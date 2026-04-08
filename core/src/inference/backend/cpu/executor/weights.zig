@@ -1374,6 +1374,7 @@ pub const TransformerBlock = struct {
                 .shared_up_proj = moe_w.shared_w3,
                 .shared_down_proj = moe_w.shared_w2,
                 .shared_d_ff = if (moe_w.shared_w1) |t| @intCast(t.shape[0]) else 0,
+                .shared_expert_gate = moe_w.shared_expert_gate,
                 // Router scaling (Gemma4 MoE)
                 .router_input_scale = if (moe_w.router_input_scale) |t| t.asSlice(f32) else null,
                 .router_per_expert_scale = if (moe_w.router_per_expert_scale) |t| t.asSlice(f32) else null,
@@ -1651,20 +1652,73 @@ pub const TransformerBlock = struct {
         };
         gated_delta_ptr.layer_idx = @intCast(block_idx);
 
-        var ffn_build = try buildOptionalSwigluTail(
-            allocator,
-            d_model,
-            d_ff,
-            use_gelu,
-            block_idx,
-            weights.fused_gate_up,
-            weights.down_proj,
-            weights.w1,
-            weights.w2,
-            weights.w3,
-            true,
-        );
-        errdefer ffn_build.deinit(allocator);
+        const is_moe = weights.moe_weights != null;
+        const ffn_ptr = try allocator.create(FfnLayer);
+        errdefer allocator.destroy(ffn_ptr);
+
+        var fused_gate_up_storage: ?Tensor = null;
+        var fused_gate_up_owned: bool = false;
+
+        if (weights.moe_weights) |moe_w| {
+            const has_shared_mlp = moe_w.shared_w1 != null;
+            const expert_d_ff: usize = if (moe_w.experts.len > 0) blk: {
+                const expert = &moe_w.experts[0];
+                if (expert.gate_up_proj) |gup| {
+                    break :blk @as(usize, @intCast(gup.shape[0])) / 2;
+                } else if (expert.gate_proj) |gp| {
+                    break :blk @as(usize, @intCast(gp.shape[0]));
+                } else break :blk d_ff;
+            } else d_ff;
+            ffn_ptr.* = .{ .moe_ffn = .{
+                .allocator = allocator,
+                .d_model = d_model,
+                .d_ff = expert_d_ff,
+                .num_experts = moe_w.num_experts,
+                .experts_per_token = moe_w.experts_per_token,
+                .router_weight = moe_w.router_weight,
+                .router_bias = moe_w.router_bias,
+                .experts = toKernelExperts(moe_w.experts),
+                .use_mxfp4 = moe_w.use_mxfp4,
+                .use_swiglu_variant = runtime.use_swiglu_variant,
+                .use_transposed_weights = runtime.use_transposed_mxfp4,
+                .use_gelu = use_gelu,
+                .shared_gate_proj = moe_w.shared_w1,
+                .shared_up_proj = moe_w.shared_w3,
+                .shared_down_proj = moe_w.shared_w2,
+                .shared_d_ff = if (moe_w.shared_w1) |t| @intCast(t.shape[0]) else 0,
+                .shared_expert_gate = moe_w.shared_expert_gate,
+                .router_input_scale = if (moe_w.router_input_scale) |t| t.asSlice(f32) else null,
+                .router_per_expert_scale = if (moe_w.router_per_expert_scale) |t| t.asSlice(f32) else null,
+                .router_scalar_root_size = if (has_shared_mlp) 1.0 / @sqrt(@as(f32, @floatFromInt(d_model))) else 0.0,
+                .pre_ffn_norm_weight = moe_w.pre_ffn_norm,
+                .post_shared_norm_weight = moe_w.post_shared_norm,
+                .pre_expert_norm_weight = moe_w.pre_expert_norm,
+                .post_expert_norm_weight = moe_w.post_expert_norm,
+                .post_combine_norm_weight = moe_w.post_combine_norm,
+                .norm_eps = norm_eps,
+                .norm_weight_offset = runtime.weight_offset,
+                .layer_idx = @intCast(block_idx),
+                .kernel_name = if (has_shared_mlp) "moe_shared" else if (moe_w.use_mxfp4) "moe_mxfp4" else "moe_f32",
+            } };
+        } else {
+            var ffn_build = try buildOptionalSwigluTail(
+                allocator,
+                d_model,
+                d_ff,
+                use_gelu,
+                block_idx,
+                weights.fused_gate_up,
+                weights.down_proj,
+                weights.w1,
+                weights.w2,
+                weights.w3,
+                true,
+            );
+            errdefer ffn_build.deinit(allocator);
+            fused_gate_up_storage = ffn_build.fused_gate_up_storage;
+            fused_gate_up_owned = ffn_build.fused_gate_up_owned;
+            ffn_ptr.* = ffn_build.layer.?.*;
+        }
 
         var kernel_list = std.ArrayListUnmanaged(CpuKernel){};
         errdefer kernel_list.deinit(allocator);
@@ -1672,7 +1726,11 @@ pub const TransformerBlock = struct {
         try kernel_list.append(allocator, .{ .norm = ln1_ptr });
         try kernel_list.append(allocator, .{ .gated_delta = gated_delta_ptr });
         if (ln2_ptr) |n| try kernel_list.append(allocator, .{ .norm = n });
-        try kernel_list.append(allocator, .{ .swiglu = &ffn_build.layer.?.swiglu });
+        if (is_moe) {
+            try kernel_list.append(allocator, .{ .moe = &ffn_ptr.moe_ffn });
+        } else {
+            try kernel_list.append(allocator, .{ .swiglu = &ffn_ptr.swiglu });
+        }
 
         const kernels = try kernel_list.toOwnedSlice(allocator);
         errdefer allocator.free(kernels);
@@ -1682,9 +1740,9 @@ pub const TransformerBlock = struct {
             .block_type = .gated_delta,
             .residual_multiplier = residual_multiplier,
             .block_idx = block_idx,
-            .fused_gate_up_storage = ffn_build.fused_gate_up_storage,
+            .fused_gate_up_storage = fused_gate_up_storage,
             .owned_gated_delta_in_proj = owned_gated_delta_in_proj,
-            .fused_gate_up_owned = ffn_build.fused_gate_up_owned,
+            .fused_gate_up_owned = fused_gate_up_owned,
         };
     }
 

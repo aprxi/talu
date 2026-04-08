@@ -647,11 +647,11 @@ test "Builder setMetadata stores key-value pairs" {
     var builder = Builder.init(allocator);
     defer builder.deinit();
 
-    try builder.setMetadata("talu.format", "gaf");
+    try builder.setMetadata("talu.format", "tq");
     try builder.setMetadata("talu.version", "1.0");
 
     try std.testing.expectEqual(@as(usize, 2), builder.metadata.count());
-    try std.testing.expectEqualStrings("gaf", builder.metadata.get("talu.format").?);
+    try std.testing.expectEqualStrings("tq", builder.metadata.get("talu.format").?);
     try std.testing.expectEqualStrings("1.0", builder.metadata.get("talu.version").?);
 }
 
@@ -681,8 +681,8 @@ test "Builder save writes metadata to file" {
     try builder.addTensor("test", .f32, &shape, &data);
 
     // Add metadata
-    try builder.setMetadata("talu.format", "gaf");
-    try builder.setMetadata("talu.quant_type", "gaf4_64");
+    try builder.setMetadata("talu.format", "tq");
+    try builder.setMetadata("talu.quant_type", "tq4_64");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -708,8 +708,8 @@ test "Builder save writes metadata to file" {
 
     // Verify metadata fields are present
     try std.testing.expect(std.mem.indexOf(u8, header_json, "\"__metadata__\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, header_json, "\"talu.format\":\"gaf\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, header_json, "\"talu.quant_type\":\"gaf4_64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header_json, "\"talu.format\":\"tq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header_json, "\"talu.quant_type\":\"tq4_64\"") != null);
 }
 
 test "Builder save writes valid file" {

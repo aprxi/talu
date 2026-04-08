@@ -327,6 +327,12 @@ fn applySpecTransforms(
             options.dequantize_mxfp8_to_bf16,
             options.dequantize_nvfp4_to_bf16,
         ),
+        .fused_linear => try transforms.orientFusedLinear(
+            safetensors,
+            name,
+            expected_in,
+            model_config.*,
+        ),
         .embedding => try transforms.orientEmbedding(allocator, safetensors, name, model_config.*),
         .conv1d_depthwise => try transforms.ensureF32(allocator, raw_tensor),
         .none => raw_tensor,

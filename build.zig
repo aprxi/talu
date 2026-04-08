@@ -682,61 +682,70 @@ pub fn build(b: *std.Build) void {
     static_step.dependOn(&b.addInstallArtifact(static_lib, .{}).step);
 
     // ==========================================================================
-    // Native CLI
+    // Native CLI (requires cargo/Rust toolchain)
     // ==========================================================================
-    const cli_mod = b.createModule(.{
-        .root_source_file = b.path("bindings/rust/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
-    const exe = b.addExecutable(.{
-        .name = "talu",
-        .root_module = cli_mod,
-    });
-    const cargo_cmd = b.addSystemCommand(&.{ "cargo", "build", "--release", "--manifest-path", "bindings/rust/Cargo.toml" });
-    exe.step.dependOn(&cargo_cmd.step);
-    exe.linkLibrary(static_lib);
-    // Link all deps including external .a archives (curl, mbedtls)
-    linkCDependencies(b, exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
-    exe.addObjectFile(b.path("bindings/rust/target/release/libtalu_cli.a"));
-
-    // Link platform-specific runtime libraries for Rust CLI
-    const cli_target_os = exe.rootModuleTarget().os.tag;
-    if (cli_target_os == .linux) {
-        exe.linkSystemLibrary("unwind");
-        exe.linkSystemLibrary("gcc_s");
-        exe.linkSystemLibrary("dl");
-        exe.linkSystemLibrary("pthread");
-        exe.linkSystemLibrary("m");
-    }
-    // macOS frameworks already linked via linkCDependencies
-
-    const install_exe = b.addInstallArtifact(exe, .{});
-    b.getInstallStep().dependOn(&install_exe.step);
+    const has_cargo = if (b.findProgram(&.{"cargo"}, &.{})) |_| true else |_| false;
+    var install_exe_step: ?*std.Build.Step = null;
     var install_mlx_metallib_step: ?*std.Build.Step.InstallFile = null;
-    if (target.result.os.tag == .macos) {
-        if (findMlxMetallib(b)) |mlx_metallib_path| {
-            const copy_mlx_metallib = b.addInstallFileWithDir(
-                .{ .cwd_relative = mlx_metallib_path },
-                .bin,
-                "mlx.metallib",
-            );
-            b.getInstallStep().dependOn(&copy_mlx_metallib.step);
-            install_mlx_metallib_step = copy_mlx_metallib;
-        }
-    }
 
-    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "talu")});
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        for (args) |arg| {
-            run_cmd.addArg(arg);
+    if (has_cargo) {
+        const cli_mod = b.createModule(.{
+            .root_source_file = b.path("bindings/rust/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+
+        const exe = b.addExecutable(.{
+            .name = "talu",
+            .root_module = cli_mod,
+        });
+        const cargo_cmd = b.addSystemCommand(&.{ "cargo", "build", "--release", "--manifest-path", "bindings/rust/Cargo.toml" });
+        exe.step.dependOn(&cargo_cmd.step);
+        exe.linkLibrary(static_lib);
+        // Link all deps including external .a archives (curl, mbedtls)
+        linkCDependencies(b, exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        exe.addObjectFile(b.path("bindings/rust/target/release/libtalu_cli.a"));
+
+        // Link platform-specific runtime libraries for Rust CLI
+        const cli_target_os = exe.rootModuleTarget().os.tag;
+        if (cli_target_os == .linux) {
+            exe.linkSystemLibrary("unwind");
+            exe.linkSystemLibrary("gcc_s");
+            exe.linkSystemLibrary("dl");
+            exe.linkSystemLibrary("pthread");
+            exe.linkSystemLibrary("m");
         }
+        // macOS frameworks already linked via linkCDependencies
+
+        const install_exe = b.addInstallArtifact(exe, .{});
+        b.getInstallStep().dependOn(&install_exe.step);
+        install_exe_step = &install_exe.step;
+
+        if (target.result.os.tag == .macos) {
+            if (findMlxMetallib(b)) |mlx_metallib_path| {
+                const copy_mlx_metallib = b.addInstallFileWithDir(
+                    .{ .cwd_relative = mlx_metallib_path },
+                    .bin,
+                    "mlx.metallib",
+                );
+                b.getInstallStep().dependOn(&copy_mlx_metallib.step);
+                install_mlx_metallib_step = copy_mlx_metallib;
+            }
+        }
+
+        const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "talu")});
+        run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_cmd.addArg(arg);
+            }
+        }
+        const run_step = b.step("run", "Run the CLI executable");
+        run_step.dependOn(&run_cmd.step);
+    } else {
+        std.debug.print("NOTE: cargo not found — skipping CLI build (library still builds)\n", .{});
     }
-    const run_step = b.step("run", "Run the CLI executable");
-    run_step.dependOn(&run_cmd.step);
 
     // ==========================================================================
     // Release step - recommended full build
@@ -746,7 +755,9 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "Build library + CLI and copy to Python (recommended)");
     release_step.dependOn(&install_lib.step);
     release_step.dependOn(python_install_step);
-    release_step.dependOn(&install_exe.step);
+    if (install_exe_step) |step| {
+        release_step.dependOn(step);
+    }
     if (install_mlx_metallib_step) |step| {
         release_step.dependOn(&step.step);
     }

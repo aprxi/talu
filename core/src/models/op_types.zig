@@ -183,6 +183,7 @@ pub const ConfigParseHook = *const fn (
 pub const WeightLayout = enum {
     none,
     linear,
+    fused_linear, // 3D stack of linear weights [n_experts, out, in] — quantizable per-slice
     conv1d_depthwise,
     embedding,
     gaffine,

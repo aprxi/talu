@@ -1674,18 +1674,23 @@ pub const MoEWeightRefs = struct {
     shared_up: LinearWeight,
     shared_down: LinearWeight,
     router_proj: LinearWeight,
-    router_input_scale: DeviceTensor,
-    router_per_expert_scale: DeviceTensor,
-    pre_ffn_norm: DeviceTensor,
-    post_shared_norm: DeviceTensor,
-    pre_expert_norm: DeviceTensor,
-    post_expert_norm: DeviceTensor,
-    post_combine_norm: DeviceTensor,
+    // Gemma4 MoE: router input/expert scales + 5 internal norms (all required).
+    // Qwen3.5 MoE: none of these (simple softmax router, no internal norms).
+    router_input_scale: ?DeviceTensor = null,
+    router_per_expert_scale: ?DeviceTensor = null,
+    pre_ffn_norm: ?DeviceTensor = null,
+    post_shared_norm: ?DeviceTensor = null,
+    pre_expert_norm: ?DeviceTensor = null,
+    post_expert_norm: ?DeviceTensor = null,
+    post_combine_norm: ?DeviceTensor = null,
+    // Qwen3.5 MoE: sigmoid gate for shared expert output scaling.
+    shared_expert_gate: ?LinearWeight = null,
     num_experts: u32,
     experts_per_token: u32,
     expert_d_ff: u32,
     shared_d_ff: u32,
     router_scalar: f32,
+    use_gelu: bool = true,
 
     pub fn deinit(self: *MoEWeightRefs, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
         for (self.expert_gate_up) |*w| w.deinit(device);
@@ -1696,13 +1701,14 @@ pub const MoEWeightRefs = struct {
         self.shared_up.deinit(device);
         self.shared_down.deinit(device);
         self.router_proj.deinit(device);
-        self.router_input_scale.deinit(device);
-        self.router_per_expert_scale.deinit(device);
-        self.pre_ffn_norm.deinit(device);
-        self.post_shared_norm.deinit(device);
-        self.pre_expert_norm.deinit(device);
-        self.post_expert_norm.deinit(device);
-        self.post_combine_norm.deinit(device);
+        if (self.router_input_scale) |*t| t.deinit(device);
+        if (self.router_per_expert_scale) |*t| t.deinit(device);
+        if (self.pre_ffn_norm) |*t| t.deinit(device);
+        if (self.post_shared_norm) |*t| t.deinit(device);
+        if (self.pre_expert_norm) |*t| t.deinit(device);
+        if (self.post_expert_norm) |*t| t.deinit(device);
+        if (self.post_combine_norm) |*t| t.deinit(device);
+        if (self.shared_expert_gate) |*w| w.deinit(device);
     }
 };
 
@@ -2786,7 +2792,7 @@ pub const BlockRuntime = struct {
                     var moe_weight_refs: ?MoEWeightRefs = null;
                     if (has_moe) {
                         const moe = attn.moe_weights.?;
-                        const moe_result = try uploadMoEWeights(device, allocator, moe, d_model, layer_idx);
+                        const moe_result = try uploadMoEWeights(device, allocator, moe, d_model, layer_idx, loaded.config.use_gelu);
                         moe_weight_refs = moe_result;
                         // Use dummy LinearWeights for w1/w2/w3 — not accessed for MoE layers
                         w1_dev = moe_result.shared_gate;
@@ -2969,13 +2975,14 @@ pub const BlockRuntime = struct {
                         moe_linear_bytes += moe_refs.router_proj.byteSize();
                         linear_weight_bytes = std.math.add(usize, linear_weight_bytes, moe_linear_bytes) catch return error.InvalidArgument;
                         // Add MoE norm bytes
-                        const moe_norm_bytes = moe_refs.pre_ffn_norm.byteSize() +
-                            moe_refs.post_shared_norm.byteSize() +
-                            moe_refs.pre_expert_norm.byteSize() +
-                            moe_refs.post_expert_norm.byteSize() +
-                            moe_refs.post_combine_norm.byteSize() +
-                            moe_refs.router_input_scale.byteSize() +
-                            moe_refs.router_per_expert_scale.byteSize();
+                        var moe_norm_bytes: usize = 0;
+                        if (moe_refs.pre_ffn_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.post_shared_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.pre_expert_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.post_expert_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.post_combine_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.router_input_scale) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.router_per_expert_scale) |t| moe_norm_bytes += t.byteSize();
                         norm_weight_bytes = std.math.add(usize, norm_weight_bytes, moe_norm_bytes) catch return error.InvalidArgument;
                     }
                     attention_block_count += 1;
@@ -3076,11 +3083,20 @@ pub const BlockRuntime = struct {
                     }
                     errdefer if (ln2_weight) |*w| w.deinit(device);
 
+                    // Upload FFN weights: either MoE or standard SwiGLU (w1/w2/w3)
+                    const has_gd_moe = gated_delta.moe_weights != null;
+                    var moe_weight_refs: ?MoEWeightRefs = null;
+                    if (has_gd_moe) {
+                        const gd_moe = gated_delta.moe_weights.?;
+                        moe_weight_refs = try uploadMoEWeights(device, allocator, gd_moe, d_model, layer_idx, loaded.config.use_gelu);
+                    }
+                    errdefer if (moe_weight_refs) |*mwr| mwr.deinit(allocator, device);
+
                     var ffn_w1: ?LinearWeight = null;
                     var ffn_w2: ?LinearWeight = null;
                     var ffn_w3: ?LinearWeight = null;
                     var d_ff: usize = 0;
-                    if (gated_delta.w1 != null or gated_delta.w2 != null or gated_delta.w3 != null) {
+                    if (!has_gd_moe and (gated_delta.w1 != null or gated_delta.w2 != null or gated_delta.w3 != null)) {
                         const w1 = gated_delta.w1 orelse return error.MissingWeight;
                         const w2 = gated_delta.w2 orelse return error.MissingWeight;
                         const w3 = gated_delta.w3 orelse return error.MissingWeight;
@@ -3325,6 +3341,24 @@ pub const BlockRuntime = struct {
                     };
                     blocks[local_idx].gated_delta_binding = &blocks[local_idx].gated_delta_runtime.?;
                     BlockRuntimeLayer.bindGatedDeltaNormWeights(&blocks[local_idx], &blocks[local_idx].gated_delta_runtime.?);
+                    if (moe_weight_refs) |moe_refs| {
+                        blocks[local_idx].moe_runtime = moe_refs;
+                        blocks[local_idx].moe_binding = &blocks[local_idx].moe_runtime.?;
+                        var moe_linear_bytes: usize = 0;
+                        for (moe_refs.expert_gate_up) |w| moe_linear_bytes += w.byteSize();
+                        for (moe_refs.expert_down) |w| moe_linear_bytes += w.byteSize();
+                        moe_linear_bytes += moe_refs.router_proj.byteSize();
+                        linear_weight_bytes = std.math.add(usize, linear_weight_bytes, moe_linear_bytes) catch return error.InvalidArgument;
+                        var moe_norm_bytes: usize = 0;
+                        if (moe_refs.pre_ffn_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.post_shared_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.pre_expert_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.post_expert_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.post_combine_norm) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.router_input_scale) |t| moe_norm_bytes += t.byteSize();
+                        if (moe_refs.router_per_expert_scale) |t| moe_norm_bytes += t.byteSize();
+                        norm_weight_bytes = std.math.add(usize, norm_weight_bytes, moe_norm_bytes) catch return error.InvalidArgument;
+                    }
                     gated_delta_block_count += 1;
                 },
                 .shortconv => |shortconv| {

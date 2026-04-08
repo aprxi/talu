@@ -4024,7 +4024,9 @@ pub fn runFfnStep(
     }
 }
 
-/// Fused MoE forward pass: shared MLP + router + experts + combine.
+/// MoE forward pass: shared MLP + router + experts + combine.
+/// Supports both Gemma4 MoE (with internal norms, GELU, router scales) and
+/// Qwen3.5 MoE (no internal norms, SiLU, sigmoid shared expert gate).
 /// Processes one row at a time (decode-focused).
 pub fn runMoEFusedStep(
     self: anytype,
@@ -4041,9 +4043,14 @@ pub fn runMoEFusedStep(
     const experts_per_token = moe.experts_per_token;
     const norm_weight_offset = self.loaded.runtime.weight_offset;
     const rmsnorm_fn = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
-    const gelu_mul_fn = self.gelu_mul_function orelse return error.CudaKernelUnavailable;
     const vector_add_fn = self.vector_add_function orelse return error.CudaKernelUnavailable;
     const vector_add_scaled_fn = self.vector_add_scaled_function orelse return error.CudaKernelUnavailable;
+
+    // Select activation function based on model type (GELU for Gemma4, SiLU for Qwen3.5)
+    const act_fn = if (moe.use_gelu)
+        (self.gelu_mul_function orelse return error.CudaKernelUnavailable)
+    else
+        (self.silu_mul_function orelse return error.CudaKernelUnavailable);
 
     const max_experts = 256;
     const max_topk = 16;
@@ -4055,13 +4062,16 @@ pub fn runMoEFusedStep(
     var selected_weights: [max_topk]f32 = undefined;
     var per_expert_scale_host: [max_experts]f32 = undefined;
 
-    // Download per-expert scale once (shared across rows).
     const ne: usize = @as(usize, num_experts);
     const ept: usize = @as(usize, experts_per_token);
-    try moe.router_per_expert_scale.buffer.download(
-        &self.device,
-        std.mem.sliceAsBytes(per_expert_scale_host[0..ne]),
-    );
+
+    // Download per-expert scale once (Gemma4 only).
+    if (moe.router_per_expert_scale) |pes| {
+        try pes.buffer.download(
+            &self.device,
+            std.mem.sliceAsBytes(per_expert_scale_host[0..ne]),
+        );
+    }
 
     const shared_d_ff_bytes: usize = @as(usize, shared_d_ff) * @sizeOf(f32);
     const expert_gate_up_bytes: usize = @as(usize, 2 * expert_d_ff) * @sizeOf(f32);
@@ -4074,72 +4084,105 @@ pub fn runMoEFusedStep(
         var output_row = try bufferSlice(output, row_offset, d_model_bytes);
 
         // ===== 1. Shared MLP =====
-        // RMSNorm(input, pre_ffn_norm) → norm_out_dev
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            rmsnorm_fn,
-            &input_row,
-            &moe.pre_ffn_norm.buffer,
-            &self.runtime_buffers.norm_out_dev,
-            1, d_model, self.norm_eps, norm_weight_offset,
-        );
+        // Input to shared MLP: RMSNorm(input) if pre_ffn_norm present, else input directly
+        var shared_mlp_input = &input_row;
+        if (moe.pre_ffn_norm) |pfn| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rmsnorm_fn,
+                &input_row,
+                &pfn.buffer,
+                &self.runtime_buffers.norm_out_dev,
+                1, d_model, self.norm_eps, norm_weight_offset,
+            );
+            shared_mlp_input = &self.runtime_buffers.norm_out_dev;
+        }
 
-        // gate_proj(normed) → ffn_gate_dev
+        // gate_proj(input) → ffn_gate_dev
         var gate_out = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, 0, shared_d_ff_bytes);
-        try engine_ops.linearForwardRows(self, &self.runtime_buffers.norm_out_dev, 1, &moe.shared_gate, &gate_out);
+        try engine_ops.linearForwardRows(self, shared_mlp_input, 1, &moe.shared_gate, &gate_out);
 
-        // up_proj(normed) → ffn_up_dev
+        // up_proj(input) → ffn_up_dev
         var up_out = try bufferSlice(&self.runtime_buffers.ffn_up_dev, 0, shared_d_ff_bytes);
-        try engine_ops.linearForwardRows(self, &self.runtime_buffers.norm_out_dev, 1, &moe.shared_up, &up_out);
+        try engine_ops.linearForwardRows(self, shared_mlp_input, 1, &moe.shared_up, &up_out);
 
-        // GELU(gate) * up → ffn_mul_dev
+        // act(gate) * up → ffn_mul_dev
         var mul_out = try bufferSlice(&self.runtime_buffers.ffn_mul_dev, 0, shared_d_ff_bytes);
-        try compute.cuda.gelu_mul.runWithFunction(
-            &self.kernel_arg_pack, &self.device, gelu_mul_fn,
-            &gate_out, &up_out, &mul_out, shared_d_ff,
-        );
+        if (moe.use_gelu) {
+            try compute.cuda.gelu_mul.runWithFunction(
+                &self.kernel_arg_pack, &self.device, act_fn,
+                &gate_out, &up_out, &mul_out, shared_d_ff,
+            );
+        } else {
+            try compute.cuda.silu_mul.runWithFunction(
+                &self.kernel_arg_pack, &self.device, act_fn,
+                &gate_out, &up_out, &mul_out, shared_d_ff,
+            );
+        }
 
         // down_proj(mul) → ffn_down_dev
         try engine_ops.linearForwardRows(self, &mul_out, 1, &moe.shared_down, &self.runtime_buffers.ffn_down_dev);
 
-        // RMSNorm(shared_out, post_shared_norm) → ffn_down_dev (in-place)
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            rmsnorm_fn,
-            &self.runtime_buffers.ffn_down_dev,
-            &moe.post_shared_norm.buffer,
-            &self.runtime_buffers.ffn_down_dev,
-            1, d_model, self.norm_eps, norm_weight_offset,
-        );
-
-        // ===== 2. Router =====
-        // RMSNorm(input, router_input_scale) with weight_offset=0 (unscaled)
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            rmsnorm_fn,
-            &input_row,
-            &moe.router_input_scale.buffer,
-            &self.runtime_buffers.norm_out_dev,
-            1, d_model, self.norm_eps, 0.0,
-        );
-
-        // Scale by router_scalar: norm_out *= router_scalar
-        if (moe.router_scalar != 1.0) {
-            try compute.cuda.vector_add_scaled.runWithFunction(
-                &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
-                &self.runtime_buffers.norm_out_dev,
-                &self.runtime_buffers.norm_out_dev,
-                &self.runtime_buffers.norm_out_dev,
-                moe.router_scalar - 1.0, d_model,
+        // Optional post-shared norm (Gemma4 only)
+        if (moe.post_shared_norm) |psn| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rmsnorm_fn,
+                &self.runtime_buffers.ffn_down_dev,
+                &psn.buffer,
+                &self.runtime_buffers.ffn_down_dev,
+                1, d_model, self.norm_eps, norm_weight_offset,
             );
         }
 
-        // Router projection → logits in ffn_gate_dev (shared MLP is done with it)
+        // Optional sigmoid gate for shared expert output (Qwen3.5 MoE)
+        if (moe.shared_expert_gate) |seg| {
+            // Compute dot(input, gate_weight) on GPU via matmul: [1, d_model] x [d_model, 1] -> [1, 1]
+            var scalar_dev = try bufferSlice(&self.runtime_buffers.ffn_up_dev, 0, @sizeOf(f32));
+            try engine_ops.linearForwardRows(self, &input_row, 1, &seg, &scalar_dev);
+            // Download scalar, compute sigmoid on host
+            var gate_scalar: [1]f32 = undefined;
+            try scalar_dev.download(&self.device, std.mem.sliceAsBytes(&gate_scalar));
+            const gate_value: f32 = 1.0 / (1.0 + @exp(-gate_scalar[0]));
+            // Scale shared output: ffn_down_dev *= gate_value
+            try compute.cuda.vector_add_scaled.runWithFunction(
+                &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
+                &self.runtime_buffers.ffn_down_dev,
+                &self.runtime_buffers.ffn_down_dev,
+                &self.runtime_buffers.ffn_down_dev,
+                gate_value - 1.0, d_model,
+            );
+        }
+
+        // ===== 2. Router =====
+        // Router input: RMSNorm + scaling (Gemma4) or direct input (Qwen3.5)
+        if (moe.router_input_scale) |ris| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rmsnorm_fn,
+                &input_row,
+                &ris.buffer,
+                &self.runtime_buffers.norm_out_dev,
+                1, d_model, self.norm_eps, 0.0,
+            );
+            if (moe.router_scalar != 1.0) {
+                try compute.cuda.vector_add_scaled.runWithFunction(
+                    &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
+                    &self.runtime_buffers.norm_out_dev,
+                    &self.runtime_buffers.norm_out_dev,
+                    &self.runtime_buffers.norm_out_dev,
+                    moe.router_scalar - 1.0, d_model,
+                );
+            }
+        }
+        const router_input = if (moe.router_input_scale != null) &self.runtime_buffers.norm_out_dev else &input_row;
+
+        // Router projection → logits
         var router_logits_dev = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, 0, router_logits_bytes);
-        try engine_ops.linearForwardRows(self, &self.runtime_buffers.norm_out_dev, 1, &moe.router_proj, &router_logits_dev);
+        try engine_ops.linearForwardRows(self, router_input, 1, &moe.router_proj, &router_logits_dev);
 
         // Download logits to host for softmax + topk
         try router_logits_dev.download(
@@ -4197,24 +4240,30 @@ pub fn runMoEFusedStep(
             }
         }
 
-        // Apply per-expert scale
-        for (selected_indices[0..ept], selected_weights[0..ept]) |idx, *w| {
-            if (idx < num_experts) {
-                w.* *= per_expert_scale_host[@as(usize, idx)];
+        // Apply per-expert scale (Gemma4 only)
+        if (moe.router_per_expert_scale != null) {
+            for (selected_indices[0..ept], selected_weights[0..ept]) |idx, *w| {
+                if (idx < num_experts) {
+                    w.* *= per_expert_scale_host[@as(usize, idx)];
+                }
             }
         }
 
         // ===== 3. Expert path =====
-        // RMSNorm(input, pre_expert_norm) → norm_out_dev
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            rmsnorm_fn,
-            &input_row,
-            &moe.pre_expert_norm.buffer,
-            &self.runtime_buffers.norm_out_dev,
-            1, d_model, self.norm_eps, norm_weight_offset,
-        );
+        // Expert input: RMSNorm (Gemma4) or raw input (Qwen3.5)
+        var expert_input = &input_row;
+        if (moe.pre_expert_norm) |pen| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rmsnorm_fn,
+                &input_row,
+                &pen.buffer,
+                &self.runtime_buffers.norm_out_dev,
+                1, d_model, self.norm_eps, norm_weight_offset,
+            );
+            expert_input = &self.runtime_buffers.norm_out_dev;
+        }
 
         // Run selected experts and accumulate weighted output
         for (0..ept) |e_idx| {
@@ -4222,28 +4271,33 @@ pub fn runMoEFusedStep(
             const weight = selected_weights[e_idx];
             if (expert_id >= num_experts) continue;
 
-            // gate_up_proj(normed) → ffn_gate_dev [2*expert_d_ff]
+            // gate_up_proj(input) → ffn_gate_dev [2*expert_d_ff]
             var expert_gate_up = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, 0, expert_gate_up_bytes);
-            try engine_ops.linearForwardRows(self, &self.runtime_buffers.norm_out_dev, 1, &moe.expert_gate_up[@as(usize, expert_id)], &expert_gate_up);
+            try engine_ops.linearForwardRows(self, expert_input, 1, &moe.expert_gate_up[@as(usize, expert_id)], &expert_gate_up);
 
             // Split: gate = [0..d_ff], up = [d_ff..2*d_ff]
             var expert_gate = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, 0, expert_d_ff_bytes);
             var expert_up = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, expert_d_ff_bytes, expert_d_ff_bytes);
 
-            // GELU(gate) * up → ffn_mul_dev
+            // act(gate) * up → ffn_mul_dev
             var expert_mul = try bufferSlice(&self.runtime_buffers.ffn_mul_dev, 0, expert_d_ff_bytes);
-            try compute.cuda.gelu_mul.runWithFunction(
-                &self.kernel_arg_pack, &self.device, gelu_mul_fn,
-                &expert_gate, &expert_up, &expert_mul, expert_d_ff,
-            );
+            if (moe.use_gelu) {
+                try compute.cuda.gelu_mul.runWithFunction(
+                    &self.kernel_arg_pack, &self.device, act_fn,
+                    &expert_gate, &expert_up, &expert_mul, expert_d_ff,
+                );
+            } else {
+                try compute.cuda.silu_mul.runWithFunction(
+                    &self.kernel_arg_pack, &self.device, act_fn,
+                    &expert_gate, &expert_up, &expert_mul, expert_d_ff,
+                );
+            }
 
             // down_proj(mul) → deepstack_add_dev (temp, d_model-sized)
             try engine_ops.linearForwardRows(self, &expert_mul, 1, &moe.expert_down[@as(usize, expert_id)], &self.runtime_buffers.deepstack_add_dev);
 
             // Accumulate: first expert bootstraps accum, rest add
             if (e_idx == 0) {
-                // attn_out_dev = weight * expert_out
-                // = expert_out + (weight - 1.0) * expert_out
                 try compute.cuda.vector_add_scaled.runWithFunction(
                     &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
                     &self.runtime_buffers.deepstack_add_dev,
@@ -4252,7 +4306,6 @@ pub fn runMoEFusedStep(
                     weight - 1.0, d_model,
                 );
             } else {
-                // attn_out_dev += weight * expert_out
                 try compute.cuda.vector_add_scaled.runWithFunction(
                     &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
                     &self.runtime_buffers.attn_out_dev,
@@ -4263,16 +4316,18 @@ pub fn runMoEFusedStep(
             }
         }
 
-        // RMSNorm(accum, post_expert_norm) → attn_out_dev (in-place)
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            rmsnorm_fn,
-            &self.runtime_buffers.attn_out_dev,
-            &moe.post_expert_norm.buffer,
-            &self.runtime_buffers.attn_out_dev,
-            1, d_model, self.norm_eps, norm_weight_offset,
-        );
+        // Optional post-expert norm (Gemma4 only)
+        if (moe.post_expert_norm) |pon| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rmsnorm_fn,
+                &self.runtime_buffers.attn_out_dev,
+                &pon.buffer,
+                &self.runtime_buffers.attn_out_dev,
+                1, d_model, self.norm_eps, norm_weight_offset,
+            );
+        }
 
         // ===== 4. Combine: output = shared_out + expert_accum =====
         try compute.cuda.vector_add.runWithFunction(
@@ -4283,15 +4338,17 @@ pub fn runMoEFusedStep(
             d_model,
         );
 
-        // RMSNorm(combined, post_combine_norm) → output (in-place)
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            rmsnorm_fn,
-            &output_row,
-            &moe.post_combine_norm.buffer,
-            &output_row,
-            1, d_model, self.norm_eps, norm_weight_offset,
-        );
+        // Optional post-combine norm (Gemma4 only)
+        if (moe.post_combine_norm) |pcn| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rmsnorm_fn,
+                &output_row,
+                &pcn.buffer,
+                &output_row,
+                1, d_model, self.norm_eps, norm_weight_offset,
+            );
+        }
     }
 }

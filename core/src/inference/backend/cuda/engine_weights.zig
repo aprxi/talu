@@ -1051,6 +1051,7 @@ pub fn uploadMoEWeights(
     moe: *const MoEWeights,
     d_model: usize,
     layer_idx: usize,
+    use_gelu: bool,
 ) !MoEWeightRefs {
     const num_experts: u32 = @intCast(moe.num_experts);
     const experts_per_token: u32 = @intCast(moe.experts_per_token);
@@ -1102,31 +1103,57 @@ pub fn uploadMoEWeights(
     var router_proj = try uploadLinearWeightWithContext(device, allocator, &moe.router_weight, d_model, layer_idx, "router.proj.weight");
     errdefer router_proj.deinit(device);
 
-    // Upload router scales
-    const router_input_scale_src = moe.router_input_scale orelse return error.MissingWeight;
-    var router_input_scale = try uploadTensor(device, allocator, &router_input_scale_src);
-    errdefer router_input_scale.deinit(device);
-    const router_per_expert_scale_src = moe.router_per_expert_scale orelse return error.MissingWeight;
-    var router_per_expert_scale = try uploadTensor(device, allocator, &router_per_expert_scale_src);
-    errdefer router_per_expert_scale.deinit(device);
+    // Upload optional router scales (Gemma4 MoE only)
+    var router_input_scale: ?DeviceTensor = null;
+    if (moe.router_input_scale) |src| {
+        router_input_scale = try uploadTensor(device, allocator, &src);
+    }
+    errdefer if (router_input_scale) |*t| t.deinit(device);
+    var router_per_expert_scale: ?DeviceTensor = null;
+    if (moe.router_per_expert_scale) |src| {
+        router_per_expert_scale = try uploadTensor(device, allocator, &src);
+    }
+    errdefer if (router_per_expert_scale) |*t| t.deinit(device);
 
-    // Upload 5 internal norms
-    const pre_ffn_norm_src = moe.pre_ffn_norm orelse return error.MissingWeight;
-    var pre_ffn_norm = try uploadTensor(device, allocator, &pre_ffn_norm_src);
-    errdefer pre_ffn_norm.deinit(device);
-    const post_shared_norm_src = moe.post_shared_norm orelse return error.MissingWeight;
-    var post_shared_norm = try uploadTensor(device, allocator, &post_shared_norm_src);
-    errdefer post_shared_norm.deinit(device);
-    const pre_expert_norm_src = moe.pre_expert_norm orelse return error.MissingWeight;
-    var pre_expert_norm = try uploadTensor(device, allocator, &pre_expert_norm_src);
-    errdefer pre_expert_norm.deinit(device);
-    const post_expert_norm_src = moe.post_expert_norm orelse return error.MissingWeight;
-    var post_expert_norm = try uploadTensor(device, allocator, &post_expert_norm_src);
-    errdefer post_expert_norm.deinit(device);
-    const post_combine_norm_src = moe.post_combine_norm orelse return error.MissingWeight;
-    const post_combine_norm = try uploadTensor(device, allocator, &post_combine_norm_src);
+    // Upload optional internal norms (Gemma4 MoE only)
+    var pre_ffn_norm: ?DeviceTensor = null;
+    if (moe.pre_ffn_norm) |src| {
+        pre_ffn_norm = try uploadTensor(device, allocator, &src);
+    }
+    errdefer if (pre_ffn_norm) |*t| t.deinit(device);
+    var post_shared_norm: ?DeviceTensor = null;
+    if (moe.post_shared_norm) |src| {
+        post_shared_norm = try uploadTensor(device, allocator, &src);
+    }
+    errdefer if (post_shared_norm) |*t| t.deinit(device);
+    var pre_expert_norm: ?DeviceTensor = null;
+    if (moe.pre_expert_norm) |src| {
+        pre_expert_norm = try uploadTensor(device, allocator, &src);
+    }
+    errdefer if (pre_expert_norm) |*t| t.deinit(device);
+    var post_expert_norm: ?DeviceTensor = null;
+    if (moe.post_expert_norm) |src| {
+        post_expert_norm = try uploadTensor(device, allocator, &src);
+    }
+    errdefer if (post_expert_norm) |*t| t.deinit(device);
+    var post_combine_norm: ?DeviceTensor = null;
+    if (moe.post_combine_norm) |src| {
+        post_combine_norm = try uploadTensor(device, allocator, &src);
+    }
+    errdefer if (post_combine_norm) |*t| t.deinit(device);
 
-    const router_scalar: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d_model)));
+    // Upload optional shared expert gate (Qwen3.5 MoE — sigmoid scaling)
+    var shared_expert_gate: ?LinearWeight = null;
+    if (moe.shared_expert_gate) |gate_src| {
+        shared_expert_gate = try uploadLinearWeightWithContext(device, allocator, &gate_src, d_model, layer_idx, "shared_expert_gate");
+    }
+    errdefer if (shared_expert_gate) |*w| w.deinit(device);
+
+    // Router scalar: 1/sqrt(d_model) for Gemma4, 1.0 for Qwen3.5 (no scaling)
+    const router_scalar: f32 = if (router_input_scale != null)
+        1.0 / @sqrt(@as(f32, @floatFromInt(d_model)))
+    else
+        1.0;
 
     log.info("inference", "CUDA MoE weights uploaded", .{
         .layer = layer_idx,
@@ -1150,11 +1177,13 @@ pub fn uploadMoEWeights(
         .pre_expert_norm = pre_expert_norm,
         .post_expert_norm = post_expert_norm,
         .post_combine_norm = post_combine_norm,
+        .shared_expert_gate = shared_expert_gate,
         .num_experts = num_experts,
         .experts_per_token = experts_per_token,
         .expert_d_ff = expert_d_ff,
         .shared_d_ff = shared_d_ff,
         .router_scalar = router_scalar,
+        .use_gelu = use_gelu,
     };
 }
 

@@ -29,18 +29,14 @@ const SchemeDefinition = struct {
 /// Each scheme has a canonical name and optional user-friendly aliases.
 const DEFS = [_]SchemeDefinition{
     // No quantization
-    .{ .val = .f16, .name = "f16", .aliases = &.{ "16bit", "half" } },
+    .{ .val = .f16, .name = "f16", .aliases = &.{} },
 
-    // Grouped Affine (MLX Compatible) - Map generic aliases to group_size=32
-    .{ .val = .gaf4_32, .name = "gaf4_32", .aliases = &.{ "mlx", "mlx4", "gaf4", "4bit", "q4", "int4" } },
-    .{ .val = .gaf4_64, .name = "gaf4_64", .aliases = &.{} },
-    .{ .val = .gaf4_128, .name = "gaf4_128", .aliases = &.{} },
-    .{ .val = .gaf8_32, .name = "gaf8_32", .aliases = &.{ "mlx8", "gaf8", "8bit", "q8", "int8" } },
-    .{ .val = .gaf8_64, .name = "gaf8_64", .aliases = &.{} },
-    .{ .val = .gaf8_128, .name = "gaf8_128", .aliases = &.{} },
+    // Talu Quantized — only default group sizes exposed
+    .{ .val = .tq4_32, .name = "tq4", .aliases = &.{} },
+    .{ .val = .tq8_64, .name = "tq8", .aliases = &.{} },
 
     // Hardware Float
-    .{ .val = .fp8_e4m3, .name = "fp8_e4m3", .aliases = &.{"fp8"} },
+    .{ .val = .fp8_e4m3, .name = "fp8", .aliases = &.{} },
     .{ .val = .fp8_e5m2, .name = "fp8_e5m2", .aliases = &.{} },
     .{ .val = .mxfp4, .name = "mxfp4", .aliases = &.{} },
     .{ .val = .nvfp4, .name = "nvfp4", .aliases = &.{} },
@@ -54,9 +50,9 @@ const DEFS = [_]SchemeDefinition{
 /// Target platform for optimized conversion.
 /// Different platforms benefit from different quantization formats.
 pub const Platform = enum(u32) {
-    cpu = 0, // Generic CPU: use Grouped Affine (gaf4_32, gaf8_32, f16)
-    metal = 1, // Apple Silicon: use Grouped Affine (gaf4_32, gaf8_32, f16)
-    cuda = 2, // NVIDIA GPU: use Grouped Affine (gaf4_32, gaf8_32, f16)
+    cpu = 0, // Generic CPU: use Talu Quantized (tq4, tq8, f16)
+    metal = 1, // Apple Silicon: use Talu Quantized (tq4, tq8, f16)
+    cuda = 2, // NVIDIA GPU: use Talu Quantized (tq4, tq8, f16)
 
     /// Parse platform from string (case-insensitive).
     pub fn fromString(s: []const u8) ?Platform {
@@ -130,22 +126,22 @@ pub const QualityProfile = enum(u32) {
 /// ## No Quantization
 /// - f16
 ///
-/// ## Grouped Affine (MLX Compatible)
-/// - gaf4_32, gaf4_64, gaf4_128, gaf8_32, gaf8_64, gaf8_128
+/// ## Talu Quantized
+/// - tq4 (tq4_32, tq4_64, tq4_128), tq8 (tq8_32, tq8_64, tq8_128)
 ///
 /// ## Hardware Float
-/// - fp8_e4m3, fp8_e5m2, mxfp4, nvfp4, mxfp8
+/// - fp8, fp8_e5m2, mxfp4, nvfp4, mxfp8
 pub const Scheme = enum(u32) {
     // No quantization
     f16 = 4, // No quantization
 
-    // Grouped Affine (MLX compatible) - values 10-15
-    gaf4_32 = 10, // 4-bit, group_size=32 (highest accuracy)
-    gaf4_64 = 11, // 4-bit, group_size=64 (exception)
-    gaf4_128 = 12, // 4-bit, group_size=128 (smallest)
-    gaf8_32 = 13, // 8-bit, group_size=32
-    gaf8_64 = 14, // 8-bit, group_size=64
-    gaf8_128 = 15, // 8-bit, group_size=128
+    // Talu Quantized - values 10-15
+    tq4_32 = 10, // 4-bit, group_size=32 (default)
+    tq4_64 = 11, // 4-bit, group_size=64
+    tq4_128 = 12, // 4-bit, group_size=128
+    tq8_32 = 13, // 8-bit, group_size=32
+    tq8_64 = 14, // 8-bit, group_size=64 (default)
+    tq8_128 = 15, // 8-bit, group_size=128
 
     // Hardware float (not yet implemented) - values 20-23
     fp8_e4m3 = 20, // FP8 E4M3 for inference (H100/vLLM)
@@ -157,7 +153,7 @@ pub const Scheme = enum(u32) {
     /// Get the conversion method for this scheme.
     pub fn getMethod(self: Scheme) Method {
         return switch (self) {
-            .f16, .gaf4_32, .gaf4_64, .gaf4_128, .gaf8_32, .gaf8_64, .gaf8_128 => .grouped_affine,
+            .f16, .tq4_32, .tq4_64, .tq4_128, .tq8_32, .tq8_64, .tq8_128 => .grouped_affine,
             .fp8_e4m3, .fp8_e5m2 => .fp8,
             .mxfp4 => .mxfp4,
             .nvfp4 => .nvfp4,
@@ -168,27 +164,27 @@ pub const Scheme = enum(u32) {
     /// Get the bit width for this scheme.
     pub fn getBits(self: Scheme) u8 {
         return switch (self) {
-            .gaf4_32, .gaf4_64, .gaf4_128, .mxfp4, .nvfp4 => 4,
-            .gaf8_32, .gaf8_64, .gaf8_128, .fp8_e4m3, .fp8_e5m2, .mxfp8 => 8,
+            .tq4_32, .tq4_64, .tq4_128, .mxfp4, .nvfp4 => 4,
+            .tq8_32, .tq8_64, .tq8_128, .fp8_e4m3, .fp8_e5m2, .mxfp8 => 8,
             .f16 => 16,
         };
     }
 
     /// Get estimated bits per parameter including overhead.
-    /// GAF has scale/bias per group.
+    /// TQ has scale/bias per group.
     /// Returns bits * 100 to avoid floating point (e.g., 450 = 4.5 bits).
     pub fn getEffectiveBitsX100(self: Scheme) u32 {
         return switch (self) {
             .f16 => 1600, // 16 bits exactly
 
-            // GAF: bits + scale/bias overhead (16-bit scale + 16-bit bias per group)
+            // TQ: bits + scale/bias overhead (16-bit scale + 16-bit bias per group)
             // Overhead = 32 bits / group_size per param
-            .gaf4_32 => 500, // 4 + 1.0 (32 bits / 32 group)
-            .gaf4_64 => 450, // 4 + 0.5 (32 bits / 64 group)
-            .gaf4_128 => 425, // 4 + 0.25 (32 bits / 128 group)
-            .gaf8_32 => 900, // 8 + 1.0
-            .gaf8_64 => 850, // 8 + 0.5
-            .gaf8_128 => 825, // 8 + 0.25
+            .tq4_32 => 500, // 4 + 1.0 (32 bits / 32 group)
+            .tq4_64 => 450, // 4 + 0.5 (32 bits / 64 group)
+            .tq4_128 => 425, // 4 + 0.25 (32 bits / 128 group)
+            .tq8_32 => 900, // 8 + 1.0
+            .tq8_64 => 850, // 8 + 0.5
+            .tq8_128 => 825, // 8 + 0.25
 
             // FP8: 8 bits exactly
             .fp8_e4m3, .fp8_e5m2 => 800,
@@ -203,9 +199,9 @@ pub const Scheme = enum(u32) {
     /// Get the group size for this scheme (0 if not applicable).
     pub fn getGroupSize(self: Scheme) u32 {
         return switch (self) {
-            .gaf4_32, .gaf8_32, .mxfp4, .nvfp4, .mxfp8 => 32,
-            .gaf4_64, .gaf8_64, .f16 => 64, // f16 uses default group_size
-            .gaf4_128, .gaf8_128 => 128,
+            .tq4_32, .tq8_32, .mxfp4, .nvfp4, .mxfp8 => 32,
+            .tq4_64, .tq8_64, .f16 => 64, // f16 uses default group_size
+            .tq4_128, .tq8_128 => 128,
             .fp8_e4m3, .fp8_e5m2 => 0,
         };
     }
@@ -214,12 +210,12 @@ pub const Scheme = enum(u32) {
     pub fn toOutputSuffix(self: Scheme) []const u8 {
         return switch (self) {
             .f16 => "F16",
-            .gaf4_32 => "GAF4",
-            .gaf4_64 => "GAF4-G64",
-            .gaf4_128 => "GAF4-G128",
-            .gaf8_32 => "GAF8",
-            .gaf8_64 => "GAF8-G64",
-            .gaf8_128 => "GAF8-G128",
+            .tq4_32 => "TQ4",
+            .tq4_64 => "TQ4_64",
+            .tq4_128 => "TQ4_128",
+            .tq8_32 => "TQ8_32",
+            .tq8_64 => "TQ8",
+            .tq8_128 => "TQ8_128",
             .fp8_e4m3 => "FP8",
             .fp8_e5m2 => "FP8-E5M2",
             .mxfp4 => "MXFP4",
@@ -242,34 +238,50 @@ pub const Scheme = enum(u32) {
 
     /// Get canonical string representation.
     pub fn toString(self: Scheme) []const u8 {
-        inline for (DEFS) |def| {
-            if (self == def.val) return def.name;
-        }
-        unreachable;
+        // Non-default group size variants are not in DEFS; handle explicitly.
+        return switch (self) {
+            .tq4_64 => "tq4_64",
+            .tq4_128 => "tq4_128",
+            .tq8_32 => "tq8_32",
+            .tq8_128 => "tq8_128",
+            else => {
+                inline for (DEFS) |def| {
+                    if (self == def.val) return def.name;
+                }
+                unreachable;
+            },
+        };
     }
 
     /// Resolve the optimal scheme for a given platform and quantization level.
-    ///
-    /// This is the single source of truth for platform/quant -> scheme mapping.
-    /// All platforms use Grouped Affine (GAF) quantization.
-    ///
-    /// | Platform | Quant | Resolved Scheme |
-    /// | -------- | ----- | --------------- |
-    /// | cpu      | q4    | gaf4_32         |
-    /// | cpu      | q8    | gaf8_32         |
-    /// | cpu      | q16   | f16             |
-    /// | metal    | q4    | gaf4_32         |
-    /// | metal    | q8    | gaf8_32         |
-    /// | metal    | q16   | f16             |
-    /// | cuda     | q4    | gaf4_32         |
-    /// | cuda     | q8    | gaf8_32         |
-    /// | cuda     | q16   | f16             |
     pub fn resolve(platform: Platform, quant: QuantLevel) Scheme {
         _ = platform; // All platforms use the same schemes now
         return switch (quant) {
-            .q4 => .gaf4_32,
-            .q8 => .gaf8_32,
+            .q4 => .tq4_32,
+            .q8 => .tq8_64,
             .q16 => .f16,
+        };
+    }
+
+    /// Apply GROUP_SIZE env var override.
+    /// Call after fromString() to remap the default group size.
+    pub fn withGroupSizeOverride(self: Scheme) Scheme {
+        const gs_env = std.posix.getenv("GROUP_SIZE") orelse return self;
+        const gs = std.fmt.parseInt(u32, gs_env, 10) catch return self;
+        return switch (self) {
+            .tq4_32, .tq4_64, .tq4_128 => switch (gs) {
+                32 => .tq4_32,
+                64 => .tq4_64,
+                128 => .tq4_128,
+                else => self,
+            },
+            .tq8_32, .tq8_64, .tq8_128 => switch (gs) {
+                32 => .tq8_32,
+                64 => .tq8_64,
+                128 => .tq8_128,
+                else => self,
+            },
+            else => self,
         };
     }
 
@@ -409,7 +421,7 @@ pub const MAX_OVERRIDES: usize = 32;
 /// Pattern uses glob syntax (e.g., "model.layers.*.mlp.experts.*").
 pub const OverrideRule = extern struct {
     pattern: ?[*:0]const u8 = null,
-    scheme: Scheme = .gaf4_32,
+    scheme: Scheme = .tq4_32,
 };
 
 // =============================================================================
@@ -419,7 +431,7 @@ pub const OverrideRule = extern struct {
 /// Conversion options.
 pub const ConvertOptions = extern struct {
     /// Explicit scheme selection. Ignored if use_platform_quant is true.
-    scheme: Scheme = .gaf4_32,
+    scheme: Scheme = .tq4_32,
     force: bool = false,
     offline: bool = false,
     destination: ?[*:0]const u8 = null,
@@ -519,7 +531,7 @@ fn defaultCalibrationFor(profile: QualityProfile, scheme: Scheme) CalibrationSet
             .fast => .{ .profile = profile, .iters = 1, .nsamples = 16, .seqlen = 256, .batch_size = 1, .nblocks = 1, .seed = 42 },
             .custom => unreachable,
         },
-        .gaf4_32, .gaf4_64, .gaf4_128, .gaf8_32, .gaf8_64, .gaf8_128 => switch (effective_profile) {
+        .tq4_32, .tq4_64, .tq4_128, .tq8_32, .tq8_64, .tq8_128 => switch (effective_profile) {
             .best => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
             .good => .{ .profile = profile, .iters = 16, .nsamples = 128, .seqlen = 1536, .batch_size = 1, .nblocks = 1, .seed = 42 },
             .balanced => .{ .profile = profile, .iters = 8, .nsamples = 64, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
@@ -1045,47 +1057,45 @@ pub fn convert(
 
 test "Scheme.getMethod" {
     try std.testing.expectEqual(Method.grouped_affine, Scheme.f16.getMethod());
-    try std.testing.expectEqual(Method.grouped_affine, Scheme.gaf4_64.getMethod());
+    try std.testing.expectEqual(Method.grouped_affine, Scheme.tq4_64.getMethod());
     try std.testing.expectEqual(Method.fp8, Scheme.fp8_e4m3.getMethod());
 }
 
 test "Scheme.getBits" {
     try std.testing.expectEqual(@as(u8, 16), Scheme.f16.getBits());
-    try std.testing.expectEqual(@as(u8, 4), Scheme.gaf4_64.getBits());
-    try std.testing.expectEqual(@as(u8, 8), Scheme.gaf8_32.getBits());
+    try std.testing.expectEqual(@as(u8, 4), Scheme.tq4_64.getBits());
+    try std.testing.expectEqual(@as(u8, 8), Scheme.tq8_32.getBits());
 }
 
 test "Scheme.getGroupSize" {
-    try std.testing.expectEqual(@as(u32, 32), Scheme.gaf4_32.getGroupSize());
-    try std.testing.expectEqual(@as(u32, 64), Scheme.gaf4_64.getGroupSize());
-    try std.testing.expectEqual(@as(u32, 128), Scheme.gaf4_128.getGroupSize());
+    try std.testing.expectEqual(@as(u32, 32), Scheme.tq4_32.getGroupSize());
+    try std.testing.expectEqual(@as(u32, 64), Scheme.tq4_64.getGroupSize());
+    try std.testing.expectEqual(@as(u32, 128), Scheme.tq4_128.getGroupSize());
 }
 
 test "Scheme.fromString" {
     // Canonical names
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("gaf4_64").?);
+    try std.testing.expectEqual(Scheme.tq4_32, Scheme.fromString("tq4").?);
+    try std.testing.expectEqual(Scheme.tq8_64, Scheme.fromString("tq8").?);
+    try std.testing.expectEqual(Scheme.fp8_e4m3, Scheme.fromString("fp8").?);
+    try std.testing.expectEqual(Scheme.f16, Scheme.fromString("f16").?);
     try std.testing.expect(Scheme.fromString("invalid") == null);
 
-    // Aliases - now map to GAF
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("4bit").?);
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("q4").?);
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("int4").?);
-    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.fromString("8bit").?);
-    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.fromString("int8").?);
-    try std.testing.expectEqual(Scheme.f16, Scheme.fromString("16bit").?);
-    try std.testing.expectEqual(Scheme.f16, Scheme.fromString("half").?);
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("mlx").?);
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("mlx4").?);
-    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.fromString("mlx8").?);
-    try std.testing.expectEqual(Scheme.fp8_e4m3, Scheme.fromString("fp8").?);
+    // Old aliases removed — must not match
+    try std.testing.expect(Scheme.fromString("gaf4") == null);
+    try std.testing.expect(Scheme.fromString("gaf8") == null);
+    try std.testing.expect(Scheme.fromString("mlx") == null);
 
-    // Case insensitive aliases
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("4BIT").?);
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("MLX").?);
+    // Case insensitive
+    try std.testing.expectEqual(Scheme.tq4_32, Scheme.fromString("TQ4").?);
+    try std.testing.expectEqual(Scheme.tq8_64, Scheme.fromString("TQ8").?);
 }
 
 test "Scheme.toString" {
-    try std.testing.expectEqualStrings("gaf4_64", Scheme.gaf4_64.toString());
+    try std.testing.expectEqualStrings("tq4", Scheme.tq4_32.toString());
+    try std.testing.expectEqualStrings("tq4_64", Scheme.tq4_64.toString());
+    try std.testing.expectEqualStrings("tq8", Scheme.tq8_64.toString());
+    try std.testing.expectEqualStrings("tq8_32", Scheme.tq8_32.toString());
     try std.testing.expectEqualStrings("f16", Scheme.f16.toString());
 }
 
@@ -1094,15 +1104,16 @@ test "Scheme.all_schemes_json" {
     // Check it's valid JSON structure
     try std.testing.expect(scheme_json[0] == '{');
     try std.testing.expect(scheme_json[scheme_json.len - 1] == '}');
-    // Check it contains expected schemes and aliases
-    try std.testing.expect(std.mem.indexOf(u8, scheme_json, "\"gaf4_32\":[\"mlx\",\"mlx4\",\"gaf4\",\"4bit\",\"q4\",\"int4\"]") != null);
+    // Check it contains expected schemes
+    try std.testing.expect(std.mem.indexOf(u8, scheme_json, "\"tq4\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scheme_json, "\"tq8\":[]") != null);
 }
 
 test "Scheme.all_schemes_string" {
     const csv = Scheme.all_schemes_string;
     // Check it contains expected schemes
-    try std.testing.expect(std.mem.indexOf(u8, csv, "gaf4_64") != null);
-    try std.testing.expect(std.mem.indexOf(u8, csv, "gaf8_32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, csv, "tq4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, csv, "tq8") != null);
 }
 
 test "Platform.fromString" {
@@ -1219,22 +1230,22 @@ test "defaultCalibrationFor nvfp4 profiles" {
 }
 
 test "defaultCalibrationFor grouped-affine profiles" {
-    const best = defaultCalibrationFor(.best, .gaf8_64);
+    const best = defaultCalibrationFor(.best, .tq8_64);
     try std.testing.expectEqual(@as(u32, 32), best.iters);
     try std.testing.expectEqual(@as(u32, 256), best.nsamples);
     try std.testing.expectEqual(@as(u32, 2048), best.seqlen);
 
-    const good = defaultCalibrationFor(.good, .gaf8_64);
+    const good = defaultCalibrationFor(.good, .tq8_64);
     try std.testing.expectEqual(@as(u32, 16), good.iters);
     try std.testing.expectEqual(@as(u32, 128), good.nsamples);
     try std.testing.expectEqual(@as(u32, 1536), good.seqlen);
 
-    const balanced = defaultCalibrationFor(.balanced, .gaf8_64);
+    const balanced = defaultCalibrationFor(.balanced, .tq8_64);
     try std.testing.expectEqual(@as(u32, 8), balanced.iters);
     try std.testing.expectEqual(@as(u32, 64), balanced.nsamples);
     try std.testing.expectEqual(@as(u32, 1024), balanced.seqlen);
 
-    const fast = defaultCalibrationFor(.fast, .gaf8_64);
+    const fast = defaultCalibrationFor(.fast, .tq8_64);
     try std.testing.expectEqual(@as(u32, 1), fast.iters);
     try std.testing.expectEqual(@as(u32, 16), fast.nsamples);
     try std.testing.expectEqual(@as(u32, 256), fast.seqlen);
@@ -1311,7 +1322,7 @@ test "rewriteNvfp4Config writes canonical quant contract fields" {
     try std.testing.expect(parsed.value == .object);
     const obj = parsed.value.object;
     const quant = objectFieldAsObject(obj, "quantization").?;
-    try std.testing.expectEqual(@as(i64, 32), objectFieldAsInt(quant, "group_size").?);
+    try std.testing.expectEqual(@as(i64, 16), objectFieldAsInt(quant, "group_size").?);
     try std.testing.expectEqual(@as(i64, 4), objectFieldAsInt(quant, "bits").?);
 
     const qcfg = objectFieldAsObject(obj, "quantization_config").?;
@@ -1409,44 +1420,44 @@ test "validateCanonicalOutput rejects hybrid nvfp4 artifact" {
     try std.testing.expectError(error.InvalidConfig, validateCanonicalOutput(allocator, dir_path, .nvfp4));
 }
 
-test "Scheme.resolve - all platforms use GAF" {
-    // All platforms now use GAF schemes
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.resolve(.cpu, .q4));
-    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.resolve(.cpu, .q8));
+test "Scheme.resolve - all platforms use TQ" {
+    // All platforms now use TQ schemes
+    try std.testing.expectEqual(Scheme.tq4_32, Scheme.resolve(.cpu, .q4));
+    try std.testing.expectEqual(Scheme.tq8_64, Scheme.resolve(.cpu, .q8));
     try std.testing.expectEqual(Scheme.f16, Scheme.resolve(.cpu, .q16));
 
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.resolve(.metal, .q4));
-    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.resolve(.metal, .q8));
+    try std.testing.expectEqual(Scheme.tq4_32, Scheme.resolve(.metal, .q4));
+    try std.testing.expectEqual(Scheme.tq8_64, Scheme.resolve(.metal, .q8));
     try std.testing.expectEqual(Scheme.f16, Scheme.resolve(.metal, .q16));
 
-    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.resolve(.cuda, .q4));
-    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.resolve(.cuda, .q8));
+    try std.testing.expectEqual(Scheme.tq4_32, Scheme.resolve(.cuda, .q4));
+    try std.testing.expectEqual(Scheme.tq8_64, Scheme.resolve(.cuda, .q8));
     try std.testing.expectEqual(Scheme.f16, Scheme.resolve(.cuda, .q16));
 }
 
 test "ConvertOptions.getEffectiveScheme - explicit scheme" {
     var opts = std.mem.zeroes(ConvertOptions);
-    opts.scheme = .gaf8_64;
+    opts.scheme = .tq8_64;
     opts.use_platform_quant = false;
-    try std.testing.expectEqual(Scheme.gaf8_64, opts.getEffectiveScheme());
+    try std.testing.expectEqual(Scheme.tq8_64, opts.getEffectiveScheme());
 }
 
 test "ConvertOptions.getEffectiveScheme - platform/quant resolution" {
     var opts = std.mem.zeroes(ConvertOptions);
     opts.use_platform_quant = true;
 
-    // CPU + 4bit -> gaf4_32
+    // CPU + 4bit -> tq4_32
     opts.platform = .cpu;
     opts.quant = .q4;
-    try std.testing.expectEqual(Scheme.gaf4_32, opts.getEffectiveScheme());
+    try std.testing.expectEqual(Scheme.tq4_32, opts.getEffectiveScheme());
 
-    // Metal + 4bit -> gaf4_32
+    // Metal + 4bit -> tq4_32
     opts.platform = .metal;
     opts.quant = .q4;
-    try std.testing.expectEqual(Scheme.gaf4_32, opts.getEffectiveScheme());
+    try std.testing.expectEqual(Scheme.tq4_32, opts.getEffectiveScheme());
 
-    // Metal + 8bit -> gaf8_32
+    // Metal + 8bit -> tq8_64
     opts.platform = .metal;
     opts.quant = .q8;
-    try std.testing.expectEqual(Scheme.gaf8_32, opts.getEffectiveScheme());
+    try std.testing.expectEqual(Scheme.tq8_64, opts.getEffectiveScheme());
 }

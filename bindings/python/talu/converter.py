@@ -8,14 +8,14 @@ Schemes
 Each scheme encodes all conversion parameters (method, bits, group_size).
 This eliminates invalid parameter combinations.
 
-**Grouped Affine (GAF):**
+**Talu Quantized (TQ):**
 
-- ``gaf4_32``: 4-bit, group_size=32 (highest accuracy)
-- ``gaf4_64``: 4-bit, group_size=64 (DEFAULT, balanced)
-- ``gaf4_128``: 4-bit, group_size=128 (smallest)
-- ``gaf8_32``: 8-bit, group_size=32
-- ``gaf8_64``: 8-bit, group_size=64
-- ``gaf8_128``: 8-bit, group_size=128
+- ``tq4``: 4-bit, group_size=32 (DEFAULT, highest accuracy)
+- ``tq4_64``: 4-bit, group_size=64
+- ``tq4_128``: 4-bit, group_size=128 (smallest)
+- ``tq8``: 8-bit, group_size=64 (DEFAULT)
+- ``tq8_32``: 8-bit, group_size=32
+- ``tq8_128``: 8-bit, group_size=128
 
 **Hardware Float (Not Yet Implemented):**
 
@@ -43,14 +43,14 @@ Usage
 -----
 >>> import talu
 
->>> # Default: 4-bit grouped affine (gaf4_64)
+>>> # Default: 4-bit Talu Quantized (tq4)
 >>> talu.convert("Qwen/Qwen3-7B")
 
->>> # Higher accuracy with smaller groups
->>> talu.convert("Qwen/Qwen3-7B", scheme="gaf4_32")
+>>> # 4-bit with larger group size
+>>> talu.convert("Qwen/Qwen3-7B", scheme="tq4_64")
 
 >>> # 8-bit near-lossless
->>> talu.convert("Qwen/Qwen3-7B", scheme="gaf8_64")
+>>> talu.convert("Qwen/Qwen3-7B", scheme="tq8")
 
 >>> # List all available schemes
 >>> talu.list_schemes()
@@ -113,14 +113,14 @@ class Scheme:
     Each scheme encodes all conversion parameters (method, bits, group_size).
     This eliminates invalid parameter combinations.
 
-    Grouped Affine (MLX Compatible)
-    -------------------------------
-    - GAF4_32: 4-bit, group_size=32 (highest accuracy)
-    - GAF4_64: 4-bit, group_size=64 (balanced, DEFAULT)
-    - GAF4_128: 4-bit, group_size=128 (smallest)
-    - GAF8_32: 8-bit, group_size=32
-    - GAF8_64: 8-bit, group_size=64
-    - GAF8_128: 8-bit, group_size=128
+    Talu Quantized (TQ)
+    -------------------
+    - TQ4_32: 4-bit, group_size=32 (DEFAULT, highest accuracy)
+    - TQ4_64: 4-bit, group_size=64
+    - TQ4_128: 4-bit, group_size=128 (smallest)
+    - TQ8_32: 8-bit, group_size=32
+    - TQ8_64: 8-bit, group_size=64 (DEFAULT)
+    - TQ8_128: 8-bit, group_size=128
 
     Hardware Float (Not Yet Implemented)
     ------------------------------------
@@ -134,13 +134,13 @@ class Scheme:
     convert : Convert models using these schemes.
     """
 
-    # Grouped Affine (MLX compatible) - values 10-15
-    GAF4_32 = 10  # 4-bit, group_size=32 (highest accuracy)
-    GAF4_64 = 11  # 4-bit, group_size=64 (balanced, DEFAULT)
-    GAF4_128 = 12  # 4-bit, group_size=128 (smallest)
-    GAF8_32 = 13  # 8-bit, group_size=32
-    GAF8_64 = 14  # 8-bit, group_size=64
-    GAF8_128 = 15  # 8-bit, group_size=128
+    # Talu Quantized - values 10-15
+    TQ4_32 = 10  # 4-bit, group_size=32 (DEFAULT, highest accuracy)
+    TQ4_64 = 11  # 4-bit, group_size=64
+    TQ4_128 = 12  # 4-bit, group_size=128 (smallest)
+    TQ8_32 = 13  # 8-bit, group_size=32
+    TQ8_64 = 14  # 8-bit, group_size=64 (DEFAULT)
+    TQ8_128 = 15  # 8-bit, group_size=128
 
     # Hardware float (not yet implemented) - values 20-23
     FP8_E4M3 = 20  # FP8 E4M3 for inference (H100/vLLM)
@@ -155,13 +155,13 @@ class Scheme:
 
 # Scheme name to enum value mapping
 SCHEME_NAME_TO_ENUM: dict[str, int] = {
-    # GAF schemes
-    "gaf4_32": Scheme.GAF4_32,
-    "gaf4_64": Scheme.GAF4_64,
-    "gaf4_128": Scheme.GAF4_128,
-    "gaf8_32": Scheme.GAF8_32,
-    "gaf8_64": Scheme.GAF8_64,
-    "gaf8_128": Scheme.GAF8_128,
+    # TQ schemes
+    "tq4": Scheme.TQ4_32,
+    "tq4_64": Scheme.TQ4_64,
+    "tq4_128": Scheme.TQ4_128,
+    "tq8": Scheme.TQ8_64,
+    "tq8_32": Scheme.TQ8_32,
+    "tq8_128": Scheme.TQ8_128,
     # Hardware float schemes
     "fp8_e4m3": Scheme.FP8_E4M3,
     "fp8_e5m2": Scheme.FP8_E5M2,
@@ -173,20 +173,20 @@ SCHEME_NAME_TO_ENUM: dict[str, int] = {
 ALL_SCHEMES = frozenset(SCHEME_NAME_TO_ENUM.keys())
 
 # Scheme categories
-GAF_SCHEMES = frozenset({"gaf4_32", "gaf4_64", "gaf4_128", "gaf8_32", "gaf8_64", "gaf8_128"})
+TQ_SCHEMES = frozenset({"tq4", "tq4_64", "tq4_128", "tq8", "tq8_32", "tq8_128"})
 HARDWARE_SCHEMES = frozenset({"fp8_e4m3", "fp8_e5m2", "mxfp4", "nvfp4"})
 
 # Currently implemented schemes
-IMPLEMENTED_SCHEMES = GAF_SCHEMES
+IMPLEMENTED_SCHEMES = TQ_SCHEMES
 
 # Type alias for scheme literals
 SchemeLiteral = Literal[
-    "gaf4_32",
-    "gaf4_64",
-    "gaf4_128",
-    "gaf8_32",
-    "gaf8_64",
-    "gaf8_128",
+    "tq4",
+    "tq4_64",
+    "tq4_128",
+    "tq8",
+    "tq8_32",
+    "tq8_128",
     "fp8_e4m3",
     "fp8_e5m2",
     "mxfp4",
@@ -198,13 +198,13 @@ def scheme_to_enum(scheme: str) -> int:
     """
     Convert scheme name (or alias) to enum value via Zig.
 
-    Zig is the single source of truth for aliases like "4bit" -> GAF4_64.
+    Zig is the single source of truth for alias resolution.
     This ensures Python and Zig always agree on alias resolution.
 
     Parameters
     ----------
     scheme : str
-        Scheme name or alias (e.g., "gaf4_64", "4bit", "mlx").
+        Scheme name or alias (e.g., "tq4", "4bit", "tq8").
 
     Returns
     -------
@@ -242,9 +242,9 @@ def scheme_to_enum(scheme: str) -> int:
     return code
 
 
-def is_gaf_scheme(scheme: str) -> bool:
-    """Check if scheme is a grouped affine (MLX compatible) scheme."""
-    return scheme.lower() in GAF_SCHEMES
+def is_tq_scheme(scheme: str) -> bool:
+    """Check if scheme is a Talu Quantized scheme."""
+    return scheme.lower() in TQ_SCHEMES
 
 
 def is_implemented(scheme: str) -> bool:
@@ -266,11 +266,11 @@ class Platform:
     Attributes
     ----------
     CPU : int
-        Resolves to CPU-optimized GAF formats (gaf4_64, gaf8_64).
+        Resolves to CPU-optimized TQ formats (tq4, tq8).
     METAL : int
-        Resolves to Apple Silicon Metal formats (gaf4_64, gaf8_64).
+        Resolves to Apple Silicon Metal formats (tq4, tq8).
     CUDA : int
-        Resolves to NVIDIA CUDA formats (gaf4_64, gaf8_64).
+        Resolves to NVIDIA CUDA formats (tq4, tq8).
     """
 
     CPU = 0
@@ -334,9 +334,9 @@ class QuantLevel:
     Attributes
     ----------
     Q4 : int
-        4-bit quantization (gaf4_64 on all platforms).
+        4-bit quantization (tq4 on all platforms).
     Q8 : int
-        8-bit quantization (gaf8_64 on all platforms).
+        8-bit quantization (tq8 on all platforms).
     """
 
     Q4 = 0
@@ -494,7 +494,7 @@ def get_schemes_json() -> str:
     Fetch the JSON string of schemes and aliases from Zig.
 
     Returns a JSON object mapping canonical scheme names to their aliases:
-    ``{"gaf4_64": ["mlx", "mlx4", "gaf4", "4bit"], ...}``
+    ``{"tq4": [], "tq8": [], ...}``
 
     Returns
     -------
@@ -686,67 +686,62 @@ def _call_execution_plan(model_info) -> tuple[dict | None, str | None]:
 
 # Descriptive info for all schemes
 SCHEME_INFO: dict[str, dict] = {
-    # Grouped Affine (MLX compatible)
-    "gaf4_32": {
-        "category": "gaf",
+    # Talu Quantized
+    "tq4": {
+        "category": "tq",
         "bits": 4,
         "group_size": 32,
-        "description": "4-bit grouped affine (highest accuracy)",
+        "description": "4-bit Talu Quantized (DEFAULT, highest accuracy)",
         "quality": "good",
         "size": "~2.5 GB/7B",
         "status": "stable",
-        "mlx_compatible": True,
-    },
-    "gaf4_64": {
-        "category": "gaf",
-        "bits": 4,
-        "group_size": 64,
-        "description": "4-bit grouped affine (balanced, DEFAULT)",
-        "quality": "good",
-        "size": "~2.5 GB/7B",
-        "status": "stable",
-        "mlx_compatible": True,
         "default": True,
     },
-    "gaf4_128": {
-        "category": "gaf",
+    "tq4_64": {
+        "category": "tq",
+        "bits": 4,
+        "group_size": 64,
+        "description": "4-bit Talu Quantized (balanced)",
+        "quality": "good",
+        "size": "~2.5 GB/7B",
+        "status": "stable",
+    },
+    "tq4_128": {
+        "category": "tq",
         "bits": 4,
         "group_size": 128,
-        "description": "4-bit grouped affine (smallest)",
+        "description": "4-bit Talu Quantized (smallest)",
         "quality": "fair",
         "size": "~2.4 GB/7B",
         "status": "stable",
-        "mlx_compatible": True,
     },
-    "gaf8_32": {
-        "category": "gaf",
+    "tq8_32": {
+        "category": "tq",
         "bits": 8,
         "group_size": 32,
-        "description": "8-bit grouped affine (highest accuracy)",
+        "description": "8-bit Talu Quantized (highest accuracy)",
         "quality": "high",
         "size": "~4.5 GB/7B",
         "status": "stable",
-        "mlx_compatible": True,
     },
-    "gaf8_64": {
-        "category": "gaf",
+    "tq8": {
+        "category": "tq",
         "bits": 8,
         "group_size": 64,
-        "description": "8-bit grouped affine (balanced)",
+        "description": "8-bit Talu Quantized (DEFAULT, balanced)",
         "quality": "high",
         "size": "~4.5 GB/7B",
         "status": "stable",
-        "mlx_compatible": True,
+        "default": True,
     },
-    "gaf8_128": {
-        "category": "gaf",
+    "tq8_128": {
+        "category": "tq",
         "bits": 8,
         "group_size": 128,
-        "description": "8-bit grouped affine (smallest)",
+        "description": "8-bit Talu Quantized (smallest)",
         "quality": "near-lossless",
         "size": "~4.4 GB/7B",
         "status": "stable",
-        "mlx_compatible": True,
     },
     # Hardware float (not yet implemented)
     "fp8_e4m3": {
@@ -799,7 +794,7 @@ def list_schemes(
         If True, include schemes that are not yet implemented
         (fp8_e4m3, fp8_e5m2, mxfp4, nvfp4).
     category : str, optional
-        Filter by category: "gaf" or "hardware".
+        Filter by category: "tq" or "hardware".
         If None, returns all categories.
 
     Returns
@@ -807,25 +802,22 @@ def list_schemes(
     dict
         Dictionary mapping scheme names to their metadata:
 
-        - ``category``: "gaf" or "hardware"
+        - ``category``: "tq" or "hardware"
         - ``bits``: Bit width
-        - ``group_size``: (gaf/hardware only) Group size
+        - ``group_size``: (tq/hardware only) Group size
         - ``description``: What this scheme does
         - ``quality``: Relative quality (fair/good/better/high/near-lossless/lossless)
         - ``size``: Approximate size for a 7B model
         - ``status``: "stable" or "not implemented"
-        - ``mlx_compatible``: (gaf only) True if compatible with MLX
-        - ``aliases``: List of user-friendly aliases (e.g., ["4bit", "q4"])
+        - ``aliases``: List of user-friendly aliases
 
     Example
     -------
     >>> import talu
     >>> schemes = talu.list_schemes()
-    >>> "gaf4_64" in schemes
+    >>> "tq4" in schemes
     True
-    >>> "description" in schemes["gaf4_64"]
-    True
-    >>> "4bit" in schemes["gaf4_64"]["aliases"]
+    >>> "description" in schemes["tq4"]
     True
 
     See Also
@@ -872,7 +864,7 @@ def schemes() -> list[str]:
     Example
     -------
     >>> schemes()
-    ['gaf4_128', 'gaf4_32', 'gaf4_64', 'gaf8_128', 'gaf8_32', 'gaf8_64']
+    ['tq4', 'tq4_128', 'tq4_64', 'tq8', 'tq8_128', 'tq8_32']
     """
     return sorted(IMPLEMENTED_SCHEMES)
 
@@ -1506,18 +1498,10 @@ def convert(
 
         **If not set**, uses ``platform`` and ``quant`` for automatic resolution.
         When neither ``scheme`` nor ``platform``/``quant`` are specified,
-        defaults to ``gaf4_64``.
+        defaults to ``tq4``.
 
-        **User-Friendly Aliases (Recommended):**
-
-        - ``"4bit"`` / ``"q4"`` / ``"int4"``: Maps to ``gaf4_64`` (balanced 4-bit)
-        - ``"8bit"`` / ``"q8"`` / ``"int8"``: Maps to ``gaf8_64`` (near-lossless)
-        - ``"mlx"`` / ``"mlx4"`` / ``"gaf4"``: Maps to ``gaf4_64`` (Apple Silicon optimized)
-        - ``"mlx8"`` / ``"gaf8"``: Maps to ``gaf8_64`` (8-bit MLX)
-        - ``"fp8"``: Maps to ``fp8_e4m3`` (H100/vLLM inference)
-
-        **Grouped Affine (MLX compatible):**
-        ``gaf4_32``, ``gaf4_64``, ``gaf4_128``, ``gaf8_32``, ``gaf8_64``, ``gaf8_128``
+        **Talu Quantized:**
+        ``tq4``, ``tq4_64``, ``tq4_128``, ``tq8``, ``tq8_32``, ``tq8_128``
 
         **Hardware float (not yet implemented):**
         ``fp8_e4m3``, ``fp8_e5m2``, ``mxfp4``, ``nvfp4``
@@ -1571,12 +1555,12 @@ def convert(
     Examples
     --------
     >>> import talu
-    >>> path = talu.convert("Qwen/Qwen3-0.6B")  # Uses gaf4_64 by default
+    >>> path = talu.convert("Qwen/Qwen3-0.6B")  # Uses tq4 by default
 
-    >>> path = talu.convert("Qwen/Qwen3-0.6B", scheme="gaf4_32")  # Higher quality
+    >>> path = talu.convert("Qwen/Qwen3-0.6B", scheme="tq4_64")  # Larger group size
 
     >>> # Platform-aware conversion
-    >>> path = talu.convert("Qwen/Qwen3-0.6B", platform="metal")  # → gaf4_64
+    >>> path = talu.convert("Qwen/Qwen3-0.6B", platform="metal")  # → tq4
 
     >>> # Sharded output for large models
     >>> path = talu.convert("meta-llama/Llama-3-70B", max_shard_size="5GB")
@@ -1614,8 +1598,8 @@ def convert(
                 "Use an explicit scheme parameter instead."
             )
     else:
-        # Explicit scheme mode (default: gaf4_64)
-        effective_scheme = scheme or "gaf4_64"
+        # Explicit scheme mode (default: tq4)
+        effective_scheme = scheme or "tq4"
 
         # Validate scheme (delegates to Zig for alias resolution)
         scheme_enum = scheme_to_enum(effective_scheme)
@@ -1634,10 +1618,10 @@ def convert(
                 f"Available schemes: {sorted(IMPLEMENTED_SCHEMES)}"
             )
 
-        # Overrides are not supported for GAF schemes
+        # Overrides are not supported for TQ schemes
         if overrides:
             raise ValidationError(
-                "Per-tensor overrides are not supported for GAF schemes. "
+                "Per-tensor overrides are not supported for TQ schemes. "
                 "All tensors use uniform quantization."
             )
 

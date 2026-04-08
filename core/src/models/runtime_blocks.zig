@@ -46,10 +46,12 @@ pub const MoEWeights = struct {
     // Router scaling (Gemma4 MoE)
     router_input_scale: ?Tensor = null,
     router_per_expert_scale: ?Tensor = null,
-    // Shared MLP (Gemma4 MoE — coexists with experts)
+    // Shared MLP (Gemma4 MoE / Qwen3.5 MoE — coexists with experts)
     shared_w1: ?Tensor = null, // gate_proj
     shared_w2: ?Tensor = null, // down_proj
     shared_w3: ?Tensor = null, // up_proj
+    // Shared expert gate (Qwen3.5 MoE — sigmoid gate for scaling shared expert output)
+    shared_expert_gate: ?Tensor = null,
     // Internal norms for fused FFN+MoE (Gemma4 MoE)
     pre_ffn_norm: ?Tensor = null, // pre_feedforward_layernorm
     post_shared_norm: ?Tensor = null, // post_feedforward_layernorm_1
@@ -188,6 +190,7 @@ pub const GatedDeltaBlockWeights = struct {
     w1: ?*const Tensor = null,
     w2: ?*const Tensor = null,
     w3: ?*const Tensor = null,
+    moe_weights: ?*MoEWeights = null,
 };
 
 pub const ShortConvBlockWeights = struct {
@@ -364,7 +367,9 @@ fn buildFused3DMoEWeights(
     num_experts: usize,
     experts_per_token: usize,
 ) !*MoEWeights {
-    const down_3d = map.get("experts.down_proj") orelse return error.MissingWeight;
+    const down_3d = map.get("experts.down_proj") orelse
+        map.get("mlp.experts.down_proj") orelse
+        return error.MissingWeight;
 
     if (gate_up_3d.n_dims < 3) return error.InvalidShape;
     if (down_3d.n_dims < 3) return error.InvalidShape;
@@ -378,6 +383,12 @@ fn buildFused3DMoEWeights(
     const down_out_dim: usize = @intCast(down_3d.shape[1]);
     const down_in_dim: usize = @intCast(down_3d.shape[2]);
 
+    // For GAF4/GAF8 expert weights, compute per-expert gaffine metadata slices
+    const gate_up_expert_scales_bytes = if (gate_up_3d.gaffine) |g| g.scales.len / num_experts else 0;
+    const gate_up_expert_biases_bytes = if (gate_up_3d.gaffine) |g| g.biases.len / num_experts else 0;
+    const down_expert_scales_bytes = if (down_3d.gaffine) |g| g.scales.len / num_experts else 0;
+    const down_expert_biases_bytes = if (down_3d.gaffine) |g| g.biases.len / num_experts else 0;
+
     var experts = try allocator.alloc(ExpertWeights, num_experts);
     errdefer allocator.free(experts);
 
@@ -385,17 +396,40 @@ fn buildFused3DMoEWeights(
         const gate_up_ptr = gate_up_3d.data()[e * gate_up_expert_bytes ..].ptr;
         const down_ptr = down_3d.data()[e * down_expert_bytes ..].ptr;
 
+        var gate_up_view = Tensor.view(gate_up_ptr, &.{ gate_up_out_dim, gate_up_in_dim }, gate_up_3d.dtype, gate_up_expert_bytes);
+        var down_view = Tensor.view(down_ptr, &.{ down_out_dim, down_in_dim }, down_3d.dtype, down_expert_bytes);
+
+        // Propagate per-expert gaffine metadata from parent 3D tensor
+        if (gate_up_3d.gaffine) |g| {
+            gate_up_view.gaffine = .{
+                .scales = g.scales[e * gate_up_expert_scales_bytes ..][0..gate_up_expert_scales_bytes],
+                .biases = g.biases[e * gate_up_expert_biases_bytes ..][0..gate_up_expert_biases_bytes],
+                .group_size = g.group_size,
+                .scales_dtype = g.scales_dtype,
+            };
+        }
+        if (down_3d.gaffine) |g| {
+            down_view.gaffine = .{
+                .scales = g.scales[e * down_expert_scales_bytes ..][0..down_expert_scales_bytes],
+                .biases = g.biases[e * down_expert_biases_bytes ..][0..down_expert_biases_bytes],
+                .group_size = g.group_size,
+                .scales_dtype = g.scales_dtype,
+            };
+        }
+
         experts[e] = .{
-            .gate_up_proj = Tensor.view(gate_up_ptr, &.{ gate_up_out_dim, gate_up_in_dim }, gate_up_3d.dtype, gate_up_expert_bytes),
-            .down_proj = Tensor.view(down_ptr, &.{ down_out_dim, down_in_dim }, down_3d.dtype, down_expert_bytes),
+            .gate_up_proj = gate_up_view,
+            .down_proj = down_view,
         };
     }
 
     const router_input_scale: ?Tensor = if (map.get("router.scale")) |t| t.* else null;
     const router_per_expert_scale: ?Tensor = if (map.get("router.per_expert_scale")) |t| t.* else null;
-    const shared_w1: ?Tensor = if (map.get("mlp.gate_proj.weight")) |t| t.* else null;
-    const shared_w2: ?Tensor = if (map.get("mlp.down_proj.weight")) |t| t.* else null;
-    const shared_w3: ?Tensor = if (map.get("mlp.up_proj.weight")) |t| t.* else null;
+    const shared_w1: ?Tensor = if (map.get("mlp.gate_proj.weight") orelse map.get("mlp.shared_expert.gate_proj.weight")) |t| t.* else null;
+    const shared_w2: ?Tensor = if (map.get("mlp.down_proj.weight") orelse map.get("mlp.shared_expert.down_proj.weight")) |t| t.* else null;
+    const shared_w3: ?Tensor = if (map.get("mlp.up_proj.weight") orelse map.get("mlp.shared_expert.up_proj.weight")) |t| t.* else null;
+
+    const shared_expert_gate: ?Tensor = if (map.get("mlp.shared_expert_gate.weight")) |t| t.* else null;
 
     // Internal norms for fused FFN+MoE
     const pre_ffn_norm: ?Tensor = if (map.get("pre_feedforward_layernorm.weight")) |t| t.* else null;
@@ -422,6 +456,7 @@ fn buildFused3DMoEWeights(
         .pre_expert_norm = pre_expert_norm,
         .post_expert_norm = post_expert_norm,
         .post_combine_norm = post_combine_norm,
+        .shared_expert_gate = shared_expert_gate,
     };
     return moe_weights;
 }
@@ -463,6 +498,21 @@ fn buildIndexedMoEWeights(
         .experts_per_token = experts_per_token,
         .use_mxfp4 = false,
     };
+
+    // Shared expert (Qwen3.5 MoE / Qwen3-Next pattern)
+    if (map.get("mlp.shared_expert.gate_proj.weight")) |gate| {
+        moe_weights.shared_w1 = gate.*;
+        if (map.get("mlp.shared_expert.up_proj.weight")) |up| {
+            moe_weights.shared_w3 = up.*;
+        }
+        if (map.get("mlp.shared_expert.down_proj.weight")) |down| {
+            moe_weights.shared_w2 = down.*;
+        }
+    }
+    if (map.get("mlp.shared_expert_gate.weight")) |gate_w| {
+        moe_weights.shared_expert_gate = gate_w.*;
+    }
+
     return moe_weights;
 }
 
@@ -482,7 +532,7 @@ fn buildMoEWeightsFromMap(
     if (map.get("mlp.experts.gate_up_proj_blocks")) |gate_up_blocks| {
         return try buildMxfp4MoEWeights(allocator, map, router_weight_ptr, gate_up_blocks, num_experts, experts_per_token);
     }
-    if (map.get("experts.gate_up_proj")) |gate_up_3d| {
+    if (map.get("experts.gate_up_proj") orelse map.get("mlp.experts.gate_up_proj")) |gate_up_3d| {
         return try buildFused3DMoEWeights(allocator, map, router_weight_ptr, gate_up_3d, num_experts, experts_per_token);
     }
     return try buildIndexedMoEWeights(allocator, map, router_weight_ptr, num_experts, experts_per_token);
@@ -666,23 +716,31 @@ pub fn blockWeightsFromMap(
             const norm_weight = getOptionalWeight(map, "mixer.norm.weight") orelse
                 getOptionalWeight(map, "linear_attn.norm.weight");
 
-            const fused_gate_up = getOptionalWeight(map, "mlp.input_linear.weight") orelse
-                getOptionalWeight(map, "mlp.gate_up_proj.weight");
-            const down_proj = getOptionalWeight(map, "mlp.output_linear.weight") orelse
-                getOptionalWeight(map, "mlp.down_proj.weight");
+            const moe_weights: ?*MoEWeights = if (context.allocator) |alloc|
+                try buildMoEWeightsFromMap(alloc, map, context.num_experts, context.experts_per_token)
+            else
+                null;
 
+            var fused_gate_up_weights: ?FusedBlockWeights = null;
+            var down_proj: ?*const Tensor = null;
             var w1: ?*const Tensor = null;
             var w2: ?*const Tensor = null;
             var w3: ?*const Tensor = null;
-            if (fused_gate_up == null) {
-                w1 = getOptionalWeight(map, "mlp.gate_proj.weight");
-                w3 = getOptionalWeight(map, "mlp.up_proj.weight");
-                w2 = down_proj;
-            }
+            if (moe_weights == null) {
+                const fused_gate_up = getOptionalWeight(map, "mlp.input_linear.weight") orelse
+                    getOptionalWeight(map, "mlp.gate_up_proj.weight");
+                down_proj = getOptionalWeight(map, "mlp.output_linear.weight") orelse
+                    getOptionalWeight(map, "mlp.down_proj.weight");
 
-            var fused_gate_up_weights: ?FusedBlockWeights = null;
-            if (fused_gate_up) |fg| {
-                fused_gate_up_weights = .{ .gate_up = fg.*, .gate_up_layout = .concat };
+                if (fused_gate_up == null) {
+                    w1 = getOptionalWeight(map, "mlp.gate_proj.weight");
+                    w3 = getOptionalWeight(map, "mlp.up_proj.weight");
+                    w2 = down_proj;
+                }
+
+                if (fused_gate_up) |fg| {
+                    fused_gate_up_weights = .{ .gate_up = fg.*, .gate_up_layout = .concat };
+                }
             }
 
             const gated_delta_config = context.gated_delta_config orelse return error.MissingGatedDeltaConfig;
@@ -704,6 +762,7 @@ pub fn blockWeightsFromMap(
                 .w1 = w1,
                 .w2 = w2,
                 .w3 = w3,
+                .moe_weights = moe_weights,
             } };
         },
         .mamba => {

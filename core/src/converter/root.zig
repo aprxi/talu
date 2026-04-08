@@ -139,7 +139,7 @@ pub const WeightLayoutMap = struct {
     pub fn shouldQuantize(self: *const WeightLayoutMap, tensor_name: []const u8) ?bool {
         if (self.layouts.get(tensor_name)) |layout| {
             return switch (layout) {
-                .linear, .embedding => true,
+                .linear, .fused_linear, .embedding => true,
                 .none, .conv1d_depthwise, .gaffine => false,
             };
         }
@@ -407,8 +407,8 @@ pub fn shouldQuantizeTensorByLayout(
 
     // Validate tensor properties (applies regardless of layout source)
 
-    // Only quantize 2D weight matrices
-    if (src_tensor.n_dims != 2) return false;
+    // Quantize 2D weight matrices and 3D fused expert weights
+    if (src_tensor.n_dims != 2 and src_tensor.n_dims != 3) return false;
 
     // Only quantize float tensors (including FP8 source models)
     switch (src_tensor.dtype) {
@@ -1196,7 +1196,7 @@ test "copyConfigFileWithQuantization adds quantization_config" {
     // Copy with quantization
     try copyConfigFileWithQuantization(allocator, source_path, output_dir, .{
         .quant_method = "talu",
-        .quant_type = "gaf4_64",
+        .quant_type = "tq4_64",
         .bits = 4,
     });
 
@@ -1211,7 +1211,7 @@ test "copyConfigFileWithQuantization adds quantization_config" {
     // Verify quantization_config is present
     try std.testing.expect(std.mem.indexOf(u8, content, "\"quantization_config\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"quant_method\":\"talu\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"quant_type\":\"gaf4_64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"quant_type\":\"tq4_64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"bits\":4") != null);
 
     // Verify original fields are preserved
@@ -1247,7 +1247,7 @@ test "copyConfigFileWithQuantization replaces existing quantization_config" {
 
     try copyConfigFileWithQuantization(allocator, source_path, output_dir, .{
         .quant_method = "talu",
-        .quant_type = "gaf8_64",
+        .quant_type = "tq8_64",
         .bits = 8,
     });
 
@@ -1259,7 +1259,7 @@ test "copyConfigFileWithQuantization replaces existing quantization_config" {
     defer allocator.free(content);
 
     // New values should be present
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"quant_type\":\"gaf8_64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"quant_type\":\"tq8_64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"bits\":8") != null);
 
     // Old values should NOT be present

@@ -13,7 +13,7 @@ pub struct TaluConfig {
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
 
-    /// Default model for inference commands (e.g., "Qwen/Qwen3-0.6B-GAF4").
+    /// Default model for inference commands (e.g., "Qwen/Qwen3-0.6B-TQ4").
     #[serde(default)]
     pub default_model: Option<String>,
 }

@@ -15,17 +15,17 @@ import pytest
 pytestmark = [pytest.mark.slow, pytest.mark.requires_model]
 
 
-class TestGAFSchemeModelLoads:
-    """Tests that GAF scheme (grouped affine) models can be loaded."""
+class TestTQSchemeModelLoads:
+    """Tests that TQ scheme (Talu Quantized) models can be loaded."""
 
-    def test_gaf4_64_loads(self, talu, convert_func, small_test_model, temp_output_dir):
-        """GAF4_64 (MLX default) model can be loaded."""
+    def test_tq4_loads(self, talu, convert_func, small_test_model, temp_output_dir):
+        """TQ4 (default 4-bit) model can be loaded."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -34,14 +34,14 @@ class TestGAFSchemeModelLoads:
         assert client is not None
         assert hasattr(client, "send")
 
-    def test_gaf8_64_loads(self, talu, convert_func, small_test_model, temp_output_dir):
-        """GAF8_64 model can be loaded."""
+    def test_tq8_loads(self, talu, convert_func, small_test_model, temp_output_dir):
+        """TQ8 (default 8-bit) model can be loaded."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf8_64",
+            scheme="tq8",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -54,16 +54,16 @@ class TestGAFSchemeModelLoads:
 class TestConvertedModelInference:
     """Tests that converted models can run inference."""
 
-    def test_gaf_scheme_generates_output(
+    def test_tq_scheme_generates_output(
         self, talu, convert_func, small_test_model, temp_output_dir
     ):
-        """GAF scheme model can generate text."""
+        """TQ scheme model can generate text."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -81,14 +81,14 @@ class TestConvertedModelInference:
 class TestConvertedModelStreaming:
     """Tests that converted models support streaming."""
 
-    def test_gaf_scheme_streams(self, talu, convert_func, small_test_model, temp_output_dir):
-        """GAF scheme model supports streaming generation."""
+    def test_tq_scheme_streams(self, talu, convert_func, small_test_model, temp_output_dir):
+        """TQ scheme model supports streaming generation."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -107,16 +107,16 @@ class TestConvertedModelStreaming:
 class TestConvertedModelTokenizer:
     """Tests that converted models have working tokenizers."""
 
-    def test_gaf_scheme_tokenizer_works(
+    def test_tq_scheme_tokenizer_works(
         self, talu, convert_func, small_test_model, temp_output_dir
     ):
-        """GAF scheme model has working tokenizer."""
+        """TQ scheme model has working tokenizer."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -134,31 +134,31 @@ class TestConvertedModelTokenizer:
 class TestQualityComparison:
     """Tests comparing quality between schemes."""
 
-    def test_gaf_schemes_produce_similar_output(
+    def test_tq_schemes_produce_similar_output(
         self, talu, convert_func, small_test_model, temp_output_dir
     ):
-        """Different GAF group sizes may produce slightly different output."""
+        """Different TQ group sizes may produce slightly different output."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
-        # Convert to GAF4_64 scheme
-        gaf4_64_path = convert_func(
+        # Convert to TQ4 scheme (default group_size=32)
+        tq4_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
 
-        # Convert to GAF4_32 scheme (different output dir to avoid collision)
+        # Convert to TQ4_64 scheme (different output dir to avoid collision)
         import os
 
-        gaf32_output_dir = os.path.join(temp_output_dir, "gaf32")
-        os.makedirs(gaf32_output_dir, exist_ok=True)
+        tq4_64_output_dir = os.path.join(temp_output_dir, "tq4_64")
+        os.makedirs(tq4_64_output_dir, exist_ok=True)
 
-        gaf4_32_path = convert_func(
+        tq4_64_path = convert_func(
             small_test_model,
-            scheme="gaf4_32",
-            output_dir=gaf32_output_dir,
+            scheme="tq4_64",
+            output_dir=tq4_64_output_dir,
             force=True,
         )
 
@@ -166,18 +166,18 @@ class TestQualityComparison:
 
         # Both should load and generate
         # Use greedy decoding for deterministic output
-        gaf64_client = talu.Chat(gaf4_64_path)
-        gaf32_client = talu.Chat(gaf4_32_path)
+        tq4_client = talu.Chat(tq4_path)
+        tq4_64_client = talu.Chat(tq4_64_path)
 
         config = GenerationConfig(max_tokens=5, temperature=0.01)
 
         prompt = "2+2="
-        gaf64_response = gaf64_client.send(prompt, config=config)
-        gaf32_response = gaf32_client.send(prompt, config=config)
+        tq4_response = tq4_client.send(prompt, config=config)
+        tq4_64_response = tq4_64_client.send(prompt, config=config)
 
         # Both should produce a response
-        assert gaf64_response is not None
-        assert gaf32_response is not None
+        assert tq4_response is not None
+        assert tq4_64_response is not None
 
         # Note: They might produce different output due to different group sizes
         # This is expected behavior, not a bug

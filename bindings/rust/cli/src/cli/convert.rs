@@ -487,7 +487,7 @@ Arguments:
   <model>           HuggingFace model ID (e.g., Qwen/Qwen3-0.6B) or local path
 
 Options:
-  --scheme NAME     Quantization scheme (default: gaf4_32)
+  --scheme NAME     Quantization scheme (default: tq4)
   --profile NAME    Quality profile: best|good|balanced|fast|custom (default: fast)
   --seed N          Deterministic calibration seed (default: 42)
   --output DIR      Output directory (default: $TALU_HOME/models)
@@ -497,13 +497,9 @@ Options:
   --json            Output JSON: {"success": true, "output_path": "..."}
   OVERRIDE          custom profile only: iters=...,samples=...,seqlen=...,batch_size=...,nblocks=...,seed=...,optimizer=...,clip_min=...,clip_max=...,shift_max=...,adaptive_clip_floor=...
 
-Grouped Affine (DEFAULT):
-  gaf4_32    4-bit, group_size=32 (DEFAULT, highest accuracy)
-  gaf4_64    4-bit, group_size=64
-  gaf4_128   4-bit, group_size=128 (smallest)
-  gaf8_32    8-bit, group_size=32 (DEFAULT)
-  gaf8_64    8-bit, group_size=64
-  gaf8_128   8-bit, group_size=128
+Talu Quantized (DEFAULT):
+  tq4        4-bit quantized (DEFAULT). GROUP_SIZE env var overrides group size (default: 32).
+  tq8        8-bit quantized. GROUP_SIZE env var overrides group size (default: 64).
 
 Hardware Float / Native:
   fp8        FP8 E4M3, block_size=128x128
@@ -513,19 +509,20 @@ Hardware Float / Native:
 Output naming:
   Models are saved with hierarchical paths: {output_dir}/{org}/{model}-{SUFFIX}
   Examples:
-    Qwen/Qwen3-0.6B + gaf4_32 -> models/Qwen/Qwen3-0.6B-GAF4
-    Qwen/Qwen3-0.6B + gaf8_32 -> models/Qwen/Qwen3-0.6B-GAF8
+    Qwen/Qwen3-0.6B + tq4     -> models/Qwen/Qwen3-0.6B-TQ4
+    Qwen/Qwen3-0.6B + tq8     -> models/Qwen/Qwen3-0.6B-TQ8
     Qwen/Qwen3-0.6B + fp8     -> models/Qwen/Qwen3-0.6B-FP8
     Qwen/Qwen3-0.6B + mxfp8   -> models/Qwen/Qwen3-0.6B-MXFP8
 
 Environment Variables:
+  GROUP_SIZE=N      Group size override for tq4 (default: 32) / tq8 (default: 64). Accepts 32, 64, or 128.
   THREADS=N         Number of threads for quantization (default: CPU count)
   HF_TOKEN          API token for private models
 
 Examples:
-  talu convert Qwen/Qwen3-0.6B                       # gaf4_32 (default)
-  talu convert Qwen/Qwen3-0.6B --scheme gaf8_32     # Near-lossless
-  talu convert Qwen/Qwen3-0.6B --scheme gaf4_32    # Highest accuracy
+  talu convert Qwen/Qwen3-0.6B                       # tq4 (default)
+  talu convert Qwen/Qwen3-0.6B --scheme tq8          # Near-lossless
+  talu convert Qwen/Qwen3-0.6B --scheme tq4          # Highest accuracy
   talu convert ./models/Qwen--Qwen3-0.6B --output /tmp -f
 
   # CI/scripting: get just the path
@@ -536,7 +533,7 @@ Examples:
 
   # CI/scripting: get JSON output
   talu convert Qwen/Qwen3-0.6B --json
-  # -> {"success": true, "output_path": "models/Qwen/Qwen3-0.6B-GAF4"}
+  # -> {"success": true, "output_path": "models/Qwen/Qwen3-0.6B-TQ4"}
 
   # Custom profile override example
   talu convert Qwen/Qwen3.5-2B --scheme mxfp8 --seed 42 --profile custom iters=400,samples=256,seqlen=2048,batch_size=1,nblocks=1,optimizer=clip+search,clip_min=0.5,clip_max=2.0,shift_max=1.0,adaptive_clip_floor=0.55
@@ -548,13 +545,9 @@ Examples:
 fn print_available_schemes() {
     let schemes = r#"Available quantization schemes:
 
-  Grouped Affine (DEFAULT):
-    gaf4_32    4-bit, group_size=32 (DEFAULT, highest accuracy)
-    gaf4_64    4-bit, group_size=64
-    gaf4_128   4-bit, group_size=128 (smallest)
-    gaf8_32    8-bit, group_size=32 (DEFAULT)
-    gaf8_64    8-bit, group_size=64
-    gaf8_128   8-bit, group_size=128
+  Talu Quantized (DEFAULT):
+    tq4        4-bit quantized (DEFAULT). GROUP_SIZE env var overrides group size (default: 32).
+    tq8        8-bit quantized. GROUP_SIZE env var overrides group size (default: 64).
 
   Hardware Float / Native:
     fp8        FP8 E4M3, block_size=128x128

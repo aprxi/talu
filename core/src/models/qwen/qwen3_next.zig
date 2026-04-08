@@ -145,7 +145,7 @@ const qwen3_next_shared_expert_weights = [_]types.WeightSpec{
     requiredLayerWeight("mlp.shared_expert.gate_proj.weight", "Linear", .linear),
     requiredLayerWeight("mlp.shared_expert.up_proj.weight", "Linear", .linear),
     requiredLayerWeight("mlp.shared_expert.down_proj.weight", "Linear", .linear),
-    requiredLayerWeight("mlp.shared_expert_gate.weight", "Linear", .linear),
+    requiredLayerWeight("mlp.shared_expert_gate.weight", "Parameter", .none),
 };
 
 const qwen3_next_linear_attention_common_weights = [_]types.WeightSpec{

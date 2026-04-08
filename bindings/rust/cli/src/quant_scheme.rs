@@ -6,9 +6,9 @@ use talu::QuantMethod;
 pub(crate) fn format_quant_scheme(method: QuantMethod, bits: i32, group_size: i32) -> String {
     match method {
         QuantMethod::None => "F16".to_string(),
-        QuantMethod::Gaffine => format!("GAF{}_{}", bits, group_size),
+        QuantMethod::Gaffine => format!("TQ{}_{}", bits, group_size),
         QuantMethod::Mxfp4 => "MXFP4".to_string(),
-        QuantMethod::Native => format!("GAF{}_{}", bits, group_size),
+        QuantMethod::Native => format!("TQ{}_{}", bits, group_size),
         QuantMethod::Fp8 => "FP8".to_string(),
         QuantMethod::Mxfp8 => "MXFP8".to_string(),
     }
@@ -80,6 +80,6 @@ mod tests {
             4,
             32,
         );
-        assert_eq!(scheme, "GAF4_32");
+        assert_eq!(scheme, "TQ4_32");
     }
 }

@@ -207,7 +207,7 @@ test "generateModelCard produces valid YAML frontmatter" {
         allocator,
         "model-name",
         "org/model-name",
-        .gaf4_64,
+        .tq4_64,
     );
     defer allocator.free(card);
 
@@ -227,7 +227,7 @@ test "generateModelCard includes scheme details" {
         allocator,
         "model-name",
         "org/model-name",
-        .gaf4_64,
+        .tq4_64,
     );
     defer allocator.free(card);
 
@@ -291,7 +291,7 @@ test "writeModelCard writes README.md to temp directory" {
         tmp_path,
         "TestModel",
         "test/TestModel",
-        .gaf4_64,
+        .tq4_64,
     );
 
     // Verify the file was created and has content
@@ -302,5 +302,5 @@ test "writeModelCard writes README.md to temp directory" {
     try std.testing.expect(readme_content.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, readme_content, "---\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme_content, "base_model: test/TestModel") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme_content, "TestModel-GAF4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_content, "TestModel-TQ4_64") != null);
 }

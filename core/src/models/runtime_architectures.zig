@@ -20,6 +20,7 @@ const ministral3 = @import("mistral/ministral3.zig");
 const phi4 = @import("phi/phi4.zig");
 const qwen3 = @import("qwen/qwen3.zig");
 const qwen3_5 = @import("qwen/qwen3_5.zig");
+const qwen3_5_moe = @import("qwen/qwen3_5_moe.zig");
 const qwen3_moe = @import("qwen/qwen3_moe.zig");
 const qwen3_next = @import("qwen/qwen3_next.zig");
 const youtu_vl = @import("youtu_vl/youtu_vl.zig");
@@ -39,6 +40,7 @@ const registry = [_]struct { id: []const u8, arch: *const types.Architecture }{
     .{ .id = phi4.id, .arch = &phi4.arch },
     .{ .id = qwen3.id, .arch = &qwen3.arch },
     .{ .id = qwen3_5.id, .arch = &qwen3_5.arch },
+    .{ .id = qwen3_5_moe.id, .arch = &qwen3_5_moe.arch },
     .{ .id = qwen3_moe.id, .arch = &qwen3_moe.arch },
     .{ .id = qwen3_next.id, .arch = &qwen3_next.arch },
     .{ .id = youtu_vl.id, .arch = &youtu_vl.arch },

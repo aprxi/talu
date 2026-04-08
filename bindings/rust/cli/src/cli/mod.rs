@@ -364,7 +364,7 @@ pub(super) struct ConvertArgs {
     pub model: Option<String>,
 
     /// Quantization scheme (use --scheme help to list available)
-    #[arg(long, default_value = "gaf4_64", value_name = "SCHEME", num_args = 1)]
+    #[arg(long, default_value = "tq4", value_name = "SCHEME", num_args = 1)]
     pub scheme: String,
 
     /// Quality profile (best|good|balanced|fast|custom)

@@ -137,6 +137,9 @@ pub const MoEFFN = struct {
     router_per_expert_scale: ?[]const f32 = null,
     router_scalar_root_size: f32 = 0.0,
 
+    /// Shared expert gate (Qwen3.5 MoE — sigmoid gate for scaling shared expert output)
+    shared_expert_gate: ?Tensor = null,
+
     /// Internal norms for fused FFN+MoE (Gemma4 MoE)
     pre_ffn_norm_weight: ?Tensor = null,
     post_shared_norm_weight: ?Tensor = null,
@@ -152,8 +155,9 @@ pub const MoEFFN = struct {
     kernel_name: ?[]const u8 = null,
 
     pub fn forward(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
-        // Dispatch to fused FFN+MoE path when shared MLP is present (Gemma4 MoE)
-        if (self.shared_gate_proj != null) {
+        // Dispatch to fused FFN+MoE path when internal norms are present (Gemma4 MoE).
+        // Qwen-style shared expert (no internal norms) is handled inline below.
+        if (self.pre_ffn_norm_weight != null) {
             return self.forwardFusedMoE(input_tensor, output_tensor, scratch, matmul_scratch);
         }
 
@@ -161,20 +165,16 @@ pub const MoEFFN = struct {
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
         const seq_len: usize = @intCast(input_tensor.shape[1]);
         std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
-        std.debug.assert(self.router_weight.dtype == .f32 or self.router_weight.dtype == .bf16 or self.router_weight.dtype == .f16);
         std.debug.assert(self.router_weight.n_dims == 2);
-        const router_rows: usize = @intCast(self.router_weight.shape[0]);
-        const router_cols: usize = @intCast(self.router_weight.shape[1]);
-        std.debug.assert((router_rows == self.d_model and router_cols == self.num_experts) or
-            (router_rows == self.num_experts and router_cols == self.d_model));
 
         // Allocate scratch buffers
+        const effective_d_ff = @max(self.d_ff, self.shared_d_ff);
         try cpu_common.ensureF32Slice(self.allocator, &scratch.router_logits, seq_len * self.num_experts);
         try cpu_common.ensureF32Slice(self.allocator, &scratch.expert_weights, seq_len * self.experts_per_token);
         try cpu_common.ensureU32Slice(self.allocator, &scratch.expert_indices, seq_len * self.experts_per_token);
         try cpu_common.ensureF32Slice(self.allocator, &scratch.expert_outputs, seq_len * self.d_model * self.experts_per_token);
-        try cpu_common.ensureF32Slice(self.allocator, &scratch.gate_up_values, seq_len * 2 * self.d_ff);
-        try cpu_common.ensureF32Slice(self.allocator, &scratch.hidden_values, seq_len * self.d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.gate_up_values, seq_len * 2 * effective_d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.hidden_values, seq_len * effective_d_ff);
 
         const input_values = input_tensor.asSlice(f32);
         const output_values = output_tensor.asSlice(f32);
@@ -189,7 +189,14 @@ pub const MoEFFN = struct {
 
             // 1. Compute router logits: [num_experts]
             const router_logits = scratch.router_logits[0..self.num_experts];
-            cpu_matvec.matVecDense(token_input, &self.router_weight, self.router_bias, router_logits);
+            {
+                var input_view = Tensor.view2DSlice(@constCast(token_input), 1, self.d_model);
+                var logits_view = Tensor.view2DSlice(router_logits, 1, self.num_experts);
+                matmulWeightTransposed(&input_view, &self.router_weight, &logits_view, matmul_scratch);
+                if (self.router_bias) |bias| {
+                    cpu_common.addBiasRows(router_logits, bias, 1, self.num_experts);
+                }
+            }
 
             // 2. Select top-k experts
             const selected_expert_indices = scratch.expert_indices[token_index * self.experts_per_token ..][0..self.experts_per_token];
@@ -211,6 +218,44 @@ pub const MoEFFN = struct {
 
                 // Accumulate weighted output
                 cpu_rowwise.addScaledInPlace(token_output, expert_output, weight);
+            }
+
+            // Shared expert (Qwen3.5 MoE / Qwen3-Next pattern — no internal norms)
+            if (self.shared_gate_proj) |shared_gate| {
+                const shared_up = self.shared_up_proj.?;
+                const shared_down = self.shared_down_proj.?;
+                const s_dff = self.shared_d_ff;
+
+                const s_gate_values = scratch.gate_up_values[0..s_dff];
+                const s_up_values = scratch.gate_up_values[s_dff..][0..s_dff];
+                const s_hidden = scratch.hidden_values[0..s_dff];
+                const s_output = scratch.expert_outputs[0..self.d_model];
+
+                var input_view = Tensor.view2DSlice(@constCast(token_input), 1, self.d_model);
+                var gate_out_view = Tensor.view2DSlice(s_gate_values, 1, s_dff);
+                var up_out_view = Tensor.view2DSlice(s_up_values, 1, s_dff);
+                var hidden_view = Tensor.view2DSlice(s_hidden, 1, s_dff);
+                var output_view = Tensor.view2DSlice(s_output, 1, self.d_model);
+
+                matmulWeightTransposed(&input_view, &shared_gate, &gate_out_view, matmul_scratch);
+                matmulWeightTransposed(&input_view, &shared_up, &up_out_view, matmul_scratch);
+
+                if (self.use_gelu) {
+                    cpu_activation.geluMulSplit(s_gate_values, s_up_values, s_hidden);
+                } else {
+                    cpu_activation.siluMulSplit(s_gate_values, s_up_values, s_hidden);
+                }
+
+                matmulWeightTransposed(&hidden_view, &shared_down, &output_view, matmul_scratch);
+
+                // Optional sigmoid gate scaling
+                if (self.shared_expert_gate) |gate_weight| {
+                    const gate_data = gate_weight.asSlice(f32);
+                    const gate_value = 1.0 / (1.0 + @exp(-cpu_linalg.dot.dotProductF32(token_input, gate_data)));
+                    cpu_rowwise.scaleInPlace(s_output, gate_value);
+                }
+
+                cpu_rowwise.addScaledInPlace(token_output, s_output, 1.0);
             }
         }
 
@@ -321,7 +366,14 @@ pub const MoEFFN = struct {
                 }
             }
 
-            cpu_matvec.matVecDense(normed, &self.router_weight, self.router_bias, router_logits);
+            {
+                var input_view = Tensor.view2DSlice(@constCast(normed), 1, self.d_model);
+                var logits_view = Tensor.view2DSlice(router_logits, 1, self.num_experts);
+                matmulWeightTransposed(&input_view, &self.router_weight, &logits_view, matmul_scratch);
+                if (self.router_bias) |bias| {
+                    cpu_common.addBiasRows(router_logits, bias, 1, self.num_experts);
+                }
+            }
 
             // Softmax over ALL experts, then top-k, then renormalize
             {

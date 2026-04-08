@@ -196,7 +196,7 @@ pub export fn talu_convert_schemes(out_schemes: *?[*:0]const u8) callconv(.c) i3
 pub export fn talu_convert_parse_scheme(name: [*:0]const u8) callconv(.c) c_int {
     const s = std.mem.span(name);
     if (scheme_mod.Scheme.fromString(s)) |scheme| {
-        return @intCast(@intFromEnum(scheme));
+        return @intCast(@intFromEnum(scheme.withGroupSizeOverride()));
     }
     return -1;
 }

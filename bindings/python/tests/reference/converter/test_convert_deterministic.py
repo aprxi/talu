@@ -20,7 +20,7 @@ class TestConvertSyntheticModel:
         """Conversion of synthetic model produces output directory."""
         result_path = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -32,7 +32,7 @@ class TestConvertSyntheticModel:
         """Converted model has config.json."""
         result_path = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -44,7 +44,7 @@ class TestConvertSyntheticModel:
         """Converted model has model.safetensors."""
         result_path = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -56,7 +56,7 @@ class TestConvertSyntheticModel:
         """Converted model has tokenizer.json."""
         result_path = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -68,7 +68,7 @@ class TestConvertSyntheticModel:
         """Conversion preserves config values from source model."""
         result_path = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -87,12 +87,12 @@ class TestConvertSchemes:
     """Test different quantization schemes with synthetic models."""
 
     @pytest.mark.parametrize(
-        "scheme", ["gaf4_32", "gaf4_64", "gaf4_128", "gaf8_32", "gaf8_64", "gaf8_128"]
+        "scheme", ["tq4", "tq4_64", "tq4_128", "tq8_32", "tq8", "tq8_128"]
     )
-    def test_gaf_scheme_produces_output(
+    def test_tq_scheme_produces_output(
         self, convert_func, synthetic_model, temp_output_dir, scheme
     ):
-        """Each GAF scheme produces valid output."""
+        """Each TQ scheme produces valid output."""
         result_path = convert_func(
             str(synthetic_model.path),
             scheme=scheme,
@@ -112,13 +112,13 @@ class TestConvertOutputNaming:
         """Output directory name includes scheme type."""
         result_path = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
 
-        # GAF schemes use GAF naming (e.g., GAF4, GAF8-G128)
-        assert "GAF4" in result_path or "gaf4" in result_path.lower()
+        # TQ schemes use TQ naming (e.g., TQ4, TQ8)
+        assert "TQ4" in result_path or "tq4" in result_path.lower()
 
 
 class TestConvertMetadataStability:
@@ -138,7 +138,7 @@ class TestConvertMetadataStability:
         # First conversion
         path1 = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -148,7 +148,7 @@ class TestConvertMetadataStability:
         with tempfile.TemporaryDirectory() as temp_dir2:
             path2 = convert_func(
                 str(synthetic_model.path),
-                scheme="gaf4_64",
+                scheme="tq4",
                 output_dir=temp_dir2,
                 force=True,
             )
@@ -168,7 +168,7 @@ class TestConvertMetadataStability:
         # First conversion
         path1 = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -178,7 +178,7 @@ class TestConvertMetadataStability:
         with tempfile.TemporaryDirectory() as temp_dir2:
             path2 = convert_func(
                 str(synthetic_model.path),
-                scheme="gaf4_64",
+                scheme="tq4",
                 output_dir=temp_dir2,
                 force=True,
             )

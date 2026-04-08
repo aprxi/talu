@@ -74,6 +74,7 @@ const GaffineInferResult = struct {
 
 /// Infer grouped-affine quantization parameters from a tensor and its scales/biases.
 /// Returns null if inference fails or the tensor is not grouped-affine.
+/// Supports both 2D [out, packed_in] and 3D [batch, out, packed_in] shapes.
 fn inferGaffineParams(
     st: *st_loader.UnifiedSafeTensors,
     name: []const u8,
@@ -90,15 +91,20 @@ fn inferGaffineParams(
     else
         name;
     const packed_shape = t.shape[0..@intCast(t.n_dims)];
-    if (packed_shape.len != 2) return null;
-    const out_features: usize = @intCast(packed_shape[0]);
-    const in_packed: usize = @intCast(packed_shape[1]);
+    if (packed_shape.len != 2 and packed_shape.len != 3) return null;
+
+    // For 3D: [batch, out_features, packed_in]. For 2D: [out_features, packed_in].
+    const is_3d = packed_shape.len == 3;
+    const batch_dim: usize = if (is_3d) @intCast(packed_shape[0]) else 1;
+    const out_features: usize = if (is_3d) @intCast(packed_shape[1]) else @intCast(packed_shape[0]);
+    const in_packed: usize = if (is_3d) @intCast(packed_shape[2]) else @intCast(packed_shape[1]);
+    const total_rows = batch_dim * out_features;
 
     // Get scales and biases bytes
     const scales_bytes = st.tryGetBytes(base, ".scales") orelse return null;
     const biases_bytes = st.tryGetBytes(base, ".biases") orelse return null;
-    if (out_features == 0) return null;
-    if (scales_bytes.len % (out_features * 2) != 0) return null;
+    if (total_rows == 0) return null;
+    if (scales_bytes.len % (total_rows * 2) != 0) return null;
     if (biases_bytes.len != scales_bytes.len) return null;
 
     // Get scales dtype (F16 or BF16)
@@ -108,8 +114,8 @@ fn inferGaffineParams(
     const scales_dtype = scales_tensor.dtype;
     if (scales_dtype != .f16 and scales_dtype != .bf16) return null;
 
-    // scales are f16/bf16 (2 bytes each), shape is [out_features, n_groups]
-    const n_groups = scales_bytes.len / (out_features * 2);
+    // scales are f16/bf16 (2 bytes each), shape is [total_rows, n_groups] or [batch, out, n_groups]
+    const n_groups = scales_bytes.len / (total_rows * 2);
     if (n_groups == 0) return null;
 
     // Auto-detect bits from relationship:
@@ -149,6 +155,7 @@ fn inferGaffineParams(
         .group_size = group_size,
     }, @src());
 
+    const unpacked_in = in_packed * values_per_word;
     return .{
         .dtype = actual_dtype,
         .values_per_word = values_per_word,
@@ -156,14 +163,19 @@ fn inferGaffineParams(
         .scales_bytes = scales_bytes,
         .biases_bytes = biases_bytes,
         .scales_dtype = scales_dtype,
-        .shape_override = .{ out_features, in_packed * values_per_word, 0, 0 },
+        .shape_override = if (is_3d)
+            .{ batch_dim, out_features, unpacked_in, 0 }
+        else
+            .{ out_features, unpacked_in, 0, 0 },
     };
 }
 
 /// Apply inferred gaffine params to a tensor, with validation.
 fn applyGaffineParams(t: *Tensor, params: GaffineInferResult, name: []const u8) !void {
-    // Validate number of groups is within kernel limits
-    const k_unpacked = params.shape_override[1];
+    // Validate number of groups is within kernel limits.
+    // For 3D [batch, out, in], the unpacked inner dim is the last non-zero override.
+    // For 2D [out, in], it's shape_override[1].
+    const k_unpacked = if (t.n_dims == 3) params.shape_override[2] else params.shape_override[1];
     const n_groups_actual = k_unpacked / params.group_size;
     if (n_groups_actual > MAX_SUPPORTED_GAFFINE_GROUPS) {
         log.err("load", "Too many groups in tensor", .{
@@ -1031,6 +1043,31 @@ fn dequantizeMxfp8WeightToBf16(
     }
 
     return owned.view();
+}
+
+/// Orient a fused 3D expert weight tensor [n_experts, out, in].
+/// For GAF4/GAF8: infer gaffine params and attach metadata (scales/biases + shape override).
+/// For native dtypes (BF16, F16, etc.): pass through unchanged.
+pub fn orientFusedLinear(
+    st: *st_loader.UnifiedSafeTensors,
+    name: []const u8,
+    expected_in: usize,
+    config: ModelConfig,
+) !Tensor {
+    var weight_tensor = try st.getTensor(name, null);
+
+    // Only apply gaffine inference for quantized types
+    if (weight_tensor.dtype == .grouped_affine_u4 or weight_tensor.dtype == .grouped_affine_u8) {
+        if (inferGaffineParams(st, name, &weight_tensor, expected_in, config.gaffine_bits)) |params| {
+            try applyGaffineParams(&weight_tensor, params, name);
+            return weight_tensor;
+        }
+        // GAF dtype but no scales/biases found — error
+        return error.MissingScales;
+    }
+
+    // Non-quantized 3D tensor: pass through unchanged
+    return weight_tensor;
 }
 
 pub fn orientWeight(

@@ -45,7 +45,7 @@ pub(crate) struct CachedModelResponse {
     /// Model architecture (e.g., "Llama", "Qwen2"), if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
-    /// Quantization scheme (e.g., "F16", "GAF4_64", "MXFP4"), if available.
+    /// Quantization scheme (e.g., "F16", "TQ4", "MXFP4"), if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quant_scheme: Option<String>,
     /// Source model ID this was converted from (e.g., "Qwen/Qwen3-0.6B"), if available.

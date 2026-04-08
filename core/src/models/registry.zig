@@ -24,6 +24,7 @@ const ministral3 = @import("mistral/ministral3.zig");
 const phi4 = @import("phi/phi4.zig");
 const qwen3 = @import("qwen/qwen3.zig");
 const qwen3_5 = @import("qwen/qwen3_5.zig");
+const qwen3_5_moe = @import("qwen/qwen3_5_moe.zig");
 const qwen3_moe = @import("qwen/qwen3_moe.zig");
 const qwen3_next = @import("qwen/qwen3_next.zig");
 const vision_shared = @import("vision_shared.zig");
@@ -105,6 +106,12 @@ pub const entries: []const Entry = &.{
         .model_types = qwen3_5.model_types,
     },
     .{
+        .id = qwen3_5_moe.id,
+        .family = qwen3_5_moe.family,
+        .version = qwen3_5_moe.version,
+        .model_types = qwen3_5_moe.model_types,
+    },
+    .{
         .id = qwen3_moe.id,
         .family = qwen3_moe.family,
         .version = qwen3_moe.version,
@@ -170,6 +177,14 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
             .attention_mlp => qwen3_5.attention_mlp_program,
             .mamba => null,
             .gated_delta => qwen3_5.gated_delta_program,
+            .shortconv => null,
+        };
+    }
+    if (std.mem.eql(u8, entry.id, qwen3_5_moe.id)) {
+        return switch (block_kind) {
+            .attention_mlp => qwen3_5_moe.attention_moe_program,
+            .mamba => null,
+            .gated_delta => qwen3_5_moe.gated_delta_moe_program,
             .shortconv => null,
         };
     }

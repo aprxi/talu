@@ -117,8 +117,8 @@ const gemma4_moe_sliding_weights = [_]types.WeightSpec{
     requiredLayerWeight("router.scale", "Parameter", .none),
     requiredLayerWeight("router.per_expert_scale", "Parameter", .none),
     // Fused 3D expert weights (split into per-expert views at load time)
-    requiredLayerWeight("experts.gate_up_proj", "Parameter", .none),
-    requiredLayerWeight("experts.down_proj", "Parameter", .none),
+    requiredLayerWeight("experts.gate_up_proj", "Parameter", .fused_linear),
+    requiredLayerWeight("experts.down_proj", "Parameter", .fused_linear),
 };
 
 // Full-attention variant: v_proj is optional (attention_k_eq_v shares K/V).
@@ -141,9 +141,9 @@ var gemma4_moe_block_variants = [_]types.BlockVariant{
 const gemma4_moe_block_weights = [_]types.WeightSpec{};
 
 const gemma4_moe_global_weights = [_]types.WeightSpec{
-    .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
-    .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "language_model.model.norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
-    .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
+    .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "language_model.model.embed_tokens.weight", "model.language_model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
+    .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "language_model.model.norm.weight", "model.language_model.norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
+    .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "language_model.lm_head.weight", "model.language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
 
 /// Config hook: apply Gemma4 defaults (pure RMS norms, sqrt(d_model) embedding
@@ -169,6 +169,7 @@ const gemma4_moe_weight_prefixes = [_][]const u8{
     "model.layers.{d}.",
     "layers.{d}.",
     "language_model.model.layers.{d}.",
+    "model.language_model.layers.{d}.",
 };
 
 const gemma4_moe_perf_hints = perf.attentionOnlyHints("gemma4_moe");

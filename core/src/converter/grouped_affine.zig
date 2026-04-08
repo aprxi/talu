@@ -103,16 +103,16 @@ pub const ConvertOptions = struct {
             // Map bits + group_size to scheme
             return switch (q.bits) {
                 4 => switch (q.group_size) {
-                    32 => .gaf4_32,
-                    64 => .gaf4_64,
-                    128 => .gaf4_128,
-                    else => .gaf4_32,
+                    32 => .tq4_32,
+                    64 => .tq4_64,
+                    128 => .tq4_128,
+                    else => .tq4_32,
                 },
                 8 => switch (q.group_size) {
-                    32 => .gaf8_32,
-                    64 => .gaf8_64,
-                    128 => .gaf8_128,
-                    else => .gaf8_32,
+                    32 => .tq8_32,
+                    64 => .tq8_64,
+                    128 => .tq8_128,
+                    else => .tq8_32,
                 },
                 else => .f16,
             };
@@ -3246,8 +3246,13 @@ fn quantizeGroupedAffineTensor(
     if (quant_bits != 4 and quant_bits != 8) return error.UnsupportedBits;
     const layer_index = extractLayerIndexFromTensorName(tensor_name);
 
-    const row_count: usize = @intCast(source_tensor.shape[0]);
-    const col_count: usize = @intCast(source_tensor.shape[1]);
+    // Support both 2D [rows, cols] and 3D [batch, rows, cols] tensors.
+    // For 3D (fused expert weights), flatten batch*rows as total_rows for quantization.
+    const is_3d = source_tensor.n_dims == 3;
+    const batch_dim: usize = if (is_3d) @intCast(source_tensor.shape[0]) else 1;
+    const inner_rows: usize = if (is_3d) @intCast(source_tensor.shape[1]) else @intCast(source_tensor.shape[0]);
+    const col_count: usize = if (is_3d) @intCast(source_tensor.shape[2]) else @intCast(source_tensor.shape[1]);
+    const row_count = batch_dim * inner_rows;
     const group_len = quant_config.group_size;
 
     const values_per_u32: usize = if (quant_bits == 4) 8 else 4;
@@ -3328,14 +3333,23 @@ fn quantizeGroupedAffineTensor(
     const pool = parallel.global();
     pool.parallelForCompute(row_count, quantizeRowSlice, &quant_ctx);
 
-    // Add tensors to builder
+    // Add tensors to builder — preserve 3D shape for fused expert weights
     const quant_dtype: DType = if (quant_bits == 4) .grouped_affine_u4 else .grouped_affine_u8;
-    try builder.addTensor(
-        tensor_name,
-        quant_dtype,
-        &[_]usize{ row_count, packed_col_count },
-        std.mem.sliceAsBytes(packed_row_words),
-    );
+    if (is_3d) {
+        try builder.addTensor(
+            tensor_name,
+            quant_dtype,
+            &[_]usize{ batch_dim, inner_rows, packed_col_count },
+            std.mem.sliceAsBytes(packed_row_words),
+        );
+    } else {
+        try builder.addTensor(
+            tensor_name,
+            quant_dtype,
+            &[_]usize{ row_count, packed_col_count },
+            std.mem.sliceAsBytes(packed_row_words),
+        );
+    }
 
     // Scales and biases names
     var scales_name_buf: [256]u8 = undefined;
@@ -3344,21 +3358,39 @@ fn quantizeGroupedAffineTensor(
     else
         tensor_name;
     const scales_tensor_name = try std.fmt.bufPrint(&scales_name_buf, "{s}.scales", .{tensor_base_name});
-    try builder.addTensor(
-        scales_tensor_name,
-        .bf16,
-        &[_]usize{ row_count, group_count },
-        std.mem.sliceAsBytes(scale_values),
-    );
+    if (is_3d) {
+        try builder.addTensor(
+            scales_tensor_name,
+            .bf16,
+            &[_]usize{ batch_dim, inner_rows, group_count },
+            std.mem.sliceAsBytes(scale_values),
+        );
+    } else {
+        try builder.addTensor(
+            scales_tensor_name,
+            .bf16,
+            &[_]usize{ row_count, group_count },
+            std.mem.sliceAsBytes(scale_values),
+        );
+    }
 
     var biases_name_buf: [256]u8 = undefined;
     const biases_tensor_name = try std.fmt.bufPrint(&biases_name_buf, "{s}.biases", .{tensor_base_name});
-    try builder.addTensor(
-        biases_tensor_name,
-        .bf16,
-        &[_]usize{ row_count, group_count },
-        std.mem.sliceAsBytes(bias_values),
-    );
+    if (is_3d) {
+        try builder.addTensor(
+            biases_tensor_name,
+            .bf16,
+            &[_]usize{ batch_dim, inner_rows, group_count },
+            std.mem.sliceAsBytes(bias_values),
+        );
+    } else {
+        try builder.addTensor(
+            biases_tensor_name,
+            .bf16,
+            &[_]usize{ row_count, group_count },
+            std.mem.sliceAsBytes(bias_values),
+        );
+    }
     return calib_summary;
 }
 

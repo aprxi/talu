@@ -43,7 +43,7 @@ impl ModelOverrides {
 /// Runtime settings stored in `<bucket>/settings.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketSettings {
-    /// Active model for this profile (e.g., "Qwen/Qwen3-0.6B-GAF4").
+    /// Active model for this profile (e.g., "Qwen/Qwen3-0.6B-TQ4").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
@@ -266,19 +266,19 @@ mod tests {
     fn test_load_real_settings_file() {
         // Test loading the actual user's settings file with max_tokens
         let toml_str = r#"
-model = "Qwen/Qwen3-0.6B-GAF4"
+model = "Qwen/Qwen3-0.6B-TQ4"
 system_prompt = "You are a helpful AI assistant."
 max_tokens = 5000
 context_length = 1
 
-[models."Qwen/Qwen3-0.6B-GAF4"]
+[models."Qwen/Qwen3-0.6B-TQ4"]
 temperature = 1.0
 top_p = 0.0
 top_k = 50
         "#;
         let settings: BucketSettings = toml::from_str(toml_str).unwrap();
         assert_eq!(settings.max_output_tokens, Some(5000));
-        assert_eq!(settings.model, Some("Qwen/Qwen3-0.6B-GAF4".to_string()));
+        assert_eq!(settings.model, Some("Qwen/Qwen3-0.6B-TQ4".to_string()));
     }
 
     #[test]

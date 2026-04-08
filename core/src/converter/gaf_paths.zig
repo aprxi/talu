@@ -180,8 +180,10 @@ pub fn generateOutputName(allocator: std.mem.Allocator, input_path: []const u8, 
         }
     }
 
-    // Strip any existing suffix like -MLX-4bit, -GAF4, etc.
+    // Strip any existing suffix like -MLX-4bit, -TQ4, -GAF4, etc.
     if (std.mem.indexOf(u8, model_name, "-MLX")) |idx| {
+        model_name = model_name[0..idx];
+    } else if (std.mem.indexOf(u8, model_name, "-TQ")) |idx| {
         model_name = model_name[0..idx];
     } else if (std.mem.indexOf(u8, model_name, "-GAF")) |idx| {
         model_name = model_name[0..idx];
