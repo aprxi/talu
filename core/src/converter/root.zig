@@ -1499,3 +1499,30 @@ test "buildWeightLayoutMap supports qwen3_5 runtime architecture" {
     defer layout_map.deinit();
     try std.testing.expect(layout_map.layouts.count() > 0);
 }
+
+test "buildWeightLayoutMap supports gemma4 language_model prefixes and aliases" {
+    const arch = models_registry.runtimeArchitectureByModelType("gemma4_text") orelse return error.TestUnexpectedResult;
+    var layout_map = try buildWeightLayoutMap(std.testing.allocator, arch, 35);
+    defer layout_map.deinit();
+
+    try std.testing.expectEqual(
+        @as(?bool, true),
+        layout_map.shouldQuantize("model.language_model.layers.0.self_attn.q_proj.weight"),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, true),
+        layout_map.shouldQuantize("model.language_model.layers.0.mlp.gate_proj.weight"),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, true),
+        layout_map.shouldQuantize("model.language_model.embed_tokens.weight"),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, true),
+        layout_map.shouldQuantize("model.language_model.lm_head.weight"),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        layout_map.shouldQuantize("model.vision_tower.encoder.layers.0.self_attn.q_proj.weight"),
+    );
+}
