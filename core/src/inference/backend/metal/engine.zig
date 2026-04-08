@@ -277,6 +277,7 @@ pub const MetalBackend = struct {
     slot_route_modes: []SlotRouteMode,
     slot_delegate_slots: []?usize,
     vision_delegate: ?cpu_engine.FusedCpuBackend = null,
+    force_text_delegate_cpu: bool = false,
     state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined,
     state_descriptor_count: u8 = 0,
 
@@ -379,6 +380,15 @@ pub const MetalBackend = struct {
     fn resolveLastError() []const u8 {
         const raw = mlx_last_error() orelse return "mlx_last_error unavailable";
         return std.mem.sliceTo(raw, 0);
+    }
+
+    fn envTruthy(name: []const u8, fallback: bool) bool {
+        const raw = std.posix.getenv(name) orelse return fallback;
+        if (raw.len == 0) return true;
+        if (std.mem.eql(u8, raw, "0")) return false;
+        if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
+        if (std.ascii.eqlIgnoreCase(raw, "off")) return false;
+        return true;
     }
 
     fn isMemoryError(message: []const u8) bool {
@@ -894,6 +904,8 @@ pub const MetalBackend = struct {
         errdefer allocator.free(slot_delegate_slots);
         @memset(slot_delegate_slots, null);
 
+        const force_text_delegate_cpu = false;
+
         var backend = MetalBackend{
             .allocator = allocator,
             .loaded = loaded,
@@ -924,6 +936,9 @@ pub const MetalBackend = struct {
             .slot_state_bindings = slot_state_bindings,
             .slot_route_modes = slot_route_modes,
             .slot_delegate_slots = slot_delegate_slots,
+            // Native Metal is the default execution route for text models.
+            // Set TALU_METAL_FORCE_TEXT_DELEGATE_CPU=1 only for targeted debug.
+            .force_text_delegate_cpu = force_text_delegate_cpu,
         };
         errdefer backend.deinit();
         try backend.collectPlanStateDescriptors();
@@ -1123,8 +1138,14 @@ pub const MetalBackend = struct {
         return true;
     }
 
+    fn hasGemma4TopKStreamingRegression(self: *const MetalBackend) bool {
+        if (self.loaded.config.hidden_size_per_layer_input > 0) return true;
+        const arch_id = self.loaded.runtime.architecture_id orelse return false;
+        return std.mem.eql(u8, arch_id, "gemma3");
+    }
+
     pub fn supportsSchedulerBackendTopKDecodeRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
-        _ = self;
+        if (sampling_config.strategy == .top_k and self.hasGemma4TopKStreamingRegression()) return false;
         return switch (sampling_config.strategy) {
             .top_k => sampling_config.top_k > 0 and
                 sampling_config.top_k <= topk_route_candidate_capacity,
@@ -1144,7 +1165,7 @@ pub const MetalBackend = struct {
         self: *const MetalBackend,
         sampling_config: *const sampling.SamplingConfig,
     ) bool {
-        _ = self;
+        if (self.hasGemma4TopKStreamingRegression()) return false;
         return sampling_config.strategy == .top_k and
             sampling_config.top_k > 0 and
             sampling_config.top_k <= topk_route_candidate_capacity and
@@ -1656,6 +1677,34 @@ pub const MetalBackend = struct {
         try self.ensureSlotStateBlocksBoundForExecution(slot_index);
         if (tokens.len == 0) return error.InvalidArgument;
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
+        if (self.force_text_delegate_cpu) {
+            var delegate = try self.ensureVisionDelegate();
+            var delegate_slot = self.slot_delegate_slots[slot_index];
+            var allocated_delegate_slot = false;
+            if (delegate_slot == null) {
+                delegate_slot = delegate.allocSlot() orelse return error.NoSlotsAvailable;
+                self.slot_delegate_slots[slot_index] = delegate_slot;
+                allocated_delegate_slot = true;
+            }
+            errdefer if (allocated_delegate_slot) {
+                if (delegate_slot) |slot| delegate.freeSlot(slot);
+                self.slot_delegate_slots[slot_index] = null;
+            };
+
+            const binding = &self.slot_state_bindings[slot_index];
+            if (binding.bound) {
+                const count: usize = @intCast(binding.count);
+                try delegate.bindSlotStateBlocks(delegate_slot.?, binding.handles[0..count]);
+            }
+            try delegate.prefillSlot(delegate_slot.?, tokens, logits_out[0..self.vocab_size]);
+            self.slot_route_modes[slot_index] = .vision_delegate;
+            const slot_logits = self.slotLogitsSlice(slot_index);
+            if (logits_out.ptr != slot_logits.ptr) {
+                @memcpy(slot_logits, logits_out[0..self.vocab_size]);
+            }
+            self.slot_positions[slot_index] = tokens.len;
+            return;
+        }
         self.releaseSlotDelegateRouting(slot_index);
         const ctx = try self.ensureSlotCtx(slot_index);
         self.resetCtx(slot_index);
@@ -1676,6 +1725,12 @@ pub const MetalBackend = struct {
             .max_batch_size = self.max_batch_size,
         }, requests.len);
         if (requests.len == 0) return;
+        if (self.force_text_delegate_cpu) {
+            for (requests) |request_entry| {
+                try self.prefillSlot(request_entry.slot_index, request_entry.prompt_tokens, request_entry.logits_out);
+            }
+            return;
+        }
         if (self.vocab_size > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
 
         var batch_prefill_count: usize = 0;
@@ -1742,6 +1797,19 @@ pub const MetalBackend = struct {
         if (!self.slot_in_use[slot_index]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(slot_index);
         if (tokens.len == 0) return error.InvalidArgument;
+        if (self.force_text_delegate_cpu) {
+            const logits_buf = self.slotLogitsSlice(slot_index);
+            try self.prefillSlot(slot_index, tokens, logits_buf);
+            var best_idx: usize = 0;
+            var best_val: f32 = -std.math.inf(f32);
+            for (logits_buf, 0..) |value, idx| {
+                if (value > best_val) {
+                    best_val = value;
+                    best_idx = idx;
+                }
+            }
+            return @intCast(best_idx);
+        }
 
         self.releaseSlotDelegateRouting(slot_index);
         const ctx = try self.ensureSlotCtx(slot_index);

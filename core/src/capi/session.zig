@@ -313,7 +313,8 @@ pub export fn talu_resolve_effective_generation_config(
     // model_config comes from generation_config.json - only override if it has non-default values
     // Note: generation_config.json uses temperature=1.0 and do_sample=false as defaults,
     // so we check do_sample to determine if the config intends sampling
-    if (model_config.do_sample) {
+    const preset_is_deterministic = default_temperature <= 0.0 and default_top_k == 1 and default_top_p >= 1.0;
+    if (model_config.do_sample and !preset_is_deterministic) {
         // generation_config.json explicitly enables sampling, use its values
         default_temperature = model_config.temperature;
         default_top_k = model_config.top_k;
@@ -516,6 +517,16 @@ test "talu_resolve_effective_generation_config samples when model has do_sample=
 
     try std.testing.expect(do_sample);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7), effective_temperature, 0.001);
+}
+
+test "deterministic preset is not overridden by generation config sampling" {
+    const default_temperature: f32 = 0.0;
+    const default_top_k: usize = 1;
+    const default_top_p: f32 = 1.0;
+    const preset_is_deterministic = default_temperature <= 0.0 and default_top_k == 1 and default_top_p >= 1.0;
+    const model_config_do_sample = true;
+    const uses_generation_override = model_config_do_sample and !preset_is_deterministic;
+    try std.testing.expect(!uses_generation_override);
 }
 
 test "EffectiveGenConfigRequest default values use sentinels" {

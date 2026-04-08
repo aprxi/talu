@@ -667,7 +667,6 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
     let min_p_from_env = env::var("MIN_P").ok().and_then(|v| v.parse::<f32>().ok());
-
     // Use core-owned policy to resolve effective generation config
     let effective = talu::model::resolve_effective_generation_config(
         &resolved_model,

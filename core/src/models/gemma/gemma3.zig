@@ -73,7 +73,14 @@ pub const attention_mlp_program: []const layer_ops.LayerOp = &.{
 
 // Runtime architecture payload (migrated from runtime_architectures.zig)
 const gemma3_model_types = [_][]const u8{ "gemma3", "gemma3_text", "gemma4", "gemma4_text", "gemma2", "gemma" };
-const gemma3_weight_prefixes = [_][]const u8{ "model.layers.{d}.", "layers.{d}.", "transformer.h.{d}.", "backbone.layers.{d}.", "language_model.model.layers.{d}." };
+const gemma3_weight_prefixes = [_][]const u8{
+    "model.layers.{d}.",
+    "layers.{d}.",
+    "transformer.h.{d}.",
+    "backbone.layers.{d}.",
+    "language_model.model.layers.{d}.",
+    "model.language_model.layers.{d}.",
+};
 const gemma3_block_weights = [_]types.WeightSpec{};
 const gemma3_sliding_attention_weights = [_]types.WeightSpec{
     .{ .id = "input_layernorm.weight", .suffix = "input_layernorm.weight", .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
@@ -108,9 +115,9 @@ var gemma3_block_variants = [_]types.BlockVariant{
     .{ .name = "full_attention", .weights = &gemma3_full_attention_weights },
 };
 const gemma3_global_weights = [_]types.WeightSpec{
-    .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
-    .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
-    .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
+    .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight", "model.language_model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
+    .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.language_model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
+    .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight", "model.language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
 /// Config hook for the Gemma family. Applies common text config fields, then
 /// detects Gemma4 variants and sets their required defaults (scaled embeddings,
@@ -149,7 +156,7 @@ fn isGemma4(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap) bool {
 
 const gemma3_perf_hints = perf.standardAttentionMlpHints("gemma3");
 const gemma3_sampling_presets: sp.SamplingPresets = .{
-    .general = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 64, .presence_penalty = 0.0 },
+    .general = .{ .temperature = 0.0, .top_p = 1.0, .top_k = 1, .presence_penalty = 0.0 },
     .coding = .{ .temperature = 0.6, .top_p = 0.95, .top_k = 64, .presence_penalty = 0.0 },
     .instruct = .{ .temperature = 0.7, .top_p = 0.8, .top_k = 64, .presence_penalty = 0.0 },
     .deterministic = .{ .temperature = 0.0, .top_p = 1.0, .top_k = 1, .presence_penalty = 0.0 },
@@ -182,3 +189,9 @@ pub var arch: types.Architecture = .{
     .performance_hints = &gemma3_perf_hints,
     .sampling_presets = &gemma3_sampling_presets,
 };
+
+test "gemma3 general sampling preset is deterministic" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), gemma3_sampling_presets.general.temperature, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), gemma3_sampling_presets.general.top_p, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), gemma3_sampling_presets.general.top_k);
+}

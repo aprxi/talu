@@ -1498,7 +1498,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             completed_before: usize,
             prefill_completed: usize,
         ) ![]const TokenEvent {
-            const top_k = request_entry.sampling_config.top_k;
+            const top_k: usize = switch (request_entry.sampling_config.strategy) {
+                .greedy => 1,
+                .top_k => request_entry.sampling_config.top_k,
+                else => return error.NotEligible,
+            };
 
             // Stack-allocated candidate buffers (2KB total for K ≤ 256).
             var candidate_logits_buf: [256]f32 = undefined;
@@ -1657,7 +1661,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const slot = re.slot_index orelse return error.NotEligible;
             if (re.grammar_sampler != null) return error.NotEligible;
             if (re.capture_final_logits) return error.NotEligible;
-            const top_k = re.sampling_config.top_k;
+            const top_k: usize = switch (re.sampling_config.strategy) {
+                .greedy => 1,
+                .top_k => re.sampling_config.top_k,
+                else => return error.NotEligible,
+            };
             if (top_k == 0 or top_k > 256) return error.NotEligible;
 
             const use_topk = comptime blk: {
@@ -1859,7 +1867,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 self.pending_queue.items.len == 0 and
                 submit_config.callback == null and
                 submit_config.vision_input == null and
-                submit_config.stop_sequences.len == 0 and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
                 submit_config.max_thinking_tokens == 0 and // thinking budget needs per-token control
@@ -2284,8 +2291,24 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             );
             try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
             const decode_ns = decode_timer.read();
-
-            const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
+            var finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
+            if (submit_config.stop_sequences.len > 0) {
+                var stop_at: ?usize = null;
+                for (submit_config.stop_sequences) |stop_seq| {
+                    if (stop_seq.len == 0 or generated.items.len < stop_seq.len) continue;
+                    var idx: usize = 0;
+                    while (idx + stop_seq.len <= generated.items.len) : (idx += 1) {
+                        if (std.mem.eql(u32, generated.items[idx .. idx + stop_seq.len], stop_seq)) {
+                            if (stop_at == null or idx < stop_at.?) stop_at = idx;
+                            break;
+                        }
+                    }
+                }
+                if (stop_at) |idx| {
+                    generated.shrinkRetainingCapacity(idx);
+                    finish_reason = .stop_sequence;
+                }
+            }
             return .{
                 .tokens = try generated.toOwnedSlice(self.allocator),
                 .finish_reason = finish_reason,
@@ -2585,7 +2608,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
             }
 
-            const max_candidate_count = @min(sampling_config.top_k, self.backend.vocabSize());
+            const route_top_k: usize = switch (sampling_config.strategy) {
+                .greedy => 1,
+                .top_k => sampling_config.top_k,
+                else => return error.NotEligible,
+            };
+            const max_candidate_count = @min(route_top_k, self.backend.vocabSize());
             var candidate_logits = try self.allocator.alloc(f32, max_candidate_count);
             defer self.allocator.free(candidate_logits);
             var candidate_ids = try self.allocator.alloc(u32, max_candidate_count);
