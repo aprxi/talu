@@ -19,6 +19,12 @@ const GateUpLayout = models.runtime_blocks.GateUpLayout;
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 
+/// Convert UE8M0 block scale exponent to f32 scale factor.
+inline fn ue8m0ToScale(e8m0: u8) f32 {
+    const exp_bits = @as(u32, e8m0) << 23;
+    return @bitCast(exp_bits);
+}
+
 // --- Shared types from engine_types.zig ---
 const engine_types = @import("engine_types.zig");
 const KvCacheDtype = engine_types.KvCacheDtype;
@@ -1682,7 +1688,7 @@ pub fn canUseModelEmbeddings(loaded: *const LoadedModel, d_model: usize) bool {
     const dim1: usize = @intCast(embeddings.shape[1]);
     if (dim0 != d_model and dim1 != d_model) return false;
     return switch (embeddings.dtype) {
-        .f32, .f16, .bf16, .grouped_affine_u4, .grouped_affine_u8 => true,
+        .f32, .f16, .bf16, .f8_e4m3, .grouped_affine_u4, .grouped_affine_u8 => true,
         else => false,
     };
 }
@@ -1770,6 +1776,24 @@ pub fn tryPopulateHiddenFromToken(
             }
 
             return false;
+        },
+        .f8_e4m3 => {
+            // MXFP8 embedding: dequant-after-take with block-32 UE8M0 scales.
+            const mxfp8 = embeddings.mxfp8 orelse return false;
+            if (dim1 != hidden_dim) return false;
+            if (token_idx >= dim0) return error.InvalidArgument;
+            const fp8_data = embeddings.data();
+            const row_offset = token_idx * dim1;
+            const scale_cols: usize = mxfp8.scale_cols;
+            const scales_ptr = mxfp8.block_scales_data orelse return false;
+            const scales = scales_ptr[0..mxfp8.block_scales_len];
+            const scale_row_offset = token_idx * scale_cols;
+            for (0..hidden_dim) |col| {
+                const block_idx = col / 32;
+                const scale = ue8m0ToScale(scales[scale_row_offset + block_idx]);
+                out[col] = dtype.fp8e4m3ToF32(fp8_data[row_offset + col]) * scale;
+            }
+            return true;
         },
         else => return false,
     }

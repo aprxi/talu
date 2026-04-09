@@ -829,8 +829,8 @@ fn writeQuantizedWeights(
                 }
                 // TALU_CONVERT_EMBED_BITS controls embedding quantization:
                 //   4  = grouped-affine U4 (default, same as linear weights)
-                //   8  = grouped-affine U8 (higher quality, larger)
-                //   16 = BF16 (lossless, largest — matches old cached quality on Metal)
+                //   8  = MXFP8 (FP8 E4M3 + block-32 scales, best quantized quality)
+                //   16 = BF16 (lossless, largest)
                 const embed_bits: ?u8 = blk: {
                     if (layout_map) |map| {
                         if (map.layouts.get(tensor_name)) |layout| {
@@ -846,24 +846,20 @@ fn writeQuantizedWeights(
                     }
                     break :blk null;
                 };
-                // BF16 embedding: convert source to BF16 and store unquantized.
+                // Non-default embedding format: MXFP8 or BF16.
                 if (embed_bits) |eb| {
+                    if (eb == 8) {
+                        try copyTensorAsMxfp8(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor);
+                        quantized_layers += 1;
+                        continue;
+                    }
                     if (eb == 16) {
                         try copyTensorAsBf16(allocator, &tensor_builder, tensor_name, source_tensor);
                         quantized_layers += 1;
                         continue;
                     }
                 }
-                const effective_quant_config = blk: {
-                    if (embed_bits) |eb| {
-                        if ((eb == 4 or eb == 8) and eb != quant_config.bits) {
-                            var embed_cfg = quant_config;
-                            embed_cfg.bits = eb;
-                            break :blk embed_cfg;
-                        }
-                    }
-                    break :blk quant_config;
-                };
+                const effective_quant_config = quant_config;
                 const calib_summary = try quantizeGroupedAffineTensor(allocator, if (cuda_calib_ctx) |*ctx| ctx else null, source_tensors, &tensor_builder, tensor_name, source_tensor, effective_quant_config, tensor_options, token_pool, &block_input_cache);
                 quantized_layers += 1;
                 mse_sum += calib_summary.best_mse;

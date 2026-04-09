@@ -1734,8 +1734,8 @@ pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeT
         return dequantizeNvfp4WeightToBf16(allocator, st, name, embed_tensor);
     }
 
-    // MXFP8 embedding: attach block scale metadata so the backend can
-    // dequantize only the rows selected by token IDs at inference time.
+    // MXFP8 embedding: attach block scale metadata so backends can use
+    // FP8 matmul for lm_head and dequant-after-take for embedding lookup.
     if (embed_tensor.dtype == .f8_e4m3) mxfp8_embed: {
         const base = if (std.mem.endsWith(u8, name, ".weight"))
             name[0 .. name.len - ".weight".len]
@@ -1760,11 +1760,10 @@ pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeT
             .cols = @intCast(embed_tensor.shape[1]),
             .scale_cols = @intCast(s_cols),
         };
-        // Always dequantize MXFP8 embeddings to BF16 for CPU/CUDA backends.
-        // The metal backend loads weights independently via MLX and handles
-        // MXFP8 embeddings natively (dequant-after-take).
         _ = dequantize_mxfp8_to_bf16;
-        return dequantizeMxfp8EmbeddingToBf16(allocator, embed_tensor);
+        // Preserve MXFP8 tensor with metadata so tied lm_head can use
+        // FP8 matmul.  The CPU embedding kernel handles dequant-after-take.
+        return embed_tensor;
     }
 
     // Keep dense embedding tables in their native dtype so tied-lm-head models

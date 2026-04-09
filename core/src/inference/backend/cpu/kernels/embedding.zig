@@ -2,7 +2,7 @@
 //! Token embedding lookup for various quantization formats
 //!
 //! This module provides embedding lookup operations for CPU inference.
-//! Supports F32 and grouped-affine u4/u8 formats.
+//! Supports F32, BF16, F16, grouped-affine u4/u8, and MXFP8 formats.
 
 pub const supported = true;
 
@@ -14,6 +14,12 @@ const cpu_quant_decode = compute.cpu.quant_decode;
 const cpu_memory = compute.cpu.memory;
 
 const Tensor = tensor.Tensor;
+
+/// Convert UE8M0 block scale exponent to f32 scale factor.
+inline fn ue8m0ToScale(e8m0: u8) f32 {
+    const exp_bits = @as(u32, e8m0) << 23;
+    return @bitCast(exp_bits);
+}
 
 /// Gather embeddings for a sequence of token IDs.
 /// Supports multiple quantization formats.
@@ -91,6 +97,27 @@ pub fn gatherEmbeddings(embedding_weights: *const Tensor, token_ids: []const u32
                 token_ids,
                 output_values,
             );
+        },
+        .f8_e4m3 => {
+            const mxfp8 = embedding_weights.mxfp8 orelse return error.InvalidDType;
+            const fp8_data = embedding_weights.data();
+            const scales_ptr = mxfp8.block_scales_data orelse return error.InvalidDType;
+            const block_scales = scales_ptr[0..mxfp8.block_scales_len];
+            const scale_cols: usize = @intCast(mxfp8.scale_cols);
+            for (token_ids, 0..) |token_id, seq_idx| {
+                if (token_id >= vocab_size) return error.InvalidTokenId;
+                const row_offset = @as(usize, token_id) * embed_dim;
+                const scale_row_offset = @as(usize, token_id) * scale_cols;
+                const out_offset = seq_idx * embed_dim;
+                // Dequantize: f32 = fp8_e4m3_to_f32(value) * ue8m0_to_scale(block_scale)
+                for (0..embed_dim) |col| {
+                    const block_idx = col / 32;
+                    const scale_byte = block_scales[scale_row_offset + block_idx];
+                    const scale = ue8m0ToScale(scale_byte);
+                    const fp8_val = fp8_data[row_offset + col];
+                    output_values[out_offset + col] = dtype.fp8e4m3ToF32(fp8_val) * scale;
+                }
+            }
         },
         else => return error.InvalidDType,
     }
