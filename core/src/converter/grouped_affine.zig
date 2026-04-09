@@ -827,23 +827,39 @@ fn writeQuantizedWeights(
                 } else {
                     tuned_tensor_count += 1;
                 }
-                // Embedding tensors default to 8-bit for better quality.
-                // TALU_CONVERT_EMBED_BITS overrides (e.g. "4" for 4-bit).
-                const effective_quant_config = blk: {
+                // TALU_CONVERT_EMBED_BITS controls embedding quantization:
+                //   4  = grouped-affine U4 (default, same as linear weights)
+                //   8  = grouped-affine U8 (higher quality, larger)
+                //   16 = BF16 (lossless, largest — matches old cached quality on Metal)
+                const embed_bits: ?u8 = blk: {
                     if (layout_map) |map| {
                         if (map.layouts.get(tensor_name)) |layout| {
                             if (layout == .embedding) {
-                                const default_embed_bits: u8 = 8;
-                                const embed_bits: u8 = if (std.posix.getenv("TALU_CONVERT_EMBED_BITS")) |raw|
+                                const default_embed_bits: u8 = 4;
+                                const bits: u8 = if (std.posix.getenv("TALU_CONVERT_EMBED_BITS")) |raw|
                                     std.fmt.parseInt(u8, raw, 10) catch default_embed_bits
                                 else
                                     default_embed_bits;
-                                if ((embed_bits == 4 or embed_bits == 8) and embed_bits != quant_config.bits) {
-                                    var embed_cfg = quant_config;
-                                    embed_cfg.bits = embed_bits;
-                                    break :blk embed_cfg;
-                                }
+                                break :blk bits;
                             }
+                        }
+                    }
+                    break :blk null;
+                };
+                // BF16 embedding: convert source to BF16 and store unquantized.
+                if (embed_bits) |eb| {
+                    if (eb == 16) {
+                        try copyTensorAsBf16(allocator, &tensor_builder, tensor_name, source_tensor);
+                        quantized_layers += 1;
+                        continue;
+                    }
+                }
+                const effective_quant_config = blk: {
+                    if (embed_bits) |eb| {
+                        if ((eb == 4 or eb == 8) and eb != quant_config.bits) {
+                            var embed_cfg = quant_config;
+                            embed_cfg.bits = eb;
+                            break :blk embed_cfg;
                         }
                     }
                     break :blk quant_config;
@@ -3511,6 +3527,37 @@ fn copyTensorUnchanged(
     const shape_array = source_tensor.shapeAsUsize();
     const shape = shape_array[0..@intCast(source_tensor.n_dims)];
     try builder.addTensor(tensor_name, source_tensor.dtype, shape, source_tensor.data()[0..source_tensor.data_size]);
+}
+
+/// Convert a tensor to BF16 and write it unquantized.
+/// Used for embedding tensors when TALU_CONVERT_EMBED_BITS=16.
+fn copyTensorAsBf16(
+    allocator: std.mem.Allocator,
+    builder: *safetensors.Builder,
+    tensor_name: []const u8,
+    source_tensor: Tensor,
+) !void {
+    const shape_array = source_tensor.shapeAsUsize();
+    const shape = shape_array[0..@intCast(source_tensor.n_dims)];
+
+    if (source_tensor.dtype == .bf16) {
+        // Already BF16 — copy as-is.
+        try builder.addTensor(tensor_name, .bf16, shape, source_tensor.data()[0..source_tensor.data_size]);
+        return;
+    }
+
+    // Convert to F32 first, then to BF16.
+    const f32_result = try convert.tensorToF32(allocator, source_tensor);
+    defer f32_result.deinit(allocator);
+    const f32_slice = f32_result.asF32Slice();
+
+    const bf16_values = try allocator.alloc(u16, f32_slice.len);
+    defer allocator.free(bf16_values);
+    for (f32_slice, bf16_values) |val, *dst| {
+        dst.* = convert.f32ToBf16(val);
+    }
+
+    try builder.addTensor(tensor_name, .bf16, shape, std.mem.sliceAsBytes(bf16_values));
 }
 
 /// Write an embedding tensor in MXFP8 format (E4M3 values + UE8M0 block
