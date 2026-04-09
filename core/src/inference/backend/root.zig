@@ -478,12 +478,10 @@ const GpuMemoryInfo = struct {
     total: usize,
 };
 
-/// Constants for auto topology memory estimation.
-/// FIT_THRESHOLD leaves headroom for other processes and allocation granularity.
-const AUTO_TOPO_FIT_THRESHOLD: usize = 90; // percent
-/// FRAGMENTATION_OVERHEAD accounts for CUDA context, memory fragmentation, and
+/// Fixed per-GPU overhead for CUDA context, allocator fragmentation, and
 /// miscellaneous buffers not individually estimated (topk, decode pointer tables, etc.).
-const AUTO_TOPO_FRAGMENTATION_OVERHEAD: usize = 110; // percent (1.1x)
+/// All other costs (weights, KV cache, activations, embed/proj) are computed exactly.
+const AUTO_TOPO_OVERHEAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB per GPU
 /// Practical seq_len cap for KV cache estimation. The engine allocates KV cache
 /// dynamically (starting at 256 tokens, doubling up to max_seq_len). Using the
 /// model's theoretical max (e.g. 262K for Qwen) would wildly overestimate.
@@ -521,10 +519,11 @@ const ModelSizeParams = struct {
     n_layers: usize,
 };
 
-/// Estimate GPU memory for a specific stage with a given number of layers.
+/// Compute GPU memory for a specific stage with a given number of layers.
 ///
 /// Separates fixed costs (embedding, projection, activation buffers) from
-/// per-layer costs (weights, KV cache) for accurate multi-GPU estimation.
+/// per-layer costs (weights, KV cache). All components are derived from
+/// known model parameters — no estimation fudge factors.
 /// Intermediate stages skip embedding/projection uploads at init time.
 fn estimatePerGpuBytes(
     p: ModelSizeParams,
@@ -559,11 +558,10 @@ fn estimatePerGpuBytes(
     if (needs_embedding) total +|= embed_bytes;
     if (needs_projection) total +|= proj_bytes;
 
-    // Small overhead for CUDA context + fragmentation.
-    return (total / 100) *| AUTO_TOPO_FRAGMENTATION_OVERHEAD;
+    return total;
 }
 
-/// Estimate total GPU memory for full model (used for logging).
+/// Compute total GPU memory for full model (used for logging).
 fn estimateModelGpuBytes(p: ModelSizeParams) usize {
     return estimatePerGpuBytes(p, p.n_layers, true, true);
 }
@@ -639,7 +637,10 @@ fn autoSelectTopology(
         }
     }
 
-    const best0_budget = gpu_infos[best0].free / 100 * AUTO_TOPO_FIT_THRESHOLD;
+    const best0_budget = if (gpu_infos[best0].free > AUTO_TOPO_OVERHEAD_BYTES)
+        gpu_infos[best0].free - AUTO_TOPO_OVERHEAD_BYTES
+    else
+        0;
 
     // S3/S5: Model fits on one GPU (with embedding + projection).
     const single_est = estimatePerGpuBytes(p, total_layers, true, true);
@@ -671,8 +672,8 @@ fn autoSelectTopology(
     const ord1 = @max(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
     const free0 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best0].free else gpu_infos[best1].free;
     const free1 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best1].free else gpu_infos[best0].free;
-    const budget0 = free0 / 100 * AUTO_TOPO_FIT_THRESHOLD;
-    const budget1 = free1 / 100 * AUTO_TOPO_FIT_THRESHOLD;
+    const budget0 = if (free0 > AUTO_TOPO_OVERHEAD_BYTES) free0 - AUTO_TOPO_OVERHEAD_BYTES else 0;
+    const budget1 = if (free1 > AUTO_TOPO_OVERHEAD_BYTES) free1 - AUTO_TOPO_OVERHEAD_BYTES else 0;
 
     // S6: Model fits across 2 GPUs (pipeline2).
     // GPU0: has embedding, no projection. GPU1: no embedding, has projection.
@@ -690,15 +691,22 @@ fn autoSelectTopology(
                     std.math.clamp(total_layers * free0 / total_free, 1, total_layers - 1)
                 else
                     total_layers / 2;
-                // Adjust up if GPU0 overflows, down if GPU1 overflows.
+                // Adjust: decrease split if GPU0 overflows, increase if GPU1 overflows.
+                // Track direction to detect oscillation (GPU0 fits at S but GPU1
+                // doesn't, GPU0 doesn't fit at S+1 → no valid split exists).
+                var last_dir: enum { none, up, down } = .none;
                 while (split < total_layers - 1) {
                     const g0 = estimatePerGpuBytes(p, split, true, false);
                     const g1 = estimatePerGpuBytes(p, total_layers - split, false, true);
                     if (g0 <= budget0 and g1 <= budget1) break;
                     if (g0 > budget0) {
+                        if (last_dir == .up) break; // oscillation
+                        last_dir = .down;
                         split -= 1;
                         if (split == 0) break;
                     } else {
+                        if (last_dir == .down) break; // oscillation
+                        last_dir = .up;
                         split += 1;
                     }
                 }
@@ -915,8 +923,8 @@ fn topologyFromCpuLayers(
     // Model-aware split: GPU0 (middle) has no embed/proj, GPU1 (last) has proj.
     // Find the split that balances utilization across both GPUs.
     const gpu0_share = if (model_params) |p| blk: {
-        const budget0 = if (free0 > 0) free0 / 100 * AUTO_TOPO_FIT_THRESHOLD else 1;
-        const budget1 = if (free1 > 0) free1 / 100 * AUTO_TOPO_FIT_THRESHOLD else 1;
+        const budget0 = if (free0 > AUTO_TOPO_OVERHEAD_BYTES) free0 - AUTO_TOPO_OVERHEAD_BYTES else 1;
+        const budget1 = if (free1 > AUTO_TOPO_OVERHEAD_BYTES) free1 - AUTO_TOPO_OVERHEAD_BYTES else 1;
         // Iterate all possible splits and pick the one that minimizes the
         // maximum utilization ratio. This accounts for projection asymmetry.
         var best_split: usize = gpu_layers / 2;
@@ -2522,8 +2530,8 @@ fn testGpuInfos(comptime N: usize, pairs: [N][2]usize) [N]GpuMemoryInfo {
     return infos;
 }
 
-/// Test helper: minimal model params where file_size dominates the estimate.
-/// embed/proj ≈ 0, kv ≈ 0, so estimate ≈ file_size * 1.1.
+/// Test helper: minimal model params where file_size dominates.
+/// embed/proj ≈ 0, kv ≈ 0, so computed bytes ≈ file_size.
 fn testMinimalParams(file_size: usize, n_layers: usize) ModelSizeParams {
     return .{
         .file_size = file_size,
@@ -2536,7 +2544,7 @@ fn testMinimalParams(file_size: usize, n_layers: usize) ModelSizeParams {
     };
 }
 
-test "estimateModelGpuBytes includes weights with overhead" {
+test "estimateModelGpuBytes includes weights and KV cache" {
     const gb = 1024 * 1024 * 1024;
     const p = ModelSizeParams{
         .file_size = gb,
@@ -2548,7 +2556,7 @@ test "estimateModelGpuBytes includes weights with overhead" {
         .n_layers = 32,
     };
     const result = estimateModelGpuBytes(p);
-    // Should be > file_size due to KV + activation + overhead.
+    // Should be > file_size due to KV cache + activation buffers + embed/proj.
     try std.testing.expect(result > gb);
     // Should be reasonable (< 3x file_size).
     try std.testing.expect(result < 3 * gb);
