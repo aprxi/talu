@@ -1570,19 +1570,12 @@ array maybe_dequantize_grouped_affine_weight(
         return weight_2d;
     }
 
-    if (cfg.quant_bits != 4 && cfg.quant_bits != 8) {
-        throw std::runtime_error("grouped-affine metadata found but quantization.bits is missing/invalid");
-    }
     if (cfg.quant_group_size <= 0) {
         throw std::runtime_error("grouped-affine metadata found but quantization.group_size is missing/invalid");
     }
 
     const int rows = weight_2d.shape(0);
     const int packed_cols = weight_2d.shape(1);
-    const int bits = cfg.quant_bits;
-    const int values_per_word = bits == 4 ? 8 : 4;
-    const uint32_t mask = bits == 4 ? 0xF : 0xFF;
-    const int cols = packed_cols * values_per_word;
 
     const array scales_f32 = astype(scales_it->second, float32);
     const array biases_f32 = astype(biases_it->second, float32);
@@ -1596,14 +1589,33 @@ array maybe_dequantize_grouped_affine_weight(
         throw std::runtime_error("grouped-affine scales/biases group mismatch for " + weight_key);
     }
 
-    const int expected_groups = (cols + cfg.quant_group_size - 1) / cfg.quant_group_size;
-    if (scales_f32.shape(1) != expected_groups) {
-        throw std::runtime_error(
-            "grouped-affine scales cols mismatch for " + weight_key +
-            " (expected=" + std::to_string(expected_groups) +
-            ", got=" + std::to_string(scales_f32.shape(1)) + ")"
-        );
+    // Auto-detect bits from scales shape. Mixed-precision models may use
+    // different bits for embedding vs linear weights (e.g. U8 embed + U4 linear).
+    const int scale_cols = scales_f32.shape(1);
+    const int gs = cfg.quant_group_size;
+    int bits = cfg.quant_bits;
+    if (bits != 4 && bits != 8) bits = 4;
+    // Verify the config hint matches; if not, try the other interpretation.
+    const int cols_from_hint = packed_cols * (bits == 4 ? 8 : 4);
+    const int expected_groups_hint = (cols_from_hint + gs - 1) / gs;
+    if (expected_groups_hint != scale_cols) {
+        const int alt_bits = bits == 4 ? 8 : 4;
+        const int cols_alt = packed_cols * (alt_bits == 4 ? 8 : 4);
+        const int expected_groups_alt = (cols_alt + gs - 1) / gs;
+        if (expected_groups_alt == scale_cols) {
+            bits = alt_bits;
+        } else {
+            throw std::runtime_error(
+                "grouped-affine scales cols mismatch for " + weight_key +
+                " (packed_cols=" + std::to_string(packed_cols) +
+                ", scale_cols=" + std::to_string(scale_cols) +
+                ", group_size=" + std::to_string(gs) + ")"
+            );
+        }
     }
+    const int values_per_word = bits == 4 ? 8 : 4;
+    const uint32_t mask = bits == 4 ? 0xF : 0xFF;
+    const int cols = packed_cols * values_per_word;
 
     const array packed_u32 = astype(weight_2d, uint32);
     eval(packed_u32);
@@ -1660,7 +1672,8 @@ bool maybe_capture_grouped_affine_quant(
     const array& lhs_weight,
     array* out_q_w,
     array* out_q_scales,
-    array* out_q_biases
+    array* out_q_biases,
+    int* out_detected_bits = nullptr
 ) {
     if (!has_grouped_affine_metadata_for_key(tensors, weight_key)) return false;
     if (!ends_with(weight_key, ".weight")) return false;
@@ -1682,17 +1695,6 @@ bool maybe_capture_grouped_affine_quant(
     if (raw_weight.ndim() != 2) return false;
     const int rows = raw_weight.shape(0);
     const int packed_cols = raw_weight.shape(1);
-    const int values_per_word = cfg.quant_bits == 4 ? 8 : 4;
-    const int cols = packed_cols * values_per_word;
-    const bool lhs_matches_unpacked =
-        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == cols;
-    const bool lhs_matches_packed =
-        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == packed_cols;
-    if (!lhs_matches_unpacked && !lhs_matches_packed) {
-        // Synthetic fused tensors (for example concatenated qkvz) do not map
-        // 1:1 to a single grouped-affine source tensor.
-        return false;
-    }
 
     const array& scales_src = scales_it->second;
     const array& biases_src = biases_it->second;
@@ -1705,12 +1707,39 @@ bool maybe_capture_grouped_affine_quant(
     if (scales_src.shape(0) != rows || biases_src.shape(0) != rows) return false;
     if (scales_src.shape(1) != biases_src.shape(1)) return false;
 
-    const int expected_groups = (cols + cfg.quant_group_size - 1) / cfg.quant_group_size;
-    if (scales_src.shape(1) != expected_groups) return false;
+    // Auto-detect bits from scales shape for mixed-precision models.
+    const int gs = cfg.quant_group_size;
+    const int scale_cols = scales_src.shape(1);
+    int bits = cfg.quant_bits;
+    if (bits != 4 && bits != 8) bits = 4;
+    int cols = packed_cols * (bits == 4 ? 8 : 4);
+    int expected_groups = (cols + gs - 1) / gs;
+    if (expected_groups != scale_cols) {
+        const int alt_bits = bits == 4 ? 8 : 4;
+        const int alt_cols = packed_cols * (alt_bits == 4 ? 8 : 4);
+        const int alt_groups = (alt_cols + gs - 1) / gs;
+        if (alt_groups == scale_cols) {
+            bits = alt_bits;
+            cols = alt_cols;
+            expected_groups = alt_groups;
+        } else {
+            return false;
+        }
+    }
+
+    const int values_per_word = bits == 4 ? 8 : 4;
+    const bool lhs_matches_unpacked =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == cols;
+    const bool lhs_matches_packed =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == packed_cols;
+    if (!lhs_matches_unpacked && !lhs_matches_packed) {
+        return false;
+    }
 
     *out_q_w = astype(raw_weight, uint32);
     *out_q_scales = scales_src;
     *out_q_biases = biases_src;
+    if (out_detected_bits) *out_detected_bits = bits;
     return true;
 }
 
@@ -1742,7 +1771,8 @@ void maybe_quantize_mxfp8_matrix(
     array* out_q_w,
     array* out_q_scales,
     array* out_q_biases,
-    bool* out_has_q
+    bool* out_has_q,
+    int* out_detected_bits = nullptr
 ) {
     if (!enabled) {
         *out_has_q = false;
@@ -1812,7 +1842,8 @@ void maybe_quantize_mxfp8_matrix(
                 lhs_weight,
                 out_q_w,
                 out_q_scales,
-                out_q_biases))
+                out_q_biases,
+                out_detected_bits))
         {
             *out_has_q = true;
             g_qmm_success += 1;
@@ -2303,14 +2334,12 @@ struct mlx_ctx {
 
     Qwen35Config cfg;
 
-    array embed_tokens = array(0.0f); // [vocab, hidden] (BF16 or dequantized)
-    array embed_tokens_raw = array(0.0f); // [vocab, hidden] uint8 (MXFP8 E4M3, when applicable)
-    array embed_tokens_scales = array(0.0f); // [vocab, scale_cols] f32 (expanded MXFP8 block scales)
-    bool embed_is_mxfp8 = false;
+    array embed_tokens = array(0.0f); // [vocab, hidden]
     array lm_head_rhs = array(0.0f);  // [hidden, vocab]
     array lm_head_q_w = array(0.0f);  // [vocab, hidden * bits / 32] packed
     array lm_head_q_scales = array(0.0f); // [vocab, hidden / group_size]
     array lm_head_q_biases = array(0.0f); // [vocab, hidden / group_size] affine-only
+    int lm_head_q_bits = 0; // detected quantization bits for lm_head (may differ from cfg)
     array final_norm_w = array(0.0f); // [hidden]
     bool has_fp8_meta = false;
     bool has_mxfp8_meta = false;
@@ -3267,16 +3296,7 @@ array forward_hidden(
     bool apply_final_norm,
     const TraceFrame* trace_frame = nullptr
 ) {
-    array hidden = array(0.0f);
-    if (ctx->embed_is_mxfp8) {
-        // MXFP8 embedding: take raw uint8 rows, then dequantize.
-        // Only the selected rows are converted, not the full vocab table.
-        const array raw_rows = take(ctx->embed_tokens_raw, input_ids, 0); // [B,S,H] u8
-        const array scale_rows = take(ctx->embed_tokens_scales, input_ids, 0); // [B,S,H] f32
-        hidden = astype(from_fp8(raw_rows, float32) * scale_rows, bfloat16);
-    } else {
-        hidden = take(ctx->embed_tokens, input_ids, 0); // [B,S,H]
-    }
+    array hidden = take(ctx->embed_tokens, input_ids, 0); // [B,S,H]
     if (std::fabs(ctx->cfg.embedding_multiplier - 1.0f) > 1.0e-6f) {
         hidden = hidden * array(ctx->cfg.embedding_multiplier, hidden.dtype());
     }
@@ -3342,11 +3362,12 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
     }
     const bool lm_head_q_ready = ctx->lm_head_q_decode_enabled &&
         ctx->lm_head_q_w.size() > 0 && ctx->lm_head_q_scales.size() > 0;
+    const int lm_bits = ctx->lm_head_q_bits > 0 ? ctx->lm_head_q_bits : ctx->cfg.quant_bits;
     const bool lm_head_affine_ready = lm_head_q_ready &&
         ctx->lm_head_q_biases.ndim() == 2 &&
         ctx->lm_head_q_biases.size() > 1 &&
         ctx->cfg.quant_group_size > 0 &&
-        (ctx->cfg.quant_bits == 4 || ctx->cfg.quant_bits == 8);
+        (lm_bits == 4 || lm_bits == 8);
     const bool lm_head_nvfp4_ready =
         lm_head_q_ready &&
         !lm_head_affine_ready &&
@@ -3365,7 +3386,7 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                     std::optional<array>(ctx->lm_head_q_biases),
                     true,
                     ctx->cfg.quant_group_size,
-                    ctx->cfg.quant_bits,
+                    lm_bits,
                     "affine"
                 )
               : (lm_head_nvfp4_ready
@@ -3535,6 +3556,7 @@ std::pair<array, array> fused_lm_head_topk_candidate_arrays(
         const array w_chunk = slice_rows_2d(ctx->lm_head_q_w, row_start, row_end);
         const array scales_chunk = slice_rows_2d(ctx->lm_head_q_scales, row_start, row_end);
         const array biases_chunk = slice_rows_2d(ctx->lm_head_q_biases, row_start, row_end);
+        const int lm_bits_chunk = ctx->lm_head_q_bits > 0 ? ctx->lm_head_q_bits : ctx->cfg.quant_bits;
         const array logits_chunk = quantized_matmul(
             hidden,
             w_chunk,
@@ -3542,7 +3564,7 @@ std::pair<array, array> fused_lm_head_topk_candidate_arrays(
             std::optional<array>(biases_chunk),
             true,
             ctx->cfg.quant_group_size,
-            ctx->cfg.quant_bits,
+            lm_bits_chunk,
             "affine"
         );
         auto topk_fn = compiled_topk_candidates(local_k);
@@ -4269,50 +4291,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             default_keep_dense_rhs_for_prefill
         );
         auto load_embed_weight = [&](const std::string& weight_key) -> array {
-            // MXFP8 embeddings: keep the raw uint8 tensor and block scales
-            // so that inference can dequantize only the rows selected by
-            // token IDs (negligible cost vs full-table dequant).
-            if (ends_with(weight_key, ".weight")) {
-                const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
-                const std::string block_scale_key = base + ".weight_block_scale";
-                auto raw_it = tensors.find(weight_key);
-                auto scale_it = tensors.find(block_scale_key);
-                if (raw_it != tensors.end() && scale_it != tensors.end() &&
-                    raw_it->second.ndim() == 2 && scale_it->second.ndim() == 2 &&
-                    (raw_it->second.dtype() == uint8 || raw_it->second.dtype() == int8) &&
-                    !has_grouped_affine_metadata_for_key(tensors, weight_key)) {
-                    const array& raw_weight = raw_it->second;
-                    const array& raw_scales = scale_it->second;
-                    const int rows = raw_weight.shape(0);
-                    const int cols = raw_weight.shape(1);
-
-                    // Decode E8M0 block scales to f32 and expand to [rows, cols].
-                    array scales_f32 = array(1.0f);
-                    if (raw_scales.dtype() == uint8 || raw_scales.dtype() == int8) {
-                        const array scales_u8 = astype(raw_scales, uint8);
-                        const int flat_size = static_cast<int>(scales_u8.size());
-                        const array flat_u8 = reshape(scales_u8, {flat_size});
-                        eval(flat_u8);
-                        const uint8_t* scale_bytes = flat_u8.data<uint8_t>();
-                        std::vector<float> decoded(static_cast<size_t>(flat_size));
-                        for (int idx = 0; idx < flat_size; ++idx) {
-                            const uint32_t exp_bits = static_cast<uint32_t>(scale_bytes[idx]) << 23;
-                            float scale = 0.0f;
-                            std::memcpy(&scale, &exp_bits, sizeof(float));
-                            decoded[static_cast<size_t>(idx)] = scale;
-                        }
-                        scales_f32 = array(decoded.begin(), Shape{raw_scales.shape(0), raw_scales.shape(1)}, float32);
-                    } else {
-                        scales_f32 = astype(raw_scales, float32);
-                    }
-                    ctx->embed_tokens_raw = raw_weight;
-                    ctx->embed_tokens_scales = expand_block_scales(scales_f32, rows, cols, weight_key);
-                    ctx->embed_is_mxfp8 = true;
-                    // Return raw for assignment to embed_tokens; inference will
-                    // use embed_tokens_raw + embed_tokens_scales after take().
-                    return raw_weight;
-                }
-            }
             return load_linear_weight(tensors, ctx->cfg, weight_key);
         };
 
@@ -4330,7 +4308,8 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             array* out_q_w,
             array* out_q_scales,
             array* out_q_biases,
-            bool* out_has_q
+            bool* out_has_q,
+            int* out_detected_bits = nullptr
         ) {
             ::maybe_quantize_mxfp8_matrix(
                 tensors_ref,
@@ -4341,7 +4320,8 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 out_q_w,
                 out_q_scales,
                 out_q_biases,
-                out_has_q
+                out_has_q,
+                out_detected_bits
             );
         };
 
@@ -4387,6 +4367,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
             }
             bool lm_head_has_q = false;
+            int lm_head_detected_bits = 0;
             maybe_quantize_mxfp8_matrix(
                 tensors,
                 ctx->cfg,
@@ -4396,9 +4377,11 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 &ctx->lm_head_q_w,
                 &ctx->lm_head_q_scales,
                 &ctx->lm_head_q_biases,
-                &lm_head_has_q
+                &lm_head_has_q,
+                &lm_head_detected_bits
             );
             ctx->lm_head_q_decode_enabled = lm_head_has_q;
+            ctx->lm_head_q_bits = lm_head_detected_bits > 0 ? lm_head_detected_bits : ctx->cfg.quant_bits;
         }
 
         // Keep dense lm_head RHS only when no quantized matmul format is
@@ -5311,13 +5294,11 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         // Arrays are ref-counted in MLX. Copying these fields keeps one shared
         // immutable weight set while each context owns independent runtime state.
         ctx->embed_tokens = source_ctx->embed_tokens;
-        ctx->embed_tokens_raw = source_ctx->embed_tokens_raw;
-        ctx->embed_tokens_scales = source_ctx->embed_tokens_scales;
-        ctx->embed_is_mxfp8 = source_ctx->embed_is_mxfp8;
         ctx->lm_head_rhs = source_ctx->lm_head_rhs;
         ctx->lm_head_q_w = source_ctx->lm_head_q_w;
         ctx->lm_head_q_scales = source_ctx->lm_head_q_scales;
         ctx->lm_head_q_biases = source_ctx->lm_head_q_biases;
+        ctx->lm_head_q_bits = source_ctx->lm_head_q_bits;
         ctx->final_norm_w = source_ctx->final_norm_w;
         ctx->has_fp8_meta = source_ctx->has_fp8_meta;
         ctx->has_mxfp8_meta = source_ctx->has_mxfp8_meta;

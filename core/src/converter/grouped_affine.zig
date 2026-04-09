@@ -778,18 +778,6 @@ fn writeQuantizedWeights(
             // Use architecture-driven layout to determine if tensor should be quantized.
             // Unknown tensors are kept in source precision.
             if (convert.shouldQuantizeTensorByLayout(layout_map, tensor_name, source_tensor)) {
-                // Embedding weights are stored as BF16 instead of quantized.
-                // Embedding lookup is a table index (not matmul), so quantization
-                // only saves storage at the cost of expensive runtime dequantization
-                // and a large runtime cache.
-                if (layout_map) |map| {
-                    if (map.layouts.get(tensor_name)) |layout| {
-                        if (layout == .embedding) {
-                            try copyTensorAsMxfp8(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor);
-                            continue;
-                        }
-                    }
-                }
                 const layer_index = extractLayerIndexFromTensorName(tensor_name);
                 if (show_calib_progress) {
                     if (active_layer) |layer| {
@@ -839,7 +827,28 @@ fn writeQuantizedWeights(
                 } else {
                     tuned_tensor_count += 1;
                 }
-                const calib_summary = try quantizeGroupedAffineTensor(allocator, if (cuda_calib_ctx) |*ctx| ctx else null, source_tensors, &tensor_builder, tensor_name, source_tensor, quant_config, tensor_options, token_pool, &block_input_cache);
+                // Embedding tensors default to 8-bit for better quality.
+                // TALU_CONVERT_EMBED_BITS overrides (e.g. "4" for 4-bit).
+                const effective_quant_config = blk: {
+                    if (layout_map) |map| {
+                        if (map.layouts.get(tensor_name)) |layout| {
+                            if (layout == .embedding) {
+                                const default_embed_bits: u8 = 8;
+                                const embed_bits: u8 = if (std.posix.getenv("TALU_CONVERT_EMBED_BITS")) |raw|
+                                    std.fmt.parseInt(u8, raw, 10) catch default_embed_bits
+                                else
+                                    default_embed_bits;
+                                if ((embed_bits == 4 or embed_bits == 8) and embed_bits != quant_config.bits) {
+                                    var embed_cfg = quant_config;
+                                    embed_cfg.bits = embed_bits;
+                                    break :blk embed_cfg;
+                                }
+                            }
+                        }
+                    }
+                    break :blk quant_config;
+                };
+                const calib_summary = try quantizeGroupedAffineTensor(allocator, if (cuda_calib_ctx) |*ctx| ctx else null, source_tensors, &tensor_builder, tensor_name, source_tensor, effective_quant_config, tensor_options, token_pool, &block_input_cache);
                 quantized_layers += 1;
                 mse_sum += calib_summary.best_mse;
                 baseline_sum += calib_summary.baseline_mse;

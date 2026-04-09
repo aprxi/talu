@@ -134,12 +134,14 @@ fn inferGaffineParams(
     const unpacked_8bit = in_packed * 4;
 
     // Disambiguate when both group sizes are valid:
-    // 1. Config's gaffine_bits is authoritative when available
-    // 2. Fall back to expected_dim matching for mixed quantization models
-    const is_4bit = if (valid_4bit and valid_8bit)
-        if (config_gaffine_bits == 4) true else if (config_gaffine_bits == 8) false else (unpacked_4bit == expected_dim)
-    else
-        valid_4bit; // Only one is valid, use that
+    // 1. Config's gaffine_bits is a hint, but must agree with expected_dim
+    //    (mixed-precision models may use different bits for embedding vs linear)
+    // 2. Fall back to expected_dim matching when the config hint mismatches
+    const is_4bit = if (valid_4bit and valid_8bit) blk: {
+        if (config_gaffine_bits == 4 and unpacked_4bit == expected_dim) break :blk true;
+        if (config_gaffine_bits == 8 and unpacked_8bit == expected_dim) break :blk false;
+        break :blk (unpacked_4bit == expected_dim);
+    } else valid_4bit; // Only one is valid, use that
 
     const actual_dtype: DType = if (is_4bit) .grouped_affine_u4 else .grouped_affine_u8;
     const values_per_word: usize = if (is_4bit) 8 else 4;
