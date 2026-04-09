@@ -835,7 +835,7 @@ fn writeQuantizedWeights(
                     if (layout_map) |map| {
                         if (map.layouts.get(tensor_name)) |layout| {
                             if (layout == .embedding) {
-                                const default_embed_bits: u8 = 4;
+                                const default_embed_bits: u8 = 8;
                                 const bits: u8 = if (std.posix.getenv("TALU_CONVERT_EMBED_BITS")) |raw|
                                     std.fmt.parseInt(u8, raw, 10) catch default_embed_bits
                                 else
