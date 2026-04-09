@@ -13,8 +13,6 @@ use talu::TokenizerHandle;
 enum ConvertProfile {
     Best,
     Good,
-    Balanced,
-    Fast,
     Custom,
 }
 
@@ -23,8 +21,6 @@ impl ConvertProfile {
         match value.to_ascii_lowercase().as_str() {
             "best" | "quality" => Some(Self::Best),
             "good" => Some(Self::Good),
-            "balanced" => Some(Self::Balanced),
-            "fast" | "quick" => Some(Self::Fast),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -34,8 +30,6 @@ impl ConvertProfile {
         match self {
             Self::Best => talu::ConvertProfile::Best,
             Self::Good => talu::ConvertProfile::Good,
-            Self::Balanced => talu::ConvertProfile::Balanced,
-            Self::Fast => talu::ConvertProfile::Fast,
             Self::Custom => talu::ConvertProfile::Custom,
         }
     }

@@ -51,7 +51,7 @@ pub const ConvertOptions = struct {
     force: bool = false,
     max_shard_size: u64 = 0,
     progress: ProgressContext = ProgressContext.NONE,
-    profile: convert.scheme.QualityProfile = .fast,
+    profile: convert.scheme.QualityProfile = .good,
     calib_iters: u32 = 400,
     calib_nsamples: u32 = 256,
     calib_seqlen: u32 = 2048,
@@ -400,7 +400,7 @@ fn writeMxfp8Weights(
         break :blk loaded;
     };
     defer if (token_pool) |pool| allocator.free(pool);
-    const require_embedding_lookup = options.profile != .fast and options.calib_iters > 0;
+    const require_embedding_lookup = options.calib_iters > 0;
     var activation_capture_cache: ?calibration_capture.LayerActivationCache = null;
     defer if (activation_capture_cache) |*cache| cache.deinit();
     if (token_pool) |pool| {
@@ -805,8 +805,7 @@ fn calibrationOptimizerFromEnv(profile: convert.scheme.QualityProfile) Calibrati
         return parseCalibrationOptimizer(raw) orelse .search;
     }
     return switch (profile) {
-        .fast => .clip,
-        .balanced, .good, .best => .clip_search,
+        .good, .best => .clip_search,
         .custom => .search,
     };
 }
@@ -1890,7 +1889,6 @@ fn calibrationEvalBudget(rows: usize, cols: usize, options: ConvertOptions) Cali
     const batch_size = @as(usize, @intCast(@max(options.calib_batch_size, 1)));
     const nblocks = @as(usize, @intCast(@max(options.calib_nblocks, 1)));
     const fast_budget_mode = blk: {
-        if (options.profile == .fast) break :blk true;
         const raw = std.posix.getenv("TALU_CONVERT_CALIB_BUDGET_MODE") orelse break :blk false;
         if (std.ascii.eqlIgnoreCase(raw, "fast")) break :blk true;
         break :blk false;
@@ -2160,7 +2158,7 @@ fn estimateBlockForwardCalibrationParameters(
             eval_budget.input_samples,
             token_pool,
             options.calib_seed,
-            source_tensors != null and options.profile != .fast and options.calib_iters > 0,
+            source_tensors != null and options.calib_iters > 0,
         );
         break :blk &owned_block_inputs.?;
     };
@@ -3341,13 +3339,13 @@ test "estimateBlockForwardCalibration honors calibration iteration budget" {
     try std.testing.expect(summary.best_step < summary.steps);
 }
 
-test "estimateBlockForwardCalibration fast profile runs clip-only calibration" {
+test "estimateBlockForwardCalibration good profile runs clip+search calibration" {
     var values: [64]f32 = undefined;
     for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i));
 
     const options = ConvertOptions{
-        .profile = .fast,
-        .calib_iters = 100,
+        .profile = .good,
+        .calib_iters = 8,
         .calib_nsamples = 16,
         .calib_seqlen = 2048,
         .calib_batch_size = 1,
@@ -3355,8 +3353,7 @@ test "estimateBlockForwardCalibration fast profile runs clip-only calibration" {
         .calib_seed = 7,
     };
     const summary = try estimateBlockForwardCalibration(std.testing.allocator, null, &values, 4, 16, options, null);
-    try std.testing.expectEqual(@as(usize, 1), summary.steps);
-    try std.testing.expectEqual(@as(usize, 0), summary.best_iter);
+    try std.testing.expect(summary.steps >= 1);
     try std.testing.expect(summary.best_mse <= summary.baseline_mse);
 }
 
@@ -3415,8 +3412,6 @@ test "parseCalibrationOptimizer accepts aliases and rejects unknown values" {
 
 test "calibrationOptimizerFromEnv maps defaults per profile" {
     if (std.posix.getenv("TALU_CONVERT_CALIB_OPTIMIZER") != null) return error.SkipZigTest;
-    try std.testing.expectEqual(CalibrationOptimizer.clip, calibrationOptimizerFromEnv(.fast));
-    try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.balanced));
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.good));
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.best));
     try std.testing.expectEqual(CalibrationOptimizer.search, calibrationOptimizerFromEnv(.custom));
@@ -3428,7 +3423,7 @@ test "calibrationDatasetRequired requires dataset whenever calibration iteration
         .calib_iters = 500,
     }));
     try std.testing.expect(calibrationDatasetRequired(.{
-        .profile = .fast,
+        .profile = .good,
         .calib_iters = 1,
     }));
     try std.testing.expect(!calibrationDatasetRequired(.{

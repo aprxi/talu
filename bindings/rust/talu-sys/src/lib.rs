@@ -156,8 +156,6 @@ impl From<u8> for CItemType {
 pub enum QualityProfile {
     Best,
     Good,
-    Balanced,
-    Fast,
     Custom,
 }
 

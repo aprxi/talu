@@ -367,8 +367,8 @@ pub(super) struct ConvertArgs {
     #[arg(long, default_value = "tq4", value_name = "SCHEME", num_args = 1)]
     pub scheme: String,
 
-    /// Quality profile (best|good|balanced|fast|custom)
-    #[arg(long, default_value = "fast", value_name = "PROFILE", num_args = 1)]
+    /// Quality profile (best|good|custom)
+    #[arg(long, default_value = "good", value_name = "PROFILE", num_args = 1)]
     pub profile: String,
 
     /// Deterministic seed for conversion calibration/search

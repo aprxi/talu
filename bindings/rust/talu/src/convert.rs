@@ -67,9 +67,7 @@ impl Scheme {
 pub enum ConvertProfile {
     Best = 0,
     Good = 1,
-    Balanced = 2,
-    Fast = 3,
-    Custom = 4,
+    Custom = 2,
 }
 
 /// Options for model conversion.
@@ -176,8 +174,6 @@ fn map_profile_to_sys(profile: ConvertProfile) -> talu_sys::QualityProfile {
     match profile {
         ConvertProfile::Best => talu_sys::QualityProfile::Best,
         ConvertProfile::Good => talu_sys::QualityProfile::Good,
-        ConvertProfile::Balanced => talu_sys::QualityProfile::Balanced,
-        ConvertProfile::Fast => talu_sys::QualityProfile::Fast,
         ConvertProfile::Custom => talu_sys::QualityProfile::Custom,
     }
 }
@@ -255,7 +251,7 @@ pub fn convert(
     c_options.force = options.force;
     c_options.return_model_id = options.return_model_id;
     c_options.calibration_profile =
-        map_profile_to_sys(options.calibration_profile.unwrap_or(ConvertProfile::Fast));
+        map_profile_to_sys(options.calibration_profile.unwrap_or(ConvertProfile::Good));
     if let Some(seed) = options.calibration_seed {
         c_options.calibration_seed = seed;
     }
@@ -337,14 +333,6 @@ mod tests {
         assert_eq!(
             map_profile_to_sys(ConvertProfile::Good),
             QualityProfile::Good
-        );
-        assert_eq!(
-            map_profile_to_sys(ConvertProfile::Balanced),
-            QualityProfile::Balanced
-        );
-        assert_eq!(
-            map_profile_to_sys(ConvertProfile::Fast),
-            QualityProfile::Fast
         );
         assert_eq!(
             map_profile_to_sys(ConvertProfile::Custom),

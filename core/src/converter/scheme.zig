@@ -100,15 +100,11 @@ pub const QuantLevel = enum(u32) {
 pub const QualityProfile = enum(u32) {
     best,
     good,
-    balanced,
-    fast,
     custom,
 
     pub fn fromString(s: []const u8) ?QualityProfile {
         if (std.ascii.eqlIgnoreCase(s, "best") or std.ascii.eqlIgnoreCase(s, "quality")) return .best;
         if (std.ascii.eqlIgnoreCase(s, "good")) return .good;
-        if (std.ascii.eqlIgnoreCase(s, "balanced")) return .balanced;
-        if (std.ascii.eqlIgnoreCase(s, "fast") or std.ascii.eqlIgnoreCase(s, "quick")) return .fast;
         if (std.ascii.eqlIgnoreCase(s, "custom")) return .custom;
         return null;
     }
@@ -452,7 +448,7 @@ pub const ConvertOptions = extern struct {
     /// If true, resolve scheme from platform/quant instead of using scheme directly.
     use_platform_quant: bool = false,
     /// Calibration profile for MXFP8/NVFP4 conversion.
-    calibration_profile: QualityProfile = .fast,
+    calibration_profile: QualityProfile = .good,
     /// Deterministic calibration seed.
     calibration_seed: u64 = 42,
     /// Explicit calibration iteration override.
@@ -517,28 +513,21 @@ fn defaultCalibrationFor(profile: QualityProfile, scheme: Scheme) CalibrationSet
     const effective_profile: QualityProfile = if (profile == .custom) .best else profile;
     return switch (scheme) {
         .mxfp8 => switch (effective_profile) {
-            .best => .{ .profile = profile, .iters = 128, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .good => .{ .profile = profile, .iters = 64, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .balanced => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .fast => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .best => .{ .profile = profile, .iters = 64, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .good => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
             .custom => unreachable,
         },
         .nvfp4 => switch (effective_profile) {
-            .best => .{ .profile = profile, .iters = 500, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .good => .{ .profile = profile, .iters = 350, .nsamples = 192, .seqlen = 1536, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            // Balanced is an intentionally lighter clip+search profile.
-            .balanced => .{ .profile = profile, .iters = 16, .nsamples = 128, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .fast => .{ .profile = profile, .iters = 1, .nsamples = 16, .seqlen = 256, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .best => .{ .profile = profile, .iters = 350, .nsamples = 192, .seqlen = 1536, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .good => .{ .profile = profile, .iters = 16, .nsamples = 128, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
             .custom => unreachable,
         },
         .tq4_32, .tq4_64, .tq4_128, .tq8_32, .tq8_64, .tq8_128 => switch (effective_profile) {
-            .best => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .good => .{ .profile = profile, .iters = 16, .nsamples = 128, .seqlen = 1536, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .balanced => .{ .profile = profile, .iters = 8, .nsamples = 64, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
-            .fast => .{ .profile = profile, .iters = 1, .nsamples = 16, .seqlen = 256, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .best => .{ .profile = profile, .iters = 16, .nsamples = 128, .seqlen = 1536, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .good => .{ .profile = profile, .iters = 8, .nsamples = 64, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
             .custom => unreachable,
         },
-        else => .{ .profile = profile, .iters = 1, .nsamples = 16, .seqlen = 256, .batch_size = 1, .nblocks = 1, .seed = 42 },
+        else => .{ .profile = profile, .iters = 8, .nsamples = 64, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
     };
 }
 
@@ -1174,95 +1163,62 @@ test "QualityProfile.fromString" {
     try std.testing.expectEqual(QualityProfile.best, QualityProfile.fromString("best").?);
     try std.testing.expectEqual(QualityProfile.best, QualityProfile.fromString("QUALITY").?);
     try std.testing.expectEqual(QualityProfile.good, QualityProfile.fromString("good").?);
-    try std.testing.expectEqual(QualityProfile.balanced, QualityProfile.fromString("balanced").?);
-    try std.testing.expectEqual(QualityProfile.fast, QualityProfile.fromString("fast").?);
-    try std.testing.expectEqual(QualityProfile.fast, QualityProfile.fromString("quick").?);
     try std.testing.expectEqual(QualityProfile.custom, QualityProfile.fromString("custom").?);
     try std.testing.expect(QualityProfile.fromString("invalid") == null);
 }
 
 test "defaultCalibrationFor mxfp8 profiles" {
     const best = defaultCalibrationFor(.best, .mxfp8);
-    try std.testing.expectEqual(@as(u32, 128), best.iters);
+    try std.testing.expectEqual(@as(u32, 64), best.iters);
     try std.testing.expectEqual(@as(u32, 256), best.nsamples);
     try std.testing.expectEqual(@as(u32, 2048), best.seqlen);
     try std.testing.expectEqual(@as(u32, 1), best.batch_size);
     try std.testing.expectEqual(@as(u32, 1), best.nblocks);
 
     const good = defaultCalibrationFor(.good, .mxfp8);
-    try std.testing.expectEqual(@as(u32, 64), good.iters);
+    try std.testing.expectEqual(@as(u32, 32), good.iters);
     try std.testing.expectEqual(@as(u32, 256), good.nsamples);
     try std.testing.expectEqual(@as(u32, 2048), good.seqlen);
-
-    const balanced = defaultCalibrationFor(.balanced, .mxfp8);
-    try std.testing.expectEqual(@as(u32, 32), balanced.iters);
-    try std.testing.expectEqual(@as(u32, 256), balanced.nsamples);
-    try std.testing.expectEqual(@as(u32, 2048), balanced.seqlen);
-
-    const fast = defaultCalibrationFor(.fast, .mxfp8);
-    try std.testing.expectEqual(@as(u32, 32), fast.iters);
-    try std.testing.expectEqual(@as(u32, 256), fast.nsamples);
-    try std.testing.expectEqual(@as(u32, 2048), fast.seqlen);
 }
 
 test "defaultCalibrationFor nvfp4 profiles" {
     const best = defaultCalibrationFor(.best, .nvfp4);
-    try std.testing.expectEqual(@as(u32, 500), best.iters);
-    try std.testing.expectEqual(@as(u32, 256), best.nsamples);
-    try std.testing.expectEqual(@as(u32, 2048), best.seqlen);
+    try std.testing.expectEqual(@as(u32, 350), best.iters);
+    try std.testing.expectEqual(@as(u32, 192), best.nsamples);
+    try std.testing.expectEqual(@as(u32, 1536), best.seqlen);
     try std.testing.expectEqual(@as(u32, 1), best.batch_size);
     try std.testing.expectEqual(@as(u32, 1), best.nblocks);
 
     const good = defaultCalibrationFor(.good, .nvfp4);
-    try std.testing.expectEqual(@as(u32, 350), good.iters);
-    try std.testing.expectEqual(@as(u32, 192), good.nsamples);
-    try std.testing.expectEqual(@as(u32, 1536), good.seqlen);
-
-    const balanced = defaultCalibrationFor(.balanced, .nvfp4);
-    try std.testing.expectEqual(@as(u32, 16), balanced.iters);
-    try std.testing.expectEqual(@as(u32, 128), balanced.nsamples);
-    try std.testing.expectEqual(@as(u32, 1024), balanced.seqlen);
-
-    const fast = defaultCalibrationFor(.fast, .nvfp4);
-    try std.testing.expectEqual(@as(u32, 1), fast.iters);
-    try std.testing.expectEqual(@as(u32, 16), fast.nsamples);
-    try std.testing.expectEqual(@as(u32, 256), fast.seqlen);
+    try std.testing.expectEqual(@as(u32, 16), good.iters);
+    try std.testing.expectEqual(@as(u32, 128), good.nsamples);
+    try std.testing.expectEqual(@as(u32, 1024), good.seqlen);
 }
 
 test "defaultCalibrationFor grouped-affine profiles" {
     const best = defaultCalibrationFor(.best, .tq8_64);
-    try std.testing.expectEqual(@as(u32, 32), best.iters);
-    try std.testing.expectEqual(@as(u32, 256), best.nsamples);
-    try std.testing.expectEqual(@as(u32, 2048), best.seqlen);
+    try std.testing.expectEqual(@as(u32, 16), best.iters);
+    try std.testing.expectEqual(@as(u32, 128), best.nsamples);
+    try std.testing.expectEqual(@as(u32, 1536), best.seqlen);
 
     const good = defaultCalibrationFor(.good, .tq8_64);
-    try std.testing.expectEqual(@as(u32, 16), good.iters);
-    try std.testing.expectEqual(@as(u32, 128), good.nsamples);
-    try std.testing.expectEqual(@as(u32, 1536), good.seqlen);
-
-    const balanced = defaultCalibrationFor(.balanced, .tq8_64);
-    try std.testing.expectEqual(@as(u32, 8), balanced.iters);
-    try std.testing.expectEqual(@as(u32, 64), balanced.nsamples);
-    try std.testing.expectEqual(@as(u32, 1024), balanced.seqlen);
-
-    const fast = defaultCalibrationFor(.fast, .tq8_64);
-    try std.testing.expectEqual(@as(u32, 1), fast.iters);
-    try std.testing.expectEqual(@as(u32, 16), fast.nsamples);
-    try std.testing.expectEqual(@as(u32, 256), fast.seqlen);
+    try std.testing.expectEqual(@as(u32, 8), good.iters);
+    try std.testing.expectEqual(@as(u32, 64), good.nsamples);
+    try std.testing.expectEqual(@as(u32, 1024), good.seqlen);
 }
 
 test "defaultCalibrationFor custom uses best defaults" {
     const mxfp8_custom = defaultCalibrationFor(.custom, .mxfp8);
     try std.testing.expectEqual(QualityProfile.custom, mxfp8_custom.profile);
-    try std.testing.expectEqual(@as(u32, 128), mxfp8_custom.iters);
+    try std.testing.expectEqual(@as(u32, 64), mxfp8_custom.iters);
     try std.testing.expectEqual(@as(u32, 256), mxfp8_custom.nsamples);
     try std.testing.expectEqual(@as(u32, 2048), mxfp8_custom.seqlen);
 
     const nvfp4_custom = defaultCalibrationFor(.custom, .nvfp4);
     try std.testing.expectEqual(QualityProfile.custom, nvfp4_custom.profile);
-    try std.testing.expectEqual(@as(u32, 500), nvfp4_custom.iters);
-    try std.testing.expectEqual(@as(u32, 256), nvfp4_custom.nsamples);
-    try std.testing.expectEqual(@as(u32, 2048), nvfp4_custom.seqlen);
+    try std.testing.expectEqual(@as(u32, 350), nvfp4_custom.iters);
+    try std.testing.expectEqual(@as(u32, 192), nvfp4_custom.nsamples);
+    try std.testing.expectEqual(@as(u32, 1536), nvfp4_custom.seqlen);
 }
 
 test "resolveCalibrationFromOptions uses profile defaults and seed" {
@@ -1273,7 +1229,7 @@ test "resolveCalibrationFromOptions uses profile defaults and seed" {
     };
     const resolved = resolveCalibrationFromOptions(options, .mxfp8);
     try std.testing.expectEqual(QualityProfile.good, resolved.profile);
-    try std.testing.expectEqual(@as(u32, 64), resolved.iters);
+    try std.testing.expectEqual(@as(u32, 32), resolved.iters);
     try std.testing.expectEqual(@as(u32, 256), resolved.nsamples);
     try std.testing.expectEqual(@as(u32, 2048), resolved.seqlen);
     try std.testing.expectEqual(@as(u64, 1234), resolved.seed);

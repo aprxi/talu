@@ -89,7 +89,7 @@ pub const ConvertOptions = struct {
     max_shard_size: u64 = 0,
     /// Progress context for emitting progress updates.
     progress: ProgressContext = ProgressContext.NONE,
-    profile: convert.scheme.QualityProfile = .fast,
+    profile: convert.scheme.QualityProfile = .good,
     calib_iters: u32 = 1,
     calib_nsamples: u32 = 16,
     calib_seqlen: u32 = 256,
@@ -679,7 +679,7 @@ fn writeQuantizedWeights(
         break :blk loaded;
     };
     defer if (token_pool) |pool| allocator.free(pool);
-    const require_embedding_lookup = options.profile != .fast and options.calib_iters > 0;
+    const require_embedding_lookup = options.calib_iters > 0;
     var activation_capture_cache: ?calibration_capture.LayerActivationCache = null;
     defer if (activation_capture_cache) |*cache| cache.deinit();
     if (token_pool) |pool| {
@@ -829,7 +829,7 @@ fn writeQuantizedWeights(
                 }
                 // TALU_CONVERT_EMBED_BITS controls embedding quantization:
                 //   4  = grouped-affine U4 (default, same as linear weights)
-                //   8  = MXFP8 (FP8 E4M3 + block-32 scales, best quantized quality)
+                //   8  = grouped-affine U8 (higher quality, calibrated)
                 //   16 = BF16 (lossless, largest)
                 const embed_bits: ?u8 = blk: {
                     if (layout_map) |map| {
@@ -846,20 +846,25 @@ fn writeQuantizedWeights(
                     }
                     break :blk null;
                 };
-                // Non-default embedding format: MXFP8 or BF16.
+                // BF16 embedding: skip quantization entirely.
                 if (embed_bits) |eb| {
-                    if (eb == 8) {
-                        try copyTensorAsMxfp8(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor);
-                        quantized_layers += 1;
-                        continue;
-                    }
                     if (eb == 16) {
                         try copyTensorAsBf16(allocator, &tensor_builder, tensor_name, source_tensor);
                         quantized_layers += 1;
                         continue;
                     }
                 }
-                const effective_quant_config = quant_config;
+                // Override quant bits for embedding (U8 vs U4).
+                const effective_quant_config = blk: {
+                    if (embed_bits) |eb| {
+                        if ((eb == 4 or eb == 8) and eb != quant_config.bits) {
+                            var embed_cfg = quant_config;
+                            embed_cfg.bits = eb;
+                            break :blk embed_cfg;
+                        }
+                    }
+                    break :blk quant_config;
+                };
                 const calib_summary = try quantizeGroupedAffineTensor(allocator, if (cuda_calib_ctx) |*ctx| ctx else null, source_tensors, &tensor_builder, tensor_name, source_tensor, effective_quant_config, tensor_options, token_pool, &block_input_cache);
                 quantized_layers += 1;
                 mse_sum += calib_summary.best_mse;
@@ -1014,8 +1019,7 @@ fn calibrationOptimizerFromEnv(profile: convert.scheme.QualityProfile) Calibrati
         return parseCalibrationOptimizer(raw) orelse .search;
     }
     return switch (profile) {
-        .fast => .clip,
-        .balanced, .good, .best => .clip_search,
+        .good, .best => .clip_search,
         .custom => .search,
     };
 }
@@ -1667,10 +1671,7 @@ fn groupedCalibrationEvalBudget(rows: usize, cols: usize, options: ConvertOption
     const batch_size = @as(usize, @intCast(@max(options.calib_batch_size, 1)));
     const nblocks = @as(usize, @intCast(@max(options.calib_nblocks, 1)));
 
-    const row_target = if (options.profile == .fast)
-        nsamples
-    else
-        @max(@as(usize, 512), nsamples * 2);
+    const row_target = @max(@as(usize, 512), nsamples * 2);
     const row_samples = @max(@as(usize, 1), @min(rows, @min(row_target, @as(usize, 2048))));
 
     const requested_inputs_u64 = @as(u64, @intCast(seqlen)) * @as(u64, @intCast(batch_size)) * @as(u64, @intCast(nblocks));
@@ -2568,7 +2569,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
             eval_budget.input_samples,
             token_pool,
             options.calib_seed,
-            source_tensors != null and options.profile != .fast and options.calib_iters > 0,
+            source_tensors != null and options.calib_iters > 0,
         );
         break :blk &owned_block_inputs.?;
     };
@@ -4133,13 +4134,13 @@ test "estimateGroupedBlockForwardCalibration honors calibration iteration budget
     try std.testing.expect(summary.best_step < summary.steps);
 }
 
-test "estimateGroupedBlockForwardCalibration fast profile runs clip-only calibration" {
+test "estimateGroupedBlockForwardCalibration good profile runs clip+search calibration" {
     var values: [64]f32 = undefined;
     for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i));
 
     const options = ConvertOptions{
-        .profile = .fast,
-        .calib_iters = 100,
+        .profile = .good,
+        .calib_iters = 8,
         .calib_nsamples = 16,
         .calib_seqlen = 2048,
         .calib_batch_size = 1,
@@ -4148,8 +4149,7 @@ test "estimateGroupedBlockForwardCalibration fast profile runs clip-only calibra
     };
 
     const summary = try estimateGroupedBlockForwardCalibration(std.testing.allocator, null, &values, 4, 16, 16, 4, options, null);
-    try std.testing.expectEqual(@as(usize, 1), summary.steps);
-    try std.testing.expectEqual(@as(usize, 0), summary.best_iter);
+    try std.testing.expect(summary.steps >= 1);
     try std.testing.expect(summary.best_mse <= summary.baseline_mse);
 }
 
@@ -4164,8 +4164,6 @@ test "parseCalibrationOptimizer accepts aliases and rejects unknown values" {
 
 test "calibrationOptimizerFromEnv maps defaults per profile" {
     if (std.posix.getenv("TALU_CONVERT_CALIB_OPTIMIZER") != null) return error.SkipZigTest;
-    try std.testing.expectEqual(CalibrationOptimizer.clip, calibrationOptimizerFromEnv(.fast));
-    try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.balanced));
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.good));
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.best));
     try std.testing.expectEqual(CalibrationOptimizer.search, calibrationOptimizerFromEnv(.custom));
@@ -4284,7 +4282,7 @@ test "calibrationDatasetRequired requires dataset whenever calibration iteration
         .calib_iters = 500,
     }));
     try std.testing.expect(calibrationDatasetRequired(.{
-        .profile = .fast,
+        .profile = .good,
         .calib_iters = 1,
     }));
     try std.testing.expect(!calibrationDatasetRequired(.{
