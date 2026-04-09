@@ -1045,6 +1045,47 @@ fn dequantizeMxfp8WeightToBf16(
     return owned.view();
 }
 
+/// Dequantize an MXFP8 embedding tensor to BF16.
+/// Unlike dequantizeMxfp8WeightToBf16, this skips orientation checks since
+/// embeddings are always [vocab, hidden] and never need transposition.
+fn dequantizeMxfp8EmbeddingToBf16(allocator: std.mem.Allocator, t: Tensor) !Tensor {
+    if (t.n_dims != 2) return error.InvalidShape;
+    const meta = t.mxfp8 orelse return error.MissingScales;
+
+    const rows: usize = @intCast(t.shape[0]);
+    const cols: usize = @intCast(t.shape[1]);
+    if (rows == 0 or cols == 0) return error.InvalidShape;
+
+    const scale_ptr = meta.block_scales_data orelse return error.MissingScales;
+    const scale_cols: usize = @intCast(meta.scale_cols);
+    if (scale_cols == 0) return error.InvalidShape;
+
+    const required_scale_cols = (cols + 31) / 32;
+    if (scale_cols < required_scale_cols) return error.InvalidShape;
+    const required_scale_len = rows * scale_cols;
+    if (meta.block_scales_len < required_scale_len) return error.InvalidShape;
+    const scales = scale_ptr[0..required_scale_len];
+
+    const src = t.data();
+    const required_src_len = rows * cols;
+    if (src.len < required_src_len) return error.InvalidShape;
+    const src_bytes = src[0..required_src_len];
+
+    const owned = try tensor.OwnedTensor.init(allocator, .bf16, &.{ rows, cols });
+    const dst_u16 = owned.asSlice(u16);
+
+    for (0..rows) |r| {
+        const scale_row = scales[r * scale_cols ..][0..scale_cols];
+        for (0..cols) |c| {
+            const idx = r * cols + c;
+            const scale = ue8m0ToScale(scale_row[c / 32]);
+            dst_u16[idx] = dtype.f32ToBf16(dtype.fp8e4m3ToF32(src_bytes[idx]) * scale);
+        }
+    }
+
+    return owned.view();
+}
+
 /// Orient a fused 3D expert weight tensor [n_experts, out, in].
 /// For GAF4/GAF8: infer gaffine params and attach metadata (scales/biases + shape override).
 /// For native dtypes (BF16, F16, etc.): pass through unchanged.
@@ -1673,7 +1714,7 @@ pub fn ensureF32(allocator: std.mem.Allocator, t: Tensor) !Tensor {
     };
 }
 
-pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTensors, name: []const u8, config: ModelConfig) !Tensor {
+pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTensors, name: []const u8, config: ModelConfig, dequantize_mxfp8_to_bf16: bool) !Tensor {
     var embed_tensor = try st.getTensor(name, null);
 
     // U32 from safetensors maps to grouped_affine_u4 by default
@@ -1689,6 +1730,39 @@ pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeT
 
     if ((embed_tensor.dtype == .u8 or embed_tensor.dtype == .i8) and std.mem.endsWith(u8, name, ".weight_packed")) {
         return dequantizeNvfp4WeightToBf16(allocator, st, name, embed_tensor);
+    }
+
+    // MXFP8 embedding: attach block scale metadata so the backend can
+    // dequantize only the rows selected by token IDs at inference time.
+    if (embed_tensor.dtype == .f8_e4m3) mxfp8_embed: {
+        const base = if (std.mem.endsWith(u8, name, ".weight"))
+            name[0 .. name.len - ".weight".len]
+        else
+            name;
+        var scale_name_buf: [256]u8 = undefined;
+        const scale_name = std.fmt.bufPrint(&scale_name_buf, "{s}.weight_block_scale", .{base}) catch break :mxfp8_embed;
+        const scale_tensor = st.getTensor(scale_name, null) catch break :mxfp8_embed;
+        if (scale_tensor.n_dims != 2) break :mxfp8_embed;
+        if (scale_tensor.dtype != .u8 and scale_tensor.dtype != .i8) break :mxfp8_embed;
+        const s_rows: usize = @intCast(scale_tensor.shape[0]);
+        const s_cols: usize = @intCast(scale_tensor.shape[1]);
+        const w_rows: usize = @intCast(embed_tensor.shape[0]);
+        if (s_rows != w_rows) break :mxfp8_embed;
+        const scale_data = scale_tensor.data();
+        const scale_byte_len = s_rows * s_cols;
+        if (scale_data.len < scale_byte_len) break :mxfp8_embed;
+        embed_tensor.mxfp8 = .{
+            .block_scales_data = scale_data.ptr,
+            .block_scales_len = scale_byte_len,
+            .rows = @intCast(w_rows),
+            .cols = @intCast(embed_tensor.shape[1]),
+            .scale_cols = @intCast(s_cols),
+        };
+        // Always dequantize MXFP8 embeddings to BF16 for CPU/CUDA backends.
+        // The metal backend loads weights independently via MLX and handles
+        // MXFP8 embeddings natively (dequant-after-take).
+        _ = dequantize_mxfp8_to_bf16;
+        return dequantizeMxfp8EmbeddingToBf16(allocator, embed_tensor);
     }
 
     // Keep dense embedding tables in their native dtype so tied-lm-head models
@@ -2575,7 +2649,7 @@ test "orientEmbedding keeps f16 embedding dtype" {
 
     var config = std.mem.zeroes(ModelConfig);
     config.d_model = 2; // embedding dimension
-    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed", config);
+    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed", config, false);
 
     try std.testing.expectEqual(DType.f16, result.dtype);
     try std.testing.expectEqual(@as(u8, 2), result.n_dims);
@@ -2613,7 +2687,7 @@ test "orientEmbedding passes through f32 embedding unchanged" {
 
     var config = std.mem.zeroes(ModelConfig);
     config.d_model = 2;
-    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed", config);
+    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed", config, false);
 
     try std.testing.expectEqual(DType.f32, result.dtype);
     const out = result.asSlice(f32);
@@ -2657,7 +2731,7 @@ test "orientEmbedding dequantizes NVFP4 packed embedding to BF16" {
 
     var config = std.mem.zeroes(ModelConfig);
     config.d_model = 4;
-    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed.weight_packed", config);
+    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed.weight_packed", config, false);
 
     try std.testing.expectEqual(DType.bf16, result.dtype);
     try std.testing.expectEqual(@as(i64, 2), result.shape[0]);

@@ -721,63 +721,6 @@ bool ends_with(const std::string& s, const std::string& suffix) {
     return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin());
 }
 
-uint64_t fnv1a64_update_bytes(uint64_t hash, const void* data, size_t len) {
-    const uint8_t* ptr = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= static_cast<uint64_t>(ptr[i]);
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-uint64_t fnv1a64_update_str(uint64_t hash, const std::string& value) {
-    return fnv1a64_update_bytes(hash, value.data(), value.size());
-}
-
-uint64_t fnv1a64_update_u64(uint64_t hash, uint64_t value) {
-    return fnv1a64_update_bytes(hash, &value, sizeof(value));
-}
-
-std::string hex_u64(uint64_t value) {
-    char buf[17] = {0};
-    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(value));
-    return std::string(buf);
-}
-
-bool metal_weight_cache_enabled() {
-    return !env_truthy("TALU_METAL_MODEL_CACHE_DISABLE", false);
-}
-
-bool metal_weight_cache_debug_enabled() {
-    return env_truthy("TALU_METAL_MODEL_CACHE_DEBUG", false);
-}
-
-std::filesystem::path metal_weight_cache_dir(const std::string& model_path) {
-    return std::filesystem::path(model_path) / ".cache" / "talu-metal";
-}
-
-std::string build_weight_cache_fingerprint(
-    const std::string& model_path,
-    const std::vector<std::string>& weight_files
-) {
-    namespace fs = std::filesystem;
-    uint64_t hash = 1469598103934665603ULL;
-    hash = fnv1a64_update_str(hash, "talu-metal-weight-cache-v1");
-    hash = fnv1a64_update_str(hash, model_path);
-    hash = fnv1a64_update_u64(hash, static_cast<uint64_t>(weight_files.size()));
-    for (const std::string& rel : weight_files) {
-        const fs::path abs_path = fs::path(model_path) / rel;
-        const std::string abs = abs_path.string();
-        const uint64_t size = static_cast<uint64_t>(fs::file_size(abs_path));
-        const uint64_t mtime = static_cast<uint64_t>(fs::last_write_time(abs_path).time_since_epoch().count());
-        hash = fnv1a64_update_str(hash, rel);
-        hash = fnv1a64_update_str(hash, abs);
-        hash = fnv1a64_update_u64(hash, size);
-        hash = fnv1a64_update_u64(hash, mtime);
-    }
-    return hex_u64(hash);
-}
-
 std::string read_file(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -2360,7 +2303,10 @@ struct mlx_ctx {
 
     Qwen35Config cfg;
 
-    array embed_tokens = array(0.0f); // [vocab, hidden]
+    array embed_tokens = array(0.0f); // [vocab, hidden] (BF16 or dequantized)
+    array embed_tokens_raw = array(0.0f); // [vocab, hidden] uint8 (MXFP8 E4M3, when applicable)
+    array embed_tokens_scales = array(0.0f); // [vocab, scale_cols] f32 (expanded MXFP8 block scales)
+    bool embed_is_mxfp8 = false;
     array lm_head_rhs = array(0.0f);  // [hidden, vocab]
     array lm_head_q_w = array(0.0f);  // [vocab, hidden * bits / 32] packed
     array lm_head_q_scales = array(0.0f); // [vocab, hidden / group_size]
@@ -3321,7 +3267,16 @@ array forward_hidden(
     bool apply_final_norm,
     const TraceFrame* trace_frame = nullptr
 ) {
-    array hidden = take(ctx->embed_tokens, input_ids, 0); // [B,S,H]
+    array hidden = array(0.0f);
+    if (ctx->embed_is_mxfp8) {
+        // MXFP8 embedding: take raw uint8 rows, then dequantize.
+        // Only the selected rows are converted, not the full vocab table.
+        const array raw_rows = take(ctx->embed_tokens_raw, input_ids, 0); // [B,S,H] u8
+        const array scale_rows = take(ctx->embed_tokens_scales, input_ids, 0); // [B,S,H] f32
+        hidden = astype(from_fp8(raw_rows, float32) * scale_rows, bfloat16);
+    } else {
+        hidden = take(ctx->embed_tokens, input_ids, 0); // [B,S,H]
+    }
     if (std::fabs(ctx->cfg.embedding_multiplier - 1.0f) > 1.0e-6f) {
         hidden = hidden * array(ctx->cfg.embedding_multiplier, hidden.dtype());
     }
@@ -4313,92 +4268,57 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             "TALU_METAL_KEEP_DENSE_RHS_FOR_PREFILL",
             default_keep_dense_rhs_for_prefill
         );
-        const bool enable_model_cache = metal_weight_cache_enabled();
-        if (metal_weight_cache_debug_enabled()) {
-            std::fprintf(stderr, "[mlx][cache] model_cache_enabled=%d\n", enable_model_cache ? 1 : 0);
-        }
-        std::unordered_map<std::string, array> runtime_cache_loaded;
-        std::unordered_map<std::string, array> runtime_cache_new;
-        std::string runtime_cache_fingerprint;
-        std::filesystem::path runtime_cache_dir;
-        std::filesystem::path runtime_cache_file;
-        if (enable_model_cache) {
-            try {
-                const std::vector<std::string> cache_weight_files = discover_weight_files(ctx->model_path);
-                runtime_cache_fingerprint = build_weight_cache_fingerprint(ctx->model_path, cache_weight_files);
-                runtime_cache_dir = metal_weight_cache_dir(ctx->model_path);
-                const std::string runtime_profile =
-                    std::string("v3-kd") + (keep_dense_rhs_for_prefill ? "1" : "0") +
-                    "-dq" + (ctx->fp8_decode_qmm_enabled ? "1" : "0");
-                runtime_cache_file = runtime_cache_dir / ("runtime-" + runtime_profile + "-" + runtime_cache_fingerprint + ".safetensors");
-                if (std::filesystem::exists(runtime_cache_file)) {
-                    auto cached = load_safetensors(runtime_cache_file.string());
-                    runtime_cache_loaded = std::move(cached.first);
-                    if (metal_weight_cache_debug_enabled()) {
-                        std::fprintf(
-                            stderr,
-                            "[mlx][cache] loaded runtime cache file=%s tensors=%zu\n",
-                            runtime_cache_file.c_str(),
-                            runtime_cache_loaded.size()
-                        );
-                    }
-                }
-            } catch (const std::exception& e) {
-                if (metal_weight_cache_debug_enabled()) {
-                    std::fprintf(stderr, "[mlx][cache] load failed reason=%s\n", e.what());
-                }
-                runtime_cache_loaded.clear();
-                runtime_cache_new.clear();
-            }
-        }
-
-        auto load_runtime_tensor = [&](const std::string& cache_key, const std::function<array()>& build_fn) -> array {
-            if (enable_model_cache) {
-                auto it_loaded = runtime_cache_loaded.find(cache_key);
-                if (it_loaded != runtime_cache_loaded.end()) return it_loaded->second;
-                auto it_new = runtime_cache_new.find(cache_key);
-                if (it_new != runtime_cache_new.end()) return it_new->second;
-            }
-            const array built = build_fn();
-            if (enable_model_cache) {
-                runtime_cache_new.emplace(cache_key, built);
-                if (metal_weight_cache_debug_enabled()) {
-                    std::fprintf(stderr, "[mlx][cache] miss key=%s\n", cache_key.c_str());
-                }
-            }
-            return built;
-        };
-
         auto load_embed_weight = [&](const std::string& weight_key) -> array {
-            return load_runtime_tensor("runtime::embed::" + weight_key, [&]() {
-                return load_linear_weight(tensors, ctx->cfg, weight_key);
-            });
+            // MXFP8 embeddings: keep the raw uint8 tensor and block scales
+            // so that inference can dequantize only the rows selected by
+            // token IDs (negligible cost vs full-table dequant).
+            if (ends_with(weight_key, ".weight")) {
+                const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+                const std::string block_scale_key = base + ".weight_block_scale";
+                auto raw_it = tensors.find(weight_key);
+                auto scale_it = tensors.find(block_scale_key);
+                if (raw_it != tensors.end() && scale_it != tensors.end() &&
+                    raw_it->second.ndim() == 2 && scale_it->second.ndim() == 2 &&
+                    (raw_it->second.dtype() == uint8 || raw_it->second.dtype() == int8) &&
+                    !has_grouped_affine_metadata_for_key(tensors, weight_key)) {
+                    const array& raw_weight = raw_it->second;
+                    const array& raw_scales = scale_it->second;
+                    const int rows = raw_weight.shape(0);
+                    const int cols = raw_weight.shape(1);
+
+                    // Decode E8M0 block scales to f32 and expand to [rows, cols].
+                    array scales_f32 = array(1.0f);
+                    if (raw_scales.dtype() == uint8 || raw_scales.dtype() == int8) {
+                        const array scales_u8 = astype(raw_scales, uint8);
+                        const int flat_size = static_cast<int>(scales_u8.size());
+                        const array flat_u8 = reshape(scales_u8, {flat_size});
+                        eval(flat_u8);
+                        const uint8_t* scale_bytes = flat_u8.data<uint8_t>();
+                        std::vector<float> decoded(static_cast<size_t>(flat_size));
+                        for (int idx = 0; idx < flat_size; ++idx) {
+                            const uint32_t exp_bits = static_cast<uint32_t>(scale_bytes[idx]) << 23;
+                            float scale = 0.0f;
+                            std::memcpy(&scale, &exp_bits, sizeof(float));
+                            decoded[static_cast<size_t>(idx)] = scale;
+                        }
+                        scales_f32 = array(decoded.begin(), Shape{raw_scales.shape(0), raw_scales.shape(1)}, float32);
+                    } else {
+                        scales_f32 = astype(raw_scales, float32);
+                    }
+                    ctx->embed_tokens_raw = raw_weight;
+                    ctx->embed_tokens_scales = expand_block_scales(scales_f32, rows, cols, weight_key);
+                    ctx->embed_is_mxfp8 = true;
+                    // Return raw for assignment to embed_tokens; inference will
+                    // use embed_tokens_raw + embed_tokens_scales after take().
+                    return raw_weight;
+                }
+            }
+            return load_linear_weight(tensors, ctx->cfg, weight_key);
         };
 
         auto load_rhs_weight = [&](const std::string& weight_key) -> array {
-            return load_runtime_tensor("runtime::rhs::" + weight_key, [&]() {
-                const array dense = load_linear_weight(tensors, ctx->cfg, weight_key);
-                return to_rhs(dense, weight_key);
-            });
-        };
-
-        auto load_runtime_bool_flag = [&](const std::string& flag_key, bool* out_value) -> bool {
-            auto it = runtime_cache_loaded.find(flag_key);
-            if (it == runtime_cache_loaded.end()) return false;
-            const array flag_i32 = astype(it->second, int32);
-            eval(flag_i32);
-            const int32_t* ptr = flag_i32.data<int32_t>();
-            *out_value = ptr != nullptr && ptr[0] != 0;
-            return true;
-        };
-
-        auto runtime_cache_put = [&](std::unordered_map<std::string, array>* map, const std::string& key, const array& value) {
-            auto it = map->find(key);
-            if (it == map->end()) {
-                map->emplace(key, value);
-            } else {
-                it->second = value;
-            }
+            const array dense = load_linear_weight(tensors, ctx->cfg, weight_key);
+            return to_rhs(dense, weight_key);
         };
 
         auto maybe_quantize_mxfp8_matrix = [&](
@@ -4412,27 +4332,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             array* out_q_biases,
             bool* out_has_q
         ) {
-            if (enable_model_cache) {
-                const std::string q_prefix = "runtime::q::" + weight_key;
-                const std::string has_key = q_prefix + "::has";
-                bool cached_has_q = false;
-                if (load_runtime_bool_flag(has_key, &cached_has_q)) {
-                    *out_has_q = cached_has_q;
-                    if (!cached_has_q) return;
-                    auto it_w = runtime_cache_loaded.find(q_prefix + "::w");
-                    auto it_s = runtime_cache_loaded.find(q_prefix + "::scales");
-                    if (it_w != runtime_cache_loaded.end() && it_s != runtime_cache_loaded.end()) {
-                        *out_q_w = it_w->second;
-                        *out_q_scales = it_s->second;
-                        if (out_q_biases != nullptr) {
-                            auto it_b = runtime_cache_loaded.find(q_prefix + "::biases");
-                            if (it_b != runtime_cache_loaded.end()) *out_q_biases = it_b->second;
-                        }
-                        return;
-                    }
-                }
-            }
-
             ::maybe_quantize_mxfp8_matrix(
                 tensors_ref,
                 cfg_ref,
@@ -4444,18 +4343,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 out_q_biases,
                 out_has_q
             );
-
-            if (enable_model_cache) {
-                const std::string q_prefix = "runtime::q::" + weight_key;
-                runtime_cache_put(&runtime_cache_new, q_prefix + "::has", array(static_cast<int32_t>(*out_has_q ? 1 : 0), int32));
-                if (*out_has_q) {
-                    runtime_cache_put(&runtime_cache_new, q_prefix + "::w", *out_q_w);
-                    runtime_cache_put(&runtime_cache_new, q_prefix + "::scales", *out_q_scales);
-                    if (out_q_biases != nullptr) {
-                        runtime_cache_put(&runtime_cache_new, q_prefix + "::biases", *out_q_biases);
-                    }
-                }
-            }
         };
 
         const std::string text_prefix = detect_text_prefix(tensors);
@@ -4514,17 +4401,19 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             ctx->lm_head_q_decode_enabled = lm_head_has_q;
         }
 
-        // Non-MXFP8 checkpoints still run prefill through the regular lm_head
-        // matmul path (decode-only QMM), so keep rhs available in that case.
-        if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled || !ctx->has_fp8_meta) {
+        // Keep dense lm_head RHS only when no quantized matmul format is
+        // available.  Grouped-affine and NVFP4 checkpoints support QMM for both
+        // prefill and decode, so the dense transpose is unnecessary.
+        if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled ||
+            (!ctx->has_fp8_meta && !ctx->has_grouped_affine_meta && !has_nvfp4_meta)) {
             if (lm_head_weight.size() == 1) lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
-            ctx->lm_head_rhs = load_runtime_tensor("runtime::lm_head_rhs::" + lm_head_key, [&]() {
+            {
                 array rhs = to_rhs(lm_head_weight, lm_head_key);
                 if (ctx->cfg.hidden_size_per_layer_input > 0 && !ctx->lm_head_q_decode_enabled) {
                     rhs = stop_gradient(copy(astype(rhs, float32)));
                 }
-                return rhs;
-            });
+                ctx->lm_head_rhs = rhs;
+            }
         }
 
         array per_layer_model_projection_weight = array(0.0f);
@@ -5299,43 +5188,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             ctx->layers.push_back(std::move(lw));
         }
 
-        if (enable_model_cache && !runtime_cache_new.empty()) {
-            try {
-                std::filesystem::create_directories(runtime_cache_dir);
-                std::unordered_map<std::string, array> runtime_cache_to_save = runtime_cache_loaded;
-                for (auto& kv : runtime_cache_new) {
-                    auto it = runtime_cache_to_save.find(kv.first);
-                    if (it == runtime_cache_to_save.end()) {
-                        runtime_cache_to_save.emplace(kv.first, kv.second);
-                    } else {
-                        it->second = kv.second;
-                    }
-                }
-                const std::filesystem::path tmp_file = runtime_cache_file.string() + ".tmp.safetensors";
-                std::unordered_map<std::string, std::string> metadata;
-                metadata.emplace("talu_cache_kind", "runtime_cache_v3");
-                metadata.emplace("talu_cache_fingerprint", runtime_cache_fingerprint);
-                save_safetensors(tmp_file.string(), std::move(runtime_cache_to_save), metadata);
-                if (std::filesystem::exists(runtime_cache_file)) {
-                    std::filesystem::remove(runtime_cache_file);
-                }
-                std::filesystem::rename(tmp_file, runtime_cache_file);
-                if (metal_weight_cache_debug_enabled()) {
-                    std::fprintf(
-                        stderr,
-                        "[mlx][cache] saved runtime cache file=%s new=%zu\n",
-                        runtime_cache_file.c_str(),
-                        runtime_cache_new.size()
-                    );
-                }
-            } catch (const std::exception& e) {
-                if (metal_weight_cache_debug_enabled()) {
-                    std::fprintf(stderr, "[mlx][cache] save failed reason=%s\n", e.what());
-                }
-                // Best-effort cache write.
-            }
-        }
-
         const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", true);
         if (enable_init_warmup) {
             // Pre-warm compiled compute_g path so WARMUP=0 benchmarks do not
@@ -5459,6 +5311,9 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         // Arrays are ref-counted in MLX. Copying these fields keeps one shared
         // immutable weight set while each context owns independent runtime state.
         ctx->embed_tokens = source_ctx->embed_tokens;
+        ctx->embed_tokens_raw = source_ctx->embed_tokens_raw;
+        ctx->embed_tokens_scales = source_ctx->embed_tokens_scales;
+        ctx->embed_is_mxfp8 = source_ctx->embed_is_mxfp8;
         ctx->lm_head_rhs = source_ctx->lm_head_rhs;
         ctx->lm_head_q_w = source_ctx->lm_head_q_w;
         ctx->lm_head_q_scales = source_ctx->lm_head_q_scales;

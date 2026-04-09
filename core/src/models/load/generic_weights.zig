@@ -333,7 +333,7 @@ fn applySpecTransforms(
             expected_in,
             model_config.*,
         ),
-        .embedding => try transforms.orientEmbedding(allocator, safetensors, name, model_config.*),
+        .embedding => try transforms.orientEmbedding(allocator, safetensors, name, model_config.*, options.dequantize_mxfp8_to_bf16),
         .conv1d_depthwise => try transforms.ensureF32(allocator, raw_tensor),
         .none => raw_tensor,
     };

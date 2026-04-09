@@ -778,6 +778,18 @@ fn writeQuantizedWeights(
             // Use architecture-driven layout to determine if tensor should be quantized.
             // Unknown tensors are kept in source precision.
             if (convert.shouldQuantizeTensorByLayout(layout_map, tensor_name, source_tensor)) {
+                // Embedding weights are stored as BF16 instead of quantized.
+                // Embedding lookup is a table index (not matmul), so quantization
+                // only saves storage at the cost of expensive runtime dequantization
+                // and a large runtime cache.
+                if (layout_map) |map| {
+                    if (map.layouts.get(tensor_name)) |layout| {
+                        if (layout == .embedding) {
+                            try copyTensorAsMxfp8(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor);
+                            continue;
+                        }
+                    }
+                }
                 const layer_index = extractLayerIndexFromTensorName(tensor_name);
                 if (show_calib_progress) {
                     if (active_layer) |layer| {
@@ -3490,6 +3502,83 @@ fn copyTensorUnchanged(
     const shape_array = source_tensor.shapeAsUsize();
     const shape = shape_array[0..@intCast(source_tensor.n_dims)];
     try builder.addTensor(tensor_name, source_tensor.dtype, shape, source_tensor.data()[0..source_tensor.data_size]);
+}
+
+/// Write an embedding tensor in MXFP8 format (E4M3 values + UE8M0 block
+/// scales).  MXFP8 is ~2x smaller than BF16 and the runtime only needs to
+/// dequantize the rows selected by token IDs (negligible cost).  For tied-
+/// weight models the lm_head QMM path can consume the packed data directly.
+fn copyTensorAsMxfp8(
+    allocator: std.mem.Allocator,
+    source_tensors: *safetensors.UnifiedSafeTensors,
+    builder: *safetensors.Builder,
+    tensor_name: []const u8,
+    source_tensor: Tensor,
+) !void {
+    _ = source_tensors;
+    if (source_tensor.n_dims != 2) return error.UnsupportedShape;
+
+    const rows: usize = @intCast(source_tensor.shape[0]);
+    const cols: usize = @intCast(source_tensor.shape[1]);
+    const scale_cols = (cols + 31) / 32;
+
+    const f32_result = try convert.tensorToF32(allocator, source_tensor);
+    defer f32_result.deinit(allocator);
+    const f32_slice = f32_result.asF32Slice();
+
+    const fp8_values = try allocator.alloc(u8, rows * cols);
+    defer allocator.free(fp8_values);
+    const e8m0_scales = try allocator.alloc(u8, rows * scale_cols);
+    defer allocator.free(e8m0_scales);
+
+    for (0..rows) |row| {
+        const row_src = f32_slice[row * cols ..][0..cols];
+        const row_dst = fp8_values[row * cols ..][0..cols];
+        const row_scales = e8m0_scales[row * scale_cols ..][0..scale_cols];
+
+        for (0..scale_cols) |g| {
+            const start = g * 32;
+            const end = @min(start + 32, cols);
+
+            // Compute group absmax.
+            var absmax: f32 = 0.0;
+            for (row_src[start..end]) |v| {
+                const av = @abs(v);
+                if (av > absmax) absmax = av;
+            }
+
+            // E8M0 encoding: shared_exp = floor(log2(absmax)) - 8, clamped.
+            const shared_exp: f32 = blk: {
+                if (absmax <= 0.0) break :blk -8.0;
+                const exp_floor = @floor(std.math.log2(absmax));
+                break :blk std.math.clamp(exp_floor - 8.0, -127.0, 127.0);
+            };
+            const e8m0: u8 = @intCast(@as(u32, @intFromFloat(std.math.clamp(shared_exp + 127.0, 0.0, 255.0))));
+            row_scales[g] = e8m0;
+
+            // Inverse scale for quantizing values into E4M3 range.
+            const scale_bits: u32 = @as(u32, e8m0) << 23;
+            const scale: f32 = @bitCast(scale_bits);
+            const inv_scale: f32 = if (scale > 0.0) 1.0 / scale else 0.0;
+
+            for (row_src[start..end], row_dst[start..end]) |v, *dst| {
+                dst.* = dtype_mod.f32ToFp8E4M3(v * inv_scale);
+            }
+        }
+    }
+
+    const shape_2d: [2]usize = .{ rows, cols };
+    try builder.addTensor(tensor_name, .f8_e4m3, &shape_2d, fp8_values);
+
+    // Write block scales as a companion tensor.
+    const base = if (std.mem.endsWith(u8, tensor_name, ".weight"))
+        tensor_name[0 .. tensor_name.len - ".weight".len]
+    else
+        tensor_name;
+    var scale_name_buf: [512]u8 = undefined;
+    const scale_name = std.fmt.bufPrint(&scale_name_buf, "{s}.weight_block_scale", .{base}) catch return error.NameTooLong;
+    const scale_shape: [2]usize = .{ rows, scale_cols };
+    try builder.addTensor(scale_name, .u8, &scale_shape, e8m0_scales);
 }
 
 // =============================================================================
