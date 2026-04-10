@@ -2930,6 +2930,75 @@ void* mlx_lazy_gated_delta_mixer_quantized(
         .fn = state_space_apply_quantized_linear,
         .ctx = &out_proj_ctx,
     };
+
+    const bool is_single_token_decode = (input_arr.shape(1) == 1);
+    if (!use_reference_recurrence and is_single_token_decode
+            and layer_state != nullptr and layer_state->gdelta_compiled_fn == nullptr) {
+        const array ck = conv_kernel_broadcast;
+        const std::optional<array> cb_cap = conv_bias_row;
+        const std::optional<array> db_cap = dt_bias_row;
+        const array al = static_terms.a_log_exp_row;
+        const std::optional<array> nw_cap = static_terms.norm_weight_heads;
+        const array in_w_cap = in_proj_w;
+        const array in_s_cap = in_proj_s;
+        const array in_b_cap = in_proj_b;
+        const array out_w_cap = out_proj_w;
+        const array out_s_cap = out_proj_s;
+        const array out_b_cap = out_proj_b;
+        const int dc = d_conv_i, nh = n_heads_i, nkh = n_key_heads_i, dh = d_head_i;
+        const int gs = group_size_i, qb = bits_i;
+        auto decode_fn = [ck, cb_cap, db_cap, al, nw_cap,
+                          in_w_cap, in_s_cap, in_b_cap,
+                          out_w_cap, out_s_cap, out_b_cap,
+                          dc, nh, nkh, dh, gs, qb](
+            const std::vector<array>& inputs
+        ) -> std::vector<array> {
+            array x = inputs[0];
+            array cs = inputs[1];
+            array ss = inputs[2];
+            StateSpaceQuantLinearCtx in_ctx_cap{
+                .w = &in_w_cap,
+                .s = &in_s_cap,
+                .b = &in_b_cap,
+                .s_handle = nullptr,
+                .b_handle = nullptr,
+                .group_size = gs,
+                .bits = qb,
+            };
+            StateSpaceQuantLinearCtx out_ctx_cap{
+                .w = &out_w_cap,
+                .s = &out_s_cap,
+                .b = &out_b_cap,
+                .s_handle = nullptr,
+                .b_handle = nullptr,
+                .group_size = gs,
+                .bits = qb,
+            };
+            StateSpaceCallable in_fn_c{.fn = state_space_apply_quantized_linear, .ctx = &in_ctx_cap};
+            StateSpaceCallable out_fn_c{.fn = state_space_apply_quantized_linear, .ctx = &out_ctx_cap};
+            const array result = gated_delta_mixer_forward_core(
+                x, in_fn_c, ck, cb_cap, al, db_cap, nw_cap, out_fn_c,
+                dc, nh, nkh, dh, cs, ss, nullptr
+            );
+            return {result, cs, ss};
+        };
+        layer_state->gdelta_compiled_fn = new std::function<std::vector<array>(
+            const std::vector<array>&)>(mlx::core::compile(decode_fn));
+    }
+    if (!use_reference_recurrence and is_single_token_decode
+            and layer_state != nullptr and layer_state->gdelta_compiled_fn != nullptr) {
+        const std::vector<array> compiled_out = (*layer_state->gdelta_compiled_fn)(
+            std::vector<array>{input_arr, conv_state, ssm_state}
+        );
+        const array out = compiled_out[0];
+        conv_state = compiled_out[1];
+        ssm_state = compiled_out[2];
+        async_eval(std::vector<array>{conv_state, ssm_state});
+        *layer_state->conv_state = conv_state;
+        *layer_state->ssm_state = ssm_state;
+        return pool_array(out);
+    }
+
     const array out = gated_delta_mixer_forward_core(
         input_arr,
         in_proj_fn,

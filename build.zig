@@ -442,6 +442,7 @@ fn addMetalSupport(
             "core/src/compute/metal/mlx/ops.cpp",
             "core/src/compute/metal/mlx/cache.cpp",
             "core/src/compute/metal/mlx/fused_ops.cpp",
+            "core/src/inference/backend/metal/mlx_bridge/config_parse.cpp",
             "core/src/inference/backend/metal/mlx_bridge/bridge.cpp",
         },
         .flags = &.{

@@ -1,4 +1,4 @@
-README ?= ../../README.md
+README ?= ../../../../../../README.md
 MODEL ?= Qwen/Qwen3.5-2B
 TOKENS ?= 120
 WARMUP ?= 1
@@ -11,17 +11,18 @@ STEP_MODE ?= multitrace
 CXX ?= c++
 ZIG ?= zig
 
-MLX_INC := ../../deps/mlx/include
-MLX_LIB_DIR := ../../deps/mlx/lib
+MLX_INC := ../../../../../../deps/mlx/include
+MLX_LIB_DIR := ../../../../../../deps/mlx/lib
 MLX_LIB := $(MLX_LIB_DIR)/libmlx.a
 MLX_METALLIB := $(MLX_LIB_DIR)/mlx.metallib
 METAL_PATH_ABS := $(abspath $(MLX_METALLIB))
-TALU_LIB_DIR := ../../zig-out/lib
+TALU_LIB_DIR := ../../../../../../zig-out/lib
 TALU_LIB_DIR_ABS := $(abspath $(TALU_LIB_DIR))
 
 OBJ_DIR := build
 BIN_DIR := bin
 BRIDGE_OBJ := $(OBJ_DIR)/bridge.o
+BRIDGE_CONFIG_TEST_BIN := $(BIN_DIR)/bridge_config_test
 CPP_BIN := $(BIN_DIR)/cpp_host
 ZIG_BIN := $(BIN_DIR)/scheduled_host
 BIN_METALLIB := $(BIN_DIR)/mlx.metallib
@@ -35,6 +36,7 @@ LDFLAGS += $(MLX_LIB) -framework Metal -framework MetalPerformanceShaders -frame
 	run-zig-readme run-cpp-readme \
 	bench bench-readme bench-readme-fresh \
 	bench-cpp-readme bench-zig-readme bench-all \
+	test-config \
 	clean info
 
 build: build-cpp build-zig
@@ -59,6 +61,13 @@ build-zig: $(BRIDGE_OBJ) scheduled.zig bridge.h $(BIN_METALLIB)
 		$(BRIDGE_OBJ) -O ReleaseFast -femit-bin=$(ZIG_BIN) \
 		-I. -I$(MLX_INC) $(MLX_LIB) -L$(TALU_LIB_DIR) -ltalu -rpath $(TALU_LIB_DIR_ABS) -lc -lc++ \
 		-framework Metal -framework MetalPerformanceShaders -framework Foundation -framework Accelerate
+
+$(BRIDGE_CONFIG_TEST_BIN): bridge_config_test.cpp config_parse.cpp
+	@mkdir -p $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) bridge_config_test.cpp config_parse.cpp -o $(BRIDGE_CONFIG_TEST_BIN)
+
+test-config: $(BRIDGE_CONFIG_TEST_BIN)
+	./$(BRIDGE_CONFIG_TEST_BIN)
 
 prepare-cpp-readme: build-cpp
 

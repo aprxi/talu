@@ -14,6 +14,16 @@ const weights = if (has_metal) main.inference.backend.metal.executor.weights els
 const xray = main.xray;
 const sampling = main.inference.backend.metal.sampling;
 
+extern fn mlx_test_grouped_affine_moe_gpu_path() c_int;
+extern fn mlx_test_depthwise_conv_decode_step() c_int;
+extern fn mlx_test_single_query_attention_matches_sdpa() c_int;
+extern fn mlx_test_kv_cache_reserve_preserves_prefix() c_int;
+extern fn mlx_test_shared_expert_gate_up_fusion() c_int;
+extern fn mlx_test_dense_mlp_gate_up_fusion() c_int;
+extern fn mlx_test_full_attention_qkv_fusion() c_int;
+extern fn mlx_test_topk_candidate_extraction_multi() c_int;
+extern fn mlx_last_error() [*:0]const u8;
+
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.fs.accessAbsolute(path, .{}) catch return false;
@@ -129,7 +139,7 @@ test "metal backend init/prefill/decode lifecycle is stable across repeated iter
         defer weights.destroyTestLoadedModel(allocator, loaded);
         loaded.runtime.architecture_id = "qwen3";
 
-        var backend = try metal.MetalBackend.init(allocator, loaded);
+        var backend = try metal.MetalBackend.init(allocator, loaded, .{});
         defer backend.deinit();
 
         var bound_state = try BoundSlotState.init(allocator, &backend, 0);
@@ -154,7 +164,7 @@ test "metal backend slot allocate/free churn is stable" {
     defer weights.destroyTestLoadedModel(allocator, loaded);
     loaded.runtime.architecture_id = "qwen3";
 
-    var backend = try metal.MetalBackend.init(allocator, loaded);
+    var backend = try metal.MetalBackend.init(allocator, loaded, .{});
     defer backend.deinit();
 
     // Repeated slot churn exercises reset/free paths that are easy to get
@@ -176,7 +186,7 @@ test "metal backend xray record+verify capture path is stable under repeated run
         defer weights.destroyTestLoadedModel(allocator, loaded);
         loaded.runtime.architecture_id = "qwen3";
 
-        var backend = try metal.MetalBackend.init(allocator, loaded);
+        var backend = try metal.MetalBackend.init(allocator, loaded, .{});
         defer backend.deinit();
 
         var bound_state = try BoundSlotState.init(allocator, &backend, 0);
@@ -220,6 +230,86 @@ test "metal backend xray record+verify capture path is stable under repeated run
     }
 }
 
+test "metal bridge grouped-affine moe gpu path matches reference implementation" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_grouped_affine_moe_gpu_path();
+    if (status != 1) {
+        std.debug.print("mlx grouped-affine moe self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge depthwise conv decode step matches conv1d" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_depthwise_conv_decode_step();
+    if (status != 1) {
+        std.debug.print("mlx depthwise conv decode self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge single-query attention matches sdpa" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_single_query_attention_matches_sdpa();
+    if (status != 1) {
+        std.debug.print("mlx single-query attention self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge kv cache reserve preserves prefix" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_kv_cache_reserve_preserves_prefix();
+    if (status != 1) {
+        std.debug.print("mlx kv cache reserve self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge shared expert gate-up fusion matches split projections" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_shared_expert_gate_up_fusion();
+    if (status != 1) {
+        std.debug.print("mlx shared expert gate-up self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge dense mlp gate-up fusion matches split projections" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_dense_mlp_gate_up_fusion();
+    if (status != 1) {
+        std.debug.print("mlx dense mlp gate-up self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge full attention qkv fusion matches split projections" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_full_attention_qkv_fusion();
+    if (status != 1) {
+        std.debug.print("mlx full attention qkv fusion self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge top-k candidate extraction supports top_k greater than one" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_topk_candidate_extraction_multi();
+    if (status != 1) {
+        std.debug.print("mlx top-k extraction self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
 test "metal backend remains stable across repeated scheduler lifecycles on one backend" {
     if (!canRunMetalRuntime()) return;
 
@@ -230,7 +320,7 @@ test "metal backend remains stable across repeated scheduler lifecycles on one b
     defer weights.destroyTestLoadedModel(allocator, loaded);
     loaded.runtime.architecture_id = "qwen3";
 
-    var backend = try metal.MetalBackend.init(allocator, loaded);
+    var backend = try metal.MetalBackend.init(allocator, loaded, .{});
     defer backend.deinit();
 
     const prompt = [_]u32{ 1, 2, 3, 4 };
@@ -259,7 +349,7 @@ test "metal backend explicit worker-thread teardown is stable across repeated ru
     defer weights.destroyTestLoadedModel(allocator, loaded);
     loaded.runtime.architecture_id = "qwen3";
 
-    var backend = try metal.MetalBackend.init(allocator, loaded);
+    var backend = try metal.MetalBackend.init(allocator, loaded, .{});
     defer backend.deinit();
 
     const prompt = [_]u32{ 1, 2, 3, 4 };
@@ -316,7 +406,7 @@ test "metal backend scheduler top-k route remains stable across repeated runs" {
     // kernels before decode routing logic is exercised.
     loaded.runtime.architecture_id = "qwen3";
 
-    var backend = try metal.MetalBackend.init(allocator, loaded);
+    var backend = try metal.MetalBackend.init(allocator, loaded, .{});
     defer backend.deinit();
 
     const prompt = [_]u32{ 1, 2, 3, 4 };

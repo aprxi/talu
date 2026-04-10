@@ -1,6 +1,7 @@
 const cpu_executor = @import("../../cpu/executor/root.zig");
+const metal_legacy_executor = @import("../../metal_legacy/executor/root.zig");
 
-pub const weights = cpu_executor.weights;
+pub const weights = metal_legacy_executor.weights;
 pub const runtime = cpu_executor.runtime;
 pub const model = cpu_executor.model;
 pub const block = cpu_executor.block;
