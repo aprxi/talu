@@ -21,6 +21,7 @@ extern fn mlx_test_kv_cache_reserve_preserves_prefix() c_int;
 extern fn mlx_test_shared_expert_gate_up_fusion() c_int;
 extern fn mlx_test_dense_mlp_gate_up_fusion() c_int;
 extern fn mlx_test_full_attention_qkv_fusion() c_int;
+extern fn mlx_test_grouped_affine_prefill_cache_helper() c_int;
 extern fn mlx_test_topk_candidate_extraction_multi() c_int;
 extern fn mlx_last_error() [*:0]const u8;
 
@@ -296,6 +297,16 @@ test "metal bridge full attention qkv fusion matches split projections" {
     const status = mlx_test_full_attention_qkv_fusion();
     if (status != 1) {
         std.debug.print("mlx full attention qkv fusion self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge grouped-affine prefill cache helper matches dense prefill and preserves decode qmm path" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_grouped_affine_prefill_cache_helper();
+    if (status != 1) {
+        std.debug.print("mlx grouped-affine prefill cache self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
     }
     try std.testing.expectEqual(@as(c_int, 1), status);
 }

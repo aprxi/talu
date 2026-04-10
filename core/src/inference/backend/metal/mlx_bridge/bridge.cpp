@@ -722,6 +722,7 @@ struct LayerWeights {
     array attn_k_rhs = array(0.0f);
     array attn_v_rhs = array(0.0f);
     array attn_qkv_rhs = array(0.0f);
+    array attn_qkv_prefill_rhs = array(0.0f);
     array attn_o_rhs = array(0.0f);
     array attn_q_q_w = array(0.0f);
     array attn_q_q_scales = array(0.0f);
@@ -760,6 +761,7 @@ struct LayerWeights {
     array lin_in_proj_a_rhs = array(0.0f);
     array lin_in_proj_b_rhs = array(0.0f);
     array lin_in_proj_qkvz_rhs = array(0.0f);
+    array lin_in_proj_qkvz_prefill_rhs = array(0.0f);
     array lin_in_proj_ba_rhs = array(0.0f);
     array lin_in_proj_all_rhs = array(0.0f);
     array lin_in_proj_qkvz_q_w = array(0.0f);
@@ -1070,6 +1072,50 @@ array to_rhs(const array& weight_2d, const std::string& name) {
     // Materialize a contiguous RHS tensor once at load-time so decode matmuls
     // do not pay strided-view penalties on every token step.
     return stop_gradient(copy(transpose(weight_2d, {1, 0})));
+}
+
+size_t grouped_affine_dequantized_weight_bytes(
+    const array& q_w,
+    int quant_bits,
+    Dtype dtype
+) {
+    if (q_w.ndim() != 2 || quant_bits <= 0) return 0;
+    const size_t out_dim = static_cast<size_t>(q_w.shape(0));
+    const size_t packed_cols = static_cast<size_t>(q_w.shape(1));
+    const size_t in_dim = packed_cols * 32ULL / static_cast<size_t>(quant_bits);
+    return out_dim * in_dim * static_cast<size_t>(size_of(dtype));
+}
+
+array build_grouped_affine_prefill_rhs(
+    const std::string& name,
+    const array& q_w,
+    const array& q_scales,
+    const array& q_biases,
+    int quant_group_size,
+    int quant_bits,
+    Dtype cache_dtype = bfloat16
+) {
+    if (q_w.ndim() != 2 || q_scales.ndim() != 2 || q_biases.ndim() != 2) {
+        return array(0.0f);
+    }
+    if (q_w.size() <= 1 || q_scales.size() <= 1 || q_biases.size() <= 1) {
+        return array(0.0f);
+    }
+    if (quant_group_size <= 0 || (quant_bits != 4 && quant_bits != 8)) {
+        return array(0.0f);
+    }
+
+    const array dense = dequantize(
+        q_w,
+        q_scales,
+        std::optional<array>(q_biases),
+        quant_group_size,
+        quant_bits,
+        "affine",
+        std::nullopt,
+        std::optional<Dtype>(cache_dtype)
+    );
+    return to_rhs(dense, name + ".prefill_cache");
 }
 
 array expand_block_scales(const array& scales_2d_f32, int rows, int cols, const std::string& name) {
@@ -1536,10 +1582,15 @@ array maybe_dequantize_grouped_affine_weight(
         }
     }
 
+    // Move the heap vector into the MLX array, then free it immediately so
+    // the large float32 buffer (rows * cols * 4 bytes) does not stay alive
+    // alongside the bf16 result. eval() forces MLX to materialise the bf16
+    // Metal buffer before the f32 one is released, keeping peak RSS minimal.
     const array dequant_f32 = array(out.begin(), Shape{rows, cols}, float32);
-    array dequant_dense = astype(dequant_f32, bfloat16);
-    dequant_dense = stop_gradient(copy(dequant_dense));
-    return dequant_dense;
+    out = std::vector<float>{};  // release host-side float32 copy immediately
+    array dequant_bf16 = astype(dequant_f32, bfloat16);
+    eval(dequant_bf16);          // materialise bf16; f32 Metal buffer can now be freed
+    return stop_gradient(dequant_bf16);
 }
 
 bool has_grouped_affine_metadata_for_key(
@@ -1829,7 +1880,8 @@ array linear_decode_maybe_quantized(
     const array& q_biases,
     bool prefill_only_qmm = false,
     int layer_idx = -1,
-    const char* op_tag = nullptr
+    const char* op_tag = nullptr,
+    const array* prefill_rhs = nullptr
 ) {
     const auto quant_compare_enabled = []() -> bool {
         return env_truthy("TALU_METAL_QMM_COMPARE", false);
@@ -1889,6 +1941,9 @@ array linear_decode_maybe_quantized(
     };
 
     const bool is_prefill_shape = x.ndim() >= 3 && x.shape(1) > 1;
+    if (is_prefill_shape && prefill_rhs != nullptr && prefill_rhs->size() > 1 && prefill_rhs->ndim() == 2) {
+        return matmul(x, *prefill_rhs);
+    }
     const bool allow_qmm = !prefill_only_qmm || is_prefill_shape;
     const bool q_ready = has_q && decode_qmm_enabled && allow_qmm && q_w.size() > 0 && q_scales.size() > 0;
     if (q_ready) {
@@ -2785,15 +2840,22 @@ std::optional<MemoryBudgetEstimate> estimate_memory_budget(
     if (!memory_size.has_value()) return std::nullopt;
     const std::optional<size_t> recommended = recommended_working_set_bytes();
     const int context_tokens = env_positive_int("TALU_METAL_MEMORY_CONTEXT_TOKENS", env_positive_int("TOKENS", 200));
-    const int active_slots = env_positive_int(
-        "TALU_METAL_MAX_BATCH_SIZE",
-        env_positive_int("TALU_CUDA_MAX_BATCH_SIZE", 8)
-    );
+    const int active_slots = env_positive_int("TALU_MAX_BATCH_SIZE", 8);
 
     MemoryBudgetEstimate estimate{};
     estimate.memory_size_bytes = *memory_size;
     estimate.max_recommended_bytes = recommended.has_value() ? *recommended : 0;
-    estimate.effective_budget_bytes = (estimate.memory_size_bytes * 8) / 10; // 0.8 * total unified memory
+    // On Apple Silicon unified memory, Metal and CPU share physical RAM.
+    // recommendedMaxWorkingSetSize is Apple's conservative perf guideline (~65-70% of RAM),
+    // not a hard allocation limit — Metal can succeed well beyond it as long as physical
+    // pages are available. Use physical RAM minus OS overhead as the effective budget,
+    // taking the max with recommendedMaxWorkingSetSize so we never go below Apple's guidance.
+    static constexpr size_t os_overhead_bytes = static_cast<size_t>(4ULL * 1024 * 1024 * 1024); // 4 GiB for OS
+    const size_t physical_budget = estimate.memory_size_bytes > os_overhead_bytes
+        ? estimate.memory_size_bytes - os_overhead_bytes
+        : 0;
+    const size_t recommended_val = recommended.has_value() ? *recommended : 0;
+    estimate.effective_budget_bytes = std::max(recommended_val, physical_budget);
     estimate.context_tokens = std::max(1, context_tokens);
     estimate.active_slots = std::max(1, active_slots);
     estimate.weight_bytes = model_weight_bytes_on_disk(model_path);
@@ -2941,7 +3003,8 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
             lw.attn_qkv_q_biases,
             prefill_only_qmm,
             layer_idx,
-            "attn.qkv_proj"
+            "attn.qkv_proj",
+            &lw.attn_qkv_prefill_rhs
         );
         q_proj_out = slice(qkv_proj_out, {0, 0, 0}, {B, S, q_proj_width});
         k_proj_out = slice(qkv_proj_out, {0, 0, q_proj_width}, {B, S, q_proj_width + k_proj_width});
@@ -3039,26 +3102,53 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     }
     int rope_offset = cache.offset;
     if (use_shared_read_cache) {
-        // Gemma4 shared-KV path uses the source layer cache offset before the
-        // current token block update (MLX-LM passes this through `offset`).
+        // Shared-KV readers use the source cache offset before the current
+        // token block update. The caller passes the destination layer's token
+        // block size separately, so reconstruct the source RoPE offset here.
         rope_offset = std::max(0, read_cache->offset - S);
     }
-    queries = fast::rope(
-        queries,
-        static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor)),
-        false,
-        std::optional<float>(lw.attn_rope_theta),
-        1.0f,
-        rope_offset
-    );
-    keys = fast::rope(
-        keys,
-        static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor)),
-        false,
-        std::optional<float>(lw.attn_rope_theta),
-        1.0f,
-        rope_offset
-    );
+    const int rope_dims = static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor));
+    // Some architectures rotate only a leading subspace inside a larger
+    // logical pairing domain. In that case:
+    // - `lw.attn_head_dim` defines the half-split pairing topology
+    // - `rope_dims` defines how many leading pairs are active
+    //
+    // A plain RoPE call with `dim = rope_dims` would rotate x[i] with
+    // x[i + rope_dims/2], which is a different operator. The correct mapping
+    // keeps the full-head pairing stride x[i] <-> x[i + head_dim/2], but only
+    // for the first `rope_dims / 2` pairs. Implement that by gathering the
+    // active first-half and matching second-half slices, applying standard RoPE
+    // on the gathered view, then scattering the rotated values back.
+    const bool use_proportional_full_head_rope =
+        ctx->cfg.global_head_dim > 0 &&
+        lw.attn_head_dim == ctx->cfg.global_head_dim &&
+        rope_dims > 0 && rope_dims < lw.attn_head_dim;
+    if (use_proportional_full_head_rope) {
+        const int hd = lw.attn_head_dim;
+        const int half_rope = rope_dims / 2;
+        const int half_hd = hd / 2;
+        // queries/keys shape here: [B, n_heads, S, hd] (already transposed)
+        auto apply_rope_full_head = [&](array t) -> array {
+            const int nh = t.shape(1);
+            array t_first = slice(t, {0,0,0,0},               {B,nh,S,half_rope});
+            array t_pass1 = slice(t, {0,0,0,half_rope},        {B,nh,S,half_hd});
+            array t_third = slice(t, {0,0,0,half_hd},          {B,nh,S,half_hd+half_rope});
+            array t_pass2 = slice(t, {0,0,0,half_hd+half_rope},{B,nh,S,hd});
+            array rope_in = concatenate({t_first, t_third}, 3);
+            rope_in = fast::rope(rope_in, rope_dims, false,
+                                 std::optional<float>(lw.attn_rope_theta), 1.0f, rope_offset);
+            array first_rot = slice(rope_in, {0,0,0,0},        {B,nh,S,half_rope});
+            array third_rot = slice(rope_in, {0,0,0,half_rope},{B,nh,S,rope_dims});
+            return concatenate({first_rot, t_pass1, third_rot, t_pass2}, 3);
+        };
+        queries = apply_rope_full_head(queries);
+        keys = apply_rope_full_head(keys);
+    } else {
+        queries = fast::rope(queries, rope_dims, false,
+                             std::optional<float>(lw.attn_rope_theta), 1.0f, rope_offset);
+        keys = fast::rope(keys, rope_dims, false,
+                          std::optional<float>(lw.attn_rope_theta), 1.0f, rope_offset);
+    }
 
     const int prev = cache.offset;
     if (!use_shared_read_cache) {
@@ -3373,7 +3463,10 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
         lw.lin_in_proj_qkvz_q_w,
         lw.lin_in_proj_qkvz_q_scales,
         lw.lin_in_proj_qkvz_q_biases,
-        prefill_only_qmm
+        prefill_only_qmm,
+        -1,
+        nullptr,
+        &lw.lin_in_proj_qkvz_prefill_rhs
     ); // [B,S,conv_dim+value_dim]
     const array ba = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
@@ -4036,8 +4129,9 @@ array run_layer(
         const int hpl = ctx->per_layer_hidden_size;
         const int layer_offset = layer_idx * hpl;
 
-        // Gemma4 per-layer input branch:
-        // proj(source_embed) -> norm -> + per-layer token embed -> gate(hidden) -> proj -> norm -> residual + scale
+        // Per-layer input branch:
+        // proj(source_embed) -> norm -> + per-layer token embed -> gate(hidden)
+        // -> proj -> norm -> residual + scale
         const array source_projection = linear(source_embeddings, lw.per_layer_model_projection_rhs);
         array per_layer_input = source_projection * array(ctx->per_layer_model_projection_scale, source_projection.dtype());
         per_layer_input = fast::rms_norm(per_layer_input, std::optional<array>(ctx->per_layer_projection_norm_w), ctx->cfg.rms_norm_eps);
@@ -5095,12 +5189,51 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
         const bool enable_fused_linear = env_truthy("TALU_METAL_FUSED_GATED_DELTA", false);
         // v3 cache/runtime policy: quantized path is allowed for prefill too,
-        // so dense RHS is only retained when explicitly requested.
-        const bool default_keep_dense_rhs_for_prefill = ctx->cfg.hidden_size_per_layer_input > 0;
+        // so dense RHS is not retained by default.
+        // Note: per-layer input projection weights (per_layer_input_gate_rhs etc.) are
+        // small and always loaded as dense unconditionally; they do not depend on this flag.
+        const bool default_keep_dense_rhs_for_prefill = false;
         const bool keep_dense_rhs_for_prefill = env_truthy(
             "TALU_METAL_KEEP_DENSE_RHS_FOR_PREFILL",
             default_keep_dense_rhs_for_prefill
         );
+        size_t prefill_cache_budget_bytes = 0;
+        if (!keep_dense_rhs_for_prefill) {
+            const int prefill_cache_mb = env_positive_int("TALU_METAL_PREFILL_DENSE_CACHE_MB", 0);
+            if (prefill_cache_mb > 0) {
+                prefill_cache_budget_bytes =
+                    static_cast<size_t>(prefill_cache_mb) * 1024ULL * 1024ULL;
+            }
+        }
+        const auto maybe_build_prefill_rhs_cache = [&](
+            const std::string& weight_key,
+            const array& q_w,
+            const array& q_scales,
+            const array& q_biases
+        ) -> array {
+            if (prefill_cache_budget_bytes == 0) return array(0.0f);
+            if (q_w.ndim() != 2 || q_scales.ndim() != 2 || q_biases.ndim() != 2) {
+                return array(0.0f);
+            }
+            const size_t estimated_bytes =
+                grouped_affine_dequantized_weight_bytes(q_w, ctx->cfg.quant_bits, bfloat16);
+            if (estimated_bytes == 0 || estimated_bytes > prefill_cache_budget_bytes) {
+                return array(0.0f);
+            }
+            array rhs = build_grouped_affine_prefill_rhs(
+                weight_key,
+                q_w,
+                q_scales,
+                q_biases,
+                ctx->cfg.quant_group_size,
+                ctx->cfg.quant_bits,
+                bfloat16
+            );
+            if (rhs.size() <= 1) return rhs;
+            eval(rhs);
+            prefill_cache_budget_bytes -= estimated_bytes;
+            return rhs;
+        };
         auto load_embed_weight = [&](const std::string& weight_key) -> array {
             return load_linear_weight(tensors, ctx->cfg, weight_key);
         };
@@ -5163,22 +5296,27 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         } else {
             if (has_tensor(tensors, text_prefix + "lm_head.weight")) {
                 lm_head_key = text_prefix + "lm_head.weight";
-                lm_head_weight = require_tensor(tensors, text_prefix + "lm_head.weight");
             } else if (has_tensor(tensors, "lm_head.weight")) {
                 lm_head_key = "lm_head.weight";
-                lm_head_weight = require_tensor(tensors, "lm_head.weight");
             } else {
                 throw std::runtime_error("missing lm_head weight (tie_word_embeddings=false)");
             }
+            // Defer loading the dense weight: for large quantized checkpoints (TQ4, FP8, NVFP4)
+            // the QMM path below avoids the full dequantize. Load dense only as a fallback.
         }
 
         const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta);
         if (enable_lm_head_qmm) {
-            if (!lm_head_weight_is_dense && lm_head_weight.size() == 1) {
-                // Tie embeddings can point at raw FP8 tensors. Load dequantized copy only
-                // if direct packed MXFP8 path is unavailable.
-                lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
-                lm_head_weight_is_dense = true;
+            if (lm_head_weight.size() == 1) {
+                // For grouped-affine: pass raw packed tensor directly — QMM capture reads
+                // scales/biases from the tensors map and only needs the shape from lhs_weight.
+                // For other formats (FP8 etc.) that need a float input, dequantize now.
+                if (has_grouped_affine_metadata_for_key(tensors, lm_head_key)) {
+                    lm_head_weight = require_tensor(tensors, lm_head_key);
+                } else {
+                    lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+                    lm_head_weight_is_dense = true;
+                }
             }
             bool lm_head_has_q = false;
             int lm_head_detected_bits = 0;
@@ -5203,7 +5341,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         // prefill and decode, so the dense transpose is unnecessary.
         if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled ||
             (!ctx->has_fp8_meta && !ctx->has_grouped_affine_meta && !has_nvfp4_meta)) {
-            if (!lm_head_weight_is_dense) {
+            // Need dense weight: dequantize now if not already in float form.
+            const bool weight_is_float = lm_head_weight.dtype() == bfloat16 ||
+                lm_head_weight.dtype() == float16 || lm_head_weight.dtype() == float32;
+            if (!weight_is_float) {
                 lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
                 lm_head_weight_is_dense = true;
             }
@@ -5788,6 +5929,13 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         const array qkv_rhs = to_rhs(ensure_qkv_weight_dense(), qkv_key);
                         const array z_rhs = to_rhs(ensure_z_weight_dense(), z_key);
                         lw.lin_in_proj_qkvz_rhs = concatenate({ qkv_rhs, z_rhs }, 1);
+                    } else {
+                        lw.lin_in_proj_qkvz_prefill_rhs = maybe_build_prefill_rhs_cache(
+                            p + "linear_attn.in_proj_qkvz",
+                            lw.lin_in_proj_qkvz_q_w,
+                            lw.lin_in_proj_qkvz_q_scales,
+                            lw.lin_in_proj_qkvz_q_biases
+                        );
                     }
                     if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
                         const array b_rhs = to_rhs(ensure_b_weight_dense(), b_key);
@@ -5911,6 +6059,13 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                                 fused_in_proj_rhs,
                                 {0, 0},
                                 {fused_rows, qkvz_cols}
+                            );
+                        } else {
+                            lw.lin_in_proj_qkvz_prefill_rhs = maybe_build_prefill_rhs_cache(
+                                p + "mixer.in_proj.qkvz_slice",
+                                lw.lin_in_proj_qkvz_q_w,
+                                lw.lin_in_proj_qkvz_q_scales,
+                                lw.lin_in_proj_qkvz_q_biases
                             );
                         }
                         if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
@@ -6057,6 +6212,14 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     lw.attn_o_rhs = load_rhs_weight(o_proj_key);
                 }
                 combine_full_attention_qkv_weights(&lw);
+                if (!keep_dense_rhs_for_prefill && enable_mlp_qmm && lw.attn_qkv_has_q) {
+                    lw.attn_qkv_prefill_rhs = maybe_build_prefill_rhs_cache(
+                        p + "self_attn.qkv",
+                        lw.attn_qkv_q_w,
+                        lw.attn_qkv_q_scales,
+                        lw.attn_qkv_q_biases
+                    );
+                }
                 lw.attn_q_norm_w = require_any_tensor(
                     tensors,
                     { p + "self_attn.q_norm.weight", p + "self_attn.q_layernorm.weight" },
@@ -9309,6 +9472,137 @@ int32_t mlx_test_full_attention_qkv_fusion(void) {
         return 0;
     } catch (...) {
         g_last_error = "unknown error in mlx_test_full_attention_qkv_fusion";
+        return 0;
+    }
+}
+
+int32_t mlx_test_grouped_affine_prefill_cache_helper(void) {
+    try {
+        constexpr int hidden = 64;
+        constexpr int seq = 3;
+        constexpr int out_dim = 96;
+        constexpr int group_size = 32;
+        constexpr int bits = 4;
+
+        std::vector<float> input_values(static_cast<size_t>(seq * hidden));
+        std::vector<float> decode_values(static_cast<size_t>(hidden));
+        std::vector<float> weight_values(static_cast<size_t>(out_dim * hidden));
+
+        for (int i = 0; i < static_cast<int>(input_values.size()); ++i) {
+            input_values[static_cast<size_t>(i)] = static_cast<float>(((i * 5) % 23) - 11) * 0.0625f;
+        }
+        for (int i = 0; i < static_cast<int>(decode_values.size()); ++i) {
+            decode_values[static_cast<size_t>(i)] = static_cast<float>(((i * 7) % 29) - 14) * 0.05f;
+        }
+        for (int i = 0; i < static_cast<int>(weight_values.size()); ++i) {
+            weight_values[static_cast<size_t>(i)] = static_cast<float>(((i * 11) % 31) - 15) * 0.03125f;
+        }
+
+        const array weight(weight_values.data(), Shape{out_dim, hidden}, float32);
+        const std::vector<array> quant = quantize(weight, group_size, bits, "affine");
+        if (quant.size() != 3) {
+            g_last_error = "mlx_test_grouped_affine_prefill_cache_helper: quantize returned unexpected output count";
+            return 0;
+        }
+
+        const array prefill_rhs = build_grouped_affine_prefill_rhs(
+            "mlx_test_grouped_affine_prefill_cache_helper",
+            quant[0],
+            quant[1],
+            quant[2],
+            group_size,
+            bits
+        );
+        if (prefill_rhs.size() <= 1 || prefill_rhs.ndim() != 2) {
+            g_last_error = "mlx_test_grouped_affine_prefill_cache_helper: failed to build prefill rhs";
+            return 0;
+        }
+
+        const array x_prefill(input_values.data(), Shape{1, seq, hidden}, float32);
+        const array x_decode(decode_values.data(), Shape{1, 1, hidden}, float32);
+
+        const array prefill_helper = linear_decode_maybe_quantized(
+            true,
+            group_size,
+            bits,
+            x_prefill,
+            array(0.0f),
+            true,
+            quant[0],
+            quant[1],
+            quant[2],
+            false,
+            -1,
+            "prefill_cache.prefill",
+            &prefill_rhs
+        );
+        const array prefill_quant = quantized_matmul(
+            x_prefill,
+            quant[0],
+            quant[1],
+            std::optional<array>(quant[2]),
+            true,
+            group_size,
+            bits,
+            "affine"
+        );
+        const array decode_helper = linear_decode_maybe_quantized(
+            true,
+            group_size,
+            bits,
+            x_decode,
+            array(0.0f),
+            true,
+            quant[0],
+            quant[1],
+            quant[2],
+            false,
+            -1,
+            "prefill_cache.decode",
+            &prefill_rhs
+        );
+        const array decode_quant = quantized_matmul(
+            x_decode,
+            quant[0],
+            quant[1],
+            std::optional<array>(quant[2]),
+            true,
+            group_size,
+            bits,
+            "affine"
+        );
+
+        const array prefill_diff = max(reshape(
+            abs(astype(prefill_helper, float32) - astype(prefill_quant, float32)),
+            {static_cast<int>(prefill_helper.size())}
+        ));
+        const array decode_diff = max(reshape(
+            abs(astype(decode_helper, float32) - astype(decode_quant, float32)),
+            {static_cast<int>(decode_helper.size())}
+        ));
+        eval({prefill_diff, decode_diff});
+        synchronize();
+
+        const float* prefill_diff_ptr = prefill_diff.data<float>();
+        const float* decode_diff_ptr = decode_diff.data<float>();
+        if (!prefill_diff_ptr || !decode_diff_ptr) {
+            g_last_error = "mlx_test_grouped_affine_prefill_cache_helper: failed to materialize diffs";
+            return 0;
+        }
+        if (prefill_diff_ptr[0] > 5e-2f) {
+            g_last_error = "mlx_test_grouped_affine_prefill_cache_helper: prefill output mismatch";
+            return 0;
+        }
+        if (decode_diff_ptr[0] > 1e-6f) {
+            g_last_error = "mlx_test_grouped_affine_prefill_cache_helper: decode path no longer matches qmm";
+            return 0;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_test_grouped_affine_prefill_cache_helper";
         return 0;
     }
 }

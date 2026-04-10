@@ -156,6 +156,7 @@ int32_t mlx_test_kv_cache_reserve_preserves_prefix(void);
 int32_t mlx_test_shared_expert_gate_up_fusion(void);
 int32_t mlx_test_dense_mlp_gate_up_fusion(void);
 int32_t mlx_test_full_attention_qkv_fusion(void);
+int32_t mlx_test_grouped_affine_prefill_cache_helper(void);
 int32_t mlx_test_topk_candidate_extraction_multi(void);
 
 int32_t talu_metal_xray_should_emit(uint8_t point_id, uint16_t layer, uint32_t position);

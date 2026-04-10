@@ -33,6 +33,21 @@ const DType = dtype_mod.DType;
 const max_calibration_input_samples: usize = 4096;
 const calibration_rows_max_bytes: usize = 32 * 1024 * 1024;
 const calibration_eval_max_bytes: usize = 32 * 1024 * 1024;
+const cuda_grouped_quant_u4_symbol: [:0]const u8 = "talu_gaffine_quantize_u4_f32";
+const cuda_grouped_quant_u8_symbol: [:0]const u8 = "talu_gaffine_quantize_u8_f32";
+const cuda_grouped_build_dq_symbol: [:0]const u8 = "talu_gaffine_build_dq_weights_f32";
+const cuda_reduce_mse_symbol: [:0]const u8 = "talu_reduce_mse_f32";
+const cuda_grouped_quant_block_x: u32 = 128;
+const cuda_grouped_build_dq_block_x: u32 = 256;
+const cuda_calibration_default_buffer_mib: usize = 128;
+const cuda_calibration_min_buffer_bytes: usize = 64 * 1024 * 1024;
+const cuda_calibration_max_buffer_bytes: usize = 256 * 1024 * 1024;
+const cuda_grouped_quant_default_tile_mib: usize = 1024;
+const cuda_grouped_quant_min_tile_bytes: usize = 64 * 1024 * 1024;
+const cuda_grouped_quant_max_tile_bytes: usize = 2 * 1024 * 1024 * 1024;
+const cuda_grouped_quant_max_grid_y_rows: usize = 65535;
+const cuda_reduce_mse_block_x: u32 = 256;
+const cuda_reduce_mse_max_blocks: u32 = 4096;
 
 /// Quantization configuration
 pub const QuantConfig = struct {
@@ -588,6 +603,11 @@ fn writeQuantizedWeights(
         };
     } else null;
     defer if (cuda_calib_ctx) |*ctx| ctx.deinit();
+    if (cuda_calib_ctx) |*ctx| {
+        if (isCudaGroupedQuantizationEnabled() and !ctx.cuda_quantization_available) {
+            log.warn("convert", "CUDA grouped-affine quantization kernels unavailable; using CPU quantization", .{});
+        }
+    }
 
     const show_calib_progress = options.calib_iters > 0 and
         envFlagEnabledDefault("TALU_CONVERT_CALIB_PROGRESS", true);
@@ -1115,18 +1135,36 @@ fn isCudaCalibrationEnabled() bool {
     return std.ascii.eqlIgnoreCase(token, "cuda");
 }
 
+fn isCudaGroupedQuantizationEnabled() bool {
+    if (!isCudaCalibrationEnabled()) return false;
+    return envFlagEnabledDefault("TALU_CONVERT_CUDA_QUANT", true);
+}
+
 const CudaCalibContext = struct {
     device: compute.cuda.device.Device,
     blas: compute.cuda.matmul.Blas,
+    quant_module: ?compute.cuda.module.Module = null,
+    quantize_u4_function: ?compute.cuda.module.Function = null,
+    quantize_u8_function: ?compute.cuda.module.Function = null,
+    build_dq_weights_function: ?compute.cuda.module.Function = null,
+    reduce_mse_function: ?compute.cuda.module.Function = null,
+    cuda_quantization_available: bool = false,
+    cuda_quantization_failed: bool = false,
+    cuda_mse_available: bool = false,
+    cuda_dq_weight_build_available: bool = false,
     x_dev: compute.cuda.device.Buffer,
     w_dev: compute.cuda.device.Buffer,
     out_dev: compute.cuda.device.Buffer,
     ref_w_dev: compute.cuda.device.Buffer,
     ref_out_dev: compute.cuda.device.Buffer,
+    mse_sum_dev: compute.cuda.device.Buffer,
     // Track cached x_dev upload: block_inputs.values pointer + dimensions.
     // Avoids re-uploading the same input matrix 91+ times per weight tensor.
     cached_x_ptr: ?[*]const f32 = null,
     cached_x_len: usize = 0,
+    // Track cached reference output upload used by CUDA-side MSE reduction.
+    cached_ref_ptr: ?[*]const f32 = null,
+    cached_ref_len: usize = 0,
 
     fn init() !CudaCalibContext {
         if (comptime !has_cuda_gpu_calib) return error.CudaNotEnabled;
@@ -1138,10 +1176,9 @@ const CudaCalibContext = struct {
         var blas = try compute.cuda.matmul.Blas.init(&device);
         errdefer blas.deinit(&device);
 
-        // Max buffer sizes: calibration_eval_max_bytes (32 MB) for each matrix.
-        // x: [input_samples × col_count], w: [col_count × sample_rows], out: [input_samples × sample_rows]
-        // All bounded by calibration_eval_max_bytes = 32 MB.
-        const max_buf = calibration_eval_max_bytes;
+        // Size calibration buffers from available VRAM so large tensors stay on the
+        // GPU scorer path instead of dropping to CPU on the first oversized block.
+        const max_buf = cudaCalibrationBufferBudgetBytes(&device);
 
         var x_dev = try device.allocBuffer(max_buf);
         errdefer x_dev.deinit(&device);
@@ -1153,21 +1190,65 @@ const CudaCalibContext = struct {
         errdefer ref_w_dev.deinit(&device);
         var ref_out_dev = try device.allocBuffer(max_buf);
         errdefer ref_out_dev.deinit(&device);
+        var mse_sum_dev = try device.allocBuffer(@sizeOf(f32));
+        errdefer mse_sum_dev.deinit(&device);
+
+        var quant_module: ?compute.cuda.module.Module = null;
+        var quantize_u4_function: ?compute.cuda.module.Function = null;
+        var quantize_u8_function: ?compute.cuda.module.Function = null;
+        var build_dq_weights_function: ?compute.cuda.module.Function = null;
+        var reduce_mse_function: ?compute.cuda.module.Function = null;
+        var cuda_quantization_available = false;
+        var cuda_mse_available = false;
+        var cuda_dq_weight_build_available = false;
+        if (isCudaGroupedQuantizationEnabled()) {
+            if (compute.cuda.module.Module.load(&device, compute.cuda.gaffine_u4_matvec.embedded_module)) |module| {
+                var loaded_module = module;
+                quantize_u4_function = loaded_module.getFunction(&device, cuda_grouped_quant_u4_symbol) catch null;
+                quantize_u8_function = loaded_module.getFunction(&device, cuda_grouped_quant_u8_symbol) catch null;
+                build_dq_weights_function = loaded_module.getFunction(&device, cuda_grouped_build_dq_symbol) catch null;
+                reduce_mse_function = loaded_module.getFunction(&device, cuda_reduce_mse_symbol) catch null;
+                if (quantize_u4_function != null and quantize_u8_function != null) {
+                    quant_module = loaded_module;
+                    cuda_quantization_available = true;
+                    cuda_mse_available = reduce_mse_function != null;
+                    cuda_dq_weight_build_available = build_dq_weights_function != null;
+                } else {
+                    loaded_module.deinit(&device);
+                }
+            } else |_| {}
+        }
 
         return .{
             .device = device,
             .blas = blas,
+            .quant_module = quant_module,
+            .quantize_u4_function = quantize_u4_function,
+            .quantize_u8_function = quantize_u8_function,
+            .build_dq_weights_function = build_dq_weights_function,
+            .reduce_mse_function = reduce_mse_function,
+            .cuda_quantization_available = cuda_quantization_available,
+            .cuda_quantization_failed = false,
+            .cuda_mse_available = cuda_mse_available,
+            .cuda_dq_weight_build_available = cuda_dq_weight_build_available,
             .x_dev = x_dev,
             .w_dev = w_dev,
             .out_dev = out_dev,
             .ref_w_dev = ref_w_dev,
             .ref_out_dev = ref_out_dev,
+            .mse_sum_dev = mse_sum_dev,
             .cached_x_ptr = null,
             .cached_x_len = 0,
+            .cached_ref_ptr = null,
+            .cached_ref_len = 0,
         };
     }
 
     fn deinit(self: *CudaCalibContext) void {
+        if (self.quant_module) |*module| {
+            module.deinit(&self.device);
+        }
+        self.mse_sum_dev.deinit(&self.device);
         self.ref_out_dev.deinit(&self.device);
         self.ref_w_dev.deinit(&self.device);
         self.out_dev.deinit(&self.device);
@@ -1177,6 +1258,272 @@ const CudaCalibContext = struct {
         self.device.deinit();
     }
 };
+
+fn cudaCalibrationBufferBudgetBytes(device: *compute.cuda.device.Device) usize {
+    const mib: usize = 1024 * 1024;
+    if (std.posix.getenv("TALU_CONVERT_CUDA_CALIB_BUF_MIB")) |raw| {
+        if (std.fmt.parseInt(usize, raw, 10)) |buffer_mib| {
+            if (buffer_mib > 0) {
+                const requested = std.math.mul(usize, buffer_mib, mib) catch cuda_calibration_max_buffer_bytes;
+                return std.math.clamp(requested, cuda_calibration_min_buffer_bytes, cuda_calibration_max_buffer_bytes);
+            }
+        } else |_| {}
+    }
+
+    if (device.memoryInfo()) |info| {
+        const adaptive = info.free / 20;
+        return std.math.clamp(adaptive, cuda_calibration_min_buffer_bytes, cuda_calibration_max_buffer_bytes);
+    } else |_| {
+        const fallback = std.math.mul(usize, cuda_calibration_default_buffer_mib, mib) catch cuda_calibration_min_buffer_bytes;
+        return std.math.clamp(fallback, cuda_calibration_min_buffer_bytes, cuda_calibration_max_buffer_bytes);
+    }
+}
+
+fn cudaGroupedQuantTileBudgetBytes(device: *compute.cuda.device.Device) usize {
+    const mib: usize = 1024 * 1024;
+    if (std.posix.getenv("TALU_CONVERT_CUDA_QUANT_TILE_MIB")) |raw| {
+        if (std.fmt.parseInt(usize, raw, 10)) |tile_mib| {
+            if (tile_mib > 0) {
+                const requested = std.math.mul(usize, tile_mib, mib) catch cuda_grouped_quant_max_tile_bytes;
+                return std.math.clamp(requested, cuda_grouped_quant_min_tile_bytes, cuda_grouped_quant_max_tile_bytes);
+            }
+        } else |_| {}
+    }
+
+    if (device.memoryInfo()) |info| {
+        const adaptive = info.free / 2;
+        return std.math.clamp(adaptive, cuda_grouped_quant_min_tile_bytes, cuda_grouped_quant_max_tile_bytes);
+    } else |_| {
+        const fallback = std.math.mul(usize, cuda_grouped_quant_default_tile_mib, mib) catch cuda_grouped_quant_min_tile_bytes;
+        return std.math.clamp(fallback, cuda_grouped_quant_min_tile_bytes, cuda_grouped_quant_max_tile_bytes);
+    }
+}
+
+fn tryQuantizeGroupedAffineRowsCuda(
+    allocator: std.mem.Allocator,
+    cuda_ctx: *CudaCalibContext,
+    source_values: []align(1) const f32,
+    row_count: usize,
+    col_count: usize,
+    group_len: usize,
+    quant_bits: u8,
+    group_scale_factors: []const f32,
+    group_bias_shifts: []const f32,
+    group_round_shifts: []const f32,
+    packed_row_words: []u32,
+    scale_values: []u16,
+    bias_values: []u16,
+) !bool {
+    if (!isCudaGroupedQuantizationEnabled()) return false;
+    if (!cuda_ctx.cuda_quantization_available or cuda_ctx.cuda_quantization_failed) return false;
+    if (row_count == 0 or col_count == 0 or group_len == 0) return false;
+    if (quant_bits != 4 and quant_bits != 8) return false;
+    if (col_count % group_len != 0) return false;
+
+    const values_per_u32: usize = if (quant_bits == 4) 8 else 4;
+    if (col_count % values_per_u32 != 0) return false;
+
+    if (std.math.cast(u32, row_count) == null) return false;
+    const col_count_u32 = std.math.cast(u32, col_count) orelse return false;
+    const group_len_u32 = std.math.cast(u32, group_len) orelse return false;
+    const packed_col_count = col_count / values_per_u32;
+    const packed_col_count_u32 = std.math.cast(u32, packed_col_count) orelse return false;
+    const group_count = col_count / group_len;
+    const group_count_u32 = std.math.cast(u32, group_count) orelse return false;
+
+    const total_packed_words = std.math.mul(usize, row_count, packed_col_count) catch return false;
+    const total_group_values = std.math.mul(usize, row_count, group_count) catch return false;
+    if (packed_row_words.len < total_packed_words) return false;
+    if (scale_values.len < total_group_values or bias_values.len < total_group_values) return false;
+
+    const quant_function = if (quant_bits == 4)
+        cuda_ctx.quantize_u4_function orelse return false
+    else
+        cuda_ctx.quantize_u8_function orelse return false;
+
+    const group_scale_factors_full = try allocator.alloc(f32, group_count);
+    defer allocator.free(group_scale_factors_full);
+    @memset(group_scale_factors_full, 1.0);
+    const sf_copy_len = @min(group_count, group_scale_factors.len);
+    @memcpy(group_scale_factors_full[0..sf_copy_len], group_scale_factors[0..sf_copy_len]);
+
+    const group_bias_shifts_full = try allocator.alloc(f32, group_count);
+    defer allocator.free(group_bias_shifts_full);
+    @memset(group_bias_shifts_full, 0.0);
+    const bs_copy_len = @min(group_count, group_bias_shifts.len);
+    @memcpy(group_bias_shifts_full[0..bs_copy_len], group_bias_shifts[0..bs_copy_len]);
+
+    const group_round_shifts_full = try allocator.alloc(f32, group_count);
+    defer allocator.free(group_round_shifts_full);
+    @memset(group_round_shifts_full, 0.0);
+    const rs_copy_len = @min(group_count, group_round_shifts.len);
+    @memcpy(group_round_shifts_full[0..rs_copy_len], group_round_shifts[0..rs_copy_len]);
+
+    const input_row_bytes = std.math.mul(usize, col_count, @sizeOf(f32)) catch return false;
+    const packed_row_bytes = std.math.mul(usize, packed_col_count, @sizeOf(u32)) catch return false;
+    const scale_row_bytes = std.math.mul(usize, group_count, @sizeOf(u16)) catch return false;
+    const bias_row_bytes = std.math.mul(usize, group_count, @sizeOf(u16)) catch return false;
+    const row_bytes_a = std.math.add(usize, input_row_bytes, packed_row_bytes) catch return false;
+    const row_bytes_b = std.math.add(usize, scale_row_bytes, bias_row_bytes) catch return false;
+    const row_total_bytes = std.math.add(usize, row_bytes_a, row_bytes_b) catch return false;
+    if (row_total_bytes == 0) return false;
+
+    const group_factor_bytes = std.math.mul(usize, group_count, @sizeOf(f32)) catch return false;
+    const fixed_bytes = std.math.mul(usize, group_factor_bytes, 3) catch return false;
+    var tile_budget_bytes = cudaGroupedQuantTileBudgetBytes(&cuda_ctx.device);
+    if (tile_budget_bytes <= fixed_bytes) {
+        tile_budget_bytes = (std.math.add(usize, fixed_bytes, row_total_bytes) catch return false);
+    }
+    const row_budget_bytes = tile_budget_bytes - fixed_bytes;
+    var rows_per_tile = row_budget_bytes / row_total_bytes;
+    if (rows_per_tile == 0) rows_per_tile = 1;
+    rows_per_tile = @min(rows_per_tile, row_count);
+    rows_per_tile = @min(rows_per_tile, cuda_grouped_quant_max_grid_y_rows);
+    rows_per_tile = @min(rows_per_tile, @as(usize, std.math.maxInt(u32)));
+
+    const max_tile_input_bytes = std.math.mul(usize, rows_per_tile, input_row_bytes) catch return false;
+    const max_tile_packed_bytes = std.math.mul(usize, rows_per_tile, packed_row_bytes) catch return false;
+    const max_tile_scale_bytes = std.math.mul(usize, rows_per_tile, scale_row_bytes) catch return false;
+    const max_tile_bias_bytes = std.math.mul(usize, rows_per_tile, bias_row_bytes) catch return false;
+
+    var group_scale_factors_dev = try cuda_ctx.device.allocBuffer(group_factor_bytes);
+    defer group_scale_factors_dev.deinit(&cuda_ctx.device);
+    var group_bias_shifts_dev = try cuda_ctx.device.allocBuffer(group_factor_bytes);
+    defer group_bias_shifts_dev.deinit(&cuda_ctx.device);
+    var group_round_shifts_dev = try cuda_ctx.device.allocBuffer(group_factor_bytes);
+    defer group_round_shifts_dev.deinit(&cuda_ctx.device);
+    try group_scale_factors_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(group_scale_factors_full));
+    try group_bias_shifts_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(group_bias_shifts_full));
+    try group_round_shifts_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(group_round_shifts_full));
+
+    var input_dev = try cuda_ctx.device.allocBuffer(max_tile_input_bytes);
+    defer input_dev.deinit(&cuda_ctx.device);
+    var packed_dev = try cuda_ctx.device.allocBuffer(max_tile_packed_bytes);
+    defer packed_dev.deinit(&cuda_ctx.device);
+    var scales_dev = try cuda_ctx.device.allocBuffer(max_tile_scale_bytes);
+    defer scales_dev.deinit(&cuda_ctx.device);
+    var biases_dev = try cuda_ctx.device.allocBuffer(max_tile_bias_bytes);
+    defer biases_dev.deinit(&cuda_ctx.device);
+
+    var arg_pack = compute.cuda.args.ArgPack.init(allocator);
+    defer arg_pack.deinit();
+
+    var row_start: usize = 0;
+    while (row_start < row_count) {
+        const tile_rows = @min(rows_per_tile, row_count - row_start);
+        const tile_rows_u32: u32 = @intCast(tile_rows);
+
+        const input_offset = std.math.mul(usize, row_start, col_count) catch return false;
+        const input_len = std.math.mul(usize, tile_rows, col_count) catch return false;
+        const input_slice = source_values[input_offset .. input_offset + input_len];
+        try input_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(input_slice));
+
+        arg_pack.reset();
+        try arg_pack.appendBufferPtr(&input_dev);
+        try arg_pack.appendBufferPtr(&group_scale_factors_dev);
+        try arg_pack.appendBufferPtr(&group_bias_shifts_dev);
+        try arg_pack.appendBufferPtr(&group_round_shifts_dev);
+        try arg_pack.appendBufferPtr(&packed_dev);
+        try arg_pack.appendBufferPtr(&scales_dev);
+        try arg_pack.appendBufferPtr(&biases_dev);
+        try arg_pack.appendScalar(u32, tile_rows_u32);
+        try arg_pack.appendScalar(u32, col_count_u32);
+        try arg_pack.appendScalar(u32, group_len_u32);
+        try arg_pack.appendScalar(u32, packed_col_count_u32);
+
+        try compute.cuda.launch.launchWithFamily(
+            &cuda_ctx.device,
+            quant_function,
+            .{
+                .grid_x = group_count_u32,
+                .grid_y = tile_rows_u32,
+                .block_x = cuda_grouped_quant_block_x,
+            },
+            &arg_pack,
+            .pointwise,
+        );
+        try cuda_ctx.device.synchronize();
+
+        const packed_offset = std.math.mul(usize, row_start, packed_col_count) catch return false;
+        const packed_len = std.math.mul(usize, tile_rows, packed_col_count) catch return false;
+        const packed_slice = packed_row_words[packed_offset .. packed_offset + packed_len];
+        try packed_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(packed_slice));
+
+        const scale_offset = std.math.mul(usize, row_start, group_count) catch return false;
+        const scale_len = std.math.mul(usize, tile_rows, group_count) catch return false;
+        const scales_slice = scale_values[scale_offset .. scale_offset + scale_len];
+        const biases_slice = bias_values[scale_offset .. scale_offset + scale_len];
+        try scales_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(scales_slice));
+        try biases_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(biases_slice));
+
+        row_start += tile_rows;
+    }
+
+    return true;
+}
+
+fn resetMseAccumulatorCuda(cuda_ctx: *CudaCalibContext) !bool {
+    if (!cuda_ctx.cuda_mse_available) return false;
+    var zero = [_]f32{0.0};
+    try cuda_ctx.mse_sum_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(zero[0..]));
+    return true;
+}
+
+fn accumulateMseCuda(
+    allocator: std.mem.Allocator,
+    cuda_ctx: *CudaCalibContext,
+    ref_dev: *const compute.cuda.device.Buffer,
+    dq_dev: *const compute.cuda.device.Buffer,
+    element_count: usize,
+) !bool {
+    if (!cuda_ctx.cuda_mse_available) return false;
+    const mse_fn = cuda_ctx.reduce_mse_function orelse return false;
+    if (element_count == 0) return false;
+    const n_u32 = std.math.cast(u32, element_count) orelse return false;
+
+    var arg_pack = compute.cuda.args.ArgPack.init(allocator);
+    defer arg_pack.deinit();
+    try arg_pack.appendBufferPtr(ref_dev);
+    try arg_pack.appendBufferPtr(dq_dev);
+    try arg_pack.appendBufferPtr(&cuda_ctx.mse_sum_dev);
+    try arg_pack.appendScalar(u32, n_u32);
+
+    const blocks_unclamped = (n_u32 + (cuda_reduce_mse_block_x - 1)) / cuda_reduce_mse_block_x;
+    const blocks = @max(@as(u32, 1), @min(blocks_unclamped, cuda_reduce_mse_max_blocks));
+    try compute.cuda.launch.launchWithFamily(
+        &cuda_ctx.device,
+        mse_fn,
+        .{
+            .grid_x = blocks,
+            .block_x = cuda_reduce_mse_block_x,
+        },
+        &arg_pack,
+        .pointwise,
+    );
+    return true;
+}
+
+fn finishMseCuda(cuda_ctx: *CudaCalibContext, element_count: usize) !?f64 {
+    if (!cuda_ctx.cuda_mse_available) return null;
+    if (element_count == 0) return null;
+    try cuda_ctx.device.synchronize();
+
+    var sum_host = [_]f32{0.0};
+    try cuda_ctx.mse_sum_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(sum_host[0..]));
+    return @as(f64, @floatCast(sum_host[0])) / @as(f64, @floatFromInt(element_count));
+}
+
+fn computeMseCuda(
+    allocator: std.mem.Allocator,
+    cuda_ctx: *CudaCalibContext,
+    ref_dev: *const compute.cuda.device.Buffer,
+    dq_dev: *const compute.cuda.device.Buffer,
+    element_count: usize,
+) !?f64 {
+    if (!(try resetMseAccumulatorCuda(cuda_ctx))) return null;
+    if (!(try accumulateMseCuda(allocator, cuda_ctx, ref_dev, dq_dev, element_count))) return null;
+    return try finishMseCuda(cuda_ctx, element_count);
+}
 
 /// Copy all tensors without quantization (preserve original format).
 fn writeUnquantizedWeights(
@@ -1853,26 +2200,19 @@ fn buildGroupedBlockForwardReferenceOutputsCuda(
     const input_samples = block_inputs.input_samples;
     const sample_rows_budget = row_cache.sample_rows;
 
-    // Build transposed ref_weights on CPU (col-major for matmul: [col_count × sample_rows])
-    const ref_weights = allocator.alloc(f32, col_count * sample_rows_budget) catch return null;
-    defer allocator.free(ref_weights);
-
-    var sampled_rows: usize = 0;
-    while (sampled_rows < sample_rows_budget) : (sampled_rows += 1) {
-        const row = row_cache.row_indices[sampled_rows];
-        const row_values = source_values[row * col_count .. (row + 1) * col_count];
-        for (0..col_count) |col| {
-            const idx = col * sample_rows_budget + sampled_rows;
-            ref_weights[idx] = row_values[col];
-        }
-    }
-
     const out_len = input_samples * sample_rows_budget;
     const x_bytes = input_samples * col_count * @sizeOf(f32);
-    const w_bytes = col_count * sample_rows_budget * @sizeOf(f32);
-    const out_bytes = out_len * @sizeOf(f32);
+    if (x_bytes > cuda_ctx.x_dev.size) return null;
 
-    if (x_bytes > cuda_ctx.x_dev.size or w_bytes > cuda_ctx.w_dev.size or out_bytes > cuda_ctx.out_dev.size) return null;
+    const max_tile_rows = cudaCalibrationMaxSampleRowsPerTile(cuda_ctx, input_samples, col_count);
+    if (max_tile_rows == 0) return null;
+    const tile_row_capacity = @min(sample_rows_budget, max_tile_rows);
+    const tile_weight_len = col_count * tile_row_capacity;
+    const tile_out_len = input_samples * tile_row_capacity;
+    const ref_weights = allocator.alloc(f32, tile_weight_len) catch return null;
+    defer allocator.free(ref_weights);
+    const out_tile = allocator.alloc(f32, tile_out_len) catch return null;
+    defer allocator.free(out_tile);
 
     const ref_host = allocator.alloc(f32, out_len) catch return null;
     errdefer allocator.free(ref_host);
@@ -1884,10 +2224,25 @@ fn buildGroupedBlockForwardReferenceOutputsCuda(
         cuda_ctx.cached_x_ptr = x_slice.ptr;
         cuda_ctx.cached_x_len = x_slice.len;
     }
-    cuda_ctx.w_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(ref_weights)) catch return null;
-    cuda_ctx.blas.matmulF32(&cuda_ctx.device, &cuda_ctx.x_dev, input_samples, col_count, &cuda_ctx.w_dev, sample_rows_budget, &cuda_ctx.out_dev) catch return null;
-    cuda_ctx.device.synchronize() catch return null;
-    cuda_ctx.out_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(ref_host)) catch return null;
+
+    var tile_start: usize = 0;
+    while (tile_start < sample_rows_budget) : (tile_start += tile_row_capacity) {
+        const tile_rows = @min(tile_row_capacity, sample_rows_budget - tile_start);
+        const ref_tile = ref_weights[0 .. col_count * tile_rows];
+        buildGroupedRefWeightsTile(source_values, col_count, row_cache, tile_start, tile_rows, ref_tile);
+        cuda_ctx.w_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(ref_tile)) catch return null;
+        cuda_ctx.blas.matmulF32(&cuda_ctx.device, &cuda_ctx.x_dev, input_samples, col_count, &cuda_ctx.w_dev, tile_rows, &cuda_ctx.out_dev) catch return null;
+        cuda_ctx.device.synchronize() catch return null;
+
+        const out_tile_slice = out_tile[0 .. input_samples * tile_rows];
+        cuda_ctx.out_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(out_tile_slice)) catch return null;
+        var p: usize = 0;
+        while (p < input_samples) : (p += 1) {
+            const src = out_tile_slice[p * tile_rows .. (p + 1) * tile_rows];
+            const dst = ref_host[p * sample_rows_budget + tile_start .. p * sample_rows_budget + tile_start + tile_rows];
+            @memcpy(dst, src);
+        }
+    }
 
     return ref_host;
 }
@@ -1964,6 +2319,42 @@ fn evaluateGroupedBlockForwardRows(sample_start: usize, sample_end: usize, ctx: 
     ctx.count += local_count;
 }
 
+const GroupedCudaDeviceWeightScratch = struct {
+    sampled_source_dev: compute.cuda.device.Buffer,
+    row_group_min_dev: compute.cuda.device.Buffer,
+    row_group_base_scale_dev: compute.cuda.device.Buffer,
+    group_scale_factors_dev: compute.cuda.device.Buffer,
+    group_bias_shifts_dev: compute.cuda.device.Buffer,
+    group_round_shifts_dev: compute.cuda.device.Buffer,
+
+    fn deinit(self: *GroupedCudaDeviceWeightScratch, device: *compute.cuda.device.Device) void {
+        self.group_round_shifts_dev.deinit(device);
+        self.group_bias_shifts_dev.deinit(device);
+        self.group_scale_factors_dev.deinit(device);
+        self.row_group_base_scale_dev.deinit(device);
+        self.row_group_min_dev.deinit(device);
+        self.sampled_source_dev.deinit(device);
+    }
+};
+
+const GroupedCudaWeightScratch = struct {
+    dq_weights: []f32,
+    ref_weights: ?[]f32 = null,
+    device: ?GroupedCudaDeviceWeightScratch = null,
+
+    fn deinit(
+        self: *GroupedCudaWeightScratch,
+        allocator: std.mem.Allocator,
+        device: ?*compute.cuda.device.Device,
+    ) void {
+        allocator.free(self.dq_weights);
+        if (self.ref_weights) |buf| allocator.free(buf);
+        if (device) |dev| {
+            if (self.device) |*gpu| gpu.deinit(dev);
+        }
+    }
+};
+
 fn evaluateGroupedBlockForwardCalibrationCandidate(
     allocator: std.mem.Allocator,
     cuda_ctx: ?*CudaCalibContext,
@@ -1978,6 +2369,7 @@ fn evaluateGroupedBlockForwardCalibrationCandidate(
     group_round_shifts: []const f32,
     replay_targets: ?*const GroupedReplayTargetMatrix,
     ref_outputs: ?[]const f32,
+    cuda_weight_scratch: ?*GroupedCudaWeightScratch,
 ) f64 {
     const max_quant_value: f32 = if (quant_bits == 4) 15.0 else 255.0;
     const group_count = row_cache.group_count;
@@ -2027,6 +2419,7 @@ fn evaluateGroupedBlockForwardCalibrationCandidate(
             group_round_shifts,
             replay_targets,
             ref_outputs,
+            cuda_weight_scratch,
         )) |gpu_err| {
             return gpu_err;
         }
@@ -2181,6 +2574,7 @@ fn evaluateGroupedBlockForwardCalibrationCandidateCuda(
     group_round_shifts: []const f32,
     replay_targets: ?*const GroupedReplayTargetMatrix,
     ref_outputs: ?[]const f32,
+    cuda_weight_scratch: ?*GroupedCudaWeightScratch,
 ) ?f64 {
     if (group_len == 0 or col_count % group_len != 0) return null;
     const max_quant_value: f32 = if (quant_bits == 4) 15.0 else 255.0;
@@ -2191,37 +2585,135 @@ fn evaluateGroupedBlockForwardCalibrationCandidateCuda(
 
     const use_replay_targets = replay_targets != null;
     const use_cached_ref = !use_replay_targets and ref_outputs != null;
-
-    // Build dequantized weights on CPU threads (same as Metal path)
-    var ref_weights_opt: ?[]f32 = null;
-    if (!use_cached_ref and !use_replay_targets) {
-        ref_weights_opt = allocator.alloc(f32, col_count * sample_rows_budget) catch return null;
-    }
-    defer if (ref_weights_opt) |ref_weights| allocator.free(ref_weights);
-    const dq_weights = allocator.alloc(f32, col_count * sample_rows_budget) catch return null;
-    defer allocator.free(dq_weights);
-
-    var build_ctx = GroupedDqWeightBuildContext{
-        .source_values = source_values,
-        .col_count = col_count,
-        .group_len = group_len,
-        .max_quant_value = max_quant_value,
-        .row_cache = row_cache,
-        .group_scale_factors = group_scale_factors,
-        .group_bias_shifts = group_bias_shifts,
-        .group_round_shifts = group_round_shifts,
-        .ref_weights = ref_weights_opt,
-        .dq_weights = dq_weights,
-    };
-    const pool = parallel.global();
-    pool.parallelForCompute(sample_rows_budget, buildGroupedDqWeightsRows, &build_ctx);
-
+    const need_ref_matmul = !use_replay_targets and ref_outputs == null;
     const out_len = input_samples * sample_rows_budget;
     const x_bytes = input_samples * col_count * @sizeOf(f32);
     const w_bytes = col_count * sample_rows_budget * @sizeOf(f32);
     const out_bytes = out_len * @sizeOf(f32);
+    if (x_bytes > cuda_ctx.x_dev.size) return null;
 
-    if (x_bytes > cuda_ctx.x_dev.size or w_bytes > cuda_ctx.w_dev.size or out_bytes > cuda_ctx.out_dev.size) return null;
+    const max_tile_rows = cudaCalibrationMaxSampleRowsPerTile(cuda_ctx, input_samples, col_count);
+    if (max_tile_rows == 0) return null;
+    const scratch_tile_rows = if (cuda_weight_scratch) |scratch|
+        if (col_count > 0) @divTrunc(scratch.dq_weights.len, col_count) else 0
+    else
+        max_tile_rows;
+    const tile_row_capacity = @min(sample_rows_budget, @min(max_tile_rows, scratch_tile_rows));
+    if (tile_row_capacity == 0) return null;
+    if (sample_rows_budget > tile_row_capacity or
+        w_bytes > cuda_ctx.w_dev.size or
+        out_bytes > cuda_ctx.out_dev.size or
+        w_bytes > cuda_ctx.ref_w_dev.size or
+        out_bytes > cuda_ctx.ref_out_dev.size)
+    {
+        return evaluateGroupedBlockForwardCalibrationCandidateCudaTiled(
+            allocator,
+            cuda_ctx,
+            source_values,
+            col_count,
+            group_len,
+            max_quant_value,
+            row_cache,
+            block_inputs,
+            group_scale_factors,
+            group_bias_shifts,
+            group_round_shifts,
+            replay_targets,
+            ref_outputs,
+            cuda_weight_scratch,
+        );
+    }
+
+    const weight_len = col_count * sample_rows_budget;
+    const use_gpu_weight_build = !need_ref_matmul and cuda_ctx.cuda_dq_weight_build_available and blk: {
+        if (cuda_weight_scratch) |scratch| {
+            break :blk scratch.device != null;
+        }
+        break :blk false;
+    };
+
+    // Build dequantized weights either on GPU (preferred) or on CPU fallback.
+    var ref_weights_opt: ?[]f32 = null;
+    var ref_weights_owned = false;
+    if (!use_gpu_weight_build and !use_cached_ref and !use_replay_targets) {
+        if (cuda_weight_scratch) |scratch| {
+            if (scratch.ref_weights) |buf| {
+                if (buf.len == weight_len) {
+                    ref_weights_opt = buf;
+                }
+            }
+        }
+        if (ref_weights_opt == null) {
+            ref_weights_opt = allocator.alloc(f32, weight_len) catch return null;
+            ref_weights_owned = true;
+        }
+    }
+    defer if (ref_weights_owned) allocator.free(ref_weights_opt.?);
+
+    if (use_gpu_weight_build) {
+        const gpu_scratch = &cuda_weight_scratch.?.device.?;
+        const build_fn = cuda_ctx.build_dq_weights_function orelse return null;
+        const col_count_u32 = std.math.cast(u32, col_count) orelse return null;
+        const sample_rows_u32 = std.math.cast(u32, sample_rows_budget) orelse return null;
+        const group_len_u32 = std.math.cast(u32, group_len) orelse return null;
+        const grid_x = @max(@as(u32, 1), (col_count_u32 + (cuda_grouped_build_dq_block_x - 1)) / cuda_grouped_build_dq_block_x);
+
+        gpu_scratch.group_scale_factors_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(group_scale_factors)) catch return null;
+        gpu_scratch.group_bias_shifts_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(group_bias_shifts)) catch return null;
+        gpu_scratch.group_round_shifts_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(group_round_shifts)) catch return null;
+
+        var arg_pack = compute.cuda.args.ArgPack.init(allocator);
+        defer arg_pack.deinit();
+        arg_pack.appendBufferPtr(&gpu_scratch.sampled_source_dev) catch return null;
+        arg_pack.appendBufferPtr(&gpu_scratch.row_group_min_dev) catch return null;
+        arg_pack.appendBufferPtr(&gpu_scratch.row_group_base_scale_dev) catch return null;
+        arg_pack.appendBufferPtr(&gpu_scratch.group_scale_factors_dev) catch return null;
+        arg_pack.appendBufferPtr(&gpu_scratch.group_bias_shifts_dev) catch return null;
+        arg_pack.appendBufferPtr(&gpu_scratch.group_round_shifts_dev) catch return null;
+        arg_pack.appendBufferPtr(&cuda_ctx.w_dev) catch return null;
+        arg_pack.appendScalar(u32, sample_rows_u32) catch return null;
+        arg_pack.appendScalar(u32, col_count_u32) catch return null;
+        arg_pack.appendScalar(u32, group_len_u32) catch return null;
+        arg_pack.appendScalar(f32, max_quant_value) catch return null;
+        compute.cuda.launch.launchWithFamily(
+            &cuda_ctx.device,
+            build_fn,
+            .{
+                .grid_x = grid_x,
+                .grid_y = sample_rows_u32,
+                .block_x = cuda_grouped_build_dq_block_x,
+            },
+            &arg_pack,
+            .pointwise,
+        ) catch return null;
+    } else {
+        var dq_weights_owned = false;
+        const dq_weights = blk: {
+            if (cuda_weight_scratch) |scratch| {
+                if (scratch.dq_weights.len == weight_len) break :blk scratch.dq_weights;
+            }
+            dq_weights_owned = true;
+            break :blk allocator.alloc(f32, weight_len) catch return null;
+        };
+        defer if (dq_weights_owned) allocator.free(dq_weights);
+
+        var build_ctx = GroupedDqWeightBuildContext{
+            .source_values = source_values,
+            .col_count = col_count,
+            .group_len = group_len,
+            .max_quant_value = max_quant_value,
+            .row_cache = row_cache,
+            .group_scale_factors = group_scale_factors,
+            .group_bias_shifts = group_bias_shifts,
+            .group_round_shifts = group_round_shifts,
+            .ref_weights = ref_weights_opt,
+            .dq_weights = dq_weights,
+        };
+        const pool = parallel.global();
+        pool.parallelForCompute(sample_rows_budget, buildGroupedDqWeightsRows, &build_ctx);
+
+        cuda_ctx.w_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(dq_weights)) catch return null;
+    }
 
     // Skip x_dev upload if already cached (same pointer + length from prior call)
     const x_slice = block_inputs.values[0 .. input_samples * col_count];
@@ -2231,11 +2723,7 @@ fn evaluateGroupedBlockForwardCalibrationCandidateCuda(
         cuda_ctx.cached_x_len = x_slice.len;
     }
 
-    // Upload dequantized weights
-    cuda_ctx.w_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(dq_weights)) catch return null;
-
     // Issue all GPU matmuls before synchronizing once
-    const need_ref_matmul = !use_replay_targets and ref_outputs == null;
     if (need_ref_matmul) {
         if (ref_weights_opt) |ref_weights| {
             cuda_ctx.ref_w_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(ref_weights)) catch return null;
@@ -2243,9 +2731,24 @@ fn evaluateGroupedBlockForwardCalibrationCandidateCuda(
         } else return null;
     }
     cuda_ctx.blas.matmulF32(&cuda_ctx.device, &cuda_ctx.x_dev, input_samples, col_count, &cuda_ctx.w_dev, sample_rows_budget, &cuda_ctx.out_dev) catch return null;
-    cuda_ctx.device.synchronize() catch return null;
+
+    if (!use_replay_targets) {
+        if (ref_outputs) |cached_ref| {
+            if (cached_ref.len != out_len) return null;
+            if (cuda_ctx.cached_ref_ptr != cached_ref.ptr or cuda_ctx.cached_ref_len != cached_ref.len) {
+                cuda_ctx.ref_out_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(cached_ref)) catch return null;
+                cuda_ctx.cached_ref_ptr = cached_ref.ptr;
+                cuda_ctx.cached_ref_len = cached_ref.len;
+            }
+        }
+        const ref_dev: *const compute.cuda.device.Buffer = &cuda_ctx.ref_out_dev;
+        if ((computeMseCuda(allocator, cuda_ctx, ref_dev, &cuda_ctx.out_dev, out_len) catch null)) |gpu_mse| {
+            return gpu_mse;
+        }
+    }
 
     // Download results
+    cuda_ctx.device.synchronize() catch return null;
     var ref_host_owned: ?[]f32 = null;
     if (need_ref_matmul) {
         ref_host_owned = allocator.alloc(f32, out_len) catch return null;
@@ -2348,6 +2851,279 @@ fn buildGroupedDqWeightsRows(sample_start: usize, sample_end: usize, ctx: *Group
     }
 }
 
+fn buildGroupedRefWeightsTile(
+    source_values: []align(1) const f32,
+    col_count: usize,
+    row_cache: *const GroupedCalibrationRowCache,
+    tile_start: usize,
+    tile_rows: usize,
+    ref_weights: []f32,
+) void {
+    var local_row: usize = 0;
+    while (local_row < tile_rows) : (local_row += 1) {
+        const sampled_row = tile_start + local_row;
+        const row = row_cache.row_indices[sampled_row];
+        const row_values = source_values[row * col_count .. (row + 1) * col_count];
+        for (0..col_count) |col| {
+            ref_weights[col * tile_rows + local_row] = row_values[col];
+        }
+    }
+}
+
+fn buildGroupedDqWeightsTile(
+    source_values: []align(1) const f32,
+    col_count: usize,
+    group_len: usize,
+    max_quant_value: f32,
+    row_cache: *const GroupedCalibrationRowCache,
+    group_scale_factors: []const f32,
+    group_bias_shifts: []const f32,
+    group_round_shifts: []const f32,
+    tile_start: usize,
+    tile_rows: usize,
+    ref_weights: ?[]f32,
+    dq_weights: []f32,
+) void {
+    const group_count = row_cache.group_count;
+    var local_row: usize = 0;
+    while (local_row < tile_rows) : (local_row += 1) {
+        const sampled_row = tile_start + local_row;
+        const row = row_cache.row_indices[sampled_row];
+        const row_values = source_values[row * col_count .. (row + 1) * col_count];
+
+        for (0..group_count) |g| {
+            const group_start = g * group_len;
+            const group_values = row_values[group_start .. group_start + group_len];
+            const row_group_idx = sampled_row * group_count + g;
+            const min_val = row_cache.group_min[row_group_idx];
+            const base_scale = row_cache.group_base_scale[row_group_idx];
+            const group_scale_factor = if (g < group_scale_factors.len)
+                group_scale_factors[g]
+            else
+                1.0;
+            const group_bias_shift = if (g < group_bias_shifts.len)
+                group_bias_shifts[g]
+            else
+                0.0;
+            const group_round_shift = if (g < group_round_shifts.len)
+                group_round_shifts[g]
+            else
+                0.0;
+            const group_scale = base_scale * group_scale_factor;
+            const group_bias = groupedBiasFromShift(min_val, group_scale, group_bias_shift);
+
+            for (group_values, 0..) |value, value_idx| {
+                const col = group_start + value_idx;
+                var quantized: f32 = 0.0;
+                if (group_scale > 0) {
+                    const normalized = (value - group_bias) / group_scale + group_round_shift;
+                    quantized = @max(0.0, @min(max_quant_value, @round(normalized)));
+                }
+                const dequant = quantized * group_scale + group_bias;
+                const idx = col * tile_rows + local_row;
+                if (ref_weights) |ref_buf| ref_buf[idx] = value;
+                dq_weights[idx] = dequant;
+            }
+        }
+    }
+}
+
+fn cudaCalibrationMaxSampleRowsPerTile(
+    cuda_ctx: *const CudaCalibContext,
+    input_samples: usize,
+    col_count: usize,
+) usize {
+    if (input_samples == 0 or col_count == 0) return 0;
+    const weight_row_bytes = std.math.mul(usize, col_count, @sizeOf(f32)) catch return 0;
+    const output_row_bytes = std.math.mul(usize, input_samples, @sizeOf(f32)) catch return 0;
+    if (weight_row_bytes == 0 or output_row_bytes == 0) return 0;
+
+    const rows_by_w = cuda_ctx.w_dev.size / weight_row_bytes;
+    const rows_by_ref_w = cuda_ctx.ref_w_dev.size / weight_row_bytes;
+    const rows_by_out = cuda_ctx.out_dev.size / output_row_bytes;
+    const rows_by_ref_out = cuda_ctx.ref_out_dev.size / output_row_bytes;
+    const tile_rows = @min(@min(rows_by_w, rows_by_ref_w), @min(rows_by_out, rows_by_ref_out));
+    if (tile_rows == 0) return 0;
+    return tile_rows;
+}
+
+fn evaluateGroupedBlockForwardCalibrationCandidateCudaTiled(
+    allocator: std.mem.Allocator,
+    cuda_ctx: *CudaCalibContext,
+    source_values: []align(1) const f32,
+    col_count: usize,
+    group_len: usize,
+    max_quant_value: f32,
+    row_cache: *const GroupedCalibrationRowCache,
+    block_inputs: *const GroupedBlockInputMatrix,
+    group_scale_factors: []const f32,
+    group_bias_shifts: []const f32,
+    group_round_shifts: []const f32,
+    replay_targets: ?*const GroupedReplayTargetMatrix,
+    ref_outputs: ?[]const f32,
+    cuda_weight_scratch: ?*GroupedCudaWeightScratch,
+) ?f64 {
+    const input_samples = block_inputs.input_samples;
+    const sample_rows_budget = row_cache.sample_rows;
+    const use_replay_targets = replay_targets != null;
+    const need_ref_matmul = !use_replay_targets and ref_outputs == null;
+    const max_tile_rows = cudaCalibrationMaxSampleRowsPerTile(cuda_ctx, input_samples, col_count);
+    if (max_tile_rows == 0) return null;
+
+    const scratch_tile_rows = if (cuda_weight_scratch) |scratch|
+        if (col_count > 0) @divTrunc(scratch.dq_weights.len, col_count) else 0
+    else
+        max_tile_rows;
+    const tile_row_capacity = @min(sample_rows_budget, @min(max_tile_rows, scratch_tile_rows));
+    if (tile_row_capacity == 0) return null;
+
+    const x_slice = block_inputs.values[0 .. input_samples * col_count];
+    if (cuda_ctx.cached_x_ptr != x_slice.ptr or cuda_ctx.cached_x_len != x_slice.len) {
+        cuda_ctx.x_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(x_slice)) catch return null;
+        cuda_ctx.cached_x_ptr = x_slice.ptr;
+        cuda_ctx.cached_x_len = x_slice.len;
+    }
+
+    const tile_weight_len = col_count * tile_row_capacity;
+    var owned_dq_weights: ?[]f32 = null;
+    defer if (owned_dq_weights) |buf| allocator.free(buf);
+    const dq_weights_buf = if (cuda_weight_scratch) |scratch|
+        scratch.dq_weights[0..tile_weight_len]
+    else blk: {
+        owned_dq_weights = allocator.alloc(f32, tile_weight_len) catch return null;
+        break :blk owned_dq_weights.?;
+    };
+
+    var owned_ref_weights: ?[]f32 = null;
+    defer if (owned_ref_weights) |buf| allocator.free(buf);
+    const ref_weights_buf: ?[]f32 = if (need_ref_matmul)
+        if (cuda_weight_scratch) |scratch|
+            if (scratch.ref_weights) |buf|
+                buf[0..tile_weight_len]
+            else blk: {
+                owned_ref_weights = allocator.alloc(f32, tile_weight_len) catch return null;
+                break :blk owned_ref_weights.?;
+            }
+        else blk: {
+            owned_ref_weights = allocator.alloc(f32, tile_weight_len) catch return null;
+            break :blk owned_ref_weights.?;
+        }
+    else
+        null;
+
+    const tile_out_capacity = input_samples * tile_row_capacity;
+    var owned_cached_ref_tile: ?[]f32 = null;
+    defer if (owned_cached_ref_tile) |buf| allocator.free(buf);
+    const cached_ref_tile_buf: ?[]f32 = if (!use_replay_targets and ref_outputs != null)
+        allocator.alloc(f32, tile_out_capacity) catch return null
+    else
+        null;
+    owned_cached_ref_tile = cached_ref_tile_buf;
+
+    const dq_out_tile_buf = allocator.alloc(f32, tile_out_capacity) catch return null;
+    defer allocator.free(dq_out_tile_buf);
+
+    const ref_out_tile_buf: ?[]f32 = if (need_ref_matmul)
+        allocator.alloc(f32, tile_out_capacity) catch return null
+    else
+        null;
+    defer if (ref_out_tile_buf) |buf| allocator.free(buf);
+
+    var weighted_err_sum: f64 = 0.0;
+    var total_count: usize = 0;
+    const use_gpu_mse = !use_replay_targets and (resetMseAccumulatorCuda(cuda_ctx) catch false);
+    var tile_start: usize = 0;
+    while (tile_start < sample_rows_budget) {
+        const tile_rows = @min(tile_row_capacity, sample_rows_budget - tile_start);
+        const dq_tile = dq_weights_buf[0 .. col_count * tile_rows];
+        const ref_tile = if (ref_weights_buf) |buf| buf[0 .. col_count * tile_rows] else null;
+        buildGroupedDqWeightsTile(
+            source_values,
+            col_count,
+            group_len,
+            max_quant_value,
+            row_cache,
+            group_scale_factors,
+            group_bias_shifts,
+            group_round_shifts,
+            tile_start,
+            tile_rows,
+            ref_tile,
+            dq_tile,
+        );
+        cuda_ctx.w_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(dq_tile)) catch return null;
+
+        if (ref_tile) |buf| {
+            cuda_ctx.ref_w_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(buf)) catch return null;
+            cuda_ctx.blas.matmulF32(&cuda_ctx.device, &cuda_ctx.x_dev, input_samples, col_count, &cuda_ctx.ref_w_dev, tile_rows, &cuda_ctx.ref_out_dev) catch return null;
+        } else if (!use_replay_targets) {
+            const cached = ref_outputs.?;
+            const cached_tile = cached_ref_tile_buf.?[0 .. input_samples * tile_rows];
+            var p: usize = 0;
+            while (p < input_samples) : (p += 1) {
+                const src = cached[p * sample_rows_budget + tile_start .. p * sample_rows_budget + tile_start + tile_rows];
+                const dst = cached_tile[p * tile_rows .. (p + 1) * tile_rows];
+                @memcpy(dst, src);
+            }
+            cuda_ctx.ref_out_dev.upload(&cuda_ctx.device, std.mem.sliceAsBytes(cached_tile)) catch return null;
+        }
+        cuda_ctx.blas.matmulF32(&cuda_ctx.device, &cuda_ctx.x_dev, input_samples, col_count, &cuda_ctx.w_dev, tile_rows, &cuda_ctx.out_dev) catch return null;
+
+        const tile_out_len = input_samples * tile_rows;
+        if (use_gpu_mse) {
+            if (!(accumulateMseCuda(allocator, cuda_ctx, &cuda_ctx.ref_out_dev, &cuda_ctx.out_dev, tile_out_len) catch false)) return null;
+            total_count += tile_out_len;
+            tile_start += tile_rows;
+            continue;
+        }
+
+        cuda_ctx.device.synchronize() catch return null;
+        if (use_replay_targets) {
+            const dq_out_tile = dq_out_tile_buf[0..tile_out_len];
+            cuda_ctx.out_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(dq_out_tile)) catch return null;
+            const targets = replay_targets.?;
+            var local_row: usize = 0;
+            while (local_row < tile_rows) : (local_row += 1) {
+                const row = row_cache.row_indices[tile_start + local_row];
+                var p: usize = 0;
+                while (p < input_samples) : (p += 1) {
+                    const diff = @as(f64, @floatCast(targets.at(p, row) - dq_out_tile[p * tile_rows + local_row]));
+                    weighted_err_sum += diff * diff;
+                    total_count += 1;
+                }
+            }
+        } else {
+            const dq_out_tile = dq_out_tile_buf[0..tile_out_len];
+            cuda_ctx.out_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(dq_out_tile)) catch return null;
+            if (need_ref_matmul) {
+                const ref_out_tile = ref_out_tile_buf.?[0..tile_out_len];
+                cuda_ctx.ref_out_dev.download(&cuda_ctx.device, std.mem.sliceAsBytes(ref_out_tile)) catch return null;
+                for (ref_out_tile, dq_out_tile) |a, b| {
+                    const diff = @as(f64, @floatCast(a - b));
+                    weighted_err_sum += diff * diff;
+                    total_count += 1;
+                }
+            } else {
+                const cached_tile = cached_ref_tile_buf.?[0..tile_out_len];
+                for (cached_tile, dq_out_tile) |a, b| {
+                    const diff = @as(f64, @floatCast(a - b));
+                    weighted_err_sum += diff * diff;
+                    total_count += 1;
+                }
+            }
+        }
+
+        tile_start += tile_rows;
+    }
+
+    if (use_gpu_mse) {
+        return finishMseCuda(cuda_ctx, total_count) catch null;
+    }
+
+    if (total_count == 0) return null;
+    return weighted_err_sum / @as(f64, @floatFromInt(total_count));
+}
+
 inline fn averageSlice(values: []const f32, fallback: f32) f32 {
     if (values.len == 0) return fallback;
     var sum: f64 = 0.0;
@@ -2366,6 +3142,7 @@ fn clipSearchGroupedCalibration(
     block_inputs: *const GroupedBlockInputMatrix,
     replay_targets: ?*const GroupedReplayTargetMatrix,
     ref_outputs: ?[]const f32,
+    cuda_weight_scratch: ?*GroupedCudaWeightScratch,
     current_scale_factors: []f32,
     current_bias_shifts: []f32,
     current_round_shifts: []f32,
@@ -2400,6 +3177,7 @@ fn clipSearchGroupedCalibration(
                 current_round_shifts,
                 replay_targets,
                 ref_outputs,
+                cuda_weight_scratch,
             );
             if (candidate_err < best_err) {
                 best_err = candidate_err;
@@ -2438,6 +3216,7 @@ fn clipSearchGroupedCalibration(
                     current_round_shifts,
                     replay_targets,
                     ref_outputs,
+                    cuda_weight_scratch,
                 );
                 if (candidate_err < best_err) {
                     best_err = candidate_err;
@@ -2594,6 +3373,103 @@ fn estimateGroupedBlockForwardCalibrationParameters(
     @memset(current_bias_shifts, 0.0);
     @memset(current_round_shifts, 0.0);
 
+    var cuda_weight_scratch: ?GroupedCudaWeightScratch = null;
+    defer if (cuda_weight_scratch) |*scratch| {
+        scratch.deinit(allocator, if (cuda_ctx) |ctx| &ctx.device else null);
+    };
+    if (cuda_ctx != null) {
+        const tile_row_capacity = if (cuda_ctx) |ctx| blk: {
+            const max_tile_rows = cudaCalibrationMaxSampleRowsPerTile(ctx, block_inputs.input_samples, col_count);
+            if (max_tile_rows == 0) break :blk @as(usize, 0);
+            break :blk @min(row_cache.sample_rows, max_tile_rows);
+        } else row_cache.sample_rows;
+        const scratch_len = col_count * tile_row_capacity;
+        const dq_weights = try allocator.alloc(f32, scratch_len);
+        const ref_weights = if (replay_targets == null and ref_outputs == null)
+            try allocator.alloc(f32, scratch_len)
+        else
+            @as(?[]f32, null);
+        cuda_weight_scratch = GroupedCudaWeightScratch{
+            .dq_weights = dq_weights,
+            .ref_weights = ref_weights,
+            .device = null,
+        };
+
+        if (cuda_ctx) |ctx| {
+            if (ctx.cuda_dq_weight_build_available and
+                tile_row_capacity == row_cache.sample_rows and
+                row_cache.sample_rows > 0 and
+                col_count > 0 and
+                group_count > 0)
+            {
+                const sampled_source = allocator.alloc(f32, scratch_len) catch null;
+                if (sampled_source) |sampled| {
+                    defer allocator.free(sampled);
+                    for (0..tile_row_capacity) |sampled_row| {
+                        const row = row_cache.row_indices[sampled_row];
+                        const src_row = source_values[row * col_count .. (row + 1) * col_count];
+                        const dst_row = sampled[sampled_row * col_count .. (sampled_row + 1) * col_count];
+                        @memcpy(dst_row, src_row);
+                    }
+
+                    const sampled_bytes = std.math.mul(usize, scratch_len, @sizeOf(f32)) catch 0;
+                    const row_group_len = std.math.mul(usize, tile_row_capacity, group_count) catch 0;
+                    const row_group_bytes = std.math.mul(usize, row_group_len, @sizeOf(f32)) catch 0;
+                    const group_param_bytes = std.math.mul(usize, group_count, @sizeOf(f32)) catch 0;
+
+                    if (sampled_bytes > 0 and sampled_bytes <= ctx.w_dev.size and row_group_bytes > 0 and group_param_bytes > 0) {
+                        var sampled_source_dev = ctx.device.allocBuffer(sampled_bytes) catch null;
+                        if (sampled_source_dev) |*sampled_dev| {
+                            defer if (cuda_weight_scratch.?.device == null) sampled_dev.deinit(&ctx.device);
+                            var row_group_min_dev = ctx.device.allocBuffer(row_group_bytes) catch null;
+                            if (row_group_min_dev) |*min_dev| {
+                                defer if (cuda_weight_scratch.?.device == null) min_dev.deinit(&ctx.device);
+                                var row_group_base_scale_dev = ctx.device.allocBuffer(row_group_bytes) catch null;
+                                if (row_group_base_scale_dev) |*base_dev| {
+                                    defer if (cuda_weight_scratch.?.device == null) base_dev.deinit(&ctx.device);
+                                    var group_scale_factors_dev = ctx.device.allocBuffer(group_param_bytes) catch null;
+                                    if (group_scale_factors_dev) |*sf_dev| {
+                                        defer if (cuda_weight_scratch.?.device == null) sf_dev.deinit(&ctx.device);
+                                        var group_bias_shifts_dev = ctx.device.allocBuffer(group_param_bytes) catch null;
+                                        if (group_bias_shifts_dev) |*bs_dev| {
+                                            defer if (cuda_weight_scratch.?.device == null) bs_dev.deinit(&ctx.device);
+                                            var group_round_shifts_dev = ctx.device.allocBuffer(group_param_bytes) catch null;
+                                            if (group_round_shifts_dev) |*rs_dev| {
+                                                defer if (cuda_weight_scratch.?.device == null) rs_dev.deinit(&ctx.device);
+
+                                                var uploads_ok = true;
+                                                sampled_dev.upload(&ctx.device, std.mem.sliceAsBytes(sampled)) catch {
+                                                    uploads_ok = false;
+                                                };
+                                                min_dev.upload(&ctx.device, std.mem.sliceAsBytes(row_cache.group_min[0..row_group_len])) catch {
+                                                    uploads_ok = false;
+                                                };
+                                                base_dev.upload(&ctx.device, std.mem.sliceAsBytes(row_cache.group_base_scale[0..row_group_len])) catch {
+                                                    uploads_ok = false;
+                                                };
+
+                                                if (uploads_ok) {
+                                                    cuda_weight_scratch.?.device = .{
+                                                        .sampled_source_dev = sampled_dev.*,
+                                                        .row_group_min_dev = min_dev.*,
+                                                        .row_group_base_scale_dev = base_dev.*,
+                                                        .group_scale_factors_dev = sf_dev.*,
+                                                        .group_bias_shifts_dev = bs_dev.*,
+                                                        .group_round_shifts_dev = rs_dev.*,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     const baseline_err = evaluateGroupedBlockForwardCalibrationCandidate(
         allocator,
         cuda_ctx,
@@ -2608,6 +3484,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
         current_round_shifts,
         if (replay_targets) |*targets| targets else null,
         ref_outputs,
+        if (cuda_weight_scratch) |*scratch| scratch else null,
     );
     const optimizer = calibrationOptimizerFromEnv(options.profile);
 
@@ -2625,6 +3502,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
             block_inputs,
             if (replay_targets) |*targets| targets else null,
             ref_outputs,
+            if (cuda_weight_scratch) |*scratch| scratch else null,
             current_scale_factors,
             current_bias_shifts,
             current_round_shifts,
@@ -2777,6 +3655,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
                     current_round_shifts,
                     if (replay_targets) |*targets| targets else null,
                     ref_outputs,
+                    if (cuda_weight_scratch) |*scratch| scratch else null,
                 );
                 if (candidate_err < accepted_err) {
                     accepted_err = candidate_err;
@@ -2862,6 +3741,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
                 current_round_shifts,
                 if (replay_targets) |*targets| targets else null,
                 ref_outputs,
+                if (cuda_weight_scratch) |*scratch| scratch else null,
             );
             if (refine_err < accepted_err) {
                 accepted_err = refine_err;
@@ -3348,24 +4228,54 @@ fn quantizeGroupedAffineTensor(
     const bias_values = try allocator.alloc(u16, row_count * group_count);
     defer allocator.free(bias_values);
 
-    // Quantize rows in parallel
-    var quant_ctx = RowQuantizeContext{
-        .source_data = source_values,
-        .packed_row_data = packed_row_words,
-        .scale_data = scale_values,
-        .bias_data = bias_values,
-        .col_count = col_count,
-        .packed_col_count = packed_col_count,
-        .group_count = group_count,
-        .group_len = group_len,
-        .quant_bits = quant_bits,
-        .group_scale_factors = calib_params.group_scale_factors,
-        .group_bias_shifts = calib_params.group_bias_shifts,
-        .group_round_shifts = calib_params.group_round_shifts,
-    };
+    var used_cuda_quant = false;
+    if (cuda_ctx) |ctx| {
+        if (!ctx.cuda_quantization_failed) {
+            used_cuda_quant = tryQuantizeGroupedAffineRowsCuda(
+                allocator,
+                ctx,
+                source_values,
+                row_count,
+                col_count,
+                group_len,
+                quant_bits,
+                calib_params.group_scale_factors,
+                calib_params.group_bias_shifts,
+                calib_params.group_round_shifts,
+                packed_row_words,
+                scale_values,
+                bias_values,
+            ) catch |err| blk: {
+                if (!ctx.cuda_quantization_failed) {
+                    log.warn("convert", "CUDA grouped-affine quantization failed; falling back to CPU", .{
+                        .tensor = tensor_name,
+                        .err = @errorName(err),
+                    });
+                    ctx.cuda_quantization_failed = true;
+                }
+                break :blk false;
+            };
+        }
+    }
+    if (!used_cuda_quant) {
+        var quant_ctx = RowQuantizeContext{
+            .source_data = source_values,
+            .packed_row_data = packed_row_words,
+            .scale_data = scale_values,
+            .bias_data = bias_values,
+            .col_count = col_count,
+            .packed_col_count = packed_col_count,
+            .group_count = group_count,
+            .group_len = group_len,
+            .quant_bits = quant_bits,
+            .group_scale_factors = calib_params.group_scale_factors,
+            .group_bias_shifts = calib_params.group_bias_shifts,
+            .group_round_shifts = calib_params.group_round_shifts,
+        };
 
-    const pool = parallel.global();
-    pool.parallelForCompute(row_count, quantizeRowSlice, &quant_ctx);
+        const pool = parallel.global();
+        pool.parallelForCompute(row_count, quantizeRowSlice, &quant_ctx);
+    }
 
     // Add tensors to builder — preserve 3D shape for fused expert weights
     const quant_dtype: DType = if (quant_bits == 4) .grouped_affine_u4 else .grouped_affine_u8;
