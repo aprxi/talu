@@ -1644,10 +1644,15 @@ array maybe_dequantize_grouped_affine_weight(
         }
     }
 
+    // Move the heap vector into the MLX array, then free it immediately so
+    // the large float32 buffer (rows * cols * 4 bytes) does not stay alive
+    // alongside the bf16 result. eval() forces MLX to materialise the bf16
+    // Metal buffer before the f32 one is released, keeping peak RSS minimal.
     const array dequant_f32 = array(out.begin(), Shape{rows, cols}, float32);
-    array dequant_dense = astype(dequant_f32, bfloat16);
-    dequant_dense = stop_gradient(copy(dequant_dense));
-    return dequant_dense;
+    out = std::vector<float>{};  // release host-side float32 copy immediately
+    array dequant_bf16 = astype(dequant_f32, bfloat16);
+    eval(dequant_bf16);          // materialise bf16; f32 Metal buffer can now be freed
+    return stop_gradient(dequant_bf16);
 }
 
 bool has_grouped_affine_metadata_for_key(
@@ -2730,15 +2735,22 @@ std::optional<MemoryBudgetEstimate> estimate_memory_budget(
     if (!memory_size.has_value()) return std::nullopt;
     const std::optional<size_t> recommended = recommended_working_set_bytes();
     const int context_tokens = env_positive_int("TALU_METAL_MEMORY_CONTEXT_TOKENS", env_positive_int("TOKENS", 200));
-    const int active_slots = env_positive_int(
-        "TALU_METAL_MAX_BATCH_SIZE",
-        env_positive_int("TALU_CUDA_MAX_BATCH_SIZE", 8)
-    );
+    const int active_slots = env_positive_int("TALU_MAX_BATCH_SIZE", 8);
 
     MemoryBudgetEstimate estimate{};
     estimate.memory_size_bytes = *memory_size;
     estimate.max_recommended_bytes = recommended.has_value() ? *recommended : 0;
-    estimate.effective_budget_bytes = (estimate.memory_size_bytes * 8) / 10; // 0.8 * total unified memory
+    // On Apple Silicon unified memory, Metal and CPU share physical RAM.
+    // recommendedMaxWorkingSetSize is Apple's conservative perf guideline (~65-70% of RAM),
+    // not a hard allocation limit — Metal can succeed well beyond it as long as physical
+    // pages are available. Use physical RAM minus OS overhead as the effective budget,
+    // taking the max with recommendedMaxWorkingSetSize so we never go below Apple's guidance.
+    static constexpr size_t os_overhead_bytes = static_cast<size_t>(4ULL * 1024 * 1024 * 1024); // 4 GiB for OS
+    const size_t physical_budget = estimate.memory_size_bytes > os_overhead_bytes
+        ? estimate.memory_size_bytes - os_overhead_bytes
+        : 0;
+    const size_t recommended_val = recommended.has_value() ? *recommended : 0;
+    estimate.effective_budget_bytes = std::max(recommended_val, physical_budget);
     estimate.context_tokens = std::max(1, context_tokens);
     estimate.active_slots = std::max(1, active_slots);
     estimate.weight_bytes = model_weight_bytes_on_disk(model_path);
@@ -4312,8 +4324,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
         // v3 cache/runtime policy: quantized path is allowed for prefill too,
-        // so dense RHS is only retained when explicitly requested.
-        const bool default_keep_dense_rhs_for_prefill = ctx->cfg.hidden_size_per_layer_input > 0;
+        // so dense RHS is not retained by default.
+        // Note: per-layer input projection weights (per_layer_input_gate_rhs etc.) are
+        // small and always loaded as dense unconditionally; they do not depend on this flag.
+        const bool default_keep_dense_rhs_for_prefill = false;
         const bool keep_dense_rhs_for_prefill = env_truthy(
             "TALU_METAL_KEEP_DENSE_RHS_FOR_PREFILL",
             default_keep_dense_rhs_for_prefill
@@ -4378,21 +4392,26 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         } else {
             if (has_tensor(tensors, text_prefix + "lm_head.weight")) {
                 lm_head_key = text_prefix + "lm_head.weight";
-                lm_head_weight = load_linear_weight(tensors, ctx->cfg, text_prefix + "lm_head.weight");
             } else if (has_tensor(tensors, "lm_head.weight")) {
                 lm_head_key = "lm_head.weight";
-                lm_head_weight = load_linear_weight(tensors, ctx->cfg, "lm_head.weight");
             } else {
                 throw std::runtime_error("missing lm_head weight (tie_word_embeddings=false)");
             }
+            // Defer loading the dense weight: for large quantized checkpoints (TQ4, FP8, NVFP4)
+            // the QMM path below avoids the full dequantize. Load dense only as a fallback.
         }
 
         const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta);
         if (enable_lm_head_qmm) {
             if (lm_head_weight.size() == 1) {
-                // Tie embeddings can point at raw FP8 tensors. Load dequantized copy only
-                // if direct packed MXFP8 path is unavailable.
-                lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+                // For grouped-affine: pass raw packed tensor directly — QMM capture reads
+                // scales/biases from the tensors map and only needs the shape from lhs_weight.
+                // For other formats (FP8 etc.) that need a float input, dequantize now.
+                if (has_grouped_affine_metadata_for_key(tensors, lm_head_key)) {
+                    lm_head_weight = require_tensor(tensors, lm_head_key);
+                } else {
+                    lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+                }
             }
             bool lm_head_has_q = false;
             int lm_head_detected_bits = 0;
@@ -4417,7 +4436,12 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         // prefill and decode, so the dense transpose is unnecessary.
         if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled ||
             (!ctx->has_fp8_meta && !ctx->has_grouped_affine_meta && !has_nvfp4_meta)) {
-            if (lm_head_weight.size() == 1) lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+            // Need dense weight: dequantize now if not already in float form.
+            const bool weight_is_float = lm_head_weight.dtype() == bfloat16 ||
+                lm_head_weight.dtype() == float16 || lm_head_weight.dtype() == float32;
+            if (!weight_is_float) {
+                lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+            }
             {
                 array rhs = to_rhs(lm_head_weight, lm_head_key);
                 if (ctx->cfg.hidden_size_per_layer_input > 0 && !ctx->lm_head_q_decode_enabled) {

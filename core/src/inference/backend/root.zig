@@ -105,13 +105,9 @@ comptime {
     }
 }
 
-/// Default max concurrent decode slots per backend.
-/// Override at runtime via TALU_CUDA_MAX_BATCH_SIZE or TALU_METAL_MAX_BATCH_SIZE.
-const MAX_BATCH_SIZE = struct {
-    const cpu: usize = 4;
-    const metal: usize = 8;
-    const cuda: usize = 8;
-};
+/// Default max concurrent decode slots for all backends.
+/// Override at runtime via TALU_MAX_BATCH_SIZE.
+const default_max_batch_size: usize = 8;
 
 /// Compute model-load options before backend initialization.
 /// This keeps backend/platform policy out of io/ while preserving optimized execution routes.
@@ -1070,21 +1066,21 @@ fn resolveCpuLayersTopology(
     return result;
 }
 
-fn resolveCudaMaxBatchSize() usize {
-    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MAX_BATCH_SIZE") catch {
-        return MAX_BATCH_SIZE.cuda;
+fn resolveMaxBatchSize() usize {
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_MAX_BATCH_SIZE") catch {
+        return default_max_batch_size;
     };
     defer std.heap.c_allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-        log.warn("inference", "Invalid TALU_CUDA_MAX_BATCH_SIZE; using default", .{
+        log.warn("inference", "Invalid TALU_MAX_BATCH_SIZE; using default", .{
             .value = trimmed,
-            .default = MAX_BATCH_SIZE.cuda,
+            .default = default_max_batch_size,
         });
-        return MAX_BATCH_SIZE.cuda;
+        return default_max_batch_size;
     };
     if (parsed == 0) {
-        log.warn("inference", "TALU_CUDA_MAX_BATCH_SIZE must be >= 1; clamping", .{
+        log.warn("inference", "TALU_MAX_BATCH_SIZE must be >= 1; clamping", .{
             .value = parsed,
             .clamped = 1,
         });
@@ -1760,7 +1756,7 @@ fn initCpu(
     reason: []const u8,
     progress: progress_mod.Context,
 ) !Backend {
-    const cpu_backend_state = cpu.BackendType.init(allocator, loaded, MAX_BATCH_SIZE.cpu, progress) catch |err| {
+    const cpu_backend_state = cpu.BackendType.init(allocator, loaded, resolveMaxBatchSize(), progress) catch |err| {
         log.warn("inference", "CPU backend init failed", .{
             .reason = @errorName(err),
             .arch = @tagName(loaded.config.model_arch),
@@ -2026,7 +2022,7 @@ fn initCuda(
             },
         };
     }
-    const cuda_max_batch_size = resolveCudaMaxBatchSize();
+    const cuda_max_batch_size = resolveMaxBatchSize();
     const n_layers = loaded.blocks.len;
     const cpu_layer_count: usize = switch (topology.mode) {
         .cpu_gpu, .cpu_gpu_gpu => topology.split_layer orelse 0,

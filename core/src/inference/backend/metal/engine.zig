@@ -13,7 +13,7 @@ const cpu_sampling_ops = compute.cpu.sampling_ops;
 
 const LoadedModel = models.LoadedModel;
 const topk_route_candidate_capacity: usize = 256;
-const default_metal_max_batch_size: usize = 8;
+const default_max_batch_size: usize = 8;
 
 const mlx_ctx = opaque {};
 
@@ -253,7 +253,7 @@ pub const MetalBackend = struct {
 
     vocab_size: usize,
     d_model: usize,
-    max_batch_size: usize = default_metal_max_batch_size,
+    max_batch_size: usize = default_max_batch_size,
 
     slot_ctxs: []?*mlx_ctx,
     slot_in_use: []bool,
@@ -352,29 +352,12 @@ pub const MetalBackend = struct {
     }
 
     fn resolveMaxBatchSize(allocator: std.mem.Allocator) usize {
-        const parse_raw = struct {
-            fn run(raw: []const u8) ?usize {
-                const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-                if (trimmed.len == 0) return null;
-                const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch return null;
-                return @max(@as(usize, 1), parsed);
-            }
-        }.run;
-
-        if (std.process.getEnvVarOwned(allocator, "TALU_METAL_MAX_BATCH_SIZE")) |raw_metal| {
-            defer allocator.free(raw_metal);
-            if (parse_raw(raw_metal)) |parsed| return parsed;
-            return default_metal_max_batch_size;
-        } else |_| {}
-
-        // Backward-compatible alias used by bench scenarios that set
-        // TALU_CUDA_MAX_BATCH_SIZE across backends.
-        if (std.process.getEnvVarOwned(allocator, "TALU_CUDA_MAX_BATCH_SIZE")) |raw_cuda| {
-            defer allocator.free(raw_cuda);
-            if (parse_raw(raw_cuda)) |parsed| return parsed;
-        } else |_| {}
-
-        return default_metal_max_batch_size;
+        const raw = std.process.getEnvVarOwned(allocator, "TALU_MAX_BATCH_SIZE") catch return default_max_batch_size;
+        defer allocator.free(raw);
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return default_max_batch_size;
+        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch return default_max_batch_size;
+        return @max(@as(usize, 1), parsed);
     }
 
     fn resolveLastError() []const u8 {

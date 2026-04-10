@@ -376,7 +376,7 @@ pub const MetalBackend = struct {
     }
 
     fn resolveMaxBatchSize() usize {
-        if (std.posix.getenv("TALU_METAL_MAX_BATCH_SIZE")) |raw| {
+        if (std.posix.getenv("TALU_MAX_BATCH_SIZE")) |raw| {
             const parsed = std.fmt.parseUnsigned(usize, std.mem.sliceTo(raw, 0), 10) catch return 8;
             return @max(@as(usize, 1), parsed);
         }

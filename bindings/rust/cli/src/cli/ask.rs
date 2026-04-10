@@ -799,7 +799,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         };
 
         // Scheduler auto-clamps to backend's max_batch_size (default 8,
-        // override via TALU_CUDA_MAX_BATCH_SIZE). No explicit config needed.
+        // override via TALU_MAX_BATCH_SIZE). No explicit config needed.
         let batch = talu::batch::BatchHandle::new(&backend, None)?;
         let mut request_ids: Vec<(u64, ChatHandle, String)> = Vec::new();
         for (i, (prompt_text, label)) in prompts.iter().enumerate() {
