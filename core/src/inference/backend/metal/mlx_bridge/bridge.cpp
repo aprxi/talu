@@ -677,6 +677,7 @@ struct LayerWeights {
     bool mlp_up_has_q = false;
     bool mlp_gate_up_has_q = false;
     bool mlp_down_has_q = false;
+    int mlp_gate_width = 0;
     bool mlp_is_moe = false;
     int moe_num_experts = 0;
     int moe_experts_per_token = 0;
@@ -746,6 +747,9 @@ struct LayerWeights {
     bool attn_o_has_q = false;
     array attn_q_norm_w = array(0.0f);
     array attn_k_norm_w = array(0.0f);
+    int attn_q_proj_width = 0;
+    int attn_k_proj_width = 0;
+    int attn_v_proj_width = 0;
     int attn_num_heads = 0;
     int attn_num_kv_heads = 0;
     int attn_head_dim = 0;
@@ -2211,12 +2215,11 @@ std::pair<array, array> gated_delta_update_fallback(
     const int Dk = q.shape(3);
     const int Hv = v.shape(2);
     const int Dv = v.shape(3);
-    const float inv_scale = 1.0f / std::sqrt(static_cast<float>(Dk));
 
     array state = state_opt.has_value() ? *state_opt : zeros({B, Hv, Dv, Dk}, q.dtype());
 
-    array q_use = fast::rms_norm(q, std::nullopt, 1.0e-6f) * array(inv_scale * inv_scale, q.dtype());
-    array k_use = fast::rms_norm(k, std::nullopt, 1.0e-6f) * array(inv_scale, k.dtype());
+    array q_use = q;
+    array k_use = k;
     if (Hv % Hk != 0) {
         throw std::runtime_error("gated-delta head mismatch: Hv must be divisible by Hk");
     }
@@ -2290,26 +2293,10 @@ const std::string& gated_delta_kernel_source() {
         for (int t = 0; t < T; ++t) {
           float q_vals[n_per_t];
           float k_vals[n_per_t];
-          float q_sq = 0.0f;
-          float k_sq = 0.0f;
           for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
-            const float q_raw = static_cast<float>(q_[s_idx]);
-            const float k_raw = static_cast<float>(k_[s_idx]);
-            q_sq += q_raw * q_raw;
-            k_sq += k_raw * k_raw;
-            q_vals[i] = q_raw;
-            k_vals[i] = k_raw;
-          }
-          q_sq = simd_sum(q_sq);
-          k_sq = simd_sum(k_sq);
-          const float inv_dk = 1.0f / static_cast<float>(Dk);
-          const float inv_sqrt_dk = rsqrt(static_cast<float>(Dk));
-          const float q_scale = rsqrt(q_sq * inv_dk + 1.0e-6f) * inv_dk;
-          const float k_scale = rsqrt(k_sq * inv_dk + 1.0e-6f) * inv_sqrt_dk;
-          for (int i = 0; i < n_per_t; ++i) {
-            q_vals[i] *= q_scale;
-            k_vals[i] *= k_scale;
+            q_vals[i] = static_cast<float>(q_[s_idx]);
+            k_vals[i] = static_cast<float>(k_[s_idx]);
           }
 
           float kv_mem = 0.0f;
@@ -2685,6 +2672,12 @@ int resolve_prefill_chunk_size() {
     return env_positive_int("TALU_METAL_PREFILL_CHUNK_SIZE", 64);
 }
 
+int resolve_prefill_sync_interval_chunks() {
+    // Chunked prefill only needs periodic sync to bound queued graph work.
+    // Synchronizing every chunk leaves long prompts unnecessarily serial.
+    return env_positive_int("TALU_METAL_PREFILL_SYNC_INTERVAL_CHUNKS", 4);
+}
+
 int resolve_prefill_full_prompt_threshold() {
     // For short prompts, one full-prompt forward avoids extra chunk-loop
     // dispatch/sync overhead in the prefill + seed-token path.
@@ -2978,9 +2971,9 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     const int S = x_norm.shape(1);
 
     const bool prefill_only_qmm = false;
-    const int q_proj_width = lw.attn_q_has_q ? lw.attn_q_q_w.shape(0) : lw.attn_q_rhs.shape(1);
-    const int k_proj_width = lw.attn_k_has_q ? lw.attn_k_q_w.shape(0) : lw.attn_k_rhs.shape(1);
-    const int v_proj_width = lw.attn_v_has_q ? lw.attn_v_q_w.shape(0) : lw.attn_v_rhs.shape(1);
+    const int q_proj_width = lw.attn_q_proj_width;
+    const int k_proj_width = lw.attn_k_proj_width;
+    const int v_proj_width = lw.attn_v_proj_width;
     const bool use_fused_qkv_proj =
         (lw.attn_qkv_rhs.size() > 1 || lw.attn_qkv_has_q) &&
         q_proj_width > 0 &&
@@ -3204,17 +3197,7 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
         env_truthy("TALU_METAL_GEMMA4_FORCE_F32_ATTN", false) &&
         ctx->cfg.hidden_size_per_layer_input > 0;
     array attn_out = array(0.0f);
-    if (S == 1) {
-        attn_out = single_query_grouped_attention(
-            queries,
-            keys_view,
-            values_view,
-            lw.attn_num_heads,
-            lw.attn_num_kv_heads,
-            lw.attn_scale,
-            force_f32_attn
-        );
-    } else if (force_f32_attn) {
+    if (force_f32_attn) {
         const array q_f32 = astype(queries, float32);
         const array k_f32 = astype(keys_view, float32);
         const array v_f32 = astype(values_view, float32);
@@ -3349,6 +3332,14 @@ bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
 bool combine_dense_mlp_gate_up_weights(LayerWeights* lw) {
     if (lw == nullptr) return false;
 
+    if (lw->mlp_gate_width <= 0) {
+        if (lw->mlp_gate_has_q && lw->mlp_gate_q_w.ndim() == 2) {
+            lw->mlp_gate_width = lw->mlp_gate_q_w.shape(0);
+        } else if (lw->mlp_gate_rhs.ndim() == 2) {
+            lw->mlp_gate_width = lw->mlp_gate_rhs.shape(1);
+        }
+    }
+
     if (lw->mlp_gate_rhs.size() > 1 && lw->mlp_up_rhs.size() > 1) {
         if (lw->mlp_gate_rhs.ndim() == 2 &&
             lw->mlp_up_rhs.ndim() == 2 &&
@@ -3391,8 +3382,47 @@ bool combine_dense_mlp_gate_up_weights(LayerWeights* lw) {
     return lw->mlp_gate_up_has_q || lw->mlp_gate_up_rhs.size() > 1;
 }
 
+void compact_dense_mlp_gate_up_weights(LayerWeights* lw) {
+    if (lw == nullptr) return;
+    if (lw->mlp_gate_up_rhs.size() <= 1 && !lw->mlp_gate_up_has_q) return;
+    if (lw->mlp_gate_width <= 0) return;
+
+    lw->mlp_gate_rhs = array(0.0f);
+    lw->mlp_up_rhs = array(0.0f);
+    lw->mlp_gate_q_w = array(0.0f);
+    lw->mlp_gate_q_scales = array(0.0f);
+    lw->mlp_gate_q_biases = array(0.0f);
+    lw->mlp_up_q_w = array(0.0f);
+    lw->mlp_up_q_scales = array(0.0f);
+    lw->mlp_up_q_biases = array(0.0f);
+    lw->mlp_gate_has_q = false;
+    lw->mlp_up_has_q = false;
+}
+
 bool combine_full_attention_qkv_weights(LayerWeights* lw) {
     if (lw == nullptr) return false;
+
+    if (lw->attn_q_proj_width <= 0) {
+        if (lw->attn_q_has_q && lw->attn_q_q_w.ndim() == 2) {
+            lw->attn_q_proj_width = lw->attn_q_q_w.shape(0);
+        } else if (lw->attn_q_rhs.ndim() == 2) {
+            lw->attn_q_proj_width = lw->attn_q_rhs.shape(1);
+        }
+    }
+    if (lw->attn_k_proj_width <= 0) {
+        if (lw->attn_k_has_q && lw->attn_k_q_w.ndim() == 2) {
+            lw->attn_k_proj_width = lw->attn_k_q_w.shape(0);
+        } else if (lw->attn_k_rhs.ndim() == 2) {
+            lw->attn_k_proj_width = lw->attn_k_rhs.shape(1);
+        }
+    }
+    if (lw->attn_v_proj_width <= 0) {
+        if (lw->attn_v_has_q && lw->attn_v_q_w.ndim() == 2) {
+            lw->attn_v_proj_width = lw->attn_v_q_w.shape(0);
+        } else if (lw->attn_v_rhs.ndim() == 2) {
+            lw->attn_v_proj_width = lw->attn_v_rhs.shape(1);
+        }
+    }
 
     if (lw->attn_q_rhs.size() > 1 && lw->attn_k_rhs.size() > 1 && lw->attn_v_rhs.size() > 1) {
         if (lw->attn_q_rhs.ndim() == 2 &&
@@ -3443,6 +3473,28 @@ bool combine_full_attention_qkv_weights(LayerWeights* lw) {
     }
 
     return lw->attn_qkv_has_q || lw->attn_qkv_rhs.size() > 1;
+}
+
+void compact_full_attention_qkv_weights(LayerWeights* lw) {
+    if (lw == nullptr) return;
+    if (lw->attn_qkv_rhs.size() <= 1 && !lw->attn_qkv_has_q) return;
+    if (lw->attn_q_proj_width <= 0 || lw->attn_k_proj_width <= 0 || lw->attn_v_proj_width <= 0) return;
+
+    lw->attn_q_rhs = array(0.0f);
+    lw->attn_k_rhs = array(0.0f);
+    lw->attn_v_rhs = array(0.0f);
+    lw->attn_q_q_w = array(0.0f);
+    lw->attn_q_q_scales = array(0.0f);
+    lw->attn_q_q_biases = array(0.0f);
+    lw->attn_k_q_w = array(0.0f);
+    lw->attn_k_q_scales = array(0.0f);
+    lw->attn_k_q_biases = array(0.0f);
+    lw->attn_v_q_w = array(0.0f);
+    lw->attn_v_q_scales = array(0.0f);
+    lw->attn_v_q_biases = array(0.0f);
+    lw->attn_q_has_q = false;
+    lw->attn_k_has_q = false;
+    lw->attn_v_has_q = false;
 }
 
 array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
@@ -4049,9 +4101,7 @@ array run_layer(
             down = down + shared_down;
         }
     } else {
-        const int mlp_gate_width = lw.mlp_gate_has_q
-            ? lw.mlp_gate_q_w.shape(0)
-            : lw.mlp_gate_rhs.shape(1);
+        const int mlp_gate_width = lw.mlp_gate_width;
         const bool use_fused_gate_up =
             (lw.mlp_gate_up_rhs.size() > 1 || lw.mlp_gate_up_has_q) &&
             mlp_gate_width > 0;
@@ -4493,17 +4543,56 @@ std::pair<array, array> fused_lm_head_topk_candidate_arrays(
 void prefill_prefix_chunks(mlx_ctx* ctx, const std::vector<int32_t>& prompt_vec, int32_t prefix_len) {
     if (prefix_len <= 0) return;
     const int chunk_size = resolve_prefill_chunk_size();
+    const int sync_interval_chunks = std::max(resolve_prefill_sync_interval_chunks(), 1);
     int32_t offset = 0;
+    int chunks_since_sync = 0;
+    array pending_hidden = array(0.0f);
+    bool has_pending_hidden = false;
     while (offset < prefix_len) {
         const int32_t remaining = prefix_len - offset;
         const int32_t take_count = std::min<int32_t>(remaining, chunk_size);
         const auto* chunk_ptr = prompt_vec.data() + static_cast<size_t>(offset);
         const array prefix_chunk(chunk_ptr, Shape{1, take_count}, int32);
-        const array prefill_hidden = forward_hidden(ctx, prefix_chunk, false);
-        eval(prefill_hidden);
-        synchronize();
+        pending_hidden = forward_hidden(ctx, prefix_chunk, false);
+        has_pending_hidden = true;
         offset += take_count;
+        chunks_since_sync += 1;
+        if (chunks_since_sync >= sync_interval_chunks) {
+            eval(pending_hidden);
+            synchronize();
+            has_pending_hidden = false;
+            chunks_since_sync = 0;
+        }
     }
+    if (has_pending_hidden) {
+        eval(pending_hidden);
+        synchronize();
+    }
+}
+
+array prefill_seed_logits_chunked(mlx_ctx* ctx, const std::vector<int32_t>& prompt_vec, int32_t prompt_len) {
+    if (!ctx) {
+        throw std::runtime_error("prefill_seed_logits_chunked: ctx is null");
+    }
+    if (prompt_len <= 0) {
+        throw std::runtime_error("prefill_seed_logits_chunked: prompt_len must be > 0");
+    }
+    const int chunk_size = resolve_prefill_chunk_size();
+    if (chunk_size <= 0) {
+        throw std::runtime_error("prefill_seed_logits_chunked: invalid chunk size");
+    }
+
+    const int tail_chunk_size = std::max(
+        chunk_size,
+        env_positive_int("TALU_METAL_PREFILL_TAIL_CHUNK_SIZE", chunk_size)
+    );
+    const int32_t tail_len = std::min<int32_t>(prompt_len, tail_chunk_size);
+    const int32_t prefix_len = prompt_len - tail_len;
+    prefill_prefix_chunks(ctx, prompt_vec, prefix_len);
+
+    const auto* tail_ptr = prompt_vec.data() + static_cast<size_t>(prefix_len);
+    const array tail_arr(tail_ptr, Shape{1, tail_len}, int32);
+    return forward_logits(ctx, tail_arr);
 }
 
 void reset_runtime_state(mlx_ctx* ctx) {
@@ -5205,6 +5294,12 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     static_cast<size_t>(prefill_cache_mb) * 1024ULL * 1024ULL;
             }
         }
+        const bool enable_linear_prefill_dense_cache =
+            prefill_cache_budget_bytes > 0 &&
+            env_truthy("TALU_METAL_PREFILL_DENSE_CACHE_LINEAR_ATTN", true);
+        const bool enable_full_attn_prefill_dense_cache =
+            prefill_cache_budget_bytes > 0 &&
+            env_truthy("TALU_METAL_PREFILL_DENSE_CACHE_FULL_ATTN", false);
         const auto maybe_build_prefill_rhs_cache = [&](
             const std::string& weight_key,
             const array& q_w,
@@ -5642,6 +5737,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     lw.mlp_down_rhs = load_rhs_weight(mlp_down_key);
                 }
                 combine_dense_mlp_gate_up_weights(&lw);
+                compact_dense_mlp_gate_up_weights(&lw);
             }
 
             const bool has_linear_split = has_tensor(tensors, p + "linear_attn.in_proj_qkv.weight");
@@ -5929,7 +6025,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         const array qkv_rhs = to_rhs(ensure_qkv_weight_dense(), qkv_key);
                         const array z_rhs = to_rhs(ensure_z_weight_dense(), z_key);
                         lw.lin_in_proj_qkvz_rhs = concatenate({ qkv_rhs, z_rhs }, 1);
-                    } else {
+                    } else if (enable_linear_prefill_dense_cache) {
                         lw.lin_in_proj_qkvz_prefill_rhs = maybe_build_prefill_rhs_cache(
                             p + "linear_attn.in_proj_qkvz",
                             lw.lin_in_proj_qkvz_q_w,
@@ -6060,7 +6156,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                                 {0, 0},
                                 {fused_rows, qkvz_cols}
                             );
-                        } else {
+                        } else if (enable_linear_prefill_dense_cache) {
                             lw.lin_in_proj_qkvz_prefill_rhs = maybe_build_prefill_rhs_cache(
                                 p + "mixer.in_proj.qkvz_slice",
                                 lw.lin_in_proj_qkvz_q_w,
@@ -6212,7 +6308,12 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     lw.attn_o_rhs = load_rhs_weight(o_proj_key);
                 }
                 combine_full_attention_qkv_weights(&lw);
-                if (!keep_dense_rhs_for_prefill && enable_mlp_qmm && lw.attn_qkv_has_q) {
+                compact_full_attention_qkv_weights(&lw);
+                if (!keep_dense_rhs_for_prefill &&
+                    enable_mlp_qmm &&
+                    enable_full_attn_prefill_dense_cache &&
+                    lw.attn_qkv_has_q)
+                {
                     lw.attn_qkv_prefill_rhs = maybe_build_prefill_rhs_cache(
                         p + "self_attn.qkv",
                         lw.attn_qkv_q_w,
@@ -6569,11 +6670,7 @@ int32_t mlx_prefill_first(
                 const array seed_logits = forward_logits(ctx, prompt_arr);
                 first_token = select_first_token(seed_logits, "prefill_first_full");
             } else {
-                prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
-
-                const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
-                const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-                const array seed_logits = forward_logits(ctx, last_token_arr);
+                const array seed_logits = prefill_seed_logits_chunked(ctx, prompt_vec, prompt_len);
                 first_token = select_first_token(seed_logits, "prefill_first_chunked");
             }
         } else {
@@ -6654,18 +6751,10 @@ int32_t mlx_prefill_logits(
                 first_logits = last_token_logits(seed_logits);
 
                 reset_runtime_state(ctx);
-                prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
-
-                const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
-                const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-                const array rebuild_logits = forward_logits(ctx, last_token_arr);
+                const array rebuild_logits = prefill_seed_logits_chunked(ctx, prompt_vec, prompt_len);
                 (void)rebuild_logits;
             } else {
-                prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
-
-                const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
-                const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-                const array seed_logits = forward_logits(ctx, last_token_arr);
+                const array seed_logits = prefill_seed_logits_chunked(ctx, prompt_vec, prompt_len);
                 first_logits = last_token_logits(seed_logits);
             }
         } else {
@@ -6968,11 +7057,7 @@ int32_t mlx_prefill_logits_batch(
                     const array seed_logits = forward_logits(ctx, prompt_arr);
                     first_logits = last_token_logits(seed_logits);
                 } else {
-                    prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
-
-                    const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
-                    const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-                    const array seed_logits = forward_logits(ctx, last_token_arr);
+                    const array seed_logits = prefill_seed_logits_chunked(ctx, prompt_vec, prompt_len);
                     first_logits = last_token_logits(seed_logits);
                 }
             } else {
@@ -9336,6 +9421,39 @@ int32_t mlx_test_dense_mlp_gate_up_fusion(void) {
             g_last_error = "mlx_test_dense_mlp_gate_up_fusion: up output mismatch";
             return 0;
         }
+
+        compact_dense_mlp_gate_up_weights(&lw);
+        if (lw.mlp_gate_rhs.size() > 1 || lw.mlp_up_rhs.size() > 1 || lw.mlp_gate_has_q || lw.mlp_up_has_q) {
+            g_last_error = "mlx_test_dense_mlp_gate_up_fusion: compaction did not clear split dense MLP projections";
+            return 0;
+        }
+        const array gate_up_compacted = linear_decode_maybe_quantized(
+            false,
+            ctx.cfg.quant_group_size,
+            ctx.cfg.quant_bits,
+            mlp_in,
+            lw.mlp_gate_up_rhs,
+            false,
+            lw.mlp_gate_up_q_w,
+            lw.mlp_gate_up_q_scales,
+            lw.mlp_gate_up_q_biases,
+            false
+        );
+        const array compact_diff = max(reshape(
+            abs(astype(gate_up_fused, float32) - astype(gate_up_compacted, float32)),
+            {static_cast<int>(gate_up_fused.size())}
+        ));
+        eval(compact_diff);
+        synchronize();
+        const float* compact_diff_ptr = compact_diff.data<float>();
+        if (!compact_diff_ptr) {
+            g_last_error = "mlx_test_dense_mlp_gate_up_fusion: failed to materialize compact diff";
+            return 0;
+        }
+        if (compact_diff_ptr[0] > 1e-6f) {
+            g_last_error = "mlx_test_dense_mlp_gate_up_fusion: compacted fused output mismatch";
+            return 0;
+        }
         return 1;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -9464,6 +9582,41 @@ int32_t mlx_test_full_attention_qkv_fusion(void) {
         }
         if (v_diff_ptr[0] > 1e-6f) {
             g_last_error = "mlx_test_full_attention_qkv_fusion: v output mismatch";
+            return 0;
+        }
+
+        compact_full_attention_qkv_weights(&lw);
+        if (lw.attn_q_rhs.size() > 1 || lw.attn_k_rhs.size() > 1 || lw.attn_v_rhs.size() > 1 ||
+            lw.attn_q_has_q || lw.attn_k_has_q || lw.attn_v_has_q)
+        {
+            g_last_error = "mlx_test_full_attention_qkv_fusion: compaction did not clear split attention projections";
+            return 0;
+        }
+        const array qkv_compacted = linear_decode_maybe_quantized(
+            false,
+            ctx.cfg.quant_group_size,
+            ctx.cfg.quant_bits,
+            x_norm,
+            lw.attn_qkv_rhs,
+            false,
+            lw.attn_qkv_q_w,
+            lw.attn_qkv_q_scales,
+            lw.attn_qkv_q_biases,
+            false
+        );
+        const array compact_diff = max(reshape(
+            abs(astype(qkv_fused, float32) - astype(qkv_compacted, float32)),
+            {static_cast<int>(qkv_fused.size())}
+        ));
+        eval(compact_diff);
+        synchronize();
+        const float* compact_diff_ptr = compact_diff.data<float>();
+        if (!compact_diff_ptr) {
+            g_last_error = "mlx_test_full_attention_qkv_fusion: failed to materialize compact diff";
+            return 0;
+        }
+        if (compact_diff_ptr[0] > 1e-6f) {
+            g_last_error = "mlx_test_full_attention_qkv_fusion: compacted fused output mismatch";
             return 0;
         }
         return 1;
@@ -9603,6 +9756,282 @@ int32_t mlx_test_grouped_affine_prefill_cache_helper(void) {
         return 0;
     } catch (...) {
         g_last_error = "unknown error in mlx_test_grouped_affine_prefill_cache_helper";
+        return 0;
+    }
+}
+
+int32_t mlx_test_gated_delta_no_double_qk_norm(void) {
+    try {
+        constexpr int B = 1;
+        constexpr int T = 3;
+        constexpr int Hk = 1;
+        constexpr int Hv = 2;
+        constexpr int Dk = 32;
+        constexpr int Dv = 4;
+
+        auto make_values = [](size_t count, float scale, int stride, int offset) {
+            std::vector<float> values(count);
+            for (size_t i = 0; i < count; ++i) {
+                const int raw = static_cast<int>((static_cast<int>(i) * stride) % 29) - offset;
+                values[i] = static_cast<float>(raw) * scale;
+            }
+            return values;
+        };
+
+        const std::vector<float> q_raw_values = make_values(static_cast<size_t>(B * T * Hk * Dk), 0.03125f, 5, 14);
+        const std::vector<float> k_raw_values = make_values(static_cast<size_t>(B * T * Hk * Dk), 0.0275f, 7, 13);
+        const std::vector<float> v_values = make_values(static_cast<size_t>(B * T * Hv * Dv), 0.05f, 3, 8);
+        const std::vector<float> a_values = make_values(static_cast<size_t>(B * T * Hv), 0.04f, 11, 5);
+        const std::vector<float> b_values = make_values(static_cast<size_t>(B * T * Hv), 0.03f, 13, 6);
+        const std::vector<float> a_log_values = make_values(static_cast<size_t>(Hv), 0.02f, 17, 4);
+        const std::vector<float> dt_bias_values = make_values(static_cast<size_t>(Hv), 0.05f, 19, 3);
+
+        const array q_raw(q_raw_values.data(), Shape{B, T, Hk, Dk}, float32);
+        const array k_raw(k_raw_values.data(), Shape{B, T, Hk, Dk}, float32);
+        const array v(v_values.data(), Shape{B, T, Hv, Dv}, float32);
+        const array a(a_values.data(), Shape{B, T, Hv}, float32);
+        const array b(b_values.data(), Shape{B, T, Hv}, float32);
+        const array A_log(a_log_values.data(), Shape{Hv}, float32);
+        const array A_exp_f32 = exp(astype(A_log, float32));
+        const array dt_bias(dt_bias_values.data(), Shape{Hv}, float32);
+
+        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(Dk));
+        const array q = fast::rms_norm(q_raw, std::nullopt, 1.0e-6f) * array(inv_scale * inv_scale, float32);
+        const array k = fast::rms_norm(k_raw, std::nullopt, 1.0e-6f) * array(inv_scale, float32);
+
+        auto [actual_out, actual_state] = gated_delta_update(q, k, v, a, b, A_exp_f32, dt_bias, std::nullopt);
+
+        array state = zeros({B, Hv, Dv, Dk}, float32);
+        array q_use = repeat(q, Hv / Hk, 2);
+        array k_use = repeat(k, Hv / Hk, 2);
+        const array beta = sigmoid(b);
+        const array g = compute_g(A_exp_f32, a, dt_bias);
+
+        std::vector<array> outputs;
+        outputs.reserve(T);
+        for (int t = 0; t < T; ++t) {
+            const array q_t = take_time_4d(q_use, t);
+            const array k_t = take_time_4d(k_use, t);
+            const array v_t = take_time_4d(v, t);
+            const array beta_t = take_time_3d(beta, t);
+            const array g_t = take_time_3d(g, t);
+
+            const array k_exp = reshape(k_t, {B, Hv, 1, Dk});
+            const array q_exp = reshape(q_t, {B, Hv, 1, Dk});
+            state = state * reshape(g_t, {B, Hv, 1, 1});
+            const array kv_mem = sum(state * k_exp, std::vector<int>{-1}, false);
+            const array delta = (v_t - kv_mem) * reshape(beta_t, {B, Hv, 1});
+            state = state + k_exp * reshape(delta, {B, Hv, Dv, 1});
+            outputs.push_back(sum(state * q_exp, std::vector<int>{-1}, false));
+        }
+        const array expected_out = stack(outputs, 1);
+        const array expected_state = state;
+
+        const array out_diff = max(reshape(
+            abs(astype(actual_out, float32) - astype(expected_out, float32)),
+            {static_cast<int>(actual_out.size())}
+        ));
+        const array state_diff = max(reshape(
+            abs(astype(actual_state, float32) - astype(expected_state, float32)),
+            {static_cast<int>(actual_state.size())}
+        ));
+        eval({out_diff, state_diff});
+        synchronize();
+
+        const float* out_diff_ptr = out_diff.data<float>();
+        const float* state_diff_ptr = state_diff.data<float>();
+        if (!out_diff_ptr || !state_diff_ptr) {
+            g_last_error = "mlx_test_gated_delta_no_double_qk_norm: failed to materialize diffs";
+            return 0;
+        }
+        if (out_diff_ptr[0] > 1e-5f) {
+            g_last_error = "mlx_test_gated_delta_no_double_qk_norm: output mismatch";
+            return 0;
+        }
+        if (state_diff_ptr[0] > 1e-5f) {
+            g_last_error = "mlx_test_gated_delta_no_double_qk_norm: state mismatch";
+            return 0;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_test_gated_delta_no_double_qk_norm";
+        return 0;
+    }
+}
+
+int32_t mlx_test_chunked_prefill_tail_matches_full_prompt(void) {
+    try {
+        struct EnvRestore {
+            bool had_value = false;
+            std::string old_value;
+            ~EnvRestore() {
+                if (had_value) {
+                    setenv("TALU_METAL_PREFILL_CHUNK_SIZE", old_value.c_str(), 1);
+                } else {
+                    unsetenv("TALU_METAL_PREFILL_CHUNK_SIZE");
+                }
+            }
+        } restore;
+        if (const char* old = std::getenv("TALU_METAL_PREFILL_CHUNK_SIZE")) {
+            restore.had_value = true;
+            restore.old_value = old;
+        }
+        setenv("TALU_METAL_PREFILL_CHUNK_SIZE", "2", 1);
+
+        constexpr int vocab = 8;
+        constexpr int hidden = 4;
+        constexpr int prompt_len = 5;
+        constexpr int ff = 6;
+
+        auto make_values = [](size_t count, float scale, int stride, int offset) {
+            std::vector<float> values(count);
+            for (size_t i = 0; i < count; ++i) {
+                const int raw = static_cast<int>((static_cast<int>(i) * stride) % 23) - offset;
+                values[i] = static_cast<float>(raw) * scale;
+            }
+            return values;
+        };
+
+        mlx_ctx full_ctx{};
+        mlx_ctx chunk_ctx{};
+        full_ctx.cfg.rms_norm_eps = 1.0e-6f;
+        full_ctx.cfg.quant_group_size = 32;
+        full_ctx.cfg.quant_bits = 4;
+        full_ctx.cfg.num_attention_heads = 1;
+        full_ctx.cfg.num_key_value_heads = 1;
+        full_ctx.cfg.head_dim = hidden;
+        full_ctx.cfg.hidden_size = hidden;
+        full_ctx.cfg.num_hidden_layers = 1;
+        full_ctx.cfg.hidden_size_per_layer_input = 0;
+        full_ctx.cfg.use_v_norm = false;
+        full_ctx.cfg.global_head_dim = 0;
+
+        chunk_ctx.cfg = full_ctx.cfg;
+
+        const std::vector<float> embed_values = make_values(static_cast<size_t>(vocab * hidden), 0.0625f, 5, 9);
+        const std::vector<float> lm_head_values = make_values(static_cast<size_t>(vocab * hidden), 0.03125f, 7, 8);
+        const std::vector<float> norm_values = make_values(static_cast<size_t>(hidden), 0.05f, 3, 2);
+        const std::vector<float> q_values = make_values(static_cast<size_t>(hidden * hidden), 0.03125f, 11, 7);
+        const std::vector<float> k_values = make_values(static_cast<size_t>(hidden * hidden), 0.0275f, 13, 6);
+        const std::vector<float> v_values = make_values(static_cast<size_t>(hidden * hidden), 0.025f, 17, 5);
+        const std::vector<float> o_values = make_values(static_cast<size_t>(hidden * hidden), 0.03f, 19, 4);
+        const std::vector<float> gate_values = make_values(static_cast<size_t>(ff * hidden), 0.03f, 5, 7);
+        const std::vector<float> up_values = make_values(static_cast<size_t>(ff * hidden), 0.04f, 7, 8);
+        const std::vector<float> down_values = make_values(static_cast<size_t>(hidden * ff), 0.035f, 9, 6);
+
+        full_ctx.embed_tokens = array(embed_values.data(), Shape{vocab, hidden}, float32);
+        full_ctx.final_norm_w = array(norm_values.data(), Shape{hidden}, float32);
+        full_ctx.lm_head_rhs = to_rhs(array(lm_head_values.data(), Shape{vocab, hidden}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.lm_head");
+
+        chunk_ctx.embed_tokens = full_ctx.embed_tokens;
+        chunk_ctx.final_norm_w = full_ctx.final_norm_w;
+        chunk_ctx.lm_head_rhs = full_ctx.lm_head_rhs;
+
+        LayerWeights lw{};
+        lw.input_layernorm_w = array(norm_values.data(), Shape{hidden}, float32);
+        lw.post_attention_layernorm_w = array(norm_values.data(), Shape{hidden}, float32);
+        lw.attn_q_norm_w = array(norm_values.data(), Shape{hidden}, float32);
+        lw.attn_k_norm_w = array(norm_values.data(), Shape{hidden}, float32);
+        lw.attn_num_heads = 1;
+        lw.attn_num_kv_heads = 1;
+        lw.attn_head_dim = hidden;
+        lw.attn_scale = 1.0f / std::sqrt(static_cast<float>(hidden));
+        lw.attn_rope_theta = 10000.0f;
+        lw.attn_partial_rotary_factor = 1.0f;
+        lw.attn_q_proj_width = hidden;
+        lw.attn_k_proj_width = hidden;
+        lw.attn_v_proj_width = hidden;
+        lw.attn_q_rhs = to_rhs(array(q_values.data(), Shape{hidden, hidden}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.q");
+        lw.attn_k_rhs = to_rhs(array(k_values.data(), Shape{hidden, hidden}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.k");
+        lw.attn_v_rhs = to_rhs(array(v_values.data(), Shape{hidden, hidden}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.v");
+        lw.attn_o_rhs = to_rhs(array(o_values.data(), Shape{hidden, hidden}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.o");
+        lw.mlp_gate_rhs = to_rhs(array(gate_values.data(), Shape{ff, hidden}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.gate");
+        lw.mlp_up_rhs = to_rhs(array(up_values.data(), Shape{ff, hidden}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.up");
+        lw.mlp_down_rhs = to_rhs(array(down_values.data(), Shape{hidden, ff}, float32), "mlx_test_chunked_prefill_tail_matches_full_prompt.down");
+
+        full_ctx.layers.push_back(lw);
+        full_ctx.kv_cache.resize(1);
+        full_ctx.linear_cache.resize(1);
+        chunk_ctx.layers.push_back(lw);
+        chunk_ctx.kv_cache.resize(1);
+        chunk_ctx.linear_cache.resize(1);
+
+        const int32_t prompt_ids[prompt_len] = {1, 3, 2, 5, 4};
+        const std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
+        const array prompt_arr(prompt_ids, Shape{1, prompt_len}, int32);
+
+        const array full_logits = forward_logits(&full_ctx, prompt_arr);
+        const array chunked_logits = prefill_seed_logits_chunked(&chunk_ctx, prompt_vec, prompt_len);
+        const array full_last = last_token_logits(full_logits);
+        const array chunked_last = last_token_logits(chunked_logits);
+
+        if (!full_ctx.kv_cache[0].keys.has_value() || !full_ctx.kv_cache[0].values.has_value() ||
+            !chunk_ctx.kv_cache[0].keys.has_value() || !chunk_ctx.kv_cache[0].values.has_value())
+        {
+            g_last_error = "mlx_test_chunked_prefill_tail_matches_full_prompt: missing kv cache tensors";
+            return 0;
+        }
+
+        const array logits_diff = max(reshape(
+            abs(astype(full_last, float32) - astype(chunked_last, float32)),
+            {static_cast<int>(full_last.size())}
+        ));
+        // Slice KV caches to the actually-used region before comparing —
+        // capacities differ due to step-based growth rounding (step=256).
+        const int kv_B = full_ctx.kv_cache[0].keys->shape(0);
+        const int kv_H = full_ctx.kv_cache[0].keys->shape(1);
+        const int kv_D = full_ctx.kv_cache[0].keys->shape(3);
+        const array full_keys = slice(*full_ctx.kv_cache[0].keys,
+            {0, 0, 0, 0}, {kv_B, kv_H, prompt_len, kv_D});
+        const array chunk_keys = slice(*chunk_ctx.kv_cache[0].keys,
+            {0, 0, 0, 0}, {kv_B, kv_H, prompt_len, kv_D});
+        const array full_vals = slice(*full_ctx.kv_cache[0].values,
+            {0, 0, 0, 0}, {kv_B, kv_H, prompt_len, kv_D});
+        const array chunk_vals = slice(*chunk_ctx.kv_cache[0].values,
+            {0, 0, 0, 0}, {kv_B, kv_H, prompt_len, kv_D});
+        const array key_diff = max(reshape(
+            abs(astype(full_keys, float32) - astype(chunk_keys, float32)),
+            {static_cast<int>(full_keys.size())}
+        ));
+        const array value_diff = max(reshape(
+            abs(astype(full_vals, float32) - astype(chunk_vals, float32)),
+            {static_cast<int>(full_vals.size())}
+        ));
+        eval({logits_diff, key_diff, value_diff});
+        synchronize();
+
+        const float* logits_diff_ptr = logits_diff.data<float>();
+        const float* key_diff_ptr = key_diff.data<float>();
+        const float* value_diff_ptr = value_diff.data<float>();
+        if (!logits_diff_ptr || !key_diff_ptr || !value_diff_ptr) {
+            g_last_error = "mlx_test_chunked_prefill_tail_matches_full_prompt: failed to materialize diffs";
+            return 0;
+        }
+        if (full_ctx.kv_cache[0].offset != prompt_len || chunk_ctx.kv_cache[0].offset != prompt_len) {
+            g_last_error = "mlx_test_chunked_prefill_tail_matches_full_prompt: unexpected kv cache offset";
+            return 0;
+        }
+        if (logits_diff_ptr[0] > 1e-5f) {
+            g_last_error = "mlx_test_chunked_prefill_tail_matches_full_prompt: logits mismatch";
+            return 0;
+        }
+        if (key_diff_ptr[0] > 1e-5f) {
+            g_last_error = "mlx_test_chunked_prefill_tail_matches_full_prompt: key cache mismatch";
+            return 0;
+        }
+        if (value_diff_ptr[0] > 1e-5f) {
+            g_last_error = "mlx_test_chunked_prefill_tail_matches_full_prompt: value cache mismatch";
+            return 0;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_test_chunked_prefill_tail_matches_full_prompt";
         return 0;
     }
 }
