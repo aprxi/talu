@@ -583,6 +583,7 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
         { "out", "next_state" },
         R"(
     constexpr float eps = 1.0e-6f;
+    constexpr uint N_SIMD = (D_HEAD + 31) / 32;
     auto fast_exp = [](float x) -> float {
       constexpr float log2e = 1.4426950408889634f;
       constexpr float ln2_hi = 0.693359375f;
@@ -616,8 +617,27 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     const bool active = lane < D_HEAD;
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
-    threadgroup float out_shared[D_HEAD];
     threadgroup float scalar_shared[8];
+    threadgroup float simd_partials[N_SIMD];
+
+    // Parallel cross-SIMD reduction: simd_sum within each group, then
+    // lane 0 sums the N_SIMD partials.  Replaces O(D_HEAD) sequential
+    // reduction with O(N_SIMD) ~ 4 iterations for D_HEAD=128.
+    auto parallel_reduce = [&](float thread_val) -> float {
+      float partial = simd_sum(thread_val);
+      uint simd_idx = thread_position_in_threadgroup.x / 32;
+      if (thread_index_in_simdgroup == 0) {
+        simd_partials[simd_idx] = partial;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float total = 0.0f;
+      if (thread_position_in_threadgroup.x == 0) {
+        for (uint i = 0; i < N_SIMD; ++i) total += simd_partials[i];
+        simd_partials[0] = total;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      return simd_partials[0];
+    };
 
     const uint vec_base = head * D_HEAD;
     const uint state_base = head * D_HEAD * D_HEAD;
@@ -627,37 +647,26 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     if (active) {
       q = query[vec_base + lane];
       k = key[vec_base + lane];
-      // Store q*q, k*k for sequential reduction (matches CPU precision)
-      q_shared[lane] = q * q;
-      k_shared[lane] = k * k;
-      out_shared[lane] = q * k;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Sequential reduction by lane 0 for exact CPU match
-    // (tiny cost: D_HEAD iterations vs D_HEAD^2 state operations)
-    if (lane == 0) {
-      float q_sq = 0.0f, k_sq = 0.0f, qk = 0.0f;
-      for (uint i = 0; i < D_HEAD; ++i) {
-        q_sq += q_shared[i];
-        k_sq += k_shared[i];
-        qk += out_shared[i];
-      }
-      const float q_scale = rsqrt(q_sq + eps) * rsqrt((float)D_HEAD);
-      const float k_scale = rsqrt(k_sq + eps);
-      scalar_shared[0] = qk * q_scale * k_scale;  // qk_dot
-      scalar_shared[1] = k_scale;
-      scalar_shared[4] = q_scale;
-      const float a = a_raw[head] + dt_bias[head];
-      const float a_log_exp_value = fast_exp(a_log_exp[head]);
-      scalar_shared[2] = fast_sigmoid(beta_raw[head]);
-      scalar_shared[3] = fast_exp((-a_log_exp_value) * fast_softplus(a));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Parallel reductions for Q/K norms and QK dot product.
+    const float q_sq = parallel_reduce(active ? q * q : 0.0f);
+    const float k_sq = parallel_reduce(active ? k * k : 0.0f);
+    const float qk_dot = parallel_reduce(active ? q * k : 0.0f);
+
+    const float q_scale = rsqrt(q_sq + eps) * rsqrt((float)D_HEAD);
+    const float k_scale = rsqrt(k_sq + eps);
+
+    // Scalar computations (all threads compute — no divergence).
+    const float a_val = a_raw[head] + dt_bias[head];
+    const float a_log_exp_value = fast_exp(a_log_exp[head]);
+    const float beta = fast_sigmoid(beta_raw[head]);
+    const float decay = fast_exp((-a_log_exp_value) * fast_softplus(a_val));
+    const float qk_scaled = qk_dot * q_scale * k_scale;
 
     if (active) {
-      q *= scalar_shared[4];
-      k *= scalar_shared[1];
+      q *= q_scale;
+      k *= k_scale;
       q_shared[lane] = q;
       k_shared[lane] = k;
     }
@@ -665,10 +674,7 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
 
     float out_value = 0.0f;
     if (active) {
-      const float beta = scalar_shared[2];
-      const float decay = scalar_shared[3];
       float kv_mem = 0.0f;
-      // Use fma for higher precision accumulation (matches CPU @mulAdd)
       for (uint i = 0; i < D_HEAD; ++i) {
         const uint state_index = state_base + (i * D_HEAD) + lane;
         const float scaled = state[state_index] * decay;
@@ -677,29 +683,21 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
       }
 
       kv_mem = (value[vec_base + lane] - kv_mem) * beta;
-      out_value = fma(kv_mem, scalar_shared[0], out_value);
+      out_value = fma(kv_mem, qk_scaled, out_value);
 
       for (uint i = 0; i < D_HEAD; ++i) {
         const uint state_index = state_base + (i * D_HEAD) + lane;
         const float scaled = state[state_index] * decay;
         next_state[state_index] = fma(k_shared[i], kv_mem, scaled);
       }
+    }
 
-      // RMS norm: sequential reduction for exact CPU match
-      out_shared[lane] = out_value * out_value;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
-      float sum_sq = 0.0f;
-      for (uint i = 0; i < D_HEAD; ++i) {
-        sum_sq += out_shared[i];
-      }
-      scalar_shared[5] = rsqrt((sum_sq / (float)D_HEAD) + eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // RMS norm: parallel reduction.
+    const float sum_sq = parallel_reduce(active ? out_value * out_value : 0.0f);
+    const float rms_scale = rsqrt((sum_sq / (float)D_HEAD) + eps);
 
     if (active) {
-      out_value *= scalar_shared[5];
+      out_value *= rms_scale;
       out_value *= norm_weight[vec_base + lane];
       const float z_value = z[vec_base + lane];
       out[vec_base + lane] = out_value * (z_value * fast_sigmoid(z_value));
@@ -2931,74 +2929,10 @@ void* mlx_lazy_gated_delta_mixer_quantized(
         .ctx = &out_proj_ctx,
     };
 
-    const bool is_single_token_decode = (input_arr.shape(1) == 1);
-    if (!use_reference_recurrence and is_single_token_decode
-            and layer_state != nullptr and layer_state->gdelta_compiled_fn == nullptr) {
-        const array ck = conv_kernel_broadcast;
-        const std::optional<array> cb_cap = conv_bias_row;
-        const std::optional<array> db_cap = dt_bias_row;
-        const array al = static_terms.a_log_exp_row;
-        const std::optional<array> nw_cap = static_terms.norm_weight_heads;
-        const array in_w_cap = in_proj_w;
-        const array in_s_cap = in_proj_s;
-        const array in_b_cap = in_proj_b;
-        const array out_w_cap = out_proj_w;
-        const array out_s_cap = out_proj_s;
-        const array out_b_cap = out_proj_b;
-        const int dc = d_conv_i, nh = n_heads_i, nkh = n_key_heads_i, dh = d_head_i;
-        const int gs = group_size_i, qb = bits_i;
-        auto decode_fn = [ck, cb_cap, db_cap, al, nw_cap,
-                          in_w_cap, in_s_cap, in_b_cap,
-                          out_w_cap, out_s_cap, out_b_cap,
-                          dc, nh, nkh, dh, gs, qb](
-            const std::vector<array>& inputs
-        ) -> std::vector<array> {
-            array x = inputs[0];
-            array cs = inputs[1];
-            array ss = inputs[2];
-            StateSpaceQuantLinearCtx in_ctx_cap{
-                .w = &in_w_cap,
-                .s = &in_s_cap,
-                .b = &in_b_cap,
-                .s_handle = nullptr,
-                .b_handle = nullptr,
-                .group_size = gs,
-                .bits = qb,
-            };
-            StateSpaceQuantLinearCtx out_ctx_cap{
-                .w = &out_w_cap,
-                .s = &out_s_cap,
-                .b = &out_b_cap,
-                .s_handle = nullptr,
-                .b_handle = nullptr,
-                .group_size = gs,
-                .bits = qb,
-            };
-            StateSpaceCallable in_fn_c{.fn = state_space_apply_quantized_linear, .ctx = &in_ctx_cap};
-            StateSpaceCallable out_fn_c{.fn = state_space_apply_quantized_linear, .ctx = &out_ctx_cap};
-            const array result = gated_delta_mixer_forward_core(
-                x, in_fn_c, ck, cb_cap, al, db_cap, nw_cap, out_fn_c,
-                dc, nh, nkh, dh, cs, ss, nullptr
-            );
-            return {result, cs, ss};
-        };
-        layer_state->gdelta_compiled_fn = new std::function<std::vector<array>(
-            const std::vector<array>&)>(mlx::core::compile(decode_fn));
-    }
-    if (!use_reference_recurrence and is_single_token_decode
-            and layer_state != nullptr and layer_state->gdelta_compiled_fn != nullptr) {
-        const std::vector<array> compiled_out = (*layer_state->gdelta_compiled_fn)(
-            std::vector<array>{input_arr, conv_state, ssm_state}
-        );
-        const array out = compiled_out[0];
-        conv_state = compiled_out[1];
-        ssm_state = compiled_out[2];
-        async_eval(std::vector<array>{conv_state, ssm_state});
-        *layer_state->conv_state = conv_state;
-        *layer_state->ssm_state = ssm_state;
-        return pool_array(out);
-    }
-
+    // Call the forward core directly without per-layer compile().
+    // Per-layer compile() adds overhead that exceeds the fusion savings
+    // for 48+ SSM layers per token. Lazy state updates let the full
+    // token graph be evaluated in one batch.
     const array out = gated_delta_mixer_forward_core(
         input_arr,
         in_proj_fn,
@@ -3018,7 +2952,6 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     );
 
     if (layer_state != nullptr) {
-        async_eval(std::vector<array>{conv_state, ssm_state});
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }

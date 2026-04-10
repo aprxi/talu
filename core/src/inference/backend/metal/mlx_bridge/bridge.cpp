@@ -756,6 +756,8 @@ struct LayerWeights {
     float attn_scale = 1.0f;
     float attn_rope_theta = 10000000.0f;
     float attn_partial_rotary_factor = 1.0f;
+    int attn_rope_dims = 0;
+    array rope_freq = array(0.0f); // [rope_dims/2] pre-computed frequencies
 
     // Linear-attention (gated-delta) branch.
     array lin_conv1d_w = array(0.0f); // [conv_dim, kernel, 1]
@@ -1888,7 +1890,8 @@ array linear_decode_maybe_quantized(
     const array* prefill_rhs = nullptr
 ) {
     const auto quant_compare_enabled = []() -> bool {
-        return env_truthy("TALU_METAL_QMM_COMPARE", false);
+        static const bool cached = env_truthy("TALU_METAL_QMM_COMPARE", false);
+        return cached;
     };
     const auto quant_compare_layer = []() -> int {
         if (const char* raw = std::getenv("TALU_METAL_QMM_COMPARE_LAYER")) {
@@ -2049,6 +2052,46 @@ array prepare_depthwise_conv1d_decode_weight(
     return decode_weight;
 }
 
+// Fused Metal kernel for depthwise conv1d decode + SiLU.
+// Replaces 6 separate kernels (mul, sum, mul, add, concat, silu) with 1.
+// Writes both the conv+silu output and the shifted cache state.
+static inline fast::CustomKernelFunction& conv1d_decode_silu_kernel() {
+    static fast::CustomKernelFunction kernel = fast::metal_kernel(
+        "talu_conv1d_decode_silu",
+        { "cache_state", "token_input", "weight" },
+        { "conv_out", "next_state" },
+        R"(
+    const uint c = thread_position_in_grid.x;
+    if (c >= CONV_DIM) return;
+
+    // Depthwise conv: dot product across kernel positions.
+    float acc = 0.0f;
+    for (uint k = 0; k < KERNEL_SIZE - 1; ++k) {
+        acc += float(cache_state[k * CONV_DIM + c]) *
+               float(weight[k * CONV_DIM + c]);
+    }
+    acc += float(token_input[c]) *
+           float(weight[(KERNEL_SIZE - 1) * CONV_DIM + c]);
+
+    // SiLU activation: x * sigmoid(x)
+    const float sig = 1.0f / (1.0f + exp(-acc));
+    // Use the same type as next_state to match output dtype.
+    using OutT = remove_reference_t<decltype(next_state[0])>;
+    conv_out[c] = static_cast<OutT>(acc * sig);
+
+    // Shift cache: drop oldest, append new token.
+    for (uint k = 0; k < KERNEL_SIZE - 2; ++k) {
+        next_state[k * CONV_DIM + c] = cache_state[(k + 1) * CONV_DIM + c];
+    }
+    next_state[(KERNEL_SIZE - 2) * CONV_DIM + c] = token_input[c];
+        )",
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
 std::pair<array, std::optional<array>> depthwise_conv1d_decode_step(
     const std::optional<array>& cache_state_opt,
     const array& token_input,
@@ -2092,6 +2135,32 @@ std::pair<array, std::optional<array>> depthwise_conv1d_decode_step(
         throw std::runtime_error("depthwise conv decode cache shape mismatch: " + name);
     }
 
+    // Use the fused Metal kernel for batch=1 decode with kernel_size > 1.
+    if (batch == 1 && kernel_size > 1) {
+        const array flat_cache = reshape(cache_state, {kernel_size - 1, conv_dim});
+        const array flat_input = reshape(token_input, {conv_dim});
+        const array flat_weight = reshape(decode_weight, {kernel_size, conv_dim});
+
+        auto outputs = conv1d_decode_silu_kernel()(
+            { flat_cache, flat_input, flat_weight },
+            { Shape{conv_dim}, Shape{kernel_size - 1, conv_dim} },
+            { token_input.dtype(), cache_state.dtype() },
+            { conv_dim, 1, 1 },
+            { std::min(conv_dim, 256), 1, 1 },
+            {
+                { "CONV_DIM", conv_dim },
+                { "KERNEL_SIZE", kernel_size },
+            },
+            std::nullopt,
+            false,
+            {}
+        );
+        conv_out = reshape(outputs[0], {1, 1, conv_dim});
+        next_state = reshape(outputs[1], {1, kernel_size - 1, conv_dim});
+        return {conv_out, next_state};
+    }
+
+    // Fallback for batch > 1 or kernel_size == 1.
     const array prev_weights = slice(decode_weight, {0, 0, 0}, {1, kernel_size - 1, conv_dim});
     const array curr_weight = slice(decode_weight, {0, kernel_size - 1, 0}, {1, kernel_size, conv_dim});
     const array prev_term = sum(cache_state * prev_weights, 1);
@@ -2101,6 +2170,83 @@ std::pair<array, std::optional<array>> depthwise_conv1d_decode_step(
     const array shifted = slice(cache_state, {0, 1, 0}, {batch, kernel_size - 1, conv_dim});
     next_state = concatenate({shifted, token_input}, 1);
     return {conv_out, next_state};
+}
+
+// Array-based RoPE that uses pre-computed frequency tables.
+// Unlike fast::rope (which takes int offset), the offset is an array input,
+// making this compilable — the compiled function can be reused across decode
+// steps without retracing.
+//
+// x: [B, n_heads, S, head_dim] (already transposed)
+// freq: [rope_dims/2] pre-computed 1/theta^(2d/rope_dims)
+// offset_arr: scalar int32 array (current position offset)
+// rope_dims: number of dimensions to rotate
+array apply_rope_array(
+    const array& x,
+    const array& freq,
+    const array& offset_arr,
+    int rope_dims
+) {
+    const int B = x.shape(0);
+    const int nh = x.shape(1);
+    const int S = x.shape(2);
+    const int hd = x.shape(3);
+    const int half = rope_dims / 2;
+
+    // Compute positions: [1, 1, S, 1]
+    // For S=1 (decode): just the offset
+    // For S>1 (prefill): offset + arange(S)
+    array positions = reshape(astype(offset_arr, float32), {1, 1, 1, 1});
+    if (S > 1) {
+        positions = positions + reshape(astype(arange(0, S, 1, int32), float32), {1, 1, S, 1});
+    }
+
+    // angles: [1, 1, S, half]
+    const array freq_bcast = reshape(freq, {1, 1, 1, half});
+    const array angle = positions * freq_bcast;
+    const array cos_a = cos(angle);
+    const array sin_a = sin(angle);
+
+    // Split x into first half and second half of rotary dims
+    const array x_first = slice(x, {0, 0, 0, 0}, {B, nh, S, half});
+    const array x_second = slice(x, {0, 0, 0, half}, {B, nh, S, rope_dims});
+
+    const array y_first = x_first * cos_a - x_second * sin_a;
+    const array y_second = x_first * sin_a + x_second * cos_a;
+
+    if (rope_dims == hd) {
+        return concatenate({y_first, y_second}, 3);
+    }
+    // Partial rotation: pass through the unrotated tail
+    const array pass = slice(x, {0, 0, 0, rope_dims}, {B, nh, S, hd});
+    return concatenate({y_first, y_second, pass}, 3);
+}
+
+// Proportional full-head RoPE: rotates only the leading `rope_dims/2`
+// pairs inside a full `head_dim`-wide pairing domain.  Uses array-based
+// RoPE internally so the offset flows through an array input.
+array apply_rope_proportional_array(
+    const array& t,
+    const array& freq,
+    const array& offset_arr,
+    int rope_dims,
+    int head_dim
+) {
+    const int B = t.shape(0);
+    const int nh = t.shape(1);
+    const int S = t.shape(2);
+    const int half_rope = rope_dims / 2;
+    const int half_hd = head_dim / 2;
+    // Gather the active first-half and matching second-half slices.
+    array t_first = slice(t, {0,0,0,0},                    {B,nh,S,half_rope});
+    array t_pass1 = slice(t, {0,0,0,half_rope},             {B,nh,S,half_hd});
+    array t_third = slice(t, {0,0,0,half_hd},               {B,nh,S,half_hd+half_rope});
+    array t_pass2 = slice(t, {0,0,0,half_hd+half_rope},     {B,nh,S,head_dim});
+    array rope_in = concatenate({t_first, t_third}, 3);
+    rope_in = apply_rope_array(rope_in, freq, offset_arr, rope_dims);
+    array first_rot = slice(rope_in, {0,0,0,0},        {B,nh,S,half_rope});
+    array third_rot = slice(rope_in, {0,0,0,half_rope}, {B,nh,S,rope_dims});
+    return concatenate({first_rot, t_pass1, third_rot, t_pass2}, 3);
 }
 
 array single_query_grouped_attention(
@@ -3084,18 +3230,6 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
         throw std::runtime_error("unexpected self_attn.q_proj output shape");
     }
 
-    array queries = fast::rms_norm(queries_raw, std::optional<array>(lw.attn_q_norm_w), ctx->cfg.rms_norm_eps);
-    array keys = reshape(k_proj_out, {B, S, lw.attn_num_kv_heads, lw.attn_head_dim});
-    keys = fast::rms_norm(keys, std::optional<array>(lw.attn_k_norm_w), ctx->cfg.rms_norm_eps);
-    array values = reshape(v_proj_out, {B, S, lw.attn_num_kv_heads, lw.attn_head_dim});
-    if (ctx->cfg.use_v_norm) {
-        values = fast::rms_norm(values, std::nullopt, ctx->cfg.rms_norm_eps);
-    }
-
-    queries = transpose(queries, {0, 2, 1, 3});
-    keys = transpose(keys, {0, 2, 1, 3});
-    values = transpose(values, {0, 2, 1, 3});
-
     KVCacheState* read_cache = &cache;
     bool use_shared_read_cache = false;
     if (lw.kv_shared_source_layer >= 0) {
@@ -3110,32 +3244,32 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     }
     int rope_offset = cache.offset;
     if (use_shared_read_cache) {
-        // Shared-KV readers use the source cache offset before the current
-        // token block update. The caller passes the destination layer's token
-        // block size separately, so reconstruct the source RoPE offset here.
         rope_offset = std::max(0, read_cache->offset - S);
     }
-    const int rope_dims = static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor));
-    // Some architectures rotate only a leading subspace inside a larger
-    // logical pairing domain. In that case:
-    // - `lw.attn_head_dim` defines the half-split pairing topology
-    // - `rope_dims` defines how many leading pairs are active
-    //
-    // A plain RoPE call with `dim = rope_dims` would rotate x[i] with
-    // x[i + rope_dims/2], which is a different operator. The correct mapping
-    // keeps the full-head pairing stride x[i] <-> x[i + head_dim/2], but only
-    // for the first `rope_dims / 2` pairs. Implement that by gathering the
-    // active first-half and matching second-half slices, applying standard RoPE
-    // on the gathered view, then scattering the rotated values back.
+    const int rope_dims = lw.attn_rope_dims > 0
+        ? lw.attn_rope_dims
+        : static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor));
     const bool use_proportional_full_head_rope =
         ctx->cfg.global_head_dim > 0 &&
         lw.attn_head_dim == ctx->cfg.global_head_dim &&
         rope_dims > 0 && rope_dims < lw.attn_head_dim;
+
+    array queries = fast::rms_norm(queries_raw, std::optional<array>(lw.attn_q_norm_w), ctx->cfg.rms_norm_eps);
+    array keys = reshape(k_proj_out, {B, S, lw.attn_num_kv_heads, lw.attn_head_dim});
+    keys = fast::rms_norm(keys, std::optional<array>(lw.attn_k_norm_w), ctx->cfg.rms_norm_eps);
+    array values = reshape(v_proj_out, {B, S, lw.attn_num_kv_heads, lw.attn_head_dim});
+    if (ctx->cfg.use_v_norm) {
+        values = fast::rms_norm(values, std::nullopt, ctx->cfg.rms_norm_eps);
+    }
+
+    queries = transpose(queries, {0, 2, 1, 3});
+    keys = transpose(keys, {0, 2, 1, 3});
+    values = transpose(values, {0, 2, 1, 3});
+
     if (use_proportional_full_head_rope) {
         const int hd = lw.attn_head_dim;
         const int half_rope = rope_dims / 2;
         const int half_hd = hd / 2;
-        // queries/keys shape here: [B, n_heads, S, hd] (already transposed)
         auto apply_rope_full_head = [&](array t) -> array {
             const int nh = t.shape(1);
             array t_first = slice(t, {0,0,0,0},               {B,nh,S,half_rope});
@@ -3526,33 +3660,57 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
     const int S = x_norm.shape(1);
 
     const bool prefill_only_qmm = false;
-    const array qkvz = linear_decode_maybe_quantized(
-        ctx->fp8_decode_qmm_enabled,
-        ctx->cfg.quant_group_size,
-        ctx->cfg.quant_bits,
-        x_norm,
-        lw.lin_in_proj_qkvz_rhs,
-        lw.lin_in_proj_qkvz_has_q,
-        lw.lin_in_proj_qkvz_q_w,
-        lw.lin_in_proj_qkvz_q_scales,
-        lw.lin_in_proj_qkvz_q_biases,
-        prefill_only_qmm,
-        -1,
-        nullptr,
-        &lw.lin_in_proj_qkvz_prefill_rhs
-    ); // [B,S,conv_dim+value_dim]
-    const array ba = linear_decode_maybe_quantized(
-        ctx->fp8_decode_qmm_enabled,
-        ctx->cfg.quant_group_size,
-        ctx->cfg.quant_bits,
-        x_norm,
-        lw.lin_in_proj_ba_rhs,
-        lw.lin_in_proj_ba_has_q,
-        lw.lin_in_proj_ba_q_w,
-        lw.lin_in_proj_ba_q_scales,
-        lw.lin_in_proj_ba_q_biases,
-        prefill_only_qmm
-    ); // [B,S,2*Hv]
+    // Use combined in_proj when available (one matmul instead of two).
+    const bool use_combined_in_proj =
+        (lw.lin_in_proj_all_has_q || lw.lin_in_proj_all_rhs.size() > 1);
+    const int qkvz_cols = lw.lin_conv_dim + lw.lin_value_dim;
+    const int ba_cols = 2 * lw.lin_num_v_heads;
+    array qkvz = array(0.0f);
+    array ba = array(0.0f);
+    if (use_combined_in_proj) {
+        const array proj_all = linear_decode_maybe_quantized(
+            ctx->fp8_decode_qmm_enabled,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            x_norm,
+            lw.lin_in_proj_all_rhs,
+            lw.lin_in_proj_all_has_q,
+            lw.lin_in_proj_all_q_w,
+            lw.lin_in_proj_all_q_scales,
+            lw.lin_in_proj_all_q_biases,
+            prefill_only_qmm
+        );
+        qkvz = slice(proj_all, {0, 0, 0}, {B, S, qkvz_cols});
+        ba = slice(proj_all, {0, 0, qkvz_cols}, {B, S, qkvz_cols + ba_cols});
+    } else {
+        qkvz = linear_decode_maybe_quantized(
+            ctx->fp8_decode_qmm_enabled,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            x_norm,
+            lw.lin_in_proj_qkvz_rhs,
+            lw.lin_in_proj_qkvz_has_q,
+            lw.lin_in_proj_qkvz_q_w,
+            lw.lin_in_proj_qkvz_q_scales,
+            lw.lin_in_proj_qkvz_q_biases,
+            prefill_only_qmm,
+            -1,
+            nullptr,
+            &lw.lin_in_proj_qkvz_prefill_rhs
+        );
+        ba = linear_decode_maybe_quantized(
+            ctx->fp8_decode_qmm_enabled,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            x_norm,
+            lw.lin_in_proj_ba_rhs,
+            lw.lin_in_proj_ba_has_q,
+            lw.lin_in_proj_ba_q_w,
+            lw.lin_in_proj_ba_q_scales,
+            lw.lin_in_proj_ba_q_biases,
+            prefill_only_qmm
+        );
+    }
     const array qkv = slice(qkvz, {0, 0, 0}, {B, S, lw.lin_conv_dim});
     const array z_flat = slice(qkvz, {0, 0, lw.lin_conv_dim}, {B, S, lw.lin_conv_dim + lw.lin_value_dim});
     const array z = reshape(z_flat, {B, S, lw.lin_num_v_heads, lw.lin_head_v_dim});
@@ -3567,6 +3725,7 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
     }
 
     array conv_out = array(0.0f);
+    bool conv_silu_fused = false;
     if (S == 1 && lw.lin_conv1d_decode_w.size() > 1) {
         auto [step_out, next_state] = depthwise_conv1d_decode_step(
             cache.conv_state,
@@ -3577,6 +3736,9 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
             "linear_attn.conv1d"
         );
         conv_out = step_out;
+        // The fused Metal kernel already applied SiLU when B==1 and
+        // kernel_size > 1. Only the fallback path needs a separate silu.
+        conv_silu_fused = (B == 1 && lw.lin_conv_kernel > 1);
         if (next_state.has_value()) {
             cache.conv_state = *next_state;
         } else {
@@ -3591,7 +3753,9 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
         );
         conv_out = conv1d(conv_input, lw.lin_conv1d_w, 1, 0, 1, lw.lin_conv_dim);
     }
-    conv_out = silu(conv_out);
+    if (!conv_silu_fused) {
+        conv_out = silu(conv_out);
+    }
 
     const array q_flat = slice(conv_out, {0, 0, 0}, {B, S, lw.lin_key_dim});
     const array k_flat = slice(conv_out, {0, 0, lw.lin_key_dim}, {B, S, 2 * lw.lin_key_dim});
@@ -3601,9 +3765,23 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
     array k = reshape(k_flat, {B, S, lw.lin_num_k_heads, lw.lin_head_k_dim});
     const array v = reshape(v_flat, {B, S, lw.lin_num_v_heads, lw.lin_head_v_dim});
 
-    const float inv_scale = 1.0f / std::sqrt(static_cast<float>(lw.lin_head_k_dim));
-    q = fast::rms_norm(q, std::nullopt, 1.0e-6f) * array(inv_scale * inv_scale, q.dtype());
-    k = fast::rms_norm(k, std::nullopt, 1.0e-6f) * array(inv_scale, k.dtype());
+    // Fuse rms_norm + scale into one compiled call. The compiled function
+    // is shared across all SSM layers (same shapes) so the cache always hits.
+    {
+        static const auto compiled_norm_scale = compile(
+            [](const std::vector<array>& inputs) {
+                return std::vector<array>{
+                    fast::rms_norm(inputs[0], std::nullopt, 1.0e-6f) * inputs[1]
+                };
+            },
+            false
+        );
+        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(lw.lin_head_k_dim));
+        const array q_scale_arr = array(inv_scale * inv_scale, q.dtype());
+        const array k_scale_arr = array(inv_scale, k.dtype());
+        q = compiled_norm_scale({q, q_scale_arr}).at(0);
+        k = compiled_norm_scale({k, k_scale_arr}).at(0);
+    }
 
     auto [out, new_state] = gated_delta_update(q, k, v, a, b, lw.lin_A_exp_f32, lw.lin_dt_bias, cache.state);
     cache.state = new_state;
@@ -3623,6 +3801,11 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
         prefill_only_qmm
     );
 }
+
+thread_local size_t g_ssm_fused_q_count = 0;
+thread_local size_t g_ssm_fused_bf16_count = 0;
+thread_local size_t g_ssm_reference_count = 0;
+thread_local bool g_ssm_fused_diag_logged = false;
 
 array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
     LayerWeights& lw = ctx->layers[static_cast<size_t>(layer_idx)];
@@ -3669,7 +3852,7 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
         lw.lin_out_proj_has_q;
     if (can_use_quantized_fused) {
         try {
-            return *static_cast<array*>(mlx_lazy_gated_delta_mixer_quantized(
+            auto result = *static_cast<array*>(mlx_lazy_gated_delta_mixer_quantized(
                 &x_norm,
                 &lw.lin_in_proj_all_q_w,
                 &lw.lin_in_proj_all_q_scales,
@@ -3691,6 +3874,8 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
                 static_cast<size_t>(lw.lin_num_k_heads),
                 static_cast<size_t>(lw.lin_head_v_dim)
             ));
+            g_ssm_fused_q_count += 1;
+            return result;
         } catch (const std::exception&) {
             lw.lin_fused_unavailable = true;
         }
@@ -3708,7 +3893,7 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
         lw.lin_out_proj_rhs.size() > 1;
     if (can_use_dense_fused) {
         try {
-            return *static_cast<array*>(mlx_lazy_gated_delta_mixer_bf16(
+            auto result = *static_cast<array*>(mlx_lazy_gated_delta_mixer_bf16(
                 &x_norm,
                 &lw.lin_in_proj_all_rhs,
                 &lw.lin_conv1d_decode_w,
@@ -3724,11 +3909,33 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
                 static_cast<size_t>(lw.lin_num_k_heads),
                 static_cast<size_t>(lw.lin_head_v_dim)
             ));
+            g_ssm_fused_bf16_count += 1;
+            return result;
         } catch (const std::exception&) {
             lw.lin_fused_unavailable = true;
         }
     }
 
+    // Log the first reference fallback with the failing predicates.
+    if (!g_ssm_fused_diag_logged && single_token_decode) {
+        g_ssm_fused_diag_logged = true;
+        std::fprintf(stderr,
+            "[mlx][ssm] fused decode rejected for layer %d: "
+            "enable=%d B1=%d S1=%d same_hd=%d shapes=%d cache=%d "
+            "all_q=%d out_q=%d unavail=%d\n",
+            layer_idx,
+            enable_fused_linear ? 1 : 0,
+            B == 1 ? 1 : 0,
+            single_token_decode ? 1 : 0,
+            same_head_dim ? 1 : 0,
+            fused_tensor_shapes_ok ? 1 : 0,
+            ctx->state_space_cache != nullptr ? 1 : 0,
+            lw.lin_in_proj_all_has_q ? 1 : 0,
+            lw.lin_out_proj_has_q ? 1 : 0,
+            lw.lin_fused_unavailable ? 1 : 0);
+        std::fflush(stderr);
+    }
+    g_ssm_reference_count += 1;
     return run_linear_attention_layer_reference(ctx, layer_idx, x_norm);
 }
 
@@ -4306,6 +4513,187 @@ array run_layer(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Compiled decode core: a pure function over all transformer layers for S=1.
+//
+// Inputs (all fixed shapes for decode):
+//   [0]           hidden      [1, 1, H]
+//   [1]           offset_arr  [1]  (int32, current position)
+//   [2]           attn_mask   [1, 1, 1, capacity+1]  (0 or -inf)
+//   [3 + i*2]     kv_keys_i   [1, num_kv_heads, capacity, head_dim]
+//   [3 + i*2 + 1] kv_vals_i   [1, num_kv_heads, capacity, head_dim]
+//
+// Outputs:
+//   [0]           hidden_out  [1, 1, H]
+//   [1 + i*2]     new_k_i     [1, num_kv_heads, 1, head_dim]
+//   [1 + i*2 + 1] new_v_i     [1, num_kv_heads, 1, head_dim]
+//
+// Weights are accessed through the captured ctx pointer (constant across
+// decode steps). KV caches and offset flow through explicit inputs so
+// compile() sees fixed shapes and traces once.
+// ---------------------------------------------------------------------------
+
+bool can_use_compiled_decode(const mlx_ctx* ctx) {
+    if (!ctx || ctx->layers.empty()) return false;
+    if (ctx->per_layer_input_enabled) return false;
+    if (ctx->cfg.hidden_size_per_layer_input > 0) return false;
+    for (const auto& lw : ctx->layers) {
+        if (lw.is_linear || lw.is_shortconv) return false;
+        if (lw.mlp_is_moe) return false;
+        if (lw.kv_shared_source_layer >= 0) return false;
+        if (lw.attn_is_sliding) return false;
+        if (lw.rope_freq.size() <= 1) return false;
+    }
+    return true;
+}
+
+using CompiledDecodeFn = std::function<std::vector<array>(const std::vector<array>&)>;
+
+CompiledDecodeFn build_compiled_decode_core(mlx_ctx* ctx) {
+    const int num_layers = static_cast<int>(ctx->layers.size());
+    const float eps = ctx->cfg.rms_norm_eps;
+    const int group_size = ctx->cfg.quant_group_size;
+    const int bits = ctx->cfg.quant_bits;
+    const bool use_gelu = ctx->cfg.use_gelu;
+    const bool use_v_norm = ctx->cfg.use_v_norm;
+    const int global_head_dim = ctx->cfg.global_head_dim;
+
+    return compile(
+        [ctx, num_layers, eps, group_size, bits, use_gelu, use_v_norm, global_head_dim](
+            const std::vector<array>& inputs
+        ) {
+            array hidden = inputs[0];
+            const array& offset_arr = inputs[1];
+            const array& attn_mask = inputs[2];
+
+            std::vector<array> new_kvs;
+            new_kvs.reserve(static_cast<size_t>(num_layers) * 2);
+
+            for (int li = 0; li < num_layers; ++li) {
+                const LayerWeights& lw = ctx->layers[static_cast<size_t>(li)];
+                const array& cache_k = inputs[static_cast<size_t>(3 + li * 2)];
+                const array& cache_v = inputs[static_cast<size_t>(3 + li * 2 + 1)];
+
+                // --- input norm ---
+                const array x_norm = fast::rms_norm(
+                    hidden, std::optional<array>(lw.input_layernorm_w), eps);
+
+                // --- QKV projection ---
+                const array qkv = lw.attn_qkv_has_q
+                    ? quantized_matmul(x_norm, lw.attn_qkv_q_w, lw.attn_qkv_q_scales,
+                          std::optional<array>(lw.attn_qkv_q_biases), true, group_size, bits, "affine")
+                    : matmul(x_norm, lw.attn_qkv_rhs);
+                const int q_w = lw.attn_q_proj_width;
+                const int k_w = lw.attn_k_proj_width;
+                const int v_w = lw.attn_v_proj_width;
+                const array q_proj = slice(qkv, {0, 0, 0}, {1, 1, q_w});
+                const array k_proj = slice(qkv, {0, 0, q_w}, {1, 1, q_w + k_w});
+                const array v_proj = slice(qkv, {0, 0, q_w + k_w}, {1, 1, q_w + k_w + v_w});
+
+                // --- Q/K/V reshape + norm ---
+                const int q_base = lw.attn_num_heads * lw.attn_head_dim;
+                const bool has_gate = (q_w == 2 * q_base);
+                array queries_raw = array(0.0f);
+                array gate = array(0.0f);
+                if (has_gate) {
+                    const array q_4d = reshape(q_proj, {1, 1, lw.attn_num_heads, 2 * lw.attn_head_dim});
+                    queries_raw = slice(q_4d, {0,0,0,0}, {1,1,lw.attn_num_heads,lw.attn_head_dim});
+                    gate = reshape(
+                        slice(q_4d, {0,0,0,lw.attn_head_dim}, {1,1,lw.attn_num_heads,2*lw.attn_head_dim}),
+                        {1, 1, q_base});
+                } else {
+                    queries_raw = reshape(q_proj, {1, 1, lw.attn_num_heads, lw.attn_head_dim});
+                }
+
+                array queries = fast::rms_norm(queries_raw, std::optional<array>(lw.attn_q_norm_w), eps);
+                array keys = reshape(k_proj, {1, 1, lw.attn_num_kv_heads, lw.attn_head_dim});
+                keys = fast::rms_norm(keys, std::optional<array>(lw.attn_k_norm_w), eps);
+                array values = reshape(v_proj, {1, 1, lw.attn_num_kv_heads, lw.attn_head_dim});
+                if (use_v_norm) {
+                    values = fast::rms_norm(values, std::nullopt, eps);
+                }
+
+                queries = transpose(queries, {0, 2, 1, 3});
+                keys = transpose(keys, {0, 2, 1, 3});
+                values = transpose(values, {0, 2, 1, 3});
+
+                // --- array-based RoPE ---
+                const int rope_dims = lw.attn_rope_dims;
+                const bool prop_rope = global_head_dim > 0 &&
+                    lw.attn_head_dim == global_head_dim &&
+                    rope_dims > 0 && rope_dims < lw.attn_head_dim;
+                if (prop_rope) {
+                    queries = apply_rope_proportional_array(
+                        queries, lw.rope_freq, offset_arr, rope_dims, lw.attn_head_dim);
+                    keys = apply_rope_proportional_array(
+                        keys, lw.rope_freq, offset_arr, rope_dims, lw.attn_head_dim);
+                } else {
+                    queries = apply_rope_array(queries, lw.rope_freq, offset_arr, rope_dims);
+                    keys = apply_rope_array(keys, lw.rope_freq, offset_arr, rope_dims);
+                }
+
+                // Emit new K/V for host-side cache commit.
+                new_kvs.push_back(keys);
+                new_kvs.push_back(values);
+
+                // --- SDPA over concat(cache, new_kv) with mask ---
+                const array sdpa_keys = concatenate({cache_k, keys}, 2);
+                const array sdpa_vals = concatenate({cache_v, values}, 2);
+                array attn_out = fast::scaled_dot_product_attention(
+                    queries, sdpa_keys, sdpa_vals, lw.attn_scale, "",
+                    std::optional<array>(attn_mask));
+
+                attn_out = transpose(attn_out, {0, 2, 1, 3});
+                attn_out = reshape(attn_out, {1, 1, lw.attn_num_heads * lw.attn_head_dim});
+                if (has_gate) {
+                    attn_out = attn_out * sigmoid(gate);
+                }
+
+                // --- O projection ---
+                const array o_out = lw.attn_o_has_q
+                    ? quantized_matmul(attn_out, lw.attn_o_q_w, lw.attn_o_q_scales,
+                          std::optional<array>(lw.attn_o_q_biases), true, group_size, bits, "affine")
+                    : matmul(attn_out, lw.attn_o_rhs);
+
+                // --- residual + post-attention norm ---
+                const array h = hidden + o_out;
+                const array mlp_in = fast::rms_norm(
+                    h, std::optional<array>(lw.post_attention_layernorm_w), eps);
+
+                // --- MLP: gate_up + silu/gelu + down ---
+                const array gate_up = lw.mlp_gate_up_has_q
+                    ? quantized_matmul(mlp_in, lw.mlp_gate_up_q_w, lw.mlp_gate_up_q_scales,
+                          std::optional<array>(lw.mlp_gate_up_q_biases), true, group_size, bits, "affine")
+                    : matmul(mlp_in, lw.mlp_gate_up_rhs);
+                const int gw = lw.mlp_gate_width;
+                const array mlp_gate = slice(gate_up, {0, 0, 0}, {1, 1, gw});
+                const array mlp_up = slice(gate_up, {0, 0, gw}, {1, 1, 2 * gw});
+                const array ff = (use_gelu ? gelu_approx(mlp_gate) : silu(mlp_gate)) * mlp_up;
+
+                const array down = lw.mlp_down_has_q
+                    ? quantized_matmul(ff, lw.mlp_down_q_w, lw.mlp_down_q_scales,
+                          std::optional<array>(lw.mlp_down_q_biases), true, group_size, bits, "affine")
+                    : matmul(ff, lw.mlp_down_rhs);
+
+                hidden = h + down;
+            }
+
+            // Final norm.
+            hidden = fast::rms_norm(hidden, std::optional<array>(ctx->final_norm_w), eps);
+
+            // Pack outputs: [hidden, new_k_0, new_v_0, ..., new_k_N-1, new_v_N-1]
+            std::vector<array> outputs;
+            outputs.reserve(1 + new_kvs.size());
+            outputs.push_back(hidden);
+            for (auto& kv : new_kvs) {
+                outputs.push_back(std::move(kv));
+            }
+            return outputs;
+        },
+        false // shape-specific: traces once for S=1, caches
+    );
+}
+
 array forward_hidden(
     mlx_ctx* ctx,
     const array& input_ids,
@@ -4329,24 +4717,8 @@ array forward_hidden(
     }
 
     if (!ctx->profile_layers) {
-        const int num_layers = static_cast<int>(ctx->layers.size());
-        // Pre-compute the first layer's input norm so that subsequent layers
-        // can overlap the previous layer's final-residual add with the
-        // current layer's input-norm read.
-        array next_x_norm = fast::rms_norm(
-            hidden,
-            std::optional<array>(ctx->layers[0].input_layernorm_w),
-            ctx->cfg.rms_norm_eps
-        );
-        for (int i = 0; i < num_layers; ++i) {
-            hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame, &next_x_norm);
-            if (i < num_layers - 1) {
-                next_x_norm = fast::rms_norm(
-                    hidden,
-                    std::optional<array>(ctx->layers[static_cast<size_t>(i + 1)].input_layernorm_w),
-                    ctx->cfg.rms_norm_eps
-                );
-            }
+        for (int i = 0; i < static_cast<int>(ctx->layers.size()); ++i) {
+            hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame);
         }
     } else {
         for (int i = 0; i < static_cast<int>(ctx->layers.size()); ++i) {
@@ -4463,6 +4835,28 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
         );
     }
     return logits;
+}
+
+// Apply LM head to an already-normed hidden state [1,1,H].
+// Used by the compiled decode path where the compiled core handles
+// all layers + final norm, and this function adds just the lm_head.
+array forward_logits_from_hidden(mlx_ctx* ctx, const array& normed_hidden) {
+    const bool lm_head_q_ready = ctx->lm_head_q_decode_enabled &&
+        ctx->lm_head_q_w.size() > 0 && ctx->lm_head_q_scales.size() > 0;
+    const int lm_bits = ctx->lm_head_q_bits > 0 ? ctx->lm_head_q_bits : ctx->cfg.quant_bits;
+    const bool lm_head_affine = lm_head_q_ready &&
+        ctx->lm_head_q_biases.ndim() == 2 && ctx->lm_head_q_biases.size() > 1 &&
+        ctx->cfg.quant_group_size > 0 && (lm_bits == 4 || lm_bits == 8);
+    if (lm_head_affine) {
+        return quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,
+            std::optional<array>(ctx->lm_head_q_biases), true,
+            ctx->cfg.quant_group_size, lm_bits, "affine");
+    }
+    if (lm_head_q_ready) {
+        return quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,
+            std::nullopt, true, std::nullopt, std::nullopt, "mxfp8");
+    }
+    return matmul(normed_hidden, ctx->lm_head_rhs);
 }
 
 bool can_use_fused_lm_head_argmax(const mlx_ctx* ctx, const TraceFrame* trace_frame = nullptr) {
@@ -6145,9 +6539,9 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         const array a_rhs = to_rhs(ensure_a_weight_dense(), a_key);
                         lw.lin_in_proj_ba_rhs = concatenate({ b_rhs, a_rhs }, 1);
                     }
-                    if (enable_fused_linear) {
-                        combine_linear_in_proj_weights(&lw);
-                    }
+                    // Always combine qkvz + ba into a single projection
+                    // tensor so the reference path can use one matmul.
+                    combine_linear_in_proj_weights(&lw);
                 } else {
                     const std::string fused_key = p + "mixer.in_proj.weight";
                     const array fused_in_proj_weight_src = require_tensor(tensors, fused_key);
@@ -6279,9 +6673,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                             );
                         }
                     }
-                    if (enable_fused_linear) {
-                        combine_linear_in_proj_weights(&lw);
-                    }
+                    combine_linear_in_proj_weights(&lw);
                 }
                 lw.lin_A_log = require_tensor(tensors, p + "linear_attn.A_log");
                 lw.lin_A_exp_f32 = exp(astype(lw.lin_A_log, float32));
@@ -6538,6 +6930,28 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             ctx->layers.push_back(std::move(lw));
         }
 
+        // Pre-compute RoPE frequency tables so decode can use array-based
+        // rotary embeddings (compilable, no position-dependent int params).
+        for (LayerWeights& layer : ctx->layers) {
+            if (layer.is_linear || layer.is_shortconv) continue;
+            const int rope_dims = static_cast<int>(
+                std::round(layer.attn_head_dim * layer.attn_partial_rotary_factor));
+            layer.attn_rope_dims = rope_dims;
+            if (rope_dims <= 0) continue;
+            const int half = rope_dims / 2;
+            std::vector<float> freq_values(static_cast<size_t>(half));
+            for (int d = 0; d < half; ++d) {
+                freq_values[static_cast<size_t>(d)] = 1.0f / std::pow(
+                    layer.attn_rope_theta,
+                    2.0f * static_cast<float>(d) / static_cast<float>(rope_dims)
+                );
+            }
+            layer.rope_freq = stop_gradient(copy(
+                array(freq_values.data(), {half}, float32)
+            ));
+            eval(layer.rope_freq);
+        }
+
         const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", true);
         if (enable_init_warmup) {
             // Pre-warm compiled compute_g path so WARMUP=0 benchmarks do not
@@ -6568,6 +6982,19 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             size_t layer_q_count = 0;
             size_t layer_q_total = 0;
             size_t layer_per_layer_count = 0;
+            // Branch-specific QMM counters.
+            size_t ssm_qkvz_q = 0, ssm_qkvz_total = 0;
+            size_t ssm_ba_q = 0, ssm_ba_total = 0;
+            size_t ssm_out_q = 0, ssm_out_total = 0;
+            size_t attn_qkv_q = 0, attn_qkv_total = 0;
+            size_t attn_o_q = 0, attn_o_total = 0;
+            size_t mlp_q = 0, mlp_total = 0;
+            size_t dense_fallback_bytes = 0;
+            auto count_dense = [&](const array& rhs) {
+                if (rhs.size() > 1 && rhs.ndim() == 2) {
+                    dense_fallback_bytes += static_cast<size_t>(rhs.size()) * rhs.itemsize();
+                }
+            };
             for (const LayerWeights& lw : ctx->layers) {
                 const bool flags[] = {
                     lw.mlp_gate_has_q,
@@ -6588,6 +7015,37 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     if (flag) layer_q_count += 1;
                 }
                 if (lw.has_per_layer_input) layer_per_layer_count += 1;
+                // SSM / linear-attention branch.
+                if (lw.is_linear) {
+                    ssm_qkvz_total += 1;
+                    ssm_ba_total += 1;
+                    ssm_out_total += 1;
+                    if (lw.lin_in_proj_qkvz_has_q) ssm_qkvz_q += 1;
+                    else count_dense(lw.lin_in_proj_qkvz_rhs);
+                    if (lw.lin_in_proj_ba_has_q) ssm_ba_q += 1;
+                    else count_dense(lw.lin_in_proj_ba_rhs);
+                    if (lw.lin_out_proj_has_q) ssm_out_q += 1;
+                    else count_dense(lw.lin_out_proj_rhs);
+                }
+                // Full-attention branch (count fused QKV + O).
+                if (!lw.is_linear && !lw.is_shortconv) {
+                    attn_qkv_total += 1;
+                    attn_o_total += 1;
+                    if (lw.attn_qkv_has_q || lw.attn_q_has_q) attn_qkv_q += 1;
+                    else { count_dense(lw.attn_qkv_rhs); count_dense(lw.attn_q_rhs); }
+                    if (lw.attn_o_has_q) attn_o_q += 1;
+                    else count_dense(lw.attn_o_rhs);
+                }
+                // MLP branch.
+                mlp_total += 1;
+                const bool mlp_q_ok = lw.mlp_gate_up_has_q || lw.mlp_gate_has_q || lw.mlp_is_moe;
+                if (mlp_q_ok && lw.mlp_down_has_q) mlp_q += 1;
+                else {
+                    count_dense(lw.mlp_gate_up_rhs);
+                    count_dense(lw.mlp_gate_rhs);
+                    count_dense(lw.mlp_up_rhs);
+                    if (!lw.mlp_down_has_q) count_dense(lw.mlp_down_rhs);
+                }
             }
             std::fprintf(
                 stderr,
@@ -6606,6 +7064,27 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 ctx->per_layer_hidden_size,
                 ctx->cfg.use_gelu ? 1 : 0
             );
+            if (ssm_qkvz_total > 0 || attn_qkv_total > 0) {
+                std::fprintf(
+                    stderr,
+                    "[mlx][qmm] ssm_qkvz=%zu/%zu ssm_ba=%zu/%zu ssm_out=%zu/%zu attn_qkv=%zu/%zu attn_o=%zu/%zu mlp=%zu/%zu dense_fallback=%.1fMB\n",
+                    ssm_qkvz_q, ssm_qkvz_total,
+                    ssm_ba_q, ssm_ba_total,
+                    ssm_out_q, ssm_out_total,
+                    attn_qkv_q, attn_qkv_total,
+                    attn_o_q, attn_o_total,
+                    mlp_q, mlp_total,
+                    static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0)
+                );
+            }
+            if (dense_fallback_bytes > 0 && ctx->has_grouped_affine_meta) {
+                std::fprintf(
+                    stderr,
+                    "[mlx][WARNING] %.1fMB of weights fell back to dense (QMM capture miss). "
+                    "This increases memory usage and slows decode.\n",
+                    static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0)
+                );
+            }
             std::fflush(stderr);
         }
 
@@ -8511,6 +8990,15 @@ int32_t mlx_decode_topk_stream(
         }
         int32_t produced = 0;
 
+        // Build compiled decode core if the model qualifies.
+        const bool use_compiled_decode =
+            !env_truthy("TALU_METAL_COMPILED_DECODE_DISABLE", false) &&
+            can_use_compiled_decode(ctx);
+        std::optional<CompiledDecodeFn> compiled_core;
+        if (use_compiled_decode) {
+            compiled_core = build_compiled_decode_core(ctx);
+        }
+
         if (!has_penalties) {
             // Fast path: chunk decode to avoid very large token graphs and avoid
             // per-token async scheduling overhead.
@@ -8542,15 +9030,66 @@ int32_t mlx_decode_topk_stream(
 
                 const auto t_build0 = std::chrono::steady_clock::now();
                 for (int32_t i = 0; i < chunk_target; ++i) {
-                    const array next_token = use_fused_greedy_decode
-                        ? fused_lm_head_argmax_token(ctx, current_token)
-                        : (use_fused_topk_decode
-                            ? sample_token_from_topk_candidates(
-                                fused_lm_head_topk_candidates(ctx, current_token, sampling_cfg.top_k),
-                                sampling_cfg
-                              )
-                            : (*compiled_sample)({last_token_logits(forward_logits(ctx, current_token))}).at(0
-                              ));
+                    array next_token = array(0, int32);
+                    if (use_fused_greedy_decode) {
+                        next_token = fused_lm_head_argmax_token(ctx, current_token);
+                    } else if (use_fused_topk_decode) {
+                        next_token = sample_token_from_topk_candidates(
+                            fused_lm_head_topk_candidates(ctx, current_token, sampling_cfg.top_k),
+                            sampling_cfg);
+                    } else if (compiled_core.has_value()) {
+                        // --- Compiled decode path ---
+                        // 1. Embed token.
+                        array hidden = take(ctx->embed_tokens, current_token, 0);
+                        if (std::fabs(ctx->cfg.embedding_multiplier - 1.0f) > 1.0e-6f) {
+                            hidden = hidden * array(ctx->cfg.embedding_multiplier, hidden.dtype());
+                        }
+                        // 2. Build attention mask.
+                        const int num_layers = static_cast<int>(ctx->layers.size());
+                        const int capacity = ctx->kv_cache[0].keys->shape(2);
+                        const int32_t cur_offset = ctx->kv_cache[0].offset;
+                        const array offset_arr = array(&cur_offset, {1}, int32);
+                        const array positions = astype(arange(0, capacity + 1, 1, int32), float32);
+                        const array offset_f = array(static_cast<float>(cur_offset), float32);
+                        const array cap_f = array(static_cast<float>(capacity), float32);
+                        const array attn_mask = reshape(
+                            where((positions < offset_f) | (positions == cap_f),
+                                  array(0.0f),
+                                  array(-std::numeric_limits<float>::infinity())),
+                            {1, 1, 1, capacity + 1});
+                        // 3. Collect inputs: [hidden, offset, mask, kv_k_0, kv_v_0, ...]
+                        std::vector<array> core_inputs;
+                        core_inputs.reserve(3 + static_cast<size_t>(num_layers) * 2);
+                        core_inputs.push_back(hidden);
+                        core_inputs.push_back(offset_arr);
+                        core_inputs.push_back(attn_mask);
+                        for (int li = 0; li < num_layers; ++li) {
+                            core_inputs.push_back(*ctx->kv_cache[static_cast<size_t>(li)].keys);
+                            core_inputs.push_back(*ctx->kv_cache[static_cast<size_t>(li)].values);
+                        }
+                        // 4. Call compiled core.
+                        auto core_out = (*compiled_core)(core_inputs);
+                        const array normed_hidden = core_out[0];
+                        // 5. Commit new K/V to caches (host-side slice_update).
+                        for (int li = 0; li < num_layers; ++li) {
+                            const array& new_k = core_out[static_cast<size_t>(1 + li * 2)];
+                            const array& new_v = core_out[static_cast<size_t>(1 + li * 2 + 1)];
+                            KVCacheState& kv = ctx->kv_cache[static_cast<size_t>(li)];
+                            const int prev = kv.offset;
+                            const int nh = ctx->layers[static_cast<size_t>(li)].attn_num_kv_heads;
+                            const int hd = ctx->layers[static_cast<size_t>(li)].attn_head_dim;
+                            kv.keys = slice_update(*kv.keys, new_k,
+                                {0, 0, prev, 0}, {1, nh, prev + 1, hd});
+                            kv.values = slice_update(*kv.values, new_v,
+                                {0, 0, prev, 0}, {1, nh, prev + 1, hd});
+                            kv.offset = prev + 1;
+                        }
+                        // 6. LM head.
+                        const array logits = forward_logits_from_hidden(ctx, normed_hidden);
+                        next_token = (*compiled_sample)({last_token_logits(logits)}).at(0);
+                    } else {
+                        next_token = (*compiled_sample)({last_token_logits(forward_logits(ctx, current_token))}).at(0);
+                    }
                     async_eval(next_token);
                     chunk_tokens.push_back(next_token);
                     current_token = next_token;
@@ -8792,6 +9331,16 @@ int32_t mlx_decode_topk_stream(
                 top_k,
                 static_cast<double>(temperature)
             );
+        }
+        if (g_ssm_fused_q_count > 0 || g_ssm_fused_bf16_count > 0 || g_ssm_reference_count > 0) {
+            std::fprintf(
+                stderr,
+                "[mlx][ssm] fused_q=%zu fused_bf16=%zu reference=%zu\n",
+                g_ssm_fused_q_count,
+                g_ssm_fused_bf16_count,
+                g_ssm_reference_count
+            );
+            std::fflush(stderr);
         }
         *out_generated_ids = generated_host.release();
         *out_generated_len = produced;
