@@ -9,6 +9,31 @@ static __device__ __forceinline__ float talu_quant_warp_sum_f32(float value) {
     return value;
 }
 
+static __device__ __forceinline__ float talu_quant_warp_min_f32(float value) {
+    value = fminf(value, __shfl_down_sync(0xFFFFFFFFu, value, 16));
+    value = fminf(value, __shfl_down_sync(0xFFFFFFFFu, value, 8));
+    value = fminf(value, __shfl_down_sync(0xFFFFFFFFu, value, 4));
+    value = fminf(value, __shfl_down_sync(0xFFFFFFFFu, value, 2));
+    value = fminf(value, __shfl_down_sync(0xFFFFFFFFu, value, 1));
+    return value;
+}
+
+static __device__ __forceinline__ float talu_quant_warp_max_f32(float value) {
+    value = fmaxf(value, __shfl_down_sync(0xFFFFFFFFu, value, 16));
+    value = fmaxf(value, __shfl_down_sync(0xFFFFFFFFu, value, 8));
+    value = fmaxf(value, __shfl_down_sync(0xFFFFFFFFu, value, 4));
+    value = fmaxf(value, __shfl_down_sync(0xFFFFFFFFu, value, 2));
+    value = fmaxf(value, __shfl_down_sync(0xFFFFFFFFu, value, 1));
+    return value;
+}
+
+static __device__ __forceinline__ unsigned short talu_quant_f32_to_bf16_rne(float value) {
+    const unsigned int fbits = __float_as_uint(value);
+    const unsigned int lsb = (fbits >> 16) & 1u;
+    const unsigned int rounding_bias = 0x7FFFu + lsb;
+    return static_cast<unsigned short>((fbits + rounding_bias) >> 16);
+}
+
 static constexpr unsigned int U8_BLOCK_THREADS = 128;
 static constexpr unsigned int U8_ELEMS_PER_THREAD = 16;
 static constexpr unsigned int U8_ELEMS_PER_STEP = U8_BLOCK_THREADS * U8_ELEMS_PER_THREAD;
@@ -1687,6 +1712,307 @@ extern "C" __global__ void talu_quantize_f32_to_i8_simple(
         int q = __float2int_rn(val * inv_scale);
         q = max(-128, min(127, q));
         row_out[i] = static_cast<signed char>(q);
+    }
+}
+
+// Quantize F32 weights to grouped-affine U4 layout.
+// Grid: (group_count, row_count), Block: (128)
+extern "C" __global__ void talu_gaffine_quantize_u4_f32(
+    const float* __restrict__ input,                // [row_count × col_count]
+    const float* __restrict__ group_scale_factors,  // [group_count]
+    const float* __restrict__ group_bias_shifts,    // [group_count]
+    const float* __restrict__ group_round_shifts,   // [group_count]
+    unsigned int* __restrict__ packed_out,          // [row_count × packed_col_count]
+    unsigned short* __restrict__ scales_out,        // [row_count × group_count] BF16
+    unsigned short* __restrict__ biases_out,        // [row_count × group_count] BF16
+    unsigned int row_count,
+    unsigned int col_count,
+    unsigned int group_size,
+    unsigned int packed_col_count
+) {
+    if (row_count == 0u || col_count == 0u || group_size == 0u) return;
+    if ((col_count % group_size) != 0u || (group_size % 8u) != 0u) return;
+
+    const unsigned int row = blockIdx.y;
+    const unsigned int group_idx = blockIdx.x;
+    const unsigned int group_count = col_count / group_size;
+    if (row >= row_count || group_idx >= group_count) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int warp_id = tid / TALU_QUANT_WARP_SIZE;
+    const unsigned int warp_count = (blockDim.x + TALU_QUANT_WARP_SIZE - 1u) / TALU_QUANT_WARP_SIZE;
+
+    const float* row_in = input + (unsigned long long)row * col_count;
+    const unsigned int group_start = group_idx * group_size;
+    const unsigned int words_per_group = group_size / 8u;
+
+    float local_min = 3.402823466e+38F;
+    float local_max = -3.402823466e+38F;
+    for (unsigned int i = tid; i < group_size; i += blockDim.x) {
+        const float value = row_in[group_start + i];
+        local_min = fminf(local_min, value);
+        local_max = fmaxf(local_max, value);
+    }
+
+    local_min = talu_quant_warp_min_f32(local_min);
+    local_max = talu_quant_warp_max_f32(local_max);
+
+    __shared__ float warp_min[8];
+    __shared__ float warp_max[8];
+    __shared__ float shared_scale;
+    __shared__ float shared_bias;
+    __shared__ float shared_round_shift;
+    if (lane == 0u) {
+        warp_min[warp_id] = local_min;
+        warp_max[warp_id] = local_max;
+    }
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float block_min = (lane < warp_count) ? warp_min[lane] : 3.402823466e+38F;
+        float block_max = (lane < warp_count) ? warp_max[lane] : -3.402823466e+38F;
+        block_min = talu_quant_warp_min_f32(block_min);
+        block_max = talu_quant_warp_max_f32(block_max);
+        if (lane == 0u) {
+            const float base_scale = (block_max > block_min) ? ((block_max - block_min) / 15.0f) : 0.0f;
+            const float scale_factor = group_scale_factors[group_idx];
+            const float group_scale = base_scale * scale_factor;
+            const float group_bias_shift = group_bias_shifts[group_idx];
+            const float group_bias = (group_scale > 0.0f)
+                ? (block_min + group_bias_shift * group_scale)
+                : block_min;
+            const float group_round_shift = group_round_shifts[group_idx];
+
+            shared_scale = group_scale;
+            shared_bias = group_bias;
+            shared_round_shift = group_round_shift;
+
+            const unsigned long long sb_index = (unsigned long long)row * group_count + group_idx;
+            scales_out[sb_index] = talu_quant_f32_to_bf16_rne(group_scale);
+            biases_out[sb_index] = talu_quant_f32_to_bf16_rne(group_bias);
+        }
+    }
+    __syncthreads();
+
+    const float group_scale = shared_scale;
+    const float group_bias = shared_bias;
+    const float group_round_shift = shared_round_shift;
+
+    const unsigned int group_word_offset = group_start / 8u;
+    const unsigned long long row_word_base = (unsigned long long)row * packed_col_count + group_word_offset;
+    for (unsigned int word_idx = tid; word_idx < words_per_group; word_idx += blockDim.x) {
+        const unsigned int value_base = group_start + word_idx * 8u;
+        unsigned int packed_word = 0u;
+
+        #pragma unroll
+        for (unsigned int value_idx = 0; value_idx < 8u; ++value_idx) {
+            const float value = row_in[value_base + value_idx];
+            unsigned int quantized = 0u;
+            if (group_scale > 0.0f) {
+                const float normalized = (value - group_bias) / group_scale + group_round_shift;
+                float rounded = roundf(normalized);
+                rounded = fminf(15.0f, fmaxf(0.0f, rounded));
+                quantized = static_cast<unsigned int>(rounded);
+            }
+            packed_word |= (quantized << (value_idx * 4u));
+        }
+
+        packed_out[row_word_base + word_idx] = packed_word;
+    }
+}
+
+// Quantize F32 weights to grouped-affine U8 layout.
+// Grid: (group_count, row_count), Block: (128)
+extern "C" __global__ void talu_gaffine_quantize_u8_f32(
+    const float* __restrict__ input,                // [row_count × col_count]
+    const float* __restrict__ group_scale_factors,  // [group_count]
+    const float* __restrict__ group_bias_shifts,    // [group_count]
+    const float* __restrict__ group_round_shifts,   // [group_count]
+    unsigned int* __restrict__ packed_out,          // [row_count × packed_col_count]
+    unsigned short* __restrict__ scales_out,        // [row_count × group_count] BF16
+    unsigned short* __restrict__ biases_out,        // [row_count × group_count] BF16
+    unsigned int row_count,
+    unsigned int col_count,
+    unsigned int group_size,
+    unsigned int packed_col_count
+) {
+    if (row_count == 0u || col_count == 0u || group_size == 0u) return;
+    if ((col_count % group_size) != 0u || (group_size % 4u) != 0u) return;
+
+    const unsigned int row = blockIdx.y;
+    const unsigned int group_idx = blockIdx.x;
+    const unsigned int group_count = col_count / group_size;
+    if (row >= row_count || group_idx >= group_count) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int warp_id = tid / TALU_QUANT_WARP_SIZE;
+    const unsigned int warp_count = (blockDim.x + TALU_QUANT_WARP_SIZE - 1u) / TALU_QUANT_WARP_SIZE;
+
+    const float* row_in = input + (unsigned long long)row * col_count;
+    const unsigned int group_start = group_idx * group_size;
+    const unsigned int words_per_group = group_size / 4u;
+
+    float local_min = 3.402823466e+38F;
+    float local_max = -3.402823466e+38F;
+    for (unsigned int i = tid; i < group_size; i += blockDim.x) {
+        const float value = row_in[group_start + i];
+        local_min = fminf(local_min, value);
+        local_max = fmaxf(local_max, value);
+    }
+
+    local_min = talu_quant_warp_min_f32(local_min);
+    local_max = talu_quant_warp_max_f32(local_max);
+
+    __shared__ float warp_min[8];
+    __shared__ float warp_max[8];
+    __shared__ float shared_scale;
+    __shared__ float shared_bias;
+    __shared__ float shared_round_shift;
+    if (lane == 0u) {
+        warp_min[warp_id] = local_min;
+        warp_max[warp_id] = local_max;
+    }
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float block_min = (lane < warp_count) ? warp_min[lane] : 3.402823466e+38F;
+        float block_max = (lane < warp_count) ? warp_max[lane] : -3.402823466e+38F;
+        block_min = talu_quant_warp_min_f32(block_min);
+        block_max = talu_quant_warp_max_f32(block_max);
+        if (lane == 0u) {
+            const float base_scale = (block_max > block_min) ? ((block_max - block_min) / 255.0f) : 0.0f;
+            const float scale_factor = group_scale_factors[group_idx];
+            const float group_scale = base_scale * scale_factor;
+            const float group_bias_shift = group_bias_shifts[group_idx];
+            const float group_bias = (group_scale > 0.0f)
+                ? (block_min + group_bias_shift * group_scale)
+                : block_min;
+            const float group_round_shift = group_round_shifts[group_idx];
+
+            shared_scale = group_scale;
+            shared_bias = group_bias;
+            shared_round_shift = group_round_shift;
+
+            const unsigned long long sb_index = (unsigned long long)row * group_count + group_idx;
+            scales_out[sb_index] = talu_quant_f32_to_bf16_rne(group_scale);
+            biases_out[sb_index] = talu_quant_f32_to_bf16_rne(group_bias);
+        }
+    }
+    __syncthreads();
+
+    const float group_scale = shared_scale;
+    const float group_bias = shared_bias;
+    const float group_round_shift = shared_round_shift;
+
+    const unsigned int group_word_offset = group_start / 4u;
+    const unsigned long long row_word_base = (unsigned long long)row * packed_col_count + group_word_offset;
+    for (unsigned int word_idx = tid; word_idx < words_per_group; word_idx += blockDim.x) {
+        const unsigned int value_base = group_start + word_idx * 4u;
+        unsigned int packed_word = 0u;
+
+        #pragma unroll
+        for (unsigned int value_idx = 0; value_idx < 4u; ++value_idx) {
+            const float value = row_in[value_base + value_idx];
+            unsigned int quantized = 0u;
+            if (group_scale > 0.0f) {
+                const float normalized = (value - group_bias) / group_scale + group_round_shift;
+                float rounded = roundf(normalized);
+                rounded = fminf(255.0f, fmaxf(0.0f, rounded));
+                quantized = static_cast<unsigned int>(rounded);
+            }
+            packed_word |= (quantized << (value_idx * 8u));
+        }
+
+        packed_out[row_word_base + word_idx] = packed_word;
+    }
+}
+
+// Build dequantized grouped-affine weights for calibration scoring.
+// Inputs are sampled source rows + per-row/group min/base-scale statistics.
+// Output layout matches matmul weight expectation: [col_count × sample_rows] (col-major).
+// Grid: (ceil(col_count/256), sample_rows), Block: (256)
+extern "C" __global__ void talu_gaffine_build_dq_weights_f32(
+    const float* __restrict__ sampled_source_rows,   // [sample_rows × col_count] row-major
+    const float* __restrict__ row_group_min,         // [sample_rows × group_count]
+    const float* __restrict__ row_group_base_scale,  // [sample_rows × group_count]
+    const float* __restrict__ group_scale_factors,   // [group_count]
+    const float* __restrict__ group_bias_shifts,     // [group_count]
+    const float* __restrict__ group_round_shifts,    // [group_count]
+    float* __restrict__ dq_weights_out,              // [col_count × sample_rows] col-major
+    unsigned int sample_rows,
+    unsigned int col_count,
+    unsigned int group_size,
+    float max_quant_value
+) {
+    if (sample_rows == 0u || col_count == 0u || group_size == 0u) return;
+    if ((col_count % group_size) != 0u) return;
+
+    const unsigned int row = blockIdx.y;
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= sample_rows || col >= col_count) return;
+
+    const unsigned int group_count = col_count / group_size;
+    const unsigned int group_idx = col / group_size;
+    const unsigned long long row_group_idx = (unsigned long long)row * group_count + group_idx;
+
+    const float value = sampled_source_rows[(unsigned long long)row * col_count + col];
+    const float min_val = row_group_min[row_group_idx];
+    const float base_scale = row_group_base_scale[row_group_idx];
+    const float group_scale = base_scale * group_scale_factors[group_idx];
+    const float group_bias_shift = group_bias_shifts[group_idx];
+    const float group_bias = (group_scale > 0.0f)
+        ? (min_val + group_bias_shift * group_scale)
+        : min_val;
+    const float group_round_shift = group_round_shifts[group_idx];
+
+    float quantized = 0.0f;
+    if (group_scale > 0.0f) {
+        const float normalized = (value - group_bias) / group_scale + group_round_shift;
+        float rounded = roundf(normalized);
+        rounded = fminf(max_quant_value, fmaxf(0.0f, rounded));
+        quantized = rounded;
+    }
+    const float dequant = quantized * group_scale + group_bias;
+    dq_weights_out[(unsigned long long)col * sample_rows + row] = dequant;
+}
+
+// Sum of squared error between two F32 vectors.
+// Writes sum((a[i]-b[i])^2) into out_sum[0].
+// Caller must zero out_sum before launch.
+// Launch: grid=(ceil(n/256)), block=(256)
+extern "C" __global__ void talu_reduce_mse_f32(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out_sum,
+    unsigned int n
+) {
+    if (n == 0u) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned long long global_tid = (unsigned long long)blockIdx.x * blockDim.x + tid;
+    const unsigned long long stride = (unsigned long long)blockDim.x * gridDim.x;
+
+    float local_sum = 0.0f;
+    for (unsigned long long i = global_tid; i < n; i += stride) {
+        const float diff = a[i] - b[i];
+        local_sum += diff * diff;
+    }
+
+    __shared__ float block_sum[256];
+    block_sum[tid] = local_sum;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x >> 1; offset > 0u; offset >>= 1) {
+        if (tid < offset) {
+            block_sum[tid] += block_sum[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0u) {
+        atomicAdd(out_sum, block_sum[0]);
     }
 }
 
