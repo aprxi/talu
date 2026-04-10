@@ -1856,7 +1856,12 @@ fn record_reference_bundle(
             ReferenceCaptureMode::Full => None,
             ReferenceCaptureMode::TranscriptOnly => Some(point_mask_for_name("token_select")?),
         };
-        let _override_guard = VerifyOverrideGuard::new(false, false, point_mask_override, None);
+        let _override_guard = VerifyOverrideGuard::new(
+            false,
+            matches!(capture_mode, ReferenceCaptureMode::Full),
+            point_mask_override,
+            None,
+        );
 
         let cfg = xray_generate_config_with_overrides(
             &resolved_model,
@@ -2852,6 +2857,7 @@ fn run_reference_refresh_process(
     command
         .arg("xray")
         .arg(model)
+        .arg(if args.output { "--output" } else { "--input" })
         .arg("--verify-record-reference-only")
         .arg("--verify-record-backend")
         .arg(reference_backend)

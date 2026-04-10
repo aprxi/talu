@@ -736,3 +736,76 @@ test "RoPE cache expansion respects max_seq_len" {
     rope.applyInPlace(&vec, 400);
     try std.testing.expectEqual(@as(usize, 512), rope.cached_len);
 }
+
+test "RoPE.applyInPlace preserves logical pairing when only a leading subspace rotates" {
+    const allocator = std.testing.allocator;
+    const logical_dim: usize = 512;
+    const rotated_dim: usize = 128;
+    const half_logical = logical_dim / 2;
+    const half_rotated = rotated_dim / 2;
+
+    const inv_freq = try allocator.alloc(f32, half_logical);
+    defer allocator.free(inv_freq);
+    for (0..half_rotated) |idx| {
+        const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(logical_dim));
+        inv_freq[idx] = 1.0 / std.math.pow(f32, 10000.0, exponent);
+    }
+    @memset(inv_freq[half_rotated..], 0.0);
+
+    var rope = try RoPE.initFromInvFreq(allocator, logical_dim, 32, inv_freq, 1.0);
+    defer rope.deinit(allocator);
+
+    var vec = [_]f32{0.0} ** logical_dim;
+    vec[0] = 1.0;
+    vec[64] = 7.0;
+    vec[256] = 2.0;
+    vec[320] = 11.0;
+    const before = vec;
+
+    rope.applyInPlace(&vec, 3);
+
+    try std.testing.expect(@abs(vec[0] - before[0]) > 1e-4);
+    try std.testing.expect(@abs(vec[256] - before[256]) > 1e-4);
+    try std.testing.expectApproxEqAbs(before[64], vec[64], 1e-6);
+    try std.testing.expectApproxEqAbs(before[320], vec[320], 1e-6);
+}
+
+test "RoPE.applyInPlace sparse logical-domain rotation matches gathered standard rotation" {
+    const allocator = std.testing.allocator;
+    const logical_dim: usize = 512;
+    const rotated_dim: usize = 128;
+    const half_logical = logical_dim / 2;
+    const half_rotated = rotated_dim / 2;
+
+    const logical_inv_freq = try allocator.alloc(f32, half_logical);
+    defer allocator.free(logical_inv_freq);
+    for (0..half_rotated) |idx| {
+        const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(logical_dim));
+        logical_inv_freq[idx] = 1.0 / std.math.pow(f32, 10000.0, exponent);
+    }
+    @memset(logical_inv_freq[half_rotated..], 0.0);
+
+    var logical_rope = try RoPE.initFromInvFreq(allocator, logical_dim, 32, logical_inv_freq, 1.0);
+    defer logical_rope.deinit(allocator);
+    var gathered_rope = try RoPE.initFromInvFreq(allocator, rotated_dim, 32, logical_inv_freq[0..half_rotated], 1.0);
+    defer gathered_rope.deinit(allocator);
+
+    var logical_vec = [_]f32{0.0} ** logical_dim;
+    for (&logical_vec, 0..) |*val, idx| {
+        val.* = @as(f32, @floatFromInt(@mod(idx * 17, 97))) / 13.0;
+    }
+    var gathered_expected = logical_vec;
+
+    logical_rope.applyInPlace(&logical_vec, 5);
+
+    var gathered = [_]f32{0.0} ** rotated_dim;
+    @memcpy(gathered[0..half_rotated], gathered_expected[0..half_rotated]);
+    @memcpy(gathered[half_rotated..rotated_dim], gathered_expected[half_logical .. half_logical + half_rotated]);
+    gathered_rope.applyInPlace(&gathered, 5);
+    @memcpy(gathered_expected[0..half_rotated], gathered[0..half_rotated]);
+    @memcpy(gathered_expected[half_logical .. half_logical + half_rotated], gathered[half_rotated..rotated_dim]);
+
+    for (logical_vec, gathered_expected) |actual, expected| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
+}

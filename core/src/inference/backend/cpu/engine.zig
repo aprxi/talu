@@ -238,8 +238,9 @@ pub const FusedCpuBackend = struct {
             @intCast(loaded.config.rope_dim)
         else
             @intCast(loaded.config.head_dim);
-        // Sliding-window layers use the base head_dim rotary width,
-        // while full-attention layers may use a reduced global rope_dim.
+        // Sliding-window layers use the base head_dim rotary width, while
+        // some full-attention layouts rotate only a leading subspace inside a
+        // larger logical pairing domain.
         const local_rope_dim: usize = @intCast(loaded.config.head_dim);
         if (global_rope_dim == 0 and local_rope_dim == 0) return .{};
 
@@ -261,6 +262,11 @@ pub const FusedCpuBackend = struct {
             global_inv_freq_owned = inv_freq;
             const base = loaded.config.rope_theta;
             const factor = if (loaded.config.rope_scaling.factor > 0) loaded.config.rope_scaling.factor else 1.0;
+            // `global_rope_dim` defines the pairing topology: index `i` rotates
+            // against `i + global_rope_dim/2`. `rotated_dims` only controls how
+            // many leading pairs receive non-identity frequencies. The tail is
+            // zero-filled so those pairs remain identity rotations while the
+            // active pairs still use the full logical half-split.
             for (0..rotated_freq_count) |idx| {
                 const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(global_rope_dim));
                 inv_freq[idx] = (1.0 / std.math.pow(f32, base, exponent)) / factor;
@@ -393,9 +399,9 @@ pub const FusedCpuBackend = struct {
             allocator.free(cpu_block_set);
         }
 
-        // Models like Gemma4 can vary attention/FFN widths by layer (e.g.
-        // sliding vs full-attention blocks). Track per-layer KV shape and
-        // size shared scratch for the maximum runtime footprint.
+        // Some architectures vary attention/FFN widths by layer. Track
+        // per-layer KV shape and size shared scratch for the maximum runtime
+        // footprint.
         var max_heads = head_total;
         var max_kv_heads = kv_head_total;
         var max_head_dim = head_dim;
@@ -431,8 +437,8 @@ pub const FusedCpuBackend = struct {
         var kv_quant_mode = kv_cache_mod.QuantMode.fromEnv();
         if (kv_quant_mode == .int8 and max_head_dim > 256) {
             // Current K-only INT8 SDPA path is tuned for narrower heads.
-            // Use f32 KV cache for wide-head models (e.g. Gemma4 full-attn layers)
-            // until a wide-head INT8 path is implemented.
+            // Use f32 KV cache for wide-head attention layers until a
+            // wide-head INT8 path is implemented.
             kv_quant_mode = .f32;
             log.warn("inference", "CPU KV INT8 disabled for wide-head model", .{
                 .max_head_dim = max_head_dim,
@@ -1274,9 +1280,9 @@ pub const FusedCpuBackend = struct {
         try self.model.embed_tokens.forward(tokens, &view);
         cpu_rowwise.scaleInPlace(output, self.loaded.config.embedding_multiplier);
 
-        // Capture source embeddings (raw scaled embed_tokens output) before
-        // the layer forward modifies the buffer. GPU stages need these for
-        // Gemma4 per-layer-input branch.
+        // Capture source embeddings (raw scaled embed_tokens output) before the
+        // layer forward modifies the buffer. GPU stages may need the original
+        // token embeddings for per-layer input branches.
         if (source_embeddings_out) |se_out| {
             @memcpy(se_out, output);
         }
@@ -2813,4 +2819,42 @@ test "slotActivationBytes and slotActivationBytesMut expose slot hidden storage"
     var bytes_mut = backend.slotActivationBytesMut(0);
     bytes_mut[0] = 0;
     try std.testing.expect(bytes_mut.len == bytes.len);
+}
+
+test "initRuntimeRopeHandles preserves logical pairing when rope_dim is smaller than global_head_dim" {
+    var config = std.mem.zeroes(tensor.ModelConfig);
+    config.head_dim = 256;
+    config.global_head_dim = 512;
+    config.rope_dim = 128;
+    config.max_seq_len = 64;
+    config.rope_theta = 10000.0;
+    config.rope_scaling = .{};
+
+    // Safe: initRuntimeRopeHandles only reads `config` and `position_embeddings`.
+    var loaded: LoadedModel = undefined;
+    loaded.config = config;
+    loaded.position_embeddings = null;
+
+    var handles = try FusedCpuBackend.initRuntimeRopeHandles(std.testing.allocator, &loaded);
+    defer FusedCpuBackend.deinitRuntimeRopeHandles(std.testing.allocator, &handles);
+
+    const rope = handles.global orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 512), rope.dim);
+    try std.testing.expectEqual(@as(usize, 256), rope.inv_freq.len);
+    try std.testing.expect(@abs(rope.inv_freq[63]) > 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rope.inv_freq[64], 1e-8);
+
+    var vec = [_]f32{0.0} ** 512;
+    vec[0] = 1.0;
+    vec[64] = 7.0;
+    vec[256] = 2.0;
+    vec[320] = 11.0;
+    const before = vec;
+
+    rope.applyInPlace(&vec, 3);
+
+    try std.testing.expect(@abs(vec[0] - before[0]) > 1e-4);
+    try std.testing.expect(@abs(vec[256] - before[256]) > 1e-4);
+    try std.testing.expectApproxEqAbs(before[64], vec[64], 1e-6);
+    try std.testing.expectApproxEqAbs(before[320], vec[320], 1e-6);
 }

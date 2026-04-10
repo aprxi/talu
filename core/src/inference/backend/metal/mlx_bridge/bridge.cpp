@@ -2878,26 +2878,53 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     }
     int rope_offset = cache.offset;
     if (use_shared_read_cache) {
-        // Gemma4 shared-KV path uses the source layer cache offset before the
-        // current token block update (MLX-LM passes this through `offset`).
+        // Shared-KV readers use the source cache offset before the current
+        // token block update. The caller passes the destination layer's token
+        // block size separately, so reconstruct the source RoPE offset here.
         rope_offset = std::max(0, read_cache->offset - S);
     }
-    queries = fast::rope(
-        queries,
-        static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor)),
-        false,
-        std::optional<float>(lw.attn_rope_theta),
-        1.0f,
-        rope_offset
-    );
-    keys = fast::rope(
-        keys,
-        static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor)),
-        false,
-        std::optional<float>(lw.attn_rope_theta),
-        1.0f,
-        rope_offset
-    );
+    const int rope_dims = static_cast<int>(std::round(lw.attn_head_dim * lw.attn_partial_rotary_factor));
+    // Some architectures rotate only a leading subspace inside a larger
+    // logical pairing domain. In that case:
+    // - `lw.attn_head_dim` defines the half-split pairing topology
+    // - `rope_dims` defines how many leading pairs are active
+    //
+    // A plain RoPE call with `dim = rope_dims` would rotate x[i] with
+    // x[i + rope_dims/2], which is a different operator. The correct mapping
+    // keeps the full-head pairing stride x[i] <-> x[i + head_dim/2], but only
+    // for the first `rope_dims / 2` pairs. Implement that by gathering the
+    // active first-half and matching second-half slices, applying standard RoPE
+    // on the gathered view, then scattering the rotated values back.
+    const bool use_proportional_full_head_rope =
+        ctx->cfg.global_head_dim > 0 &&
+        lw.attn_head_dim == ctx->cfg.global_head_dim &&
+        rope_dims > 0 && rope_dims < lw.attn_head_dim;
+    if (use_proportional_full_head_rope) {
+        const int hd = lw.attn_head_dim;
+        const int half_rope = rope_dims / 2;
+        const int half_hd = hd / 2;
+        // queries/keys shape here: [B, n_heads, S, hd] (already transposed)
+        auto apply_rope_full_head = [&](array t) -> array {
+            const int nh = t.shape(1);
+            array t_first = slice(t, {0,0,0,0},               {B,nh,S,half_rope});
+            array t_pass1 = slice(t, {0,0,0,half_rope},        {B,nh,S,half_hd});
+            array t_third = slice(t, {0,0,0,half_hd},          {B,nh,S,half_hd+half_rope});
+            array t_pass2 = slice(t, {0,0,0,half_hd+half_rope},{B,nh,S,hd});
+            array rope_in = concatenate({t_first, t_third}, 3);
+            rope_in = fast::rope(rope_in, rope_dims, false,
+                                 std::optional<float>(lw.attn_rope_theta), 1.0f, rope_offset);
+            array first_rot = slice(rope_in, {0,0,0,0},        {B,nh,S,half_rope});
+            array third_rot = slice(rope_in, {0,0,0,half_rope},{B,nh,S,rope_dims});
+            return concatenate({first_rot, t_pass1, third_rot, t_pass2}, 3);
+        };
+        queries = apply_rope_full_head(queries);
+        keys = apply_rope_full_head(keys);
+    } else {
+        queries = fast::rope(queries, rope_dims, false,
+                             std::optional<float>(lw.attn_rope_theta), 1.0f, rope_offset);
+        keys = fast::rope(keys, rope_dims, false,
+                          std::optional<float>(lw.attn_rope_theta), 1.0f, rope_offset);
+    }
 
     const int prev = cache.offset;
     if (!use_shared_read_cache) {
@@ -3254,8 +3281,9 @@ array run_layer(
         const int hpl = ctx->per_layer_hidden_size;
         const int layer_offset = layer_idx * hpl;
 
-        // Gemma4 per-layer input branch:
-        // proj(source_embed) -> norm -> + per-layer token embed -> gate(hidden) -> proj -> norm -> residual + scale
+        // Per-layer input branch:
+        // proj(source_embed) -> norm -> + per-layer token embed -> gate(hidden)
+        // -> proj -> norm -> residual + scale
         const array source_projection = linear(source_embeddings, lw.per_layer_model_projection_rhs);
         array per_layer_input = source_projection * array(ctx->per_layer_model_projection_scale, source_projection.dtype());
         per_layer_input = fast::rms_norm(per_layer_input, std::optional<array>(ctx->per_layer_projection_norm_w), ctx->cfg.rms_norm_eps);
