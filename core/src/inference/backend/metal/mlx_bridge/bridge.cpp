@@ -2454,6 +2454,7 @@ struct mlx_ctx {
     std::vector<LinearCacheState> linear_cache;
     void* state_space_cache = nullptr;
     int kv_reserve_tokens = 0;
+    bool has_moe_layers = false;
     bool profile_layers = false;
     bool stream_ready = false;
     uint32_t trace_decode_token = 1;
@@ -2666,10 +2667,18 @@ int env_positive_int(const char* name, int fallback) {
     return fallback;
 }
 
-int resolve_prefill_chunk_size() {
-    // Keep prefill graphs bounded by default to avoid Metal OOM on larger
-    // models; callers can override for benchmarking.
-    return env_positive_int("TALU_METAL_PREFILL_CHUNK_SIZE", 64);
+int resolve_prefill_chunk_size(const mlx_ctx* ctx = nullptr) {
+    // Env var always wins when set.
+    if (const char* raw = std::getenv("TALU_METAL_PREFILL_CHUNK_SIZE")) {
+        try {
+            const int parsed = std::stoi(raw);
+            if (parsed > 0) return parsed;
+        } catch (...) {}
+    }
+    // Dense models can use larger chunks for better GPU utilization.
+    // MoE models keep smaller chunks to bound per-layer memory.
+    if (ctx && !ctx->has_moe_layers) return 256;
+    return 64;
 }
 
 int resolve_prefill_sync_interval_chunks() {
@@ -2678,10 +2687,16 @@ int resolve_prefill_sync_interval_chunks() {
     return env_positive_int("TALU_METAL_PREFILL_SYNC_INTERVAL_CHUNKS", 4);
 }
 
-int resolve_prefill_full_prompt_threshold() {
-    // For short prompts, one full-prompt forward avoids extra chunk-loop
-    // dispatch/sync overhead in the prefill + seed-token path.
-    return env_positive_int("TALU_METAL_PREFILL_FULL_PROMPT_THRESHOLD", 128);
+int resolve_prefill_full_prompt_threshold(const mlx_ctx* ctx = nullptr) {
+    if (const char* raw = std::getenv("TALU_METAL_PREFILL_FULL_PROMPT_THRESHOLD")) {
+        try {
+            const int parsed = std::stoi(raw);
+            if (parsed > 0) return parsed;
+        } catch (...) {}
+    }
+    // Dense models can safely process longer prompts in one shot.
+    if (ctx && !ctx->has_moe_layers) return 512;
+    return 128;
 }
 
 bool should_use_full_prompt_prefill(const mlx_ctx* ctx, int32_t prompt_len, int full_prompt_threshold) {
@@ -3194,8 +3209,8 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
 
     const std::string mask_mode = (S > 1) ? "causal" : "";
     const bool force_f32_attn =
-        env_truthy("TALU_METAL_GEMMA4_FORCE_F32_ATTN", false) &&
-        ctx->cfg.hidden_size_per_layer_input > 0;
+        ctx->cfg.hidden_size_per_layer_input > 0 &&
+        env_truthy("TALU_METAL_GEMMA4_FORCE_F32_ATTN", false);
     array attn_out = array(0.0f);
     if (force_f32_attn) {
         const array q_f32 = astype(queries, float32);
@@ -3222,7 +3237,13 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     attn_out = transpose(attn_out, {0, 2, 1, 3});
     attn_out = reshape(attn_out, {B, S, lw.attn_num_heads * lw.attn_head_dim});
     if (has_query_gate) {
-        attn_out = attn_out * sigmoid(gate);
+        static const auto compiled_sigmoid_gate = compile(
+            [](const std::vector<array>& inputs) {
+                return std::vector<array>{inputs[0] * sigmoid(inputs[1])};
+            },
+            true
+        );
+        attn_out = compiled_sigmoid_gate({attn_out, gate}).at(0);
     }
 
     return linear_decode_maybe_quantized(
@@ -3876,7 +3897,24 @@ array run_grouped_affine_moe_reference(mlx_ctx* ctx, const LayerWeights& lw, con
                     ctx->cfg.quant_bits,
                     "affine"
                 );
-                const array ff = (ctx->cfg.use_gelu ? gelu_approx(gate) : silu(gate)) * up;
+                array ff = array(0.0f);
+                {
+                    static const auto compiled_silu_gate_mul = compile(
+                        [](const std::vector<array>& inputs) {
+                            return std::vector<array>{silu(inputs[0]) * inputs[1]};
+                        },
+                        true
+                    );
+                    static const auto compiled_gelu_gate_mul = compile(
+                        [](const std::vector<array>& inputs) {
+                            return std::vector<array>{gelu_approx(inputs[0]) * inputs[1]};
+                        },
+                        true
+                    );
+                    ff = ctx->cfg.use_gelu
+                        ? compiled_gelu_gate_mul({gate, up}).at(0)
+                        : compiled_silu_gate_mul({gate, up}).at(0);
+                }
                 const array down = quantized_matmul(
                     ff,
                     slice_expert_matrix(lw.moe_down_w, expert_id, "moe_down_w"),
@@ -3907,7 +3945,8 @@ array run_layer(
     const array& hidden,
     const array& source_embeddings,
     const array& input_ids,
-    const TraceFrame* trace_frame
+    const TraceFrame* trace_frame,
+    const array* precomputed_x_norm = nullptr
 ) {
     LayerWeights& lw = ctx->layers[static_cast<size_t>(layer_idx)];
     if (trace_frame) {
@@ -3921,7 +3960,9 @@ array run_layer(
         );
     }
 
-    const array x_norm = fast::rms_norm(hidden, std::optional<array>(lw.input_layernorm_w), ctx->cfg.rms_norm_eps);
+    const array x_norm = precomputed_x_norm
+        ? *precomputed_x_norm
+        : fast::rms_norm(hidden, std::optional<array>(lw.input_layernorm_w), ctx->cfg.rms_norm_eps);
 
     const array residual_branch = lw.is_linear
         ? run_linear_attention_layer(ctx, layer_idx, x_norm)
@@ -4073,7 +4114,24 @@ array run_layer(
                     false
                 );
             }
-            const array shared_ff = (ctx->cfg.use_gelu ? gelu_approx(shared_gate) : silu(shared_gate)) * shared_up;
+            array shared_ff = array(0.0f);
+            {
+                static const auto compiled_silu_gate_mul = compile(
+                    [](const std::vector<array>& inputs) {
+                        return std::vector<array>{silu(inputs[0]) * inputs[1]};
+                    },
+                    true
+                );
+                static const auto compiled_gelu_gate_mul = compile(
+                    [](const std::vector<array>& inputs) {
+                        return std::vector<array>{gelu_approx(inputs[0]) * inputs[1]};
+                    },
+                    true
+                );
+                shared_ff = ctx->cfg.use_gelu
+                    ? compiled_gelu_gate_mul({shared_gate, shared_up}).at(0)
+                    : compiled_silu_gate_mul({shared_gate, shared_up}).at(0);
+            }
             array shared_down = linear_decode_maybe_quantized(
                 ctx->fp8_decode_qmm_enabled,
                 ctx->cfg.quant_group_size,
@@ -4129,7 +4187,23 @@ array run_layer(
                 {0, 0, mlp_gate_width},
                 {gate_up.shape(0), gate_up.shape(1), 2 * mlp_gate_width}
             );
-            ff = (ctx->cfg.use_gelu ? gelu_approx(gate) : silu(gate)) * up;
+            {
+                static const auto compiled_silu_gate_mul = compile(
+                    [](const std::vector<array>& inputs) {
+                        return std::vector<array>{silu(inputs[0]) * inputs[1]};
+                    },
+                    true
+                );
+                static const auto compiled_gelu_gate_mul = compile(
+                    [](const std::vector<array>& inputs) {
+                        return std::vector<array>{gelu_approx(inputs[0]) * inputs[1]};
+                    },
+                    true
+                );
+                ff = ctx->cfg.use_gelu
+                    ? compiled_gelu_gate_mul({gate, up}).at(0)
+                    : compiled_silu_gate_mul({gate, up}).at(0);
+            }
         } else {
             const array gate = linear_decode_maybe_quantized(
                 ctx->fp8_decode_qmm_enabled,
@@ -4155,7 +4229,23 @@ array run_layer(
                 lw.mlp_up_q_biases,
                 false
             );
-            ff = (ctx->cfg.use_gelu ? gelu_approx(gate) : silu(gate)) * up;
+            {
+                static const auto compiled_silu_gate_mul = compile(
+                    [](const std::vector<array>& inputs) {
+                        return std::vector<array>{silu(inputs[0]) * inputs[1]};
+                    },
+                    true
+                );
+                static const auto compiled_gelu_gate_mul = compile(
+                    [](const std::vector<array>& inputs) {
+                        return std::vector<array>{gelu_approx(inputs[0]) * inputs[1]};
+                    },
+                    true
+                );
+                ff = ctx->cfg.use_gelu
+                    ? compiled_gelu_gate_mul({gate, up}).at(0)
+                    : compiled_silu_gate_mul({gate, up}).at(0);
+            }
         }
         down = linear_decode_maybe_quantized(
             ctx->fp8_decode_qmm_enabled,
@@ -4239,8 +4329,24 @@ array forward_hidden(
     }
 
     if (!ctx->profile_layers) {
-        for (int i = 0; i < static_cast<int>(ctx->layers.size()); ++i) {
-            hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame);
+        const int num_layers = static_cast<int>(ctx->layers.size());
+        // Pre-compute the first layer's input norm so that subsequent layers
+        // can overlap the previous layer's final-residual add with the
+        // current layer's input-norm read.
+        array next_x_norm = fast::rms_norm(
+            hidden,
+            std::optional<array>(ctx->layers[0].input_layernorm_w),
+            ctx->cfg.rms_norm_eps
+        );
+        for (int i = 0; i < num_layers; ++i) {
+            hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame, &next_x_norm);
+            if (i < num_layers - 1) {
+                next_x_norm = fast::rms_norm(
+                    hidden,
+                    std::optional<array>(ctx->layers[static_cast<size_t>(i + 1)].input_layernorm_w),
+                    ctx->cfg.rms_norm_eps
+                );
+            }
         }
     } else {
         for (int i = 0; i < static_cast<int>(ctx->layers.size()); ++i) {
@@ -4542,7 +4648,7 @@ std::pair<array, array> fused_lm_head_topk_candidate_arrays(
 
 void prefill_prefix_chunks(mlx_ctx* ctx, const std::vector<int32_t>& prompt_vec, int32_t prefix_len) {
     if (prefix_len <= 0) return;
-    const int chunk_size = resolve_prefill_chunk_size();
+    const int chunk_size = resolve_prefill_chunk_size(ctx);
     const int sync_interval_chunks = std::max(resolve_prefill_sync_interval_chunks(), 1);
     int32_t offset = 0;
     int chunks_since_sync = 0;
@@ -4577,7 +4683,7 @@ array prefill_seed_logits_chunked(mlx_ctx* ctx, const std::vector<int32_t>& prom
     if (prompt_len <= 0) {
         throw std::runtime_error("prefill_seed_logits_chunked: prompt_len must be > 0");
     }
-    const int chunk_size = resolve_prefill_chunk_size();
+    const int chunk_size = resolve_prefill_chunk_size(ctx);
     if (chunk_size <= 0) {
         throw std::runtime_error("prefill_seed_logits_chunked: invalid chunk size");
     }
@@ -5561,6 +5667,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 }
 
                 lw.mlp_is_moe = true;
+                ctx->has_moe_layers = true;
                 lw.moe_num_experts = ctx->cfg.num_experts;
                 lw.moe_experts_per_token = ctx->cfg.num_experts_per_tok;
                 lw.moe_router_group_size = ctx->cfg.quant_group_size;
@@ -6650,7 +6757,7 @@ int32_t mlx_prefill_first(
         reset_runtime_state(ctx);
         ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
         ctx->kv_reserve_tokens = resolve_kv_reserve_target_tokens(ctx, prompt_len, 0);
-        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold();
+        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold(ctx);
         const auto select_first_token = [&](const array& seed_logits, const char* stage) -> array {
             const array logits_last = last_token_logits(seed_logits);
             if (logits_sanity_enabled()) {
@@ -6715,7 +6822,7 @@ int32_t mlx_prefill_logits(
         reset_runtime_state(ctx);
         ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
         ctx->kv_reserve_tokens = resolve_kv_reserve_target_tokens(ctx, prompt_len, 0);
-        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold();
+        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold(ctx);
 
         array first_logits = array(0.0f);
         const bool prefill_trace_enabled = ctx->xray_enabled &&
@@ -8423,6 +8530,10 @@ int32_t mlx_decode_topk_stream(
             std::vector<array> chunk_tokens;
             chunk_tokens.reserve(static_cast<size_t>(effective_topk_chunk_size));
             bool saw_eos = false;
+            // Pre-compile sampling when not using fused decode paths.
+            const auto compiled_sample = (!use_fused_greedy_decode && !use_fused_topk_decode)
+                ? compiled_sampling_step(sampling_cfg)
+                : nullptr;
             const auto total_t0 = std::chrono::steady_clock::now();
             while (produced < decode_tokens && !saw_eos) {
                 const int32_t remaining = decode_tokens - produced;
@@ -8438,9 +8549,7 @@ int32_t mlx_decode_topk_stream(
                                 fused_lm_head_topk_candidates(ctx, current_token, sampling_cfg.top_k),
                                 sampling_cfg
                               )
-                            : sample_token_from_logits(
-                                last_token_logits(forward_logits(ctx, current_token)),
-                                sampling_cfg
+                            : (*compiled_sample)({last_token_logits(forward_logits(ctx, current_token))}).at(0
                               ));
                     async_eval(next_token);
                     chunk_tokens.push_back(next_token);
