@@ -1211,7 +1211,12 @@ const CudaCalibContext = struct {
                 if (quantize_u4_function != null and quantize_u8_function != null) {
                     quant_module = loaded_module;
                     cuda_quantization_available = true;
-                    cuda_mse_available = reduce_mse_function != null;
+                    // GPU MSE reduction uses F32 accumulation with non-deterministic
+                    // atomicAdd ordering, which can mislead the calibration optimizer
+                    // for certain weight distributions (e.g., up_proj in 27B models).
+                    // Force CPU F64 MSE for deterministic calibration while keeping
+                    // GPU matmul and weight-build for speed.
+                    cuda_mse_available = false;
                     cuda_dq_weight_build_available = build_dq_weights_function != null;
                 } else {
                     loaded_module.deinit(&device);
@@ -5184,6 +5189,21 @@ test "sorted tensor names maintain nondecreasing layer order" {
         }
         prev_layer = layer;
     }
+}
+
+test "CUDA calibration context disables GPU MSE to ensure F64 precision" {
+    // Regression test: GPU MSE reduction uses F32 accumulation with non-deterministic
+    // atomicAdd, which can mislead the calibration optimizer for certain weight
+    // distributions (e.g., up_proj in 27B models got 46% wrong scale factors).
+    // The CPU F64 fallback path must always be used for calibration MSE.
+    if (comptime !has_cuda_gpu_calib) return error.SkipZigTest;
+    if (compute.cuda.device.probeRuntime() != .available) return error.SkipZigTest;
+    if (!isCudaCalibrationEnabled()) return error.SkipZigTest;
+
+    var ctx = CudaCalibContext.init() catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    try std.testing.expect(!ctx.cuda_mse_available);
 }
 
 test "calibrationDatasetRequired requires dataset whenever calibration iterations are enabled" {

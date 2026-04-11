@@ -185,6 +185,8 @@ fn uploadCpuKvToMirrors(
 ) !void {
     const GpuType = @TypeOf(gpu_backend.*);
     if (comptime !@hasField(GpuType, "block_runtime")) return;
+    const BrtType = @TypeOf(gpu_backend.block_runtime);
+    if (comptime !@hasField(BrtType, "replicated_kv_sources")) return;
     const replicated = gpu_backend.block_runtime.replicated_kv_sources;
     if (replicated.len == 0) return;
 

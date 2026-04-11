@@ -28,10 +28,11 @@ static __device__ __forceinline__ float talu_quant_warp_max_f32(float value) {
 }
 
 static __device__ __forceinline__ unsigned short talu_quant_f32_to_bf16_rne(float value) {
+    // Truncation (matching CPU f32ToBf16: bits >> 16).
+    // Must match the CPU converter path to produce bit-identical model files
+    // regardless of whether CUDA or CPU quantization is used.
     const unsigned int fbits = __float_as_uint(value);
-    const unsigned int lsb = (fbits >> 16) & 1u;
-    const unsigned int rounding_bias = 0x7FFFu + lsb;
-    return static_cast<unsigned short>((fbits + rounding_bias) >> 16);
+    return static_cast<unsigned short>(fbits >> 16);
 }
 
 static constexpr unsigned int U8_BLOCK_THREADS = 128;

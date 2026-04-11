@@ -4557,7 +4557,19 @@ test "interleaved multi-slot lifecycle with pipeline stage" {
 
 const computeInitLayerRange = CudaBackend.computeInitLayerRange;
 const InitOptions = CudaBackend.InitOptions;
-const no_sharing_config: tensor.ModelConfig = .{};
+const no_sharing_config: tensor.ModelConfig = .{
+    .vocab_size = 1000,
+    .d_model = 256,
+    .n_layers = 32,
+    .n_heads = 8,
+    .n_kv_groups = 1,
+    .d_ff = 512,
+    .max_seq_len = 2048,
+    .head_dim = 32,
+    .rope_theta = 10000.0,
+    .norm_eps = 1e-5,
+    .gaffine_group_size = 32,
+};
 
 test "computeInitLayerRange: single topology uses full range" {
     const r = try computeInitLayerRange(.{ .topology_mode = .single }, 32, no_sharing_config);
