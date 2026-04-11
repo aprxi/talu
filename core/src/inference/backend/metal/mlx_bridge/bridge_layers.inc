@@ -317,6 +317,34 @@ bool combine_linear_in_proj_weights(LayerWeights* lw) {
     return lw->lin_in_proj_all_has_q || lw->lin_in_proj_all_rhs.size() > 1;
 }
 
+void compact_linear_in_proj_weights(LayerWeights* lw) {
+    if (lw == nullptr) return;
+    if (!lw->lin_in_proj_all_has_q && lw->lin_in_proj_all_rhs.size() <= 1) return;
+
+    // Clear individual qkvz/ba weights — the combined all_* version is used.
+    // NOTE: the combined arrays were created via concatenate()+copy() and may
+    // still hold lazy graph references to the originals. MLX ref-counting
+    // keeps the underlying buffers alive until the combined arrays are
+    // evaluated, so this only frees our C++ array handles, not the Metal
+    // buffers. The real memory savings happen after the first forward pass
+    // materializes the combined arrays and releases the graph references.
+    lw->lin_in_proj_qkvz_rhs = array(0.0f);
+    lw->lin_in_proj_ba_rhs = array(0.0f);
+    lw->lin_in_proj_qkvz_q_w = array(0.0f);
+    lw->lin_in_proj_qkvz_q_scales = array(0.0f);
+    lw->lin_in_proj_qkvz_q_biases = array(0.0f);
+    lw->lin_in_proj_qkvz_has_q = false;
+    lw->lin_in_proj_ba_q_w = array(0.0f);
+    lw->lin_in_proj_ba_q_scales = array(0.0f);
+    lw->lin_in_proj_ba_q_biases = array(0.0f);
+    lw->lin_in_proj_ba_has_q = false;
+    // Also clear individual separate projections if they exist.
+    lw->lin_in_proj_qkv_rhs = array(0.0f);
+    lw->lin_in_proj_z_rhs = array(0.0f);
+    lw->lin_in_proj_a_rhs = array(0.0f);
+    lw->lin_in_proj_b_rhs = array(0.0f);
+}
+
 bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
     if (lw == nullptr) return false;
 

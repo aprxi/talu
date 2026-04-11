@@ -905,6 +905,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     // Always combine qkvz + ba into a single projection
                     // tensor so the reference path can use one matmul.
                     combine_linear_in_proj_weights(&lw);
+                    compact_linear_in_proj_weights(&lw);
                 } else {
                     const std::string fused_key = p + "mixer.in_proj.weight";
                     const array fused_in_proj_weight_src = require_tensor(tensors, fused_key);
@@ -1041,6 +1042,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         }
                     }
                     combine_linear_in_proj_weights(&lw);
+                    compact_linear_in_proj_weights(&lw);
                 }
                 lw.lin_A_log = require_tensor(tensors, p + "linear_attn.A_log");
                 lw.lin_A_exp_f32 = exp(astype(lw.lin_A_log, float32));
@@ -1357,12 +1359,37 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             size_t attn_o_q = 0, attn_o_total = 0;
             size_t mlp_q = 0, mlp_total = 0;
             size_t dense_fallback_bytes = 0;
+            const bool quantized_checkpoint =
+                has_mxfp8_meta || ctx->has_grouped_affine_meta || has_nvfp4_meta;
+            const bool strict_quantized_decode_requested =
+                env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", false);
+            const bool strict_quantized_decode_active =
+                strict_quantized_decode_requested && quantized_checkpoint;
+            if (strict_quantized_decode_active && !ctx->fp8_decode_qmm_enabled) {
+                throw std::runtime_error(
+                    "TALU_METAL_STRICT_QUANTIZED_DECODE requires TALU_METAL_FP8_DECODE_QMM=1"
+                );
+            }
+            size_t strict_required = 0;
+            size_t strict_quantized = 0;
+            std::vector<std::string> strict_missing;
+            strict_missing.reserve(64);
             auto count_dense = [&](const array& rhs) {
                 if (rhs.size() > 1 && rhs.ndim() == 2) {
                     dense_fallback_bytes += static_cast<size_t>(rhs.size()) * rhs.itemsize();
                 }
             };
-            for (const LayerWeights& lw : ctx->layers) {
+            auto record_strict = [&](bool required, bool is_quantized, const std::string& name) {
+                if (!strict_quantized_decode_active || !required) return;
+                strict_required += 1;
+                if (is_quantized) {
+                    strict_quantized += 1;
+                } else {
+                    strict_missing.push_back(name);
+                }
+            };
+            for (size_t layer_idx = 0; layer_idx < ctx->layers.size(); ++layer_idx) {
+                const LayerWeights& lw = ctx->layers[layer_idx];
                 const bool flags[] = {
                     lw.mlp_gate_has_q,
                     lw.mlp_up_has_q,
@@ -1383,16 +1410,24 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 }
                 if (lw.has_per_layer_input) layer_per_layer_count += 1;
                 // SSM / linear-attention branch.
+                // After compact_linear_in_proj_weights, individual qkvz/ba flags
+                // are cleared — check the combined all_has_q instead.
                 if (lw.is_linear) {
                     ssm_qkvz_total += 1;
                     ssm_ba_total += 1;
                     ssm_out_total += 1;
-                    if (lw.lin_in_proj_qkvz_has_q) ssm_qkvz_q += 1;
-                    else count_dense(lw.lin_in_proj_qkvz_rhs);
-                    if (lw.lin_in_proj_ba_has_q) ssm_ba_q += 1;
-                    else count_dense(lw.lin_in_proj_ba_rhs);
+                    const bool ssm_in_proj_q = lw.lin_in_proj_all_has_q || lw.lin_in_proj_qkvz_has_q;
+                    if (ssm_in_proj_q) { ssm_qkvz_q += 1; ssm_ba_q += 1; }
+                    else { count_dense(lw.lin_in_proj_qkvz_rhs); count_dense(lw.lin_in_proj_ba_rhs); }
                     if (lw.lin_out_proj_has_q) ssm_out_q += 1;
                     else count_dense(lw.lin_out_proj_rhs);
+                    record_strict(true, ssm_in_proj_q, "layer" + std::to_string(layer_idx) + ".lin_in_proj");
+                    record_strict(true, lw.lin_out_proj_has_q, "layer" + std::to_string(layer_idx) + ".lin_out_proj");
+                }
+                // ShortConv branch.
+                if (lw.is_shortconv) {
+                    record_strict(true, lw.sc_in_proj_has_q, "layer" + std::to_string(layer_idx) + ".sc_in_proj");
+                    record_strict(true, lw.sc_out_proj_has_q, "layer" + std::to_string(layer_idx) + ".sc_out_proj");
                 }
                 // Full-attention branch (count fused QKV + O).
                 if (!lw.is_linear && !lw.is_shortconv) {
@@ -1402,6 +1437,9 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     else { count_dense(lw.attn_qkv_rhs); count_dense(lw.attn_q_rhs); }
                     if (lw.attn_o_has_q) attn_o_q += 1;
                     else count_dense(lw.attn_o_rhs);
+                    const bool attn_qkv_quantized = lw.attn_qkv_has_q || (lw.attn_q_has_q && lw.attn_k_has_q && lw.attn_v_has_q);
+                    record_strict(true, attn_qkv_quantized, "layer" + std::to_string(layer_idx) + ".attn_qkv");
+                    record_strict(true, lw.attn_o_has_q, "layer" + std::to_string(layer_idx) + ".attn_o");
                 }
                 // MLP branch.
                 mlp_total += 1;
@@ -1412,6 +1450,17 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     count_dense(lw.mlp_gate_rhs);
                     count_dense(lw.mlp_up_rhs);
                     if (!lw.mlp_down_has_q) count_dense(lw.mlp_down_rhs);
+                }
+                if (lw.mlp_is_moe) {
+                    const bool moe_quantized =
+                        lw.moe_gate_scales.size() > 1 &&
+                        lw.moe_up_scales.size() > 1 &&
+                        lw.moe_down_scales.size() > 1;
+                    record_strict(true, moe_quantized, "layer" + std::to_string(layer_idx) + ".moe_experts");
+                } else {
+                    const bool mlp_in_quantized = lw.mlp_gate_up_has_q || (lw.mlp_gate_has_q && lw.mlp_up_has_q);
+                    record_strict(true, mlp_in_quantized, "layer" + std::to_string(layer_idx) + ".mlp_in");
+                    record_strict(true, lw.mlp_down_has_q, "layer" + std::to_string(layer_idx) + ".mlp_down");
                 }
             }
             std::fprintf(
@@ -1444,14 +1493,153 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0)
                 );
             }
-            if (dense_fallback_bytes > 0 && ctx->has_grouped_affine_meta) {
-                std::fprintf(
-                    stderr,
-                    "[mlx][WARNING] %.1fMB of weights fell back to dense (QMM capture miss). "
-                    "This increases memory usage and slows decode.\n",
-                    static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0)
+            std::fprintf(
+                stderr,
+                "[mlx][qmm_strict] requested=%d active=%d required=%zu quantized=%zu missing=%zu\n",
+                strict_quantized_decode_requested ? 1 : 0,
+                strict_quantized_decode_active ? 1 : 0,
+                strict_required,
+                strict_quantized,
+                strict_missing.size()
+            );
+            if (strict_quantized_decode_active && !strict_missing.empty()) {
+                std::string preview;
+                const size_t max_items = std::min<size_t>(strict_missing.size(), 8);
+                for (size_t idx = 0; idx < max_items; ++idx) {
+                    if (!preview.empty()) preview += ", ";
+                    preview += strict_missing[idx];
+                }
+                if (strict_missing.size() > max_items) {
+                    preview += ", ...";
+                }
+                throw std::runtime_error(
+                    "TALU_METAL_STRICT_QUANTIZED_DECODE: missing quantized decode projections: " + preview
                 );
             }
+            // Strict quantized decode mode: treat dense fallback as fatal.
+            // Prevents silent memory ballooning and bandwidth loss from bf16
+            // dequantized weights on memory-constrained systems (24GB).
+            if (dense_fallback_bytes > 0) {
+                if (strict_quantized_decode_active) {
+                    char msg[512];
+                    std::snprintf(
+                        msg, sizeof(msg),
+                        "TALU_METAL_STRICT_QUANTIZED_DECODE: %.1fMB dense fallback detected "
+                        "(ssm_qkvz=%zu/%zu ssm_ba=%zu/%zu ssm_out=%zu/%zu "
+                        "attn_qkv=%zu/%zu attn_o=%zu/%zu mlp=%zu/%zu). "
+                        "All decode projections must use quantized matmul in strict mode.",
+                        static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0),
+                        ssm_qkvz_q, ssm_qkvz_total,
+                        ssm_ba_q, ssm_ba_total,
+                        ssm_out_q, ssm_out_total,
+                        attn_qkv_q, attn_qkv_total,
+                        attn_o_q, attn_o_total,
+                        mlp_q, mlp_total
+                    );
+                    throw std::runtime_error(msg);
+                }
+                if (ctx->has_grouped_affine_meta) {
+                    std::fprintf(
+                        stderr,
+                        "[mlx][WARNING] %.1fMB of weights fell back to dense (QMM capture miss). "
+                        "This increases memory usage and slows decode. "
+                        "Set TALU_METAL_STRICT_QUANTIZED_DECODE=1 to fail-fast.\n",
+                        static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0)
+                    );
+                }
+            }
+
+            // Verify lm_head is quantized in strict mode.
+            if (strict_quantized_decode_active && !ctx->lm_head_q_decode_enabled)
+            {
+                throw std::runtime_error(
+                    "TALU_METAL_STRICT_QUANTIZED_DECODE: lm_head not captured for quantized decode. "
+                    "Dense lm_head causes memory ballooning on constrained systems."
+                );
+            }
+
+            // Verify embeddings are quantized in strict mode.
+            if (strict_quantized_decode_active && !ctx->embed_tokens_has_q)
+            {
+                throw std::runtime_error(
+                    "TALU_METAL_STRICT_QUANTIZED_DECODE: embed_tokens not captured for quantized lookup. "
+                    "Dense embedding causes memory ballooning on constrained systems."
+                );
+            }
+            std::fflush(stderr);
+        }
+
+        // Memory residency summary: total bytes retained in ctx arrays.
+        {
+            auto array_bytes = [](const array& a) -> size_t {
+                return (a.size() > 1) ? static_cast<size_t>(a.size()) * a.itemsize() : 0;
+            };
+            size_t ctx_bytes = 0;
+            ctx_bytes += array_bytes(ctx->embed_tokens);
+            ctx_bytes += array_bytes(ctx->embed_tokens_q_w);
+            ctx_bytes += array_bytes(ctx->embed_tokens_q_scales);
+            ctx_bytes += array_bytes(ctx->embed_tokens_q_biases);
+            ctx_bytes += array_bytes(ctx->lm_head_rhs);
+            ctx_bytes += array_bytes(ctx->lm_head_q_w);
+            ctx_bytes += array_bytes(ctx->lm_head_q_scales);
+            ctx_bytes += array_bytes(ctx->lm_head_q_biases);
+            ctx_bytes += array_bytes(ctx->final_norm_w);
+            ctx_bytes += array_bytes(ctx->per_layer_embedding);
+            size_t layer_q_bytes = 0;
+            size_t layer_dense_bytes = 0;
+            size_t layer_other_bytes = 0;
+            for (const LayerWeights& lw : ctx->layers) {
+                // Quantized weight storage (packed + scales + biases).
+                for (const auto* a : {
+                    &lw.mlp_gate_q_w, &lw.mlp_gate_q_scales, &lw.mlp_gate_q_biases,
+                    &lw.mlp_up_q_w, &lw.mlp_up_q_scales, &lw.mlp_up_q_biases,
+                    &lw.mlp_down_q_w, &lw.mlp_down_q_scales, &lw.mlp_down_q_biases,
+                    &lw.mlp_gate_up_q_w, &lw.mlp_gate_up_q_scales, &lw.mlp_gate_up_q_biases,
+                    &lw.attn_q_q_w, &lw.attn_q_q_scales, &lw.attn_q_q_biases,
+                    &lw.attn_k_q_w, &lw.attn_k_q_scales, &lw.attn_k_q_biases,
+                    &lw.attn_v_q_w, &lw.attn_v_q_scales, &lw.attn_v_q_biases,
+                    &lw.attn_qkv_q_w, &lw.attn_qkv_q_scales, &lw.attn_qkv_q_biases,
+                    &lw.attn_o_q_w, &lw.attn_o_q_scales, &lw.attn_o_q_biases,
+                    &lw.lin_in_proj_qkvz_q_w, &lw.lin_in_proj_qkvz_q_scales, &lw.lin_in_proj_qkvz_q_biases,
+                    &lw.lin_in_proj_ba_q_w, &lw.lin_in_proj_ba_q_scales, &lw.lin_in_proj_ba_q_biases,
+                    &lw.lin_in_proj_all_q_w, &lw.lin_in_proj_all_q_scales, &lw.lin_in_proj_all_q_biases,
+                    &lw.lin_out_proj_q_w, &lw.lin_out_proj_q_scales, &lw.lin_out_proj_q_biases,
+                    &lw.sc_in_proj_q_w, &lw.sc_in_proj_q_scales, &lw.sc_in_proj_q_biases,
+                    &lw.sc_out_proj_q_w, &lw.sc_out_proj_q_scales, &lw.sc_out_proj_q_biases,
+                }) {
+                    layer_q_bytes += array_bytes(*a);
+                }
+                // Dense RHS fallbacks.
+                for (const auto* a : {
+                    &lw.mlp_gate_rhs, &lw.mlp_up_rhs, &lw.mlp_down_rhs, &lw.mlp_gate_up_rhs,
+                    &lw.attn_q_rhs, &lw.attn_k_rhs, &lw.attn_v_rhs, &lw.attn_qkv_rhs, &lw.attn_o_rhs,
+                    &lw.attn_qkv_prefill_rhs,
+                    &lw.lin_in_proj_qkvz_rhs, &lw.lin_in_proj_qkvz_prefill_rhs,
+                    &lw.lin_in_proj_ba_rhs, &lw.lin_in_proj_all_rhs,
+                    &lw.lin_out_proj_rhs,
+                    &lw.sc_in_proj_rhs, &lw.sc_out_proj_rhs,
+                    &lw.moe_shared_gate_rhs, &lw.moe_shared_up_rhs, &lw.moe_shared_down_rhs, &lw.moe_shared_gate_up_rhs,
+                }) {
+                    layer_dense_bytes += array_bytes(*a);
+                }
+                // Norms, conv, A_log, dt_bias, etc.
+                for (const auto* a : {
+                    &lw.input_layernorm_w, &lw.post_attention_layernorm_w,
+                    &lw.lin_conv1d_w, &lw.lin_conv1d_decode_w,
+                    &lw.lin_A_log, &lw.lin_A_exp_f32, &lw.lin_dt_bias, &lw.lin_norm_w,
+                }) {
+                    layer_other_bytes += array_bytes(*a);
+                }
+            }
+            std::fprintf(
+                stderr,
+                "[mlx][mem] ctx=%.1fMB layer_q=%.1fMB layer_dense=%.1fMB layer_other=%.1fMB total=%.1fMB\n",
+                static_cast<double>(ctx_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(layer_q_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(layer_dense_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(layer_other_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(ctx_bytes + layer_q_bytes + layer_dense_bytes + layer_other_bytes) / (1024.0 * 1024.0)
+            );
             std::fflush(stderr);
         }
 

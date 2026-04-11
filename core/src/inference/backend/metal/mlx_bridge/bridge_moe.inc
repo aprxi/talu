@@ -194,6 +194,7 @@ array run_layer(
     const bool has_gemma_four_norm =
         lw.pre_feedforward_layernorm_w.size() > 1 &&
         lw.post_feedforward_layernorm_w.size() > 1;
+
     const array h = has_gemma_four_norm
         ? (hidden + fast::rms_norm(residual_branch, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps))
         : (hidden + residual_branch);

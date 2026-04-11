@@ -492,6 +492,14 @@ array maybe_dequantize_grouped_affine_weight(
     const uint32_t mask = bits == 4 ? 0xF : 0xFF;
     const int cols = packed_cols * values_per_word;
 
+    // This path creates a host-side std::vector<float> of size rows*cols
+    // (32x the packed size for 4-bit), then converts to bf16.
+    // On constrained systems this causes severe memory ballooning.
+    std::fprintf(stderr, "[mlx][dequant] dense grouped-affine fallback: %s (%d x %d = %.1fMB bf16)\n",
+        weight_key.c_str(), rows, cols,
+        static_cast<double>(rows) * cols * 2.0 / (1024.0 * 1024.0));
+    std::fflush(stderr);
+
     const array packed_u32 = astype(weight_2d, uint32);
     eval(packed_u32);
     eval(scales_f32);
