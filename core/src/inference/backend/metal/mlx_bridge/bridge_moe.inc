@@ -212,6 +212,56 @@ array run_layer(
             !use_mxfp4_moe &&
             lw.moe_gate_up_w.size() > 1 &&
             lw.moe_gate_up_scales.size() > 1;
+
+        // Decode-specialized path: split routing from expert compute.
+        // For B=1 S=1 with affine fused_gate_up, use the separate routing
+        // helper + expert compute function to enable future custom kernel.
+        const int B = mlp_in.shape(0);
+        const int S = mlp_in.shape(1);
+        const bool use_decode_expert_path =
+            B == 1 && S == 1 &&
+            use_fused_affine_gate_up &&
+            !use_mxfp4_moe &&
+            env_truthy("TALU_METAL_MOE_DECODE_GEMV", true);
+
+        if (use_decode_expert_path) {
+            // Routing: same logic as fused kernel but separated for custom expert compute.
+            array router_logits = matmul(mlp_in, transpose(lw.moe_router_w, {1, 0}));
+            const int k = lw.moe_experts_per_token;
+            auto partitioned = argpartition(router_logits, -k, -1);
+            const int rd = router_logits.ndim() - 1;
+            Shape rstart(router_logits.ndim(), 0);
+            Shape rstop = router_logits.shape();
+            rstart[rd] = lw.moe_num_experts - k;
+            auto tk_indices = slice(partitioned, rstart, rstop);
+            auto tk_logits = take_along_axis(router_logits, tk_indices, rd);
+            auto tk_weights = softmax(tk_logits, -1, true);
+
+            struct { array top_k_indices; array expert_weights; } route = {
+                std::move(tk_indices), std::move(tk_weights)
+            };
+            const auto gate_up_biases = lw.moe_gate_up_biases.size() > 1
+                ? std::optional<array>(lw.moe_gate_up_biases)
+                : std::nullopt;
+            const auto down_biases = lw.moe_down_biases.size() > 1
+                ? std::optional<array>(lw.moe_down_biases)
+                : std::nullopt;
+            down = moe_expert_compute_decode(
+                mlp_in,
+                route.top_k_indices,
+                route.expert_weights,
+                lw.moe_gate_up_w,
+                lw.moe_gate_up_scales,
+                gate_up_biases,
+                lw.moe_down_w,
+                lw.moe_down_scales,
+                down_biases,
+                lw.moe_expert_group_size,
+                ctx->cfg.quant_bits,
+                ctx->cfg.use_gelu
+            );
+        } else {
+
         down = use_mxfp4_moe
             ? *static_cast<array*>(mlx_lazy_fused_expert_mix_ffn_mxfp4(
                 &mlp_in,
@@ -269,6 +319,7 @@ array run_layer(
                 ctx->cfg.quant_bits,
                 ctx->cfg.use_gelu
             )));
+        } // end else (non-decode or non-eligible path)
 
         if (lw.moe_shared_gate_rhs.size() > 1 || lw.moe_shared_gate_has_q) {
             const bool use_fused_shared_gate_up =

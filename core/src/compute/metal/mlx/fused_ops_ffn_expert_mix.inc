@@ -800,3 +800,49 @@ void* mlx_lazy_fused_expert_mix_ffn_affine_fused_gate_up(
     auto out = sum(weighted, -2);
     return pool_array(std::move(out));
 }
+
+// ---------------------------------------------------------------------------
+// Routing-only helper: computes top-k expert selection without expert matmuls.
+// Used by bridge to split routing from expert compute for custom decode kernels.
+// ---------------------------------------------------------------------------
+struct MoeRouteResult {
+    array top_k_indices;
+    array expert_weights;
+};
+
+static MoeRouteResult moe_route(
+    const array& x,
+    const void* router_w_handle,
+    const array& router_w,
+    const void* router_bias_handle,
+    size_t num_experts,
+    size_t experts_per_token
+) {
+    array router_logits = matmul(
+        x,
+        orient_matmul_rhs_cached(
+            router_w_handle,
+            router_w,
+            x.shape(x.ndim() - 1),
+            static_cast<int>(num_experts),
+            true
+        )
+    );
+    if (router_bias_handle != nullptr) {
+        const auto& bias = *static_cast<const array*>(router_bias_handle);
+        router_logits = router_logits + cast_bias_cached(router_bias_handle, bias, router_logits.dtype());
+    }
+
+    const int k = static_cast<int>(experts_per_token);
+    auto partitioned_indices = argpartition(router_logits, -k, -1);
+    const int last_dim = router_logits.ndim() - 1;
+    const int total_experts = static_cast<int>(num_experts);
+    Shape start(router_logits.ndim(), 0);
+    Shape stop = router_logits.shape();
+    start[last_dim] = total_experts - k;
+    auto top_k_indices = slice(partitioned_indices, start, stop);
+    auto top_k_logits = take_along_axis(router_logits, top_k_indices, last_dim);
+    auto expert_weights = softmax(top_k_logits, -1, true);
+
+    return { std::move(top_k_indices), std::move(expert_weights) };
+}
