@@ -158,7 +158,11 @@ int32_t mlx_test_dense_mlp_gate_up_fusion(void);
 int32_t mlx_test_full_attention_qkv_fusion(void);
 int32_t mlx_test_grouped_affine_prefill_cache_helper(void);
 int32_t mlx_test_gated_delta_no_double_qk_norm(void);
+int32_t mlx_test_rmsnorm_gated_kernel_matches_reference(void);
 int32_t mlx_test_chunked_prefill_tail_matches_full_prompt(void);
+int32_t mlx_test_linear_attention_fused_quant_inproj_reuse(void);
+int32_t mlx_test_grouped_affine_embedding_lookup_matches_reference(void);
+int32_t mlx_test_linear_attention_fused_mixer_matches_reference(void);
 int32_t mlx_test_topk_candidate_extraction_multi(void);
 
 int32_t talu_metal_xray_should_emit(uint8_t point_id, uint16_t layer, uint32_t position);

@@ -2435,7 +2435,6 @@ pub const BlockType = WeightHandles.LayerWeights.LayerKind;
 
 const testing = std.testing;
 const metal_device = compute.metal.device;
-const model_executor = @import("model.zig");
 
 test "resolveAttentionMixerLayout returns quantized for fully quantized attention projections" {
     const layout = try resolveAttentionMixerLayout(
@@ -2851,115 +2850,6 @@ test "freeWeights releases all GPU resources" {
     freeWeights(testing.allocator, weight_handles);
 
     // If we get here without crash, test passes
-}
-
-test "Model.forward produces logits from input tokens" {
-    if (comptime builtin.os.tag != .macos) return;
-    if (!metal_device.isAvailable()) return;
-
-    const loaded = try createTestLoadedModel(testing.allocator);
-    defer destroyTestLoadedModel(testing.allocator, loaded);
-
-    const weight_handles = try loadWeightsToGPU(testing.allocator, loaded);
-    defer freeWeights(testing.allocator, weight_handles);
-
-    // Create KV cache
-    const cache = runtime_graph.Cache.init(1, true, 0);
-    defer cache.deinit();
-
-    // Run forward pass with single token
-    const input_ids = [_]u32{1};
-    const logits_handle = try model_executor.Model.forward(
-        testing.allocator,
-        weight_handles,
-        &input_ids,
-        loaded.config,
-        cache,
-        null,
-        0,
-        false,
-    );
-
-    // Verify we got a valid logits handle
-    try testing.expect(logits_handle != null);
-
-    // Eval and verify shape
-    var handles = [_]mlx_graph.ArrayHandle{logits_handle};
-    mlx_graph.eval(&handles);
-
-    var shape_buffer: [8]usize = undefined;
-    const rank = mlx_graph.getShape(logits_handle, &shape_buffer);
-    try testing.expect(rank >= 1);
-    // Last dimension should be vocab_size (32)
-    try testing.expectEqual(@as(usize, 32), shape_buffer[rank - 1]);
-
-    mlx_graph.freeArray(logits_handle);
-}
-
-test "Model.forwardFromGPUToken produces logits from GPU token" {
-    if (comptime builtin.os.tag != .macos) return;
-    if (!metal_device.isAvailable()) return;
-
-    const loaded = try createTestLoadedModel(testing.allocator);
-    defer destroyTestLoadedModel(testing.allocator, loaded);
-
-    const weight_handles = try loadWeightsToGPU(testing.allocator, loaded);
-    defer freeWeights(testing.allocator, weight_handles);
-
-    // Create KV cache
-    const cache = runtime_graph.Cache.init(1, true, 0);
-    defer cache.deinit();
-
-    // First do a prefill to populate cache and get a token
-    const prefill_ids = [_]u32{1};
-    const prefill_logits = try model_executor.Model.forward(
-        testing.allocator,
-        weight_handles,
-        &prefill_ids,
-        loaded.config,
-        cache,
-        null,
-        null,
-        0,
-        false,
-    );
-    defer mlx_graph.freeArray(prefill_logits);
-
-    // Get last position logits and compute argmax to get a GPU token handle
-    const last_logits = mlx_graph.mlx_lazy_slice_last(prefill_logits);
-    const token_handle = mlx_graph.mlx_lazy_argmax(last_logits, -1);
-    defer mlx_graph.freeArray(token_handle);
-
-    // Eval to materialize the token
-    var token_handles = [_]mlx_graph.ArrayHandle{token_handle};
-    mlx_graph.eval(&token_handles);
-
-    // Run forward pass with GPU token
-    const logits_handle = try model_executor.Model.forwardFromGPUToken(
-        testing.allocator,
-        weight_handles,
-        token_handle,
-        loaded.config,
-        cache,
-        null,
-        null,
-        1, // pos_offset = 1 since we did 1 prefill token
-    );
-
-    // Verify we got a valid logits handle
-    try testing.expect(logits_handle != null);
-
-    // Eval and verify shape
-    var handles = [_]mlx_graph.ArrayHandle{logits_handle};
-    mlx_graph.eval(&handles);
-
-    var shape_buffer: [8]usize = undefined;
-    const rank = mlx_graph.getShape(logits_handle, &shape_buffer);
-    try testing.expect(rank >= 1);
-    // Last dimension should be vocab_size (32)
-    try testing.expectEqual(@as(usize, 32), shape_buffer[rank - 1]);
-
-    mlx_graph.freeArray(logits_handle);
 }
 
 test "buildMetalLayerProgramRegisterSlotMap reuses temp slots from liveness" {

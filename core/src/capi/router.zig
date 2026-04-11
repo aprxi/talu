@@ -489,11 +489,10 @@ pub export fn talu_backend_model_info(
     const backend_ptr = backend orelse return std.mem.zeroes(CModelInfo);
     const boxed: *spec_mod.InferenceBackend = @ptrCast(@alignCast(backend_ptr));
     const engine = boxed.getLocalEngine() orelse return std.mem.zeroes(CModelInfo);
-    const loaded = engine.loaded;
-    const cfg = loaded.config;
+    const cfg = engine.model_config;
     return .{
-        .file_size = @intCast(loaded.file_size),
-        .tensor_count = @intCast(loaded.tensor_count),
+        .file_size = @intCast(engine.model_file_size),
+        .tensor_count = @intCast(engine.model_tensor_count),
         .vocab_size = cfg.vocab_size,
         .d_model = cfg.d_model,
         .n_layers = cfg.n_layers,
@@ -502,7 +501,7 @@ pub export fn talu_backend_model_info(
         .d_ff = cfg.d_ff,
         .max_seq_len = cfg.max_seq_len,
         .gaffine_group_size = cfg.gaffine_group_size,
-        .weight_dtype = @intFromEnum(loaded.original_weight_dtype),
+        .weight_dtype = engine.model_weight_dtype_tag,
         ._pad = .{0} ** 7,
     };
 }

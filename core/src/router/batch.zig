@@ -359,7 +359,7 @@ pub const BatchWrapper = struct {
         // Prepend BOS if configured.
         const bos_token_id: ?u32 = if (self.engine.gen_config.bos_token_id) |id|
             (if (self.engine.gen_config.add_bos_token) id else null)
-        else if (self.engine.loaded.config.bos_token_id) |id|
+        else if (self.engine.model_config.bos_token_id) |id|
             (if (self.engine.gen_config.add_bos_token and id >= 0) @intCast(id) else null)
         else
             null;

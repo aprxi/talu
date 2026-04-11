@@ -25,6 +25,7 @@
 const std = @import("std");
 const inference = @import("../inference/root.zig");
 const models = @import("../models/root.zig");
+const tensor = @import("../tensor.zig");
 const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const protocol = @import("protocol/root.zig");
@@ -339,8 +340,13 @@ pub const TokenCallback = inference_types.TokenCallback;
 pub const LocalEngine = struct {
     allocator: std.mem.Allocator,
 
-    /// Loaded model weights and config.
-    loaded: *models.LoadedModel,
+    /// Loaded model weights/config when retained by the active backend.
+    loaded: ?*models.LoadedModel,
+    /// Immutable model config snapshot used by routing/template logic.
+    model_config: tensor.ModelConfig,
+    model_file_size: usize,
+    model_tensor_count: usize,
+    model_weight_dtype_tag: u8,
 
     /// Tokenizer for encoding/decoding.
     tok: tokenizer_mod.Tokenizer,
@@ -685,9 +691,12 @@ pub const LocalEngine = struct {
         if (loader_thread_state.err) |e| return e;
 
         const loaded_model = try allocator.create(models.LoadedModel);
-        errdefer allocator.destroy(loaded_model);
         loaded_model.* = loader_thread_state.loaded_model.?;
-        errdefer loaded_model.deinit();
+        var retained_loaded_model: ?*models.LoadedModel = loaded_model;
+        errdefer if (retained_loaded_model) |lm| {
+            lm.deinit();
+            allocator.destroy(lm);
+        };
 
         {
             const now = std.time.nanoTimestamp();
@@ -697,7 +706,11 @@ pub const LocalEngine = struct {
         }
 
         // Create sampler
-        var sampler_instance = try sampler.Sampler.init(allocator, seed, @intCast(loaded_model.config.vocab_size));
+        const model_config_snapshot = loaded_model.config;
+        const model_file_size_snapshot = loaded_model.file_size;
+        const model_tensor_count_snapshot = loaded_model.tensor_count;
+        const model_weight_dtype_tag_snapshot: u8 = @intFromEnum(loaded_model.original_weight_dtype);
+        var sampler_instance = try sampler.Sampler.init(allocator, seed, @intCast(model_config_snapshot.vocab_size));
         errdefer sampler_instance.deinit();
 
         {
@@ -725,6 +738,19 @@ pub const LocalEngine = struct {
         progress.updateLine(1, 1, "Backend initialized, preparing runtime...");
         const scheduler_state_descriptors = try collectSchedulerStateDescriptors(allocator, loaded_model);
         errdefer if (scheduler_state_descriptors.len > 0) allocator.free(scheduler_state_descriptors);
+        const can_release_loaded_after_backend_init = switch (compute_backend) {
+            .metal => |*backend| if (comptime backend_root.metal.BackendType != void and
+                @hasDecl(backend_root.metal.BackendType, "canReleaseLoadedModel"))
+                backend.canReleaseLoadedModel()
+            else
+                false,
+            else => false,
+        };
+        if (can_release_loaded_after_backend_init) {
+            loaded_model.deinit();
+            allocator.destroy(loaded_model);
+            retained_loaded_model = null;
+        }
 
         {
             const now = std.time.nanoTimestamp();
@@ -777,7 +803,11 @@ pub const LocalEngine = struct {
 
         return LocalEngine{
             .allocator = allocator,
-            .loaded = loaded_model,
+            .loaded = retained_loaded_model,
+            .model_config = model_config_snapshot,
+            .model_file_size = model_file_size_snapshot,
+            .model_tensor_count = model_tensor_count_snapshot,
+            .model_weight_dtype_tag = model_weight_dtype_tag_snapshot,
             .tok = tokenizer_instance,
             .samp = sampler_instance,
             .backend = compute_backend,
@@ -793,8 +823,10 @@ pub const LocalEngine = struct {
     pub fn deinit(self: *LocalEngine) void {
         self.backend.deinit();
         self.samp.deinit();
-        self.loaded.deinit();
-        self.allocator.destroy(self.loaded);
+        if (self.loaded) |loaded| {
+            loaded.deinit();
+            self.allocator.destroy(loaded);
+        }
         self.tok.deinit();
         self.gen_config.deinit(self.allocator);
         self.allocator.free(self.model_path);
@@ -1018,7 +1050,7 @@ pub const LocalEngine = struct {
         // Get BOS token ID
         const bos_token_id: ?u32 = if (self.gen_config.bos_token_id) |id|
             (if (self.gen_config.add_bos_token) id else null)
-        else if (self.loaded.config.bos_token_id) |id|
+        else if (self.model_config.bos_token_id) |id|
             (if (self.gen_config.add_bos_token and id >= 0) @intCast(id) else null)
         else
             null;
@@ -1390,7 +1422,7 @@ pub const LocalEngine = struct {
         const image_count = countInputImageParts(chat);
         if (image_count == 0) return null;
         log.debug("router", "Vision input detected", .{ .images = image_count }, @src());
-        if (self.loaded.config.image_token_id <= 0) return error.UnsupportedContentType;
+        if (self.model_config.image_token_id <= 0) return error.UnsupportedContentType;
 
         const preprocess_opts = try self.buildVisionPreprocessOptions();
 
@@ -1451,7 +1483,7 @@ pub const LocalEngine = struct {
         return VisionPromptInput{
             .prefill = .{
                 .images = images,
-                .image_token_id = @intCast(self.loaded.config.image_token_id),
+                .image_token_id = @intCast(self.model_config.image_token_id),
             },
             .token_counts = token_counts,
         };
@@ -1471,9 +1503,9 @@ pub const LocalEngine = struct {
     }
 
     fn buildVisionPreprocessOptions(self: *const LocalEngine) !image_mod.VisionPreprocessOptions {
-        const patch_size = try requirePositiveConfigU32(self.loaded.config.vision_patch_size);
-        const temporal_patch_size = try requirePositiveConfigU32(self.loaded.config.vision_temporal_patch_size);
-        const spatial_merge_size = try requirePositiveConfigU32(self.loaded.config.vision_spatial_merge_size);
+        const patch_size = try requirePositiveConfigU32(self.model_config.vision_patch_size);
+        const temporal_patch_size = try requirePositiveConfigU32(self.model_config.vision_temporal_patch_size);
+        const spatial_merge_size = try requirePositiveConfigU32(self.model_config.vision_spatial_merge_size);
         const resize_factor = try std.math.mul(u32, patch_size, spatial_merge_size);
 
         // Cross-check patch_size if preprocessor_config provided one.
@@ -1507,9 +1539,9 @@ pub const LocalEngine = struct {
             }
             // Ensure min does not exceed clamped max.
             if (min_pixels > max_pixels) min_pixels = 0;
-        } else if (self.loaded.config.vision_num_position_embeddings > 0) {
+        } else if (self.model_config.vision_num_position_embeddings > 0) {
             // Fallback when preprocessor_config.json absent or has no pixel limits.
-            const n_pos: u64 = std.math.cast(u64, self.loaded.config.vision_num_position_embeddings) orelse 0;
+            const n_pos: u64 = std.math.cast(u64, self.model_config.vision_num_position_embeddings) orelse 0;
             if (n_pos > 0) {
                 const base_pixels = n_pos * @as(u64, patch_size) * @as(u64, patch_size);
                 if (temporal_patch_size == 1 and spatial_merge_size == 1) {
@@ -1655,16 +1687,16 @@ pub const LocalEngine = struct {
     fn resolveVisionBoundaryTokens(self: *const LocalEngine) VisionBoundaryTokens {
         var boundaries = VisionBoundaryTokens{};
 
-        boundaries.start_token_id = if (self.loaded.config.vision_start_token_id > 0)
-            std.math.cast(u32, self.loaded.config.vision_start_token_id)
+        boundaries.start_token_id = if (self.model_config.vision_start_token_id > 0)
+            std.math.cast(u32, self.model_config.vision_start_token_id)
         else
             null;
         if (boundaries.start_token_id == null) {
             boundaries.start_token_id = tokenIdByCandidates(&self.tok, &.{ "<|vision_start|>", "<|image_start|>" });
         }
 
-        boundaries.end_token_id = if (self.loaded.config.vision_end_token_id > 0)
-            std.math.cast(u32, self.loaded.config.vision_end_token_id)
+        boundaries.end_token_id = if (self.model_config.vision_end_token_id > 0)
+            std.math.cast(u32, self.model_config.vision_end_token_id)
         else
             null;
         if (boundaries.end_token_id == null) {

@@ -2,6 +2,7 @@ const std = @import("std");
 const contract = @import("../contract.zig");
 const runtime_contract = @import("../../runtime_contract/root.zig");
 const models = @import("../../../models/root.zig");
+const tensor = @import("../../../tensor.zig");
 const log = @import("../../../log.zig");
 const progress_mod = @import("../../../progress.zig");
 const metal_vision = @import("vision/root.zig");
@@ -10,6 +11,8 @@ const sampling = @import("../cpu/sampling.zig");
 const compute = @import("../../../compute/root.zig");
 const trace = @import("../../../xray/trace.zig");
 const cpu_sampling_ops = compute.cpu.sampling_ops;
+const ModelConfig = tensor.ModelConfig;
+const ModelRuntime = tensor.ModelRuntime;
 
 const LoadedModel = models.LoadedModel;
 const topk_route_candidate_capacity: usize = 256;
@@ -246,7 +249,9 @@ pub const MetalBackend = struct {
     pub const PrefillVisionInput = metal_vision.PrefillVisionInput;
 
     allocator: std.mem.Allocator,
-    loaded: *LoadedModel,
+    model_config: ModelConfig,
+    model_runtime: ModelRuntime,
+    loaded_for_delegate: ?*LoadedModel = null,
     model_id_z: [:0]u8,
     model_path_z: [:0]u8,
     seed: c_int,
@@ -318,13 +323,28 @@ pub const MetalBackend = struct {
         }
     }
 
-    fn collectPlanStateDescriptors(self: *MetalBackend) !void {
-        const arch_id = self.loaded.runtime.architecture_id orelse return;
-        const entry = models.registry.detectByArchitectureId(arch_id) orelse return;
-        var count: u8 = 0;
+    fn shouldRetainLoadedForVisionDelegate(config: *const ModelConfig, runtime: *const ModelRuntime) bool {
+        if (config.image_token_id <= 0) return false;
+        const arch_id = runtime.architecture_id orelse return false;
+        return models.registry.visionProgramByArchitectureId(arch_id) != null;
+    }
 
-        for (self.loaded.blocks) |layer| {
-            const program = models.registry.blockProgramFor(entry, layer.block_type) orelse continue;
+    fn collectPlanStateDescriptors(self: *MetalBackend) !void {
+        const arch_id = self.model_runtime.architecture_id orelse return;
+        const entry = models.registry.detectByArchitectureId(arch_id) orelse return;
+        const arch = models.registry.runtimeArchitectureById(entry.id) orelse return error.UnsupportedModel;
+        var count: u8 = 0;
+        const layer_count: usize = @intCast(@max(self.model_config.n_layers, 0));
+
+        for (0..layer_count) |layer_idx| {
+            const variant = arch.getVariantWithOverride(layer_idx, self.model_config.layer_types);
+            const block_type = if (variant) |v|
+                models.weights.blocks.BlockKind.fromVariantName(v.name) orelse continue
+            else if (arch.has_mamba)
+                models.weights.blocks.BlockKind.mamba
+            else
+                models.weights.blocks.BlockKind.attention_mlp;
+            const program = models.registry.blockProgramFor(entry, block_type) orelse continue;
             try appendProgramStateDescriptors(
                 self.state_descriptors_storage[0..],
                 &count,
@@ -515,9 +535,10 @@ pub const MetalBackend = struct {
 
     fn ensureVisionDelegate(self: *MetalBackend) !*cpu_engine.FusedCpuBackend {
         if (self.vision_delegate) |*delegate| return delegate;
+        const loaded = self.loaded_for_delegate orelse return error.UnsupportedContentType;
         self.vision_delegate = try cpu_engine.FusedCpuBackend.init(
             self.allocator,
-            self.loaded,
+            loaded,
             self.max_batch_size,
             progress_mod.Context.NONE,
         );
@@ -831,6 +852,8 @@ pub const MetalBackend = struct {
 
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
         const d_model = std.math.cast(usize, loaded.config.d_model) orelse return error.InvalidArgument;
+        const retain_loaded_for_vision_delegate =
+            shouldRetainLoadedForVisionDelegate(&loaded.config, &loaded.runtime);
         const slot_ctxs = try allocator.alloc(?*mlx_ctx, max_batch_size);
         errdefer allocator.free(slot_ctxs);
         @memset(slot_ctxs, null);
@@ -891,7 +914,9 @@ pub const MetalBackend = struct {
 
         var backend = MetalBackend{
             .allocator = allocator,
-            .loaded = loaded,
+            .model_config = loaded.config,
+            .model_runtime = loaded.runtime,
+            .loaded_for_delegate = if (retain_loaded_for_vision_delegate) loaded else null,
             .model_id_z = model_id_z,
             .model_path_z = model_path_z,
             .seed = seed,
@@ -926,6 +951,10 @@ pub const MetalBackend = struct {
         errdefer backend.deinit();
         try backend.collectPlanStateDescriptors();
         return backend;
+    }
+
+    pub fn canReleaseLoadedModel(self: *const MetalBackend) bool {
+        return self.loaded_for_delegate == null;
     }
 
     pub fn deinit(self: *MetalBackend) void {
@@ -1122,8 +1151,8 @@ pub const MetalBackend = struct {
     }
 
     fn hasGemma4TopKStreamingRegression(self: *const MetalBackend) bool {
-        if (self.loaded.config.hidden_size_per_layer_input > 0) return true;
-        const arch_id = self.loaded.runtime.architecture_id orelse return false;
+        if (self.model_config.hidden_size_per_layer_input > 0) return true;
+        const arch_id = self.model_runtime.architecture_id orelse return false;
         return std.mem.eql(u8, arch_id, "gemma3");
     }
 
@@ -1940,6 +1969,21 @@ test "MetalBackend.applySamplingMutationsToLogits applies repetition penalty" {
     try std.testing.expectApproxEqAbs(@as(f32, -4.0), logits[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), logits[3], 1e-6);
+}
+
+test "MetalBackend.shouldRetainLoadedForVisionDelegate only retains weights for active vision configs" {
+    var cfg = std.mem.zeroes(ModelConfig);
+    var runtime = std.mem.zeroes(ModelRuntime);
+    runtime.architecture_id = "qwen3";
+
+    cfg.image_token_id = 0;
+    try std.testing.expect(!MetalBackend.shouldRetainLoadedForVisionDelegate(&cfg, &runtime));
+
+    cfg.image_token_id = 151652;
+    try std.testing.expect(MetalBackend.shouldRetainLoadedForVisionDelegate(&cfg, &runtime));
+
+    runtime.architecture_id = null;
+    try std.testing.expect(!MetalBackend.shouldRetainLoadedForVisionDelegate(&cfg, &runtime));
 }
 
 test "MetalBackend.applySamplingMutationsToLogits applies additive penalties" {

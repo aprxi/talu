@@ -2008,6 +2008,7 @@ static inline array gated_delta_mixer_forward_core(
     array& ssm_state,
     GatedDeltaCaptureOutputs* capture_out
 ) {
+    const int batch = input.shape(0);
     const int seq_len = input.shape(1);
     const Dtype model_dtype = input.dtype();
     const int d_inner = n_heads * d_head;
@@ -2036,6 +2037,9 @@ static inline array gated_delta_mixer_forward_core(
     if (n_heads <= 0 || d_head <= 0 || d_conv <= 0) {
         throw std::invalid_argument("[gated_delta] invalid config dims");
     }
+    if (batch <= 0) {
+        throw std::invalid_argument("[gated_delta] invalid batch");
+    }
 
     // Projection matmuls stay in model dtype for bf16/f16 tensor-core throughput.
     // FP32 upcasting happens after projection, before recurrent state math.
@@ -2045,17 +2049,17 @@ static inline array gated_delta_mixer_forward_core(
     }
 
     // Keep qkv in model dtype through causal-conv for throughput.
-    array qkv_all = slice(proj_all, {0, 0, 0}, {1, seq_len, qkv_len});
-    const array z_all = ensure_float32(slice(proj_all, {0, 0, qkv_len}, {1, seq_len, qkv_len + d_inner}));
+    array qkv_all = slice(proj_all, {0, 0, 0}, {batch, seq_len, qkv_len});
+    const array z_all = ensure_float32(slice(proj_all, {0, 0, qkv_len}, {batch, seq_len, qkv_len + d_inner}));
     const array beta_raw_all = ensure_float32(slice(
         proj_all,
         {0, 0, qkv_len + d_inner},
-        {1, seq_len, qkv_len + d_inner + n_heads}
+        {batch, seq_len, qkv_len + d_inner + n_heads}
     ));
     const array a_raw_all = ensure_float32(slice(
         proj_all,
         {0, 0, qkv_len + d_inner + n_heads},
-        {1, seq_len, proj_len}
+        {batch, seq_len, proj_len}
     ));
 
     // One causal-conv path for any sequence length (no seq_len-specialized
@@ -2088,23 +2092,122 @@ static inline array gated_delta_mixer_forward_core(
     const array dt_bias_heads_value = dt_bias_heads.has_value() ? *dt_bias_heads : zeros({n_heads}, float32);
     const array norm_weight_heads_value = norm_weight_heads.has_value() ? *norm_weight_heads : ones({n_heads, d_head}, float32);
 
-    array state = reshape(ssm_state, {n_heads, d_head, d_head});
+    array state = reshape(ssm_state, {batch, n_heads, d_head, d_head});
 
     // Slice Q and K (n_kh heads each) and V (n_heads value heads).
-    array query_kh = reshape(slice(qkv_conv_all, {0, 0, 0}, {1, seq_len, qk_len}), {seq_len, n_kh, d_head});
-    array key_kh   = reshape(slice(qkv_conv_all, {0, 0, qk_len}, {1, seq_len, 2 * qk_len}), {seq_len, n_kh, d_head});
-    const array value_all = reshape(slice(qkv_conv_all, {0, 0, 2 * qk_len}, {1, seq_len, qkv_len}), {seq_len, n_heads, d_head});
-    const array z_heads_all = reshape(z_all, {seq_len, n_heads, d_head});
+    array query_kh = reshape(slice(qkv_conv_all, {0, 0, 0}, {batch, seq_len, qk_len}), {batch, seq_len, n_kh, d_head});
+    array key_kh   = reshape(slice(qkv_conv_all, {0, 0, qk_len}, {batch, seq_len, 2 * qk_len}), {batch, seq_len, n_kh, d_head});
+    const array value_all = reshape(slice(qkv_conv_all, {0, 0, 2 * qk_len}, {batch, seq_len, qkv_len}), {batch, seq_len, n_heads, d_head});
+    const array z_heads_all = reshape(z_all, {batch, seq_len, n_heads, d_head});
 
     // Expand Q and K from n_kh to n_heads when using GQA (groups_per_key > 1).
     // Each KV head is shared by groups_per_key value heads, so we need interleaved
     // repeat: [k0,k0,k1,k1,...] not block repeat [k0,k1,...,k0,k1,...].
     const int groups_per_key = n_heads / n_kh;
+
+    // Decode fast path: seq_len is always 1 for the fused bridge route.
+    // Skip per-token vectors/concats and dispatch a single recurrence step.
+    if (seq_len == 1 && capture_out == nullptr) {
+        std::vector<array> batch_outputs;
+        std::vector<array> next_state_rows;
+        batch_outputs.reserve(static_cast<size_t>(batch));
+        next_state_rows.reserve(static_cast<size_t>(batch));
+
+        for (int b = 0; b < batch; ++b) {
+            array query = reshape(
+                slice(query_kh, {b, 0, 0, 0}, {b + 1, 1, n_kh, d_head}),
+                {n_kh, d_head}
+            );
+            array key = reshape(
+                slice(key_kh, {b, 0, 0, 0}, {b + 1, 1, n_kh, d_head}),
+                {n_kh, d_head}
+            );
+            if (groups_per_key > 1) {
+                query = reshape(
+                    tile(reshape(query, {n_kh, 1, d_head}), {1, groups_per_key, 1}),
+                    {n_heads, d_head}
+                );
+                key = reshape(
+                    tile(reshape(key, {n_kh, 1, d_head}), {1, groups_per_key, 1}),
+                    {n_heads, d_head}
+                );
+            }
+            const array value = reshape(
+                slice(value_all, {b, 0, 0, 0}, {b + 1, 1, n_heads, d_head}),
+                {n_heads, d_head}
+            );
+            const array z = reshape(
+                slice(z_heads_all, {b, 0, 0, 0}, {b + 1, 1, n_heads, d_head}),
+                {n_heads, d_head}
+            );
+            const array beta_raw = reshape(
+                slice(beta_raw_all, {b, 0, 0}, {b + 1, 1, n_heads}),
+                {n_heads}
+            );
+            const array a_raw = reshape(
+                slice(a_raw_all, {b, 0, 0}, {b + 1, 1, n_heads}),
+                {n_heads}
+            );
+            array state_row = reshape(
+                slice(state, {b, 0, 0, 0}, {b + 1, n_heads, d_head, d_head}),
+                {n_heads, d_head, d_head}
+            );
+
+            array out(0.0f, float32);
+            if (use_reference_recurrence) {
+                const auto ref_step = gated_delta_recurrence_step_reference(
+                    state_row,
+                    query,
+                    key,
+                    value,
+                    z,
+                    beta_raw,
+                    a_raw,
+                    a_log_exp_row,
+                    dt_bias_heads_value,
+                    norm_weight_heads_value,
+                    n_heads,
+                    d_head
+                );
+                state_row = ref_step.next_state;
+                out = ref_step.norm;
+            } else {
+                const auto [normed_out, next_state] = gated_delta_recurrence_step(
+                    state_row,
+                    query,
+                    key,
+                    value,
+                    z,
+                    beta_raw,
+                    a_raw,
+                    a_log_exp_row,
+                    dt_bias_heads_value,
+                    norm_weight_heads_value,
+                    n_heads,
+                    d_head
+                );
+                state_row = next_state;
+                out = normed_out;
+            }
+
+            next_state_rows.emplace_back(reshape(state_row, {1, n_heads, d_head, d_head}));
+            batch_outputs.emplace_back(state_space_call(out_proj_fn, reshape(out, {1, 1, d_inner})));
+        }
+
+        state = (next_state_rows.size() == 1)
+            ? next_state_rows.front()
+            : concatenate(next_state_rows, 0);
+        ssm_state = reshape(state, {batch, n_heads, d_head, d_head});
+        return (batch_outputs.size() == 1)
+            ? batch_outputs.front()
+            : concatenate(batch_outputs, 0);
+    }
+
     array query_all = (groups_per_key > 1)
-        ? reshape(tile(reshape(query_kh, {seq_len, n_kh, 1, d_head}), {1, 1, groups_per_key, 1}), {seq_len, n_heads, d_head})
+        ? reshape(tile(reshape(query_kh, {batch, seq_len, n_kh, 1, d_head}), {1, 1, 1, groups_per_key, 1}), {batch, seq_len, n_heads, d_head})
         : query_kh;
     array key_all = (groups_per_key > 1)
-        ? reshape(tile(reshape(key_kh, {seq_len, n_kh, 1, d_head}), {1, 1, groups_per_key, 1}), {seq_len, n_heads, d_head})
+        ? reshape(tile(reshape(key_kh, {batch, seq_len, n_kh, 1, d_head}), {1, 1, 1, groups_per_key, 1}), {batch, seq_len, n_heads, d_head})
         : key_kh;
 
     std::vector<array> outputs;
@@ -2116,91 +2219,148 @@ static inline array gated_delta_mixer_forward_core(
         norm_outputs.reserve(static_cast<size_t>(seq_len));
     }
     for (int token_idx = 0; token_idx < seq_len; ++token_idx) {
-        array query = reshape(slice(query_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        array key = reshape(slice(key_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        const array value = reshape(slice(value_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        const array z = reshape(slice(z_heads_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        const array beta_raw = reshape(slice(beta_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads});
-        const array a_raw = reshape(slice(a_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads});
-        array out(0.0f, float32);
-        if (use_reference_recurrence) {
-            const auto ref_step = gated_delta_recurrence_step_reference(
-                state,
-                query,
-                key,
-                value,
-                z,
-                beta_raw,
-                a_raw,
-                a_log_exp_row,
-                dt_bias_heads_value,
-                norm_weight_heads_value,
-                n_heads,
-                d_head
-            );
-            state = ref_step.next_state;
-            out = ref_step.norm;
-            if (capture_out != nullptr) {
-                ssm_outputs.emplace_back(reshape(ref_step.ssm, {1, 1, d_inner}));
-                norm_outputs.emplace_back(reshape(ref_step.norm, {1, 1, d_inner}));
-            }
-        } else if (capture_out != nullptr) {
-            const array ssm_probe = gated_delta_recurrence_ssm_probe(
-                state,
-                query,
-                key,
-                value,
-                beta_raw,
-                a_raw,
-                a_log_exp_row,
-                dt_bias_heads_value,
-                n_heads,
-                d_head
-            );
-            const auto [normed_out, next_state] = gated_delta_recurrence_step(
-                state,
-                query,
-                key,
-                value,
-                z,
-                beta_raw,
-                a_raw,
-                a_log_exp_row,
-                dt_bias_heads_value,
-                norm_weight_heads_value,
-                n_heads,
-                d_head
-            );
-            state = next_state;
-            out = normed_out;
-            ssm_outputs.emplace_back(reshape(ssm_probe, {1, 1, d_inner}));
-            norm_outputs.emplace_back(reshape(normed_out, {1, 1, d_inner}));
-        } else {
-            const auto [normed_out, next_state] = gated_delta_recurrence_step(
-                state,
-                query,
-                key,
-                value,
-                z,
-                beta_raw,
-                a_raw,
-                a_log_exp_row,
-                dt_bias_heads_value,
-                norm_weight_heads_value,
-                n_heads,
-                d_head
-            );
-            state = next_state;
-            out = normed_out;
+        std::vector<array> token_outputs;
+        std::vector<array> token_state_rows;
+        std::vector<array> token_ssm_outputs;
+        std::vector<array> token_norm_outputs;
+        token_outputs.reserve(static_cast<size_t>(batch));
+        token_state_rows.reserve(static_cast<size_t>(batch));
+        if (capture_out != nullptr) {
+            token_ssm_outputs.reserve(static_cast<size_t>(batch));
+            token_norm_outputs.reserve(static_cast<size_t>(batch));
         }
 
-        // Keep recurrence output in fp32 for out_proj to avoid precision loss
-        // accumulation across long decode runs.
-        const array out_proj_in = reshape(out, {1, 1, d_inner});
-        outputs.emplace_back(state_space_call(out_proj_fn, out_proj_in));
+        for (int b = 0; b < batch; ++b) {
+            array query = reshape(
+                slice(query_all, {b, token_idx, 0, 0}, {b + 1, token_idx + 1, n_heads, d_head}),
+                {n_heads, d_head}
+            );
+            array key = reshape(
+                slice(key_all, {b, token_idx, 0, 0}, {b + 1, token_idx + 1, n_heads, d_head}),
+                {n_heads, d_head}
+            );
+            const array value = reshape(
+                slice(value_all, {b, token_idx, 0, 0}, {b + 1, token_idx + 1, n_heads, d_head}),
+                {n_heads, d_head}
+            );
+            const array z = reshape(
+                slice(z_heads_all, {b, token_idx, 0, 0}, {b + 1, token_idx + 1, n_heads, d_head}),
+                {n_heads, d_head}
+            );
+            const array beta_raw = reshape(
+                slice(beta_raw_all, {b, token_idx, 0}, {b + 1, token_idx + 1, n_heads}),
+                {n_heads}
+            );
+            const array a_raw = reshape(
+                slice(a_raw_all, {b, token_idx, 0}, {b + 1, token_idx + 1, n_heads}),
+                {n_heads}
+            );
+            array state_row = reshape(
+                slice(state, {b, 0, 0, 0}, {b + 1, n_heads, d_head, d_head}),
+                {n_heads, d_head, d_head}
+            );
+
+            array out(0.0f, float32);
+            if (use_reference_recurrence) {
+                const auto ref_step = gated_delta_recurrence_step_reference(
+                    state_row,
+                    query,
+                    key,
+                    value,
+                    z,
+                    beta_raw,
+                    a_raw,
+                    a_log_exp_row,
+                    dt_bias_heads_value,
+                    norm_weight_heads_value,
+                    n_heads,
+                    d_head
+                );
+                state_row = ref_step.next_state;
+                out = ref_step.norm;
+                if (capture_out != nullptr) {
+                    token_ssm_outputs.emplace_back(reshape(ref_step.ssm, {1, 1, d_inner}));
+                    token_norm_outputs.emplace_back(reshape(ref_step.norm, {1, 1, d_inner}));
+                }
+            } else if (capture_out != nullptr) {
+                const array ssm_probe = gated_delta_recurrence_ssm_probe(
+                    state_row,
+                    query,
+                    key,
+                    value,
+                    beta_raw,
+                    a_raw,
+                    a_log_exp_row,
+                    dt_bias_heads_value,
+                    n_heads,
+                    d_head
+                );
+                const auto [normed_out, next_state] = gated_delta_recurrence_step(
+                    state_row,
+                    query,
+                    key,
+                    value,
+                    z,
+                    beta_raw,
+                    a_raw,
+                    a_log_exp_row,
+                    dt_bias_heads_value,
+                    norm_weight_heads_value,
+                    n_heads,
+                    d_head
+                );
+                state_row = next_state;
+                out = normed_out;
+                token_ssm_outputs.emplace_back(reshape(ssm_probe, {1, 1, d_inner}));
+                token_norm_outputs.emplace_back(reshape(normed_out, {1, 1, d_inner}));
+            } else {
+                const auto [normed_out, next_state] = gated_delta_recurrence_step(
+                    state_row,
+                    query,
+                    key,
+                    value,
+                    z,
+                    beta_raw,
+                    a_raw,
+                    a_log_exp_row,
+                    dt_bias_heads_value,
+                    norm_weight_heads_value,
+                    n_heads,
+                    d_head
+                );
+                state_row = next_state;
+                out = normed_out;
+            }
+
+            token_state_rows.emplace_back(reshape(state_row, {1, n_heads, d_head, d_head}));
+            // Keep recurrence output in fp32 for out_proj to avoid precision loss
+            // accumulation across long decode runs.
+            token_outputs.emplace_back(state_space_call(out_proj_fn, reshape(out, {1, 1, d_inner})));
+        }
+
+        state = (token_state_rows.size() == 1)
+            ? token_state_rows.front()
+            : concatenate(token_state_rows, 0);
+        outputs.emplace_back(
+            (token_outputs.size() == 1)
+                ? token_outputs.front()
+                : concatenate(token_outputs, 0)
+        );
+        if (capture_out != nullptr) {
+            ssm_outputs.emplace_back(
+                (token_ssm_outputs.size() == 1)
+                    ? token_ssm_outputs.front()
+                    : concatenate(token_ssm_outputs, 0)
+            );
+            norm_outputs.emplace_back(
+                (token_norm_outputs.size() == 1)
+                    ? token_norm_outputs.front()
+                    : concatenate(token_norm_outputs, 0)
+            );
+        }
     }
 
-    ssm_state = reshape(state, {1, n_heads, d_head, d_head});
+    ssm_state = reshape(state, {batch, n_heads, d_head, d_head});
     if (outputs.empty()) {
         throw std::invalid_argument("[gated_delta] empty sequence");
     }
@@ -2265,6 +2425,7 @@ void* mlx_lazy_state_space_block_bf16(
     const auto* down_proj_w = static_cast<const array*>(down_proj);
 
     const int d_state_i = static_cast<int>(d_state);
+    const int batch = input_arr.shape(0);
     const int d_conv_i = static_cast<int>(d_conv);
     const int n_heads_i = static_cast<int>(n_heads);
     const int d_head_i = static_cast<int>(d_head);
@@ -2523,6 +2684,7 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     const auto* norm_w = static_cast<const array*>(norm_weight);
     const auto& out_proj_w = *static_cast<const array*>(out_proj);
 
+    const int batch = input_arr.shape(0);
     const int d_conv_i = static_cast<int>(d_conv);
     const int n_heads_i = static_cast<int>(n_heads);
     const int n_key_heads_i = static_cast<int>(n_key_heads > 0 ? n_key_heads : n_heads);
@@ -2644,31 +2806,33 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(0) != batch ||
             layer_state->conv_state->shape(1) != d_conv_i ||
             layer_state->conv_state->shape(2) != qkv_len;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
+            layer_state->conv_state = new array(zeros({batch, d_conv_i, qkv_len}, float32));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
+        conv_state = zeros({batch, d_conv_i, qkv_len}, float32);
     }
 
     array ssm_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->ssm_state == nullptr ||
+            layer_state->ssm_state->shape(0) != batch ||
             layer_state->ssm_state->shape(1) != n_heads_i ||
             layer_state->ssm_state->shape(2) != d_head_i ||
             layer_state->ssm_state->shape(3) != d_head_i;
         if (need_init) {
             delete layer_state->ssm_state;
-            layer_state->ssm_state = new array(zeros({1, n_heads_i, d_head_i, d_head_i}, float32));
+            layer_state->ssm_state = new array(zeros({batch, n_heads_i, d_head_i, d_head_i}, float32));
         }
         ssm_state = *layer_state->ssm_state;
     } else {
-        ssm_state = zeros({1, n_heads_i, d_head_i, d_head_i}, float32);
+        ssm_state = zeros({batch, n_heads_i, d_head_i, d_head_i}, float32);
     }
 
     array in_proj_rhs(0.0f, model_dtype);
@@ -2712,7 +2876,7 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     // compiled MLX function that caches the gated-delta forward graph topology.
     // Restricted to seq_len==1 (decode) to avoid tracing the full prefill loop.
     const bool is_single_token_decode = (input_arr.shape(1) == 1);
-    if (!use_reference_recurrence and is_single_token_decode
+    if (!use_reference_recurrence and is_single_token_decode and batch == 1
             and layer_state != nullptr and layer_state->gdelta_compiled_fn == nullptr) {
         const array ck = *layer_state->gdelta_conv_kernel;
         const std::optional<array> cb_cap = layer_state->gdelta_conv_bias_row
@@ -2744,7 +2908,7 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             const std::vector<array>&)>(mlx::core::compile(decode_fn));
     }
     // Fast path: use compiled graph to avoid rebuilding decode topology.
-    if (!use_reference_recurrence and is_single_token_decode
+    if (!use_reference_recurrence and is_single_token_decode and batch == 1
             and layer_state != nullptr and layer_state->gdelta_compiled_fn != nullptr) {
         const std::vector<array> compiled_out = (*layer_state->gdelta_compiled_fn)(
             std::vector<array>{input_arr, conv_state, ssm_state});
@@ -2828,6 +2992,7 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     const auto& out_proj_s = *static_cast<const array*>(out_s);
     const auto& out_proj_b = *static_cast<const array*>(out_b);
 
+    const int batch = input_arr.shape(0);
     const int d_conv_i = static_cast<int>(d_conv);
     const int n_heads_i = static_cast<int>(n_heads);
     const int n_key_heads_i = static_cast<int>(n_key_heads > 0 ? n_key_heads : n_heads);
@@ -2851,55 +3016,129 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     if (cache != nullptr && layer_state == nullptr) {
         throw std::invalid_argument("[gated_delta] cache layer index out of range");
     }
-    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
-    const std::optional<array> conv_bias_row = (conv_b != nullptr)
-        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
-        : std::nullopt;
-    const std::optional<array> dt_bias_row = (dt_b != nullptr)
-        ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
-        : std::nullopt;
-    const std::optional<array> norm_weight_arr = (norm_w != nullptr)
-        ? std::optional<array>(*norm_w)
-        : std::nullopt;
-    const auto static_terms = resolve_gated_delta_static_terms(
-        a_log,
-        norm_weight,
-        a_log_arr,
-        norm_weight_arr,
-        n_heads_i,
-        d_head_i
-    );
+    array conv_kernel_broadcast(0.0f, input_arr.dtype());
+    std::optional<array> conv_bias_row = std::nullopt;
+    std::optional<array> dt_bias_row = std::nullopt;
+    std::optional<GatedDeltaStaticTerms> static_terms = std::nullopt;
+    if (layer_state != nullptr) {
+        const bool need_static_refresh =
+            layer_state->gdelta_conv_kernel == nullptr ||
+            layer_state->gdelta_a_log_exp_row == nullptr ||
+            layer_state->gdelta_conv_weight_handle != conv_weight ||
+            layer_state->gdelta_conv_bias_handle != conv_bias ||
+            layer_state->gdelta_dt_bias_handle != dt_bias ||
+            layer_state->gdelta_a_log_handle != a_log ||
+            layer_state->gdelta_norm_weight_handle != norm_weight ||
+            layer_state->gdelta_qkv_len != qkv_len ||
+            layer_state->gdelta_n_heads != n_heads_i ||
+            layer_state->gdelta_d_head != d_head_i;
+        if (need_static_refresh) {
+            const std::optional<array> norm_weight_arr = (norm_w != nullptr)
+                ? std::optional<array>(*norm_w)
+                : std::nullopt;
+            conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
+            conv_bias_row = (conv_b != nullptr)
+                ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
+                : std::nullopt;
+            dt_bias_row = (dt_b != nullptr)
+                ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
+                : std::nullopt;
+            static_terms.emplace(resolve_gated_delta_static_terms(
+                a_log,
+                norm_weight,
+                a_log_arr,
+                norm_weight_arr,
+                n_heads_i,
+                d_head_i
+            ));
+            delete layer_state->gdelta_conv_kernel;
+            delete layer_state->gdelta_conv_bias_row;
+            delete layer_state->gdelta_dt_bias_row;
+            delete layer_state->gdelta_a_log_exp_row;
+            delete layer_state->gdelta_norm_weight_heads;
+            layer_state->gdelta_conv_kernel = new array(conv_kernel_broadcast);
+            layer_state->gdelta_conv_bias_row = conv_bias_row.has_value() ? new array(*conv_bias_row) : nullptr;
+            layer_state->gdelta_dt_bias_row = dt_bias_row.has_value() ? new array(*dt_bias_row) : nullptr;
+            layer_state->gdelta_a_log_exp_row = new array(static_terms->a_log_exp_row);
+            layer_state->gdelta_norm_weight_heads = static_terms->norm_weight_heads.has_value()
+                ? new array(*static_terms->norm_weight_heads)
+                : nullptr;
+            layer_state->gdelta_conv_weight_handle = conv_weight;
+            layer_state->gdelta_conv_bias_handle = conv_bias;
+            layer_state->gdelta_dt_bias_handle = dt_bias;
+            layer_state->gdelta_a_log_handle = a_log;
+            layer_state->gdelta_norm_weight_handle = norm_weight;
+            layer_state->gdelta_qkv_len = qkv_len;
+            layer_state->gdelta_n_heads = n_heads_i;
+            layer_state->gdelta_d_head = d_head_i;
+        } else {
+            conv_kernel_broadcast = *layer_state->gdelta_conv_kernel;
+            conv_bias_row = (layer_state->gdelta_conv_bias_row != nullptr)
+                ? std::optional<array>(*layer_state->gdelta_conv_bias_row)
+                : std::nullopt;
+            dt_bias_row = (layer_state->gdelta_dt_bias_row != nullptr)
+                ? std::optional<array>(*layer_state->gdelta_dt_bias_row)
+                : std::nullopt;
+            static_terms = GatedDeltaStaticTerms{
+                *layer_state->gdelta_a_log_exp_row,
+                (layer_state->gdelta_norm_weight_heads != nullptr)
+                    ? std::optional<array>(*layer_state->gdelta_norm_weight_heads)
+                    : std::nullopt,
+            };
+        }
+    } else {
+        const std::optional<array> norm_weight_arr = (norm_w != nullptr)
+            ? std::optional<array>(*norm_w)
+            : std::nullopt;
+        conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
+        conv_bias_row = (conv_b != nullptr)
+            ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
+            : std::nullopt;
+        dt_bias_row = (dt_b != nullptr)
+            ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
+            : std::nullopt;
+        static_terms.emplace(resolve_gated_delta_static_terms(
+            a_log,
+            norm_weight,
+            a_log_arr,
+            norm_weight_arr,
+            n_heads_i,
+            d_head_i
+        ));
+    }
 
     const Dtype model_dtype = input_arr.dtype();
     array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(0) != batch ||
             layer_state->conv_state->shape(1) != d_conv_i ||
             layer_state->conv_state->shape(2) != qkv_len;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
+            layer_state->conv_state = new array(zeros({batch, d_conv_i, qkv_len}, float32));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
+        conv_state = zeros({batch, d_conv_i, qkv_len}, float32);
     }
 
     array ssm_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->ssm_state == nullptr ||
+            layer_state->ssm_state->shape(0) != batch ||
             layer_state->ssm_state->shape(1) != n_heads_i ||
             layer_state->ssm_state->shape(2) != d_head_i ||
             layer_state->ssm_state->shape(3) != d_head_i;
         if (need_init) {
             delete layer_state->ssm_state;
-            layer_state->ssm_state = new array(zeros({1, n_heads_i, d_head_i, d_head_i}, float32));
+            layer_state->ssm_state = new array(zeros({batch, n_heads_i, d_head_i, d_head_i}, float32));
         }
         ssm_state = *layer_state->ssm_state;
     } else {
-        ssm_state = zeros({1, n_heads_i, d_head_i, d_head_i}, float32);
+        ssm_state = zeros({batch, n_heads_i, d_head_i, d_head_i}, float32);
     }
 
     StateSpaceQuantLinearCtx in_proj_ctx{
@@ -2938,9 +3177,9 @@ void* mlx_lazy_gated_delta_mixer_quantized(
         in_proj_fn,
         conv_kernel_broadcast,
         conv_bias_row,
-        static_terms.a_log_exp_row,
+        static_terms->a_log_exp_row,
         dt_bias_row,
-        static_terms.norm_weight_heads,
+        static_terms->norm_weight_heads,
         out_proj_fn,
         d_conv_i,
         n_heads_i,

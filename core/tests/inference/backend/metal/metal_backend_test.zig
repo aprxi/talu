@@ -23,7 +23,11 @@ extern fn mlx_test_dense_mlp_gate_up_fusion() c_int;
 extern fn mlx_test_full_attention_qkv_fusion() c_int;
 extern fn mlx_test_grouped_affine_prefill_cache_helper() c_int;
 extern fn mlx_test_gated_delta_no_double_qk_norm() c_int;
+extern fn mlx_test_rmsnorm_gated_kernel_matches_reference() c_int;
 extern fn mlx_test_chunked_prefill_tail_matches_full_prompt() c_int;
+extern fn mlx_test_linear_attention_fused_quant_inproj_reuse() c_int;
+extern fn mlx_test_grouped_affine_embedding_lookup_matches_reference() c_int;
+extern fn mlx_test_linear_attention_fused_mixer_matches_reference() c_int;
 extern fn mlx_test_topk_candidate_extraction_multi() c_int;
 extern fn mlx_last_error() [*:0]const u8;
 
@@ -323,12 +327,52 @@ test "metal bridge gated-delta recurrence does not renormalize q and k internall
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
+test "metal bridge rmsnorm-gated kernel matches reference path" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_rmsnorm_gated_kernel_matches_reference();
+    if (status != 1) {
+        std.debug.print("mlx rmsnorm-gated self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
 test "metal bridge chunked prefill tail matches full prompt logits" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_chunked_prefill_tail_matches_full_prompt();
     if (status != 1) {
         std.debug.print("mlx chunked prefill self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge fused linear grouped-affine in-proj reuses captured quantized payload" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_linear_attention_fused_quant_inproj_reuse();
+    if (status != 1) {
+        std.debug.print("mlx fused linear in-proj reuse self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge grouped-affine embedding lookup dequantizes selected token rows correctly" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_grouped_affine_embedding_lookup_matches_reference();
+    if (status != 1) {
+        std.debug.print("mlx grouped-affine embedding lookup self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge linear attention fused mixer supports batched decode and matches reference" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_linear_attention_fused_mixer_matches_reference();
+    if (status != 1) {
+        std.debug.print("mlx linear-attention fused mixer self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
     }
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
