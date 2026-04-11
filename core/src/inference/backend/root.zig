@@ -56,7 +56,7 @@ pub const PrefillProgressFn = cpu.BackendType.PrefillProgressFn;
 
 /// Re-export pooling strategy for embedding extraction
 pub const PoolingStrategy = contract.PoolingStrategy;
-const has_metal = build_options.enable_metal and builtin.os.tag == .macos;
+pub const has_metal = build_options.enable_metal and builtin.os.tag == .macos;
 const has_cuda = build_options.enable_cuda and (builtin.os.tag == .linux or builtin.os.tag == .windows);
 pub const metal = if (has_metal) @import("metal/root.zig") else struct {
     pub const BackendType = void;

@@ -109,7 +109,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta;
         ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
-        const bool enable_fused_linear = env_truthy("TALU_METAL_FUSED_GATED_DELTA", false);
         // v3 cache/runtime policy: quantized path is allowed for prefill too,
         // so dense RHS is not retained by default.
         // Note: per-layer input projection weights (per_layer_input_gate_rhs etc.) are
@@ -351,7 +350,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         ctx->layers.reserve(static_cast<size_t>(ctx->cfg.num_hidden_layers));
         ctx->kv_cache.resize(static_cast<size_t>(ctx->cfg.num_hidden_layers));
         ctx->linear_cache.resize(static_cast<size_t>(ctx->cfg.num_hidden_layers));
-        ctx->state_space_cache = mlx_state_space_cache_create(static_cast<size_t>(ctx->cfg.num_hidden_layers));
         const std::vector<int> shared_kv_sources = resolve_shared_kv_source_layers(ctx->cfg);
 
         for (int i = 0; i < ctx->cfg.num_hidden_layers; ++i) {
@@ -1470,6 +1468,12 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             );
         }
 
+        // Release the safetensors tensor map. Per-layer weights already hold
+        // their own references to the arrays they need; clearing the map drops
+        // reference counts on any arrays only referenced here (unused metadata
+        // tensors, __metadata__ entries, redundant aliases).
+        tensors.clear();
+
         return ctx.release();
     } catch (const std::exception& e) {
         if (wired_limit_acquired) release_wired_limit();
@@ -1534,7 +1538,6 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         ctx->per_layer_projection_norm_w = source_ctx->per_layer_projection_norm_w;
         ctx->layers = source_ctx->layers;
         ctx->profile_layers = source_ctx->profile_layers;
-        ctx->state_space_cache = mlx_state_space_cache_create(source_ctx->layers.size());
 
         // Runtime state starts clean for the cloned context.
         ctx->kv_cache.resize(source_ctx->kv_cache.size());
@@ -1564,10 +1567,6 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
 
 void mlx_destroy(mlx_ctx* ctx) {
     if (ctx) {
-        if (ctx->state_space_cache != nullptr) {
-            mlx_state_space_cache_free(ctx->state_space_cache);
-            ctx->state_space_cache = nullptr;
-        }
         release_wired_limit();
         leave_rng_epoch();
     }

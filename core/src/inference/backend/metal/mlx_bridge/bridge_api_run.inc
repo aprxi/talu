@@ -441,16 +441,6 @@ int32_t mlx_decode_topk_stream(
                 static_cast<double>(temperature)
             );
         }
-        if (g_ssm_fused_q_count > 0 || g_ssm_fused_bf16_count > 0 || g_ssm_reference_count > 0) {
-            std::fprintf(
-                stderr,
-                "[mlx][ssm] fused_q=%zu fused_bf16=%zu reference=%zu\n",
-                g_ssm_fused_q_count,
-                g_ssm_fused_bf16_count,
-                g_ssm_reference_count
-            );
-            std::fflush(stderr);
-        }
         *out_generated_ids = generated_host.release();
         *out_generated_len = produced;
         return 1;

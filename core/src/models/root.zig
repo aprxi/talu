@@ -39,6 +39,19 @@ pub fn loadModel(
     return loader.loadModel(allocator, config_path, safetensors_path, load_options, progress);
 }
 
+/// Load model config and per-layer block types WITHOUT loading weight tensor data.
+/// Reads safetensors headers for dtype/count metadata only. Suitable for backends
+/// that load weights independently (e.g., Metal/MLX).
+pub fn loadModelMetadataOnly(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    safetensors_path: []const u8,
+) !LoadedModel {
+    _ = loadArchitectureDefinitions(allocator);
+    const model_kind = try resolveModelKindForConfig(allocator, config_path);
+    return loader.loadModelMetadataOnly(allocator, config_path, safetensors_path, model_kind.runtime_arch, model_kind.parse_config_hook);
+}
+
 pub fn loadArchitectureDefinitions(allocator: std.mem.Allocator) bool {
     return registry.loadArchitectureDefinitions(allocator);
 }

@@ -647,7 +647,4 @@ void reset_runtime_state(mlx_ctx* ctx) {
         lc.conv_state.reset();
         lc.state.reset();
     }
-    if (ctx->state_space_cache != nullptr) {
-        mlx_state_space_cache_reset(ctx->state_space_cache);
-    }
 }

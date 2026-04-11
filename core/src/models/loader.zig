@@ -82,6 +82,29 @@ fn loadSafeTensorsModel(
     return loaded_model;
 }
 
+/// Load model config, architecture metadata, and per-layer block types WITHOUT
+/// loading weight tensor data. Reads only safetensors headers.
+pub fn loadModelMetadataOnly(
+    backing_allocator: std.mem.Allocator,
+    config_path: []const u8,
+    weights_path: []const u8,
+    runtime_arch: *const op_types.Architecture,
+    parse_config_hook: ?op_types.ConfigParseHook,
+) !LoadedModel {
+    var loaded_model = try weights_impl.loadModelMetadataOnly(
+        backing_allocator,
+        config_path,
+        weights_path,
+        runtime_arch,
+        parse_config_hook,
+    );
+    errdefer loaded_model.deinit();
+
+    applyRuntimeArchitectureMetadata(&loaded_model, runtime_arch);
+
+    return loaded_model;
+}
+
 // =============================================================================
 // Model Detection
 // =============================================================================

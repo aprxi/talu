@@ -332,7 +332,6 @@ bool prepare_fused_decode_ctx(
     }
 
     *fused_ctx = *first;
-    fused_ctx->state_space_cache = nullptr;
     fused_ctx->xray_enabled = false;
     fused_ctx->stream_ready = true;
     fused_ctx->sampling_context_counts.clear();

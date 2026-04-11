@@ -92,6 +92,109 @@ pub fn loadModel(
     );
 }
 
+/// Load model config, architecture metadata, and per-layer block types WITHOUT
+/// loading weight tensor data. Reads only safetensors headers for dtype detection
+/// and tensor counts. Suitable for backends that load weights independently
+/// (e.g., Metal/MLX loads from model_path via its own C++ loader).
+pub fn loadModelMetadataOnly(
+    backing_allocator: std.mem.Allocator,
+    config_path: []const u8,
+    safetensors_path: []const u8,
+    runtime_arch: *const model_types.Architecture,
+    parse_config_hook: ?model_types.ConfigParseHook,
+) !LoadedModel {
+    var arena_alloc = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer arena_alloc.deinit();
+    const arena_allocator = arena_alloc.allocator();
+
+    // Read safetensors headers only (no mmap of weight data)
+    var safetensors_file = try st_loader.UnifiedSafeTensors.loadMetadataOnly(backing_allocator, safetensors_path);
+    errdefer safetensors_file.deinit();
+
+    const arch = runtime_arch;
+    var model_config = try cfg_loader.loadConfigForArchitectureWithHook(
+        arena_allocator,
+        config_path,
+        arch.name,
+        parse_config_hook orelse arch.parse_config_hook,
+    );
+
+    const layer_count: usize = @intCast(model_config.n_layers);
+    var block_weights = try arena_allocator.alloc(runtime_blocks.LayerWeights, layer_count);
+
+    try requireArchitectureMetadata(arch);
+    inferMoEFromArchitecture(arch, &model_config);
+
+    // Parse heterogeneous layer types from config.json
+    if (arch.isHeterogeneous()) {
+        if (arch.block_variants) |variants| {
+            var variant_names = try arena_allocator.alloc([]const u8, variants.len);
+            for (variants, 0..) |variant, i| {
+                variant_names[i] = variant.name;
+            }
+            model_config.layer_types = cfg_loader.parseLayerTypes(arena_allocator, config_path, variant_names, arch.variant_aliases) catch null;
+        }
+    }
+
+    // Detect dtype from safetensors header metadata (no weight data access)
+    const original_weight_dtype = blk: {
+        const detected = try detectOriginalWeightDType(arena_allocator, arch, model_config.layer_types, &safetensors_file);
+        if (detected == .grouped_affine_u4 and model_config.gaffine_bits == 8) {
+            break :blk DType.grouped_affine_u8;
+        }
+        break :blk detected;
+    };
+
+    // Populate block types from architecture metadata (no weight loading)
+    for (0..layer_count) |layer_idx| {
+        const variant = arch.getVariantWithOverride(layer_idx, model_config.layer_types);
+        const block_type = if (variant) |v|
+            runtime_blocks.BlockKind.fromVariantName(v.name) orelse return error.UnknownBlockVariant
+        else if (arch.has_mamba)
+            runtime_blocks.BlockKind.mamba
+        else
+            runtime_blocks.BlockKind.attention_mlp;
+
+        const layer_meta = if (variant) |v| v.meta orelse arch.kernel_meta else arch.kernel_meta;
+
+        block_weights[layer_idx] = .{
+            .block_type = block_type,
+            .weight_map = .{},
+            .map_context = .{
+                .sliding_window = 0,
+                .kernel_meta = layer_meta,
+                .mamba_config = null,
+                .gated_delta_config = null,
+                .shortconv_config = null,
+                .num_experts = 0,
+                .experts_per_token = 0,
+                .allocator = null,
+            },
+        };
+    }
+
+    // QK norm detection requires weight map inspection — skip for metadata-only.
+    // The Metal backend detects this independently from its own weight loading.
+
+    return LoadedModel{
+        .arena = arena_alloc,
+        .config = model_config,
+        .runtime = .{},
+        .st = safetensors_file,
+        .ln_final = null,
+        .lm_head = null,
+        .token_embeddings = std.mem.zeroes(Tensor),
+        .position_embeddings = null,
+        .token_type_embeddings = null,
+        .embedding_norm_weight = null,
+        .embedding_norm_bias = null,
+        .blocks = block_weights,
+        .original_weight_dtype = original_weight_dtype,
+        .file_size = safetensors_file.fileSize(),
+        .tensor_count = safetensors_file.tensorCount(),
+    };
+}
+
 /// Environment flags collected once at load time to avoid repeated lookups.
 const LoaderEnvFlags = struct {
     enable_cpu_fusion: bool,

@@ -89,49 +89,6 @@ extern "C" void* mlx_lazy_fused_expert_mix_ffn_affine_fused_gate_up(
     bool use_gelu
 );
 
-extern "C" void* mlx_lazy_gated_delta_mixer_bf16(
-    const void* input,
-    const void* in_proj,
-    const void* conv_weight,
-    const void* conv_bias,
-    const void* a_log,
-    const void* dt_bias,
-    const void* norm_weight,
-    const void* out_proj,
-    void* gated_delta_cache_ptr,
-    size_t layer_idx,
-    size_t d_conv,
-    size_t n_heads,
-    size_t n_key_heads,
-    size_t d_head
-);
-
-extern "C" void* mlx_lazy_gated_delta_mixer_quantized(
-    const void* input,
-    const void* in_w,
-    const void* in_s,
-    const void* in_b,
-    const void* conv_weight,
-    const void* conv_bias,
-    const void* a_log,
-    const void* dt_bias,
-    const void* norm_weight,
-    const void* out_w,
-    const void* out_s,
-    const void* out_b,
-    size_t group_size,
-    size_t bits,
-    void* gated_delta_cache_ptr,
-    size_t layer_idx,
-    size_t d_conv,
-    size_t n_heads,
-    size_t n_key_heads,
-    size_t d_head
-);
-
-extern "C" void* mlx_state_space_cache_create(size_t n_layers);
-extern "C" void mlx_state_space_cache_reset(void* cache_ptr);
-extern "C" void mlx_state_space_cache_free(void* cache_ptr);
 
 // ---------------------------------------------------------------------------
 // Anonymous namespace: internal state, sampling, types, weights, ops
@@ -240,7 +197,6 @@ struct mlx_ctx {
     std::vector<LayerWeights> layers;
     std::vector<KVCacheState> kv_cache;
     std::vector<LinearCacheState> linear_cache;
-    void* state_space_cache = nullptr;
     int kv_reserve_tokens = 0;
     bool has_moe_layers = false;
     bool profile_layers = false;
