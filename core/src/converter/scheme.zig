@@ -13,6 +13,7 @@ const progress_api = @import("../capi/progress.zig");
 const json = @import("../io/json/root.zig");
 const safetensors = @import("../io/safetensors/root.zig");
 const repository = @import("../io/repository/root.zig");
+const log = @import("../log.zig");
 
 // =============================================================================
 // Scheme Definitions (Single Source of Truth)
@@ -42,6 +43,15 @@ const DEFS = [_]SchemeDefinition{
     .{ .val = .nvfp4, .name = "nvfp4", .aliases = &.{} },
     .{ .val = .mxfp8, .name = "mxfp8", .aliases = &.{} },
 };
+
+fn parsedGroupSizeOverrideEnv() ?u32 {
+    const gs_env = std.posix.getenv("GROUP_SIZE") orelse return null;
+    const gs = std.fmt.parseInt(u32, gs_env, 10) catch return null;
+    return switch (gs) {
+        32, 64, 128 => gs,
+        else => null,
+    };
+}
 
 // =============================================================================
 // Platform and Quantization Level Enums
@@ -132,7 +142,7 @@ pub const Scheme = enum(u32) {
     f16 = 4, // No quantization
 
     // Talu Quantized - values 10-15
-    tq4_32 = 10, // 4-bit, group_size=32 (default)
+    tq4_32 = 10, // 4-bit, group_size=32
     tq4_64 = 11, // 4-bit, group_size=64
     tq4_128 = 12, // 4-bit, group_size=128
     tq8_32 = 13, // 8-bit, group_size=32
@@ -204,13 +214,14 @@ pub const Scheme = enum(u32) {
 
     /// Get the output name suffix for this scheme.
     pub fn toOutputSuffix(self: Scheme) []const u8 {
+        const explicit_group_size_override = parsedGroupSizeOverrideEnv() != null;
         return switch (self) {
             .f16 => "F16",
-            .tq4_32 => "TQ4",
+            .tq4_32 => if (explicit_group_size_override) "TQ4_32" else "TQ4",
             .tq4_64 => "TQ4_64",
             .tq4_128 => "TQ4_128",
             .tq8_32 => "TQ8_32",
-            .tq8_64 => "TQ8",
+            .tq8_64 => if (explicit_group_size_override) "TQ8_64" else "TQ8",
             .tq8_128 => "TQ8_128",
             .fp8_e4m3 => "FP8",
             .fp8_e5m2 => "FP8-E5M2",
@@ -262,8 +273,7 @@ pub const Scheme = enum(u32) {
     /// Apply GROUP_SIZE env var override.
     /// Call after fromString() to remap the default group size.
     pub fn withGroupSizeOverride(self: Scheme) Scheme {
-        const gs_env = std.posix.getenv("GROUP_SIZE") orelse return self;
-        const gs = std.fmt.parseInt(u32, gs_env, 10) catch return self;
+        const gs = parsedGroupSizeOverrideEnv() orelse return self;
         return switch (self) {
             .tq4_32, .tq4_64, .tq4_128 => switch (gs) {
                 32 => .tq4_32,
@@ -498,6 +508,7 @@ pub const ConvertResult = struct {
 
 pub const InvalidOutputPath = error{InvalidOutputPath};
 pub const supported_quant_contract_version: i64 = 1;
+const tq4_model_size_threshold_params: u64 = 4_000_000_000;
 
 const CalibrationSettings = struct {
     profile: QualityProfile,
@@ -529,6 +540,67 @@ fn defaultCalibrationFor(profile: QualityProfile, scheme: Scheme) CalibrationSet
         },
         else => .{ .profile = profile, .iters = 8, .nsamples = 64, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
     };
+}
+
+fn countTotalParamsFromSourceTensors(
+    allocator: std.mem.Allocator,
+    source_tensors: *safetensors.UnifiedSafeTensors,
+) !u64 {
+    const tensor_names = try source_tensors.tensorNames(allocator);
+    defer allocator.free(tensor_names);
+
+    var total_params: u64 = 0;
+    for (tensor_names) |name| {
+        const tensor = source_tensors.getTensor(name, null) catch continue;
+        var numel: u64 = 1;
+        for (tensor.shape[0..@intCast(tensor.n_dims)]) |dim| {
+            numel *= @intCast(dim);
+        }
+        total_params += numel;
+    }
+    return total_params;
+}
+
+fn countTotalParamsForModel(allocator: std.mem.Allocator, model_path: []const u8) !u64 {
+    var model_bundle = try repository.resolve(allocator, model_path, .{});
+    defer model_bundle.deinit();
+
+    var source_tensors = try safetensors.UnifiedSafeTensors.load(
+        allocator,
+        model_bundle.weights_path() orelse return error.WeightsNotFound,
+    );
+    defer source_tensors.deinit();
+
+    return countTotalParamsFromSourceTensors(allocator, &source_tensors);
+}
+
+fn selectQ4DefaultByModelSize(total_params: u64) Scheme {
+    return if (total_params < tq4_model_size_threshold_params) .tq4_32 else .tq4_64;
+}
+
+fn shouldApplyAutoQ4ModelSizeDefault(options: ConvertOptions, scheme: Scheme) bool {
+    if (scheme != .tq4_32) return false;
+    if (options.num_overrides > 0) return false;
+    if (parsedGroupSizeOverrideEnv() != null) return false;
+    return true;
+}
+
+fn resolveAutoQ4DefaultScheme(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    options: ConvertOptions,
+    scheme: Scheme,
+) !Scheme {
+    if (!shouldApplyAutoQ4ModelSizeDefault(options, scheme)) return scheme;
+    const total_params = try countTotalParamsForModel(allocator, model_path);
+    const selected = selectQ4DefaultByModelSize(total_params);
+    log.info("convert", "Auto-selected q4 default group size", .{
+        .total_params = total_params,
+        .threshold_params = tq4_model_size_threshold_params,
+        .selected_scheme = selected.toString(),
+        .group_size = selected.getGroupSize(),
+    });
+    return selected;
 }
 
 fn resolveCalibrationFromOptions(options: ConvertOptions, scheme: Scheme) CalibrationSettings {
@@ -823,7 +895,7 @@ pub fn estimateDryRun(
     scheme: Scheme,
     options: ConvertOptions,
 ) ![]u8 {
-    // 1. Resolve model bundle (offline option not currently used)
+    // 1. Resolve model bundle
     var model_bundle = try repository.resolve(allocator, model_path, .{});
     defer model_bundle.deinit();
 
@@ -832,18 +904,7 @@ pub fn estimateDryRun(
     defer source_tensors.deinit();
 
     // 3. Count total parameters via tensor names
-    const tensor_names = try source_tensors.tensorNames(allocator);
-    defer allocator.free(tensor_names);
-
-    var total_params: u64 = 0;
-    for (tensor_names) |name| {
-        const tensor = source_tensors.getTensor(name, null) catch continue;
-        var numel: u64 = 1;
-        for (tensor.shape[0..@intCast(tensor.n_dims)]) |dim| {
-            numel *= @intCast(dim);
-        }
-        total_params += numel;
-    }
+    const total_params = try countTotalParamsFromSourceTensors(allocator, &source_tensors);
 
     // 4. Estimate size based on scheme
     const bits_x100 = scheme.getEffectiveBitsX100();
@@ -881,8 +942,13 @@ pub fn convert(
     output_dir: []const u8,
     options: ConvertOptions,
 ) ConvertResult {
-    // Resolve effective scheme (from platform/quant or explicit)
-    const scheme = options.getEffectiveScheme();
+    // Resolve effective scheme (from platform/quant or explicit).
+    // For q4 defaults, auto-select group size by model size unless GROUP_SIZE
+    // is explicitly set.
+    var scheme = options.getEffectiveScheme();
+    scheme = resolveAutoQ4DefaultScheme(allocator, model_path, options, scheme) catch |err| {
+        return .{ .err = err };
+    };
     const calibration = resolveCalibrationFromOptions(options, scheme);
 
     // Handle dry run mode
@@ -1044,6 +1110,30 @@ pub fn convert(
 // Tests
 // =============================================================================
 
+const EnvFns = struct {
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+};
+
+fn setEnvVar(alloc: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    const key_z = try alloc.dupeZ(u8, key);
+    defer alloc.free(key_z);
+    const value_z = try alloc.dupeZ(u8, value);
+    defer alloc.free(value_z);
+    if (EnvFns.setenv(key_z.ptr, value_z.ptr, 1) != 0) return error.Unexpected;
+}
+
+fn unsetEnvVar(alloc: std.mem.Allocator, key: []const u8) !void {
+    const key_z = try alloc.dupeZ(u8, key);
+    defer alloc.free(key_z);
+    _ = EnvFns.unsetenv(key_z.ptr);
+}
+
+fn captureEnvVar(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const value = std.posix.getenv(key) orelse return null;
+    return try allocator.dupe(u8, value);
+}
+
 test "Scheme.getMethod" {
     try std.testing.expectEqual(Method.grouped_affine, Scheme.f16.getMethod());
     try std.testing.expectEqual(Method.grouped_affine, Scheme.tq4_64.getMethod());
@@ -1086,6 +1176,90 @@ test "Scheme.toString" {
     try std.testing.expectEqualStrings("tq8", Scheme.tq8_64.toString());
     try std.testing.expectEqualStrings("tq8_32", Scheme.tq8_32.toString());
     try std.testing.expectEqualStrings("f16", Scheme.f16.toString());
+}
+
+test "Scheme.toOutputSuffix keeps default suffixes without GROUP_SIZE env" {
+    const allocator = std.testing.allocator;
+    const old_group_size = try captureEnvVar(allocator, "GROUP_SIZE");
+    defer if (old_group_size) |val| allocator.free(val);
+    defer {
+        if (old_group_size) |val| {
+            setEnvVar(allocator, "GROUP_SIZE", val) catch {};
+        } else {
+            unsetEnvVar(allocator, "GROUP_SIZE") catch {};
+        }
+    }
+
+    try unsetEnvVar(allocator, "GROUP_SIZE");
+    try std.testing.expectEqualStrings("TQ4", Scheme.tq4_32.toOutputSuffix());
+    try std.testing.expectEqualStrings("TQ8", Scheme.tq8_64.toOutputSuffix());
+}
+
+test "Scheme.toOutputSuffix includes explicit default group size with GROUP_SIZE env" {
+    const allocator = std.testing.allocator;
+    const old_group_size = try captureEnvVar(allocator, "GROUP_SIZE");
+    defer if (old_group_size) |val| allocator.free(val);
+    defer {
+        if (old_group_size) |val| {
+            setEnvVar(allocator, "GROUP_SIZE", val) catch {};
+        } else {
+            unsetEnvVar(allocator, "GROUP_SIZE") catch {};
+        }
+    }
+
+    try setEnvVar(allocator, "GROUP_SIZE", "32");
+    try std.testing.expectEqualStrings("TQ4_32", Scheme.tq4_32.toOutputSuffix());
+
+    try setEnvVar(allocator, "GROUP_SIZE", "64");
+    try std.testing.expectEqualStrings("TQ8_64", Scheme.tq8_64.toOutputSuffix());
+}
+
+test "Scheme.toOutputSuffix ignores invalid GROUP_SIZE env values" {
+    const allocator = std.testing.allocator;
+    const old_group_size = try captureEnvVar(allocator, "GROUP_SIZE");
+    defer if (old_group_size) |val| allocator.free(val);
+    defer {
+        if (old_group_size) |val| {
+            setEnvVar(allocator, "GROUP_SIZE", val) catch {};
+        } else {
+            unsetEnvVar(allocator, "GROUP_SIZE") catch {};
+        }
+    }
+
+    try setEnvVar(allocator, "GROUP_SIZE", "17");
+    try std.testing.expectEqualStrings("TQ4", Scheme.tq4_32.toOutputSuffix());
+}
+
+test "selectQ4DefaultByModelSize uses 4B cutoff" {
+    try std.testing.expectEqual(Scheme.tq4_32, selectQ4DefaultByModelSize(3_999_999_999));
+    try std.testing.expectEqual(Scheme.tq4_64, selectQ4DefaultByModelSize(4_000_000_000));
+}
+
+test "shouldApplyAutoQ4ModelSizeDefault only for default tq4 without env override" {
+    var options = std.mem.zeroes(ConvertOptions);
+    options.num_overrides = 0;
+
+    const allocator = std.testing.allocator;
+    const old_group_size = try captureEnvVar(allocator, "GROUP_SIZE");
+    defer if (old_group_size) |val| allocator.free(val);
+    defer {
+        if (old_group_size) |val| {
+            setEnvVar(allocator, "GROUP_SIZE", val) catch {};
+        } else {
+            unsetEnvVar(allocator, "GROUP_SIZE") catch {};
+        }
+    }
+
+    try unsetEnvVar(allocator, "GROUP_SIZE");
+    try std.testing.expect(shouldApplyAutoQ4ModelSizeDefault(options, .tq4_32));
+    try std.testing.expect(!shouldApplyAutoQ4ModelSizeDefault(options, .tq4_64));
+
+    options.num_overrides = 1;
+    try std.testing.expect(!shouldApplyAutoQ4ModelSizeDefault(options, .tq4_32));
+    options.num_overrides = 0;
+
+    try setEnvVar(allocator, "GROUP_SIZE", "64");
+    try std.testing.expect(!shouldApplyAutoQ4ModelSizeDefault(options, .tq4_32));
 }
 
 test "Scheme.all_schemes_json" {
