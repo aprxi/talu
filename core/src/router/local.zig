@@ -618,6 +618,19 @@ pub const LocalEngine = struct {
 
         const model_load_options = backend_root.defaultModelLoadOptions(backend_init_options);
 
+        // On macOS with Metal, load only config/metadata (no weight tensors).
+        // MLX C++ will load weights independently via mlx_create. This avoids
+        // a memory spike from two copies of weights coexisting during init.
+        // Only use metadata-only when Metal might be selected. When the user
+        // explicitly picks CPU or CUDA (via config or BACKEND env), load full
+        // weights immediately.
+        const metal_metadata_only = if (comptime !backend_root.has_metal)
+            false
+        else blk: {
+            const effective = backend_root.effectiveLoadSelection(backend_init_options.selection);
+            break :blk (effective == .auto or effective == .metal);
+        };
+
         // Start model loading in background thread
         const ModelLoaderThread = struct {
             alloc: std.mem.Allocator,
@@ -627,12 +640,20 @@ pub const LocalEngine = struct {
             prog: progress_mod.ProgressContext,
             loaded_model: ?models.LoadedModel = null,
             err: ?anyerror = null,
+            use_metadata_only: bool,
 
             fn loadModel(self: *@This()) void {
-                self.loaded_model = models.loadModel(self.alloc, self.config_path, self.weights_path, self.load_options, self.prog) catch |e| {
-                    self.err = e;
-                    return;
-                };
+                if (self.use_metadata_only) {
+                    self.loaded_model = models.loadModelMetadataOnly(self.alloc, self.config_path, self.weights_path) catch |e| {
+                        self.err = e;
+                        return;
+                    };
+                } else {
+                    self.loaded_model = models.loadModel(self.alloc, self.config_path, self.weights_path, self.load_options, self.prog) catch |e| {
+                        self.err = e;
+                        return;
+                    };
+                }
             }
         };
 
@@ -642,6 +663,7 @@ pub const LocalEngine = struct {
             .weights_path = wp,
             .load_options = model_load_options,
             .prog = progress,
+            .use_metadata_only = metal_metadata_only,
         };
 
         // Try threaded loading
@@ -685,7 +707,11 @@ pub const LocalEngine = struct {
             thread.join();
         } else {
             // Thread spawn failed - load synchronously
-            loader_thread_state.loaded_model = try models.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
+            if (metal_metadata_only) {
+                loader_thread_state.loaded_model = try models.loadModelMetadataOnly(allocator, model_bundle.config_path(), wp);
+            } else {
+                loader_thread_state.loaded_model = try models.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
+            }
         }
 
         if (loader_thread_state.err) |e| return e;
@@ -735,6 +761,14 @@ pub const LocalEngine = struct {
         };
         var compute_backend = try Backend.init(allocator, loaded_model, backend_options, progress);
         errdefer compute_backend.deinit();
+
+        // If we loaded metadata-only but backend fell back to CPU, re-load full weights.
+        if (metal_metadata_only and compute_backend != .metal) {
+            log.info("inference", "CPU fallback with metadata-only load; re-loading full weights", .{});
+            loaded_model.deinit();
+            loaded_model.* = try models.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
+        }
+
         progress.updateLine(1, 1, "Backend initialized, preparing runtime...");
         const scheduler_state_descriptors = try collectSchedulerStateDescriptors(allocator, loaded_model);
         errdefer if (scheduler_state_descriptors.len > 0) allocator.free(scheduler_state_descriptors);

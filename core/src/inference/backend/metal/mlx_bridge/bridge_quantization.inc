@@ -492,42 +492,20 @@ array maybe_dequantize_grouped_affine_weight(
     const uint32_t mask = bits == 4 ? 0xF : 0xFF;
     const int cols = packed_cols * values_per_word;
 
+    // Use MLX's GPU-side dequantize — avoids host-side std::vector<float>
+    // balloon that the old CPU loop created (32x expansion for 4-bit).
     const array packed_u32 = astype(weight_2d, uint32);
-    eval(packed_u32);
-    eval(scales_f32);
-    eval(biases_f32);
-
-    const uint32_t* packed_ptr = packed_u32.data<uint32_t>();
-    const float* scales_ptr = scales_f32.data<float>();
-    const float* biases_ptr = biases_f32.data<float>();
-    const int group_count = scales_f32.shape(1);
-
-    std::vector<float> out(static_cast<size_t>(rows) * static_cast<size_t>(cols));
-    for (int r = 0; r < rows; ++r) {
-        const size_t packed_row_off = static_cast<size_t>(r) * static_cast<size_t>(packed_cols);
-        const size_t group_row_off = static_cast<size_t>(r) * static_cast<size_t>(group_count);
-        const size_t out_row_off = static_cast<size_t>(r) * static_cast<size_t>(cols);
-        for (int c = 0; c < cols; ++c) {
-            const int word_idx = c / values_per_word;
-            const int lane = c % values_per_word;
-            const int shift = lane * bits;
-            const uint32_t q = (packed_ptr[packed_row_off + static_cast<size_t>(word_idx)] >> shift) & mask;
-            const int g = c / cfg.quant_group_size;
-            const float scale = scales_ptr[group_row_off + static_cast<size_t>(g)];
-            const float bias = biases_ptr[group_row_off + static_cast<size_t>(g)];
-            out[out_row_off + static_cast<size_t>(c)] = static_cast<float>(q) * scale + bias;
-        }
-    }
-
-    // Move the heap vector into the MLX array, then free it immediately so
-    // the large float32 buffer (rows * cols * 4 bytes) does not stay alive
-    // alongside the bf16 result. eval() forces MLX to materialise the bf16
-    // Metal buffer before the f32 one is released, keeping peak RSS minimal.
-    const array dequant_f32 = array(out.begin(), Shape{rows, cols}, float32);
-    out = std::vector<float>{};  // release host-side float32 copy immediately
-    array dequant_bf16 = astype(dequant_f32, bfloat16);
-    eval(dequant_bf16);          // materialise bf16; f32 Metal buffer can now be freed
-    return stop_gradient(dequant_bf16);
+    array dequant = mlx::core::dequantize(
+        packed_u32,
+        scales_it->second,
+        std::optional<array>(biases_it->second),
+        cfg.quant_group_size,
+        bits,
+        "affine",
+        std::nullopt,
+        bfloat16
+    );
+    return stop_gradient(dequant);
 }
 
 bool has_grouped_affine_metadata_for_key(

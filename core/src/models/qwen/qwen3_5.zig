@@ -125,9 +125,14 @@ const qwen3_5_weight_prefixes = [_][]const u8{
 };
 
 fn requiredLayerWeight(comptime weight_id: []const u8, comptime suffix: []const u8, comptime module_type: []const u8, comptime layout: types.WeightLayout) types.WeightSpec {
+    return requiredLayerWeightWithAliases(weight_id, suffix, module_type, layout, &.{});
+}
+
+fn requiredLayerWeightWithAliases(comptime weight_id: []const u8, comptime suffix: []const u8, comptime module_type: []const u8, comptime layout: types.WeightLayout, comptime aliases: []const []const u8) types.WeightSpec {
     return .{
         .id = weight_id,
         .suffix = suffix,
+        .aliases = aliases,
         .module_type = module_type,
         .layout = layout,
         .dtype = "float32",
@@ -185,7 +190,7 @@ const qwen3_5_linear_attention_weights = [_]types.WeightSpec{
     },
     requiredLayerWeight("linear_attn.out_proj.weight", "linear_attn.out_proj.weight", "Linear", .linear),
     requiredLayerWeight("post_attention_layernorm.weight", "post_attention_layernorm.weight", "RMSNorm", .none),
-    requiredLayerWeight("mlp.gate_proj.weight", "mlp.gate_proj.weight", "Linear", .linear),
+    requiredLayerWeightWithAliases("mlp.gate_proj.weight", "mlp.gate_proj.weight", "Linear", .linear, &.{"mlp.gate_up_proj.weight"}),
     requiredLayerWeight("mlp.up_proj.weight", "mlp.up_proj.weight", "Linear", .linear),
     requiredLayerWeight("mlp.down_proj.weight", "mlp.down_proj.weight", "Linear", .linear),
 };
@@ -195,11 +200,12 @@ const qwen3_5_full_attention_weights = [_]types.WeightSpec{
     requiredLayerWeight("self_attn.q_proj.weight", "self_attn.q_proj.weight", "Linear", .linear),
     requiredLayerWeight("self_attn.k_proj.weight", "self_attn.k_proj.weight", "Linear", .linear),
     requiredLayerWeight("self_attn.v_proj.weight", "self_attn.v_proj.weight", "Linear", .linear),
+    optionalLayerWeight("self_attn.qkv_proj.weight", "self_attn.qkv_proj.weight", "Linear", .linear),
     requiredLayerWeight("self_attn.o_proj.weight", "self_attn.o_proj.weight", "Linear", .linear),
     requiredLayerWeight("self_attn.q_norm.weight", "self_attn.q_norm.weight", "RMSNorm", .none),
     requiredLayerWeight("self_attn.k_norm.weight", "self_attn.k_norm.weight", "RMSNorm", .none),
     requiredLayerWeight("post_attention_layernorm.weight", "post_attention_layernorm.weight", "RMSNorm", .none),
-    requiredLayerWeight("mlp.gate_proj.weight", "mlp.gate_proj.weight", "Linear", .linear),
+    requiredLayerWeightWithAliases("mlp.gate_proj.weight", "mlp.gate_proj.weight", "Linear", .linear, &.{"mlp.gate_up_proj.weight"}),
     requiredLayerWeight("mlp.up_proj.weight", "mlp.up_proj.weight", "Linear", .linear),
     requiredLayerWeight("mlp.down_proj.weight", "mlp.down_proj.weight", "Linear", .linear),
 };
@@ -293,6 +299,19 @@ const qwen3_5_conversion_fusions = [_]types.ConversionFusion{
         },
         .output_suffix = "mixer.in_proj.weight",
     },
+    .{
+        .kind = .dense_mlp_gate_up,
+        .trigger_suffix = "mlp.gate_proj.weight",
+        .required_input_suffixes = &.{
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+        },
+        .output_suffix = "mlp.gate_up_proj.weight",
+    },
+    // NOTE: attention_qkv fusion is NOT enabled because the CPU plan-based
+    // executor doesn't support fused QKV for gated-attention models.
+    // Metal handles QKV combination at runtime (576 MB copy, acceptable).
+    // Re-enable once the CPU plan compiler supports fused QKV.
 };
 
 const qwen3_5_perf_hints = perf.PerfHints{
@@ -323,7 +342,7 @@ pub var arch: types.Architecture = .{
     .global_weights = &qwen3_5_global_weights,
     .weight_prefixes = &qwen3_5_weight_prefixes,
     .conversion_fusions = &qwen3_5_conversion_fusions,
-    .d_ff_source_weight_ids = &.{"mlp.gate_proj.weight"},
+    .d_ff_source_weight_ids = &.{ "mlp.gate_proj.weight", "mlp.gate_up_proj.weight" },
     .resolve_d_ff_from_weights = true,
     .has_qk_norm = true,
     .has_moe = false,

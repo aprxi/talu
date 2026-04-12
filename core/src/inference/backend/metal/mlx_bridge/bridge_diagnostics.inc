@@ -208,10 +208,8 @@ int resolve_prefill_chunk_size(const mlx_ctx* ctx = nullptr) {
             if (parsed > 0) return parsed;
         } catch (...) {}
     }
-    // Dense models can use larger chunks for better GPU utilization.
-    // MoE models keep smaller chunks to bound per-layer memory.
-    if (ctx && !ctx->has_moe_layers) return 256;
-    return 64;
+    // Larger chunks improve matmul efficiency during prefill.
+    return 256;
 }
 
 int resolve_prefill_sync_interval_chunks() {
@@ -227,9 +225,8 @@ int resolve_prefill_full_prompt_threshold(const mlx_ctx* ctx = nullptr) {
             if (parsed > 0) return parsed;
         } catch (...) {}
     }
-    // Dense models can safely process longer prompts in one shot.
-    if (ctx && !ctx->has_moe_layers) return 512;
-    return 128;
+    // Full-prompt prefill avoids chunking overhead for short prompts.
+    return 512;
 }
 
 bool should_use_full_prompt_prefill(const mlx_ctx* ctx, int32_t prompt_len, int full_prompt_threshold) {

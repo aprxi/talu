@@ -251,8 +251,12 @@ array forward_hidden(
     }
 
     if (!ctx->profile_layers) {
-        for (int i = 0; i < static_cast<int>(ctx->layers.size()); ++i) {
+        const int n_layers = static_cast<int>(ctx->layers.size());
+        for (int i = 0; i < n_layers; ++i) {
             hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame);
+            if (i < n_layers - 1) {
+                async_eval(hidden);
+            }
         }
     } else {
         for (int i = 0; i < static_cast<int>(ctx->layers.size()); ++i) {
@@ -646,8 +650,5 @@ void reset_runtime_state(mlx_ctx* ctx) {
     for (auto& lc : ctx->linear_cache) {
         lc.conv_state.reset();
         lc.state.reset();
-    }
-    if (ctx->state_space_cache != nullptr) {
-        mlx_state_space_cache_reset(ctx->state_space_cache);
     }
 }

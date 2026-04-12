@@ -1221,6 +1221,10 @@ fn maybeWriteFusedTensorForPlan(
             _ = try quantizeMxfp8Tensor(allocator, source_tensors, builder, plan.output_name, fused.*, options, token_pool, block_input_cache);
             return true;
         },
+        .dense_mlp_gate_up, .attention_qkv => {
+            // MXFP8 converter: structural fusions not yet implemented.
+            return false;
+        },
     }
 }
 

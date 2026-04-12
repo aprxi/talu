@@ -163,7 +163,6 @@ struct LayerWeights {
     bool lin_in_proj_qkvz_has_q = false;
     bool lin_in_proj_ba_has_q = false;
     bool lin_in_proj_all_has_q = false;
-    bool lin_fused_unavailable = false;
     array lin_A_log = array(0.0f);
     array lin_A_exp_f32 = array(0.0f);
     array lin_dt_bias = array(0.0f);

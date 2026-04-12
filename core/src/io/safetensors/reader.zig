@@ -76,6 +76,8 @@ pub const SafeTensors = struct {
     buffer: MappedBuffer,
     entries: std.StringHashMapUnmanaged(Entry) = .{},
     data_start: usize,
+    /// Non-zero when loaded via loadMetadataOnly (no mmap buffer).
+    metadata_only_file_size: usize = 0,
 
     pub const Entry = struct {
         dtype: DType,
@@ -234,6 +236,7 @@ pub const SafeTensors = struct {
 
     /// Get file size in bytes
     pub fn fileSize(self: *const SafeTensors) usize {
+        if (self.metadata_only_file_size > 0) return self.metadata_only_file_size;
         return self.buffer.mapped_data.len;
     }
 
@@ -241,6 +244,75 @@ pub const SafeTensors = struct {
     pub fn tensorCount(self: *const SafeTensors) usize {
         return self.entries.count();
     }
+
+    /// Load only tensor metadata (names, dtypes, shapes) without memory-mapping
+    /// the weight data. Useful when only config/dtype detection is needed.
+    /// Tensors returned by getTensor() will have dtype/shape but data_ptr = undefined.
+    pub fn loadMetadataOnly(allocator: std.mem.Allocator, path: []const u8) !SafeTensors {
+        var st_file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer st_file.close();
+
+        const file_stat = try st_file.stat();
+        if (file_stat.size < 8) return error.InvalidFile;
+        const file_size: usize = @intCast(file_stat.size);
+
+        // Read header size (8 bytes)
+        var header_size_buf: [8]u8 = undefined;
+        const read_len = try st_file.readAll(&header_size_buf);
+        if (read_len != 8) return error.IncompleteRead;
+
+        const max_header_bytes: usize = 10 * 1024 * 1024;
+        const header_bytes = std.mem.readInt(u64, &header_size_buf, .little);
+        if (header_bytes > @as(u64, max_header_bytes)) return error.InvalidHeader;
+        const header_size: usize = @intCast(header_bytes);
+
+        // Read header JSON
+        const header_buf = try allocator.alloc(u8, header_size);
+        defer allocator.free(header_buf);
+        const header_read = try st_file.readAll(header_buf);
+        if (header_read != header_size) return error.IncompleteRead;
+
+        var parsed_json = json.parseValue(allocator, header_buf, .{ .max_size_bytes = max_header_bytes }) catch |err| {
+            return switch (err) {
+                error.InputTooLarge => error.InvalidHeader,
+                error.InputTooDeep => error.InvalidHeader,
+                error.StringTooLong => error.InvalidHeader,
+                error.InvalidJson => error.InvalidHeader,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
+        defer parsed_json.deinit();
+
+        if (parsed_json.value != .object) return error.InvalidHeader;
+
+        var safetensors = SafeTensors{
+            .allocator = allocator,
+            .buffer = .{ .mapped_data = @as([]align(std.heap.page_size_min) u8, &.{}) },
+            .data_start = 0,
+            .metadata_only_file_size = file_size,
+        };
+
+        var entry_iter = parsed_json.value.object.iterator();
+        while (entry_iter.next()) |kv| {
+            const tensor_name = kv.key_ptr.*;
+            const meta = kv.value_ptr.*;
+            if (meta != .object) continue;
+
+            const entry_dtype = parseDType(meta.object.get("dtype") orelse continue) orelse continue;
+            const shape = try parseShape(allocator, meta.object.get("shape") orelse continue);
+            errdefer allocator.free(shape);
+
+            const stored_name = try allocator.dupe(u8, tensor_name);
+            try safetensors.entries.put(allocator, stored_name, .{
+                .dtype = entry_dtype,
+                .shape = shape,
+                .data = &.{},
+            });
+        }
+
+        return safetensors;
+    }
+
 };
 
 /// Parse SafeTensors dtype string to internal DType.

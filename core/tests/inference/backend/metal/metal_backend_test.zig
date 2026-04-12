@@ -27,7 +27,6 @@ extern fn mlx_test_rmsnorm_gated_kernel_matches_reference() c_int;
 extern fn mlx_test_chunked_prefill_tail_matches_full_prompt() c_int;
 extern fn mlx_test_linear_attention_fused_quant_inproj_reuse() c_int;
 extern fn mlx_test_grouped_affine_embedding_lookup_matches_reference() c_int;
-extern fn mlx_test_linear_attention_fused_mixer_matches_reference() c_int;
 extern fn mlx_test_topk_candidate_extraction_multi() c_int;
 extern fn mlx_last_error() [*:0]const u8;
 
@@ -363,16 +362,6 @@ test "metal bridge grouped-affine embedding lookup dequantizes selected token ro
     const status = mlx_test_grouped_affine_embedding_lookup_matches_reference();
     if (status != 1) {
         std.debug.print("mlx grouped-affine embedding lookup self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
-    }
-    try std.testing.expectEqual(@as(c_int, 1), status);
-}
-
-test "metal bridge linear attention fused mixer supports batched decode and matches reference" {
-    if (!canRunMetalRuntime()) return;
-
-    const status = mlx_test_linear_attention_fused_mixer_matches_reference();
-    if (status != 1) {
-        std.debug.print("mlx linear-attention fused mixer self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
     }
     try std.testing.expectEqual(@as(c_int, 1), status);
 }

@@ -145,11 +145,16 @@ pub fn loadWeightMap(
     var name_resolver: NameResolver = .{};
     defer name_resolver.deinit(allocator);
 
+    // First pass: load all specs, deferring required checks.
+    // This allows fused tensors (loaded via aliases) to be split
+    // before missing-weight errors are raised for their components.
     for (specs) |spec| {
+        var deferred_spec = spec;
+        deferred_spec.required = false;
         if (try loadWeightBySpec(
             allocator,
             safetensors,
-            spec,
+            deferred_spec,
             weight_prefixes,
             layer_idx,
             model_config,
@@ -158,6 +163,152 @@ pub fn loadWeightMap(
         )) |weight| {
             try map.put(allocator, spec.id, weight);
         }
+    }
+
+    // When the checkpoint has fused gate_up_proj (loaded via alias as gate_proj),
+    // store it under the fused key AND split into separate gate + up.
+    if (map.get("mlp.up_proj.weight") == null) {
+        if (map.get("mlp.gate_proj.weight")) |fused| {
+            if (fused.n_dims == 2 and fused.shape[0] > 0 and @mod(@as(usize, @intCast(fused.shape[0])), 2) == 0) {
+                const half_rows = @divExact(@as(usize, @intCast(fused.shape[0])), 2);
+                const cols: usize = @intCast(fused.shape[1]);
+                const bytes_per_row = fused.data_size / @as(usize, @intCast(fused.shape[0]));
+
+                // Keep the fused tensor under the gate_up_proj key for runtimes that support it.
+                log.debug("load", "Splitting fused gate_up_proj", .{
+                    .layer = layer_idx,
+                    .total_rows = fused.shape[0],
+                    .half_rows = @as(i64, @intCast(half_rows)),
+                }, @src());
+                try map.put(allocator, "mlp.gate_up_proj.weight", fused);
+
+                // Split into separate gate + up for runtimes that expect individual weights.
+                const gate_ptr = try allocator.create(tensor.Tensor);
+                gate_ptr.* = fused.*;
+                gate_ptr.shape[0] = @intCast(half_rows);
+                gate_ptr.numel = half_rows * cols;
+                gate_ptr.data_size = half_rows * bytes_per_row;
+                try map.put(allocator, "mlp.gate_proj.weight", gate_ptr);
+
+                const up_ptr = try allocator.create(tensor.Tensor);
+                up_ptr.* = fused.*;
+                up_ptr.shape[0] = @intCast(half_rows);
+                up_ptr.numel = half_rows * cols;
+                up_ptr.data_size = half_rows * bytes_per_row;
+                if (fused.data_ptr) |base| {
+                    up_ptr.data_ptr = base + half_rows * bytes_per_row;
+                }
+                try map.put(allocator, "mlp.up_proj.weight", up_ptr);
+            }
+        }
+    }
+
+    // When fused qkv_proj is loaded (as its own spec), split into individual
+    // Q/K/V. The split dequantizes to the orient output dtype since gaffine
+    // metadata can't be trivially sliced across row boundaries.
+    if (map.get("self_attn.q_proj.weight") == null and map.get("self_attn.qkv_proj.weight") != null) {
+        if (map.get("self_attn.qkv_proj.weight")) |fused| {
+            if (fused.n_dims == 2) {
+                // The oriented fused tensor has output_features as shape[0].
+                // For gaffine, orient expands packed cols to real cols in metadata
+                // but shape[1] remains packed. Use data_size for byte math.
+                const total_out: usize = @intCast(fused.shape[0]);
+                const num_kv_heads: usize = if (model_config.n_kv_groups > 0 and model_config.n_heads > 0)
+                    @divExact(@as(usize, @intCast(model_config.n_heads)), @as(usize, @intCast(model_config.n_kv_groups)))
+                else
+                    0;
+                const kv_out: usize = if (num_kv_heads > 0 and model_config.head_dim > 0)
+                    num_kv_heads * @as(usize, @intCast(model_config.head_dim))
+                else
+                    0;
+                if (kv_out > 0 and total_out > 2 * kv_out) {
+                    const q_out = total_out - 2 * kv_out;
+                    const cols: usize = @intCast(fused.shape[1]);
+                    const bpr = fused.data_size / total_out;
+
+                    // Split gaffine scales/biases along rows too.
+                    const ga = fused.gaffine;
+                    const sbpr: usize = if (ga) |g| g.scales.len / total_out else 0;
+                    const bbpr: usize = if (ga) |g| g.biases.len / total_out else 0;
+
+                    const q_ptr = try allocator.create(tensor.Tensor);
+                    q_ptr.* = fused.*;
+                    q_ptr.shape[0] = @intCast(q_out);
+                    q_ptr.numel = q_out * cols;
+                    q_ptr.data_size = q_out * bpr;
+                    if (ga) |g| {
+                        q_ptr.gaffine = .{
+                            .scales = g.scales[0 .. q_out * sbpr],
+                            .biases = g.biases[0 .. q_out * bbpr],
+                            .group_size = g.group_size,
+                            .scales_dtype = g.scales_dtype,
+                        };
+                    }
+                    try map.put(allocator, "self_attn.q_proj.weight", q_ptr);
+
+                    const k_ptr = try allocator.create(tensor.Tensor);
+                    k_ptr.* = fused.*;
+                    k_ptr.shape[0] = @intCast(kv_out);
+                    k_ptr.numel = kv_out * cols;
+                    k_ptr.data_size = kv_out * bpr;
+                    if (fused.data_ptr) |base| {
+                        k_ptr.data_ptr = base + q_out * bpr;
+                    }
+                    if (ga) |g| {
+                        k_ptr.gaffine = .{
+                            .scales = g.scales[q_out * sbpr ..][0 .. kv_out * sbpr],
+                            .biases = g.biases[q_out * bbpr ..][0 .. kv_out * bbpr],
+                            .group_size = g.group_size,
+                            .scales_dtype = g.scales_dtype,
+                        };
+                    }
+                    try map.put(allocator, "self_attn.k_proj.weight", k_ptr);
+
+                    const v_ptr = try allocator.create(tensor.Tensor);
+                    v_ptr.* = fused.*;
+                    v_ptr.shape[0] = @intCast(kv_out);
+                    v_ptr.numel = kv_out * cols;
+                    v_ptr.data_size = kv_out * bpr;
+                    if (fused.data_ptr) |base| {
+                        v_ptr.data_ptr = base + (q_out + kv_out) * bpr;
+                    }
+                    if (ga) |g| {
+                        v_ptr.gaffine = .{
+                            .scales = g.scales[(q_out + kv_out) * sbpr ..][0 .. kv_out * sbpr],
+                            .biases = g.biases[(q_out + kv_out) * bbpr ..][0 .. kv_out * bbpr],
+                            .group_size = g.group_size,
+                            .scales_dtype = g.scales_dtype,
+                        };
+                    }
+                    try map.put(allocator, "self_attn.v_proj.weight", v_ptr);
+                }
+            }
+        }
+    }
+
+    // Second pass: check required specs are present.
+    const has_fused_gate_up = map.contains("mlp.gate_up_proj.weight");
+    const has_fused_qkv = map.contains("self_attn.qkv_proj.weight");
+    for (specs) |spec| {
+        if (!spec.required) continue;
+        if (map.get(spec.id) != null) continue;
+
+        // Fused gate_up covers individual up.
+        if (has_fused_gate_up) {
+            if (std.mem.eql(u8, spec.id, "mlp.up_proj.weight")) continue;
+        }
+        // Fused qkv covers individual q, k and v.
+        if (has_fused_qkv) {
+            if (std.mem.eql(u8, spec.id, "self_attn.q_proj.weight") or
+                std.mem.eql(u8, spec.id, "self_attn.k_proj.weight") or
+                std.mem.eql(u8, spec.id, "self_attn.v_proj.weight")) continue;
+        }
+
+        log.err("load", "Missing required weight", .{
+            .id = spec.id,
+            .layer = layer_idx,
+        }, @src());
+        return error.MissingWeight;
     }
 
     return map;

@@ -279,10 +279,10 @@ bool combine_linear_in_proj_weights(LayerWeights* lw) {
             lw->lin_in_proj_ba_rhs.ndim() == 2 &&
             lw->lin_in_proj_qkvz_rhs.shape(0) == lw->lin_in_proj_ba_rhs.shape(0))
         {
-            lw->lin_in_proj_all_rhs = stop_gradient(copy(concatenate(
+            lw->lin_in_proj_all_rhs = stop_gradient(concatenate(
                 {lw->lin_in_proj_qkvz_rhs, lw->lin_in_proj_ba_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -299,22 +299,50 @@ bool combine_linear_in_proj_weights(LayerWeights* lw) {
         lw->lin_in_proj_ba_q_biases.ndim() == 2 &&
         lw->lin_in_proj_qkvz_q_biases.shape(1) == lw->lin_in_proj_ba_q_biases.shape(1))
     {
-        lw->lin_in_proj_all_q_w = stop_gradient(copy(concatenate(
+        lw->lin_in_proj_all_q_w = stop_gradient(concatenate(
             {lw->lin_in_proj_qkvz_q_w, lw->lin_in_proj_ba_q_w},
             0
-        )));
-        lw->lin_in_proj_all_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->lin_in_proj_all_q_scales = stop_gradient(concatenate(
             {lw->lin_in_proj_qkvz_q_scales, lw->lin_in_proj_ba_q_scales},
             0
-        )));
-        lw->lin_in_proj_all_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->lin_in_proj_all_q_biases = stop_gradient(concatenate(
             {lw->lin_in_proj_qkvz_q_biases, lw->lin_in_proj_ba_q_biases},
             0
-        )));
+        ));
         lw->lin_in_proj_all_has_q = true;
     }
 
     return lw->lin_in_proj_all_has_q || lw->lin_in_proj_all_rhs.size() > 1;
+}
+
+void compact_linear_in_proj_weights(LayerWeights* lw) {
+    if (lw == nullptr) return;
+    if (!lw->lin_in_proj_all_has_q && lw->lin_in_proj_all_rhs.size() <= 1) return;
+
+    // Clear individual qkvz/ba weights — the combined all_* version is used.
+    // NOTE: the combined arrays were created via concatenate()+copy() and may
+    // still hold lazy graph references to the originals. MLX ref-counting
+    // keeps the underlying buffers alive until the combined arrays are
+    // evaluated, so this only frees our C++ array handles, not the Metal
+    // buffers. The real memory savings happen after the first forward pass
+    // materializes the combined arrays and releases the graph references.
+    lw->lin_in_proj_qkvz_rhs = array(0.0f);
+    lw->lin_in_proj_ba_rhs = array(0.0f);
+    lw->lin_in_proj_qkvz_q_w = array(0.0f);
+    lw->lin_in_proj_qkvz_q_scales = array(0.0f);
+    lw->lin_in_proj_qkvz_q_biases = array(0.0f);
+    lw->lin_in_proj_qkvz_has_q = false;
+    lw->lin_in_proj_ba_q_w = array(0.0f);
+    lw->lin_in_proj_ba_q_scales = array(0.0f);
+    lw->lin_in_proj_ba_q_biases = array(0.0f);
+    lw->lin_in_proj_ba_has_q = false;
+    // Also clear individual separate projections if they exist.
+    lw->lin_in_proj_qkv_rhs = array(0.0f);
+    lw->lin_in_proj_z_rhs = array(0.0f);
+    lw->lin_in_proj_a_rhs = array(0.0f);
+    lw->lin_in_proj_b_rhs = array(0.0f);
 }
 
 bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
@@ -325,10 +353,10 @@ bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
             lw->moe_shared_up_rhs.ndim() == 2 &&
             lw->moe_shared_gate_rhs.shape(0) == lw->moe_shared_up_rhs.shape(0))
         {
-            lw->moe_shared_gate_up_rhs = stop_gradient(copy(concatenate(
+            lw->moe_shared_gate_up_rhs = stop_gradient(concatenate(
                 {lw->moe_shared_gate_rhs, lw->moe_shared_up_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -344,18 +372,18 @@ bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
         lw->moe_shared_up_q_biases.ndim() == 2 &&
         lw->moe_shared_gate_q_biases.shape(1) == lw->moe_shared_up_q_biases.shape(1))
     {
-        lw->moe_shared_gate_up_q_w = stop_gradient(copy(concatenate(
+        lw->moe_shared_gate_up_q_w = stop_gradient(concatenate(
             {lw->moe_shared_gate_q_w, lw->moe_shared_up_q_w},
             0
-        )));
-        lw->moe_shared_gate_up_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->moe_shared_gate_up_q_scales = stop_gradient(concatenate(
             {lw->moe_shared_gate_q_scales, lw->moe_shared_up_q_scales},
             0
-        )));
-        lw->moe_shared_gate_up_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->moe_shared_gate_up_q_biases = stop_gradient(concatenate(
             {lw->moe_shared_gate_q_biases, lw->moe_shared_up_q_biases},
             0
-        )));
+        ));
         lw->moe_shared_gate_up_has_q = true;
     }
 
@@ -378,10 +406,10 @@ bool combine_dense_mlp_gate_up_weights(LayerWeights* lw) {
             lw->mlp_up_rhs.ndim() == 2 &&
             lw->mlp_gate_rhs.shape(0) == lw->mlp_up_rhs.shape(0))
         {
-            lw->mlp_gate_up_rhs = stop_gradient(copy(concatenate(
+            lw->mlp_gate_up_rhs = stop_gradient(concatenate(
                 {lw->mlp_gate_rhs, lw->mlp_up_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -397,18 +425,18 @@ bool combine_dense_mlp_gate_up_weights(LayerWeights* lw) {
         lw->mlp_up_q_biases.ndim() == 2 &&
         lw->mlp_gate_q_biases.shape(1) == lw->mlp_up_q_biases.shape(1))
     {
-        lw->mlp_gate_up_q_w = stop_gradient(copy(concatenate(
+        lw->mlp_gate_up_q_w = stop_gradient(concatenate(
             {lw->mlp_gate_q_w, lw->mlp_up_q_w},
             0
-        )));
-        lw->mlp_gate_up_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->mlp_gate_up_q_scales = stop_gradient(concatenate(
             {lw->mlp_gate_q_scales, lw->mlp_up_q_scales},
             0
-        )));
-        lw->mlp_gate_up_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->mlp_gate_up_q_biases = stop_gradient(concatenate(
             {lw->mlp_gate_q_biases, lw->mlp_up_q_biases},
             0
-        )));
+        ));
         lw->mlp_gate_up_has_q = true;
     }
 
@@ -464,10 +492,10 @@ bool combine_full_attention_qkv_weights(LayerWeights* lw) {
             lw->attn_q_rhs.shape(0) == lw->attn_k_rhs.shape(0) &&
             lw->attn_q_rhs.shape(0) == lw->attn_v_rhs.shape(0))
         {
-            lw->attn_qkv_rhs = stop_gradient(copy(concatenate(
+            lw->attn_qkv_rhs = stop_gradient(concatenate(
                 {lw->attn_q_rhs, lw->attn_k_rhs, lw->attn_v_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -490,18 +518,18 @@ bool combine_full_attention_qkv_weights(LayerWeights* lw) {
         lw->attn_q_q_biases.shape(1) == lw->attn_k_q_biases.shape(1) &&
         lw->attn_q_q_biases.shape(1) == lw->attn_v_q_biases.shape(1))
     {
-        lw->attn_qkv_q_w = stop_gradient(copy(concatenate(
+        lw->attn_qkv_q_w = stop_gradient(concatenate(
             {lw->attn_q_q_w, lw->attn_k_q_w, lw->attn_v_q_w},
             0
-        )));
-        lw->attn_qkv_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->attn_qkv_q_scales = stop_gradient(concatenate(
             {lw->attn_q_q_scales, lw->attn_k_q_scales, lw->attn_v_q_scales},
             0
-        )));
-        lw->attn_qkv_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->attn_qkv_q_biases = stop_gradient(concatenate(
             {lw->attn_q_q_biases, lw->attn_k_q_biases, lw->attn_v_q_biases},
             0
-        )));
+        ));
         lw->attn_qkv_has_q = true;
     }
 
@@ -671,138 +699,7 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
     );
 }
 
-thread_local size_t g_ssm_fused_q_count = 0;
-thread_local size_t g_ssm_fused_bf16_count = 0;
-thread_local size_t g_ssm_reference_count = 0;
-thread_local bool g_ssm_fused_diag_logged = false;
-
 array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
-    LayerWeights& lw = ctx->layers[static_cast<size_t>(layer_idx)];
-    const int B = x_norm.shape(0);
-    const int S = x_norm.shape(1);
-    const bool enable_fused_linear = env_truthy("TALU_METAL_FUSED_GATED_DELTA", false);
-    const bool single_token_decode = S == 1;
-    if (enable_fused_linear &&
-        !lw.lin_in_proj_all_has_q &&
-        lw.lin_in_proj_qkvz_has_q &&
-        lw.lin_in_proj_ba_has_q)
-    {
-        combine_linear_in_proj_weights(&lw);
-    }
-    if (enable_fused_linear &&
-        lw.lin_in_proj_all_rhs.size() <= 1 &&
-        lw.lin_in_proj_qkvz_rhs.size() > 1 &&
-        lw.lin_in_proj_ba_rhs.size() > 1)
-    {
-        combine_linear_in_proj_weights(&lw);
-    }
-
-    const bool same_head_dim = lw.lin_head_k_dim == lw.lin_head_v_dim;
-    const bool fused_tensor_shapes_ok =
-        lw.lin_conv1d_decode_w.ndim() == 3 &&
-        lw.lin_conv1d_decode_w.shape(0) == 1 &&
-        lw.lin_conv1d_decode_w.shape(1) == lw.lin_conv_kernel &&
-        lw.lin_conv1d_decode_w.shape(2) == lw.lin_conv_dim &&
-        lw.lin_A_log.ndim() == 1 &&
-        lw.lin_A_log.shape(0) == lw.lin_num_v_heads &&
-        lw.lin_dt_bias.ndim() == 1 &&
-        lw.lin_dt_bias.shape(0) == lw.lin_num_v_heads &&
-        lw.lin_norm_w.ndim() == 1 &&
-        (lw.lin_norm_w.shape(0) == lw.lin_head_v_dim || lw.lin_norm_w.shape(0) == lw.lin_value_dim);
-    const bool can_use_quantized_fused =
-        enable_fused_linear &&
-        single_token_decode &&
-        same_head_dim &&
-        fused_tensor_shapes_ok &&
-        !lw.lin_fused_unavailable &&
-        ctx->state_space_cache != nullptr &&
-        lw.lin_in_proj_all_has_q &&
-        lw.lin_out_proj_has_q;
-    if (can_use_quantized_fused) {
-        try {
-            auto result = *static_cast<array*>(mlx_lazy_gated_delta_mixer_quantized(
-                &x_norm,
-                &lw.lin_in_proj_all_q_w,
-                &lw.lin_in_proj_all_q_scales,
-                &lw.lin_in_proj_all_q_biases,
-                &lw.lin_conv1d_decode_w,
-                nullptr,
-                &lw.lin_A_log,
-                &lw.lin_dt_bias,
-                &lw.lin_norm_w,
-                &lw.lin_out_proj_q_w,
-                &lw.lin_out_proj_q_scales,
-                &lw.lin_out_proj_q_biases,
-                static_cast<size_t>(ctx->cfg.quant_group_size),
-                static_cast<size_t>(ctx->cfg.quant_bits),
-                ctx->state_space_cache,
-                static_cast<size_t>(layer_idx),
-                static_cast<size_t>(lw.lin_conv_kernel),
-                static_cast<size_t>(lw.lin_num_v_heads),
-                static_cast<size_t>(lw.lin_num_k_heads),
-                static_cast<size_t>(lw.lin_head_v_dim)
-            ));
-            g_ssm_fused_q_count += 1;
-            return result;
-        } catch (const std::exception&) {
-            lw.lin_fused_unavailable = true;
-        }
-    }
-
-    const bool can_use_dense_fused =
-        enable_fused_linear &&
-        single_token_decode &&
-        same_head_dim &&
-        fused_tensor_shapes_ok &&
-        !lw.lin_fused_unavailable &&
-        ctx->state_space_cache != nullptr &&
-        lw.lin_in_proj_all_rhs.size() > 1 &&
-        lw.lin_out_proj_rhs.size() > 1;
-    if (can_use_dense_fused) {
-        try {
-            auto result = *static_cast<array*>(mlx_lazy_gated_delta_mixer_bf16(
-                &x_norm,
-                &lw.lin_in_proj_all_rhs,
-                &lw.lin_conv1d_decode_w,
-                nullptr,
-                &lw.lin_A_log,
-                &lw.lin_dt_bias,
-                &lw.lin_norm_w,
-                &lw.lin_out_proj_rhs,
-                ctx->state_space_cache,
-                static_cast<size_t>(layer_idx),
-                static_cast<size_t>(lw.lin_conv_kernel),
-                static_cast<size_t>(lw.lin_num_v_heads),
-                static_cast<size_t>(lw.lin_num_k_heads),
-                static_cast<size_t>(lw.lin_head_v_dim)
-            ));
-            g_ssm_fused_bf16_count += 1;
-            return result;
-        } catch (const std::exception&) {
-            lw.lin_fused_unavailable = true;
-        }
-    }
-
-    // Log the first reference fallback with the failing predicates.
-    if (!g_ssm_fused_diag_logged && single_token_decode) {
-        g_ssm_fused_diag_logged = true;
-        std::fprintf(stderr,
-            "[mlx][ssm] fused decode rejected for layer %d: "
-            "enable=%d B=%d S1=%d same_hd=%d shapes=%d cache=%d "
-            "all_q=%d out_q=%d unavail=%d\n",
-            layer_idx,
-            enable_fused_linear ? 1 : 0,
-            B,
-            single_token_decode ? 1 : 0,
-            same_head_dim ? 1 : 0,
-            fused_tensor_shapes_ok ? 1 : 0,
-            ctx->state_space_cache != nullptr ? 1 : 0,
-            lw.lin_in_proj_all_has_q ? 1 : 0,
-            lw.lin_out_proj_has_q ? 1 : 0,
-            lw.lin_fused_unavailable ? 1 : 0);
-        std::fflush(stderr);
-    }
-    g_ssm_reference_count += 1;
     return run_linear_attention_layer_reference(ctx, layer_idx, x_norm);
 }
 

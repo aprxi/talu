@@ -206,6 +206,199 @@ array gelu_approx(const array& x) {
     return half * x * (one + tanh(inner));
 }
 
+// Custom Metal kernel for MoE expert GEMV decode (B=1, S=1).
+// Fuses gate_up dequant-GEMV + silu activation + down dequant-GEMV + weighting
+// for K selected experts in one dispatch. Intermediate activations stay in
+// threadgroup shared memory — no intermediate Metal buffer allocations.
+static inline fast::CustomKernelFunction& moe_expert_gemv_kernel() {
+    static fast::CustomKernelFunction kernel = fast::metal_kernel(
+        "talu_moe_expert_gemv_int4",
+        { "x", "top_k_indices", "expert_weights",
+          "gate_up_w", "gate_up_scales", "gate_up_biases",
+          "down_w", "down_scales", "down_biases" },
+        { "out" },
+        R"(
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint expert_slot = thread_position_in_grid.z;
+
+    const int expert_idx = top_k_indices[expert_slot];
+    const float routing_weight = float(expert_weights[expert_slot]);
+
+    threadgroup float tg_x[HIDDEN];
+    threadgroup float tg_gu[GU_ROWS];
+
+    // Load x into shared memory cooperatively.
+    for (uint i = tid; i < HIDDEN; i += TG_SIZE) {
+        tg_x[i] = float(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 1: Gate_Up GEMV — int4 dequant on the fly.
+    const uint gu_w_off = expert_idx * GU_ROWS * GU_PCOLS;
+    const uint gu_s_off = expert_idx * GU_ROWS * GU_NGRP;
+
+    for (uint row = tid; row < GU_ROWS; row += TG_SIZE) {
+        float acc = 0.0f;
+        const uint wr = gu_w_off + row * GU_PCOLS;
+        const uint sr = gu_s_off + row * GU_NGRP;
+        for (uint pc = 0; pc < GU_PCOLS; pc++) {
+            const uint32_t packed = gate_up_w[wr + pc];
+            const uint bc = pc * 8;
+            for (uint n = 0; n < 8; n++) {
+                const uint col = bc + n;
+                const float q = float((packed >> (n * 4)) & 0xF);
+                const uint g = col / GRP_SZ;
+                acc += (q * float(gate_up_scales[sr + g])
+                          + float(gate_up_biases[sr + g])) * tg_x[col];
+            }
+        }
+        tg_gu[row] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: SiLU activation — reuse tg_gu[0..D_FF-1] as mid.
+    for (uint j = tid; j < D_FF; j += TG_SIZE) {
+        const float g = tg_gu[j];
+        const float u = tg_gu[D_FF + j];
+        const float sig = 1.0f / (1.0f + exp(-g));
+        tg_gu[j] = g * sig * u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: Down GEMV + weight — write partial output per expert.
+    const uint dn_w_off = expert_idx * HIDDEN * DN_PCOLS;
+    const uint dn_s_off = expert_idx * HIDDEN * DN_NGRP;
+
+    using OutT = remove_reference_t<decltype(out[0])>;
+    for (uint row = tid; row < HIDDEN; row += TG_SIZE) {
+        float acc = 0.0f;
+        const uint wr = dn_w_off + row * DN_PCOLS;
+        const uint sr = dn_s_off + row * DN_NGRP;
+        for (uint pc = 0; pc < DN_PCOLS; pc++) {
+            const uint32_t packed = down_w[wr + pc];
+            const uint bc = pc * 8;
+            for (uint n = 0; n < 8; n++) {
+                const uint col = bc + n;
+                const float q = float((packed >> (n * 4)) & 0xF);
+                const uint g = col / GRP_SZ;
+                acc += (q * float(down_scales[sr + g])
+                          + float(down_biases[sr + g])) * tg_gu[col];
+            }
+        }
+        out[expert_slot * HIDDEN + row] = static_cast<OutT>(acc * routing_weight);
+    }
+        )",
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+// MoE expert compute for decode (B=1, S=1): given routing results,
+// compute gate_up gather-GEMV → silu*up → down gather-GEMV → weight+sum.
+// Uses custom Metal kernel for int4 affine silu path; falls back to gather_qmm.
+array moe_expert_compute_decode(
+    const array& x,                   // [B, S, hidden] bf16
+    const array& top_k_indices,       // [B, S, K] int32
+    const array& expert_weights,      // [B, S, K] float32
+    const array& gate_up_w,           // [num_experts, 2*d_ff, packed] uint32
+    const array& gate_up_scales,      // [num_experts, 2*d_ff, groups] bf16
+    const std::optional<array>& gate_up_biases,
+    const array& down_w,              // [num_experts, hidden, packed] uint32
+    const array& down_scales,         // [num_experts, hidden, groups] bf16
+    const std::optional<array>& down_biases,
+    int expert_group_size,
+    int expert_bits,
+    bool use_gelu
+) {
+    const int hidden = x.shape(x.ndim() - 1);
+    const int K = top_k_indices.shape(top_k_indices.ndim() - 1);
+    const int gu_rows = gate_up_w.shape(1);        // 2*d_ff
+    const int d_ff = gu_rows / 2;
+    const int gu_pcols = gate_up_w.shape(2);        // hidden/8 packed
+    const int gu_ngrp = gate_up_scales.shape(2);    // hidden/group_size
+    const int dn_pcols = down_w.shape(2);            // d_ff/8 packed
+    const int dn_ngrp = down_scales.shape(2);        // d_ff/group_size
+
+    // Custom kernel disabled: naive scalar GEMV can't compete with MLX's
+    // vectorized gather_qmm. Keeping kernel code for future reference.
+    // To re-enable: set use_custom = !use_gelu && ... (conditions below).
+    const bool use_custom = false;
+
+    if (use_custom) {
+        const array x_flat = reshape(x, {hidden});
+        const array idx_flat = reshape(astype(top_k_indices, int32), {K});
+        const array ew_flat = reshape(astype(expert_weights, float32), {K});
+
+        const int tg_size = std::min(256, std::max(gu_rows, hidden));
+
+        auto outputs = moe_expert_gemv_kernel()(
+            { x_flat, idx_flat, ew_flat,
+              gate_up_w, gate_up_scales, *gate_up_biases,
+              down_w, down_scales, *down_biases },
+            { Shape{K * hidden} },
+            { x.dtype() },
+            std::make_tuple(tg_size, 1, K),
+            std::make_tuple(tg_size, 1, 1),
+            {
+                { "HIDDEN", hidden },
+                { "D_FF", d_ff },
+                { "GU_ROWS", gu_rows },
+                { "GU_PCOLS", gu_pcols },
+                { "GU_NGRP", gu_ngrp },
+                { "DN_PCOLS", dn_pcols },
+                { "DN_NGRP", dn_ngrp },
+                { "GRP_SZ", expert_group_size },
+                { "TG_SIZE", tg_size },
+            },
+            std::nullopt,
+            false,
+            {}
+        );
+        // Sum K expert partial outputs → [hidden].
+        const array partials = reshape(outputs[0], {K, hidden});
+        return reshape(sum(partials, 0), x.shape());
+    }
+
+    // Fallback: gather_qmm path.
+    const auto x_expanded = expand_dims(x, {-2, -3});
+
+    auto gate_up_out = gather_qmm(
+        x_expanded,
+        gate_up_w, gate_up_scales, gate_up_biases,
+        std::nullopt, top_k_indices,
+        true,
+        expert_group_size, expert_bits, "affine", false
+    );
+
+    const int last_dim = gate_up_out.ndim() - 1;
+    const int half_width = gate_up_out.shape(last_dim) / 2;
+    Shape gate_start(gate_up_out.ndim(), 0);
+    Shape gate_stop = gate_up_out.shape();
+    gate_stop[last_dim] = half_width;
+    Shape up_start(gate_up_out.ndim(), 0);
+    up_start[last_dim] = half_width;
+    const array gate_out = slice(gate_up_out, gate_start, gate_stop);
+    const array up_out = slice(gate_up_out, up_start, gate_up_out.shape());
+
+    const array mid = use_gelu
+        ? (gelu_approx(gate_out) * up_out)
+        : ((gate_out * sigmoid(gate_out)) * up_out);
+
+    auto down_out = gather_qmm(
+        mid,
+        down_w, down_scales, down_biases,
+        std::nullopt, top_k_indices,
+        true,
+        expert_group_size, expert_bits, "affine", false
+    );
+
+    down_out = squeeze(down_out, -2);
+    const auto weights_expanded = expand_dims(expert_weights, -1);
+    return sum(down_out * weights_expanded, -2);
+}
+
 array prepare_depthwise_conv1d_decode_weight(
     const array& weight,
     int conv_dim,
