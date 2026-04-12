@@ -2750,6 +2750,72 @@ pub fn tryFusedNvfp4GateUpSiluForward(
     return true;
 }
 
+pub fn tryFusedNvfp4GateUpGeluForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+    expected_out_dim: u32,
+) !bool {
+    if (!self.loaded.config.use_gelu) return false;
+    if (rows == 0 or rows > 32) return false;
+    if (rows > 1 and !self.nvfp4_sequence_fused_gate_up_supported) return false;
+
+    const gate = switch (gate_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    if (gate.rows != up.rows) return false;
+    if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
+    if (gate.rows != self.d_model) return false;
+    if (gate.group_size == 0 or up.group_size == 0) return false;
+    if ((gate.rows % gate.group_size) != 0 or (up.rows % up.group_size) != 0) return false;
+    if (gate.scales_buffer.pointer == 0 or up.scales_buffer.pointer == 0) return false;
+    if (gate.weight_global_scale == 0.0 or up.weight_global_scale == 0.0) return false;
+
+    var fused_fn = self.nvfp4_matvec_gate_up_gelu_function orelse return false;
+    var batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.nvfp4_matvec_gate_up_gelu_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            batch_tile = 8;
+        }
+    }
+
+    const out_dim: u32 = @intCast(gate.cols);
+    const in_dim: u32 = @intCast(gate.rows);
+    const batch_rows: u32 = @intCast(rows);
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_mul_dev);
+    try self.kernel_arg_pack.appendScalar(u32, out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, gate.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, gate.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, gate.weight_global_scale);
+    try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, up.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, up.weight_global_scale);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (out_dim + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec_gate_up_silu);
+    return true;
+}
+
 pub fn tryFusedMxfp8GateUpForward(
     self: anytype,
     input: *const compute.cuda.Buffer,

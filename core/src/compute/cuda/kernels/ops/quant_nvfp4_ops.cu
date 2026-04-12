@@ -111,16 +111,17 @@ static __device__ __forceinline__ void nvfp4_lut_init(float* lut, unsigned int t
 }
 
 // Process one NVFP4 word (4 bytes = 8 nibbles) against 2 float4 inputs.
-// Uses shared memory LUT for branchless FP4 decode.
-#define NVFP4_PROCESS_WORD(word, inp0, inp1, acc, lut) do { \
-    (acc) = fmaf((inp0).x, (lut)[(word) & 0xFu], (acc)); \
-    (acc) = fmaf((inp0).y, (lut)[((word) >> 4) & 0xFu], (acc)); \
-    (acc) = fmaf((inp0).z, (lut)[((word) >> 8) & 0xFu], (acc)); \
-    (acc) = fmaf((inp0).w, (lut)[((word) >> 12) & 0xFu], (acc)); \
-    (acc) = fmaf((inp1).x, (lut)[((word) >> 16) & 0xFu], (acc)); \
-    (acc) = fmaf((inp1).y, (lut)[((word) >> 20) & 0xFu], (acc)); \
-    (acc) = fmaf((inp1).z, (lut)[((word) >> 24) & 0xFu], (acc)); \
-    (acc) = fmaf((inp1).w, (lut)[(word) >> 28], (acc)); \
+// Uses shared memory LUT for fast FP4 decode with 2-way ILP accumulators
+// (r0/r1) to halve the FMA dependency chain depth vs single-accumulator.
+#define NVFP4_PROCESS_WORD(word, inp0, inp1, r0, r1, lut) do { \
+    (r0) = fmaf((inp0).x, (lut)[(word) & 0xFu], (r0)); \
+    (r1) = fmaf((inp0).y, (lut)[((word) >> 4) & 0xFu], (r1)); \
+    (r0) = fmaf((inp0).z, (lut)[((word) >> 8) & 0xFu], (r0)); \
+    (r1) = fmaf((inp0).w, (lut)[((word) >> 12) & 0xFu], (r1)); \
+    (r0) = fmaf((inp1).x, (lut)[((word) >> 16) & 0xFu], (r0)); \
+    (r1) = fmaf((inp1).y, (lut)[((word) >> 20) & 0xFu], (r1)); \
+    (r0) = fmaf((inp1).z, (lut)[((word) >> 24) & 0xFu], (r0)); \
+    (r1) = fmaf((inp1).w, (lut)[(word) >> 28], (r1)); \
 } while (0)
 
 // ---------------------------------------------------------------------------
@@ -252,6 +253,7 @@ extern "C" __global__ void talu_dequant_nvfp4_to_bf16(
 
 // Inner-batch NVFP4 GEMV: vectorized 64-bit weight loads + float4 input loads.
 // Each iteration processes 2 u32 words = 16 FP4 elements = 1 scale group (group_size=16).
+// Uses 2-way ILP accumulators per word to halve FMA dependency chain depth.
 // Scale is applied once per group via post-multiply on the accumulated partial.
 // Requires: group_size == 16, in_dim % 16 == 0.
 template <unsigned int BATCH>
@@ -294,23 +296,23 @@ static __device__ __forceinline__ void talu_nvfp4_matvec_batched(
             if (b >= batch_rows) break;
             const unsigned long long row_off = (unsigned long long)b * in_dim;
 
-            float partial = 0.0f;
+            float r0 = 0.0f, r1 = 0.0f;
 
             // Phase 1: w0 (elements 0-7)
             {
                 const float4 i0 = *reinterpret_cast<const float4*>(&input[row_off + base_elem]);
                 const float4 i1 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 4]);
-                NVFP4_PROCESS_WORD(w0, i0, i1, partial, fp4_lut);
+                NVFP4_PROCESS_WORD(w0, i0, i1, r0, r1, fp4_lut);
             }
 
             // Phase 2: w1 (elements 8-15)
             {
                 const float4 i2 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 8]);
                 const float4 i3 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 12]);
-                NVFP4_PROCESS_WORD(w1, i2, i3, partial, fp4_lut);
+                NVFP4_PROCESS_WORD(w1, i2, i3, r0, r1, fp4_lut);
             }
 
-            acc[b] = fmaf(partial, scale, acc[b]);
+            acc[b] = fmaf(r0 + r1, scale, acc[b]);
         }
     }
 
@@ -364,7 +366,7 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_f32(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_f32_tile8(
+extern "C" __global__ __launch_bounds__(128, 4) void talu_nvfp4_matvec_f32_tile8(
     const float* __restrict__ input,
     const unsigned char* __restrict__ weight_packed,
     const unsigned char* __restrict__ scales,
@@ -505,7 +507,7 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_qkv_f32(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_qkv_f32_tile8(
+extern "C" __global__ __launch_bounds__(128, 4) void talu_nvfp4_matvec_qkv_f32_tile8(
     const float* __restrict__ input,
     const unsigned char* __restrict__ q_weight_packed,
     const unsigned char* __restrict__ q_scales,
@@ -682,7 +684,7 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_gate_up_f
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_gate_up_f32_tile8(
+extern "C" __global__ __launch_bounds__(128, 4) void talu_nvfp4_matvec_gate_up_f32_tile8(
     const float* __restrict__ input,
     const unsigned char* __restrict__ gate_weight_packed,
     const unsigned char* __restrict__ gate_scales,
@@ -819,26 +821,26 @@ static __device__ __forceinline__ void talu_nvfp4_gate_up_silu_batched(
             if (b >= batch_rows) break;
             const unsigned long long row_off = (unsigned long long)b * in_dim;
 
-            float gp = 0.0f, up_p = 0.0f;
+            float gr0 = 0.0f, gr1 = 0.0f, ur0 = 0.0f, ur1 = 0.0f;
 
             // Phase 1: first 8 elements (word 0)
             {
                 const float4 i0 = *reinterpret_cast<const float4*>(&input[row_off + base_elem]);
                 const float4 i1 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 4]);
-                NVFP4_PROCESS_WORD(gw0, i0, i1, gp, fp4_lut);
-                NVFP4_PROCESS_WORD(uw0, i0, i1, up_p, fp4_lut);
+                NVFP4_PROCESS_WORD(gw0, i0, i1, gr0, gr1, fp4_lut);
+                NVFP4_PROCESS_WORD(uw0, i0, i1, ur0, ur1, fp4_lut);
             }
 
             // Phase 2: next 8 elements (word 1)
             {
                 const float4 i2 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 8]);
                 const float4 i3 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 12]);
-                NVFP4_PROCESS_WORD(gw1, i2, i3, gp, fp4_lut);
-                NVFP4_PROCESS_WORD(uw1, i2, i3, up_p, fp4_lut);
+                NVFP4_PROCESS_WORD(gw1, i2, i3, gr0, gr1, fp4_lut);
+                NVFP4_PROCESS_WORD(uw1, i2, i3, ur0, ur1, fp4_lut);
             }
 
-            gate_acc[b] = fmaf(gp, gs, gate_acc[b]);
-            up_acc[b] = fmaf(up_p, us, up_acc[b]);
+            gate_acc[b] = fmaf(gr0 + gr1, gs, gate_acc[b]);
+            up_acc[b] = fmaf(ur0 + ur1, us, up_acc[b]);
         }
     }
 
@@ -905,7 +907,7 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_gate_up_s
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_gate_up_silu_f32_tile8(
+extern "C" __global__ __launch_bounds__(128, 4) void talu_nvfp4_matvec_gate_up_silu_f32_tile8(
     const float* __restrict__ input,
     const unsigned char* __restrict__ gate_weight_packed,
     const unsigned char* __restrict__ gate_scales,
@@ -956,6 +958,202 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_gate_up_s
         case 6u: talu_nvfp4_gate_up_silu_batched<6>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 6u); break;
         case 7u: talu_nvfp4_gate_up_silu_batched<7>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 7u); break;
         case 8u: talu_nvfp4_gate_up_silu_batched<8>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 8u); break;
+        default: return;
+    }
+}
+
+// Fused gate+up+gelu NVFP4 GEMV: same structure as silu variant but applies
+// GELU activation instead of SiLU. Used by Gemma4 architecture.
+// GELU(x) ≈ x × σ(1.702 × x) (fast sigmoid approximation).
+template <unsigned int BATCH>
+static __device__ __forceinline__ void talu_nvfp4_gate_up_gelu_batched(
+    const float* input,
+    const unsigned char* gate_weight_packed,
+    const unsigned char* gate_scales,
+    const unsigned char* up_weight_packed,
+    const unsigned char* up_scales,
+    float* out,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int out_idx,
+    unsigned int gate_scale_cols,
+    float gate_inv_global,
+    unsigned int up_scale_cols,
+    float up_inv_global,
+    const float* fp4_lut,
+    unsigned int lane,
+    unsigned int batch_rows
+) {
+    const unsigned int gate_scale_row_off = out_idx * gate_scale_cols;
+    const unsigned int up_scale_row_off = out_idx * up_scale_cols;
+    const unsigned int* gate_words = reinterpret_cast<const unsigned int*>(gate_weight_packed);
+    const unsigned int* up_words = reinterpret_cast<const unsigned int*>(up_weight_packed);
+
+    float gate_acc[BATCH] = {};
+    float up_acc[BATCH] = {};
+
+    for (unsigned int wp = lane; wp < gate_scale_cols; wp += TALU_QUANT_WARP_SIZE) {
+        unsigned int gw0, gw1, uw0, uw1;
+        asm volatile(
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(gw0), "=r"(gw1)
+            : "l"(&gate_words[wp << 1]));
+        asm volatile(
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(uw0), "=r"(uw1)
+            : "l"(&up_words[wp << 1]));
+
+        const unsigned int base_elem = wp << 4;
+
+        const float gs = fp8e4m3_to_f32(
+            static_cast<__nv_fp8_storage_t>(gate_scales[gate_scale_row_off + wp])) * gate_inv_global;
+        const float us = fp8e4m3_to_f32(
+            static_cast<__nv_fp8_storage_t>(up_scales[up_scale_row_off + wp])) * up_inv_global;
+
+        #pragma unroll
+        for (unsigned int b = 0; b < BATCH; b++) {
+            if (b >= batch_rows) break;
+            const unsigned long long row_off = (unsigned long long)b * in_dim;
+
+            float gr0 = 0.0f, gr1 = 0.0f, ur0 = 0.0f, ur1 = 0.0f;
+
+            {
+                const float4 i0 = *reinterpret_cast<const float4*>(&input[row_off + base_elem]);
+                const float4 i1 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 4]);
+                NVFP4_PROCESS_WORD(gw0, i0, i1, gr0, gr1, fp4_lut);
+                NVFP4_PROCESS_WORD(uw0, i0, i1, ur0, ur1, fp4_lut);
+            }
+
+            {
+                const float4 i2 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 8]);
+                const float4 i3 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 12]);
+                NVFP4_PROCESS_WORD(gw1, i2, i3, gr0, gr1, fp4_lut);
+                NVFP4_PROCESS_WORD(uw1, i2, i3, ur0, ur1, fp4_lut);
+            }
+
+            gate_acc[b] = fmaf(gr0 + gr1, gs, gate_acc[b]);
+            up_acc[b] = fmaf(ur0 + ur1, us, up_acc[b]);
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int b = 0; b < BATCH; b++) {
+        if (b >= batch_rows) break;
+        const float gate = talu_quant_warp_sum_f32(gate_acc[b]);
+        const float up = talu_quant_warp_sum_f32(up_acc[b]);
+        if (lane == 0) {
+            // GELU(x) = x × Φ(x) ≈ 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
+            const float x = gate;
+            const float c = 0.7978845608f; // sqrt(2/pi)
+            const float inner = c * (x + 0.044715f * x * x * x);
+            const float gelu = 0.5f * x * (1.0f + tanhf(inner));
+            out[(unsigned long long)b * out_dim + out_idx] = gelu * up;
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_gate_up_gelu_f32(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ gate_weight_packed,
+    const unsigned char* __restrict__ gate_scales,
+    const unsigned char* __restrict__ up_weight_packed,
+    const unsigned char* __restrict__ up_scales,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int gate_scale_cols,
+    unsigned int gate_group_size,
+    float gate_weight_global_scale,
+    unsigned int up_scale_cols,
+    unsigned int up_group_size,
+    float up_weight_global_scale,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * FP8_BATCH_TILE;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE
+        ? batch_rows - batch_base : FP8_BATCH_TILE;
+    if (gate_group_size != 16u || up_group_size != 16u) return;
+    if ((in_dim & 15u) != 0u) return;
+    if (gate_weight_global_scale == 0.0f || up_weight_global_scale == 0.0f) return;
+
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const unsigned int packed_cols = (in_dim + 1u) >> 1;
+    const float g_inv = 1.0f / gate_weight_global_scale;
+    const float u_inv = 1.0f / up_weight_global_scale;
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    const unsigned char* gate_row_weight = gate_weight_packed + (unsigned long long)out_idx * packed_cols;
+    const unsigned char* up_row_weight = up_weight_packed + (unsigned long long)out_idx * packed_cols;
+
+    switch (tile_rows) {
+        case 1u: talu_nvfp4_gate_up_gelu_batched<1>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_gate_up_gelu_batched<2>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_gate_up_gelu_batched<3>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_gate_up_gelu_batched<4>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 4u); break;
+        default: return;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 4) void talu_nvfp4_matvec_gate_up_gelu_f32_tile8(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ gate_weight_packed,
+    const unsigned char* __restrict__ gate_scales,
+    const unsigned char* __restrict__ up_weight_packed,
+    const unsigned char* __restrict__ up_scales,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int gate_scale_cols,
+    unsigned int gate_group_size,
+    float gate_weight_global_scale,
+    unsigned int up_scale_cols,
+    unsigned int up_group_size,
+    float up_weight_global_scale,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * FP8_BATCH_TILE_X8;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE_X8
+        ? batch_rows - batch_base : FP8_BATCH_TILE_X8;
+    if (gate_group_size != 16u || up_group_size != 16u) return;
+    if ((in_dim & 15u) != 0u) return;
+    if (gate_weight_global_scale == 0.0f || up_weight_global_scale == 0.0f) return;
+
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const unsigned int packed_cols = (in_dim + 1u) >> 1;
+    const float g_inv = 1.0f / gate_weight_global_scale;
+    const float u_inv = 1.0f / up_weight_global_scale;
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    const unsigned char* gate_row_weight = gate_weight_packed + (unsigned long long)out_idx * packed_cols;
+    const unsigned char* up_row_weight = up_weight_packed + (unsigned long long)out_idx * packed_cols;
+
+    switch (tile_rows) {
+        case 1u: talu_nvfp4_gate_up_gelu_batched<1>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_gate_up_gelu_batched<2>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_gate_up_gelu_batched<3>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_gate_up_gelu_batched<4>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 4u); break;
+        case 5u: talu_nvfp4_gate_up_gelu_batched<5>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 5u); break;
+        case 6u: talu_nvfp4_gate_up_gelu_batched<6>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 6u); break;
+        case 7u: talu_nvfp4_gate_up_gelu_batched<7>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 7u); break;
+        case 8u: talu_nvfp4_gate_up_gelu_batched<8>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 8u); break;
         default: return;
     }
 }
@@ -1013,6 +1211,18 @@ extern "C" __global__ void talu_nvfp4_matvec_gate_up_silu_f32(
     float gate_weight_global_scale, unsigned int up_scale_cols, unsigned int up_group_size,
     float up_weight_global_scale, unsigned int batch_rows) {}
 extern "C" __global__ void talu_nvfp4_matvec_gate_up_silu_f32_tile8(
+    const float* input, const unsigned char* gate_weight_packed, const unsigned char* gate_scales,
+    const unsigned char* up_weight_packed, const unsigned char* up_scales, float* out,
+    unsigned int out_dim, unsigned int in_dim, unsigned int gate_scale_cols, unsigned int gate_group_size,
+    float gate_weight_global_scale, unsigned int up_scale_cols, unsigned int up_group_size,
+    float up_weight_global_scale, unsigned int batch_rows) {}
+extern "C" __global__ void talu_nvfp4_matvec_gate_up_gelu_f32(
+    const float* input, const unsigned char* gate_weight_packed, const unsigned char* gate_scales,
+    const unsigned char* up_weight_packed, const unsigned char* up_scales, float* out,
+    unsigned int out_dim, unsigned int in_dim, unsigned int gate_scale_cols, unsigned int gate_group_size,
+    float gate_weight_global_scale, unsigned int up_scale_cols, unsigned int up_group_size,
+    float up_weight_global_scale, unsigned int batch_rows) {}
+extern "C" __global__ void talu_nvfp4_matvec_gate_up_gelu_f32_tile8(
     const float* input, const unsigned char* gate_weight_packed, const unsigned char* gate_scales,
     const unsigned char* up_weight_packed, const unsigned char* up_scales, float* out,
     unsigned int out_dim, unsigned int in_dim, unsigned int gate_scale_cols, unsigned int gate_group_size,

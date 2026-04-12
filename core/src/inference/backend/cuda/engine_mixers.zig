@@ -3987,6 +3987,13 @@ pub fn runFfnStep(
         up_weight,
         rows,
         d_ff,
+    )) or (try engine_ops.tryFusedNvfp4GateUpGeluForward(
+        self,
+        input,
+        gate_weight,
+        up_weight,
+        rows,
+        d_ff,
     )) or (try engine_ops.tryFusedGaffineU4GateUpSiluForward(
         self,
         input,
