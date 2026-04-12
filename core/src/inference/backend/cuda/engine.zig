@@ -104,6 +104,7 @@ const resolveCudaGaffineU4DecodeI8 = engine_types.resolveCudaGaffineU4DecodeI8;
 const resolveCudaGatedDeltaSsmI8State = engine_types.resolveCudaGatedDeltaSsmI8State;
 const resolveCudaMemoryReserveBytes = engine_types.resolveCudaMemoryReserveBytes;
 const resolveCudaExternalOverheadCapBytes = engine_types.resolveCudaExternalOverheadCapBytes;
+const resolveCudaEnableStandaloneLayerScalars = engine_types.resolveCudaEnableStandaloneLayerScalars;
 const resolveCudaMaxSeqLen = engine_types.resolveCudaMaxSeqLen;
 const resolveCudaInitialKvCacheTokens = engine_types.resolveCudaInitialKvCacheTokens;
 const resolveCudaPrefillChunkRowsCap = engine_types.resolveCudaPrefillChunkRowsCap;
@@ -155,6 +156,8 @@ pub const CudaBackend = struct {
     vector_add_rows_strided_source: ?compute.cuda.registry.KernelSource = null,
     vector_add_scaled_rows_strided_function: ?compute.cuda.Function = null,
     vector_add_scaled_rows_strided_source: ?compute.cuda.registry.KernelSource = null,
+    residual_add_scaled_rows_strided_function: ?compute.cuda.Function = null,
+    residual_add_scaled_rows_strided_source: ?compute.cuda.registry.KernelSource = null,
     residual_scaled_rmsnorm_rows_strided_function: ?compute.cuda.Function = null,
     residual_scaled_rmsnorm_rows_strided_source: ?compute.cuda.registry.KernelSource = null,
     mul_function: ?compute.cuda.Function = null,
@@ -167,6 +170,7 @@ pub const CudaBackend = struct {
     cast_f32_to_f16_source: ?compute.cuda.registry.KernelSource = null,
     cast_f32_to_bf16_function: ?compute.cuda.Function = null,
     cast_f32_to_bf16_source: ?compute.cuda.registry.KernelSource = null,
+    cast_bf16_to_f32_function: ?compute.cuda.Function = null,
     embedding_lookup_f32_function: ?compute.cuda.Function = null,
     embedding_lookup_f32_source: ?compute.cuda.registry.KernelSource = null,
     embedding_lookup_u16_function: ?compute.cuda.Function = null,
@@ -533,6 +537,12 @@ pub const CudaBackend = struct {
     /// Per-layer scalar multipliers for models that have `layer_scalar` weights
     /// but no PLE (hidden_size_per_layer_input == 0). Indexed by local layer index.
     standalone_layer_scalars: ?[]f32 = null,
+    /// Layer-local marker for scalar fusion into terminal residual_add.
+    /// When true, layer-program residual_add applies the scalar and the post-layer
+    /// standalone scalar pass is skipped for that layer.
+    standalone_layer_scalar_fused_layers: ?[]bool = null,
+    /// Whether Gemma layer-scalar multipliers are applied in CUDA decode paths.
+    enable_layer_scalars: bool = false,
 
     const PipelineTransferMode = enum { none, peer_to_peer, host_staged };
 
@@ -894,6 +904,23 @@ pub const CudaBackend = struct {
         return scalars;
     }
 
+    fn initStandaloneLayerScalarFusionMap(self: *CudaBackend, scalars: []const f32) ![]bool {
+        const fused = try self.allocator.alloc(bool, scalars.len);
+        errdefer self.allocator.free(fused);
+        @memset(fused, false);
+
+        const layer_count = @min(scalars.len, self.block_runtime.blocks.len);
+        for (0..layer_count) |layer_idx| {
+            if (scalars[layer_idx] == 1.0) continue;
+            const compiled = self.block_runtime.blocks[layer_idx].compiled_plan orelse continue;
+            const instructions = compiled.plan.instructions;
+            if (instructions.len == 0) continue;
+            if (instructions[instructions.len - 1].opcode != .residual_add) continue;
+            fused[layer_idx] = true;
+        }
+        return fused;
+    }
+
     pub fn ensureGemma4EmbedAddHostCapacity(self: *CudaBackend, elements: usize) !void {
         if (elements == 0) return error.InvalidArgument;
         if (self.gemma4_embed_add_host.len >= elements) return;
@@ -1128,7 +1155,7 @@ pub const CudaBackend = struct {
         );
 
         const layer_scalar = gemma4.layer_scalars[layer_idx];
-        if (layer_scalar != 1.0) {
+        if (self.enable_layer_scalars and layer_scalar != 1.0) {
             try compute.cuda.vector_add_scaled.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
@@ -1148,6 +1175,10 @@ pub const CudaBackend = struct {
         hidden_rows: *compute.cuda.Buffer,
         rows: usize,
     ) !void {
+        if (!self.enable_layer_scalars) return;
+        if (self.standalone_layer_scalar_fused_layers) |fused| {
+            if (layer_idx < fused.len and fused[layer_idx]) return;
+        }
         const scalars = self.standalone_layer_scalars orelse return;
         if (layer_idx >= scalars.len) return;
         const scalar = scalars[layer_idx];
@@ -1496,16 +1527,41 @@ pub const CudaBackend = struct {
             backend.gemma4_per_layer = null;
         }
         errdefer backend.deinitGemma4PerLayerRuntime();
+        backend.enable_layer_scalars = resolveCudaEnableStandaloneLayerScalars();
         // Standalone layer scalars (models with layer_scalar but no PLE).
-        backend.standalone_layer_scalars = backend.initStandaloneLayerScalars(backend.block_runtime.blocks.len, layer_range.start) catch null;
+        backend.standalone_layer_scalars = if (backend.enable_layer_scalars)
+            (backend.initStandaloneLayerScalars(backend.block_runtime.blocks.len, layer_range.start) catch null)
+        else
+            null;
         errdefer {
             if (backend.standalone_layer_scalars) |s| allocator.free(s);
             backend.standalone_layer_scalars = null;
         }
+        backend.standalone_layer_scalar_fused_layers = if (backend.enable_layer_scalars and backend.standalone_layer_scalars != null)
+            (backend.initStandaloneLayerScalarFusionMap(backend.standalone_layer_scalars.?) catch null)
+        else
+            null;
+        errdefer {
+            if (backend.standalone_layer_scalar_fused_layers) |flags| allocator.free(flags);
+            backend.standalone_layer_scalar_fused_layers = null;
+        }
+        if (!backend.enable_layer_scalars) {
+            log.info("inference", "CUDA layer_scalars disabled", .{
+                .env = "TALU_CUDA_STANDALONE_LAYER_SCALARS",
+                .default = 1,
+            });
+        }
         if (backend.standalone_layer_scalars) |scalars| {
+            var fused_layers: usize = 0;
+            if (backend.standalone_layer_scalar_fused_layers) |flags| {
+                for (flags) |fused| {
+                    if (fused) fused_layers += 1;
+                }
+            }
             log.warn("inference", "CUDA standalone layer_scalars enabled", .{
                 .layers = scalars.len,
                 .layer_offset = layer_range.start,
+                .fused_layers = fused_layers,
             });
         }
 
@@ -1739,6 +1795,9 @@ pub const CudaBackend = struct {
                     stage1_ptr.device.enablePeerAccess(&backend.device) catch {};
                     backend.pipeline_transfer_mode = .peer_to_peer;
                     log.info("inference", "CUDA pipeline2 using peer-to-peer transfer", .{});
+                } else if (backend.probePipelinePeerCopy(stage1_ptr)) {
+                    backend.pipeline_transfer_mode = .peer_to_peer;
+                    log.info("inference", "CUDA pipeline2 using peer-copy transfer", .{});
                 } else {
                     const transfer_bytes = try backend.pipelineActivationByteCount();
                     backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer_bytes);
@@ -2185,6 +2244,7 @@ pub const CudaBackend = struct {
         if (self.parity_prefill_block_out_host.len > 0) self.allocator.free(self.parity_prefill_block_out_host);
         self.deinitGemma4PerLayerRuntime();
         if (self.standalone_layer_scalars) |s| self.allocator.free(s);
+        if (self.standalone_layer_scalar_fused_layers) |flags| self.allocator.free(flags);
         if (self.gemma4_embed_add_host.len > 0) self.allocator.free(self.gemma4_embed_add_host);
         if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
         if (self.gated_delta_stage_mid_host.len > 0) self.allocator.free(self.gated_delta_stage_mid_host);
@@ -2268,6 +2328,28 @@ pub const CudaBackend = struct {
             .f32 => @sizeOf(f32),
         };
         return std.math.mul(usize, self.d_model, element_bytes) catch error.InvalidArgument;
+    }
+
+    fn probePipelinePeerCopy(self: *CudaBackend, dst: *CudaBackend) bool {
+        const src_size = self.runtime_buffers.input_dev.size;
+        const dst_size = dst.runtime_buffers.input_dev.size;
+        const min_size = @min(src_size, dst_size);
+        if (min_size == 0) return false;
+        const probe_bytes = @min(min_size, @as(usize, 256));
+        self.device.memcpyPeerAsync(
+            dst.runtime_buffers.input_dev.pointer,
+            dst.device.context,
+            self.runtime_buffers.input_dev.pointer,
+            self.device.context,
+            probe_bytes,
+            self.compute_stream,
+        ) catch return false;
+        if (self.compute_stream) |stream| {
+            self.device.synchronizeStream(stream) catch return false;
+        } else {
+            self.device.synchronize() catch return false;
+        }
+        return true;
     }
 
     pub fn transferPipelineActivation(self: *CudaBackend, dst: *CudaBackend, byte_count: usize) !void {
@@ -3059,6 +3141,13 @@ pub const CudaBackend = struct {
         if (top_k == 0) return error.InvalidArgument;
         if (top_k > 256) return error.InvalidArgument;
         if (self.loaded.config.logits_scaling <= 0.0) return error.UnsupportedModel;
+        const needed_candidates = std.math.mul(usize, requests.len, top_k) catch return error.InvalidArgument;
+        if (candidate_logits_out.len < needed_candidates or
+            candidate_ids_out.len < needed_candidates or
+            candidate_counts_out.len < requests.len)
+        {
+            return error.InvalidArgument;
+        }
         const max_n = 128;
         if (requests.len > max_n) return error.InvalidArgument;
 
@@ -3090,7 +3179,21 @@ pub const CudaBackend = struct {
             self.slot_positions[req.slot_index] = raw_positions_buf[i] + 1;
         }
 
-        try self.extractTopKFromBatchedDeviceLogits(
+        // Greedy single-request fast path: avoid full-vocab top-k extraction
+        // when only one candidate is needed.
+        if (top_k == 1 and requests.len == 1) {
+            candidate_ids_out[0] = try self.selectNextTokenFromDeviceLogitsImpl();
+            candidate_logits_out[0] = 0.0;
+            candidate_counts_out[0] = 1;
+            return;
+        }
+
+        var topk_source_backend: *CudaBackend = self;
+        if (self.topology_mode == .pipeline2) {
+            topk_source_backend = self.pipeline_backend1 orelse return error.InvalidTopologyConfig;
+        }
+
+        try topk_source_backend.extractTopKFromBatchedDeviceLogits(
             requests.len,
             top_k,
             candidate_logits_out,
@@ -3583,31 +3686,85 @@ pub const CudaBackend = struct {
     }
 
     fn modelHasNvfp4Weights(self: *const CudaBackend) bool {
-        if (switch (self.runtime_buffers.projection_weight) { .nvfp4 => true, else => false }) return true;
+        if (switch (self.runtime_buffers.projection_weight) {
+            .nvfp4 => true,
+            else => false,
+        }) return true;
 
         for (self.block_runtime.blocks) |layer| {
             if (layer.attention_binding) |attn| {
-                if (switch (attn.q_proj) { .nvfp4 => true, else => false }) return true;
-                if (switch (attn.k_proj) { .nvfp4 => true, else => false }) return true;
-                if (switch (attn.v_proj) { .nvfp4 => true, else => false }) return true;
-                if (switch (attn.o_proj) { .nvfp4 => true, else => false }) return true;
-                if (switch (attn.w1) { .nvfp4 => true, else => false }) return true;
-                if (switch (attn.w2) { .nvfp4 => true, else => false }) return true;
-                if (switch (attn.w3) { .nvfp4 => true, else => false }) return true;
+                if (switch (attn.q_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (attn.k_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (attn.v_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (attn.o_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (attn.w1) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (attn.w2) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (attn.w3) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
             }
             if (layer.shortconv_binding) |conv| {
-                if (switch (conv.in_proj) { .nvfp4 => true, else => false }) return true;
-                if (switch (conv.out_proj) { .nvfp4 => true, else => false }) return true;
-                if (conv.ffn_w1) |w1| if (switch (w1) { .nvfp4 => true, else => false }) return true;
-                if (conv.ffn_w2) |w2| if (switch (w2) { .nvfp4 => true, else => false }) return true;
-                if (conv.ffn_w3) |w3| if (switch (w3) { .nvfp4 => true, else => false }) return true;
+                if (switch (conv.in_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (conv.out_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (conv.ffn_w1) |w1| if (switch (w1) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (conv.ffn_w2) |w2| if (switch (w2) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (conv.ffn_w3) |w3| if (switch (w3) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
             }
             if (layer.gated_delta_binding) |gd| {
-                if (switch (gd.in_proj) { .nvfp4 => true, else => false }) return true;
-                if (switch (gd.out_proj) { .nvfp4 => true, else => false }) return true;
-                if (gd.ffn_w1) |w1| if (switch (w1) { .nvfp4 => true, else => false }) return true;
-                if (gd.ffn_w2) |w2| if (switch (w2) { .nvfp4 => true, else => false }) return true;
-                if (gd.ffn_w3) |w3| if (switch (w3) { .nvfp4 => true, else => false }) return true;
+                if (switch (gd.in_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (switch (gd.out_proj) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (gd.ffn_w1) |w1| if (switch (w1) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (gd.ffn_w2) |w2| if (switch (w2) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
+                if (gd.ffn_w3) |w3| if (switch (w3) {
+                    .nvfp4 => true,
+                    else => false,
+                }) return true;
             }
         }
         return false;
@@ -3644,6 +3801,10 @@ pub const CudaBackend = struct {
     }
 
     pub fn selectNextTokenFromDeviceLogitsImpl(self: *CudaBackend) !u32 {
+        if (self.topology_mode == .pipeline2) {
+            const stage1 = self.pipeline_backend1 orelse return error.InvalidTopologyConfig;
+            return selectNextTokenFromDeviceLogits(stage1);
+        }
         return selectNextTokenFromDeviceLogits(self);
     }
 

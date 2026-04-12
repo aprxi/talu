@@ -1177,6 +1177,24 @@ pub fn layerProgramMoEAdapter(
     try engine_mixers.runMoEFusedStep(self, input, ctx.active_rows_u32, moe_ref, output);
 }
 
+fn standaloneLayerScalarOutputScale(self: anytype, ctx: *LayerProgramExecutionContext) f32 {
+    if (comptime @hasField(@TypeOf(self.*), "enable_layer_scalars")) {
+        if (!self.enable_layer_scalars) return 1.0;
+    } else {
+        return 1.0;
+    }
+    if (!@hasField(@TypeOf(self.*), "standalone_layer_scalars")) return 1.0;
+    if (!@hasField(@TypeOf(self.*), "standalone_layer_scalar_fused_layers")) return 1.0;
+
+    const scalars = self.standalone_layer_scalars orelse return 1.0;
+    const fused_flags = self.standalone_layer_scalar_fused_layers orelse return 1.0;
+    if (ctx.layer_index >= scalars.len or ctx.layer_index >= fused_flags.len) return 1.0;
+    if (!fused_flags[ctx.layer_index]) return 1.0;
+    const compiled = ctx.layer.compiled_plan orelse return 1.0;
+    if (ctx.op_index + 1 != compiled.plan.instructions.len) return 1.0;
+    return scalars[ctx.layer_index];
+}
+
 pub fn layerProgramResidualAddAdapter(
     self: anytype,
     insn: *const runtime_contract.Instruction,
@@ -1196,6 +1214,7 @@ pub fn layerProgramResidualAddAdapter(
     const residual_src = bufferFromTensorHandle(io.inputs[0]);
     const residual = bufferFromTensorHandle(io.outputs[0]);
     const branch = bufferFromTensorHandle(io.inputs[1]);
+    const output_scale = standaloneLayerScalarOutputScale(self, ctx);
     try engine_ops.addResidualWithScaleRowsStrideAware(
         self,
         residual,
@@ -1204,6 +1223,7 @@ pub fn layerProgramResidualAddAdapter(
         ctx.active_rows_u32,
         ctx.d_model_u32,
         scale,
+        output_scale,
     );
 }
 
@@ -2350,6 +2370,9 @@ pub fn assignResolvedKernel(
         .cast_f32_to_bf16 => {
             self.cast_f32_to_bf16_function = resolved.function;
             self.cast_f32_to_bf16_source = resolved.source;
+        },
+        .cast_bf16_to_f32 => {
+            self.cast_bf16_to_f32_function = resolved.function;
         },
         .embedding_lookup_f32 => {
             self.embedding_lookup_f32_function = resolved.function;

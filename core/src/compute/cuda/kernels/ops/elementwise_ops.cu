@@ -66,6 +66,31 @@ extern "C" __global__ void talu_vector_add_scaled_rows_strided_f32(
     out[out_idx] = a[a_idx] + b[b_idx] * scale;
 }
 
+extern "C" __global__ void talu_residual_add_scaled_rows_strided_f32(
+    float* out,
+    const float* a,
+    const float* b,
+    float residual_scale,
+    float output_scale,
+    unsigned int rows,
+    unsigned int cols,
+    unsigned int out_stride,
+    unsigned int a_stride,
+    unsigned int b_stride
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = rows * cols;
+    if (index >= total) return;
+
+    const unsigned int row = index / cols;
+    const unsigned int col = index - row * cols;
+    const unsigned long long out_idx = (unsigned long long)row * out_stride + col;
+    const unsigned long long a_idx = (unsigned long long)row * a_stride + col;
+    const unsigned long long b_idx = (unsigned long long)row * b_stride + col;
+    const float residual = a[a_idx] + b[b_idx] * residual_scale;
+    out[out_idx] = residual * output_scale;
+}
+
 extern "C" __global__ void talu_mul_f32(
     float* out,
     const float* a,
@@ -122,6 +147,16 @@ extern "C" __global__ void talu_cast_f32_to_bf16(
     const unsigned int lsb = (bits >> 16) & 1u;
     const unsigned int rounding_bias = 0x7FFFu + lsb;
     out[index] = (unsigned short)((bits + rounding_bias) >> 16);
+}
+
+extern "C" __global__ void talu_cast_bf16_to_f32(
+    float* out,
+    const unsigned short* input,
+    unsigned int count
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    out[index] = __uint_as_float(static_cast<unsigned int>(input[index]) << 16);
 }
 
 extern "C" __global__ void talu_decode_u32_increment(

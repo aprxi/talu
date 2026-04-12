@@ -1649,6 +1649,90 @@ test "computeBatchedDecodeLogits routes pipeline2 decode per request through sin
     }
 }
 
+test "computeBatchedDecodeLogitsDeviceOnly routes pipeline2 decode per request without host logits" {
+    const Mock = struct {
+        const BlockRuntimeMock = struct {
+            blocks: [3]u8 = [_]u8{0} ** 3,
+        };
+
+        max_batch_size: usize = 4,
+        topology_mode: enum { single, pipeline2 } = .pipeline2,
+        block_runtime: BlockRuntimeMock = .{},
+        activate_calls: usize = 0,
+        activated_slots: [8]usize = [_]usize{0} ** 8,
+        compute_calls: usize = 0,
+        recorded_tokens: [8]u32 = [_]u32{0} ** 8,
+        recorded_positions: [8]usize = [_]usize{0} ** 8,
+        recorded_slots: [8]usize = [_]usize{0} ** 8,
+        recorded_layer_limits: [8]usize = [_]usize{0} ** 8,
+        recorded_compute_logits: [8]bool = [_]bool{false} ** 8,
+        recorded_download_logits: [8]bool = [_]bool{false} ** 8,
+        recorded_has_logits_out: [8]bool = [_]bool{false} ** 8,
+        recorded_use_preloaded_input: [8]bool = [_]bool{false} ** 8,
+
+        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
+            self.activated_slots[self.activate_calls] = slot_index;
+            self.activate_calls += 1;
+        }
+
+        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+            self: *@This(),
+            token: u32,
+            position: usize,
+            slot_index: usize,
+            logits_out_opt: ?[]f32,
+            layer_limit: usize,
+            compute_logits: bool,
+            download_logits: bool,
+            ensure_kv_capacity: bool,
+            trace_seq_len_u32: u32,
+            trace_pos_offset: usize,
+            hidden_override: ?[]const f32,
+            deepstack_layer_features_opt: ?[]const []const f32,
+            deepstack_feature_index_opt: ?usize,
+            use_preloaded_input: bool,
+        ) !void {
+            _ = ensure_kv_capacity;
+            _ = trace_seq_len_u32;
+            _ = trace_pos_offset;
+            _ = hidden_override;
+            _ = deepstack_layer_features_opt;
+            _ = deepstack_feature_index_opt;
+            const idx = self.compute_calls;
+            self.compute_calls += 1;
+            self.recorded_tokens[idx] = token;
+            self.recorded_positions[idx] = position;
+            self.recorded_slots[idx] = slot_index;
+            self.recorded_layer_limits[idx] = layer_limit;
+            self.recorded_compute_logits[idx] = compute_logits;
+            self.recorded_download_logits[idx] = download_logits;
+            self.recorded_has_logits_out[idx] = logits_out_opt != null;
+            self.recorded_use_preloaded_input[idx] = use_preloaded_input;
+        }
+    };
+
+    var mock = Mock{};
+    const tokens = [_]u32{ 101, 202, 303 };
+    const slot_indices = [_]usize{ 1, 3, 0 };
+    const positions = [_]usize{ 9, 10, 11 };
+
+    try engine_forward.computeBatchedDecodeLogitsDeviceOnly(&mock, tokens[0..], slot_indices[0..], positions[0..]);
+
+    try std.testing.expectEqual(tokens.len, mock.activate_calls);
+    try std.testing.expectEqual(tokens.len, mock.compute_calls);
+    for (0..tokens.len) |i| {
+        try std.testing.expectEqual(slot_indices[i], mock.activated_slots[i]);
+        try std.testing.expectEqual(tokens[i], mock.recorded_tokens[i]);
+        try std.testing.expectEqual(positions[i], mock.recorded_positions[i]);
+        try std.testing.expectEqual(slot_indices[i], mock.recorded_slots[i]);
+        try std.testing.expectEqual(mock.block_runtime.blocks.len, mock.recorded_layer_limits[i]);
+        try std.testing.expect(mock.recorded_compute_logits[i]);
+        try std.testing.expect(!mock.recorded_download_logits[i]);
+        try std.testing.expect(!mock.recorded_has_logits_out[i]);
+        try std.testing.expect(!mock.recorded_use_preloaded_input[i]);
+    }
+}
+
 test "computeBatchedDecodeLogits routes cpu_gpu decode per request through single-token path" {
     const Mock = struct {
         const BlockRuntimeMock = struct {

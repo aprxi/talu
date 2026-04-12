@@ -3887,6 +3887,10 @@ fn shouldUseFlashDecodePath(
 ) bool {
     if (std.posix.getenv("TALU_NO_FLASH_DECODE") != null) return false;
     if (!flash_decode_available) return false;
+    // Single-row decode does not provide enough row-level parallelism to
+    // amortize split-K flash decode overhead; separate decode attention is
+    // consistently faster for this shape.
+    if (n_rows <= 1) return false;
     if (kv_groups == 0 or kv_groups > 4) return false;
     if (head_dim == 0 or head_dim > 256) return false;
     const flash_blocks = std.math.mul(u32, n_kv_heads, n_rows) catch return false;
@@ -3901,6 +3905,7 @@ test "shouldUseFlashDecodePath keeps low-kv decode conservative" {
 }
 
 test "shouldUseFlashDecodePath accepts sufficient parallelism" {
+    try std.testing.expect(!shouldUseFlashDecodePath(2, 128, 16, 1, true));
     try std.testing.expect(shouldUseFlashDecodePath(4, 256, 8, 4, true));
     try std.testing.expect(shouldUseFlashDecodePath(2, 128, 16, 2, true));
 }
@@ -4094,7 +4099,10 @@ pub fn runMoEFusedStep(
                 &input_row,
                 &pfn.buffer,
                 &self.runtime_buffers.norm_out_dev,
-                1, d_model, self.norm_eps, norm_weight_offset,
+                1,
+                d_model,
+                self.norm_eps,
+                norm_weight_offset,
             );
             shared_mlp_input = &self.runtime_buffers.norm_out_dev;
         }
@@ -4111,13 +4119,23 @@ pub fn runMoEFusedStep(
         var mul_out = try bufferSlice(&self.runtime_buffers.ffn_mul_dev, 0, shared_d_ff_bytes);
         if (moe.use_gelu) {
             try compute.cuda.gelu_mul.runWithFunction(
-                &self.kernel_arg_pack, &self.device, act_fn,
-                &gate_out, &up_out, &mul_out, shared_d_ff,
+                &self.kernel_arg_pack,
+                &self.device,
+                act_fn,
+                &gate_out,
+                &up_out,
+                &mul_out,
+                shared_d_ff,
             );
         } else {
             try compute.cuda.silu_mul.runWithFunction(
-                &self.kernel_arg_pack, &self.device, act_fn,
-                &gate_out, &up_out, &mul_out, shared_d_ff,
+                &self.kernel_arg_pack,
+                &self.device,
+                act_fn,
+                &gate_out,
+                &up_out,
+                &mul_out,
+                shared_d_ff,
             );
         }
 
@@ -4133,7 +4151,10 @@ pub fn runMoEFusedStep(
                 &self.runtime_buffers.ffn_down_dev,
                 &psn.buffer,
                 &self.runtime_buffers.ffn_down_dev,
-                1, d_model, self.norm_eps, norm_weight_offset,
+                1,
+                d_model,
+                self.norm_eps,
+                norm_weight_offset,
             );
         }
 
@@ -4148,11 +4169,14 @@ pub fn runMoEFusedStep(
             const gate_value: f32 = 1.0 / (1.0 + @exp(-gate_scalar[0]));
             // Scale shared output: ffn_down_dev *= gate_value
             try compute.cuda.vector_add_scaled.runWithFunction(
-                &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
+                &self.kernel_arg_pack,
+                &self.device,
+                vector_add_scaled_fn,
                 &self.runtime_buffers.ffn_down_dev,
                 &self.runtime_buffers.ffn_down_dev,
                 &self.runtime_buffers.ffn_down_dev,
-                gate_value - 1.0, d_model,
+                gate_value - 1.0,
+                d_model,
             );
         }
 
@@ -4166,15 +4190,21 @@ pub fn runMoEFusedStep(
                 &input_row,
                 &ris.buffer,
                 &self.runtime_buffers.norm_out_dev,
-                1, d_model, self.norm_eps, 0.0,
+                1,
+                d_model,
+                self.norm_eps,
+                0.0,
             );
             if (moe.router_scalar != 1.0) {
                 try compute.cuda.vector_add_scaled.runWithFunction(
-                    &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    vector_add_scaled_fn,
                     &self.runtime_buffers.norm_out_dev,
                     &self.runtime_buffers.norm_out_dev,
                     &self.runtime_buffers.norm_out_dev,
-                    moe.router_scalar - 1.0, d_model,
+                    moe.router_scalar - 1.0,
+                    d_model,
                 );
             }
         }
@@ -4260,7 +4290,10 @@ pub fn runMoEFusedStep(
                 &input_row,
                 &pen.buffer,
                 &self.runtime_buffers.norm_out_dev,
-                1, d_model, self.norm_eps, norm_weight_offset,
+                1,
+                d_model,
+                self.norm_eps,
+                norm_weight_offset,
             );
             expert_input = &self.runtime_buffers.norm_out_dev;
         }
@@ -4283,13 +4316,23 @@ pub fn runMoEFusedStep(
             var expert_mul = try bufferSlice(&self.runtime_buffers.ffn_mul_dev, 0, expert_d_ff_bytes);
             if (moe.use_gelu) {
                 try compute.cuda.gelu_mul.runWithFunction(
-                    &self.kernel_arg_pack, &self.device, act_fn,
-                    &expert_gate, &expert_up, &expert_mul, expert_d_ff,
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    act_fn,
+                    &expert_gate,
+                    &expert_up,
+                    &expert_mul,
+                    expert_d_ff,
                 );
             } else {
                 try compute.cuda.silu_mul.runWithFunction(
-                    &self.kernel_arg_pack, &self.device, act_fn,
-                    &expert_gate, &expert_up, &expert_mul, expert_d_ff,
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    act_fn,
+                    &expert_gate,
+                    &expert_up,
+                    &expert_mul,
+                    expert_d_ff,
                 );
             }
 
@@ -4299,19 +4342,25 @@ pub fn runMoEFusedStep(
             // Accumulate: first expert bootstraps accum, rest add
             if (e_idx == 0) {
                 try compute.cuda.vector_add_scaled.runWithFunction(
-                    &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    vector_add_scaled_fn,
                     &self.runtime_buffers.deepstack_add_dev,
                     &self.runtime_buffers.deepstack_add_dev,
                     &self.runtime_buffers.attn_out_dev,
-                    weight - 1.0, d_model,
+                    weight - 1.0,
+                    d_model,
                 );
             } else {
                 try compute.cuda.vector_add_scaled.runWithFunction(
-                    &self.kernel_arg_pack, &self.device, vector_add_scaled_fn,
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    vector_add_scaled_fn,
                     &self.runtime_buffers.attn_out_dev,
                     &self.runtime_buffers.deepstack_add_dev,
                     &self.runtime_buffers.attn_out_dev,
-                    weight, d_model,
+                    weight,
+                    d_model,
                 );
             }
         }
@@ -4325,13 +4374,18 @@ pub fn runMoEFusedStep(
                 &self.runtime_buffers.attn_out_dev,
                 &pon.buffer,
                 &self.runtime_buffers.attn_out_dev,
-                1, d_model, self.norm_eps, norm_weight_offset,
+                1,
+                d_model,
+                self.norm_eps,
+                norm_weight_offset,
             );
         }
 
         // ===== 4. Combine: output = shared_out + expert_accum =====
         try compute.cuda.vector_add.runWithFunction(
-            &self.kernel_arg_pack, &self.device, vector_add_fn,
+            &self.kernel_arg_pack,
+            &self.device,
+            vector_add_fn,
             &self.runtime_buffers.ffn_down_dev,
             &self.runtime_buffers.attn_out_dev,
             &output_row,
@@ -4347,7 +4401,10 @@ pub fn runMoEFusedStep(
                 &output_row,
                 &pcn.buffer,
                 &output_row,
-                1, d_model, self.norm_eps, norm_weight_offset,
+                1,
+                d_model,
+                self.norm_eps,
+                norm_weight_offset,
             );
         }
     }

@@ -1898,24 +1898,10 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                         trace_pos_offset,
                         runtime_activation_bytes,
                     );
-                    // Stage1 computed logits on stage1's device. When the caller
-                    // keeps logits on-device (download_logits=false, used by
-                    // decodeStreaming + selectNextTokenFromDeviceLogitsImpl),
-                    // copy them to stage0's device buffer.
-                    if (comptime @hasField(SelfType, "runtime_buffers")) {
-                        if (compute_logits and !download_logits) {
-                            const proj_vocab = self.runtime_buffers.projected_vocab;
-                            const host_logits = std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host[0..proj_vocab]);
-                            try runtime_stage1.runtime_buffers.logits_dev.download(
-                                &runtime_stage1.device,
-                                host_logits,
-                            );
-                            try self.runtime_buffers.logits_dev.upload(
-                                &self.device,
-                                host_logits,
-                            );
-                        }
-                    }
+                    // In device-only decode mode, keep logits resident on stage1.
+                    // Pipeline-aware token-selection/top-k extraction consumes
+                    // stage1 logits directly to avoid full-vocab stage1→host→stage0
+                    // copies on every token.
                     return;
                 }
             }
@@ -1966,24 +1952,9 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 deepstack_feature_index_opt,
                 true,
             );
-            // Stage1 computed logits on stage1's device. When the caller
-            // keeps logits on-device (download_logits=false, used by
-            // decodeStreaming + selectNextTokenFromDeviceLogitsImpl),
-            // copy them to stage0's device buffer.
-            if (comptime @hasField(SelfType, "runtime_buffers")) {
-                if (compute_logits and !download_logits) {
-                    const proj_vocab = self.runtime_buffers.projected_vocab;
-                    const host_logits = std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host[0..proj_vocab]);
-                    try stage1.runtime_buffers.logits_dev.download(
-                        &stage1.device,
-                        host_logits,
-                    );
-                    try self.runtime_buffers.logits_dev.upload(
-                        &self.device,
-                        host_logits,
-                    );
-                }
-            }
+            // In device-only decode mode, keep logits resident on stage1.
+            // Pipeline-aware token-selection/top-k extraction consumes stage1
+            // logits directly.
             return;
         }
     }
@@ -2784,18 +2755,22 @@ fn computeBatchedDecodeLogitsWithMode(
     const n: u32 = @intCast(n_usize);
     const force_prototype = std.posix.getenv("TALU_FORCE_PROTOTYPE") != null;
     if (force_prototype or topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) {
-        if (output_mode == .device_only) return error.UnsupportedModel;
+        const emit_host_logits = output_mode == .host_logits;
         for (0..n_usize) |i| {
             self.activateKvSlot(slot_indices[i]);
+            const logits_target: ?[]f32 = if (emit_host_logits) blk: {
+                if (comptime !@hasDecl(SelfType, "slotLogits")) return error.InvalidTopologyConfig;
+                break :blk self.slotLogits(slot_indices[i]);
+            } else null;
             try computeGpuPrototypeLogitsWithLayerLimit(
                 self,
                 tokens[i],
                 positions[i],
                 slot_indices[i],
-                self.slotLogits(slot_indices[i]),
+                logits_target,
                 self.block_runtime.blocks.len,
                 true,
-                true,
+                emit_host_logits,
                 true,
                 1,
                 positions[i],
@@ -2804,6 +2779,7 @@ fn computeBatchedDecodeLogitsWithMode(
                 null,
                 false,
             );
+            if (!emit_host_logits) continue;
             // Sync batch host buffer: the decode loop reads logits via
             // batchedHostLogitsRow() which returns projected_logits_batch_host.
             // Copy from slotLogits (the authoritative source after the prototype

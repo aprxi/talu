@@ -159,10 +159,16 @@ pub fn linearForwardRows(
             // - f16: keep native batched GEMV for small row counts.
             // - bf16: switch to tensor-core GEMM at n>=8 to avoid leaving
             //   throughput on the table for batched decode.
-            const prefer_matvec = switch (w.dtype) {
+            var prefer_matvec = switch (w.dtype) {
                 .f16 => rows <= 32,
                 .bf16 => rows < 8,
             };
+            // Large single-row BF16 projections (notably lm_head) are
+            // throughput-bound on custom GEMV. Prefer cuBLAS BF16 tensor-core
+            // GEMM for very wide outputs to improve decode throughput.
+            if (rows == 1 and w.dtype == .bf16 and output_row_width >= 65536) {
+                prefer_matvec = false;
+            }
             if (prefer_matvec) {
                 try compute.cuda.matvec_u16.runWithFunction(
                     &self.kernel_arg_pack,
@@ -1097,8 +1103,70 @@ pub fn linearForwardRows(
             return error.CudaKernelUnavailable;
         },
         .nvfp4 => |w| {
-            // Prefill path: dequant NVFP4→BF16, then cuBLAS BF16 tensor core GEMM.
-            // Weight-only dequant avoids quality-degrading activation quantization.
+            // Native FP4 tensor core prefill (Blackwell SM_100+):
+            // Quantize F32 input → FP4, then cuBLASLt FP4×FP4 → F32 GEMM.
+            // Native cuBLASLt FP4×FP4 → BF16 GEMM + BF16→F32 cast (Blackwell SM_100+).
+            if (rows > 4 and w.scales_lt_buffer.size > 0) nvfp4_native_blas: {
+                const quant_fn = self.quantize_f32_to_nvfp4_function orelse break :nvfp4_native_blas;
+                var blas_lt = self.blas_lt orelse break :nvfp4_native_blas;
+
+                const in_dim = w.rows;
+                const out_dim = w.cols;
+
+                // Scratch layout:
+                // - activation_u16_dev: FP4 packed input [rows × packed_in_cols]
+                // - dequant_f16_dev:    [0..scale_bytes] interleaved UE4M3 scales
+                //                       [scale_bytes..] BF16 GEMM output [rows × out_dim]
+                const packed_in_cols = (in_dim + 1) / 2;
+                const input_fp4_bytes = std.math.mul(usize, rows, packed_in_cols) catch break :nvfp4_native_blas;
+                const input_scale_bytes = engine_types.Nvfp4LinearWeight.cublasLtScaleTensorSize(in_dim, rows);
+                if (self.runtime_buffers.activation_u16_dev.size < input_fp4_bytes) break :nvfp4_native_blas;
+                if (self.runtime_buffers.dequant_f16_dev.size < input_scale_bytes) break :nvfp4_native_blas;
+
+                var input_fp4_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_fp4_bytes) catch break :nvfp4_native_blas;
+                var input_scales_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, input_scale_bytes) catch break :nvfp4_native_blas;
+
+                // Step 1: Quantize F32 input → FP4 E2M1 + interleaved UE4M3 scales.
+                const padded_outer: u32 = @intCast(engine_types.Nvfp4LinearWeight.roundoff(rows, 128));
+                const sf_k = (in_dim + 15) / 16;
+                const padded_sf_k: u32 = @intCast(engine_types.Nvfp4LinearWeight.roundoff(sf_k, 4));
+                const quant_grid_x = std.math.cast(u32, sf_k) orelse break :nvfp4_native_blas;
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :nvfp4_native_blas;
+                self.kernel_arg_pack.appendBufferPtr(&input_fp4_buf) catch break :nvfp4_native_blas;
+                self.kernel_arg_pack.appendBufferPtr(&input_scales_buf) catch break :nvfp4_native_blas;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :nvfp4_native_blas;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch break :nvfp4_native_blas;
+                self.kernel_arg_pack.appendScalar(u32, padded_outer) catch break :nvfp4_native_blas;
+                self.kernel_arg_pack.appendScalar(u32, padded_sf_k) catch break :nvfp4_native_blas;
+                compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+                    .grid_x = quant_grid_x,
+                    .grid_y = padded_outer,
+                    .block_x = 32,
+                }, &self.kernel_arg_pack, .other) catch |err| {
+                    log.warn("inference", "NVFP4 native FAIL: quant launch", .{ .err = @errorName(err) });
+                    break :nvfp4_native_blas;
+                };
+
+                // Step 2: cuBLASLt FP4×FP4 → F32 GEMM (native FP4 tensor cores).
+                const alpha_scale: f32 = 1.0 / w.weight_global_scale;
+
+                blas_lt.matmulNvfp4(
+                    &self.device,
+                    &w.buffer,
+                    &w.scales_lt_buffer,
+                    &input_fp4_buf,
+                    &input_scales_buf,
+                    &packed_out,
+                    rows,
+                    out_dim,
+                    in_dim,
+                    alpha_scale,
+                ) catch break :nvfp4_native_blas;
+                return;
+            }
+
+            // Fallback: dequant NVFP4→BF16, then cuBLAS BF16 tensor core GEMM.
             if (rows > 32) nvfp4_dequant_blas: {
                 const dequant_fn = self.nvfp4_dequant_to_bf16_function orelse break :nvfp4_dequant_blas;
                 const cast_fn = self.cast_f32_to_bf16_function orelse break :nvfp4_dequant_blas;
@@ -1549,15 +1617,56 @@ pub fn addResidualWithScaleRowsStrideAware(
     rows: u32,
     cols: u32,
     scale: layer_ops.ResidualScale,
+    output_scale: f32,
 ) !void {
     if (rows == 0 or cols == 0) return error.InvalidArgument;
     const packed_count = std.math.mul(u32, rows, cols) catch return error.InvalidArgument;
     const packed_bytes = std.math.mul(usize, @as(usize, packed_count), @sizeOf(f32)) catch return error.InvalidArgument;
-    if (out.size == packed_bytes and residual.size == packed_bytes and branch.size == packed_bytes) {
-        return addResidualWithScale(self, out, residual, branch, packed_count, scale);
-    }
     if (out.size < packed_bytes or residual.size < packed_bytes or branch.size < packed_bytes) {
         return error.InvalidInstructionBinding;
+    }
+
+    const residual_scale: f32 = switch (scale) {
+        .one => 1.0,
+        .residual_multiplier => self.loaded.config.residual_multiplier,
+        .literal => |literal| literal,
+    };
+    const has_fused_scalar = output_scale != 1.0 and self.residual_add_scaled_rows_strided_function != null;
+
+    if (out.size == packed_bytes and residual.size == packed_bytes and branch.size == packed_bytes) {
+        if (has_fused_scalar) {
+            try compute.cuda.residual_add_scaled_rows_strided.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.residual_add_scaled_rows_strided_function.?,
+                residual,
+                branch,
+                out,
+                residual_scale,
+                output_scale,
+                rows,
+                cols,
+                cols,
+                cols,
+                cols,
+            );
+            return;
+        }
+        try addResidualWithScale(self, out, residual, branch, packed_count, scale);
+        if (output_scale != 1.0) {
+            const vector_add_scaled_function = self.vector_add_scaled_function orelse return error.CudaKernelUnavailable;
+            try compute.cuda.vector_add_scaled.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                vector_add_scaled_function,
+                out,
+                out,
+                out,
+                output_scale - 1.0,
+                packed_count,
+            );
+        }
+        return;
     }
 
     const row_count: usize = @intCast(rows);
@@ -1581,6 +1690,25 @@ pub fn addResidualWithScaleRowsStrideAware(
     const out_stride_elems_u32 = std.math.cast(u32, out_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
     const residual_stride_elems_u32 = std.math.cast(u32, residual_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
     const branch_stride_elems_u32 = std.math.cast(u32, branch_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+
+    if (has_fused_scalar) {
+        try compute.cuda.residual_add_scaled_rows_strided.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.residual_add_scaled_rows_strided_function.?,
+            residual,
+            branch,
+            out,
+            residual_scale,
+            output_scale,
+            rows,
+            cols,
+            residual_stride_elems_u32,
+            branch_stride_elems_u32,
+            out_stride_elems_u32,
+        );
+        return;
+    }
 
     if (self.vector_add_rows_strided_function != null and self.vector_add_scaled_rows_strided_function != null) {
         switch (scale) {
@@ -1648,6 +1776,22 @@ pub fn addResidualWithScaleRowsStrideAware(
                 }
             },
         }
+        if (output_scale != 1.0) {
+            try compute.cuda.vector_add_scaled_rows_strided.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.vector_add_scaled_rows_strided_function.?,
+                out,
+                out,
+                out,
+                output_scale - 1.0,
+                rows,
+                cols,
+                out_stride_elems_u32,
+                out_stride_elems_u32,
+                out_stride_elems_u32,
+            );
+        }
         return;
     }
 
@@ -1660,6 +1804,19 @@ pub fn addResidualWithScaleRowsStrideAware(
         var residual_row = try bufferSlice(residual, residual_offset, row_bytes);
         var branch_row = try bufferSlice(branch, branch_offset, row_bytes);
         try addResidualWithScale(self, &out_row, &residual_row, &branch_row, cols, scale);
+        if (output_scale != 1.0) {
+            const vector_add_scaled_function = self.vector_add_scaled_function orelse return error.CudaKernelUnavailable;
+            try compute.cuda.vector_add_scaled.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                vector_add_scaled_function,
+                &out_row,
+                &out_row,
+                &out_row,
+                output_scale - 1.0,
+                cols,
+            );
+        }
     }
 }
 
@@ -2536,7 +2693,7 @@ pub fn tryFusedNvfp4GateUpSiluForward(
     expected_out_dim: u32,
 ) !bool {
     if (self.loaded.config.use_gelu) return false;
-    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
+    if (rows == 0 or rows > 32) return false;
     if (rows > 1 and !self.nvfp4_sequence_fused_gate_up_supported) return false;
 
     const gate = switch (gate_weight.*) {
@@ -2659,7 +2816,9 @@ pub fn tryFusedNvfp4GateUpForward(
     up_weight: *const LinearWeight,
     rows: usize,
 ) !bool {
-    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
+    // Fused GEMV gate+up: efficient for decode (small row counts).
+    // For prefill (rows > 32), per-projection cuBLASLt GEMM is faster.
+    if (rows == 0 or rows > 32) return false;
     if (rows > 1 and !self.nvfp4_sequence_fused_gate_up_supported) return false;
     const gate = switch (gate_weight.*) {
         .nvfp4 => |w| w,

@@ -1865,13 +1865,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const can_use_greedy_streaming = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
-                submit_config.callback == null and
                 submit_config.vision_input == null and
+                submit_config.stop_sequences.len == 0 and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
                 submit_config.max_thinking_tokens == 0 and // thinking budget needs per-token control
                 effective_sampling.strategy == .greedy and
                 !has_sampling_adjustments and
+                !xray.isTeacherForcingEnabled() and
                 backend_supports_greedy_streaming and
                 self.backend.supportsSchedulerBackendDecodeStreamingRoute();
             if (can_use_greedy_streaming) {
@@ -1887,13 +1888,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const can_use_top_k_streaming = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
-                submit_config.callback == null and
                 submit_config.vision_input == null and
                 submit_config.stop_sequences.len == 0 and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
                 submit_config.max_thinking_tokens == 0 and
                 effective_sampling.seed == 0 and
+                !xray.isTeacherForcingEnabled() and
                 backend_supports_top_k_streaming and
                 self.backend.supportsSchedulerBackendTopKStreamingRoute(&effective_sampling);
             if (can_use_top_k_streaming) {
@@ -2143,11 +2144,23 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const StreamCbCtx = struct {
                 submit_callback: *const fn (u64, u32, bool, bool, ?*anyopaque) void,
                 submit_callback_data: ?*anyopaque,
+                eos_token_ids: []const u32,
+                max_tail_tokens: usize,
+                emitted_tail_tokens: usize = 0,
 
                 fn onToken(token: u32, user_data: ?*anyopaque) void {
                     const ctx: *@This() = @ptrCast(@alignCast(user_data));
-                    // Finalization for this sync route is handled by the outer layer.
-                    ctx.submit_callback(0, token, false, false, ctx.submit_callback_data);
+                    ctx.emitted_tail_tokens += 1;
+                    var is_final = ctx.emitted_tail_tokens >= ctx.max_tail_tokens;
+                    if (!is_final) {
+                        for (ctx.eos_token_ids) |eos_id| {
+                            if (token == eos_id) {
+                                is_final = true;
+                                break;
+                            }
+                        }
+                    }
+                    ctx.submit_callback(0, token, is_final, false, ctx.submit_callback_data);
                 }
             };
 
@@ -2275,6 +2288,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 stream_cb_ctx = .{
                     .submit_callback = cb,
                     .submit_callback_data = submit_config.callback_data,
+                    .eos_token_ids = eos_token_ids,
+                    .max_tail_tokens = remaining_token_budget,
                 };
                 backend_stream_cb = StreamCbCtx.onToken;
                 backend_stream_cb_data = @ptrCast(&stream_cb_ctx.?);
@@ -2282,7 +2297,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             const tail_count = try self.backend.decodeStreaming(
                 current_token,
-                prompt_tokens.len + generated.items.len - 1,
+                generated.items.len + 1,
                 remaining_token_budget,
                 eos_token_ids,
                 generated_tail,
@@ -2327,11 +2342,23 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const StreamCbCtx = struct {
                 submit_callback: *const fn (u64, u32, bool, bool, ?*anyopaque) void,
                 submit_callback_data: ?*anyopaque,
+                eos_token_ids: []const u32,
+                max_tail_tokens: usize,
+                emitted_tail_tokens: usize = 0,
 
                 fn onToken(token: u32, user_data: ?*anyopaque) void {
                     const ctx: *@This() = @ptrCast(@alignCast(user_data));
-                    // Finalization for this sync route is handled by the outer layer.
-                    ctx.submit_callback(0, token, false, false, ctx.submit_callback_data);
+                    ctx.emitted_tail_tokens += 1;
+                    var is_final = ctx.emitted_tail_tokens >= ctx.max_tail_tokens;
+                    if (!is_final) {
+                        for (ctx.eos_token_ids) |eos_id| {
+                            if (token == eos_id) {
+                                is_final = true;
+                                break;
+                            }
+                        }
+                    }
+                    ctx.submit_callback(0, token, is_final, false, ctx.submit_callback_data);
                 }
             };
 
@@ -2462,6 +2489,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 stream_cb_ctx = .{
                     .submit_callback = cb,
                     .submit_callback_data = submit_config.callback_data,
+                    .eos_token_ids = eos_token_ids,
+                    .max_tail_tokens = remaining_token_budget,
                 };
                 backend_stream_cb = StreamCbCtx.onToken;
                 backend_stream_cb_data = @ptrCast(&stream_cb_ctx.?);
@@ -2469,7 +2498,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             const tail_count = try self.backend.decodeTopKStreaming(
                 current_token,
-                prompt_tokens.len + generated.items.len - 1,
+                generated.items.len + 1,
                 remaining_token_budget,
                 eos_token_ids,
                 sampling_config,

@@ -523,6 +523,9 @@ const cublaslt_matmul_desc_b_scale_mode: i32 = 32;
 // Scale modes
 const cublaslt_scale_vec16_ue4m3: i32 = 1;
 const cublaslt_scale_vec32_ue8m0: i32 = 2;
+const cublaslt_scale_scalar_32f: i32 = 0;
+const cublaslt_matmul_desc_d_scale_pointer: i32 = 19;
+const cublaslt_matmul_desc_d_scale_mode: i32 = 33;
 
 // Preference attributes
 const cublaslt_pref_max_workspace_bytes: i32 = 1;
@@ -571,7 +574,7 @@ pub const BlasLt = struct {
     cached_plans: [max_cached_plans]CachedPlan = [_]CachedPlan{.{}} ** max_cached_plans,
     n_cached: usize = 0,
 
-    const lt_workspace_size: usize = 32 * 1024 * 1024; // 32MB (matches NVIDIA sample)
+    const default_lt_workspace_mb: usize = 32;
     const max_cached_plans = 64;
 
     const PlanKind = enum(u8) {
@@ -607,8 +610,13 @@ pub const BlasLt = struct {
         }
         errdefer _ = api.destroy(handle);
 
-        // Allocate workspace
-        var workspace = try device.allocBuffer(lt_workspace_size);
+        // Allocate workspace — larger workspace enables cuBLASLt split-K and better tiling.
+        const ws_mb = if (std.posix.getenv("TALU_CUBLASLT_WORKSPACE_MB")) |s|
+            std.fmt.parseInt(usize, s, 10) catch default_lt_workspace_mb
+        else
+            default_lt_workspace_mb;
+        const ws_bytes = ws_mb * 1024 * 1024;
+        var workspace = try device.allocBuffer(ws_bytes);
         errdefer workspace.deinit(device);
 
         return .{
@@ -616,7 +624,7 @@ pub const BlasLt = struct {
             .api = api,
             .handle = handle,
             .workspace = workspace,
-            .workspace_size = lt_workspace_size,
+            .workspace_size = ws_bytes,
         };
     }
 
@@ -728,9 +736,10 @@ pub const BlasLt = struct {
             return error.CublasLtLayoutCreateFailed;
         if (self.api.matrix_layout_create(&plan.b_layout, ab_dtype, K, M, K) != cublas_status_success)
             return error.CublasLtLayoutCreateFailed;
-        if (self.api.matrix_layout_create(&plan.c_layout, cuda_r_32f, N, M, N) != cublas_status_success)
+        const cd_dtype: c_int = cuda_r_32f;
+        if (self.api.matrix_layout_create(&plan.c_layout, cd_dtype, N, M, N) != cublas_status_success)
             return error.CublasLtLayoutCreateFailed;
-        if (self.api.matrix_layout_create(&plan.d_layout, cuda_r_32f, N, M, N) != cublas_status_success)
+        if (self.api.matrix_layout_create(&plan.d_layout, cd_dtype, N, M, N) != cublas_status_success)
             return error.CublasLtLayoutCreateFailed;
 
         // Run heuristic search (the expensive part — only done once per unique M,N,K)
@@ -743,6 +752,14 @@ pub const BlasLt = struct {
         if (self.api.matmul_preference_set_attribute(preference, cublaslt_pref_max_workspace_bytes, @ptrCast(&ws_size), @sizeOf(usize)) != cublas_status_success)
             return error.CublasLtSetAttributeFailed;
 
+        const heuristic_capacity: c_int = 8;
+        const requested_heuristics: c_int = switch (kind) {
+            // FP4 path benefits from broader heuristic exploration on Blackwell.
+            .nvfp4 => 8,
+            // Keep baseline heuristic behavior for non-NVFP4 plans.
+            .mxfp8 => 1,
+        };
+        var heuristic_results: [heuristic_capacity][128]u64 = [_][128]u64{[_]u64{0} ** 128} ** heuristic_capacity;
         var returned_results: c_int = 0;
         const heur_status = self.api.matmul_algo_get_heuristic(
             h,
@@ -752,12 +769,14 @@ pub const BlasLt = struct {
             plan.c_layout,
             plan.d_layout,
             preference,
-            1,
-            @ptrCast(&plan.heuristic_result),
+            requested_heuristics,
+            @ptrCast(&heuristic_results),
             &returned_results,
         );
         if (heur_status != cublas_status_success or returned_results == 0)
             return error.CublasLtNoAlgorithm;
+        // Use the top-ranked result (cuBLASLt orders by expected performance).
+        plan.heuristic_result = heuristic_results[0];
 
         // Store in cache
         const idx = self.n_cached;
@@ -831,11 +850,11 @@ pub const BlasLt = struct {
         }
     }
 
-    /// Block-scaled NVFP4 GEMM: C_f32 = A_fp4 @ B_fp4^T with UE4M3 block-16 scales.
+    /// Block-scaled NVFP4 GEMM: C_f32 = alpha * A_fp4 @ B_fp4^T with UE4M3 block-16 scales.
     ///
     /// Weight A: [out_dim × in_dim] row-major FP4 E2M1, scales: interleaved UE4M3
     /// Input B: [rows × in_dim] row-major FP4 E2M1, scales: interleaved UE4M3
-    /// Output C: [rows × out_dim] row-major F32
+    /// Output C: [rows × out_dim] row-major F32 (cuBLASLt FP4 does not support F32 output)
     pub fn matmulNvfp4(
         self: *BlasLt,
         device: *device_mod.Device,
@@ -870,7 +889,6 @@ pub const BlasLt = struct {
         const out_dev: ?*anyopaque = @ptrFromInt(out_f32.pointer);
         const ws_ptr: ?*anyopaque = if (self.workspace) |ws| @ptrFromInt(ws.pointer) else null;
         const algo_ptr: ?*const anyopaque = @ptrCast(&plan.heuristic_result);
-
         const matmul_status = self.api.matmul(
             self.handle,
             plan.matmul_desc,

@@ -1896,7 +1896,6 @@ fn initCuda(
         }
     }
 
-
     if (topology.mode != .single) {
         const device_count = if (has_cuda)
             compute.cuda.Device.deviceCount() catch |err| {

@@ -929,10 +929,16 @@ fn resolveNvfp4DecodedMeta(
     name: []const u8,
     packed_tensor: Tensor,
 ) !Nvfp4DecodedMeta {
-    if (!std.mem.endsWith(u8, name, ".weight_packed")) return error.InvalidShape;
     if (packed_tensor.n_dims != 2) return error.InvalidShape;
 
-    const base = name[0 .. name.len - ".weight_packed".len];
+    // Accept both compressed-tensors naming (".weight_packed") and
+    // modelopt/NVIDIA naming (".weight" with U8 dtype + F8_E4M3 scales).
+    const base = if (std.mem.endsWith(u8, name, ".weight_packed"))
+        name[0 .. name.len - ".weight_packed".len]
+    else if (std.mem.endsWith(u8, name, ".weight"))
+        name[0 .. name.len - ".weight".len]
+    else
+        return error.InvalidShape;
     const rows: usize = @intCast(packed_tensor.shape[0]);
     const packed_cols: usize = @intCast(packed_tensor.shape[1]);
     if (rows == 0 or packed_cols == 0) return error.InvalidShape;
@@ -955,13 +961,32 @@ fn resolveNvfp4DecodedMeta(
     const scale_required = std.math.mul(usize, scale_rows, scale_cols) catch return error.InvalidShape;
     if (scale_bytes.len < scale_required) return error.InvalidShape;
 
+    // The NVFP4 kernels divide by global_scale (i.e. multiply by 1/global_scale).
+    // Two naming conventions exist with different semantics:
+    // - ".weight_global_scale": stored as 1/scale (divide directly) — compressed-tensors/vLLM
+    // - ".weight_scale_2": stored as scale (multiply) — modelopt/NVIDIA
+    //   For weight_scale_2 we store the reciprocal so the kernel's division is correct.
     var global_scale: f32 = 1.0;
-    var global_scale_name_buf: [320]u8 = undefined;
-    const global_scale_name = std.fmt.bufPrint(&global_scale_name_buf, "{s}.weight_global_scale", .{base}) catch return error.InvalidShape;
-    if (st.getTensor(global_scale_name, null)) |global_scale_tensor| {
-        global_scale = try readTensorScalarF32(global_scale_tensor);
-        if (!std.math.isFinite(global_scale) or global_scale == 0.0) return error.InvalidShape;
-    } else |_| {}
+    blk: {
+        var buf1: [320]u8 = undefined;
+        if (std.fmt.bufPrint(&buf1, "{s}.weight_global_scale", .{base})) |gs_name| {
+            if (st.getTensor(gs_name, null)) |t| {
+                global_scale = try readTensorScalarF32(t);
+                break :blk;
+            } else |_| {}
+        } else |_| {}
+        var buf2: [320]u8 = undefined;
+        if (std.fmt.bufPrint(&buf2, "{s}.weight_scale_2", .{base})) |gs2_name| {
+            if (st.getTensor(gs2_name, null)) |t| {
+                const scale2 = try readTensorScalarF32(t);
+                if (!std.math.isFinite(scale2) or scale2 == 0.0) return error.InvalidShape;
+                // Invert: kernel divides by global_scale, but weight_scale_2 is a multiplier.
+                global_scale = 1.0 / scale2;
+                break :blk;
+            } else |_| {}
+        } else |_| {}
+    }
+    if (!std.math.isFinite(global_scale) or global_scale == 0.0) return error.InvalidShape;
 
     return .{
         .rows = rows,
@@ -1148,12 +1173,14 @@ pub fn orientWeight(
         };
     }
 
-    // Handle NVFP4 packed weights (compressed-tensors):
-    // ".weight_packed" U8 (parsed as i8 by safetensors reader) +
-    // ".weight_scale" F8_E4M3 + optional ".weight_global_scale" F32.
+    // Handle NVFP4 packed weights:
+    // compressed-tensors: ".weight_packed" U8 + ".weight_scale" F8_E4M3 + ".weight_global_scale" F32
+    // modelopt/NVIDIA:    ".weight" U8      + ".weight_scale" F8_E4M3 + ".weight_scale_2" F32
     // Keep packed payload for native CUDA kernels when requested, otherwise
     // dequantize once at load time for backends without native NVFP4 execution.
-    if ((weight_tensor.dtype == .u8 or weight_tensor.dtype == .i8) and std.mem.endsWith(u8, name, ".weight_packed")) {
+    if ((weight_tensor.dtype == .u8 or weight_tensor.dtype == .i8) and
+        (std.mem.endsWith(u8, name, ".weight_packed") or std.mem.endsWith(u8, name, ".weight")))
+    {
         if (dequantize_nvfp4_to_bf16) {
             const dequantized = try dequantizeNvfp4WeightToBf16(allocator, st, name, weight_tensor);
             const dequant_rows: usize = @intCast(dequantized.shape[0]);

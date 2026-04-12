@@ -178,6 +178,10 @@ pub fn resolveCudaQuantizeFp8() bool {
     return resolveEnvBool("TALU_CUDA_QUANTIZE_FP8", false);
 }
 
+pub fn resolveCudaEnableStandaloneLayerScalars() bool {
+    return resolveEnvBool("TALU_CUDA_STANDALONE_LAYER_SCALARS", true);
+}
+
 pub fn resolveCudaMemoryReserveBytes() usize {
     const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MEMORY_RESERVE_MIB") catch {
         return 0;
@@ -335,6 +339,7 @@ pub const KernelSlot = enum {
     copy_u16,
     cast_f32_to_f16,
     cast_f32_to_bf16,
+    cast_bf16_to_f32,
     embedding_lookup_f32,
     embedding_lookup_u16,
     embedding_lookup_u16_rows,
@@ -507,6 +512,7 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .copy_u16, .op_name = compute.cuda.copy_u16.op_name, .embedded_symbol = compute.cuda.copy_u16.embedded_symbol },
     .{ .slot = .cast_f32_to_f16, .op_name = compute.cuda.cast_f32_to_f16.op_name, .embedded_symbol = compute.cuda.cast_f32_to_f16.embedded_symbol },
     .{ .slot = .cast_f32_to_bf16, .op_name = compute.cuda.cast_f32_to_bf16.op_name, .embedded_symbol = compute.cuda.cast_f32_to_bf16.embedded_symbol },
+    .{ .slot = .cast_bf16_to_f32, .op_name = compute.cuda.cast_bf16_to_f32.op_name, .embedded_symbol = compute.cuda.cast_bf16_to_f32.embedded_symbol },
     .{ .slot = .embedding_lookup_f32, .op_name = compute.cuda.embedding_lookup_f32.op_name, .embedded_symbol = compute.cuda.embedding_lookup_f32.embedded_symbol },
     .{ .slot = .embedding_lookup_u16, .op_name = compute.cuda.embedding_lookup_u16.op_name, .embedded_symbol = compute.cuda.embedding_lookup_u16.embedded_symbol },
     .{ .slot = .embedding_lookup_u16_rows, .op_name = compute.cuda.embedding_lookup_u16_rows.op_name, .embedded_symbol = compute.cuda.embedding_lookup_u16_rows.embedded_symbol },
