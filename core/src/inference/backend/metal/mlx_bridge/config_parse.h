@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-struct Qwen35Config {
+struct BridgeModelConfig {
     int hidden_size = 0;
     int num_hidden_layers = 0;
     int intermediate_size = 0;
@@ -50,8 +50,9 @@ struct Qwen35Config {
 };
 
 struct ParsedModelConfig {
-    Qwen35Config cfg;
-    bool allow_qwen_norm_shift = true;
+    BridgeModelConfig cfg;
+    bool allow_norm_shift = true;
 };
 
-ParsedModelConfig parse_qwen35_config(const std::string& model_path);
+struct mlx_model_flags;
+ParsedModelConfig parse_model_config(const std::string& model_path, const mlx_model_flags* flags = nullptr);

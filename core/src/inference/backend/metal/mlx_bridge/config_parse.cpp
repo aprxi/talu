@@ -1,4 +1,5 @@
 #include "config_parse.h"
+#include "bridge.h"
 
 #include <algorithm>
 #include <cmath>
@@ -102,7 +103,7 @@ bool find_string_array_value(const std::string& text, const std::string& key, st
 
 } // namespace
 
-ParsedModelConfig parse_qwen35_config(const std::string& model_path) {
+ParsedModelConfig parse_model_config(const std::string& model_path, const mlx_model_flags* flags) {
     const std::string config_text = read_file(std::filesystem::path(model_path) / "config.json");
     std::string text_cfg;
     try {
@@ -111,7 +112,7 @@ ParsedModelConfig parse_qwen35_config(const std::string& model_path) {
         text_cfg = config_text;
     }
 
-    Qwen35Config cfg;
+    BridgeModelConfig cfg;
     ParsedModelConfig parsed;
 
     if (!find_int_value(text_cfg, "hidden_size", &cfg.hidden_size)) throw std::runtime_error("missing text_config.hidden_size");
@@ -210,25 +211,44 @@ ParsedModelConfig parse_qwen35_config(const std::string& model_path) {
     } catch (const std::runtime_error&) {
     }
 
-    const std::regex lfm2_re("\\\"model_type\\\"\\s*:\\s*\\\"lfm2(?:_vl|_5)?\\\"");
-    const bool is_lfm2_family = std::regex_search(config_text, lfm2_re) || std::regex_search(text_cfg, lfm2_re);
-    const std::regex gemma4_re("\\\"model_type\\\"\\s*:\\s*\\\"gemma4(?:_text)?\\\"");
-    const bool is_gemma4_family = std::regex_search(config_text, gemma4_re) || std::regex_search(text_cfg, gemma4_re);
-    cfg.use_layer_q_norm_head_dim = is_gemma4_family;
-    if (is_gemma4_family) {
-        if (cfg.num_hidden_layers > 0 && static_cast<int>(cfg.layer_types.size()) != cfg.num_hidden_layers) {
+    if (flags) {
+        // Use capability flags from the Zig runtime instead of regex detection.
+        cfg.use_layer_q_norm_head_dim = flags->use_layer_q_norm_head_dim != 0;
+        cfg.use_v_norm = flags->use_v_norm != 0;
+        cfg.embedding_multiplier = flags->embedding_multiplier;
+        cfg.attention_multiplier = flags->attention_multiplier;
+        if (cfg.use_layer_q_norm_head_dim &&
+            cfg.num_hidden_layers > 0 &&
+            static_cast<int>(cfg.layer_types.size()) != cfg.num_hidden_layers) {
             throw std::runtime_error(
-                "gemma4 config parse error: layer_types length mismatch (got=" +
+                "config parse error: layer_types length mismatch (got=" +
                 std::to_string(cfg.layer_types.size()) +
                 ", expected=" + std::to_string(cfg.num_hidden_layers) + ")"
             );
         }
-        cfg.embedding_multiplier = std::sqrt(static_cast<float>(cfg.hidden_size));
-        cfg.attention_multiplier = 1.0f;
-        cfg.use_v_norm = true;
+        parsed.cfg = cfg;
+        parsed.allow_norm_shift = flags->allow_norm_shift != 0;
+    } else {
+        // Fallback: regex-based model family detection for standalone bridge use.
+        const std::regex lfm2_re("\\\"model_type\\\"\\s*:\\s*\\\"lfm2(?:_vl|_5)?\\\"");
+        const bool is_lfm2_family = std::regex_search(config_text, lfm2_re) || std::regex_search(text_cfg, lfm2_re);
+        const std::regex gemma4_re("\\\"model_type\\\"\\s*:\\s*\\\"gemma4(?:_text)?\\\"");
+        const bool is_gemma4_family = std::regex_search(config_text, gemma4_re) || std::regex_search(text_cfg, gemma4_re);
+        cfg.use_layer_q_norm_head_dim = is_gemma4_family;
+        if (is_gemma4_family) {
+            if (cfg.num_hidden_layers > 0 && static_cast<int>(cfg.layer_types.size()) != cfg.num_hidden_layers) {
+                throw std::runtime_error(
+                    "config parse error: layer_types length mismatch (got=" +
+                    std::to_string(cfg.layer_types.size()) +
+                    ", expected=" + std::to_string(cfg.num_hidden_layers) + ")"
+                );
+            }
+            cfg.embedding_multiplier = std::sqrt(static_cast<float>(cfg.hidden_size));
+            cfg.attention_multiplier = 1.0f;
+            cfg.use_v_norm = true;
+        }
+        parsed.cfg = cfg;
+        parsed.allow_norm_shift = !is_lfm2_family && !is_gemma4_family;
     }
-
-    parsed.cfg = cfg;
-    parsed.allow_qwen_norm_shift = !is_lfm2_family && !is_gemma4_family;
     return parsed;
 }

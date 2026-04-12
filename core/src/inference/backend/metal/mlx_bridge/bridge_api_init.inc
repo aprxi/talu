@@ -14,7 +14,7 @@ int32_t mlx_validate_config(const char* model_path) {
         if (!std::filesystem::exists(model_path)) {
             throw std::runtime_error(std::string("resolved model_path does not exist: ") + model_path);
         }
-        const ParsedModelConfig parsed = parse_qwen35_config(model_path);
+        const ParsedModelConfig parsed = parse_model_config(model_path);
         if (!validate_memory_budget_or_set_error(model_path, parsed.cfg)) {
             return 0;
         }
@@ -28,7 +28,7 @@ int32_t mlx_validate_config(const char* model_path) {
     }
 }
 
-mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) {
+static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, int32_t seed, const mlx_model_flags* flags) {
     bool wired_limit_acquired = false;
     bool rng_entered = false;
     const bool qmm_debug = []() {
@@ -77,14 +77,14 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             wired_limit_acquired = acquire_wired_limit();
         }
 
-        const ParsedModelConfig parsed_cfg = parse_qwen35_config(ctx->model_path);
+        const ParsedModelConfig parsed_cfg = parse_model_config(ctx->model_path, flags);
         ctx->cfg = parsed_cfg.cfg;
         if (!validate_memory_budget_or_set_error(ctx->model_path, ctx->cfg)) {
             return nullptr;
         }
 
         auto tensors = load_weight_tensors(ctx->model_path);
-        sanitize_qwen35_tensors(tensors, ctx->cfg.tie_word_embeddings, parsed_cfg.allow_qwen_norm_shift);
+        sanitize_model_tensors(tensors, ctx->cfg.tie_word_embeddings, parsed_cfg.allow_norm_shift);
         const bool has_fp8_meta = has_fp8_quant_metadata(tensors);
         ctx->has_fp8_meta = has_fp8_meta;
         const bool has_mxfp8_meta = has_mxfp8_quant_metadata(tensors);
@@ -172,7 +172,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
 
         auto maybe_quantize_mxfp8_matrix = [&](
             const std::unordered_map<std::string, array>& tensors_ref,
-            const Qwen35Config& cfg_ref,
+            const BridgeModelConfig& cfg_ref,
             const std::string& weight_key,
             const array& lhs_weight,
             bool enabled,
@@ -1154,7 +1154,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     if (qkv_weight.ndim() == 2) {
                         // Detect Q/K/V widths from config.
                         // Q proj width is the total output rows of the Q projection.
-                        // For gated attention (Qwen3.5), Q carries both q and gate,
+                        // For gated attention, Q carries both q and gate,
                         // so width = 2 * num_heads * head_dim. Detect from tensor shape.
                         lw.attn_q_proj_width = qkv_weight.shape(0)
                             - lw.attn_num_kv_heads * lw.attn_head_dim   // K
@@ -1709,6 +1709,14 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         g_last_error = "unknown error in mlx_create";
         return nullptr;
     }
+}
+
+mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) {
+    return mlx_create_impl(model_id, model_path, seed, nullptr);
+}
+
+mlx_ctx* mlx_create_with_flags(const char* model_id, const char* model_path, int32_t seed, const mlx_model_flags* flags) {
+    return mlx_create_impl(model_id, model_path, seed, flags);
 }
 
 mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {

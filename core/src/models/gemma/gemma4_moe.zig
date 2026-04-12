@@ -204,6 +204,7 @@ pub var arch: types.Architecture = .{
     .use_swiglu_oss = false,
     .norm_weight_offset = 1.0,
     .explicit_qk_norm_ops = false,
+    .norm_weights_pre_shifted = true,
     .embedding_multiplier = 1.0, // Overridden by config hook to sqrt(d_model)
     .performance_hints = &gemma4_moe_perf_hints,
     .sampling_presets = &gemma4_moe_sampling_presets,

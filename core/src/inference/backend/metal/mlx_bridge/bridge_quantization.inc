@@ -420,7 +420,7 @@ void materialize_nvfp4_affine_execution_tensors(
 
 array maybe_dequantize_grouped_affine_weight(
     const std::unordered_map<std::string, array>& tensors,
-    const Qwen35Config& cfg,
+    const BridgeModelConfig& cfg,
     const std::string& weight_key,
     const array& weight_2d
 ) {
@@ -525,7 +525,7 @@ bool has_grouped_affine_metadata_for_key(
 
 bool maybe_capture_grouped_affine_quant(
     const std::unordered_map<std::string, array>& tensors,
-    const Qwen35Config& cfg,
+    const BridgeModelConfig& cfg,
     const std::string& weight_key,
     const array& lhs_weight,
     array* out_q_w,
@@ -603,7 +603,7 @@ bool maybe_capture_grouped_affine_quant(
 
 array load_linear_weight(
     const std::unordered_map<std::string, array>& tensors,
-    const Qwen35Config& cfg,
+    const BridgeModelConfig& cfg,
     const std::string& weight_key
 ) {
     const array& raw_weight = require_tensor(tensors, weight_key);
@@ -648,7 +648,7 @@ std::pair<array, array> split_fused_moe_gate_up_projection(
 
 void maybe_quantize_mxfp8_matrix(
     const std::unordered_map<std::string, array>& tensors,
-    const Qwen35Config& cfg,
+    const BridgeModelConfig& cfg,
     const std::string& weight_key,
     const array& lhs_weight,
     bool enabled,

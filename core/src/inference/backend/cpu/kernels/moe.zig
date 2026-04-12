@@ -51,7 +51,7 @@ pub const MoEScratch = struct {
     expert_outputs: []f32 = &.{}, // outputs from each expert
     gate_up_values: []f32 = &.{}, // intermediate for SwiGLU
     hidden_values: []f32 = &.{}, // intermediate hidden_values state
-    // Gemma4 MoE fused kernel scratch
+    // Fused MoE kernel scratch (models with internal norms)
     shared_gate_up_values: []f32 = &.{},
     shared_hidden_values: []f32 = &.{},
     shared_output: []f32 = &.{},
@@ -126,21 +126,21 @@ pub const MoEFFN = struct {
     /// Use GELU activation instead of SiLU in expert FFN
     use_gelu: bool = false,
 
-    /// Shared MLP weights (Gemma4 MoE — coexists with experts)
+    /// Shared MLP weights (fused MoE — coexists with experts)
     shared_gate_proj: ?Tensor = null,
     shared_up_proj: ?Tensor = null,
     shared_down_proj: ?Tensor = null,
     shared_d_ff: usize = 0,
 
-    /// Router scaling (Gemma4 MoE)
+    /// Router scaling (fused MoE with learned input scale)
     router_input_scale: ?[]const f32 = null,
     router_per_expert_scale: ?[]const f32 = null,
     router_scalar_root_size: f32 = 0.0,
 
-    /// Shared expert gate (Qwen3.5 MoE — sigmoid gate for scaling shared expert output)
+    /// Shared expert gate (sigmoid gate for scaling shared expert output)
     shared_expert_gate: ?Tensor = null,
 
-    /// Internal norms for fused FFN+MoE (Gemma4 MoE)
+    /// Internal norms for fused FFN+MoE
     pre_ffn_norm_weight: ?Tensor = null,
     post_shared_norm_weight: ?Tensor = null,
     pre_expert_norm_weight: ?Tensor = null,
@@ -155,7 +155,7 @@ pub const MoEFFN = struct {
     kernel_name: ?[]const u8 = null,
 
     pub fn forward(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
-        // Dispatch to fused FFN+MoE path when internal norms are present (Gemma4 MoE).
+        // Dispatch to fused FFN+MoE path when internal norms are present.
         // Qwen-style shared expert (no internal norms) is handled inline below.
         if (self.pre_ffn_norm_weight != null) {
             return self.forwardFusedMoE(input_tensor, output_tensor, scratch, matmul_scratch);
@@ -220,7 +220,7 @@ pub const MoEFFN = struct {
                 cpu_rowwise.addScaledInPlace(token_output, expert_output, weight);
             }
 
-            // Shared expert (Qwen3.5 MoE / Qwen3-Next pattern — no internal norms)
+            // Shared expert (no internal norms)
             if (self.shared_gate_proj) |shared_gate| {
                 const shared_up = self.shared_up_proj.?;
                 const shared_down = self.shared_down_proj.?;
@@ -280,7 +280,7 @@ pub const MoEFFN = struct {
         }
     }
 
-    /// Fused FFN+MoE forward pass for Gemma4 MoE.
+    /// Fused FFN+MoE forward pass (models with internal norms).
     /// Handles: shared MLP + custom router (softmax-then-topk) + experts + internal norms.
     fn forwardFusedMoE(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
         std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);

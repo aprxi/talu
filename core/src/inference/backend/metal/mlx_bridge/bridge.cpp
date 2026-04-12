@@ -167,7 +167,7 @@ struct mlx_ctx {
     std::string model_id;
     std::string model_path;
 
-    Qwen35Config cfg;
+    BridgeModelConfig cfg;
 
     array embed_tokens = array(0.0f); // [vocab, hidden]
     array embed_tokens_q_w = array(0.0f); // [vocab, hidden * bits / 32] packed

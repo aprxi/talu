@@ -43,16 +43,16 @@ pub const MoEWeights = struct {
     num_experts: usize,
     experts_per_token: usize,
     use_mxfp4: bool = false,
-    // Router scaling (Gemma4 MoE)
+    // Router scaling (fused MoE with learned input scale)
     router_input_scale: ?Tensor = null,
     router_per_expert_scale: ?Tensor = null,
-    // Shared MLP (Gemma4 MoE / Qwen3.5 MoE — coexists with experts)
+    // Shared MLP (fused MoE — coexists with experts)
     shared_w1: ?Tensor = null, // gate_proj
     shared_w2: ?Tensor = null, // down_proj
     shared_w3: ?Tensor = null, // up_proj
-    // Shared expert gate (Qwen3.5 MoE — sigmoid gate for scaling shared expert output)
+    // Shared expert gate (sigmoid gate for scaling shared expert output)
     shared_expert_gate: ?Tensor = null,
-    // Internal norms for fused FFN+MoE (Gemma4 MoE)
+    // Internal norms for fused FFN+MoE
     pre_ffn_norm: ?Tensor = null, // pre_feedforward_layernorm
     post_shared_norm: ?Tensor = null, // post_feedforward_layernorm_1
     pre_expert_norm: ?Tensor = null, // pre_feedforward_layernorm_2
@@ -87,7 +87,7 @@ pub const GatedDeltaConfig = struct {
     n_heads: u32,
     d_head: u32,
     /// Number of key/query heads. May be less than n_heads (value heads) for
-    /// GQA-style models (e.g. Qwen3.5-4B). Defaults to n_heads when symmetric.
+    /// GQA-style models. Defaults to n_heads when symmetric.
     n_key_heads: u32 = 0,
 };
 
@@ -499,7 +499,7 @@ fn buildIndexedMoEWeights(
         .use_mxfp4 = false,
     };
 
-    // Shared expert (Qwen3.5 MoE / Qwen3-Next pattern)
+    // Shared expert (no internal norms)
     if (map.get("mlp.shared_expert.gate_proj.weight")) |gate| {
         moe_weights.shared_w1 = gate.*;
         if (map.get("mlp.shared_expert.up_proj.weight")) |up| {

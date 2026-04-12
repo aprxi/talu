@@ -631,11 +631,13 @@ pub const ModelRuntime = struct {
     has_gated_delta: bool = false,
     has_shortconv: bool = false,
     has_mla: bool = false,
+    has_per_layer_branch: bool = false,
     weight_offset: f32 = 0.0,
     qk_norm_weight_offset: f32 = 0.0,
     explicit_qk_norm_ops: bool = false,
     use_swiglu_variant: bool = false, // SwiGLU variant: alpha=1.702, clipping, (up+1) formulation
     use_transposed_mxfp4: bool = false,
+    norm_weights_pre_shifted: bool = false, // Weights already include norm offset; skip bridge sanitization
 };
 
 pub const ModelConfig = struct {

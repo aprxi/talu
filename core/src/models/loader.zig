@@ -149,6 +149,7 @@ pub fn applyRuntimeArchitectureMetadata(
     loaded_model.runtime.has_shortconv = runtime_architecture.has_shortconv;
     loaded_model.runtime.has_mla = runtime_architecture.has_mla;
     loaded_model.runtime.explicit_qk_norm_ops = runtime_architecture.explicit_qk_norm_ops;
+    loaded_model.runtime.norm_weights_pre_shifted = runtime_architecture.norm_weights_pre_shifted;
     log.debug("load", "Set runtime architecture metadata", .{
         .architecture = runtime_architecture.name,
     }, @src());

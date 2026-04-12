@@ -90,7 +90,7 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     array gate = array(0.0f);
     bool has_query_gate = false;
     if (q_last_dim == 2 * q_base_dim) {
-        // Qwen3.5 full-attention branch: q projection carries both q and gate.
+        // Gated-attention branch: q projection carries both q and gate.
         has_query_gate = true;
         const array q_reshaped = reshape(q_proj_out, {B, S, lw.attn_num_heads, 2 * lw.attn_head_dim});
         queries_raw = slice(q_reshaped, {0, 0, 0, 0}, {B, S, lw.attn_num_heads, lw.attn_head_dim});
@@ -101,7 +101,7 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
         );
         gate = reshape(gate_raw, {B, S, q_base_dim});
     } else if (q_last_dim == q_base_dim) {
-        // Qwen3 attention branch: q projection has no gating half.
+        // Standard attention branch: q projection has no gating half.
         queries_raw = reshape(q_proj_out, {B, S, lw.attn_num_heads, lw.attn_head_dim});
     } else {
         throw std::runtime_error("unexpected self_attn.q_proj output shape");

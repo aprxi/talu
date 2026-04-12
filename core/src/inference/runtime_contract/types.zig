@@ -135,18 +135,23 @@ pub const StateBlockId = enum(u8) {
     shortconv = 1,
     mamba = 2,
     gated_delta = 3,
+    per_layer_source_embeddings = 4,
+    per_layer_token_ids = 5,
 };
 
 pub const kv_cache_state_id: u8 = @intFromEnum(StateBlockId.kv_cache);
 pub const shortconv_state_id: u8 = @intFromEnum(StateBlockId.shortconv);
 pub const mamba_state_id: u8 = @intFromEnum(StateBlockId.mamba);
 pub const gated_delta_state_id: u8 = @intFromEnum(StateBlockId.gated_delta);
+pub const per_layer_source_embeddings_state_id: u8 = @intFromEnum(StateBlockId.per_layer_source_embeddings);
+pub const per_layer_token_ids_state_id: u8 = @intFromEnum(StateBlockId.per_layer_token_ids);
 
 pub const state_runtime_kind_none: u8 = 0;
 pub const state_runtime_kind_kv_cache: u8 = 1;
 pub const state_runtime_kind_shortconv_cache: u8 = 2;
 pub const state_runtime_kind_mamba_cache: u8 = 3;
 pub const state_runtime_kind_gated_delta_cache: u8 = 4;
+pub const state_runtime_kind_per_layer_branch: u8 = 5;
 
 pub const Instruction = struct {
     opcode: Opcode,
@@ -545,6 +550,14 @@ pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
             "dt_bias",
             "norm_weight",
         },
+        .per_layer_branch => &.{
+            "model_projection",
+            "projection_norm",
+            "per_layer_embedding",
+            "input_gate",
+            "projection",
+            "post_norm",
+        },
         .shortconv => &.{ "in_proj", "conv_weight", "out_proj", "conv_bias" },
         .mla_attention => &.{ "q_a_proj", "q_a_norm", "q_b_proj", "kv_a_proj", "kv_a_norm", "kv_b_proj", "o_proj" },
         .embedding => &.{"embedding"},
@@ -659,6 +672,22 @@ pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
             .zero_init = true,
             .lifecycle = .slot_persistent,
             .runtime_kind = state_runtime_kind_gated_delta_cache,
+        },
+        .per_layer_source_embeddings => .{
+            .id = @intFromEnum(StateBlockId.per_layer_source_embeddings),
+            .size_bytes = builtin_state_block_bytes,
+            .align_bytes = 64,
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+            .runtime_kind = state_runtime_kind_per_layer_branch,
+        },
+        .per_layer_token_ids => .{
+            .id = @intFromEnum(StateBlockId.per_layer_token_ids),
+            .size_bytes = builtin_state_block_bytes,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .request_scoped,
+            .runtime_kind = state_runtime_kind_per_layer_branch,
         },
     };
 }
@@ -805,6 +834,7 @@ fn expectedParamKindForOpcode(opcode: Opcode) !ParamKind {
         .moe,
         .mamba_mixer,
         .gated_delta_net,
+        .per_layer_branch,
         .shortconv,
         .mla_attention,
         .embedding,
@@ -847,6 +877,7 @@ fn expectedKernelDebugTypeForOpcode(opcode: Opcode) !op_types.OpType {
         .moe => .moe,
         .mamba_mixer => .mamba_mixer,
         .gated_delta_net => .gated_delta_net,
+        .per_layer_branch => .per_layer_branch,
         .shortconv => .shortconv,
         .mla_attention => .multihead_attention,
         .embedding => .embedding,

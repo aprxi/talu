@@ -35,6 +35,7 @@ pub const mla_attention = @import("mla_attention.zig");
 pub const moe = @import("moe.zig");
 pub const norm = @import("norm.zig");
 pub const rope = @import("rope.zig");
+pub const per_layer_branch = @import("per_layer_branch.zig");
 pub const shortconv = @import("shortconv.zig");
 pub const weights = @import("weights.zig");
 

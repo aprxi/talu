@@ -177,6 +177,7 @@ pub var arch: types.Architecture = .{
     .use_swiglu_oss = false,
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
+    .norm_weights_pre_shifted = true,
     .embedding_multiplier = 1.0,
     .performance_hints = &lfm2_5_perf_hints,
     .sampling_presets = &lfm2_5_sampling_presets,

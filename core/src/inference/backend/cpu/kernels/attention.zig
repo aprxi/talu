@@ -1333,7 +1333,7 @@ pub const MultiHeadAttention = struct {
         matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
-        // Shared read cache is used for Gemma-style KV-sharing layers.
+        // Shared read cache is used for KV-sharing layers.
         // This can be active in both cached prefill and decode paths.
         const shared_kv_cache = read_cache != cache;
         const exact_softmax = getExactSoftmax(self.allocator);
@@ -2126,7 +2126,7 @@ pub const MultiHeadAttention = struct {
         use_cache: bool,
     ) !void {
         if (!use_cache) return error.InvalidArgument;
-        // Gemma4 KV sharing only applies in decode (when reading from an existing cache).
+        // KV sharing only applies in decode (when reading from an existing cache).
         // Prefill must always use the current layer's own K/V projections.
         const shared_kv_cache = use_cache and read_cache != cache;
 

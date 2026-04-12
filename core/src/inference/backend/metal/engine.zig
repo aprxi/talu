@@ -20,9 +20,19 @@ const default_max_batch_size: usize = 8;
 
 const mlx_ctx = opaque {};
 
+const MlxModelFlags = extern struct {
+    use_layer_q_norm_head_dim: u8 = 0,
+    allow_norm_shift: u8 = 1,
+    use_v_norm: u8 = 0,
+    _pad: u8 = 0,
+    embedding_multiplier: f32 = 1.0,
+    attention_multiplier: f32 = 0.0,
+};
+
 extern fn mlx_is_available() c_int;
 extern fn mlx_validate_config(model_path: [*:0]const u8) c_int;
 extern fn mlx_create(model_id: [*:0]const u8, model_path: [*:0]const u8, seed: c_int) ?*mlx_ctx;
+extern fn mlx_create_with_flags(model_id: [*:0]const u8, model_path: [*:0]const u8, seed: c_int, flags: *const MlxModelFlags) ?*mlx_ctx;
 extern fn mlx_clone(source_ctx: ?*mlx_ctx, seed: c_int) ?*mlx_ctx;
 extern fn mlx_destroy(ctx: ?*mlx_ctx) void;
 extern fn mlx_reset(ctx: ?*mlx_ctx) c_int;
@@ -255,6 +265,7 @@ pub const MetalBackend = struct {
     model_id_z: [:0]u8,
     model_path_z: [:0]u8,
     seed: c_int,
+    bridge_flags: MlxModelFlags,
 
     vocab_size: usize,
     d_model: usize,
@@ -510,7 +521,7 @@ pub const MetalBackend = struct {
             }
         }
         if (created == null) {
-            created = mlx_create(self.model_id_z.ptr, self.model_path_z.ptr, self.seed);
+            created = mlx_create_with_flags(self.model_id_z.ptr, self.model_path_z.ptr, self.seed, &self.bridge_flags);
         }
         const ctx = created orelse {
             log.warn("inference", "metal slot context creation failed", .{
@@ -836,7 +847,14 @@ pub const MetalBackend = struct {
 
         const seed = readSeedFromEnv(allocator);
         const max_batch_size = resolveMaxBatchSize(allocator);
-        const ctx = mlx_create(model_id_z.ptr, model_path_z.ptr, seed) orelse {
+        const model_flags = MlxModelFlags{
+            .use_layer_q_norm_head_dim = if (loaded.config.global_head_dim > 0 and loaded.config.global_head_dim != loaded.config.head_dim) 1 else 0,
+            .allow_norm_shift = if (loaded.runtime.norm_weights_pre_shifted) 0 else 1,
+            .use_v_norm = if (loaded.config.use_v_norm) 1 else 0,
+            .embedding_multiplier = loaded.config.embedding_multiplier,
+            .attention_multiplier = loaded.config.attention_multiplier,
+        };
+        const ctx = mlx_create_with_flags(model_id_z.ptr, model_path_z.ptr, seed, &model_flags) orelse {
             const mlx_error = resolveLastError();
             if (isMemoryError(mlx_error)) {
                 if (init_config.memory_fit_is_error) {
@@ -920,6 +938,7 @@ pub const MetalBackend = struct {
             .model_id_z = model_id_z,
             .model_path_z = model_path_z,
             .seed = seed,
+            .bridge_flags = model_flags,
             .vocab_size = vocab_size,
             .d_model = d_model,
             .max_batch_size = max_batch_size,
@@ -1150,14 +1169,17 @@ pub const MetalBackend = struct {
         return true;
     }
 
-    fn hasGemma4TopKStreamingRegression(self: *const MetalBackend) bool {
+    fn hasTopKStreamingRegression(self: *const MetalBackend) bool {
+        // Models with per-layer-input branches require non-streaming TopK.
         if (self.model_config.hidden_size_per_layer_input > 0) return true;
-        const arch_id = self.model_runtime.architecture_id orelse return false;
-        return std.mem.eql(u8, arch_id, "gemma3");
+        // Models with (1+w) norm formulation AND scaled embeddings have a
+        // numerical divergence in the streaming TopK path.
+        if (self.model_runtime.weight_offset != 0.0 and self.model_config.embedding_multiplier != 1.0) return true;
+        return false;
     }
 
     pub fn supportsSchedulerBackendTopKDecodeRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
-        if (sampling_config.strategy == .top_k and self.hasGemma4TopKStreamingRegression()) return false;
+        if (sampling_config.strategy == .top_k and self.hasTopKStreamingRegression()) return false;
         return switch (sampling_config.strategy) {
             .top_k => sampling_config.top_k > 0 and
                 sampling_config.top_k <= topk_route_candidate_capacity,
@@ -1177,7 +1199,7 @@ pub const MetalBackend = struct {
         self: *const MetalBackend,
         sampling_config: *const sampling.SamplingConfig,
     ) bool {
-        if (self.hasGemma4TopKStreamingRegression()) return false;
+        if (self.hasTopKStreamingRegression()) return false;
         return sampling_config.strategy == .top_k and
             sampling_config.top_k > 0 and
             sampling_config.top_k <= topk_route_candidate_capacity and
