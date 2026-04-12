@@ -1123,11 +1123,40 @@ pub const MetalBackend = struct {
         }
         const ctx = try self.ensureSlotCtx(0);
 
-        const produced = try self.decodeStream(ctx, first_token, budget, eos_token_ids, output_tokens);
-        if (callback) |cb| {
-            for (output_tokens[0..produced]) |token| cb(token, callback_data);
+        if (callback != null) {
+            // Per-token decode loop: fire callback after each token for true
+            // streaming. The bulk bridge path (mlx_decode_stream) generates all
+            // tokens internally and cannot call back per-token.
+            var produced: usize = 0;
+            var current_token = first_token;
+            const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
+            defer self.allocator.free(logits_buf);
+            while (produced < budget) {
+                try self.decodeLogits(ctx, current_token, logits_buf);
+                var best_idx: usize = 0;
+                var best_val: f32 = -std.math.inf(f32);
+                for (logits_buf, 0..) |value, idx| {
+                    if (value > best_val) {
+                        best_val = value;
+                        best_idx = idx;
+                    }
+                }
+                current_token = @intCast(best_idx);
+                output_tokens[produced] = current_token;
+                produced += 1;
+                if (callback) |cb| cb(current_token, callback_data);
+                for (eos_token_ids) |eos_id| {
+                    if (current_token == eos_id) {
+                        self.slot_positions[0] = start_position + produced;
+                        return produced;
+                    }
+                }
+            }
+            self.slot_positions[0] = start_position + produced;
+            return produced;
         }
 
+        const produced = try self.decodeStream(ctx, first_token, budget, eos_token_ids, output_tokens);
         self.slot_positions[0] = start_position + produced;
         return produced;
     }
@@ -1149,6 +1178,41 @@ pub const MetalBackend = struct {
 
         const budget = @min(max_tokens, output_tokens.len);
         const ctx = try self.ensureSlotCtx(0);
+
+        if (callback != null) {
+            // Per-token decode loop with host-side TopK sampling for true
+            // streaming. The bulk bridge path (mlx_decode_topk_stream) generates
+            // all tokens internally and cannot call back per-token.
+            var produced: usize = 0;
+            var current_token = first_token;
+            const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
+            defer self.allocator.free(logits_buf);
+            while (produced < budget) {
+                try self.decodeLogits(ctx, current_token, logits_buf);
+                applySamplingMutationsToLogits(logits_buf[0..self.vocab_size], sampling_config);
+                const candidate_count = @min(sampling_config.top_k, self.vocab_size);
+                const candidate_logits = try self.allocator.alloc(f32, candidate_count);
+                defer self.allocator.free(candidate_logits);
+                const candidate_ids = try self.allocator.alloc(u32, candidate_count);
+                defer self.allocator.free(candidate_ids);
+                const n = fillTopKFromLogits(logits_buf[0..self.vocab_size], candidate_count, candidate_logits, candidate_ids);
+                if (n == 0) return error.InvalidArgument;
+                // Greedy from top-k candidates (temperature/top-p applied by scheduler).
+                current_token = candidate_ids[0];
+                output_tokens[produced] = current_token;
+                produced += 1;
+                if (callback) |cb| cb(current_token, callback_data);
+                for (eos_token_ids) |eos_id| {
+                    if (current_token == eos_id) {
+                        self.slot_positions[0] = start_position + produced;
+                        return produced;
+                    }
+                }
+            }
+            self.slot_positions[0] = start_position + produced;
+            return produced;
+        }
+
         const produced = try self.decodeTopKStream(
             ctx,
             first_token,
@@ -1157,9 +1221,6 @@ pub const MetalBackend = struct {
             sampling_config,
             output_tokens,
         );
-        if (callback) |cb| {
-            for (output_tokens[0..produced]) |token| cb(token, callback_data);
-        }
         self.slot_positions[0] = start_position + produced;
         return produced;
     }
