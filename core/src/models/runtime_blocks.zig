@@ -622,15 +622,17 @@ pub fn blockWeightsFromMap(
             if (moe_weights == null) {
                 const fused_gate_up = getOptionalWeight(map, "mlp.gate_up_proj.weight") orelse
                     getOptionalWeight(map, "mlp.input_linear.weight");
+                // Keep split gate/up pointers available even when fused gate_up
+                // exists so backends can choose the best execution path per dtype.
+                w1 = getOptionalWeight(map, "mlp.gate_proj.weight") orelse
+                    getOptionalWeight(map, "feed_forward.w1.weight") orelse
+                    getOptionalWeight(map, "mlp.dense_in.weight");
+                w3 = getOptionalWeight(map, "mlp.up_proj.weight") orelse
+                    getOptionalWeight(map, "feed_forward.w3.weight");
                 if (fused_gate_up) |fg| {
                     fused.gate_up = fg.*;
-                } else {
-                    w1 = getOptionalWeight(map, "mlp.gate_proj.weight") orelse
-                        getOptionalWeight(map, "feed_forward.w1.weight") orelse
-                        getOptionalWeight(map, "mlp.dense_in.weight");
-                    w3 = getOptionalWeight(map, "mlp.up_proj.weight") orelse
-                        getOptionalWeight(map, "feed_forward.w3.weight");
-                    if (w1 == null) return error.MissingWeight;
+                } else if (w1 == null) {
+                    return error.MissingWeight;
                 }
                 w2 = getOptionalWeight(map, "mlp.down_proj.weight") orelse
                     getOptionalWeight(map, "mlp.output_linear.weight") orelse
@@ -732,11 +734,11 @@ pub fn blockWeightsFromMap(
                 down_proj = getOptionalWeight(map, "mlp.output_linear.weight") orelse
                     getOptionalWeight(map, "mlp.down_proj.weight");
 
-                if (fused_gate_up == null) {
-                    w1 = getOptionalWeight(map, "mlp.gate_proj.weight");
-                    w3 = getOptionalWeight(map, "mlp.up_proj.weight");
-                    w2 = down_proj;
-                }
+                // Always expose split gate/up when present so runtimes can
+                // choose between fused and split execution based on dtype/path.
+                w1 = getOptionalWeight(map, "mlp.gate_proj.weight");
+                w3 = getOptionalWeight(map, "mlp.up_proj.weight");
+                w2 = down_proj;
 
                 if (fused_gate_up) |fg| {
                     fused_gate_up_weights = .{ .gate_up = fg.*, .gate_up_layout = .concat };
@@ -935,6 +937,125 @@ test "blockWeightsFromMap gated_delta accepts qwen3.5 split linear attention wei
     try std.testing.expectEqual(@as(i64, 2), gated_delta.weights.in_proj.shape[1]);
     try std.testing.expect(gated_delta.weights.dt_bias != null);
     try std.testing.expect(gated_delta.weights.norm_weight != null);
+    try std.testing.expect(gated_delta.w1 != null);
+    try std.testing.expect(gated_delta.w2 != null);
+    try std.testing.expect(gated_delta.w3 != null);
+}
+
+test "blockWeightsFromMap attention_mlp keeps split FFN views when fused gate_up is present" {
+    const allocator = std.testing.allocator;
+    var map = WeightMap{};
+    defer map.deinit(allocator);
+
+    var ln1_data = [_]f32{ 1, 1 };
+    var ln2_data = [_]f32{ 1, 1 };
+    var q_data = [_]f32{ 1, 2, 3, 4 };
+    var k_data = [_]f32{ 5, 6, 7, 8 };
+    var v_data = [_]f32{ 9, 10, 11, 12 };
+    var o_data = [_]f32{ 13, 14, 15, 16 };
+    var gate_up_data = [_]f32{
+        1, 2,
+        3, 4,
+        5, 6,
+        7, 8,
+    };
+    var gate_data = [_]f32{ 1, 2, 3, 4 };
+    var up_data = [_]f32{ 5, 6, 7, 8 };
+    var down_data = [_]f32{ 9, 10, 11, 12 };
+
+    var ln1 = Tensor.view2DSlice(ln1_data[0..], 1, 2);
+    var ln2 = Tensor.view2DSlice(ln2_data[0..], 1, 2);
+    var q = Tensor.view2DSlice(q_data[0..], 2, 2);
+    var k = Tensor.view2DSlice(k_data[0..], 2, 2);
+    var v = Tensor.view2DSlice(v_data[0..], 2, 2);
+    var o = Tensor.view2DSlice(o_data[0..], 2, 2);
+    var gate_up = Tensor.view2DSlice(gate_up_data[0..], 4, 2);
+    var gate = Tensor.view2DSlice(gate_data[0..], 2, 2);
+    var up = Tensor.view2DSlice(up_data[0..], 2, 2);
+    var down = Tensor.view2DSlice(down_data[0..], 2, 2);
+
+    try map.put(allocator, "input_layernorm.weight", &ln1);
+    try map.put(allocator, "post_attention_layernorm.weight", &ln2);
+    try map.put(allocator, "self_attn.q_proj.weight", &q);
+    try map.put(allocator, "self_attn.k_proj.weight", &k);
+    try map.put(allocator, "self_attn.v_proj.weight", &v);
+    try map.put(allocator, "self_attn.o_proj.weight", &o);
+    try map.put(allocator, "mlp.gate_up_proj.weight", &gate_up);
+    try map.put(allocator, "mlp.gate_proj.weight", &gate);
+    try map.put(allocator, "mlp.up_proj.weight", &up);
+    try map.put(allocator, "mlp.down_proj.weight", &down);
+
+    const block = try blockWeightsFromMap(&map, .attention_mlp, .{ .allocator = allocator });
+    try std.testing.expect(block == .attention_mlp);
+    const attn = block.attention_mlp;
+    try std.testing.expect(attn.fused.gate_up != null);
+    try std.testing.expect(attn.w1 != null);
+    try std.testing.expect(attn.w2 != null);
+    try std.testing.expect(attn.w3 != null);
+}
+
+test "blockWeightsFromMap gated_delta keeps split FFN views when fused gate_up is present" {
+    const allocator = std.testing.allocator;
+    var map = WeightMap{};
+    defer map.deinit(allocator);
+
+    var ln1_data = [_]f32{ 1, 1 };
+    var in_proj_qkv_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var in_proj_z_data = [_]f32{ 9, 10, 11, 12 };
+    var in_proj_b_data = [_]f32{ 13, 14 };
+    var in_proj_a_data = [_]f32{ 15, 16 };
+    var conv_data = [_]f32{ 0, 1, 2, 3, 4, 5 };
+    var a_log_data = [_]f32{ 0.1, 0.2 };
+    var out_proj_data = [_]f32{ 1, 0, 0, 1 };
+    var mlp_gate_up_data = [_]f32{
+        1, 2,
+        3, 4,
+        5, 6,
+        7, 8,
+    };
+    var mlp_gate_data = [_]f32{ 1, 2, 3, 4 };
+    var mlp_up_data = [_]f32{ 5, 6, 7, 8 };
+    var mlp_down_data = [_]f32{ 9, 10, 11, 12 };
+
+    var ln1 = Tensor.view2DSlice(ln1_data[0..], 1, 2);
+    var in_proj_qkv = Tensor.view2DSlice(in_proj_qkv_data[0..], 4, 2);
+    var in_proj_z = Tensor.view2DSlice(in_proj_z_data[0..], 2, 2);
+    var in_proj_b = Tensor.view2DSlice(in_proj_b_data[0..], 1, 2);
+    var in_proj_a = Tensor.view2DSlice(in_proj_a_data[0..], 1, 2);
+    var conv = Tensor.view(@ptrCast(conv_data[0..].ptr), &.{ 6, 1, 1 }, .f32, null);
+    var a_log = Tensor.view(@ptrCast(a_log_data[0..].ptr), &.{2}, .f32, null);
+    var out_proj = Tensor.view2DSlice(out_proj_data[0..], 2, 2);
+    var mlp_gate_up = Tensor.view2DSlice(mlp_gate_up_data[0..], 4, 2);
+    var mlp_gate = Tensor.view2DSlice(mlp_gate_data[0..], 2, 2);
+    var mlp_up = Tensor.view2DSlice(mlp_up_data[0..], 2, 2);
+    var mlp_down = Tensor.view2DSlice(mlp_down_data[0..], 2, 2);
+
+    try map.put(allocator, "input_layernorm.weight", &ln1);
+    try map.put(allocator, "linear_attn.in_proj_qkv.weight", &in_proj_qkv);
+    try map.put(allocator, "linear_attn.in_proj_z.weight", &in_proj_z);
+    try map.put(allocator, "linear_attn.in_proj_b.weight", &in_proj_b);
+    try map.put(allocator, "linear_attn.in_proj_a.weight", &in_proj_a);
+    try map.put(allocator, "linear_attn.conv1d.weight", &conv);
+    try map.put(allocator, "linear_attn.A_log", &a_log);
+    try map.put(allocator, "linear_attn.out_proj.weight", &out_proj);
+    try map.put(allocator, "mlp.gate_up_proj.weight", &mlp_gate_up);
+    try map.put(allocator, "mlp.gate_proj.weight", &mlp_gate);
+    try map.put(allocator, "mlp.up_proj.weight", &mlp_up);
+    try map.put(allocator, "mlp.down_proj.weight", &mlp_down);
+
+    const block = try blockWeightsFromMap(&map, .gated_delta, .{
+        .gated_delta_config = .{
+            .d_model = 2,
+            .d_conv = 1,
+            .n_heads = 2,
+            .d_head = 1,
+        },
+        .allocator = allocator,
+    });
+
+    try std.testing.expect(block == .gated_delta);
+    const gated_delta = block.gated_delta;
+    try std.testing.expect(gated_delta.fused_gate_up != null);
     try std.testing.expect(gated_delta.w1 != null);
     try std.testing.expect(gated_delta.w2 != null);
     try std.testing.expect(gated_delta.w3 != null);

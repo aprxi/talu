@@ -188,6 +188,16 @@ pub fn loadWeightMap(
                 gate_ptr.shape[0] = @intCast(half_rows);
                 gate_ptr.numel = half_rows * cols;
                 gate_ptr.data_size = half_rows * bytes_per_row;
+                if (fused.gaffine) |g| {
+                    const scales_bytes_per_row = std.math.divExact(usize, g.scales.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+                    const bias_bytes_per_row = std.math.divExact(usize, g.biases.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+                    gate_ptr.gaffine = .{
+                        .scales = g.scales[0 .. half_rows * scales_bytes_per_row],
+                        .biases = g.biases[0 .. half_rows * bias_bytes_per_row],
+                        .group_size = g.group_size,
+                        .scales_dtype = g.scales_dtype,
+                    };
+                }
                 try map.put(allocator, "mlp.gate_proj.weight", gate_ptr);
 
                 const up_ptr = try allocator.create(tensor.Tensor);
@@ -197,6 +207,16 @@ pub fn loadWeightMap(
                 up_ptr.data_size = half_rows * bytes_per_row;
                 if (fused.data_ptr) |base| {
                     up_ptr.data_ptr = base + half_rows * bytes_per_row;
+                }
+                if (fused.gaffine) |g| {
+                    const scales_bytes_per_row = std.math.divExact(usize, g.scales.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+                    const bias_bytes_per_row = std.math.divExact(usize, g.biases.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+                    up_ptr.gaffine = .{
+                        .scales = g.scales[half_rows * scales_bytes_per_row ..][0 .. half_rows * scales_bytes_per_row],
+                        .biases = g.biases[half_rows * bias_bytes_per_row ..][0 .. half_rows * bias_bytes_per_row],
+                        .group_size = g.group_size,
+                        .scales_dtype = g.scales_dtype,
+                    };
                 }
                 try map.put(allocator, "mlp.up_proj.weight", up_ptr);
             }

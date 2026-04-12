@@ -1665,6 +1665,71 @@ pub const GatedDeltaWeightRefs = struct {
     norm_weight: ?*const Tensor = null,
 };
 
+pub const GatedDeltaFfnUploadPlan = union(enum) {
+    none,
+    split: struct {
+        w1: *const Tensor,
+        w2: *const Tensor,
+        w3: *const Tensor,
+    },
+    fused: struct {
+        gate_up: Tensor,
+        gate_up_layout: GateUpLayout,
+        w2: *const Tensor,
+    },
+};
+
+fn supportsFusedGateUpDenseUpload(dtype_tag: tensor.DType) bool {
+    return switch (dtype_tag) {
+        .f16, .bf16, .f32 => true,
+        else => false,
+    };
+}
+
+pub fn resolveGatedDeltaFfnUploadPlan(gated_delta: *const models.runtime_blocks.GatedDeltaBlockWeights) !GatedDeltaFfnUploadPlan {
+    if (gated_delta.moe_weights != null) return .none;
+
+    const split_w1 = gated_delta.w1;
+    const split_w2 = gated_delta.w2 orelse gated_delta.down_proj;
+    const split_w3 = gated_delta.w3;
+
+    if (gated_delta.fused_gate_up) |fused| {
+        const gate_up = fused.gate_up orelse return error.MissingWeight;
+        const w2 = split_w2 orelse return error.MissingWeight;
+        if (supportsFusedGateUpDenseUpload(gate_up.dtype)) {
+            return .{
+                .fused = .{
+                    .gate_up = gate_up,
+                    .gate_up_layout = fused.gate_up_layout,
+                    .w2 = w2,
+                },
+            };
+        }
+        if (split_w1 != null or split_w2 != null or split_w3 != null) {
+            return .{
+                .split = .{
+                    .w1 = split_w1 orelse return error.MissingWeight,
+                    .w2 = split_w2 orelse return error.MissingWeight,
+                    .w3 = split_w3 orelse return error.MissingWeight,
+                },
+            };
+        }
+        return error.UnsupportedModel;
+    }
+
+    if (split_w1 != null or split_w2 != null or split_w3 != null) {
+        return .{
+            .split = .{
+                .w1 = split_w1 orelse return error.MissingWeight,
+                .w2 = split_w2 orelse return error.MissingWeight,
+                .w3 = split_w3 orelse return error.MissingWeight,
+            },
+        };
+    }
+
+    return .none;
+}
+
 pub const SwiGluWeightRefs = struct {
     w1: ?*const LinearWeight = null,
     w3: ?*const LinearWeight = null,
@@ -2806,17 +2871,34 @@ pub const BlockRuntime = struct {
                         w2_dev = moe_result.shared_down;
                         d_ff = @max(moe_result.shared_d_ff, 2 * @as(usize, moe_result.expert_d_ff));
                     } else if (attn.fused.gate_up) |gate_up| {
-                        const fused_gate_up = try uploadFusedGateUpWeights(
-                            device,
-                            allocator,
-                            &gate_up,
-                            d_model,
-                            attn.fused.gate_up_layout,
-                        );
-                        w1_dev = fused_gate_up.gate;
-                        w3_dev = fused_gate_up.up;
-                        d_ff = w1_dev.cols();
-                        w2_dev = try uploadLinearWeightWithContext(device, allocator, w2.?, d_ff, layer_idx, "mlp.down_proj.weight");
+                        if (supportsFusedGateUpDenseUpload(gate_up.dtype)) {
+                            const fused_gate_up = try uploadFusedGateUpWeights(
+                                device,
+                                allocator,
+                                &gate_up,
+                                d_model,
+                                attn.fused.gate_up_layout,
+                            );
+                            w1_dev = fused_gate_up.gate;
+                            w3_dev = fused_gate_up.up;
+                            d_ff = w1_dev.cols();
+                            w2_dev = try uploadLinearWeightWithContext(device, allocator, w2.?, d_ff, layer_idx, "mlp.down_proj.weight");
+                        } else {
+                            const w1 = attn.w1 orelse return error.MissingWeight;
+                            const w3 = attn.w3 orelse return error.MissingWeight;
+                            w1_dev = try uploadLinearWeightWithContext(device, allocator, w1, d_model, layer_idx, "mlp.gate_proj.weight");
+                            w3_dev = try uploadLinearWeightWithContext(device, allocator, w3, d_model, layer_idx, "mlp.up_proj.weight");
+                            if (w1_dev.cols() != w3_dev.cols()) {
+                                log.warn("inference", "CUDA block runtime gate/up dim mismatch", .{
+                                    .layer = layer_idx,
+                                    .w1_cols = w1_dev.cols(),
+                                    .w3_cols = w3_dev.cols(),
+                                });
+                                return error.UnsupportedModel;
+                            }
+                            d_ff = w1_dev.cols();
+                            w2_dev = try uploadLinearWeightWithContext(device, allocator, w2.?, d_ff, layer_idx, "mlp.down_proj.weight");
+                        }
                     } else {
                         const w1 = attn.w1 orelse return error.MissingWeight;
                         const w3 = attn.w3 orelse return error.MissingWeight;
@@ -3045,12 +3127,6 @@ pub const BlockRuntime = struct {
                         allocator.free(blocks[local_idx].slot_width_hints);
                         blocks[local_idx].slot_width_hints = &.{};
                     };
-                    if (gated_delta.fused_gate_up != null) {
-                        log.warn("inference", "CUDA gated-delta fused gate_up not supported yet", .{
-                            .layer = layer_idx,
-                        });
-                        return error.UnsupportedModel;
-                    }
                     if (gated_delta.config.d_model != d_model) {
                         log.warn("inference", "CUDA gated-delta d_model mismatch", .{
                             .layer = layer_idx,
@@ -3102,42 +3178,83 @@ pub const BlockRuntime = struct {
                     var ffn_w2: ?LinearWeight = null;
                     var ffn_w3: ?LinearWeight = null;
                     var d_ff: usize = 0;
-                    if (!has_gd_moe and (gated_delta.w1 != null or gated_delta.w2 != null or gated_delta.w3 != null)) {
-                        const w1 = gated_delta.w1 orelse return error.MissingWeight;
-                        const w2 = gated_delta.w2 orelse return error.MissingWeight;
-                        const w3 = gated_delta.w3 orelse return error.MissingWeight;
-                        if (ln2_weight == null) {
-                            log.warn("inference", "CUDA gated-delta ffn requires ln2", .{
-                                .layer = layer_idx,
-                            });
-                            return error.UnsupportedModel;
+                    if (!has_gd_moe) {
+                        const ffn_plan = try resolveGatedDeltaFfnUploadPlan(&gated_delta);
+                        switch (ffn_plan) {
+                            .none => {
+                                log.warn("inference", "CUDA gated-delta missing FFN weights", .{
+                                    .layer = layer_idx,
+                                });
+                                return error.UnsupportedModel;
+                            },
+                            .split => |split| {
+                                if (ln2_weight == null) {
+                                    log.warn("inference", "CUDA gated-delta ffn requires ln2", .{
+                                        .layer = layer_idx,
+                                    });
+                                    return error.UnsupportedModel;
+                                }
+                                var w1_dev = try uploadLinearWeightWithContext(device, allocator, split.w1, d_model, layer_idx, "mlp.gate_proj.weight");
+                                errdefer w1_dev.deinit(device);
+                                var w3_dev = try uploadLinearWeightWithContext(device, allocator, split.w3, d_model, layer_idx, "mlp.up_proj.weight");
+                                errdefer w3_dev.deinit(device);
+                                if (w1_dev.cols() != w3_dev.cols()) {
+                                    log.warn("inference", "CUDA gated-delta gate/up dim mismatch", .{
+                                        .layer = layer_idx,
+                                        .w1_cols = w1_dev.cols(),
+                                        .w3_cols = w3_dev.cols(),
+                                    });
+                                    return error.UnsupportedModel;
+                                }
+                                d_ff = w1_dev.cols();
+                                var w2_dev = try uploadLinearWeightWithContext(device, allocator, split.w2, d_ff, layer_idx, "mlp.down_proj.weight");
+                                errdefer w2_dev.deinit(device);
+                                if (w2_dev.cols() != d_model) {
+                                    log.warn("inference", "CUDA gated-delta down_proj out dim unsupported", .{
+                                        .layer = layer_idx,
+                                        .w2_cols = w2_dev.cols(),
+                                        .d_model = d_model,
+                                    });
+                                    return error.UnsupportedModel;
+                                }
+                                ffn_w1 = w1_dev;
+                                ffn_w2 = w2_dev;
+                                ffn_w3 = w3_dev;
+                            },
+                            .fused => |fused| {
+                                if (ln2_weight == null) {
+                                    log.warn("inference", "CUDA gated-delta ffn requires ln2", .{
+                                        .layer = layer_idx,
+                                    });
+                                    return error.UnsupportedModel;
+                                }
+                                const fused_gate_up = try uploadFusedGateUpWeights(
+                                    device,
+                                    allocator,
+                                    &fused.gate_up,
+                                    d_model,
+                                    fused.gate_up_layout,
+                                );
+                                var w1_dev = fused_gate_up.gate;
+                                errdefer w1_dev.deinit(device);
+                                var w3_dev = fused_gate_up.up;
+                                errdefer w3_dev.deinit(device);
+                                d_ff = w1_dev.cols();
+                                var w2_dev = try uploadLinearWeightWithContext(device, allocator, fused.w2, d_ff, layer_idx, "mlp.down_proj.weight");
+                                errdefer w2_dev.deinit(device);
+                                if (w2_dev.cols() != d_model) {
+                                    log.warn("inference", "CUDA gated-delta down_proj out dim unsupported", .{
+                                        .layer = layer_idx,
+                                        .w2_cols = w2_dev.cols(),
+                                        .d_model = d_model,
+                                    });
+                                    return error.UnsupportedModel;
+                                }
+                                ffn_w1 = w1_dev;
+                                ffn_w2 = w2_dev;
+                                ffn_w3 = w3_dev;
+                            },
                         }
-                        var w1_dev = try uploadLinearWeightWithContext(device, allocator, w1, d_model, layer_idx, "mlp.gate_proj.weight");
-                        errdefer w1_dev.deinit(device);
-                        var w3_dev = try uploadLinearWeightWithContext(device, allocator, w3, d_model, layer_idx, "mlp.up_proj.weight");
-                        errdefer w3_dev.deinit(device);
-                        if (w1_dev.cols() != w3_dev.cols()) {
-                            log.warn("inference", "CUDA gated-delta gate/up dim mismatch", .{
-                                .layer = layer_idx,
-                                .w1_cols = w1_dev.cols(),
-                                .w3_cols = w3_dev.cols(),
-                            });
-                            return error.UnsupportedModel;
-                        }
-                        d_ff = w1_dev.cols();
-                        var w2_dev = try uploadLinearWeightWithContext(device, allocator, w2, d_ff, layer_idx, "mlp.down_proj.weight");
-                        errdefer w2_dev.deinit(device);
-                        if (w2_dev.cols() != d_model) {
-                            log.warn("inference", "CUDA gated-delta down_proj out dim unsupported", .{
-                                .layer = layer_idx,
-                                .w2_cols = w2_dev.cols(),
-                                .d_model = d_model,
-                            });
-                            return error.UnsupportedModel;
-                        }
-                        ffn_w1 = w1_dev;
-                        ffn_w2 = w2_dev;
-                        ffn_w3 = w3_dev;
                     }
                     errdefer if (ffn_w1) |*w| w.deinit(device);
                     errdefer if (ffn_w2) |*w| w.deinit(device);

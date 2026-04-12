@@ -43,6 +43,7 @@ const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 const buildCudaLayerProgramRegisterSlotMap = engine_types.buildCudaLayerProgramRegisterSlotMap;
 const required_kernels = engine_types.required_kernels;
 const KernelSlot = engine_types.KernelSlot;
+const resolveGatedDeltaFfnUploadPlan = engine_types.resolveGatedDeltaFfnUploadPlan;
 
 // --- Functions from engine_weights.zig ---
 const engine_weights = @import("engine_weights.zig");
@@ -711,6 +712,166 @@ test "canFuseDenseU16QkvWeights rejects mixed dtypes" {
     };
 
     try std.testing.expect(!engine_ops.canFuseDenseU16QkvWeights(1024, q, k, v));
+}
+
+fn makeGatedDeltaBlockForFfnPlan(
+    dummy: *const Tensor,
+    w1: ?*const Tensor,
+    w2: ?*const Tensor,
+    w3: ?*const Tensor,
+    down_proj: ?*const Tensor,
+    fused_gate_up: ?Tensor,
+    gate_up_layout: models.runtime_blocks.GateUpLayout,
+) models.runtime_blocks.GatedDeltaBlockWeights {
+    return .{
+        .ln1_weight = dummy,
+        .config = .{
+            .d_model = 2,
+            .d_conv = 1,
+            .n_heads = 1,
+            .d_head = 2,
+            .n_key_heads = 1,
+        },
+        .weights = .{
+            .in_proj = dummy,
+            .conv1d_weight = dummy,
+            .A_log = dummy,
+            .out_proj = dummy,
+        },
+        .fused_gate_up = if (fused_gate_up) |fg|
+            .{ .gate_up = fg, .gate_up_layout = gate_up_layout }
+        else
+            null,
+        .down_proj = down_proj,
+        .w1 = w1,
+        .w2 = w2,
+        .w3 = w3,
+        .moe_weights = null,
+    };
+}
+
+test "resolveGatedDeltaFfnUploadPlan returns split weights when gate/up are separate" {
+    var dummy_data = [_]f32{ 1, 2, 3, 4 };
+    var w1_data = [_]f32{ 5, 6, 7, 8 };
+    var w2_data = [_]f32{ 9, 10, 11, 12 };
+    var w3_data = [_]f32{ 13, 14, 15, 16 };
+    var dummy = Tensor.view2DSlice(dummy_data[0..], 2, 2);
+    var w1 = Tensor.view2DSlice(w1_data[0..], 2, 2);
+    var w2 = Tensor.view2DSlice(w2_data[0..], 2, 2);
+    var w3 = Tensor.view2DSlice(w3_data[0..], 2, 2);
+
+    var block = makeGatedDeltaBlockForFfnPlan(
+        &dummy,
+        &w1,
+        &w2,
+        &w3,
+        null,
+        null,
+        .concat,
+    );
+
+    const plan = try resolveGatedDeltaFfnUploadPlan(&block);
+    switch (plan) {
+        .split => |split| {
+            try std.testing.expect(split.w1 == &w1);
+            try std.testing.expect(split.w2 == &w2);
+            try std.testing.expect(split.w3 == &w3);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "resolveGatedDeltaFfnUploadPlan returns fused gate_up when present" {
+    var dummy_data = [_]f32{ 1, 2, 3, 4 };
+    var fused_data = [_]f32{
+        1, 2,
+        3, 4,
+        5, 6,
+        7, 8,
+    };
+    var down_data = [_]f32{ 9, 10, 11, 12 };
+    var dummy = Tensor.view2DSlice(dummy_data[0..], 2, 2);
+    const fused = Tensor.view2DSlice(fused_data[0..], 4, 2);
+    var down = Tensor.view2DSlice(down_data[0..], 2, 2);
+
+    var block = makeGatedDeltaBlockForFfnPlan(
+        &dummy,
+        null,
+        null,
+        null,
+        &down,
+        fused,
+        .concat,
+    );
+
+    const plan = try resolveGatedDeltaFfnUploadPlan(&block);
+    switch (plan) {
+        .fused => |fused_plan| {
+            try std.testing.expectEqual(models.runtime_blocks.GateUpLayout.concat, fused_plan.gate_up_layout);
+            try std.testing.expect(fused_plan.w2 == &down);
+            try std.testing.expectEqual(@as(i64, 4), fused_plan.gate_up.shape[0]);
+            try std.testing.expectEqual(@as(i64, 2), fused_plan.gate_up.shape[1]);
+            try std.testing.expectEqual(fused.data_ptr, fused_plan.gate_up.data_ptr);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "resolveGatedDeltaFfnUploadPlan falls back to split weights for non-dense fused dtype" {
+    var dummy_data = [_]f32{ 1, 2, 3, 4 };
+    var gate_data = [_]f32{ 5, 6, 7, 8 };
+    var up_data = [_]f32{ 9, 10, 11, 12 };
+    var down_data = [_]f32{ 13, 14, 15, 16 };
+    var fused_u4_bytes = [_]u8{0} ** 16;
+    const fused_shape = [_]usize{ 4, 2 };
+    var dummy = Tensor.view2DSlice(dummy_data[0..], 2, 2);
+    var gate = Tensor.view2DSlice(gate_data[0..], 2, 2);
+    var up = Tensor.view2DSlice(up_data[0..], 2, 2);
+    var down = Tensor.view2DSlice(down_data[0..], 2, 2);
+    const fused = Tensor.view(&fused_u4_bytes, &fused_shape, .grouped_affine_u4, fused_u4_bytes.len);
+
+    var block = makeGatedDeltaBlockForFfnPlan(
+        &dummy,
+        &gate,
+        &down,
+        &up,
+        &down,
+        fused,
+        .concat,
+    );
+
+    const plan = try resolveGatedDeltaFfnUploadPlan(&block);
+    switch (plan) {
+        .split => |split| {
+            try std.testing.expect(split.w1 == &gate);
+            try std.testing.expect(split.w2 == &down);
+            try std.testing.expect(split.w3 == &up);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "resolveGatedDeltaFfnUploadPlan rejects fused gate_up without down projection" {
+    var dummy_data = [_]f32{ 1, 2, 3, 4 };
+    var fused_data = [_]f32{
+        1, 2,
+        3, 4,
+        5, 6,
+        7, 8,
+    };
+    var dummy = Tensor.view2DSlice(dummy_data[0..], 2, 2);
+    const fused = Tensor.view2DSlice(fused_data[0..], 4, 2);
+
+    var block = makeGatedDeltaBlockForFfnPlan(
+        &dummy,
+        null,
+        null,
+        null,
+        null,
+        fused,
+        .concat,
+    );
+    try std.testing.expectError(error.MissingWeight, resolveGatedDeltaFfnUploadPlan(&block));
 }
 
 test "collectTokenPositions returns all matching positions" {
