@@ -138,6 +138,44 @@ pub const ConvertOptions = struct {
 
 pub const modelIdFromOutputPath = gaf_paths.modelIdFromOutputPath;
 
+/// Concatenate multiple rank-2 tensors along axis 0 (rows).
+/// All inputs must have the same number of columns and dtype.
+/// Caller owns the returned tensor's data buffer.
+fn concatWeightsAxis0(allocator: std.mem.Allocator, tensors: []const *const Tensor) !Tensor {
+    if (tensors.len == 0) return error.InvalidWeightTransform;
+    const cols: usize = @intCast(tensors[0].shape[1]);
+    const dt = tensors[0].dtype;
+    var total_rows: usize = 0;
+    var total_bytes: usize = 0;
+    for (tensors) |t| {
+        if (t.n_dims != 2) return error.InvalidWeightTransform;
+        if (@as(usize, @intCast(t.shape[1])) != cols) return error.InvalidWeightTransform;
+        if (t.dtype != dt) return error.InvalidWeightTransform;
+        total_rows += @intCast(t.shape[0]);
+        total_bytes += t.data_size;
+    }
+    const buf = try allocator.alloc(u8, total_bytes);
+    errdefer allocator.free(buf);
+    var offset: usize = 0;
+    for (tensors) |t| {
+        const ptr = t.data_ptr orelse return error.InvalidWeightTransform;
+        @memcpy(buf[offset .. offset + t.data_size], ptr[0..t.data_size]);
+        offset += t.data_size;
+    }
+    var fused = std.mem.zeroes(Tensor);
+    fused.dtype = dt;
+    fused.n_dims = 2;
+    fused.shape[0] = @intCast(total_rows);
+    fused.shape[1] = @intCast(cols);
+    fused.numel = total_rows * cols;
+    fused.strides[0] = @intCast(cols);
+    fused.strides[1] = 1;
+    fused.data_ptr = buf.ptr;
+    fused.data_size = total_bytes;
+    fused.owns_data = false;
+    return fused;
+}
+
 fn maybeWriteFusedTensorForPlan(
     allocator: std.mem.Allocator,
     cuda_ctx: ?*CudaCalibContext,
@@ -167,6 +205,29 @@ fn maybeWriteFusedTensorForPlan(
             defer @constCast(fused).deinit(allocator);
 
             _ = try quantizeGroupedAffineTensor(allocator, cuda_ctx, source_tensors, builder, plan.output_name, fused.*, quant_config, options, token_pool, block_input_cache);
+            return true;
+        },
+        .dense_mlp_gate_up => {
+            if (plan.required_inputs.len != 2) return error.InvalidWeightTransform;
+            const gate = try source_tensors.getTensor(plan.required_inputs[0], null);
+            const up = try source_tensors.getTensor(plan.required_inputs[1], null);
+
+            const fused_tensor = try concatWeightsAxis0(allocator, &.{ &gate, &up });
+            defer allocator.free(fused_tensor.data_ptr.?[0..fused_tensor.data_size]);
+
+            _ = try quantizeGroupedAffineTensor(allocator, cuda_ctx, source_tensors, builder, plan.output_name, fused_tensor, quant_config, options, token_pool, block_input_cache);
+            return true;
+        },
+        .attention_qkv => {
+            if (plan.required_inputs.len != 3) return error.InvalidWeightTransform;
+            const q = try source_tensors.getTensor(plan.required_inputs[0], null);
+            const k = try source_tensors.getTensor(plan.required_inputs[1], null);
+            const v = try source_tensors.getTensor(plan.required_inputs[2], null);
+
+            const fused_tensor = try concatWeightsAxis0(allocator, &.{ &q, &k, &v });
+            defer allocator.free(fused_tensor.data_ptr.?[0..fused_tensor.data_size]);
+
+            _ = try quantizeGroupedAffineTensor(allocator, cuda_ctx, source_tensors, builder, plan.output_name, fused_tensor, quant_config, options, token_pool, block_input_cache);
             return true;
         },
     }

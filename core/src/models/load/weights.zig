@@ -623,6 +623,8 @@ pub fn loadModelWithArchitecture(
             }
         }
 
+        // Fused gate_up and QKV splits are handled inside loadWeightMap.
+
         // Optional weight-driven d_ff correction, explicitly enabled by architecture metadata.
         if (arch.resolve_d_ff_from_weights and layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {
             try inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids, arch.has_fused_gate_up);

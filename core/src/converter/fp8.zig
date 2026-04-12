@@ -352,6 +352,10 @@ fn maybeWriteFusedTensorForPlan(
             try quantizeFp8Tensor(allocator, source_tensors, builder, plan.output_name, fused.*);
             return true;
         },
+        .dense_mlp_gate_up, .attention_qkv => {
+            // FP8 converter: structural fusions not yet implemented.
+            return false;
+        },
     }
 }
 

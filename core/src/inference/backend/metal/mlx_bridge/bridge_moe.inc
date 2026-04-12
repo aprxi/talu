@@ -195,13 +195,15 @@ array run_layer(
         lw.pre_feedforward_layernorm_w.size() > 1 &&
         lw.post_feedforward_layernorm_w.size() > 1;
 
-    const array h = has_gemma_four_norm
-        ? (hidden + fast::rms_norm(residual_branch, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps))
-        : (hidden + residual_branch);
-
-    const array mlp_in = has_gemma_four_norm
-        ? fast::rms_norm(h, std::optional<array>(lw.pre_feedforward_layernorm_w), ctx->cfg.rms_norm_eps)
-        : fast::rms_norm(h, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps);
+    array h = array(0.0f);
+    array mlp_in = array(0.0f);
+    if (has_gemma_four_norm) {
+        h = hidden + fast::rms_norm(residual_branch, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps);
+        mlp_in = fast::rms_norm(h, std::optional<array>(lw.pre_feedforward_layernorm_w), ctx->cfg.rms_norm_eps);
+    } else {
+        h = hidden + residual_branch;
+        mlp_in = fast::rms_norm(h, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps);
+    }
     array down = array(0.0f);
     if (lw.mlp_is_moe) {
         const bool use_mxfp4_moe =

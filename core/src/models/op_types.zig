@@ -200,6 +200,8 @@ pub const WeightTransform = enum {
 
 pub const ConversionFusionKind = enum {
     gated_delta_split_in_proj,
+    dense_mlp_gate_up,
+    attention_qkv,
 };
 
 /// Models-owned converter fusion contract.

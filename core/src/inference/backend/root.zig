@@ -126,7 +126,7 @@ pub fn defaultModelLoadOptions(init_options: InitOptions) LoadOptions {
     };
 }
 
-fn effectiveLoadSelection(requested: Selection) Selection {
+pub fn effectiveLoadSelection(requested: Selection) Selection {
     if (requested != .auto) return requested;
     if (std.posix.getenv("BACKEND")) |raw_ptr| {
         if (parseSelectionToken(raw_ptr)) |parsed| return parsed;

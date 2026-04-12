@@ -544,42 +544,11 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     lw.moe_shared_expert_gate_w = shared_gate_weight;
                 }
             } else {
-                const std::string mlp_gate_key = has_tensor(tensors, p + "mlp.gate_proj.weight")
-                    ? p + "mlp.gate_proj.weight"
-                    : p + "feed_forward.w1.weight";
-                const std::string mlp_up_key = has_tensor(tensors, p + "mlp.up_proj.weight")
-                    ? p + "mlp.up_proj.weight"
-                    : p + "feed_forward.w3.weight";
                 const std::string mlp_down_key = has_tensor(tensors, p + "mlp.down_proj.weight")
                     ? p + "mlp.down_proj.weight"
                     : p + "feed_forward.w2.weight";
+                const array& mlp_down_weight = require_tensor(tensors, mlp_down_key);
 
-                const array& mlp_gate_weight = require_tensor(tensors, mlp_gate_key); // [out,in] raw
-                const array& mlp_up_weight = require_tensor(tensors, mlp_up_key); // [out,in] raw
-                const array& mlp_down_weight = require_tensor(tensors, mlp_down_key); // [out,in] raw
-
-                maybe_quantize_mxfp8_matrix(
-                    tensors,
-                    ctx->cfg,
-                    mlp_gate_key,
-                    mlp_gate_weight,
-                    enable_mlp_qmm,
-                    &lw.mlp_gate_q_w,
-                    &lw.mlp_gate_q_scales,
-                    &lw.mlp_gate_q_biases,
-                    &lw.mlp_gate_has_q
-                );
-                maybe_quantize_mxfp8_matrix(
-                    tensors,
-                    ctx->cfg,
-                    mlp_up_key,
-                    mlp_up_weight,
-                    enable_mlp_qmm,
-                    &lw.mlp_up_q_w,
-                    &lw.mlp_up_q_scales,
-                    &lw.mlp_up_q_biases,
-                    &lw.mlp_up_has_q
-                );
                 maybe_quantize_mxfp8_matrix(
                     tensors,
                     ctx->cfg,
@@ -591,24 +560,72 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     &lw.mlp_down_q_biases,
                     &lw.mlp_down_has_q
                 );
-                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_has_q) {
-                    lw.mlp_gate_rhs = load_rhs_weight(mlp_gate_key);
-                }
-                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_up_has_q) {
-                    lw.mlp_up_rhs = load_rhs_weight(mlp_up_key);
-                }
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_down_has_q) {
                     lw.mlp_down_rhs = load_rhs_weight(mlp_down_key);
                 }
-                combine_dense_mlp_gate_up_weights(&lw);
-                compact_dense_mlp_gate_up_weights(&lw);
+
+                // Prefer fused gate_up_proj if the checkpoint has it (produced by
+                // talu convert). This avoids a concatenate+copy at runtime that
+                // duplicates weight data already in the mmap.
+                const std::string gate_up_key = p + "mlp.gate_up_proj.weight";
+                if (has_tensor(tensors, gate_up_key) &&
+                    has_grouped_affine_metadata_for_key(tensors, gate_up_key))
+                {
+                    const array& gate_up_weight = require_tensor(tensors, gate_up_key);
+                    if (gate_up_weight.ndim() == 2 && gate_up_weight.shape(0) > 0) {
+                        lw.mlp_gate_width = gate_up_weight.shape(0) / 2;
+                        maybe_capture_grouped_affine_quant(
+                            tensors, ctx->cfg, gate_up_key, gate_up_weight,
+                            &lw.mlp_gate_up_q_w,
+                            &lw.mlp_gate_up_q_scales,
+                            &lw.mlp_gate_up_q_biases
+                        );
+                        lw.mlp_gate_up_has_q = lw.mlp_gate_up_q_w.ndim() == 2;
+                        if (lw.mlp_gate_up_has_q) {
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                        if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_up_has_q) {
+                            lw.mlp_gate_up_rhs = load_rhs_weight(gate_up_key);
+                        }
+                    }
+                }
+
+                // Fallback: separate gate + up tensors, combined at runtime.
+                if (!lw.mlp_gate_up_has_q && lw.mlp_gate_up_rhs.size() <= 1) {
+                    const std::string mlp_gate_key = has_tensor(tensors, p + "mlp.gate_proj.weight")
+                        ? p + "mlp.gate_proj.weight"
+                        : p + "feed_forward.w1.weight";
+                    const std::string mlp_up_key = has_tensor(tensors, p + "mlp.up_proj.weight")
+                        ? p + "mlp.up_proj.weight"
+                        : p + "feed_forward.w3.weight";
+                    const array& mlp_gate_weight = require_tensor(tensors, mlp_gate_key);
+                    const array& mlp_up_weight = require_tensor(tensors, mlp_up_key);
+                    maybe_quantize_mxfp8_matrix(
+                        tensors, ctx->cfg, mlp_gate_key, mlp_gate_weight, enable_mlp_qmm,
+                        &lw.mlp_gate_q_w, &lw.mlp_gate_q_scales, &lw.mlp_gate_q_biases, &lw.mlp_gate_has_q
+                    );
+                    maybe_quantize_mxfp8_matrix(
+                        tensors, ctx->cfg, mlp_up_key, mlp_up_weight, enable_mlp_qmm,
+                        &lw.mlp_up_q_w, &lw.mlp_up_q_scales, &lw.mlp_up_q_biases, &lw.mlp_up_has_q
+                    );
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_has_q) {
+                        lw.mlp_gate_rhs = load_rhs_weight(mlp_gate_key);
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_up_has_q) {
+                        lw.mlp_up_rhs = load_rhs_weight(mlp_up_key);
+                    }
+                    combine_dense_mlp_gate_up_weights(&lw);
+                    compact_dense_mlp_gate_up_weights(&lw);
+                }
             }
 
             const bool has_linear_split = has_tensor(tensors, p + "linear_attn.in_proj_qkv.weight");
             const bool has_linear_fused = has_tensor(tensors, p + "mixer.in_proj.weight");
             const bool has_linear = has_linear_split || has_linear_fused;
             const bool has_shortconv = has_tensor(tensors, p + "conv.in_proj.weight");
-            const bool has_attn = has_tensor(tensors, p + "self_attn.q_proj.weight");
+            const bool has_attn = has_tensor(tensors, p + "self_attn.q_proj.weight")
+                || has_tensor(tensors, p + "self_attn.qkv_proj.weight");
             const int branch_count = (has_linear ? 1 : 0) + (has_shortconv ? 1 : 0) + (has_attn ? 1 : 0);
             if (branch_count == 0) {
                 std::string present;
@@ -1109,74 +1126,88 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 lw.sc_conv_dim = proj_dim / 3;
                 lw.sc_conv_kernel = lw.sc_conv1d_w.shape(1);
             } else {
-                const std::string q_proj_key = p + "self_attn.q_proj.weight";
-                const std::string k_proj_key = p + "self_attn.k_proj.weight";
-                const std::string v_proj_key = p + "self_attn.v_proj.weight";
                 const std::string o_proj_key = has_tensor(tensors, p + "self_attn.o_proj.weight")
                     ? p + "self_attn.o_proj.weight"
                     : p + "self_attn.out_proj.weight";
-                const array& q_proj_weight = require_tensor(tensors, q_proj_key);
-                const array& k_proj_weight = require_tensor(tensors, k_proj_key);
-                const array& v_proj_weight = require_tensor(tensors, v_proj_key);
                 const array& o_proj_weight = require_tensor(tensors, o_proj_key);
                 maybe_quantize_mxfp8_matrix(
-                    tensors,
-                    ctx->cfg,
-                    q_proj_key,
-                    q_proj_weight,
-                    enable_mlp_qmm,
-                    &lw.attn_q_q_w,
-                    &lw.attn_q_q_scales,
-                    &lw.attn_q_q_biases,
-                    &lw.attn_q_has_q
+                    tensors, ctx->cfg, o_proj_key, o_proj_weight, enable_mlp_qmm,
+                    &lw.attn_o_q_w, &lw.attn_o_q_scales, &lw.attn_o_q_biases, &lw.attn_o_has_q
                 );
-                maybe_quantize_mxfp8_matrix(
-                    tensors,
-                    ctx->cfg,
-                    k_proj_key,
-                    k_proj_weight,
-                    enable_mlp_qmm,
-                    &lw.attn_k_q_w,
-                    &lw.attn_k_q_scales,
-                    &lw.attn_k_q_biases,
-                    &lw.attn_k_has_q
-                );
-                maybe_quantize_mxfp8_matrix(
-                    tensors,
-                    ctx->cfg,
-                    v_proj_key,
-                    v_proj_weight,
-                    enable_mlp_qmm,
-                    &lw.attn_v_q_w,
-                    &lw.attn_v_q_scales,
-                    &lw.attn_v_q_biases,
-                    &lw.attn_v_has_q
-                );
-                maybe_quantize_mxfp8_matrix(
-                    tensors,
-                    ctx->cfg,
-                    o_proj_key,
-                    o_proj_weight,
-                    enable_mlp_qmm,
-                    &lw.attn_o_q_w,
-                    &lw.attn_o_q_scales,
-                    &lw.attn_o_q_biases,
-                    &lw.attn_o_has_q
-                );
-                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_q_has_q) {
-                    lw.attn_q_rhs = load_rhs_weight(q_proj_key);
-                }
-                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_k_has_q) {
-                    lw.attn_k_rhs = load_rhs_weight(k_proj_key);
-                }
-                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_v_has_q) {
-                    lw.attn_v_rhs = load_rhs_weight(v_proj_key);
-                }
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_o_has_q) {
                     lw.attn_o_rhs = load_rhs_weight(o_proj_key);
                 }
-                combine_full_attention_qkv_weights(&lw);
-                compact_full_attention_qkv_weights(&lw);
+
+                // Set attention dimensions early so fused QKV path can compute proj widths.
+                lw.attn_num_heads = ctx->cfg.num_attention_heads;
+                lw.attn_num_kv_heads = ctx->cfg.num_key_value_heads > 0
+                    ? ctx->cfg.num_key_value_heads
+                    : ctx->cfg.num_attention_heads;
+                lw.attn_head_dim = ctx->cfg.head_dim;
+
+                // Prefer fused qkv_proj if the checkpoint has it (produced by talu convert).
+                const std::string qkv_proj_key = p + "self_attn.qkv_proj.weight";
+                if (has_tensor(tensors, qkv_proj_key) &&
+                    has_grouped_affine_metadata_for_key(tensors, qkv_proj_key))
+                {
+                    const array& qkv_weight = require_tensor(tensors, qkv_proj_key);
+                    if (qkv_weight.ndim() == 2) {
+                        // Detect Q/K/V widths from config.
+                        // Q proj width is the total output rows of the Q projection.
+                        // For gated attention (Qwen3.5), Q carries both q and gate,
+                        // so width = 2 * num_heads * head_dim. Detect from tensor shape.
+                        lw.attn_q_proj_width = qkv_weight.shape(0)
+                            - lw.attn_num_kv_heads * lw.attn_head_dim   // K
+                            - lw.attn_num_kv_heads * lw.attn_head_dim;  // V
+                        lw.attn_k_proj_width = lw.attn_num_kv_heads * lw.attn_head_dim;
+                        lw.attn_v_proj_width = lw.attn_num_kv_heads * lw.attn_head_dim;
+                        maybe_capture_grouped_affine_quant(
+                            tensors, ctx->cfg, qkv_proj_key, qkv_weight,
+                            &lw.attn_qkv_q_w, &lw.attn_qkv_q_scales, &lw.attn_qkv_q_biases
+                        );
+                        lw.attn_qkv_has_q = lw.attn_qkv_q_w.ndim() == 2;
+                        if (lw.attn_qkv_has_q) {
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                        if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_qkv_has_q) {
+                            lw.attn_qkv_rhs = load_rhs_weight(qkv_proj_key);
+                        }
+                    }
+                }
+
+                // Fallback: separate Q/K/V tensors, combined at runtime.
+                if (!lw.attn_qkv_has_q && lw.attn_qkv_rhs.size() <= 1) {
+                    const std::string q_proj_key = p + "self_attn.q_proj.weight";
+                    const std::string k_proj_key = p + "self_attn.k_proj.weight";
+                    const std::string v_proj_key = p + "self_attn.v_proj.weight";
+                    const array& q_proj_weight = require_tensor(tensors, q_proj_key);
+                    const array& k_proj_weight = require_tensor(tensors, k_proj_key);
+                    const array& v_proj_weight = require_tensor(tensors, v_proj_key);
+                    maybe_quantize_mxfp8_matrix(
+                        tensors, ctx->cfg, q_proj_key, q_proj_weight, enable_mlp_qmm,
+                        &lw.attn_q_q_w, &lw.attn_q_q_scales, &lw.attn_q_q_biases, &lw.attn_q_has_q
+                    );
+                    maybe_quantize_mxfp8_matrix(
+                        tensors, ctx->cfg, k_proj_key, k_proj_weight, enable_mlp_qmm,
+                        &lw.attn_k_q_w, &lw.attn_k_q_scales, &lw.attn_k_q_biases, &lw.attn_k_has_q
+                    );
+                    maybe_quantize_mxfp8_matrix(
+                        tensors, ctx->cfg, v_proj_key, v_proj_weight, enable_mlp_qmm,
+                        &lw.attn_v_q_w, &lw.attn_v_q_scales, &lw.attn_v_q_biases, &lw.attn_v_has_q
+                    );
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_q_has_q) {
+                        lw.attn_q_rhs = load_rhs_weight(q_proj_key);
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_k_has_q) {
+                        lw.attn_k_rhs = load_rhs_weight(k_proj_key);
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_v_has_q) {
+                        lw.attn_v_rhs = load_rhs_weight(v_proj_key);
+                    }
+                    combine_full_attention_qkv_weights(&lw);
+                    compact_full_attention_qkv_weights(&lw);
+                }
                 if (!keep_dense_rhs_for_prefill &&
                     enable_mlp_qmm &&
                     enable_full_attn_prefill_dense_cache &&
@@ -1206,7 +1237,9 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 }
 
                 lw.attn_head_dim = ctx->cfg.head_dim;
-                const int q_proj_out_dim = q_proj_weight.shape(0);
+                const int q_proj_out_dim = lw.attn_q_proj_width > 0
+                    ? lw.attn_q_proj_width
+                    : (lw.attn_q_has_q ? lw.attn_q_q_w.shape(0) : (lw.attn_q_rhs.ndim() == 2 ? lw.attn_q_rhs.shape(1) : 0));
                 if (q_proj_out_dim <= 0 || (q_proj_out_dim % lw.attn_num_heads) != 0) {
                     throw std::runtime_error(
                         "q_proj output dim is not divisible by num_attention_heads for layer " +
@@ -1225,7 +1258,9 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 }
 
                 if (ctx->cfg.use_layer_q_norm_head_dim) {
-                    const int k_proj_out_dim = k_proj_weight.shape(0);
+                    const int k_proj_out_dim = lw.attn_k_proj_width > 0
+                        ? lw.attn_k_proj_width
+                        : (lw.attn_k_has_q ? lw.attn_k_q_w.shape(0) : (lw.attn_k_rhs.ndim() == 2 ? lw.attn_k_rhs.shape(1) : 0));
                     if (k_proj_out_dim <= 0 || (k_proj_out_dim % lw.attn_head_dim) != 0) {
                         throw std::runtime_error(
                             "k_proj output dim is not divisible by derived head_dim for layer " +

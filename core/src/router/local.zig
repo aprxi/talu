@@ -621,7 +621,15 @@ pub const LocalEngine = struct {
         // On macOS with Metal, load only config/metadata (no weight tensors).
         // MLX C++ will load weights independently via mlx_create. This avoids
         // a memory spike from two copies of weights coexisting during init.
-        const metal_metadata_only = comptime (backend_root.has_metal);
+        // Only use metadata-only when Metal might be selected. When the user
+        // explicitly picks CPU or CUDA (via config or BACKEND env), load full
+        // weights immediately.
+        const metal_metadata_only = if (comptime !backend_root.has_metal)
+            false
+        else blk: {
+            const effective = backend_root.effectiveLoadSelection(backend_init_options.selection);
+            break :blk (effective == .auto or effective == .metal);
+        };
 
         // Start model loading in background thread
         const ModelLoaderThread = struct {

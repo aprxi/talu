@@ -279,10 +279,10 @@ bool combine_linear_in_proj_weights(LayerWeights* lw) {
             lw->lin_in_proj_ba_rhs.ndim() == 2 &&
             lw->lin_in_proj_qkvz_rhs.shape(0) == lw->lin_in_proj_ba_rhs.shape(0))
         {
-            lw->lin_in_proj_all_rhs = stop_gradient(copy(concatenate(
+            lw->lin_in_proj_all_rhs = stop_gradient(concatenate(
                 {lw->lin_in_proj_qkvz_rhs, lw->lin_in_proj_ba_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -299,18 +299,18 @@ bool combine_linear_in_proj_weights(LayerWeights* lw) {
         lw->lin_in_proj_ba_q_biases.ndim() == 2 &&
         lw->lin_in_proj_qkvz_q_biases.shape(1) == lw->lin_in_proj_ba_q_biases.shape(1))
     {
-        lw->lin_in_proj_all_q_w = stop_gradient(copy(concatenate(
+        lw->lin_in_proj_all_q_w = stop_gradient(concatenate(
             {lw->lin_in_proj_qkvz_q_w, lw->lin_in_proj_ba_q_w},
             0
-        )));
-        lw->lin_in_proj_all_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->lin_in_proj_all_q_scales = stop_gradient(concatenate(
             {lw->lin_in_proj_qkvz_q_scales, lw->lin_in_proj_ba_q_scales},
             0
-        )));
-        lw->lin_in_proj_all_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->lin_in_proj_all_q_biases = stop_gradient(concatenate(
             {lw->lin_in_proj_qkvz_q_biases, lw->lin_in_proj_ba_q_biases},
             0
-        )));
+        ));
         lw->lin_in_proj_all_has_q = true;
     }
 
@@ -353,10 +353,10 @@ bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
             lw->moe_shared_up_rhs.ndim() == 2 &&
             lw->moe_shared_gate_rhs.shape(0) == lw->moe_shared_up_rhs.shape(0))
         {
-            lw->moe_shared_gate_up_rhs = stop_gradient(copy(concatenate(
+            lw->moe_shared_gate_up_rhs = stop_gradient(concatenate(
                 {lw->moe_shared_gate_rhs, lw->moe_shared_up_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -372,18 +372,18 @@ bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
         lw->moe_shared_up_q_biases.ndim() == 2 &&
         lw->moe_shared_gate_q_biases.shape(1) == lw->moe_shared_up_q_biases.shape(1))
     {
-        lw->moe_shared_gate_up_q_w = stop_gradient(copy(concatenate(
+        lw->moe_shared_gate_up_q_w = stop_gradient(concatenate(
             {lw->moe_shared_gate_q_w, lw->moe_shared_up_q_w},
             0
-        )));
-        lw->moe_shared_gate_up_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->moe_shared_gate_up_q_scales = stop_gradient(concatenate(
             {lw->moe_shared_gate_q_scales, lw->moe_shared_up_q_scales},
             0
-        )));
-        lw->moe_shared_gate_up_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->moe_shared_gate_up_q_biases = stop_gradient(concatenate(
             {lw->moe_shared_gate_q_biases, lw->moe_shared_up_q_biases},
             0
-        )));
+        ));
         lw->moe_shared_gate_up_has_q = true;
     }
 
@@ -406,10 +406,10 @@ bool combine_dense_mlp_gate_up_weights(LayerWeights* lw) {
             lw->mlp_up_rhs.ndim() == 2 &&
             lw->mlp_gate_rhs.shape(0) == lw->mlp_up_rhs.shape(0))
         {
-            lw->mlp_gate_up_rhs = stop_gradient(copy(concatenate(
+            lw->mlp_gate_up_rhs = stop_gradient(concatenate(
                 {lw->mlp_gate_rhs, lw->mlp_up_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -425,18 +425,18 @@ bool combine_dense_mlp_gate_up_weights(LayerWeights* lw) {
         lw->mlp_up_q_biases.ndim() == 2 &&
         lw->mlp_gate_q_biases.shape(1) == lw->mlp_up_q_biases.shape(1))
     {
-        lw->mlp_gate_up_q_w = stop_gradient(copy(concatenate(
+        lw->mlp_gate_up_q_w = stop_gradient(concatenate(
             {lw->mlp_gate_q_w, lw->mlp_up_q_w},
             0
-        )));
-        lw->mlp_gate_up_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->mlp_gate_up_q_scales = stop_gradient(concatenate(
             {lw->mlp_gate_q_scales, lw->mlp_up_q_scales},
             0
-        )));
-        lw->mlp_gate_up_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->mlp_gate_up_q_biases = stop_gradient(concatenate(
             {lw->mlp_gate_q_biases, lw->mlp_up_q_biases},
             0
-        )));
+        ));
         lw->mlp_gate_up_has_q = true;
     }
 
@@ -492,10 +492,10 @@ bool combine_full_attention_qkv_weights(LayerWeights* lw) {
             lw->attn_q_rhs.shape(0) == lw->attn_k_rhs.shape(0) &&
             lw->attn_q_rhs.shape(0) == lw->attn_v_rhs.shape(0))
         {
-            lw->attn_qkv_rhs = stop_gradient(copy(concatenate(
+            lw->attn_qkv_rhs = stop_gradient(concatenate(
                 {lw->attn_q_rhs, lw->attn_k_rhs, lw->attn_v_rhs},
                 1
-            )));
+            ));
         }
     }
 
@@ -518,18 +518,18 @@ bool combine_full_attention_qkv_weights(LayerWeights* lw) {
         lw->attn_q_q_biases.shape(1) == lw->attn_k_q_biases.shape(1) &&
         lw->attn_q_q_biases.shape(1) == lw->attn_v_q_biases.shape(1))
     {
-        lw->attn_qkv_q_w = stop_gradient(copy(concatenate(
+        lw->attn_qkv_q_w = stop_gradient(concatenate(
             {lw->attn_q_q_w, lw->attn_k_q_w, lw->attn_v_q_w},
             0
-        )));
-        lw->attn_qkv_q_scales = stop_gradient(copy(concatenate(
+        ));
+        lw->attn_qkv_q_scales = stop_gradient(concatenate(
             {lw->attn_q_q_scales, lw->attn_k_q_scales, lw->attn_v_q_scales},
             0
-        )));
-        lw->attn_qkv_q_biases = stop_gradient(copy(concatenate(
+        ));
+        lw->attn_qkv_q_biases = stop_gradient(concatenate(
             {lw->attn_q_q_biases, lw->attn_k_q_biases, lw->attn_v_q_biases},
             0
-        )));
+        ));
         lw->attn_qkv_has_q = true;
     }
 
