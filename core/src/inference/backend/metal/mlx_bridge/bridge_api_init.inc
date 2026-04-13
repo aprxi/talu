@@ -570,23 +570,14 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 // talu convert). This avoids a concatenate+copy at runtime that
                 // duplicates weight data already in the mmap.
                 const std::string gate_up_key = p + "mlp.gate_up_proj.weight";
-                if (has_tensor(tensors, gate_up_key) &&
-                    has_grouped_affine_metadata_for_key(tensors, gate_up_key))
-                {
+                if (has_tensor(tensors, gate_up_key)) {
                     const array& gate_up_weight = require_tensor(tensors, gate_up_key);
                     if (gate_up_weight.ndim() == 2 && gate_up_weight.shape(0) > 0) {
                         lw.mlp_gate_width = gate_up_weight.shape(0) / 2;
-                        maybe_capture_grouped_affine_quant(
-                            tensors, ctx->cfg, gate_up_key, gate_up_weight,
-                            &lw.mlp_gate_up_q_w,
-                            &lw.mlp_gate_up_q_scales,
-                            &lw.mlp_gate_up_q_biases
+                        maybe_quantize_mxfp8_matrix(
+                            tensors, ctx->cfg, gate_up_key, gate_up_weight, enable_mlp_qmm,
+                            &lw.mlp_gate_up_q_w, &lw.mlp_gate_up_q_scales, &lw.mlp_gate_up_q_biases, &lw.mlp_gate_up_has_q
                         );
-                        lw.mlp_gate_up_has_q = lw.mlp_gate_up_q_w.ndim() == 2;
-                        if (lw.mlp_gate_up_has_q) {
-                            g_qmm_attempts += 1;
-                            g_qmm_success += 1;
-                        }
                         if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_up_has_q) {
                             lw.mlp_gate_up_rhs = load_rhs_weight(gate_up_key);
                         }
@@ -1149,9 +1140,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
 
                 // Prefer fused qkv_proj if the checkpoint has it (produced by talu convert).
                 const std::string qkv_proj_key = p + "self_attn.qkv_proj.weight";
-                if (has_tensor(tensors, qkv_proj_key) &&
-                    has_grouped_affine_metadata_for_key(tensors, qkv_proj_key))
-                {
+                if (has_tensor(tensors, qkv_proj_key)) {
                     const array& qkv_weight = require_tensor(tensors, qkv_proj_key);
                     if (qkv_weight.ndim() == 2) {
                         // Detect Q/K/V widths from config.
@@ -1163,15 +1152,10 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             - lw.attn_num_kv_heads * lw.attn_head_dim;  // V
                         lw.attn_k_proj_width = lw.attn_num_kv_heads * lw.attn_head_dim;
                         lw.attn_v_proj_width = lw.attn_num_kv_heads * lw.attn_head_dim;
-                        maybe_capture_grouped_affine_quant(
-                            tensors, ctx->cfg, qkv_proj_key, qkv_weight,
-                            &lw.attn_qkv_q_w, &lw.attn_qkv_q_scales, &lw.attn_qkv_q_biases
+                        maybe_quantize_mxfp8_matrix(
+                            tensors, ctx->cfg, qkv_proj_key, qkv_weight, enable_mlp_qmm,
+                            &lw.attn_qkv_q_w, &lw.attn_qkv_q_scales, &lw.attn_qkv_q_biases, &lw.attn_qkv_has_q
                         );
-                        lw.attn_qkv_has_q = lw.attn_qkv_q_w.ndim() == 2;
-                        if (lw.attn_qkv_has_q) {
-                            g_qmm_attempts += 1;
-                            g_qmm_success += 1;
-                        }
                         if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_qkv_has_q) {
                             lw.attn_qkv_rhs = load_rhs_weight(qkv_proj_key);
                         }

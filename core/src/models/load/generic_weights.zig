@@ -22,6 +22,31 @@ pub const LoadOptions = struct {
     dequantize_nvfp4_to_bf16: bool = true,
 };
 
+// noinline: called 5 times inside loadWeightMap; inlining all copies inflates that
+// function enough to trigger the AArch64 LLVM RegisterCoalescer crash in ReleaseFast.
+noinline fn sliceNvfp4Rows(meta: tensor.Nvfp4Meta, row_start: usize, row_count: usize) !tensor.Nvfp4Meta {
+    const total_rows: usize = @intCast(meta.rows);
+    const scale_cols: usize = @intCast(meta.scale_cols);
+    if (row_count == 0 or scale_cols == 0) return error.InvalidShape;
+    if (row_start > total_rows or row_count > total_rows - row_start) return error.InvalidShape;
+
+    const scale_offset = std.math.mul(usize, row_start, scale_cols) catch return error.InvalidShape;
+    const scale_len = std.math.mul(usize, row_count, scale_cols) catch return error.InvalidShape;
+    if (meta.block_scales_len < scale_offset + scale_len) return error.InvalidShape;
+    const base_scales = meta.block_scales_data orelse return error.MissingScales;
+
+    return .{
+        .block_scales_data = base_scales + scale_offset,
+        .block_scales_len = scale_len,
+        .rows = @intCast(row_count),
+        .cols = meta.cols,
+        .packed_cols = meta.packed_cols,
+        .scale_cols = meta.scale_cols,
+        .group_size = meta.group_size,
+        .weight_global_scale = meta.weight_global_scale,
+    };
+}
+
 const NormalizedNameEntry = struct {
     actual_name: []const u8,
     ambiguous: bool = false,
@@ -131,7 +156,140 @@ pub const NameResolver = struct {
     }
 };
 
-pub fn loadWeightMap(
+// noinline: extracted from loadWeightMap to prevent its size from triggering the
+// AArch64 LLVM RegisterCoalescer crash in ReleaseFast.
+noinline fn splitFusedGateUp(
+    allocator: Allocator,
+    map: *WeightMap,
+    fused: *const Tensor,
+    layer_idx: usize,
+) !void {
+    if (fused.n_dims != 2 or fused.shape[0] <= 0 or @mod(@as(usize, @intCast(fused.shape[0])), 2) != 0) return;
+    const half_rows = @divExact(@as(usize, @intCast(fused.shape[0])), 2);
+    const cols: usize = @intCast(fused.shape[1]);
+    const bytes_per_row = fused.data_size / @as(usize, @intCast(fused.shape[0]));
+
+    // Keep the fused tensor under the gate_up_proj key for runtimes that support it.
+    log.debug("load", "Splitting fused gate_up_proj", .{
+        .layer = layer_idx,
+        .total_rows = fused.shape[0],
+        .half_rows = @as(i64, @intCast(half_rows)),
+    }, @src());
+    try map.put(allocator, "mlp.gate_up_proj.weight", fused);
+
+    const gate_ptr = try allocator.create(tensor.Tensor);
+    gate_ptr.* = fused.*;
+    gate_ptr.shape[0] = @intCast(half_rows);
+    gate_ptr.numel = half_rows * cols;
+    gate_ptr.data_size = half_rows * bytes_per_row;
+    if (fused.gaffine) |g| {
+        const sbpr = std.math.divExact(usize, g.scales.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+        const bbpr = std.math.divExact(usize, g.biases.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+        gate_ptr.gaffine = .{
+            .scales = g.scales[0 .. half_rows * sbpr],
+            .biases = g.biases[0 .. half_rows * bbpr],
+            .group_size = g.group_size,
+            .scales_dtype = g.scales_dtype,
+        };
+    }
+    if (fused.nvfp4) |meta| gate_ptr.nvfp4 = try sliceNvfp4Rows(meta, 0, half_rows);
+    try map.put(allocator, "mlp.gate_proj.weight", gate_ptr);
+
+    const up_ptr = try allocator.create(tensor.Tensor);
+    up_ptr.* = fused.*;
+    up_ptr.shape[0] = @intCast(half_rows);
+    up_ptr.numel = half_rows * cols;
+    up_ptr.data_size = half_rows * bytes_per_row;
+    if (fused.data_ptr) |base| up_ptr.data_ptr = base + half_rows * bytes_per_row;
+    if (fused.gaffine) |g| {
+        const sbpr = std.math.divExact(usize, g.scales.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+        const bbpr = std.math.divExact(usize, g.biases.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
+        up_ptr.gaffine = .{
+            .scales = g.scales[half_rows * sbpr ..][0 .. half_rows * sbpr],
+            .biases = g.biases[half_rows * bbpr ..][0 .. half_rows * bbpr],
+            .group_size = g.group_size,
+            .scales_dtype = g.scales_dtype,
+        };
+    }
+    if (fused.nvfp4) |meta| up_ptr.nvfp4 = try sliceNvfp4Rows(meta, half_rows, half_rows);
+    try map.put(allocator, "mlp.up_proj.weight", up_ptr);
+}
+
+// noinline: same reason as splitFusedGateUp above.
+noinline fn splitFusedQkv(
+    allocator: Allocator,
+    map: *WeightMap,
+    fused: *const Tensor,
+    model_config: *const tensor.ModelConfig,
+) !void {
+    if (fused.n_dims != 2) return;
+    const total_out: usize = @intCast(fused.shape[0]);
+    const num_kv_heads: usize = if (model_config.n_kv_groups > 0 and model_config.n_heads > 0)
+        @divExact(@as(usize, @intCast(model_config.n_heads)), @as(usize, @intCast(model_config.n_kv_groups)))
+    else
+        0;
+    const kv_out: usize = if (num_kv_heads > 0 and model_config.head_dim > 0)
+        num_kv_heads * @as(usize, @intCast(model_config.head_dim))
+    else
+        0;
+    if (kv_out == 0 or total_out <= 2 * kv_out) return;
+
+    const q_out = total_out - 2 * kv_out;
+    const cols: usize = @intCast(fused.shape[1]);
+    const bpr = fused.data_size / total_out;
+    const ga = fused.gaffine;
+    const sbpr: usize = if (ga) |g| g.scales.len / total_out else 0;
+    const bbpr: usize = if (ga) |g| g.biases.len / total_out else 0;
+
+    const q_ptr = try allocator.create(tensor.Tensor);
+    q_ptr.* = fused.*;
+    q_ptr.shape[0] = @intCast(q_out);
+    q_ptr.numel = q_out * cols;
+    q_ptr.data_size = q_out * bpr;
+    if (ga) |g| q_ptr.gaffine = .{
+        .scales = g.scales[0 .. q_out * sbpr],
+        .biases = g.biases[0 .. q_out * bbpr],
+        .group_size = g.group_size,
+        .scales_dtype = g.scales_dtype,
+    };
+    if (fused.nvfp4) |meta| q_ptr.nvfp4 = try sliceNvfp4Rows(meta, 0, q_out);
+    try map.put(allocator, "self_attn.q_proj.weight", q_ptr);
+
+    const k_ptr = try allocator.create(tensor.Tensor);
+    k_ptr.* = fused.*;
+    k_ptr.shape[0] = @intCast(kv_out);
+    k_ptr.numel = kv_out * cols;
+    k_ptr.data_size = kv_out * bpr;
+    if (fused.data_ptr) |base| k_ptr.data_ptr = base + q_out * bpr;
+    if (ga) |g| k_ptr.gaffine = .{
+        .scales = g.scales[q_out * sbpr ..][0 .. kv_out * sbpr],
+        .biases = g.biases[q_out * bbpr ..][0 .. kv_out * bbpr],
+        .group_size = g.group_size,
+        .scales_dtype = g.scales_dtype,
+    };
+    if (fused.nvfp4) |meta| k_ptr.nvfp4 = try sliceNvfp4Rows(meta, q_out, kv_out);
+    try map.put(allocator, "self_attn.k_proj.weight", k_ptr);
+
+    const v_ptr = try allocator.create(tensor.Tensor);
+    v_ptr.* = fused.*;
+    v_ptr.shape[0] = @intCast(kv_out);
+    v_ptr.numel = kv_out * cols;
+    v_ptr.data_size = kv_out * bpr;
+    if (fused.data_ptr) |base| v_ptr.data_ptr = base + (q_out + kv_out) * bpr;
+    if (ga) |g| v_ptr.gaffine = .{
+        .scales = g.scales[(q_out + kv_out) * sbpr ..][0 .. kv_out * sbpr],
+        .biases = g.biases[(q_out + kv_out) * bbpr ..][0 .. kv_out * bbpr],
+        .group_size = g.group_size,
+        .scales_dtype = g.scales_dtype,
+    };
+    if (fused.nvfp4) |meta| v_ptr.nvfp4 = try sliceNvfp4Rows(meta, q_out + kv_out, kv_out);
+    try map.put(allocator, "self_attn.v_proj.weight", v_ptr);
+}
+
+// noinline: prevents LLVM from inlining this ~90-line function into the test bodies
+// that call it (115+ lines each), which would create 200+ line combined functions
+// and trigger the AArch64 LLVM RegisterCoalescer crash in ReleaseFast.
+pub noinline fn loadWeightMap(
     allocator: Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,
     specs: []const WeightSpec,
@@ -169,140 +327,15 @@ pub fn loadWeightMap(
     // store it under the fused key AND split into separate gate + up.
     if (map.get("mlp.up_proj.weight") == null) {
         if (map.get("mlp.gate_proj.weight")) |fused| {
-            if (fused.n_dims == 2 and fused.shape[0] > 0 and @mod(@as(usize, @intCast(fused.shape[0])), 2) == 0) {
-                const half_rows = @divExact(@as(usize, @intCast(fused.shape[0])), 2);
-                const cols: usize = @intCast(fused.shape[1]);
-                const bytes_per_row = fused.data_size / @as(usize, @intCast(fused.shape[0]));
-
-                // Keep the fused tensor under the gate_up_proj key for runtimes that support it.
-                log.debug("load", "Splitting fused gate_up_proj", .{
-                    .layer = layer_idx,
-                    .total_rows = fused.shape[0],
-                    .half_rows = @as(i64, @intCast(half_rows)),
-                }, @src());
-                try map.put(allocator, "mlp.gate_up_proj.weight", fused);
-
-                // Split into separate gate + up for runtimes that expect individual weights.
-                const gate_ptr = try allocator.create(tensor.Tensor);
-                gate_ptr.* = fused.*;
-                gate_ptr.shape[0] = @intCast(half_rows);
-                gate_ptr.numel = half_rows * cols;
-                gate_ptr.data_size = half_rows * bytes_per_row;
-                if (fused.gaffine) |g| {
-                    const scales_bytes_per_row = std.math.divExact(usize, g.scales.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
-                    const bias_bytes_per_row = std.math.divExact(usize, g.biases.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
-                    gate_ptr.gaffine = .{
-                        .scales = g.scales[0 .. half_rows * scales_bytes_per_row],
-                        .biases = g.biases[0 .. half_rows * bias_bytes_per_row],
-                        .group_size = g.group_size,
-                        .scales_dtype = g.scales_dtype,
-                    };
-                }
-                try map.put(allocator, "mlp.gate_proj.weight", gate_ptr);
-
-                const up_ptr = try allocator.create(tensor.Tensor);
-                up_ptr.* = fused.*;
-                up_ptr.shape[0] = @intCast(half_rows);
-                up_ptr.numel = half_rows * cols;
-                up_ptr.data_size = half_rows * bytes_per_row;
-                if (fused.data_ptr) |base| {
-                    up_ptr.data_ptr = base + half_rows * bytes_per_row;
-                }
-                if (fused.gaffine) |g| {
-                    const scales_bytes_per_row = std.math.divExact(usize, g.scales.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
-                    const bias_bytes_per_row = std.math.divExact(usize, g.biases.len, @as(usize, @intCast(fused.shape[0]))) catch return error.InvalidShape;
-                    up_ptr.gaffine = .{
-                        .scales = g.scales[half_rows * scales_bytes_per_row ..][0 .. half_rows * scales_bytes_per_row],
-                        .biases = g.biases[half_rows * bias_bytes_per_row ..][0 .. half_rows * bias_bytes_per_row],
-                        .group_size = g.group_size,
-                        .scales_dtype = g.scales_dtype,
-                    };
-                }
-                try map.put(allocator, "mlp.up_proj.weight", up_ptr);
-            }
+            try splitFusedGateUp(allocator, &map, fused, layer_idx);
         }
     }
 
     // When fused qkv_proj is loaded (as its own spec), split into individual
-    // Q/K/V. The split dequantizes to the orient output dtype since gaffine
-    // metadata can't be trivially sliced across row boundaries.
+    // Q/K/V by slicing along output rows.
     if (map.get("self_attn.q_proj.weight") == null and map.get("self_attn.qkv_proj.weight") != null) {
         if (map.get("self_attn.qkv_proj.weight")) |fused| {
-            if (fused.n_dims == 2) {
-                // The oriented fused tensor has output_features as shape[0].
-                // For gaffine, orient expands packed cols to real cols in metadata
-                // but shape[1] remains packed. Use data_size for byte math.
-                const total_out: usize = @intCast(fused.shape[0]);
-                const num_kv_heads: usize = if (model_config.n_kv_groups > 0 and model_config.n_heads > 0)
-                    @divExact(@as(usize, @intCast(model_config.n_heads)), @as(usize, @intCast(model_config.n_kv_groups)))
-                else
-                    0;
-                const kv_out: usize = if (num_kv_heads > 0 and model_config.head_dim > 0)
-                    num_kv_heads * @as(usize, @intCast(model_config.head_dim))
-                else
-                    0;
-                if (kv_out > 0 and total_out > 2 * kv_out) {
-                    const q_out = total_out - 2 * kv_out;
-                    const cols: usize = @intCast(fused.shape[1]);
-                    const bpr = fused.data_size / total_out;
-
-                    // Split gaffine scales/biases along rows too.
-                    const ga = fused.gaffine;
-                    const sbpr: usize = if (ga) |g| g.scales.len / total_out else 0;
-                    const bbpr: usize = if (ga) |g| g.biases.len / total_out else 0;
-
-                    const q_ptr = try allocator.create(tensor.Tensor);
-                    q_ptr.* = fused.*;
-                    q_ptr.shape[0] = @intCast(q_out);
-                    q_ptr.numel = q_out * cols;
-                    q_ptr.data_size = q_out * bpr;
-                    if (ga) |g| {
-                        q_ptr.gaffine = .{
-                            .scales = g.scales[0 .. q_out * sbpr],
-                            .biases = g.biases[0 .. q_out * bbpr],
-                            .group_size = g.group_size,
-                            .scales_dtype = g.scales_dtype,
-                        };
-                    }
-                    try map.put(allocator, "self_attn.q_proj.weight", q_ptr);
-
-                    const k_ptr = try allocator.create(tensor.Tensor);
-                    k_ptr.* = fused.*;
-                    k_ptr.shape[0] = @intCast(kv_out);
-                    k_ptr.numel = kv_out * cols;
-                    k_ptr.data_size = kv_out * bpr;
-                    if (fused.data_ptr) |base| {
-                        k_ptr.data_ptr = base + q_out * bpr;
-                    }
-                    if (ga) |g| {
-                        k_ptr.gaffine = .{
-                            .scales = g.scales[q_out * sbpr ..][0 .. kv_out * sbpr],
-                            .biases = g.biases[q_out * bbpr ..][0 .. kv_out * bbpr],
-                            .group_size = g.group_size,
-                            .scales_dtype = g.scales_dtype,
-                        };
-                    }
-                    try map.put(allocator, "self_attn.k_proj.weight", k_ptr);
-
-                    const v_ptr = try allocator.create(tensor.Tensor);
-                    v_ptr.* = fused.*;
-                    v_ptr.shape[0] = @intCast(kv_out);
-                    v_ptr.numel = kv_out * cols;
-                    v_ptr.data_size = kv_out * bpr;
-                    if (fused.data_ptr) |base| {
-                        v_ptr.data_ptr = base + (q_out + kv_out) * bpr;
-                    }
-                    if (ga) |g| {
-                        v_ptr.gaffine = .{
-                            .scales = g.scales[(q_out + kv_out) * sbpr ..][0 .. kv_out * sbpr],
-                            .biases = g.biases[(q_out + kv_out) * bbpr ..][0 .. kv_out * bbpr],
-                            .group_size = g.group_size,
-                            .scales_dtype = g.scales_dtype,
-                        };
-                    }
-                    try map.put(allocator, "self_attn.v_proj.weight", v_ptr);
-                }
-            }
+            try splitFusedQkv(allocator, &map, fused, model_config);
         }
     }
 
@@ -384,7 +417,10 @@ fn loadWeightBySpec(
     return null;
 }
 
-fn tryLoadCandidate(
+// noinline: inlining into loadWeightMap (called per-spec in a loop) pulls in
+// the full applySpecTransforms + orientWeight chain, inflating that function enough
+// to trigger the AArch64 LLVM RegisterCoalescer crash in ReleaseFast.
+noinline fn tryLoadCandidate(
     allocator: Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,
     spec: WeightSpec,
@@ -943,4 +979,122 @@ test "loadWeightMap fails on ambiguous normalized wrapper mapping" {
             .{},
         ),
     );
+}
+
+test "loadWeightMap splits fused gate_up nvfp4 metadata rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const model_path = try std.fs.path.join(allocator, &.{ tmp_path, "fused_gate_up_nvfp4.safetensors" });
+    defer allocator.free(model_path);
+
+    const packed_weight = [_]u8{
+        0x21, 0x43,
+        0x65, 0x87,
+        0xA9, 0xCB,
+        0xED, 0x0F,
+    };
+    const block_scales = [_]u8{ 0x30, 0x31, 0x32, 0x33 };
+    const scale2 = [_]f32{1.0};
+
+    const entries = [_]st_loader.TensorEntry{
+        .{
+            .name = "model.layers.0.mlp.gate_up_proj.weight",
+            .dtype = .u8,
+            .shape = &.{ 4, 2 },
+            .data = packed_weight[0..],
+        },
+        .{
+            .name = "model.layers.0.mlp.gate_up_proj.weight_scale",
+            .dtype = .f8_e4m3,
+            .shape = &.{ 4, 1 },
+            .data = block_scales[0..],
+        },
+        .{
+            .name = "model.layers.0.mlp.gate_up_proj.weight_scale_2",
+            .dtype = .f32,
+            .shape = &.{},
+            .data = std.mem.sliceAsBytes(&scale2),
+        },
+    };
+    try st_loader.write(allocator, model_path, &entries);
+
+    var safetensors = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer safetensors.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const specs = [_]WeightSpec{
+        .{
+            .id = "mlp.gate_proj.weight",
+            .suffix = "mlp.gate_proj.weight",
+            .aliases = &.{"mlp.gate_up_proj.weight"},
+            .module_type = "Linear",
+            .layout = .linear,
+            .dtype = "float32",
+            .required = true,
+        },
+        .{
+            .id = "mlp.up_proj.weight",
+            .suffix = "mlp.up_proj.weight",
+            .module_type = "Linear",
+            .layout = .linear,
+            .dtype = "float32",
+            .required = true,
+        },
+    };
+    const prefixes = [_][]const u8{"model.layers.{d}."};
+    const config = tensor.ModelConfig{
+        .d_model = 4,
+        .vocab_size = 16,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_groups = 1,
+        .d_ff = 2,
+        .head_dim = 4,
+        .max_seq_len = 16,
+        .rope_theta = 10000.0,
+        .norm_eps = 1e-5,
+        .gaffine_group_size = 32,
+        .model_arch = .custom,
+    };
+
+    var map = try loadWeightMap(
+        arena_alloc,
+        &safetensors,
+        &specs,
+        &prefixes,
+        0,
+        &config,
+        .{ .dequantize_nvfp4_to_bf16 = false },
+    );
+    defer map.deinit(arena_alloc);
+
+    const fused = map.get("mlp.gate_up_proj.weight") orelse return error.TestExpectedEqual;
+    const gate = map.get("mlp.gate_proj.weight") orelse return error.TestExpectedEqual;
+    const up = map.get("mlp.up_proj.weight") orelse return error.TestExpectedEqual;
+
+    try std.testing.expectEqual(@as(i64, 4), fused.shape[0]);
+    try std.testing.expectEqual(@as(i64, 2), gate.shape[0]);
+    try std.testing.expectEqual(@as(i64, 2), up.shape[0]);
+
+    const gate_meta = gate.nvfp4 orelse return error.TestExpectedEqual;
+    const up_meta = up.nvfp4 orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 2), gate_meta.rows);
+    try std.testing.expectEqual(@as(u32, 2), up_meta.rows);
+    try std.testing.expectEqual(@as(usize, 2), gate_meta.block_scales_len);
+    try std.testing.expectEqual(@as(usize, 2), up_meta.block_scales_len);
+
+    const gate_scales = gate_meta.block_scales_data.?[0..gate_meta.block_scales_len];
+    const up_scales = up_meta.block_scales_data.?[0..up_meta.block_scales_len];
+    try std.testing.expectEqualSlices(u8, &.{ block_scales[0], block_scales[1] }, gate_scales);
+    try std.testing.expectEqualSlices(u8, &.{ block_scales[2], block_scales[3] }, up_scales);
+
+    try std.testing.expectEqualSlices(u8, packed_weight[0..4], gate.data()[0..gate.data_size]);
+    try std.testing.expectEqualSlices(u8, packed_weight[4..8], up.data()[0..up.data_size]);
 }

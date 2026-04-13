@@ -1,8 +1,7 @@
 //! NVFP4 Converter
 //!
-//! Dedicated NVFP4 conversion surface. Conversion rewrites grouped-affine
-//! intermediate weights into canonical NVFP4 packed tensors and removes the
-//! grouped-affine execution tensors from the final artifact.
+//! Converts grouped-affine q4 tensors into modelopt-compatible NVFP4 tensor
+//! layout and rewrites config metadata accordingly.
 
 const std = @import("std");
 const grouped_affine = @import("grouped_affine.zig");
@@ -11,7 +10,6 @@ const safetensors = @import("io_pkg").safetensors.root;
 const tensor = @import("tensor_pkg");
 const dtype = @import("dtype_pkg");
 
-const grouped_affine_group_size: usize = 32;
 const nvfp4_group_size: usize = 16;
 const fp4_codebook = [_]f32{
     0.0,  0.5,  1.0,  1.5,
@@ -131,6 +129,51 @@ fn fp4E2m1NibbleToF32(nibble: u8) f32 {
     return fp4_codebook[nibble & 0x0F];
 }
 
+const SourceLayout = struct {
+    values_per_u32: usize,
+    unpacked_cols: usize,
+    source_group_size: usize,
+};
+
+fn selectSourceLayout(packed_word_cols: usize, source_group_count: usize, prefer_u8: bool) ?SourceLayout {
+    if (packed_word_cols == 0 or source_group_count == 0) return null;
+
+    var u4_layout: ?SourceLayout = null;
+    var u8_layout: ?SourceLayout = null;
+    const candidates = [_]usize{ 8, 4 };
+    for (candidates) |values_per_u32| {
+        const cols = std.math.mul(usize, packed_word_cols, values_per_u32) catch continue;
+        if (cols % source_group_count != 0) continue;
+        const source_group_size = cols / source_group_count;
+        if (source_group_size < 8 or source_group_size > 256) continue;
+        if ((source_group_size % 8) != 0) continue;
+        const layout = SourceLayout{
+            .values_per_u32 = values_per_u32,
+            .unpacked_cols = cols,
+            .source_group_size = source_group_size,
+        };
+        if (values_per_u32 == 8)
+            u4_layout = layout
+        else
+            u8_layout = layout;
+    }
+
+    if (prefer_u8) {
+        if (u8_layout) |layout| return layout;
+        if (u4_layout) |layout| return layout;
+        return null;
+    }
+
+    if (u4_layout) |layout| return layout;
+    if (u8_layout) |layout| return layout;
+    return null;
+}
+
+fn isEmbeddingWeight(weight_name: []const u8) bool {
+    return std.mem.endsWith(u8, weight_name, "embed_tokens.weight") or
+        std.mem.endsWith(u8, weight_name, "embedding.weight");
+}
+
 fn nearestFp4E2m1Nibble(value: f32) u8 {
     var best: u8 = 0;
     var best_err = std.math.inf(f32);
@@ -165,7 +208,21 @@ fn addPackedNvfp4CompanionForWeight(
 
     const rows: usize = @intCast(weight.shape[0]);
     const packed_word_cols: usize = @intCast(weight.shape[1]);
-    const cols = packed_word_cols * 8;
+    const source_group_count: usize = @intCast(scales.shape[1]);
+    if (source_group_count == 0) return;
+    // grouped-affine U32 payload can represent either:
+    // - u4 packing: 8 values per u32
+    // - u8 packing: 4 values per u32
+    // Infer source layout from packed width + scale columns and prefer the
+    // embedding/u8 interpretation for embedding tables.
+    const source_layout = selectSourceLayout(
+        packed_word_cols,
+        source_group_count,
+        isEmbeddingWeight(weight_name),
+    ) orelse return;
+    const cols = source_layout.unpacked_cols;
+    const source_values_per_u32 = source_layout.values_per_u32;
+    const source_group_size = source_layout.source_group_size;
     if ((cols % nvfp4_group_size) != 0) return;
     const groups = cols / nvfp4_group_size;
 
@@ -177,21 +234,25 @@ fn addPackedNvfp4CompanionForWeight(
     defer allocator.free(packed_bytes);
     const packed_scales = try allocator.alloc(u8, rows * groups);
     defer allocator.free(packed_scales);
-    const global_scale = [_]f32{1.0};
+    const weight_scale_2 = [_]f32{1.0};
+    const input_scale = [_]f32{1.0};
 
     var block_vals: [nvfp4_group_size]f32 = undefined;
     for (0..rows) |r| {
         for (0..groups) |g| {
-            const grouped_affine_group = (g * nvfp4_group_size) / grouped_affine_group_size;
-            const scale = dtype.bf16ToF32(src_scales[r * (cols / grouped_affine_group_size) + grouped_affine_group]);
-            const bias = dtype.bf16ToF32(src_biases[r * (cols / grouped_affine_group_size) + grouped_affine_group]);
+            const grouped_affine_group = (g * nvfp4_group_size) / source_group_size;
+            const scale = dtype.bf16ToF32(src_scales[r * source_group_count + grouped_affine_group]);
+            const bias = dtype.bf16ToF32(src_biases[r * source_group_count + grouped_affine_group]);
             const group_start = g * nvfp4_group_size;
 
             var max_abs: f32 = 0.0;
             for (0..nvfp4_group_size) |i| {
                 const col = group_start + i;
-                const word = src_words[r * packed_word_cols + (col / 8)];
-                const quant = @as(u8, @intCast((word >> @intCast((col % 8) * 4)) & 0xF));
+                const word = src_words[r * packed_word_cols + (col / source_values_per_u32)];
+                const quant: u8 = if (source_values_per_u32 == 8)
+                    @intCast((word >> @as(u5, @intCast((col % 8) * 4))) & 0xF)
+                else
+                    @intCast((word >> @as(u5, @intCast((col % 4) * 8))) & 0xFF);
                 const value = @as(f32, @floatFromInt(quant)) * scale + bias;
                 block_vals[i] = value;
                 max_abs = @max(max_abs, @abs(value));
@@ -212,17 +273,42 @@ fn addPackedNvfp4CompanionForWeight(
         }
     }
 
-    const packed_name = try std.fmt.allocPrint(allocator, "{s}.weight_packed", .{base});
-    defer allocator.free(packed_name);
-    try builder.addTensor(packed_name, .u8, &[_]usize{ rows, cols / 2 }, packed_bytes);
+    // modelopt/NVFP4 expects packed fp4 payload under "<base>.weight".
+    try builder.addTensor(weight_name, .u8, &[_]usize{ rows, cols / 2 }, packed_bytes);
 
     const scale_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base});
     defer allocator.free(scale_name);
     try builder.addTensor(scale_name, .f8_e4m3, &[_]usize{ rows, groups }, packed_scales);
 
-    const global_scale_name = try std.fmt.allocPrint(allocator, "{s}.weight_global_scale", .{base});
-    defer allocator.free(global_scale_name);
-    try builder.addTensor(global_scale_name, .f32, &[_]usize{1}, std.mem.sliceAsBytes(&global_scale));
+    const scale2_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base});
+    defer allocator.free(scale2_name);
+    try builder.addTensor(scale2_name, .f32, &[_]usize{}, std.mem.sliceAsBytes(&weight_scale_2));
+
+    const input_scale_name = try std.fmt.allocPrint(allocator, "{s}.input_scale", .{base});
+    defer allocator.free(input_scale_name);
+    try builder.addTensor(input_scale_name, .f32, &[_]usize{}, std.mem.sliceAsBytes(&input_scale));
+}
+
+test "selectSourceLayout picks u8 for embedding when ambiguous" {
+    const layout_opt = selectSourceLayout(640, 160, true);
+    try std.testing.expect(layout_opt != null);
+    const layout = layout_opt.?;
+    try std.testing.expectEqual(@as(usize, 4), layout.values_per_u32);
+    try std.testing.expectEqual(@as(usize, 2560), layout.unpacked_cols);
+    try std.testing.expectEqual(@as(usize, 16), layout.source_group_size);
+}
+
+test "selectSourceLayout picks u4 for non-embedding when ambiguous" {
+    const layout_opt = selectSourceLayout(320, 80, false);
+    try std.testing.expect(layout_opt != null);
+    const layout = layout_opt.?;
+    try std.testing.expectEqual(@as(usize, 8), layout.values_per_u32);
+    try std.testing.expectEqual(@as(usize, 2560), layout.unpacked_cols);
+    try std.testing.expectEqual(@as(usize, 32), layout.source_group_size);
+}
+
+test "selectSourceLayout rejects invalid ratios" {
+    try std.testing.expectEqual(@as(?SourceLayout, null), selectSourceLayout(640, 81, false));
 }
 
 fn chooseNvfp4BlockScale(block_vals: []const f32, max_abs: f32) f32 {
@@ -297,10 +383,9 @@ pub fn rewriteConfigToCanonical(allocator: std.mem.Allocator, output_path: []con
     }
 
     if (!first_field) try output_buf.append(allocator, ',');
-    try output_buf.appendSlice(allocator, "\"quantization\":{\"group_size\":16,\"bits\":4}");
     try output_buf.appendSlice(
         allocator,
-        ",\"quantization_config\":{\"quant_method\":\"nvfp4\",\"quant_type\":\"nvfp4\",\"bits\":4,\"group_size\":16,\"fmt\":\"e2m1\",\"scale_fmt\":\"e4m3\",\"tensor_layout\":\"weight_packed+weight_scale\",\"quant_contract_version\":1}",
+        "\"quantization_config\":{\"config_groups\":{\"group_0\":{\"input_activations\":{\"dynamic\":false,\"num_bits\":4,\"type\":\"float\",\"group_size\":16},\"weights\":{\"dynamic\":false,\"num_bits\":4,\"type\":\"float\",\"group_size\":16}}},\"bits\":4,\"quant_algo\":\"NVFP4\",\"kv_cache_scheme\":{\"dynamic\":false,\"num_bits\":8,\"type\":\"float\"},\"producer\":{\"name\":\"modelopt\",\"version\":\"0.37.0\"},\"quant_method\":\"modelopt\"}",
     );
     try output_buf.append(allocator, '}');
 

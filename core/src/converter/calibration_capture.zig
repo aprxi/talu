@@ -251,7 +251,10 @@ pub fn sampleLayerActivations(
     );
 }
 
-pub fn sampleLayerActivationsForRole(
+// noinline: called from buildNvfp4InputSecondMoments (noinline); inlining a for loop
+// over sampleLayerActivationsForPoint (which itself inlines 37 lines) into that function
+// would create excessive phi node complexity triggering the AArch64 RegisterCoalescer crash.
+pub noinline fn sampleLayerActivationsForRole(
     allocator: std.mem.Allocator,
     cache: *const LayerActivationCache,
     layer: u32,
@@ -350,7 +353,9 @@ pub fn sampleLayerActivationPairForPoints(
     };
 }
 
-fn sampleLayerActivationsForPoint(
+// noinline: called in a for loop from sampleLayerActivationsForRole (noinline); if inlined,
+// the loop body becomes 37 lines of complex hash-map/allocation code.
+noinline fn sampleLayerActivationsForPoint(
     allocator: std.mem.Allocator,
     cache: *const LayerActivationCache,
     layer: u32,
@@ -388,7 +393,10 @@ fn sampleLayerActivationsForPoint(
     };
 }
 
-pub fn captureFromInference(
+// noinline: 82-line function with complex control flow. Called from writeNvfp4Weights
+// (noinline, 200+ lines); inlining it would push that function over the complexity
+// threshold that triggers the AArch64 LLVM RegisterCoalescer crash in ReleaseFast.
+pub noinline fn captureFromInference(
     allocator: std.mem.Allocator,
     model_path: []const u8,
     prompt_tokens: []const u32,

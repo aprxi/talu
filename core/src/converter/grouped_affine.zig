@@ -27,6 +27,7 @@ const xray = @import("xray_pkg");
 const has_metal_gpu_calib = build_options.enable_metal and builtin.os.tag == .macos;
 const has_cuda_gpu_calib = build_options.enable_cuda and
     (builtin.os.tag == .linux or builtin.os.tag == .windows);
+extern fn mlx_runtime_binary_dir() ?[*:0]const u8;
 
 const Tensor = tensor.Tensor;
 const DType = dtype_mod.DType;
@@ -669,6 +670,9 @@ fn writeQuantizedWeights(
             log.warn("convert", "CUDA grouped-affine quantization kernels unavailable; using CPU quantization", .{});
         }
     }
+    // Keep converter Metal behavior consistent with inference: place mlx.metallib
+    // at the MLX runtime loader path before backend selection.
+    ensureMlxMetallibColocatedForCalibration();
 
     const show_calib_progress = options.calib_iters > 0 and
         envFlagEnabledDefault("TALU_CONVERT_CALIB_PROGRESS", true);
@@ -1186,7 +1190,104 @@ fn isMetalCalibrationEnabled() bool {
             !std.ascii.eqlIgnoreCase(token, "auto") and
             token.len > 0) return false;
     }
-    return compute.metal.isAvailable();
+    if (!compute.metal.isAvailable()) return false;
+    return isMlxMetallibAvailableForCalibration();
+}
+
+fn pathExistsAbsoluteOrCwd(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+fn mlxRuntimeBinaryDir() ?[]const u8 {
+    if (comptime !has_metal_gpu_calib) return null;
+    const raw = mlx_runtime_binary_dir() orelse return null;
+    const dir = std.mem.sliceTo(raw, 0);
+    if (dir.len == 0) return null;
+    return dir;
+}
+
+fn isMlxMetallibAvailableForCalibration() bool {
+    if (mlxRuntimeBinaryDir()) |runtime_dir| {
+        var runtime_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const runtime_path = std.fmt.bufPrint(&runtime_buf, "{s}/mlx.metallib", .{runtime_dir}) catch "";
+        if (runtime_path.len > 0 and pathExistsAbsoluteOrCwd(runtime_path)) return true;
+    }
+
+    if (std.posix.getenv("MLX_METALLIB")) |env_path| {
+        const trimmed = std.mem.trim(u8, env_path, " \t\r\n");
+        if (trimmed.len > 0) return pathExistsAbsoluteOrCwd(trimmed);
+    }
+
+    const candidates = [_][]const u8{
+        "mlx.metallib",
+        "zig-out/bin/mlx.metallib",
+        "zig-out/lib/mlx.metallib",
+        "deps/mlx/lib/mlx.metallib",
+        "deps/mlx-src/build/mlx/backend/metal/kernels/mlx.metallib",
+        "/opt/homebrew/bin/mlx.metallib",
+        "/usr/local/bin/mlx.metallib",
+    };
+    for (candidates) |candidate| {
+        if (pathExistsAbsoluteOrCwd(candidate)) return true;
+    }
+    return false;
+}
+
+fn ensureMlxMetallibColocatedForCalibration() void {
+    if (comptime !has_metal_gpu_calib) return;
+    if (!compute.metal.isAvailable()) return;
+    const runtime_dir = mlxRuntimeBinaryDir() orelse return;
+
+    var dst_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dst = std.fmt.bufPrint(&dst_buf, "{s}/mlx.metallib", .{runtime_dir}) catch return;
+    if (pathExistsAbsoluteOrCwd(dst)) return;
+
+    var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_dir = std.fs.selfExeDirPath(&exe_dir_buf) catch "";
+    var exe_candidate_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var exe_lib_candidate_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const candidate_exe = if (exe_dir.len > 0)
+        (std.fmt.bufPrint(&exe_candidate_buf, "{s}/mlx.metallib", .{exe_dir}) catch "")
+    else
+        "";
+    const candidate_exe_lib = if (exe_dir.len > 0)
+        (std.fmt.bufPrint(&exe_lib_candidate_buf, "{s}/../lib/mlx.metallib", .{exe_dir}) catch "")
+    else
+        "";
+    const candidate_env = std.posix.getenv("MLX_METALLIB") orelse "";
+
+    const candidates = [_][]const u8{
+        candidate_env,
+        candidate_exe,
+        candidate_exe_lib,
+        "mlx.metallib",
+        "zig-out/bin/mlx.metallib",
+        "zig-out/lib/mlx.metallib",
+        "deps/mlx/lib/mlx.metallib",
+        "deps/mlx-src/build/mlx/backend/metal/kernels/mlx.metallib",
+        "/opt/homebrew/bin/mlx.metallib",
+        "/usr/local/bin/mlx.metallib",
+    };
+    for (candidates) |candidate| {
+        if (!pathExistsAbsoluteOrCwd(candidate)) continue;
+        std.fs.cwd().copyFile(candidate, std.fs.cwd(), dst, .{}) catch continue;
+        log.info("convert", "metal colocated mlx.metallib for converter calibration", .{
+            .src = candidate,
+            .dst = dst,
+        });
+        return;
+    }
+
+    log.warn("convert", "metal calibration mlx.metallib missing at runtime lookup path", .{
+        .runtime_dir = runtime_dir,
+        .runtime_path = dst,
+    });
 }
 
 fn isCudaCalibrationEnabled() bool {
@@ -2423,6 +2524,7 @@ const GroupedCudaWeightScratch = struct {
 
 fn evaluateGroupedBlockForwardCalibrationCandidate(
     allocator: std.mem.Allocator,
+    metal_calibration_enabled: bool,
     cuda_ctx: ?*CudaCalibContext,
     source_values: []align(1) const f32,
     col_count: usize,
@@ -2452,7 +2554,7 @@ fn evaluateGroupedBlockForwardCalibrationCandidate(
         }
     }
 
-    if (isMetalCalibrationEnabled()) {
+    if (metal_calibration_enabled) {
         if (evaluateGroupedBlockForwardCalibrationCandidateMetal(
             allocator,
             source_values,
@@ -3199,6 +3301,7 @@ inline fn averageSlice(values: []const f32, fallback: f32) f32 {
 
 fn clipSearchGroupedCalibration(
     allocator: std.mem.Allocator,
+    metal_calibration_enabled: bool,
     cuda_ctx: ?*CudaCalibContext,
     source_values: []align(1) const f32,
     col_count: usize,
@@ -3231,6 +3334,7 @@ fn clipSearchGroupedCalibration(
             @memset(current_round_shifts, shift);
             const candidate_err = evaluateGroupedBlockForwardCalibrationCandidate(
                 allocator,
+                metal_calibration_enabled,
                 cuda_ctx,
                 source_values,
                 col_count,
@@ -3270,6 +3374,7 @@ fn clipSearchGroupedCalibration(
                 @memset(current_round_shifts, shift);
                 const candidate_err = evaluateGroupedBlockForwardCalibrationCandidate(
                     allocator,
+                    metal_calibration_enabled,
                     cuda_ctx,
                     source_values,
                     col_count,
@@ -3418,8 +3523,9 @@ fn estimateGroupedBlockForwardCalibrationParameters(
         );
         break :blk &owned_block_inputs.?;
     };
+    const metal_calibration_enabled = isMetalCalibrationEnabled();
     const ref_outputs = if (replay_targets == null) blk: {
-        if (isMetalCalibrationEnabled()) {
+        if (metal_calibration_enabled) {
             if (buildGroupedBlockForwardReferenceOutputsMetal(allocator, source_values, col_count, &row_cache, block_inputs)) |r| break :blk r;
         }
         if (cuda_ctx) |ctx| {
@@ -3538,6 +3644,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
 
     const baseline_err = evaluateGroupedBlockForwardCalibrationCandidate(
         allocator,
+        metal_calibration_enabled,
         cuda_ctx,
         source_values,
         col_count,
@@ -3559,6 +3666,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
     if (optimizer == .clip or optimizer == .clip_search) {
         const clip = clipSearchGroupedCalibration(
             allocator,
+            metal_calibration_enabled,
             cuda_ctx,
             source_values,
             col_count,
@@ -3709,6 +3817,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
 
                 const candidate_err = evaluateGroupedBlockForwardCalibrationCandidate(
                     allocator,
+                    metal_calibration_enabled,
                     cuda_ctx,
                     source_values,
                     col_count,
@@ -3795,6 +3904,7 @@ fn estimateGroupedBlockForwardCalibrationParameters(
             }
             const refine_err = evaluateGroupedBlockForwardCalibrationCandidate(
                 allocator,
+                metal_calibration_enabled,
                 cuda_ctx,
                 source_values,
                 col_count,

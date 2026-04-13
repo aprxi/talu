@@ -1068,6 +1068,23 @@ pub fn build(b: *std.Build) void {
         std.debug.print("NOTE: cargo not found — skipping CLI build (library still builds)\n", .{});
     }
 
+    const lib_step = b.step("lib", "Build and install dynamic library only");
+    lib_step.dependOn(&install_lib.step);
+
+    const cli_step = b.step("cli", "Build CLI executable only (no Python install)");
+    if (install_exe_step) |step| {
+        cli_step.dependOn(step);
+    } else {
+        const cli_fail_step = FailStep.create(b,
+            \\
+            \\ERROR: 'cli' step requires cargo (Rust toolchain).
+            \\
+            \\Install cargo, then run: zig build cli -Drelease
+            \\
+        );
+        cli_step.dependOn(&cli_fail_step.step);
+    }
+
     // ==========================================================================
     // Release step - recommended full build
     // ==========================================================================
