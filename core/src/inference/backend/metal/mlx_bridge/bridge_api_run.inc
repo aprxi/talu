@@ -111,7 +111,10 @@ int32_t mlx_decode_topk_stream(
         if (!has_penalties) {
             // Fast path: chunk decode to avoid very large token graphs and avoid
             // per-token async scheduling overhead.
-            const int32_t topk_chunk_size = []() -> int32_t {
+            // Gemma4-style per-layer-input models are sensitive to the bulk
+            // chunked decode graph; default to stepwise decode for correctness.
+            const bool force_stepwise_decode = ctx->cfg.hidden_size_per_layer_input > 0;
+            const int32_t topk_chunk_size = [force_stepwise_decode]() -> int32_t {
                 if (const char* raw = std::getenv("TALU_METAL_TOPK_CHUNK")) {
                     char* end = nullptr;
                     const long parsed = std::strtol(raw, &end, 10);
@@ -119,9 +122,15 @@ int32_t mlx_decode_topk_stream(
                         return static_cast<int32_t>(parsed);
                     }
                 }
+                if (force_stepwise_decode) {
+                    return 1;
+                }
                 return 32;
             }();
-            const int32_t effective_topk_chunk_size = std::min<int32_t>(topk_chunk_size, 128);
+            const int32_t effective_topk_chunk_size = std::max<int32_t>(
+                1,
+                std::min<int32_t>(topk_chunk_size, 128)
+            );
             const int32_t token_scalar = first_token;
             array current_token = array(&token_scalar, Shape{1, 1}, int32);
             std::vector<array> chunk_tokens;
@@ -255,7 +264,8 @@ int32_t mlx_decode_topk_stream(
                 frequency_penalty == 0.0f &&
                 presence_penalty != 0.0f;
 
-            const int32_t penalty_chunk_size = []() -> int32_t {
+            const bool force_stepwise_decode = ctx->cfg.hidden_size_per_layer_input > 0;
+            const int32_t penalty_chunk_size = [force_stepwise_decode]() -> int32_t {
                 if (const char* raw = std::getenv("TALU_METAL_TOPK_PENALTY_CHUNK")) {
                     char* end = nullptr;
                     const long parsed = std::strtol(raw, &end, 10);
@@ -263,9 +273,15 @@ int32_t mlx_decode_topk_stream(
                         return static_cast<int32_t>(parsed);
                     }
                 }
+                if (force_stepwise_decode) {
+                    return 1;
+                }
                 return 16;
             }();
-            const int32_t effective_penalty_chunk_size = std::min<int32_t>(penalty_chunk_size, 64);
+            const int32_t effective_penalty_chunk_size = std::max<int32_t>(
+                1,
+                std::min<int32_t>(penalty_chunk_size, 64)
+            );
 
             if (presence_only_penalty) {
                 // Chunked GPU path for the common presence-only configuration.

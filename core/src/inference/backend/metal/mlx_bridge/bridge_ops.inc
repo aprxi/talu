@@ -107,7 +107,7 @@ array linear_decode_maybe_quantized(
             return out;
         }
         if (nvfp4_ready) {
-            const array out = quantized_matmul(
+            array out = quantized_matmul(
                 x,
                 q_w,
                 q_scales,
@@ -117,6 +117,15 @@ array linear_decode_maybe_quantized(
                 quant_bits,
                 "nvfp4"
             );
+            // NVFP4 stores 1/global_scale in q_biases as a scalar post-multiply.
+            // This avoids lossy FP8 round-trip from folding global_scale into scales.
+            if (q_biases.size() == 1 && q_biases.dtype() == float32) {
+                eval(q_biases);
+                const float inv_gs = q_biases.item<float>();
+                if (inv_gs != 1.0f) {
+                    out = out * array(inv_gs, out.dtype());
+                }
+            }
             if (should_compare_quant(true)) emit_quant_compare(out);
             return out;
         }

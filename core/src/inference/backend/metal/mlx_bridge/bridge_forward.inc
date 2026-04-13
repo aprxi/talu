@@ -339,16 +339,18 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                     "affine"
                 )
               : (lm_head_nvfp4_ready
-                    ? quantized_matmul(
-                          lm_input,
-                          ctx->lm_head_q_w,
-                          ctx->lm_head_q_scales,
-                          std::nullopt,
-                          true,
-                          ctx->cfg.quant_group_size,
-                          ctx->cfg.quant_bits,
-                          "nvfp4"
-                      )
+                    ? [&]() {
+                          array out = quantized_matmul(
+                              lm_input, ctx->lm_head_q_w, ctx->lm_head_q_scales,
+                              std::nullopt, true, ctx->cfg.quant_group_size,
+                              ctx->cfg.quant_bits, "nvfp4");
+                          if (ctx->lm_head_q_biases.size() == 1 && ctx->lm_head_q_biases.dtype() == float32) {
+                              eval(ctx->lm_head_q_biases);
+                              const float inv_gs = ctx->lm_head_q_biases.item<float>();
+                              if (inv_gs != 1.0f) out = out * array(inv_gs, out.dtype());
+                          }
+                          return out;
+                      }()
               : quantized_matmul(
                     lm_input,
                     ctx->lm_head_q_w,

@@ -384,35 +384,28 @@ bool capture_native_nvfp4_quant(
     if ((cols % 16) != 0) return false;
     if (scale_src.shape(0) != rows || scale_src.shape(1) != (cols / 16)) return false;
 
-    // MLX's NVFP4 kernel: value = fp4_lut[nibble] * from_fp8(scale_u8).
-    // Fold the global_scale into the block scales so the kernel gets the
-    // effective scale directly. For compressed-tensors global_scale is a
-    // divisor; for modelopt weight_scale_2 is a multiplier.
-    float gs = 1.0f;
+    // Resolve global_scale: compressed-tensors stores 1/scale in weight_global_scale;
+    // modelopt stores scale in weight_scale_2 (we invert to get the divisor).
+    // Instead of folding global_scale into the FP8 block scales (lossy round-trip),
+    // we keep the original FP8 scales and store 1/global_scale as a post-multiply
+    // factor in q_biases. The matmul dispatch applies it after quantized_matmul.
+    float inv_gs = 1.0f;
     if (has_tensor(tensors, base + ".weight_global_scale")) {
         const array gs_f32 = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
         eval(gs_f32);
-        gs = gs_f32.item<float>();
+        const float gs = gs_f32.item<float>();
+        if (gs != 0.0f && std::isfinite(gs)) inv_gs = 1.0f / gs;
     } else if (has_tensor(tensors, base + ".weight_scale_2")) {
         const array gs2_f32 = astype(require_tensor(tensors, base + ".weight_scale_2"), float32);
         eval(gs2_f32);
         const float s2 = gs2_f32.item<float>();
-        if (s2 != 0.0f && std::isfinite(s2)) gs = 1.0f / s2;
-    }
-    if (gs == 0.0f) return false;
-
-    // Adjust scales: effective = from_fp8(raw_scale) / global_scale → re-encode as FP8
-    array adjusted_scales = scale_src;
-    if (gs != 1.0f) {
-        array scales_f32 = astype(from_fp8(scale_src, float32), float32);
-        scales_f32 = divide(scales_f32, array(gs, float32));
-        adjusted_scales = view(to_fp8(scales_f32), uint8);
-        eval(adjusted_scales);
+        if (s2 != 0.0f && std::isfinite(s2)) inv_gs = s2;
     }
 
     *out_q_w = stop_gradient(copy(reshape(view(packed_src, uint32), {rows, packed_byte_cols / 4})));
-    *out_q_scales = stop_gradient(copy(adjusted_scales));
-    *out_q_biases = array(0.0f);
+    *out_q_scales = stop_gradient(copy(scale_src));
+    // Store inv_gs (1/global_scale) as scalar — dispatch multiplies result by this.
+    *out_q_biases = stop_gradient(array(inv_gs, float32));
     return true;
 }
 
