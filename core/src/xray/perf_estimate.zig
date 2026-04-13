@@ -4,7 +4,7 @@
 //! Independent of runtime types - takes primitive configuration values.
 
 const std = @import("std");
-const dtype_mod = @import("../dtype.zig");
+const dtype_mod = @import("dtype_pkg");
 
 const DType = dtype_mod.DType;
 

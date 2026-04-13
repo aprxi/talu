@@ -21,7 +21,7 @@ pub const TransformerBlock = block.TransformerBlock;
 pub const Linear = layers.Linear;
 pub const Embedding = layers.Embedding;
 
-const layer_ops = @import("../../../../models/layer_ops.zig");
+const layer_ops = @import("models_pkg").layer_ops;
 pub const LayerOp = layer_ops.LayerOp;
 pub const BufferId = layer_ops.BufferId;
 

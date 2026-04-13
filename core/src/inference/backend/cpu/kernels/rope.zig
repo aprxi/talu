@@ -5,7 +5,7 @@
 pub const supported = true;
 
 const std = @import("std");
-const compute = @import("../../../../compute/root.zig");
+const compute = @import("compute_pkg");
 
 // Re-export RoPE via compute/cpu ops facade.
 pub const RoPE = compute.cpu.math.RoPE;

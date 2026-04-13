@@ -8,7 +8,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const mask_mod = @import("mask.zig");
 const cache = @import("cache.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 const trie_mod = @import("trie.zig");
 
 const Grammar = ast.Grammar;

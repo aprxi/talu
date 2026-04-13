@@ -6,7 +6,7 @@ const error_codes = @import("../error_codes.zig");
 const responses_mod = @import("../responses.zig");
 const responses_root = @import("../../responses/root.zig");
 const db = @import("../../db/root.zig");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 const vector = @import("vector.zig");
 
 const allocator = std.heap.c_allocator;

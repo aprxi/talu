@@ -15,6 +15,9 @@ pub const plugins = @import("plugins/root.zig");
 /// SafeTensors format parsing.
 pub const safetensors = struct {
     pub const root = @import("safetensors/root.zig");
+    pub const reader = @import("safetensors/reader.zig");
+    pub const writer = @import("safetensors/writer.zig");
+    pub const sharded = @import("safetensors/sharded.zig");
     pub const names = @import("safetensors/names.zig");
     pub const norm_loader = @import("safetensors/norm_loader.zig");
 };

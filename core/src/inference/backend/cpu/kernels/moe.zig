@@ -6,8 +6,8 @@ pub const supported = true;
 
 const std = @import("std");
 const build_options = @import("build_options");
-const tensor = @import("../../../../tensor.zig");
-const compute = @import("../../../../compute/root.zig");
+const tensor = @import("tensor_pkg");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const mxfp4 = compute.cpu.mxfp4;
 const cpu_activation = compute.cpu.activation;
@@ -16,10 +16,10 @@ const cpu_matvec = compute.cpu.linalg.matvec;
 const cpu_normalization = compute.cpu.normalization;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_topk = compute.cpu.topk;
-const dtype_mod = @import("../../../../dtype.zig");
-const inspect = @import("../../../../xray/root.zig");
+const dtype_mod = @import("dtype_pkg");
+const inspect = @import("xray_pkg");
 const trace = inspect.trace;
-const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
+const dump = if (build_options.dump_tensors) @import("xray_pkg").dump.capture else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
 

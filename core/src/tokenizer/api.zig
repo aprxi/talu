@@ -10,7 +10,7 @@ const tok_encode = @import("encode.zig");
 const offsets_mod = @import("offsets.zig");
 const pipeline_impl = @import("pipeline.zig");
 const unigram_model = @import("unigram.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 // Unicode replacement character (U+FFFD)
 const REPLACEMENT_CHAR = "\xEF\xBF\xBD";

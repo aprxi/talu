@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 // Spin counts tuned for LLM inference latency - keep CPU hot to avoid syscall overhead
 const SPIN_BEFORE_YIELD: usize = 10_000;

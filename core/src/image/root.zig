@@ -5,14 +5,14 @@ const std = @import("std");
 const pixel = @import("pixel.zig");
 const limits_mod = @import("limits.zig");
 const sniff_mod = @import("sniff.zig");
-const exif = @import("exif.zig");
+const exif_mod = @import("exif.zig");
 const alpha_mod = @import("alpha.zig");
 const resize_mod = @import("resize.zig");
 const convert_mod = @import("convert.zig");
 const model_input_mod = @import("model_input.zig");
 const encode_mod = @import("encode.zig");
 const preprocess_mod = @import("preprocess.zig");
-const codecs = @import("codecs/root.zig");
+const codecs_mod = @import("codecs/root.zig");
 
 pub const Image = pixel.Image;
 pub const PixelFormat = pixel.PixelFormat;
@@ -20,7 +20,7 @@ pub const Rgb8 = pixel.Rgb8;
 pub const ColorPolicy = pixel.ColorPolicy;
 pub const Limits = limits_mod.Limits;
 pub const Format = sniff_mod.Format;
-pub const Orientation = exif.Orientation;
+pub const Orientation = exif_mod.Orientation;
 pub const AlphaMode = alpha_mod.AlphaMode;
 pub const ResizeFilter = resize_mod.ResizeFilter;
 pub const FitMode = resize_mod.FitMode;
@@ -43,6 +43,8 @@ pub const ExplicitResize = preprocess_mod.ExplicitResize;
 pub const VisionPreprocessOptions = preprocess_mod.VisionPreprocessOptions;
 pub const VisionPreprocessResult = preprocess_mod.VisionPreprocessResult;
 pub const bytesPerPixel = pixel.bytesPerPixel;
+pub const exif = exif_mod;
+pub const codecs = codecs_mod;
 
 pub const DecodeOptions = struct {
     limits: Limits = .{},
@@ -69,10 +71,10 @@ pub fn decode(
     const format = detectFormat(bytes) orelse return error.UnsupportedImageFormat;
 
     var decoded = switch (format) {
-        .jpeg => try codecs.jpeg.decode(allocator, bytes, opts.limits, opts.apply_orientation),
-        .png => try codecs.png.decode(allocator, bytes, opts.limits),
-        .webp => try codecs.webp.decode(allocator, bytes, opts.limits),
-        .pdf => try codecs.pdf.decode(allocator, bytes, opts.limits),
+        .jpeg => try codecs_mod.jpeg.decode(allocator, bytes, opts.limits, opts.apply_orientation),
+        .png => try codecs_mod.png.decode(allocator, bytes, opts.limits),
+        .webp => try codecs_mod.webp.decode(allocator, bytes, opts.limits),
+        .pdf => try codecs_mod.pdf.decode(allocator, bytes, opts.limits),
     };
     errdefer decoded.deinit(allocator);
 
@@ -128,8 +130,8 @@ pub fn toModelInput(
 }
 
 pub const encode = encode_mod.encode;
-pub const codecs_internal = codecs;
-pub const pdf = codecs.pdf;
+pub const codecs_internal = codecs_mod;
+pub const pdf = codecs_mod.pdf;
 
 pub const TransformSpec = struct {
     limits: Limits = .{},
@@ -204,7 +206,7 @@ pub fn transformPdfPage(
     dpi: u32,
     spec: TransformSpec,
 ) !TransformResult {
-    var decoded = try codecs.pdf.renderPage(
+    var decoded = try codecs_mod.pdf.renderPage(
         allocator,
         bytes,
         page_index,

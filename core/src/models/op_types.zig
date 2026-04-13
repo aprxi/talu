@@ -4,8 +4,8 @@
 //! and inference runtime wiring.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
-const runtime_contract = @import("../inference/runtime_contract/root.zig");
+const tensor = @import("tensor_pkg");
+const runtime_contract = @import("runtime_contract_pkg");
 const perf_hints = @import("perf_hints.zig");
 const sampling_presets = @import("sampling_presets.zig");
 

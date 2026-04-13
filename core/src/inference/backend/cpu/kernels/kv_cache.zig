@@ -21,7 +21,7 @@
 pub const supported = true;
 
 const std = @import("std");
-const compute = @import("../../../../compute/root.zig");
+const compute = @import("compute_pkg");
 const cpu_indexing = compute.cpu.indexing;
 const cpu_memory = compute.cpu.memory;
 const cpu_common = compute.cpu.common;

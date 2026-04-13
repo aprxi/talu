@@ -4,7 +4,7 @@ const std = @import("std");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 const db = @import("../../db/root.zig");
-const tensor_mod = @import("../../tensor.zig");
+const tensor_mod = @import("tensor_pkg");
 const helpers = @import("helpers.zig");
 
 const allocator = std.heap.c_allocator;

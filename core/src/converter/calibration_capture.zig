@@ -5,12 +5,12 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const dtype_mod = @import("../dtype.zig");
-const log = @import("../log.zig");
-const xray = @import("../xray/root.zig");
+const dtype_mod = @import("dtype_pkg");
+const log = @import("log_pkg");
+const xray = @import("xray_pkg");
 const router_local = @import("../router/local.zig");
-const backend_root = @import("../inference/backend/root.zig");
-const progress_mod = @import("../capi/progress.zig");
+const backend_root = @import("inference_pkg").backend;
+const progress_mod = @import("progress_pkg");
 const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
 
 pub const CaptureOptions = struct {
@@ -406,7 +406,7 @@ pub fn captureFromInference(
         options.seed,
         .{},
         .{ .selection = options.backend_selection },
-        progress_mod.ProgressContext.NONE,
+        progress_mod.Context.NONE,
     );
     defer engine.deinit();
 

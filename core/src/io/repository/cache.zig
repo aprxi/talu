@@ -3,7 +3,7 @@
 //! Handles hub cache directory format and model ID parsing.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 const resolver = @import("resolver.zig");
 
 /// Parse a model ID from a cache path.

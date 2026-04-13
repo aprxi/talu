@@ -4,11 +4,11 @@
 //! applies transforms/layout handling without model-specific hardcoding.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const st_loader = @import("../../io/safetensors/root.zig");
-const model_types = @import("../op_types.zig");
+const tensor = @import("tensor_pkg");
+const st_loader = @import("io_pkg").safetensors.root;
+const model_types = @import("models_pkg").op_types;
 const transforms = @import("transforms.zig");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 
 const Tensor = tensor.Tensor;
 const Allocator = std.mem.Allocator;

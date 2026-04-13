@@ -9,7 +9,7 @@ const error_codes = @import("../error_codes.zig");
 const docs = @import("../documents_impl.zig");
 const responses_mod = @import("../responses.zig");
 const db = @import("../../db/root.zig");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 const helpers = @import("helpers.zig");
 const ops = @import("ops.zig");
 

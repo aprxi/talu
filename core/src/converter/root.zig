@@ -7,13 +7,13 @@
 //! This module only contains genuinely shared code.
 
 const std = @import("std");
-const json = @import("../io/json/root.zig");
-const log = @import("../log.zig");
-const tensor_mod = @import("../tensor.zig");
-const safetensors = @import("../io/safetensors/root.zig");
-const dtype_mod = @import("../dtype.zig");
-const op_types = @import("../models/op_types.zig");
-const models_registry = @import("../models/registry.zig");
+const json = @import("io_pkg").json;
+const log = @import("log_pkg");
+const tensor_mod = @import("tensor_pkg");
+const safetensors = @import("io_pkg").safetensors.root;
+const dtype_mod = @import("dtype_pkg");
+const op_types = @import("models_pkg").op_types;
+const models_registry = @import("models_pkg").registry;
 
 pub const mapping = @import("mapping.zig");
 pub const grouped_affine = @import("grouped_affine.zig");

@@ -7,9 +7,9 @@
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
-const dtype = @import("../../../../dtype.zig");
-const compute = @import("../../../../compute/root.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const compute = @import("compute_pkg");
 const cpu_quant_decode = compute.cpu.quant_decode;
 const cpu_memory = compute.cpu.memory;
 

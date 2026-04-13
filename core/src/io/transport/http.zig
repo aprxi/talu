@@ -7,7 +7,7 @@ const c = @cImport({
     @cInclude("curl/curl.h");
 });
 
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 
 /// Mozilla CA certificates bundle - embedded at compile time for portability
 /// Downloaded from https://curl.se/ca/cacert.pem during build, provided via build.zig

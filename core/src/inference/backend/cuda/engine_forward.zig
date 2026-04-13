@@ -5,10 +5,10 @@
 //! Functions use `self: anytype` to avoid circular imports with engine.zig.
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
-const tensor = @import("../../../tensor.zig");
-const log = @import("../../../log.zig");
-const trace = @import("../../../xray/trace.zig");
+const compute = @import("compute_pkg");
+const tensor = @import("tensor_pkg");
+const log = @import("log_pkg");
+const trace = @import("xray_pkg").trace;
 const staged_orchestrator = @import("../staged_orchestrator.zig");
 
 // --- Shared types from engine_types.zig ---

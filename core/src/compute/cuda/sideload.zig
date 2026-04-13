@@ -1,7 +1,7 @@
 //! Sideloaded CUDA kernel payload cache and download helpers.
 
 const std = @import("std");
-const transport = @import("../../io/transport/root.zig");
+const transport = @import("io_pkg").transport;
 
 pub const cache_dir_env = "TALU_CUDA_CACHE_DIR";
 pub const kernel_base_url_env = "TALU_CUDA_KERNEL_BASE_URL";

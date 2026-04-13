@@ -18,7 +18,7 @@
 //!   are pending flush after a crash or while a writer is active.
 
 const std = @import("std");
-const kvbuf = @import("../../io/kvbuf/root.zig");
+const kvbuf = @import("io_pkg").kvbuf;
 const db_reader = @import("../reader.zig");
 const db_block_reader = @import("../block_reader.zig");
 const db_blob_store = @import("store.zig");

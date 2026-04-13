@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const simd = @import("simd/arch/root.zig");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;

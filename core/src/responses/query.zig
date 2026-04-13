@@ -4,12 +4,12 @@
 //! they are fully decoupled from the adapter struct.
 
 const std = @import("std");
-const kvbuf = @import("../io/kvbuf/root.zig");
+const kvbuf = @import("io_pkg").kvbuf;
 const db_reader = @import("../db/reader.zig");
 const db_blob_store = @import("../db/blob/store.zig");
 const block_reader = @import("../db/block_reader.zig");
 const types = @import("../db/types.zig");
-const parallel = @import("../system/parallel.zig");
+const parallel = @import("compute_pkg").parallel;
 
 const codec = @import("codec.zig");
 const search = @import("search.zig");

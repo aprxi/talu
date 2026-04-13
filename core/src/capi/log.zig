@@ -3,7 +3,7 @@
 //! Allows bindings to control log level and format programmatically.
 //! Used by CLI for -v/-vv/-vvv flags and --log-format option.
 
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 /// Log levels (matches log.Level enum values)
 pub const LogLevel = enum(c_int) {

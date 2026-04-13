@@ -15,7 +15,7 @@ const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const reasoning_parser_mod = responses_mod.reasoning_parser;
 const firewall = @import("firewall.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 /// Backend-agnostic tool call input for commit.
 pub const ToolCallInput = struct {

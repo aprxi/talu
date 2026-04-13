@@ -3,8 +3,8 @@
 //! Computes output = input @ weight^T using matmulF32 from compute.cpu.linalg.
 
 const std = @import("std");
-const tensor_mod = @import("../../tensor.zig");
-const compute = @import("../../compute/root.zig");
+const tensor_mod = @import("tensor_pkg");
+const compute = @import("compute_pkg");
 
 const Tensor = tensor_mod.Tensor;
 const MatmulScratch = compute.cpu.linalg.MatmulScratch;

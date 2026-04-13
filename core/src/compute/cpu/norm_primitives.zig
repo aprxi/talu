@@ -1,7 +1,7 @@
 //! Normalization operations with stride-aware implementations.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const tv = @import("tensor_view.zig");
 const math = @import("math.zig");
 
@@ -16,7 +16,7 @@ const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;
 
 /// Dtype conversion helpers - wrapped to remove inline calling convention
-const dtype_mod = @import("../../dtype.zig");
+const dtype_mod = @import("dtype_pkg");
 
 fn fp16ToF32(x: u16) f32 {
     return dtype_mod.fp16ToF32(x);

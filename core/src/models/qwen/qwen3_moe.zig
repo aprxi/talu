@@ -1,8 +1,8 @@
 //! Qwen3-MoE model-version metadata.
 
 const std = @import("std");
-const layer_ops = @import("../layer_ops.zig");
-const types = @import("../op_types.zig");
+const layer_ops = @import("models_pkg").layer_ops;
+const types = @import("models_pkg").op_types;
 const config_hooks = @import("../config/hook_utils.zig");
 const perf = @import("../perf_hints.zig");
 const sp = @import("../sampling_presets.zig");

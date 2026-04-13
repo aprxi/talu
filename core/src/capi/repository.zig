@@ -19,12 +19,12 @@
 //! - talu_repo_search() - Search for models on source
 
 const std = @import("std");
-const repository = @import("../io/repository/root.zig");
+const repository = @import("io_pkg").repository.root;
 const ffi = @import("../helpers/ffi.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const progress_api = @import("progress.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 const allocator = std.heap.c_allocator;
 

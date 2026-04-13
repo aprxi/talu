@@ -1,7 +1,7 @@
 //! Shared multimodal RoPE helpers for inference backends.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
+const tensor = @import("tensor_pkg");
 const vision_common = @import("vision_types.zig");
 
 pub const PrefillVisionImage = vision_common.PrefillVisionImage;

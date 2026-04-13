@@ -10,9 +10,8 @@ const std = @import("std");
 
 pub const sampling = @import("sampling.zig");
 pub const scheduler = @import("scheduler.zig");
-pub const config = @import("config/root.zig");
 pub const vision_types = @import("vision_types.zig");
-pub const runtime_contract = @import("runtime_contract/root.zig");
+pub const runtime_contract = @import("runtime_contract_pkg");
 
 /// Generation request/response types.
 pub const types = struct {

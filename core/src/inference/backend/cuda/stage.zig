@@ -9,7 +9,7 @@
 //! copies when hardware supports it, falling back to host-staged transfer otherwise.
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
+const compute = @import("compute_pkg");
 const pipeline = @import("../pipeline.zig");
 
 /// Wrapper around a CudaBackend pointer that satisfies the pipeline stage contract.

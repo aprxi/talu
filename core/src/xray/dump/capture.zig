@@ -8,8 +8,8 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const trace = @import("../trace.zig");
-const dtype_mod = @import("../../dtype.zig");
+const trace = @import("xray_pkg").trace;
+const dtype_mod = @import("dtype_pkg");
 
 pub const DumpEnabled = build_options.dump_tensors;
 

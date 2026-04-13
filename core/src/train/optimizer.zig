@@ -8,7 +8,7 @@
 //!   param -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * param)
 
 const std = @import("std");
-const compute = @import("../compute/root.zig");
+const compute = @import("compute_pkg");
 
 const simd = compute.cpu.simd.arch;
 const VEC = simd.f32_vec_len;

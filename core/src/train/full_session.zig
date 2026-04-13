@@ -22,7 +22,7 @@ const optimizer_mod = @import("optimizer.zig");
 const scheduler_mod = @import("scheduler.zig");
 const data_mod = @import("data.zig");
 const loop_mod = @import("loop.zig");
-const compute = @import("../compute/root.zig");
+const compute = @import("compute_pkg");
 
 const Allocator = std.mem.Allocator;
 const TransformerConfig = model_config.TransformerConfig;

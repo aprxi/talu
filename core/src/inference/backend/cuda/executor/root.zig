@@ -3,7 +3,7 @@
 //! This module currently provides contract-shape types only. Runtime execution
 //! lives in `engine.zig`.
 
-const topology = @import("../../../../models/op_types.zig");
+const topology = @import("models_pkg").op_types;
 const kernels = @import("../kernels/root.zig");
 const std = @import("std");
 

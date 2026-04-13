@@ -22,7 +22,7 @@
 //! }
 
 const std = @import("std");
-const io = @import("../io/root.zig");
+const io = @import("io_pkg");
 
 /// Error types for tool schema conversion.
 pub const ToolSchemaError = error{
@@ -683,7 +683,7 @@ test "parseToolCall missing name" {
 
 test "toolsToGrammarSchema schema compiles to grammar" {
     const allocator = std.testing.allocator;
-    const validate = @import("../validate/root.zig");
+    const validate = @import("validate_pkg");
     const cache = validate.cache;
 
     // Flat format with realistic BFCL-style parameters
@@ -707,7 +707,7 @@ test "toolsToGrammarSchema schema compiles to grammar" {
 
 test "toolsToGrammarSchema multi-tool schema compiles to grammar" {
     const allocator = std.testing.allocator;
-    const validate = @import("../validate/root.zig");
+    const validate = @import("validate_pkg");
     const cache = validate.cache;
 
     const tools_json =

@@ -26,7 +26,7 @@ const std = @import("std");
 const provider_mod = @import("provider.zig");
 const http_engine = @import("http_engine.zig");
 const kv_store = @import("../db/kv/store.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 const Allocator = std.mem.Allocator;
 

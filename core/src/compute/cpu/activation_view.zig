@@ -18,7 +18,7 @@ const fastExp = math.fastExp;
 const fastExpScalar = math.fastExpScalar;
 
 /// Dtype conversion helpers - wrapped to remove inline calling convention
-const dtype_mod = @import("../../dtype.zig");
+const dtype_mod = @import("dtype_pkg");
 
 fn fp16ToF32(x: u16) f32 {
     return dtype_mod.fp16ToF32(x);

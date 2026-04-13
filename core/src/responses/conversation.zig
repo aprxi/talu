@@ -27,10 +27,10 @@
 //! Thread safety: NOT thread-safe. All access must be from a single thread.
 
 const std = @import("std");
-const json_mod = @import("../io/json/root.zig");
+const json_mod = @import("io_pkg").json;
 const items = @import("items.zig");
 const backend_mod = @import("backend.zig");
-const code_mod = @import("../validate/code/root.zig");
+const code_mod = @import("validate_pkg").code;
 
 pub const Item = items.Item;
 pub const ItemType = items.ItemType;

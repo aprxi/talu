@@ -1,7 +1,7 @@
 //! Quantized row decode primitives for CPU compute.
 
 const std = @import("std");
-const dtype = @import("../../dtype.zig");
+const dtype = @import("dtype_pkg");
 const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
 
 /// Decode one FP16 row to f32.

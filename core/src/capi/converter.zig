@@ -11,12 +11,12 @@
 
 const std = @import("std");
 const scheme_mod = @import("../converter/scheme.zig");
-const io = @import("../io/root.zig");
-const model_config = @import("../models/config/root.zig");
-const models_dispatcher = @import("../models/root.zig");
+const repository = @import("io_pkg").repository.root;
+const model_config = @import("models_pkg").config;
+const models_dispatcher = @import("models_pkg");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
-const xray = @import("../xray/root.zig");
+const xray = @import("xray_pkg");
 const execution_plan = xray.execution_plan;
 
 // Import session for path resolution and tokenizer for memory utils
@@ -149,7 +149,7 @@ pub export fn talu_convert(
     const output_dir_cstr = output_dir orelse return convertArgError("output_dir is required");
     const convert_options = options orelse &ConvertOptions{};
 
-    const resolved_path = io.repository.resolveModelPath(
+    const resolved_path = repository.resolveModelPath(
         allocator,
         std.mem.span(model_path_cstr),
         .{ .offline = convert_options.offline, .progress = convert_options.progressContext() },

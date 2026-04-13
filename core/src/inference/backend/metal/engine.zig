@@ -1,15 +1,15 @@
 const std = @import("std");
 const contract = @import("../contract.zig");
-const runtime_contract = @import("../../runtime_contract/root.zig");
-const models = @import("../../../models/root.zig");
-const tensor = @import("../../../tensor.zig");
-const log = @import("../../../log.zig");
-const progress_mod = @import("../../../progress.zig");
+const runtime_contract = @import("runtime_contract_pkg");
+const models = @import("models_pkg");
+const tensor = @import("tensor_pkg");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
 const metal_vision = @import("vision/root.zig");
 const cpu_engine = @import("../cpu/engine.zig");
 const sampling = @import("../cpu/sampling.zig");
-const compute = @import("../../../compute/root.zig");
-const trace = @import("../../../xray/trace.zig");
+const compute = @import("compute_pkg");
+const trace = @import("xray_pkg").trace;
 const cpu_sampling_ops = compute.cpu.sampling_ops;
 const ModelConfig = tensor.ModelConfig;
 const ModelRuntime = tensor.ModelRuntime;
@@ -37,6 +37,7 @@ extern fn mlx_clone(source_ctx: ?*mlx_ctx, seed: c_int) ?*mlx_ctx;
 extern fn mlx_destroy(ctx: ?*mlx_ctx) void;
 extern fn mlx_reset(ctx: ?*mlx_ctx) c_int;
 extern fn mlx_last_error() ?[*:0]const u8;
+extern fn mlx_runtime_binary_dir() ?[*:0]const u8;
 
 extern fn mlx_prefill_first(
     ctx: ?*mlx_ctx,
@@ -394,6 +395,68 @@ pub const MetalBackend = struct {
     fn resolveLastError() []const u8 {
         const raw = mlx_last_error() orelse return "mlx_last_error unavailable";
         return std.mem.sliceTo(raw, 0);
+    }
+
+    fn runtimeBinaryDir() ?[]const u8 {
+        const raw = mlx_runtime_binary_dir() orelse return null;
+        const dir = std.mem.sliceTo(raw, 0);
+        if (dir.len == 0) return null;
+        return dir;
+    }
+
+    fn pathExists(path: []const u8) bool {
+        if (path.len == 0) return false;
+        if (std.fs.path.isAbsolute(path)) {
+            std.fs.accessAbsolute(path, .{}) catch return false;
+            return true;
+        }
+        std.fs.cwd().access(path, .{}) catch return false;
+        return true;
+    }
+
+    fn ensureMlxMetallibColocated(allocator: std.mem.Allocator) void {
+        const runtime_dir = runtimeBinaryDir() orelse return;
+        var dst_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/mlx.metallib", .{runtime_dir}) catch return;
+        if (pathExists(dst)) return;
+
+        var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_dir = std.fs.selfExeDirPath(&exe_dir_buf) catch "";
+        var cand1_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var cand2_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const candidate_exe = if (exe_dir.len > 0)
+            (std.fmt.bufPrint(&cand1_buf, "{s}/mlx.metallib", .{exe_dir}) catch "")
+        else
+            "";
+        const candidate_exe_lib = if (exe_dir.len > 0)
+            (std.fmt.bufPrint(&cand2_buf, "{s}/../lib/mlx.metallib", .{exe_dir}) catch "")
+        else
+            "";
+        const candidate_env = std.posix.getenv("MLX_METALLIB") orelse "";
+        const candidates = [_][]const u8{
+            candidate_env,
+            candidate_exe,
+            candidate_exe_lib,
+            "mlx.metallib",
+            "zig-out/lib/mlx.metallib",
+            "deps/mlx/lib/mlx.metallib",
+        };
+
+        for (candidates) |src| {
+            if (!pathExists(src)) continue;
+            std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{}) catch continue;
+            log.info("inference", "metal colocated mlx.metallib for runtime loader", .{
+                .src = src,
+                .dst = dst,
+            });
+            return;
+        }
+
+        log.warn("inference", "metal mlx.metallib missing at runtime lookup path", .{
+            .runtime_dir = runtime_dir,
+            .runtime_path = dst,
+        });
+        _ = allocator;
     }
 
     fn envTruthy(name: []const u8, fallback: bool) bool {
@@ -845,6 +908,8 @@ pub const MetalBackend = struct {
         const model_id_z = try allocator.dupeZ(u8, model_id_src);
         errdefer allocator.free(model_id_z);
 
+        ensureMlxMetallibColocated(allocator);
+
         const seed = readSeedFromEnv(allocator);
         const max_batch_size = resolveMaxBatchSize(allocator);
         const model_flags = MlxModelFlags{
@@ -856,15 +921,34 @@ pub const MetalBackend = struct {
         };
         const ctx = mlx_create_with_flags(model_id_z.ptr, model_path_z.ptr, seed, &model_flags) orelse {
             const mlx_error = resolveLastError();
+            const runtime_dir = runtimeBinaryDir() orelse "";
+            var runtime_metal_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const runtime_metal_path = if (runtime_dir.len > 0)
+                (std.fmt.bufPrint(&runtime_metal_buf, "{s}/mlx.metallib", .{runtime_dir}) catch "")
+            else
+                "";
+            const runtime_has_metallib = pathExists(runtime_metal_path);
             if (isMemoryError(mlx_error)) {
                 if (init_config.memory_fit_is_error) {
-                    log.err("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error }, @src());
+                    log.err("inference", "metal mlx_create failed", .{
+                        .mlx_error = mlx_error,
+                        .mlx_runtime_dir = runtime_dir,
+                        .mlx_runtime_has_metallib = @as(u8, @intFromBool(runtime_has_metallib)),
+                    }, @src());
                 } else {
-                    log.warn("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error });
+                    log.warn("inference", "metal mlx_create failed", .{
+                        .mlx_error = mlx_error,
+                        .mlx_runtime_dir = runtime_dir,
+                        .mlx_runtime_has_metallib = @as(u8, @intFromBool(runtime_has_metallib)),
+                    });
                 }
                 return error.OutOfMemory;
             }
-            log.warn("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error });
+            log.warn("inference", "metal mlx_create failed", .{
+                .mlx_error = mlx_error,
+                .mlx_runtime_dir = runtime_dir,
+                .mlx_runtime_has_metallib = @as(u8, @intFromBool(runtime_has_metallib)),
+            });
             return error.InvalidArgument;
         };
 

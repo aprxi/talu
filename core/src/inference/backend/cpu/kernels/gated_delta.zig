@@ -6,15 +6,15 @@
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const Tensor = tensor.Tensor;
-const log = @import("../../../../log.zig");
-const compute = @import("../../../../compute/root.zig");
+const log = @import("log_pkg");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
-const parallel = @import("../../../../system/parallel.zig");
-const trace = @import("../../../../xray/root.zig").trace;
+const parallel = @import("compute_pkg").parallel;
+const trace = @import("xray_pkg").trace;
 
 fn saturatingU64FromU128(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);

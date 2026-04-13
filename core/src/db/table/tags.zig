@@ -9,7 +9,7 @@
 //! Schema 7: ConversationTag junction table
 
 const std = @import("std");
-const kvbuf = @import("../../io/kvbuf/root.zig");
+const kvbuf = @import("io_pkg").kvbuf;
 const db_writer = @import("../writer.zig");
 const block_reader = @import("../block_reader.zig");
 const types = @import("../types.zig");

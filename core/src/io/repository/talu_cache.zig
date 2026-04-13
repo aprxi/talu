@@ -4,7 +4,7 @@
 //! Models are stored as org/name subdirectories containing config.json + weights.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 const cache = @import("cache.zig");
 const resolver = @import("resolver.zig");
 

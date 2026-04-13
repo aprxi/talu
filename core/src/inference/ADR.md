@@ -38,7 +38,7 @@ This ADR governs text and multimodal routes that execute `ExecutionPlan` instruc
 `compute/` MUST NOT own scheduler policy or model-family orchestration.
 
 ## Normative Contract Types
-The following types are REQUIRED runtime contracts. Their semantics MUST match `core/src/inference/runtime_contract/types.zig`.
+The following types are REQUIRED runtime contracts. Their semantics MUST match `core/src/runtime_contract/types.zig`.
 
 ```zig
 pub const Opcode = enum(u8) { ... };

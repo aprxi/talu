@@ -4,13 +4,13 @@
 //! metadata from `core/src/models/*`.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
+const tensor = @import("tensor_pkg");
 const op_types = @import("op_types.zig");
 const cfg_loader = @import("config/root.zig");
 const weights_impl = @import("load/weights.zig");
 const models_registry = @import("registry.zig");
-const log = @import("../log.zig");
-const progress_mod = @import("../progress.zig");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
 const validation = @import("load/validation.zig");
 
 // Re-export types

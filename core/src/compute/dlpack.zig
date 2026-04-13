@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const device_mod = @import("device.zig");
-const tensor_mod = @import("../tensor.zig");
+const tensor_mod = @import("tensor_pkg");
 
 pub const DeviceType = device_mod.DeviceType;
 pub const Device = device_mod.Device;

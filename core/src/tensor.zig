@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const dtype_mod = @import("dtype.zig");
+const dtype_mod = @import("dtype_pkg");
 
 const c = @cImport({
     @cInclude("stdlib.h");

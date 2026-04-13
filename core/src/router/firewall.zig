@@ -3,8 +3,8 @@
 //! Centralizes policy evaluation for tool calls across engines.
 
 const std = @import("std");
-const io = @import("../io/root.zig");
-const log = @import("../log.zig");
+const io = @import("io_pkg");
+const log = @import("log_pkg");
 const responses_mod = @import("../responses/root.zig");
 const policy_mod = @import("../agent/policy/evaluate.zig");
 

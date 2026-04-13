@@ -4,7 +4,7 @@
 //! It intentionally stays data-only and does not depend on inference executors.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
+const tensor = @import("tensor_pkg");
 const graph_types = @import("op_types.zig");
 const transforms = @import("load/transforms.zig");
 

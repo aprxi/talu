@@ -10,12 +10,12 @@
 //! Schema 12: Document Deletes (tombstones)
 
 const std = @import("std");
-const kvbuf = @import("../../io/kvbuf/root.zig");
+const kvbuf = @import("io_pkg").kvbuf;
 const db_writer = @import("../writer.zig");
 const block_reader = @import("../block_reader.zig");
 const db_blob_store = @import("../blob/store.zig");
 const types = @import("../types.zig");
-const parallel = @import("../../system/parallel.zig");
+const parallel = @import("compute_pkg").parallel;
 const generic = @import("generic.zig");
 
 const Allocator = std.mem.Allocator;

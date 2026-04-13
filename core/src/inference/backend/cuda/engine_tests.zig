@@ -5,14 +5,14 @@
 //! engine_ops, engine_mixers, and engine_layer_program.
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
-const tensor = @import("../../../tensor.zig");
-const dtype = @import("../../../dtype.zig");
-const models = @import("../../../models/root.zig");
+const compute = @import("compute_pkg");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const models = @import("models_pkg");
 const layer_ops = models.layer_ops;
 const opcode_map = models.plan.opcode_map;
 const plan_compiler = models.plan.compiler;
-const runtime_contract = @import("../../runtime_contract/root.zig");
+const runtime_contract = @import("runtime_contract_pkg");
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 

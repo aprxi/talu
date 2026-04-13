@@ -4,7 +4,7 @@
 //! This enables catching errors before expensive LLM API calls.
 
 const std = @import("std");
-const io = @import("../io/root.zig");
+const io = @import("io_pkg");
 const ast = @import("ast.zig");
 const lexer_mod = @import("lexer.zig");
 const parser_mod = @import("parser.zig");

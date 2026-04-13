@@ -5,18 +5,18 @@
 //! components (QKV, gate/up projections).
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const dtype = @import("../../dtype.zig");
-const log = @import("../../log.zig");
-const progress_mod = @import("../../progress.zig");
-const runtime_blocks = @import("../runtime_blocks.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
+const runtime_blocks = @import("models_pkg").runtime_blocks;
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
-const st_loader = @import("../../io/safetensors/root.zig");
-const model_types = @import("../op_types.zig");
+const st_loader = @import("io_pkg").safetensors.root;
+const model_types = @import("models_pkg").op_types;
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
 

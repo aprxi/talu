@@ -15,7 +15,7 @@
 //! parsing. All format conversion logic lives in the protocol module.
 
 const std = @import("std");
-const io = @import("../../io/root.zig");
+const io = @import("io_pkg");
 const responses_mod = @import("../../responses/root.zig");
 const Conversation = responses_mod.Conversation;
 const ContentType = responses_mod.ContentType;

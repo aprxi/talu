@@ -4,15 +4,15 @@
 //! runtime code so backend vision execution stays model-agnostic.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
+const tensor = @import("tensor_pkg");
 const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
 const registry = @import("registry.zig");
-const st_writer = @import("../io/safetensors/writer.zig");
+const st_writer = @import("io_pkg").safetensors.writer;
 const generic_weights = @import("load/generic_weights.zig");
 const weights = @import("load/weights.zig");
 
-pub const SafeTensors = @import("../io/safetensors/root.zig").UnifiedSafeTensors;
+pub const SafeTensors = @import("io_pkg").safetensors.root.UnifiedSafeTensors;
 pub const LoadedModel = weights.LoadedModel;
 pub const VisionMetadata = op_types.VisionMetadata;
 const Allocator = std.mem.Allocator;

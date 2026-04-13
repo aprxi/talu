@@ -14,7 +14,7 @@
 //!   5. Embedding backward → grad_token_embedding
 
 const std = @import("std");
-const compute = @import("../compute/root.zig");
+const compute = @import("compute_pkg");
 const model_config = @import("model_config.zig");
 const model_weights_mod = @import("model_weights.zig");
 const activations_mod = @import("activations.zig");

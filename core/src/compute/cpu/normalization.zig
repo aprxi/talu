@@ -1,7 +1,7 @@
 //! Normalization primitives for CPU compute path.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const math_ops = @import("math.zig");
 const tv = @import("tensor_view.zig");
 const norm_view = @import("norm_primitives.zig");

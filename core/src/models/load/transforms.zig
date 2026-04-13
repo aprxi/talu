@@ -3,11 +3,11 @@
 //! Shared routines for orienting weights, dequantizing, and fusing projections.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const dtype = @import("../../dtype.zig");
-const st_loader = @import("../../io/safetensors/root.zig");
-const log = @import("../../log.zig");
-const op_types = @import("../op_types.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const st_loader = @import("io_pkg").safetensors.root;
+const log = @import("log_pkg");
+const op_types = @import("models_pkg").op_types;
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
@@ -2322,7 +2322,7 @@ test "convertToF32 returns error for empty tensor" {
 
 test "orientWeight transposes f32 weight when needed" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2365,7 +2365,7 @@ test "orientWeight transposes f32 weight when needed" {
 
 test "orientWeight returns untransposed when rows equals expected_in" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight_notr";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2402,7 +2402,7 @@ test "orientWeight returns untransposed when rows equals expected_in" {
 
 test "orientWeight detects MXFP8 scales from weight_scale suffix" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight_mxfp8_weight_scale";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2440,7 +2440,7 @@ test "orientWeight detects MXFP8 scales from weight_scale suffix" {
 
 test "orientWeight dequantizes NVFP4 packed weights to BF16" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight_nvfp4";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2649,7 +2649,7 @@ test "buildGatedDeltaSplitInProj preserves NVFP4 dequantized values across globa
 
 test "orientEmbedding keeps f16 embedding dtype" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_embed";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2693,7 +2693,7 @@ test "orientEmbedding keeps f16 embedding dtype" {
 
 test "orientEmbedding passes through f32 embedding unchanged" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_embed_f32";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2727,7 +2727,7 @@ test "orientEmbedding passes through f32 embedding unchanged" {
 
 test "orientEmbedding dequantizes NVFP4 packed embedding to BF16" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_embed_nvfp4";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};

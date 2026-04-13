@@ -1,8 +1,8 @@
 //! C API for file/image inspect + image decode/convert/encode/model input.
 
 const std = @import("std");
-const image = @import("../image/root.zig");
-const exif = @import("../image/exif.zig");
+const image = @import("image_pkg");
+const exif = @import("image_pkg").exif;
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 
@@ -961,7 +961,7 @@ pub export fn talu_pdf_render_page(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }
 
-    const codecs = @import("../image/codecs/root.zig");
+    const codecs = @import("image_pkg").codecs;
     const rendered = codecs.pdf.renderPage(
         allocator,
         bytes.?[0..bytes_len],
@@ -996,7 +996,7 @@ pub export fn talu_pdf_page_count(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }
 
-    const codecs = @import("../image/codecs/root.zig");
+    const codecs = @import("image_pkg").codecs;
     const count = codecs.pdf.pageCount(bytes.?[0..bytes_len]) catch |err| {
         capi_error.setError(err, "PDF page count failed: {s}", .{@errorName(err)});
         return @intFromEnum(error_codes.errorToCode(err));

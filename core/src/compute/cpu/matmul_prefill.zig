@@ -6,11 +6,11 @@
 //! L1 across every row — matching BF16's tiling pattern exactly.
 
 const std = @import("std");
-const parallel = @import("../../system/parallel.zig");
+const parallel = @import("compute_pkg").parallel;
 const matmul = @import("matmul_primitives.zig");
 const simd = @import("simd/arch/root.zig");
 const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
-const dtype_mod = @import("../../dtype.zig");
+const dtype_mod = @import("dtype_pkg");
 const DType = dtype_mod.DType;
 const fp16ToF32 = dtype_mod.fp16ToF32;
 const bf16ToF32 = dtype_mod.bf16ToF32;

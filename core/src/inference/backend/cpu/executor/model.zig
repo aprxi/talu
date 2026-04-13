@@ -5,26 +5,26 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const log = @import("../../../../log.zig");
-const models = @import("../../../../models/root.zig");
+const log = @import("log_pkg");
+const models = @import("models_pkg");
 const Block = @import("block.zig").Block;
-const layer_ops = @import("../../../../models/layer_ops.zig");
-const tensor_mod = @import("../../../../tensor.zig");
-const dtype_mod = @import("../../../../dtype.zig");
-const st_loader = @import("../../../../io/safetensors/root.zig");
-const compute = @import("../../../../compute/root.zig");
+const layer_ops = @import("models_pkg").layer_ops;
+const tensor_mod = @import("tensor_pkg");
+const dtype_mod = @import("dtype_pkg");
+const st_loader = @import("io_pkg").safetensors.root;
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_memory = compute.cpu.memory;
 const cpu_activation = compute.cpu.activation;
-const inspect = @import("../../../../xray/root.zig");
+const inspect = @import("xray_pkg");
 const kernel_info = inspect.kernel_info;
 const perf_estimate = inspect.perf_estimate;
-const trace = @import("../../../../xray/trace.zig");
-const runtime_contract = @import("../../../runtime_contract/root.zig");
+const trace = @import("xray_pkg").trace;
+const runtime_contract = @import("runtime_contract_pkg");
 const state_bindings = @import("../state_bindings.zig");
-const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
+const dump = if (build_options.dump_tensors) @import("xray_pkg").dump.capture else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
 const embedding_kernel = @import("../kernels/embedding.zig");

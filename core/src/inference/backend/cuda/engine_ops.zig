@@ -5,10 +5,10 @@
 //! Functions use `self: anytype` to avoid circular imports with engine.zig.
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
-const tensor = @import("../../../tensor.zig");
-const dtype = @import("../../../dtype.zig");
-const log = @import("../../../log.zig");
+const compute = @import("compute_pkg");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const log = @import("log_pkg");
 
 // --- Shared types from engine_types.zig ---
 const engine_types = @import("engine_types.zig");
@@ -22,7 +22,7 @@ const enable_dispatch_observability = engine_types.enable_dispatch_observability
 const bufferF32RowCount = engine_types.bufferF32RowCount;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 
-const models = @import("../../../models/root.zig");
+const models = @import("models_pkg");
 const layer_ops = models.layer_ops;
 
 // --- Utility functions from engine_weights.zig ---

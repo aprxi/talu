@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const loader = @import("loader.zig");
-const progress_mod = @import("../progress.zig");
+const progress_mod = @import("progress_pkg");
 
 pub const registry = @import("registry.zig");
 pub const layer_ops = @import("layer_ops.zig");
@@ -18,6 +18,9 @@ pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");
 pub const plan = @import("plan/root.zig");
 pub const config = @import("config/root.zig");
+pub const load = struct {
+    pub const transforms = @import("load/transforms.zig");
+};
 pub const common = struct {
     pub const types = @import("common/types.zig");
 };

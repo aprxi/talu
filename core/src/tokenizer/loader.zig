@@ -12,7 +12,7 @@ const unigram_model = @import("unigram.zig");
 const utils = @import("utils.zig");
 const ct = @import("c_types.zig");
 const tok_fns = @import("pipeline.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 const PATTERN_GPT2: [:0]const u8 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
 const PATTERN_BERT: [:0]const u8 = "[A-Za-z0-9]+|[^A-Za-z0-9\\s]+";

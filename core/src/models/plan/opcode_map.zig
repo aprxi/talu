@@ -1,8 +1,8 @@
 //! Single source of truth: mapping between model op metadata and runtime opcodes.
 
 const std = @import("std");
-const layer_ops = @import("../layer_ops.zig");
-const op_types = @import("../op_types.zig");
+const layer_ops = @import("models_pkg").layer_ops;
+const op_types = @import("models_pkg").op_types;
 const opcode_mod = @import("opcode.zig");
 
 pub const Opcode = opcode_mod.Opcode;

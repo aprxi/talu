@@ -6,7 +6,7 @@
 
 const engine_mod = @import("engine.zig");
 const contract = @import("../contract.zig");
-const compute = @import("../../../compute/root.zig");
+const compute = @import("compute_pkg");
 
 pub const BackendType = engine_mod.CudaBackend;
 pub const CudaBackend = engine_mod.CudaBackend;

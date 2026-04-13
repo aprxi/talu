@@ -9,7 +9,7 @@ const ct = @import("c_types.zig");
 const utils = @import("utils.zig");
 const types = @import("types.zig");
 const strings = @import("strings.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 const c = @cImport({
     @cDefine("PCRE2_CODE_UNIT_WIDTH", "8");

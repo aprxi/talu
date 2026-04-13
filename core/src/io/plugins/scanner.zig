@@ -6,7 +6,7 @@
 //! NOT thread-safe. Caller must synchronize access.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 
 pub const ScanError = error{
     OutOfMemory,

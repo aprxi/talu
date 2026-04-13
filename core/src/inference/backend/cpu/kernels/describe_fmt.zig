@@ -5,8 +5,8 @@
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
-const inspect = @import("../../../../xray/root.zig");
+const tensor = @import("tensor_pkg");
+const inspect = @import("xray_pkg");
 
 pub const Tensor = tensor.Tensor;
 pub const KernelOp = inspect.kernel_info.KernelOp;
@@ -68,7 +68,7 @@ fn formatSeqMatmulOp(
     indent: usize,
     in_features: usize,
     out_features: usize,
-    dtype: @import("../../../../dtype.zig").DType,
+    dtype: @import("dtype_pkg").DType,
 ) !void {
     const matmul_op = KernelOp{ .matmul = .{
         .m = .seq,

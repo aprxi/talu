@@ -6,10 +6,10 @@
 
 const std = @import("std");
 const grouped_affine = @import("grouped_affine.zig");
-const json = @import("../io/json/root.zig");
-const safetensors = @import("../io/safetensors/root.zig");
-const tensor = @import("../tensor.zig");
-const dtype = @import("../dtype.zig");
+const json = @import("io_pkg").json;
+const safetensors = @import("io_pkg").safetensors.root;
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
 
 const grouped_affine_group_size: usize = 32;
 const nvfp4_group_size: usize = 16;

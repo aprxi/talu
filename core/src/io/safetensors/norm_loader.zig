@@ -5,8 +5,8 @@
 
 const std = @import("std");
 
-const tensor = @import("../../tensor.zig");
-const dtype = @import("../../dtype.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
 const st_loader = @import("root.zig");
 const st_names = @import("names.zig");
 

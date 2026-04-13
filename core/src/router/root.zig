@@ -124,7 +124,7 @@
 //! ```
 
 const std = @import("std");
-const progress_mod = @import("../capi/progress.zig");
+const progress_mod = @import("progress_pkg");
 
 pub const local = @import("local.zig");
 pub const capi_bridge = @import("capi_bridge.zig");
@@ -136,7 +136,7 @@ pub const protocol = @import("protocol/root.zig");
 pub const tool_schema = @import("tool_schema.zig");
 pub const commit = @import("commit.zig");
 pub const batch = @import("batch.zig");
-const inference_mod = @import("../inference/root.zig");
+const inference_bridge = @import("inference_bridge.zig");
 
 // Model specification exports (from spec.zig)
 pub const CanonicalSpec = spec.CanonicalSpec;
@@ -193,9 +193,9 @@ pub const ParsedToolCall = tool_schema.ParsedToolCall;
 pub const ToolSchemaError = tool_schema.ToolSchemaError;
 
 // Inference types (for LocalEngine.run)
-pub const InferenceConfig = inference_mod.types.InferenceConfig;
-pub const InferenceState = inference_mod.types.InferenceState;
-pub const FinishReason = inference_mod.types.FinishReason;
+pub const InferenceConfig = inference_bridge.types.InferenceConfig;
+pub const InferenceState = inference_bridge.types.InferenceState;
+pub const FinishReason = inference_bridge.types.FinishReason;
 
 // Scheduler exports (continuous batching via LocalEngine.createScheduler)
 pub const Scheduler = local.Scheduler;
@@ -405,7 +405,7 @@ pub fn getOrCreateEngineWithBackendConfig(
         42,
         config,
         backend_init_options,
-        progress_mod.ProgressContext.NONE,
+        progress_mod.Context.NONE,
     );
 
     // Cache with copied key

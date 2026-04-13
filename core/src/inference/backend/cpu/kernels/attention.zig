@@ -8,8 +8,8 @@ pub const supported = true;
 
 const std = @import("std");
 const build_options = @import("build_options");
-const tensor = @import("../../../../tensor.zig");
-const compute = @import("../../../../compute/root.zig");
+const tensor = @import("tensor_pkg");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const flash_attention = compute.cpu.simd.flash_attention;
 const cpu_sdpa = compute.cpu.sdpa_rowwise;
@@ -21,14 +21,14 @@ const cpu_norm = compute.cpu.normalization;
 const cpu_reduction = compute.cpu.reduction;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_softmax = compute.cpu.softmax;
-const parallel = @import("../../../../system/parallel.zig");
+const parallel = @import("compute_pkg").parallel;
 const rope_kernel = @import("rope.zig");
 const kv_cache_module = @import("kv_cache.zig");
 const QuantMode = kv_cache_module.QuantMode;
 const fmt = @import("describe_fmt.zig");
-const inspect = @import("../../../../xray/root.zig");
+const inspect = @import("xray_pkg");
 const trace = inspect.trace;
-const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
+const dump = if (build_options.dump_tensors) @import("xray_pkg").dump.capture else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
 

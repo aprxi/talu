@@ -9,15 +9,15 @@
 //! execution plan, not by model family.
 
 const std = @import("std");
-const compute = @import("../../../../compute/root.zig");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_activation = compute.cpu.activation;
 const cpu_common = compute.cpu.common;
-const tensor_mod = @import("../../../../tensor.zig");
-const dtype_mod = @import("../../../../dtype.zig");
+const tensor_mod = @import("tensor_pkg");
+const dtype_mod = @import("dtype_pkg");
 const norm_kernel = @import("norm.zig");
-const trace = @import("../../../../xray/trace.zig");
+const trace = @import("xray_pkg").trace;
 
 const Tensor = tensor_mod.Tensor;
 const RMSNorm = norm_kernel.RMSNorm;

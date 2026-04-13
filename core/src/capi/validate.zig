@@ -17,7 +17,7 @@
 //!    - Use with talu_set_response_format_handle for optimal performance
 
 const std = @import("std");
-const validate_mod = @import("../validate/root.zig");
+const validate_mod = @import("validate_pkg");
 const sampler_mod = validate_mod.sampler;
 const mask_mod = validate_mod.mask;
 const cache_mod = validate_mod.cache;
@@ -26,7 +26,7 @@ const ffi = @import("../helpers/ffi.zig");
 const tokenizer_capi = @import("tokenizer.zig");
 const responses_capi = @import("responses.zig");
 const responses_mod = @import("../responses/root.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 

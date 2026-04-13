@@ -4,13 +4,13 @@
 //! Handles attention, FFN, and residual connections for each layer.
 
 const std = @import("std");
-const layer_ops = @import("../../../../models/layer_ops.zig");
-const plan_compiler = @import("../../../../models/plan/compiler.zig");
-const tensor = @import("../../../../tensor.zig");
-const compute = @import("../../../../compute/root.zig");
-const error_context = @import("../../../../error_context.zig");
-const log = @import("../../../../log.zig");
-const runtime_contract = @import("../../../runtime_contract/root.zig");
+const layer_ops = @import("models_pkg").layer_ops;
+const plan_compiler = @import("models_pkg").plan.compiler;
+const tensor = @import("tensor_pkg");
+const compute = @import("compute_pkg");
+const error_context = @import("error_context_pkg");
+const log = @import("log_pkg");
+const runtime_contract = @import("runtime_contract_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const tv = compute.cpu.tensor_view;
 const activation_ops = compute.cpu.activation_view;
@@ -34,7 +34,7 @@ const gated_delta_kernel = @import("../kernels/gated_delta.zig");
 const shortconv_kernel = @import("../kernels/shortconv.zig");
 const vision_adapters = @import("../../../vision_program_adapters.zig");
 const state_bindings = @import("../state_bindings.zig");
-const trace = @import("../../../../xray/root.zig").trace;
+const trace = @import("xray_pkg").trace;
 
 const Tensor = tensor.Tensor;
 const Attention = attn_kernel.MultiHeadAttention;

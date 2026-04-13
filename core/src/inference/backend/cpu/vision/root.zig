@@ -7,8 +7,8 @@
 //! Selection is signature-based (tensor layout), not model-family based.
 
 const std = @import("std");
-const models = @import("../../../../models/root.zig");
-const log = @import("../../../../log.zig");
+const models = @import("models_pkg");
+const log = @import("log_pkg");
 const common_vision = @import("types.zig");
 
 const fused_qkv_runtime = @import("fused_qkv.zig");

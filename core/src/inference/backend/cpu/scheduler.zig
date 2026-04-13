@@ -34,12 +34,11 @@ const FusedCpuBackend = cpu_engine.FusedCpuBackend;
 const DecodeRequest = contract.DecodeRequest;
 const DecodeResult = contract.DecodeResult;
 const sampling = @import("sampling.zig");
-const log = @import("../../../log.zig");
-const validate = @import("../../../validate/root.zig");
-const tokenizer_mod = @import("../../../tokenizer/root.zig");
-const runtime_contract = @import("../../runtime_contract/root.zig");
-const trace = @import("../../../xray/trace.zig");
-const xray = @import("../../../xray/root.zig");
+const log = @import("log_pkg");
+const validate = @import("validate_pkg");
+const runtime_contract = @import("runtime_contract_pkg");
+const trace = @import("xray_pkg").trace;
+const xray = @import("xray_pkg");
 
 fn generationShouldStop(stop_flag: ?*const std.atomic.Value(bool)) bool {
     if (stop_flag) |flag| {
@@ -170,6 +169,60 @@ pub const TokenEvent = struct {
     timestamp_ns: i128 = 0,
 };
 
+/// Tokenizer view used by grammar-constrained sampling without binding the
+/// scheduler to a concrete tokenizer module type.
+pub const TokenizerView = struct {
+    context: ?*const anyopaque,
+    token_bytes_fn: *const fn (?*const anyopaque, usize) ?[]const u8,
+    vocab_size_fn: *const fn (?*const anyopaque) usize,
+
+    pub fn tokenBytes(self: *const TokenizerView, token_id: usize) ?[]const u8 {
+        return self.token_bytes_fn(self.context, token_id);
+    }
+
+    pub fn getVocabSize(self: *const TokenizerView) usize {
+        return self.vocab_size_fn(self.context);
+    }
+
+    pub fn fromTokenizer(tokenizer_ptr: anytype) TokenizerView {
+        const Ptr = @TypeOf(tokenizer_ptr);
+        const ptr_info = @typeInfo(Ptr);
+        if (ptr_info != .pointer) {
+            @compileError("TokenizerView.fromTokenizer expects a pointer");
+        }
+        const TokenizerType = ptr_info.pointer.child;
+
+        const token_bytes_fn = struct {
+            fn call(ctx: ?*const anyopaque, token_id: usize) ?[]const u8 {
+                const typed: *const TokenizerType = @ptrCast(@alignCast(ctx orelse return null));
+                return typed.tokenBytes(token_id);
+            }
+        }.call;
+
+        const vocab_size_fn = struct {
+            fn call(ctx: ?*const anyopaque) usize {
+                const typed: *const TokenizerType = @ptrCast(@alignCast(ctx orelse return 0));
+                if (@hasDecl(TokenizerType, "getVocabSize")) {
+                    return typed.getVocabSize();
+                }
+                if (@hasField(TokenizerType, "vocab_size")) {
+                    return typed.vocab_size;
+                }
+                if (@hasField(TokenizerType, "tokenizer_handle")) {
+                    return typed.tokenizer_handle.getVocabSize();
+                }
+                @compileError("Tokenizer type must provide getVocabSize(), vocab_size, or tokenizer_handle.getVocabSize()");
+            }
+        }.call;
+
+        return .{
+            .context = @ptrCast(tokenizer_ptr),
+            .token_bytes_fn = token_bytes_fn,
+            .vocab_size_fn = vocab_size_fn,
+        };
+    }
+};
+
 /// Scheduler configuration.
 pub const SchedulerConfig = struct {
     /// Maximum concurrent requests (limited by backend's max_batch_size)
@@ -181,7 +234,7 @@ pub const SchedulerConfig = struct {
     /// Enable priority scheduling (otherwise FIFO)
     priority_scheduling: bool = false,
     /// Optional tokenizer for grammar-constrained sampling.
-    tokenizer: ?*tokenizer_mod.Tokenizer = null,
+    tokenizer: ?TokenizerView = null,
     /// Plan-owned state descriptor contract for scheduler allocation.
     state_descriptors: []const runtime_contract.StateDescriptor = &.{},
 };

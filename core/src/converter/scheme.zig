@@ -9,11 +9,11 @@ const grouped_affine = @import("grouped_affine.zig");
 const fp8_converter = @import("fp8.zig");
 const mxfp8_converter = @import("mxfp8.zig");
 const nvfp4_converter = @import("nvfp4.zig");
-const progress_api = @import("../capi/progress.zig");
-const json = @import("../io/json/root.zig");
-const safetensors = @import("../io/safetensors/root.zig");
-const repository = @import("../io/repository/root.zig");
-const log = @import("../log.zig");
+const progress_api = @import("progress_pkg");
+const json = @import("io_pkg").json;
+const safetensors = @import("io_pkg").safetensors.root;
+const repository = @import("io_pkg").repository.root;
+const log = @import("log_pkg");
 
 // =============================================================================
 // Scheme Definitions (Single Source of Truth)
@@ -411,10 +411,10 @@ pub const Method = enum {
 // =============================================================================
 
 /// Re-export unified progress types for converter use.
-pub const CProgressCallback = progress_api.CProgressCallback;
+pub const CProgressCallback = progress_api.Callback;
 pub const ProgressUpdate = progress_api.ProgressUpdate;
 pub const ProgressAction = progress_api.ProgressAction;
-pub const ProgressContext = progress_api.ProgressContext;
+pub const ProgressContext = progress_api.Context;
 
 // =============================================================================
 // Override Rules

@@ -8,12 +8,12 @@
 //! `self: anytype` to avoid importing engine.zig (same pattern as decode.zig).
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
-const tensor = @import("../../../tensor.zig");
-const dtype = @import("../../../dtype.zig");
-const log = @import("../../../log.zig");
-const load_transforms = @import("../../../models/load/transforms.zig");
-const models = @import("../../../models/root.zig");
+const compute = @import("compute_pkg");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const log = @import("log_pkg");
+const load_transforms = @import("models_pkg").load.transforms;
+const models = @import("models_pkg");
 const GateUpLayout = models.runtime_blocks.GateUpLayout;
 
 const LoadedModel = models.LoadedModel;

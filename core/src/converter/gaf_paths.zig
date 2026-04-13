@@ -4,8 +4,8 @@
 //! This module handles directory structure and config format generation.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
-const io = @import("../io/root.zig");
+const tensor = @import("tensor_pkg");
+const io = @import("io_pkg");
 
 const ModelConfig = tensor.ModelConfig;
 

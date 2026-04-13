@@ -41,8 +41,8 @@ const std = @import("std");
 const capi_types = @import("../capi/types.zig");
 const local_mod = @import("local.zig");
 const http_engine_mod = @import("http_engine.zig");
-const repository_scheme = @import("../io/repository/scheme.zig");
-const progress_mod = @import("../capi/progress.zig");
+const repository_scheme = @import("io_pkg").repository.scheme;
+const progress_mod = @import("progress_pkg");
 
 pub const HttpEngine = http_engine_mod.HttpEngine;
 
@@ -440,7 +440,7 @@ pub fn getCapabilities(
 pub fn createInferenceBackend(
     allocator: std.mem.Allocator,
     canon: *const CanonicalSpec,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) !InferenceBackend {
     switch (canon.backend_type) {
         .Local => {

@@ -12,4 +12,4 @@ pub const TokenEvent = cpu_scheduler.TokenEvent;
 pub const Request = cpu_scheduler.Request;
 pub const FinishReason = cpu_scheduler.FinishReason;
 pub const GenericScheduler = cpu_scheduler.GenericScheduler;
-
+pub const TokenizerView = cpu_scheduler.TokenizerView;

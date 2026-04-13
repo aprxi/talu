@@ -31,6 +31,22 @@ fn isModelsPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/models/");
 }
 
+fn isRouterPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/src/router/");
+}
+
+fn isRouterInferenceBridgePath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/router/inference_bridge.zig");
+}
+
+fn isConverterPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/src/converter/");
+}
+
+fn isConverterInferenceBoundaryPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/converter/calibration_capture.zig");
+}
+
 fn isModelsGenericLoaderPath(path: []const u8) bool {
     return std.mem.eql(u8, path, "core/src/models/load/weights.zig") or
         std.mem.eql(u8, path, "core/src/models/load/generic_weights.zig");
@@ -42,6 +58,11 @@ fn isCpuVisionSelectorPath(path: []const u8) bool {
 
 fn importTargetsCompute(target: []const u8) bool {
     return std.mem.indexOf(u8, target, "compute/") != null;
+}
+
+fn importTargetsInference(target: []const u8) bool {
+    return std.mem.indexOf(u8, target, "inference/") != null or
+        std.mem.eql(u8, target, "inference_pkg");
 }
 
 fn isComputeRootImport(target: []const u8) bool {
@@ -131,6 +152,20 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
             violations += 1;
             if (emit) {
                 std.debug.print("{s}:{d}: inference must import compute via compute/root.zig only: \"{s}\"\n", .{ file_path, line, target });
+            }
+        }
+
+        if (isRouterPath(file_path) and !isRouterInferenceBridgePath(file_path) and importTargetsInference(target)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}:{d}: router must import inference only via router/inference_bridge.zig: \"{s}\"\n", .{ file_path, line, target });
+            }
+        }
+
+        if (isConverterPath(file_path) and !isConverterInferenceBoundaryPath(file_path) and importTargetsInference(target)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}:{d}: converter must import inference only via converter/calibration_capture.zig: \"{s}\"\n", .{ file_path, line, target });
             }
         }
 
@@ -489,6 +524,46 @@ test "lintSource rejects models importing inference internals" {
     try std.testing.expectEqual(
         @as(usize, 1),
         try lintSource(std.testing.allocator, "core/src/models/registry.zig", src, false),
+    );
+}
+
+test "lintSource rejects router direct inference import" {
+    const src =
+        \\const bad = @import("../inference/root.zig");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/router/local.zig", src, false),
+    );
+}
+
+test "lintSource allows router inference bridge import" {
+    const src =
+        \\const ok = @import("inference_bridge.zig");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/router/local.zig", src, false),
+    );
+}
+
+test "lintSource rejects converter direct inference import" {
+    const src =
+        \\const bad = @import("../inference/calibration_capture.zig");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/converter/mxfp8.zig", src, false),
+    );
+}
+
+test "lintSource allows converter inference boundary import" {
+    const src =
+        \\const ok = @import("inference_pkg");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/converter/calibration_capture.zig", src, false),
     );
 }
 

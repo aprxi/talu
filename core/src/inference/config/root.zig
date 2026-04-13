@@ -2,7 +2,7 @@
 //!
 //! Owns generation-time configuration parsing used by router/session/tokenizer.
 
-const generation = @import("generation.zig");
+const generation = @import("../../config/generation.zig");
 
 pub const GenerationConfig = generation.GenerationConfig;
 pub const loadGenerationConfig = generation.loadGenerationConfig;

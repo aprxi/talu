@@ -4,9 +4,9 @@
 //! with Mixture-of-Experts in the FFN path (256 routed experts + shared expert).
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const layer_ops = @import("../layer_ops.zig");
-const types = @import("../op_types.zig");
+const tensor = @import("tensor_pkg");
+const layer_ops = @import("models_pkg").layer_ops;
+const types = @import("models_pkg").op_types;
 const config_hooks = @import("../config/hook_utils.zig");
 const perf = @import("../perf_hints.zig");
 const sp = @import("../sampling_presets.zig");

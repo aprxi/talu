@@ -16,8 +16,8 @@
 //! are accumulated across query heads.
 
 const std = @import("std");
-const compute = @import("../../compute/root.zig");
-const parallel = @import("../../system/parallel.zig");
+const compute = @import("compute_pkg");
+const parallel = @import("compute_pkg").parallel;
 
 const simd = compute.cpu.simd.arch;
 const VEC = simd.f32_vec_len;

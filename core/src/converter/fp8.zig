@@ -4,19 +4,19 @@
 //! scaling and exports in HuggingFace-compatible SafeTensors format.
 
 const std = @import("std");
-const log = @import("../log.zig");
-const tensor = @import("../tensor.zig");
-const dtype_mod = @import("../dtype.zig");
-const safetensors = @import("../io/safetensors/root.zig");
-const repository = @import("../io/repository/root.zig");
+const log = @import("log_pkg");
+const tensor = @import("tensor_pkg");
+const dtype_mod = @import("dtype_pkg");
+const safetensors = @import("io_pkg").safetensors.root;
+const repository = @import("io_pkg").repository.root;
 const gaf_paths = @import("gaf_paths.zig");
-const config_loader = @import("../models/config/root.zig");
-const op_types = @import("../models/op_types.zig");
-const parallel = @import("../system/parallel.zig");
+const config_loader = @import("models_pkg").config;
+const op_types = @import("models_pkg").op_types;
+const parallel = @import("compute_pkg").parallel;
 const convert = @import("root.zig");
-const models_registry = @import("../models/registry.zig");
-const load_transforms = @import("../models/load/transforms.zig");
-const json = @import("../io/json/root.zig");
+const models_registry = @import("models_pkg").registry;
+const load_transforms = @import("models_pkg").load.transforms;
+const json = @import("io_pkg").json;
 
 const Tensor = tensor.Tensor;
 const DType = dtype_mod.DType;

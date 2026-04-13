@@ -8,24 +8,24 @@
 //! containers (`TransformerBlock`) that the engine references.
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
-const dtype = @import("../../../../dtype.zig");
-const compute = @import("../../../../compute/root.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_copy = compute.cpu.memory.copy;
 const cpu_layout = compute.cpu.layout;
 const cpu_common = compute.cpu.common;
-const layer_ops = @import("../../../../models/layer_ops.zig");
+const layer_ops = @import("models_pkg").layer_ops;
 const fmt = @import("../kernels/describe_fmt.zig");
 const runtime_mod = @import("runtime.zig");
-const inspect = @import("../../../../xray/root.zig");
+const inspect = @import("xray_pkg");
 const trace = inspect.trace;
-const log = @import("../../../../log.zig");
-const progress_mod = @import("../../../../progress.zig");
-const runtime_blocks = @import("../../../../models/runtime_blocks.zig");
-const topology = @import("../../../../models/op_types.zig");
-const models_registry = @import("../../../../models/registry.zig");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
+const runtime_blocks = @import("models_pkg").runtime_blocks;
+const topology = @import("models_pkg").op_types;
+const models_registry = @import("models_pkg").registry;
 
 pub const BufferId = layer_ops.BufferId;
 

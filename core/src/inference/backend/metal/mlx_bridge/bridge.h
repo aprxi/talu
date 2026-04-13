@@ -158,6 +158,7 @@ int32_t mlx_decode_topk_stream(
 void mlx_tokens_free(int32_t* ids);
 
 const char* mlx_last_error(void);
+const char* mlx_runtime_binary_dir(void);
 
 int32_t mlx_test_grouped_affine_moe_gpu_path(void);
 int32_t mlx_test_depthwise_conv_decode_step(void);

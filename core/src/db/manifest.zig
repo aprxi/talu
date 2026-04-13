@@ -3,7 +3,7 @@
 //! The manifest is the root of trust for immutable segments on disk.
 
 const std = @import("std");
-const json = @import("../io/json/root.zig");
+const json = @import("io_pkg").json;
 const checksum = @import("checksum.zig");
 
 const Allocator = std.mem.Allocator;
