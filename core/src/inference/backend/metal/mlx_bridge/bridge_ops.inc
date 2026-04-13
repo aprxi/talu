@@ -35,7 +35,10 @@ array linear_decode_maybe_quantized(
         if (!q_path_active || !quant_compare_enabled()) return false;
         if (rhs.size() <= 1 || rhs.ndim() < 2) return false;
         const int target_layer = quant_compare_layer();
-        if (layer_idx >= 0 && target_layer >= 0 && layer_idx != target_layer) return false;
+        if (target_layer >= 0) {
+            if (layer_idx < 0) return false;
+            if (layer_idx != target_layer) return false;
+        }
         const std::string target_op = quant_compare_op();
         if (target_op.empty()) return true;
         if (op_tag == nullptr) return false;
@@ -87,8 +90,6 @@ array linear_decode_maybe_quantized(
             !affine_ready &&
             q_w.dtype() == uint32 &&
             q_scales.dtype() == uint8 &&
-            q_biases.size() == 1 &&
-            q_biases.dtype() == float32 &&
             quant_group_size == 16 &&
             quant_bits == 4;
         if (affine_ready) {
@@ -106,21 +107,16 @@ array linear_decode_maybe_quantized(
             return out;
         }
         if (nvfp4_ready) {
-            const bool reshape_back = x.ndim() == 3;
-            const int batch = x.shape(0);
-            const int seq = reshape_back ? x.shape(1) : 1;
-            const array x2d = reshape_back ? reshape(x, {batch * seq, x.shape(2)}) : x;
-            const array out2d = qqmm(
-                x2d,
+            const array out = quantized_matmul(
+                x,
                 q_w,
-                std::optional<array>(q_scales),
+                q_scales,
+                std::nullopt,
+                true,
                 quant_group_size,
                 quant_bits,
-                "nvfp4",
-                std::optional<array>(nvfp4_unit_global_scale()),
-                std::optional<array>(q_biases)
+                "nvfp4"
             );
-            const array out = reshape_back ? reshape(out2d, {batch, seq, out2d.shape(1)}) : out2d;
             if (should_compare_quant(true)) emit_quant_compare(out);
             return out;
         }

@@ -89,6 +89,8 @@ array maybe_dequantize_fp8_weight(
     const std::string block_scale_key = base + ".weight_block_scale";
     const std::string weight_scale_key = base + ".weight_scale";
     const bool has_nvfp4_packed = tensors.find(base + ".weight_packed") != tensors.end();
+    const bool has_nvfp4_modelopt = tensors.find(base + ".weight_scale_2") != tensors.end();
+    const bool has_nvfp4 = has_nvfp4_packed || has_nvfp4_modelopt;
     const bool has_grouped_affine_scales = tensors.find(base + ".scales") != tensors.end();
     const bool has_grouped_affine_biases =
         tensors.find(base + ".biases") != tensors.end() ||
@@ -97,7 +99,7 @@ array maybe_dequantize_fp8_weight(
     auto scale_inv_it = tensors.find(scale_inv_key);
     auto block_scale_it = tensors.find(block_scale_key);
     if (block_scale_it == tensors.end() &&
-        !has_nvfp4_packed &&
+        !has_nvfp4 &&
         !(has_grouped_affine_scales && has_grouped_affine_biases)) {
         block_scale_it = tensors.find(weight_scale_key);
     }
@@ -189,8 +191,13 @@ bool has_nvfp4_metadata_for_key(
 ) {
     if (!ends_with(weight_key, ".weight")) return false;
     const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
-    return tensors.find(base + ".weight_packed") != tensors.end() &&
-        tensors.find(base + ".weight_scale") != tensors.end();
+    const bool has_scale = tensors.find(base + ".weight_scale") != tensors.end();
+    if (!has_scale) return false;
+    // compressed-tensors: .weight_packed + .weight_scale
+    if (tensors.find(base + ".weight_packed") != tensors.end()) return true;
+    // modelopt: .weight (U8) + .weight_scale + .weight_scale_2
+    if (tensors.find(base + ".weight_scale_2") != tensors.end()) return true;
+    return false;
 }
 
 const array& nvfp4_unit_global_scale() {
@@ -206,7 +213,10 @@ array dequantize_nvfp4_weight(
     const std::string& weight_key
 ) {
     const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
-    const array packed_u8 = astype(require_tensor(tensors, base + ".weight_packed"), uint8);
+    // compressed-tensors: packed data in .weight_packed; modelopt: in .weight
+    const bool use_packed_key = has_tensor(tensors, base + ".weight_packed");
+    const std::string packed_key = use_packed_key ? (base + ".weight_packed") : weight_key;
+    const array packed_u8 = astype(require_tensor(tensors, packed_key), uint8);
     const array scales_f32 = astype(require_tensor(tensors, base + ".weight_scale"), float32);
     eval(packed_u8);
     eval(scales_f32);
@@ -229,9 +239,16 @@ array dequantize_nvfp4_weight(
 
     float global_scale = 1.0f;
     if (has_tensor(tensors, base + ".weight_global_scale")) {
+        // compressed-tensors: stored as 1/scale (divide directly)
         const array global_f32 = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
         eval(global_f32);
         if (global_f32.size() > 0) global_scale = global_f32.item<float>();
+    } else if (has_tensor(tensors, base + ".weight_scale_2")) {
+        // modelopt: stored as multiplier — invert for the division formula
+        const array gs2_f32 = astype(require_tensor(tensors, base + ".weight_scale_2"), float32);
+        eval(gs2_f32);
+        const float s2 = gs2_f32.item<float>();
+        if (s2 != 0.0f && std::isfinite(s2)) global_scale = 1.0f / s2;
     }
     if (global_scale == 0.0f) {
         throw std::runtime_error("invalid nvfp4 global scale for " + weight_key);
@@ -351,7 +368,10 @@ bool capture_native_nvfp4_quant(
     if (!ends_with(weight_key, ".weight")) return false;
 
     const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
-    const array packed_src = astype(require_tensor(tensors, base + ".weight_packed"), uint8);
+    // compressed-tensors: packed data in .weight_packed; modelopt: in .weight
+    const bool use_packed_key = has_tensor(tensors, base + ".weight_packed");
+    const std::string packed_key = use_packed_key ? (base + ".weight_packed") : weight_key;
+    const array packed_src = astype(require_tensor(tensors, packed_key), uint8);
     const array scale_src = view(require_tensor(tensors, base + ".weight_scale"), uint8);
     eval(packed_src);
     eval(scale_src);
@@ -364,14 +384,35 @@ bool capture_native_nvfp4_quant(
     if ((cols % 16) != 0) return false;
     if (scale_src.shape(0) != rows || scale_src.shape(1) != (cols / 16)) return false;
 
-    array global_scale = array(1.0f, float32);
+    // MLX's NVFP4 kernel: value = fp4_lut[nibble] * from_fp8(scale_u8).
+    // Fold the global_scale into the block scales so the kernel gets the
+    // effective scale directly. For compressed-tensors global_scale is a
+    // divisor; for modelopt weight_scale_2 is a multiplier.
+    float gs = 1.0f;
     if (has_tensor(tensors, base + ".weight_global_scale")) {
-        global_scale = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
+        const array gs_f32 = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
+        eval(gs_f32);
+        gs = gs_f32.item<float>();
+    } else if (has_tensor(tensors, base + ".weight_scale_2")) {
+        const array gs2_f32 = astype(require_tensor(tensors, base + ".weight_scale_2"), float32);
+        eval(gs2_f32);
+        const float s2 = gs2_f32.item<float>();
+        if (s2 != 0.0f && std::isfinite(s2)) gs = 1.0f / s2;
+    }
+    if (gs == 0.0f) return false;
+
+    // Adjust scales: effective = from_fp8(raw_scale) / global_scale → re-encode as FP8
+    array adjusted_scales = scale_src;
+    if (gs != 1.0f) {
+        array scales_f32 = astype(from_fp8(scale_src, float32), float32);
+        scales_f32 = divide(scales_f32, array(gs, float32));
+        adjusted_scales = view(to_fp8(scales_f32), uint8);
+        eval(adjusted_scales);
     }
 
     *out_q_w = stop_gradient(copy(reshape(view(packed_src, uint32), {rows, packed_byte_cols / 4})));
-    *out_q_scales = stop_gradient(copy(scale_src));
-    *out_q_biases = stop_gradient(copy(global_scale));
+    *out_q_scales = stop_gradient(copy(adjusted_scales));
+    *out_q_biases = array(0.0f);
     return true;
 }
 

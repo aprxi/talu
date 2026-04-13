@@ -41,6 +41,7 @@ struct BridgeModelConfig {
     float final_logit_softcapping = 0.0f;
     int quant_bits = 0;
     int quant_group_size = 0;
+    std::string quant_mode = "affine";
 
     bool tie_word_embeddings = true;
     bool use_layer_q_norm_head_dim = false;

@@ -103,9 +103,15 @@ bool has_grouped_affine_quant_metadata(const std::unordered_map<std::string, arr
 
 bool has_nvfp4_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
     for (const auto& kv : tensors) {
-        if (!ends_with(kv.first, ".weight_packed")) continue;
-        const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight_packed").size());
-        if (tensors.find(base + ".weight_scale") != tensors.end()) {
+        // compressed-tensors: .weight_packed + .weight_scale
+        if (ends_with(kv.first, ".weight_packed")) {
+            const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight_packed").size());
+            if (tensors.find(base + ".weight_scale") != tensors.end()) {
+                return true;
+            }
+        }
+        // modelopt: .weight_scale_2 is unique to NVFP4 modelopt format
+        if (ends_with(kv.first, ".weight_scale_2")) {
             return true;
         }
     }

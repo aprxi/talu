@@ -22,12 +22,14 @@ CompiledDecodeFn build_compiled_decode_core(mlx_ctx* ctx) {
     const float eps = ctx->cfg.rms_norm_eps;
     const int group_size = ctx->cfg.quant_group_size;
     const int bits = ctx->cfg.quant_bits;
+    const std::string qmode = ctx->cfg.quant_mode;
+    const bool qmode_affine = (qmode == "affine");
     const bool use_gelu = ctx->cfg.use_gelu;
     const bool use_v_norm = ctx->cfg.use_v_norm;
     const int global_head_dim = ctx->cfg.global_head_dim;
 
     return compile(
-        [ctx, num_layers, eps, group_size, bits, use_gelu, use_v_norm, global_head_dim](
+        [ctx, num_layers, eps, group_size, bits, qmode, qmode_affine, use_gelu, use_v_norm, global_head_dim](
             const std::vector<array>& inputs
         ) {
             array hidden = inputs[0];
@@ -49,7 +51,8 @@ CompiledDecodeFn build_compiled_decode_core(mlx_ctx* ctx) {
                 // --- QKV projection ---
                 const array qkv = lw.attn_qkv_has_q
                     ? quantized_matmul(x_norm, lw.attn_qkv_q_w, lw.attn_qkv_q_scales,
-                          std::optional<array>(lw.attn_qkv_q_biases), true, group_size, bits, "affine")
+                          qmode_affine ? std::optional<array>(lw.attn_qkv_q_biases) : std::nullopt,
+                          true, group_size, bits, qmode)
                     : matmul(x_norm, lw.attn_qkv_rhs);
                 const int q_w = lw.attn_q_proj_width;
                 const int k_w = lw.attn_k_proj_width;
@@ -120,7 +123,8 @@ CompiledDecodeFn build_compiled_decode_core(mlx_ctx* ctx) {
                 // --- O projection ---
                 const array o_out = lw.attn_o_has_q
                     ? quantized_matmul(attn_out, lw.attn_o_q_w, lw.attn_o_q_scales,
-                          std::optional<array>(lw.attn_o_q_biases), true, group_size, bits, "affine")
+                          qmode_affine ? std::optional<array>(lw.attn_o_q_biases) : std::nullopt,
+                          true, group_size, bits, qmode)
                     : matmul(attn_out, lw.attn_o_rhs);
 
                 // --- residual + post-attention norm ---
@@ -131,7 +135,8 @@ CompiledDecodeFn build_compiled_decode_core(mlx_ctx* ctx) {
                 // --- MLP: gate_up + silu/gelu + down ---
                 const array gate_up = lw.mlp_gate_up_has_q
                     ? quantized_matmul(mlp_in, lw.mlp_gate_up_q_w, lw.mlp_gate_up_q_scales,
-                          std::optional<array>(lw.mlp_gate_up_q_biases), true, group_size, bits, "affine")
+                          qmode_affine ? std::optional<array>(lw.mlp_gate_up_q_biases) : std::nullopt,
+                          true, group_size, bits, qmode)
                     : matmul(mlp_in, lw.mlp_gate_up_rhs);
                 const int gw = lw.mlp_gate_width;
                 const array mlp_gate = slice(gate_up, {0, 0, 0}, {1, 1, gw});
@@ -140,7 +145,8 @@ CompiledDecodeFn build_compiled_decode_core(mlx_ctx* ctx) {
 
                 const array down = lw.mlp_down_has_q
                     ? quantized_matmul(ff, lw.mlp_down_q_w, lw.mlp_down_q_scales,
-                          std::optional<array>(lw.mlp_down_q_biases), true, group_size, bits, "affine")
+                          qmode_affine ? std::optional<array>(lw.mlp_down_q_biases) : std::nullopt,
+                          true, group_size, bits, qmode)
                     : matmul(ff, lw.mlp_down_rhs);
 
                 hidden = h + down;
@@ -315,10 +321,11 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
         !lm_head_affine_ready &&
         ctx->lm_head_q_w.dtype() == uint32 &&
         ctx->lm_head_q_scales.dtype() == uint8 &&
-        ctx->lm_head_q_biases.size() == 1 &&
-        ctx->lm_head_q_biases.dtype() == float32 &&
         ctx->cfg.quant_group_size == 16 &&
-        ctx->cfg.quant_bits == 4;
+        ctx->cfg.quant_bits == 4 &&
+        ctx->lm_head_q_w.ndim() == 2 &&
+        ctx->lm_head_q_scales.ndim() == 2 &&
+        ctx->lm_head_q_scales.shape(1) == ctx->lm_head_q_w.shape(1) / 2;
     array logits = lm_head_q_ready
         ? (lm_head_affine_ready
               ? quantized_matmul(
@@ -332,18 +339,15 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                     "affine"
                 )
               : (lm_head_nvfp4_ready
-                    ? reshape(
-                          qqmm(
-                              reshape(lm_input, {lm_input.shape(0), lm_input.shape(2)}),
-                              ctx->lm_head_q_w,
-                              std::optional<array>(ctx->lm_head_q_scales),
-                              ctx->cfg.quant_group_size,
-                              ctx->cfg.quant_bits,
-                              "nvfp4",
-                              std::optional<array>(nvfp4_unit_global_scale()),
-                              std::optional<array>(ctx->lm_head_q_biases)
-                          ),
-                          {lm_input.shape(0), 1, ctx->lm_head_q_w.shape(0)}
+                    ? quantized_matmul(
+                          lm_input,
+                          ctx->lm_head_q_w,
+                          ctx->lm_head_q_scales,
+                          std::nullopt,
+                          true,
+                          ctx->cfg.quant_group_size,
+                          ctx->cfg.quant_bits,
+                          "nvfp4"
                       )
               : quantized_matmul(
                     lm_input,

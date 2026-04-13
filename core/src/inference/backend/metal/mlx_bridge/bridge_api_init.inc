@@ -99,6 +99,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             // Pure NVFP4 must stay on the native MLX NVFP4 path.
             ctx->cfg.quant_bits = 4;
             ctx->cfg.quant_group_size = 16;
+            ctx->cfg.quant_mode = "nvfp4";
         }
         ctx->has_grouped_affine_meta = has_grouped_affine_meta;
         // Decode-time QMM defaults on for quantized checkpoints:
@@ -381,6 +382,9 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             if (has_tensor(tensors, p + "post_feedforward_layernorm.weight")) {
                 lw.post_feedforward_layernorm_w = require_tensor(tensors, p + "post_feedforward_layernorm.weight");
             }
+            if (has_tensor(tensors, p + "layer_scalar")) {
+                lw.layer_scalar = scalar_to_f32(require_tensor(tensors, p + "layer_scalar"), p + "layer_scalar");
+            }
             if (ctx->per_layer_input_enabled) {
                 const int hpl = ctx->per_layer_hidden_size;
                 const int row_start = i * hpl;
@@ -390,8 +394,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     per_layer_model_projection_weight.shape(1) == ctx->cfg.hidden_size &&
                     has_tensor(tensors, p + "per_layer_input_gate.weight") &&
                     has_tensor(tensors, p + "per_layer_projection.weight") &&
-                    has_tensor(tensors, p + "post_per_layer_input_norm.weight") &&
-                    has_tensor(tensors, p + "layer_scalar"))
+                    has_tensor(tensors, p + "post_per_layer_input_norm.weight"))
                 {
                     const array per_layer_model_projection_slice = slice(
                         per_layer_model_projection_weight,
@@ -405,7 +408,6 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     lw.per_layer_input_gate_rhs = load_rhs_weight(p + "per_layer_input_gate.weight");
                     lw.per_layer_projection_rhs = load_rhs_weight(p + "per_layer_projection.weight");
                     lw.post_per_layer_input_norm_w = require_tensor(tensors, p + "post_per_layer_input_norm.weight");
-                    lw.layer_scalar = scalar_to_f32(require_tensor(tensors, p + "layer_scalar"), p + "layer_scalar");
                     lw.has_per_layer_input = true;
                 }
             }
@@ -1180,7 +1182,10 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 if (!lw.attn_qkv_has_q && lw.attn_qkv_rhs.size() <= 1) {
                     const std::string q_proj_key = p + "self_attn.q_proj.weight";
                     const std::string k_proj_key = p + "self_attn.k_proj.weight";
-                    const std::string v_proj_key = p + "self_attn.v_proj.weight";
+                    // attention_k_eq_v: V shares K weights when v_proj is absent
+                    const std::string v_proj_key = has_tensor(tensors, p + "self_attn.v_proj.weight")
+                        ? p + "self_attn.v_proj.weight"
+                        : k_proj_key;
                     const array& q_proj_weight = require_tensor(tensors, q_proj_key);
                     const array& k_proj_weight = require_tensor(tensors, k_proj_key);
                     const array& v_proj_weight = require_tensor(tensors, v_proj_key);
