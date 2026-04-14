@@ -32,12 +32,22 @@ fn detect_scheme_override(model_path: &str) -> Option<String> {
     let config_path = Path::new(model_path).join("config.json");
     let config_raw = std::fs::read_to_string(config_path).ok()?;
     let config_json: serde_json::Value = serde_json::from_str(&config_raw).ok()?;
-    let quant_method = config_json
-        .get("quantization_config")?
+    let quant_config = config_json.get("quantization_config")?;
+    let quant_method = quant_config
         .get("quant_method")?
         .as_str()?
         .trim()
         .to_ascii_lowercase();
+
+    if quant_method == "modelopt" {
+        let quant_algo = quant_config
+            .get("quant_algo")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase());
+        if matches!(quant_algo.as_deref(), Some("nvfp4")) {
+            return Some("NVFP4".to_string());
+        }
+    }
 
     match quant_method.as_str() {
         "nvfp4" => Some("NVFP4".to_string()),
@@ -67,6 +77,25 @@ mod tests {
             QuantMethod::Gaffine,
             4,
             32,
+        );
+        assert_eq!(scheme, "NVFP4");
+    }
+
+    #[test]
+    fn format_quant_scheme_uses_modelopt_nvfp4_override_from_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"quantization_config":{"quant_method":"modelopt","quant_algo":"NVFP4"}}"#,
+        )
+        .expect("write config");
+
+        let scheme = format_quant_scheme_for_path(
+            temp.path().to_str().expect("utf8 path"),
+            QuantMethod::Gaffine,
+            4,
+            64,
         );
         assert_eq!(scheme, "NVFP4");
     }

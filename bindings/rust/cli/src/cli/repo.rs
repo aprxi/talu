@@ -46,6 +46,14 @@ pub(super) struct UnifiedProgressCtx {
     multi: MultiProgress,
     /// Map of line_id -> ProgressBar
     bars: std::collections::HashMap<u8, ProgressBar>,
+    /// Sticky metadata used for optional history-style progress logging.
+    line_meta: std::collections::HashMap<u8, ProgressLineMeta>,
+}
+
+struct ProgressLineMeta {
+    label: String,
+    total: u64,
+    last_logged_current: u64,
 }
 
 impl UnifiedProgressCtx {
@@ -53,6 +61,7 @@ impl UnifiedProgressCtx {
         Self {
             multi: MultiProgress::new(),
             bars: std::collections::HashMap::new(),
+            line_meta: std::collections::HashMap::new(),
         }
     }
 
@@ -65,6 +74,7 @@ impl UnifiedProgressCtx {
             &update.message,
             update.current,
             update.total,
+            false,
         );
     }
 
@@ -82,6 +92,7 @@ impl UnifiedProgressCtx {
             &update.message,
             update.current,
             update.total,
+            true,
         );
     }
 
@@ -94,6 +105,7 @@ impl UnifiedProgressCtx {
         message: &str,
         current: u64,
         total: u64,
+        emit_history_line: bool,
     ) {
         match action {
             RepoProgressAction::Add => {
@@ -101,6 +113,14 @@ impl UnifiedProgressCtx {
                 if let Some(old_bar) = self.bars.remove(&line_id) {
                     old_bar.finish_and_clear();
                 }
+                self.line_meta.insert(
+                    line_id,
+                    ProgressLineMeta {
+                        label: label.to_string(),
+                        total,
+                        last_logged_current: 0,
+                    },
+                );
 
                 // Create new progress bar
                 let bar = if total > 0 {
@@ -157,11 +177,44 @@ impl UnifiedProgressCtx {
                         bar.set_message(message.to_string());
                     }
                 }
+                if emit_history_line && current > 0 {
+                    let line = self
+                        .line_meta
+                        .entry(line_id)
+                        .or_insert_with(|| ProgressLineMeta {
+                            label: label.to_string(),
+                            total,
+                            last_logged_current: 0,
+                        });
+                    if !label.is_empty() {
+                        line.label = label.to_string();
+                    }
+                    if total > 0 {
+                        line.total = total;
+                    }
+                    if current != line.last_logged_current {
+                        line.last_logged_current = current;
+                        let label_text = if line.label.is_empty() {
+                            "Progress"
+                        } else {
+                            &line.label
+                        };
+                        let history_line = if line.total > 0 {
+                            format!("{label_text} {current}/{} {message}", line.total)
+                        } else if message.is_empty() {
+                            format!("{label_text} {current}")
+                        } else {
+                            format!("{label_text} {current} {message}")
+                        };
+                        let _ = self.multi.println(history_line);
+                    }
+                }
             }
             RepoProgressAction::Complete => {
                 if let Some(bar) = self.bars.remove(&line_id) {
                     bar.finish();
                 }
+                self.line_meta.remove(&line_id);
             }
         }
     }
@@ -171,6 +224,7 @@ impl UnifiedProgressCtx {
         for (_, bar) in self.bars.drain() {
             bar.finish();
         }
+        self.line_meta.clear();
     }
 }
 

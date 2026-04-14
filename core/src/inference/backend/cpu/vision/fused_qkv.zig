@@ -41,6 +41,78 @@ pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;
 pub const EncodedVisionOutput = common_vision.EncodedVisionOutput;
 
+fn loadOrientedWeightByCandidates(
+    tensor_allocator: std.mem.Allocator,
+    name_resolver: *vision_load.TensorNameResolver,
+    st: *vision_load.SafeTensors,
+    model_config: ModelConfig,
+    candidates: []const []const u8,
+    expected_in: usize,
+) !Tensor {
+    for (candidates) |candidate| {
+        const resolved_name = (try name_resolver.resolve(st, candidate)) orelse continue;
+        _ = st.getTensor(resolved_name, null) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        return models.load.transforms.orientWeight(
+            tensor_allocator,
+            st,
+            resolved_name,
+            expected_in,
+            model_config,
+            true,
+            true,
+        );
+    }
+    return error.NotFound;
+}
+
+fn expandLayerTemplateRuntime(buf: []u8, template: []const u8, layer_idx: usize) ![]const u8 {
+    const marker = std.mem.indexOf(u8, template, "{d}") orelse {
+        if (template.len > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[0..template.len], template);
+        return buf[0..template.len];
+    };
+
+    var stream = std.io.fixedBufferStream(buf);
+    const writer = stream.writer();
+    try writer.writeAll(template[0..marker]);
+    try writer.print("{d}", .{layer_idx});
+    try writer.writeAll(template[marker + 3 ..]);
+    return stream.getWritten();
+}
+
+fn loadOrientedLayerWeightByTemplates(
+    tensor_allocator: std.mem.Allocator,
+    name_resolver: *vision_load.TensorNameResolver,
+    st: *vision_load.SafeTensors,
+    model_config: ModelConfig,
+    layer_idx: usize,
+    templates: []const []const u8,
+    expected_in: usize,
+) !Tensor {
+    var name_buf: [192]u8 = undefined;
+    for (templates) |template| {
+        const candidate = expandLayerTemplateRuntime(name_buf[0..], template, layer_idx) catch continue;
+        const resolved_name = (try name_resolver.resolve(st, candidate)) orelse continue;
+        _ = st.getTensor(resolved_name, null) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        return models.load.transforms.orientWeight(
+            tensor_allocator,
+            st,
+            resolved_name,
+            expected_in,
+            model_config,
+            true,
+            true,
+        );
+    }
+    return error.NotFound;
+}
+
 pub const VisionRuntime = struct {
     allocator: std.mem.Allocator,
 
@@ -181,6 +253,7 @@ pub const VisionRuntime = struct {
         if (num_grid_side * num_grid_side != num_pos_embeddings) return error.InvalidShape;
 
         const st = &loaded.st.?;
+        const tensor_allocator = loaded.arena.allocator();
         const vision_metadata = vision_load.resolveVisionMetadata(loaded);
         var name_resolver = vision_load.TensorNameResolver.init(allocator);
         defer name_resolver.deinit();
@@ -191,27 +264,59 @@ pub const VisionRuntime = struct {
         const patch_proj_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, patch_proj_bias_tensor);
         errdefer allocator.free(patch_proj_bias);
 
-        const pos_embed_tensor = try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.position_embed_candidates);
+        const pos_embed_tensor = try loadOrientedWeightByCandidates(
+            tensor_allocator,
+            &name_resolver,
+            st,
+            loaded.config,
+            vision_metadata.position_embed_candidates,
+            vision_hidden_size,
+        );
         const pos_embed_f32 = try vision_tensor_convert.tensorToOwnedF32(allocator, pos_embed_tensor);
         errdefer allocator.free(pos_embed_f32);
 
-        const merger_norm_weight = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_norm_weight_candidates));
+        const merger_norm_weight_tensor = try loadOrientedWeightByCandidates(
+            tensor_allocator,
+            &name_resolver,
+            st,
+            loaded.config,
+            vision_metadata.merger_norm_weight_candidates,
+            vision_hidden_size,
+        );
+        const merger_norm_weight = try vision_tensor_convert.tensorToOwnedF32(allocator, merger_norm_weight_tensor);
         errdefer allocator.free(merger_norm_weight);
         const merger_norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_norm_bias_candidates));
         errdefer allocator.free(merger_norm_bias);
 
-        const merger_fc1_weight = try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc1_candidates);
+        const merge_units = spatial_merge_size * spatial_merge_size;
+        const merger_fc1_weight = try loadOrientedWeightByCandidates(
+            tensor_allocator,
+            &name_resolver,
+            st,
+            loaded.config,
+            vision_metadata.merger_fc1_candidates,
+            vision_hidden_size * merge_units,
+        );
         const merger_fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc1_bias_candidates));
         errdefer allocator.free(merger_fc1_bias);
 
-        const merger_fc2_weight = try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc2_candidates);
+        const merger_fc2_weight = try loadOrientedWeightByCandidates(
+            tensor_allocator,
+            &name_resolver,
+            st,
+            loaded.config,
+            vision_metadata.merger_fc2_candidates,
+            vision_intermediate_size,
+        );
         const merger_fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc2_bias_candidates));
         errdefer allocator.free(merger_fc2_bias);
         const deepstack_mergers = try loadDeepstackMergers(
             allocator,
+            tensor_allocator,
             &name_resolver,
             st,
             &vision_metadata,
+            loaded.config,
             vision_hidden_size,
             language_hidden_size,
             spatial_merge_size,
@@ -251,18 +356,50 @@ pub const VisionRuntime = struct {
             const ln2_weight = try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.ln2_weight_templates);
             const ln2_bias = try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.ln2_bias_templates);
 
-            const qkv_weight = try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.fused_qkv_weight_templates);
+            const qkv_weight = try loadOrientedLayerWeightByTemplates(
+                tensor_allocator,
+                &name_resolver,
+                st,
+                loaded.config,
+                layer_idx,
+                vision_metadata.fused_qkv_weight_templates,
+                vision_hidden_size,
+            );
             const qkv_bias_all = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.fused_qkv_bias_templates));
             errdefer allocator.free(qkv_bias_all);
 
-            const o_weight = try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.out_proj_weight_templates);
+            const o_weight = try loadOrientedLayerWeightByTemplates(
+                tensor_allocator,
+                &name_resolver,
+                st,
+                loaded.config,
+                layer_idx,
+                vision_metadata.out_proj_weight_templates,
+                vision_hidden_size,
+            );
             const o_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.out_proj_bias_templates));
             errdefer allocator.free(o_bias);
 
-            const fc1_weight = try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.fc1_weight_templates);
+            const fc1_weight = try loadOrientedLayerWeightByTemplates(
+                tensor_allocator,
+                &name_resolver,
+                st,
+                loaded.config,
+                layer_idx,
+                vision_metadata.fc1_weight_templates,
+                vision_hidden_size,
+            );
             const fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.fc1_bias_templates));
             errdefer allocator.free(fc1_bias);
-            const fc2_weight = try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.fc2_weight_templates);
+            const fc2_weight = try loadOrientedLayerWeightByTemplates(
+                tensor_allocator,
+                &name_resolver,
+                st,
+                loaded.config,
+                layer_idx,
+                vision_metadata.fc2_weight_templates,
+                vision_intermediate_size,
+            );
             const fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(&name_resolver, st, layer_idx, vision_metadata.fc2_bias_templates));
             errdefer allocator.free(fc2_bias);
 
@@ -871,9 +1008,11 @@ fn flattenPatchProjWeight(
 
 fn loadDeepstackMergers(
     allocator: std.mem.Allocator,
+    tensor_allocator: std.mem.Allocator,
     name_resolver: *vision_load.TensorNameResolver,
     st: *vision_load.SafeTensors,
     vision_metadata: *const vision_load.VisionMetadata,
+    model_config: ModelConfig,
     vision_hidden_size: usize,
     language_hidden_size: usize,
     spatial_merge_size: usize,
@@ -892,7 +1031,15 @@ fn loadDeepstackMergers(
     }
 
     for (0..merger_count) |merger_idx| {
-        const norm_weight_tensor = vision_load.getLayerTensorByTemplates(name_resolver, st, merger_idx, vision_metadata.deepstack_norm_weight_templates) catch |err| switch (err) {
+        const norm_weight_tensor = loadOrientedLayerWeightByTemplates(
+            tensor_allocator,
+            name_resolver,
+            st,
+            model_config,
+            merger_idx,
+            vision_metadata.deepstack_norm_weight_templates,
+            merged_width,
+        ) catch |err| switch (err) {
             error.NotFound => break,
             else => return err,
         };
@@ -902,11 +1049,27 @@ fn loadDeepstackMergers(
         const norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(name_resolver, st, merger_idx, vision_metadata.deepstack_norm_bias_templates));
         errdefer allocator.free(norm_bias);
 
-        const fc1_weight = try vision_load.getLayerTensorByTemplates(name_resolver, st, merger_idx, vision_metadata.deepstack_fc1_weight_templates);
+        const fc1_weight = try loadOrientedLayerWeightByTemplates(
+            tensor_allocator,
+            name_resolver,
+            st,
+            model_config,
+            merger_idx,
+            vision_metadata.deepstack_fc1_weight_templates,
+            merged_width,
+        );
         const fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(name_resolver, st, merger_idx, vision_metadata.deepstack_fc1_bias_templates));
         errdefer allocator.free(fc1_bias);
 
-        const fc2_weight = try vision_load.getLayerTensorByTemplates(name_resolver, st, merger_idx, vision_metadata.deepstack_fc2_weight_templates);
+        const fc2_weight = try loadOrientedLayerWeightByTemplates(
+            tensor_allocator,
+            name_resolver,
+            st,
+            model_config,
+            merger_idx,
+            vision_metadata.deepstack_fc2_weight_templates,
+            merged_width,
+        );
         const fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(name_resolver, st, merger_idx, vision_metadata.deepstack_fc2_bias_templates));
         errdefer allocator.free(fc2_bias);
 

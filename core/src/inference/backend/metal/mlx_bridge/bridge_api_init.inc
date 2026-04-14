@@ -709,9 +709,22 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     const array z_weight_src = require_tensor(tensors, z_key);
                     const array a_weight_src = require_tensor(tensors, a_key);
                     const array b_weight_src = require_tensor(tensors, b_key);
+                    const bool split_has_nvfp4 =
+                        has_nvfp4_metadata_for_key(tensors, qkv_key) ||
+                        has_nvfp4_metadata_for_key(tensors, z_key) ||
+                        has_nvfp4_metadata_for_key(tensors, b_key) ||
+                        has_nvfp4_metadata_for_key(tensors, a_key);
+                    // Split native NVFP4 tensors carry per-tensor global scaling
+                    // (`weight_scale_2`) and must not be concatenated through
+                    // grouped-affine/synthetic quantization paths.
+                    const bool allow_split_affine_qmm = !split_has_nvfp4;
+                    lw.lin_in_proj_quant_optional = split_has_nvfp4;
                     bool lin_qkvz_q_captured = false;
                     bool lin_ba_q_captured = false;
-                    if (enable_mlp_qmm && env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true)) {
+                    if (allow_split_affine_qmm &&
+                        enable_mlp_qmm &&
+                        env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true))
+                    {
                         // Split linear-attn checkpoints store grouped-affine metadata
                         // per source tensor. Capture each source tensor losslessly
                         // and concatenate packed payload + calibration metadata.
@@ -791,7 +804,10 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             g_qmm_success += 1;
                         }
                     }
-                    if (!lin_qkvz_q_captured && env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false)) {
+                    if (allow_split_affine_qmm &&
+                        !lin_qkvz_q_captured &&
+                        env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false))
+                    {
                         array qkv_q_w = array(0.0f);
                         array qkv_q_scales = array(0.0f);
                         array qkv_q_biases = array(0.0f);
@@ -830,7 +846,10 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             g_qmm_success += 1;
                         }
                     }
-                    if (!lin_ba_q_captured && env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false)) {
+                    if (allow_split_affine_qmm &&
+                        !lin_ba_q_captured &&
+                        env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false))
+                    {
                         array b_q_w = array(0.0f);
                         array b_q_scales = array(0.0f);
                         array b_q_biases = array(0.0f);
@@ -889,7 +908,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                         if (!b_weight_dense.has_value()) b_weight_dense = load_linear_weight(tensors, ctx->cfg, b_key);
                         return *b_weight_dense;
                     };
-                    if (!lin_qkvz_q_captured) {
+                    if (allow_split_affine_qmm && !lin_qkvz_q_captured) {
                         const array qkvz_weight = concatenate({ensure_qkv_weight_dense(), ensure_z_weight_dense()}, 0);
                         maybe_quantize_mxfp8_matrix(
                             tensors,
@@ -903,7 +922,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             &lw.lin_in_proj_qkvz_has_q
                         );
                     }
-                    if (!lin_ba_q_captured) {
+                    if (allow_split_affine_qmm && !lin_ba_q_captured) {
                         const array ba_weight = concatenate({ensure_b_weight_dense(), ensure_a_weight_dense()}, 0);
                         maybe_quantize_mxfp8_matrix(
                             tensors,
@@ -1459,7 +1478,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             const bool nvfp4_only_quantized_checkpoint =
                 has_nvfp4_meta && !ctx->has_grouped_affine_meta && !has_mxfp8_meta;
             const bool strict_quantized_decode_requested =
-                env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", nvfp4_only_quantized_checkpoint);
+                env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", false);
             const bool strict_quantized_decode_active =
                 strict_quantized_decode_requested && quantized_checkpoint;
             if (strict_quantized_decode_active && !ctx->fp8_decode_qmm_enabled) {
@@ -1518,7 +1537,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     else { count_dense(lw.lin_in_proj_qkvz_rhs); count_dense(lw.lin_in_proj_ba_rhs); }
                     if (lw.lin_out_proj_has_q) ssm_out_q += 1;
                     else count_dense(lw.lin_out_proj_rhs);
-                    record_strict(true, ssm_in_proj_q, "layer" + std::to_string(layer_idx) + ".lin_in_proj");
+                    record_strict(false, ssm_in_proj_q, "layer" + std::to_string(layer_idx) + ".lin_in_proj");
                     record_strict(true, lw.lin_out_proj_has_q, "layer" + std::to_string(layer_idx) + ".lin_out_proj");
                 }
                 // ShortConv branch.

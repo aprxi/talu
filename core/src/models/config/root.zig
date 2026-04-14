@@ -83,6 +83,7 @@ const QuantConfig = struct {
     group_size: ?i64 = null,
     bits: ?i64 = null,
     quant_method: ?[]const u8 = null, // "mxfp4", etc.
+    quant_algo: ?[]const u8 = null, // modelopt style (e.g. "NVFP4")
     mode: ?[]const u8 = null, // Alternative to quant_method used by some models
     quant_contract_version: ?i64 = null,
 };
@@ -228,6 +229,23 @@ fn objectStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn modeloptWeightsGroupSizeFromConfigGroups(quant_config_obj: std.json.ObjectMap) ?i64 {
+    const config_groups_value = quant_config_obj.get("config_groups") orelse return null;
+    if (config_groups_value != .object) return null;
+
+    var group_iter = config_groups_value.object.iterator();
+    while (group_iter.next()) |group_entry| {
+        if (group_entry.value_ptr.* != .object) continue;
+        const group_obj = group_entry.value_ptr.*.object;
+        const weights_value = group_obj.get("weights") orelse continue;
+        if (weights_value != .object) continue;
+        if (objectIntField(weights_value.object, "group_size")) |group_size| {
+            return group_size;
+        }
+    }
+    return null;
+}
+
 fn mergeRootQuantizationConfig(config_json: *JsonConfig, root_obj: std.json.ObjectMap) void {
     if (config_json.quantization == null) {
         if (root_obj.get("quantization")) |raw| {
@@ -242,14 +260,25 @@ fn mergeRootQuantizationConfig(config_json: *JsonConfig, root_obj: std.json.Obje
         }
     }
 
-    if (config_json.quantization_config == null) {
-        if (root_obj.get("quantization_config")) |raw| {
-            if (raw == .object) {
-                const q = raw.object;
+    if (root_obj.get("quantization_config")) |raw| {
+        if (raw == .object) {
+            const q = raw.object;
+            const inferred_group_size = objectIntField(q, "group_size") orelse modeloptWeightsGroupSizeFromConfigGroups(q);
+            if (config_json.quantization_config) |existing| {
+                var merged = existing;
+                if (merged.group_size == null) merged.group_size = inferred_group_size;
+                if (merged.bits == null) merged.bits = objectIntField(q, "bits");
+                if (merged.quant_method == null) merged.quant_method = objectStringField(q, "quant_method");
+                if (merged.quant_algo == null) merged.quant_algo = objectStringField(q, "quant_algo");
+                if (merged.mode == null) merged.mode = objectStringField(q, "mode");
+                if (merged.quant_contract_version == null) merged.quant_contract_version = objectIntField(q, "quant_contract_version");
+                config_json.quantization_config = merged;
+            } else {
                 config_json.quantization_config = .{
-                    .group_size = objectIntField(q, "group_size"),
+                    .group_size = inferred_group_size,
                     .bits = objectIntField(q, "bits"),
                     .quant_method = objectStringField(q, "quant_method"),
+                    .quant_algo = objectStringField(q, "quant_algo"),
                     .mode = objectStringField(q, "mode"),
                     .quant_contract_version = objectIntField(q, "quant_contract_version"),
                 };
@@ -589,6 +618,11 @@ pub fn loadConfigForArchitectureWithHook(
                     const version = quant_config.quant_contract_version orelse return error.UnsupportedModel;
                     if (version != 1) return error.UnsupportedModel;
                     break :blk .mxfp8;
+                }
+                if (std.mem.eql(u8, method, "modelopt")) {
+                    if (quant_config.quant_algo) |algo| {
+                        if (std.ascii.eqlIgnoreCase(algo, "NVFP4")) break :blk .gaffine;
+                    }
                 }
                 if (std.mem.eql(u8, method, "nvfp4")) {
                     const version = quant_config.quant_contract_version orelse return error.UnsupportedModel;
@@ -1284,6 +1318,46 @@ test "loadConfig rejects nvfp4 quantization_config with unsupported contract ver
     defer std.testing.allocator.free(path);
 
     try std.testing.expectError(error.UnsupportedModel, loadConfig(std.testing.allocator, path));
+}
+
+test "loadConfig accepts modelopt NVFP4 config and extracts group size from config_groups" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "vocab_size": 248320,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 8,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 3584,
+        \\  "max_position_embeddings": 32768,
+        \\  "quantization_config": {
+        \\    "quant_method": "modelopt",
+        \\    "quant_algo": "NVFP4",
+        \\    "bits": 4,
+        \\    "config_groups": {
+        \\      "group_0": {
+        \\        "weights": {
+        \\          "group_size": 16
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(tensor.QuantMethod.gaffine, config.quant_method);
+    try std.testing.expectEqual(@as(i32, 4), config.gaffine_bits);
+    try std.testing.expectEqual(@as(i32, 16), config.gaffine_group_size);
 }
 
 test "initialDff prefers MoE intermediate size when experts are configured" {

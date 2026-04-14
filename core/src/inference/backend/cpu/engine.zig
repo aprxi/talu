@@ -376,14 +376,19 @@ pub const FusedCpuBackend = struct {
         var runtime_rope = try initRuntimeRopeHandles(allocator, loaded);
         errdefer deinitRuntimeRopeHandles(allocator, &runtime_rope);
 
-        const cpu_block_set = try cpu_blocks.buildBlocksFromLayers(
+        const cpu_block_set = cpu_blocks.buildBlocksFromLayers(
             allocator,
             loaded.arena.allocator(),
             loaded.config,
             loaded.runtime,
             loaded.blocks,
             progress,
-        );
+        ) catch |err| {
+            log.warn("inference", "CPU block build failed", .{
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         if (loaded.runtime.explicit_qk_norm_ops) {
             for (cpu_block_set) |*block| {
                 if (block.getAttentionMut()) |attn_ptr| {
@@ -476,11 +481,21 @@ pub const FusedCpuBackend = struct {
         );
         errdefer scratch.deinit();
 
-        var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
+        var vision_runtime = vision_runtime_mod.VisionRuntime.init(allocator, loaded) catch |err| {
+            log.warn("inference", "CPU vision runtime init failed", .{
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
         // Build executor model
-        var model = try Transformer.build(allocator, loaded, cpu_block_set);
+        var model = Transformer.build(allocator, loaded, cpu_block_set) catch |err| {
+            log.warn("inference", "CPU model build failed", .{
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         errdefer model.deinit(allocator);
 
         // Initialize recurrent/latent state from compiled plan descriptors.

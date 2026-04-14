@@ -92,11 +92,8 @@ impl StreamCtx {
 
         let _ = io::stdout().write_all(token.text.as_bytes());
         self.pending_flush_bytes += token.text.len();
-        if should_flush_stream_output(
-            &token.text,
-            self.pending_flush_bytes,
-            self.flush_each_token,
-        ) {
+        if should_flush_stream_output(&token.text, self.pending_flush_bytes, self.flush_each_token)
+        {
             let _ = io::stdout().flush();
             self.pending_flush_bytes = 0;
         }
@@ -762,6 +759,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
                         &update.message,
                         update.current,
                         update.total,
+                        false,
                     );
                 }
             }))
@@ -1432,7 +1430,11 @@ mod tests {
     #[test]
     fn stream_flush_policy_buffers_when_not_interactive() {
         assert!(should_flush_stream_output("\n", 1, false));
-        assert!(should_flush_stream_output("token", STREAM_FLUSH_BYTES, false));
+        assert!(should_flush_stream_output(
+            "token",
+            STREAM_FLUSH_BYTES,
+            false
+        ));
         assert!(!should_flush_stream_output(
             "token",
             STREAM_FLUSH_BYTES - 1,

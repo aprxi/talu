@@ -49,7 +49,7 @@ pub const TensorNameResolver = struct {
         self.resolver.deinit(self.allocator);
     }
 
-    fn resolve(self: *TensorNameResolver, st: *SafeTensors, candidate: []const u8) !?[]const u8 {
+    pub fn resolve(self: *TensorNameResolver, st: *SafeTensors, candidate: []const u8) !?[]const u8 {
         var qweight_name_buf: [1024]u8 = undefined;
         return try self.resolver.resolve(self.allocator, st, candidate, qweight_name_buf[0..]);
     }

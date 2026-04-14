@@ -418,6 +418,14 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
     return owned;
 }
 
+pub fn loadCalibrationTokenPoolForConvert(
+    allocator: std.mem.Allocator,
+    tokenizer_path: []const u8,
+    options: ConvertOptions,
+) !?[]u32 {
+    return loadCalibrationTokenPool(allocator, tokenizer_path, options);
+}
+
 inline fn calibrationDatasetRequired(options: ConvertOptions) bool {
     return options.calib_iters > 0;
 }
@@ -619,12 +627,32 @@ pub fn convertToGroupedAffine(
     return output_dir_path;
 }
 
+fn hasNonEmptyFile(dir: std.fs.Dir, sub_path: []const u8) bool {
+    var file = dir.openFile(sub_path, .{}) catch return false;
+    defer file.close();
+    const size = file.getEndPos() catch return false;
+    return size > 0;
+}
+
+fn hasValidSafetensorsFile(dir: std.fs.Dir, sub_path: []const u8) bool {
+    var file = dir.openFile(sub_path, .{}) catch return false;
+    defer file.close();
+
+    const file_size = file.getEndPos() catch return false;
+    if (file_size <= 8) return false;
+
+    var len_buf: [8]u8 = undefined;
+    const read_len = file.readAll(&len_buf) catch return false;
+    if (read_len != len_buf.len) return false;
+    const header_len = std.mem.readInt(u64, &len_buf, .little);
+    if (header_len == 0) return false;
+    return header_len <= (file_size - len_buf.len);
+}
+
 fn isCompleteConversionOutput(dir: std.fs.Dir) bool {
     dir.access("config.json", .{}) catch return false;
-    dir.access("model.safetensors", .{}) catch {
-        dir.access("model.safetensors.index.json", .{}) catch return false;
-    };
-    return true;
+    if (hasValidSafetensorsFile(dir, "model.safetensors")) return true;
+    return hasNonEmptyFile(dir, "model.safetensors.index.json");
 }
 
 /// Quantize all tensors and write to SafeTensors file.
@@ -4797,6 +4825,7 @@ test "ConvertOptions: without quantization (preserve precision)" {
 }
 
 test "isCompleteConversionOutput requires config and weights" {
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4807,7 +4836,23 @@ test "isCompleteConversionOutput requires config and weights" {
         try std.testing.expect(!isCompleteConversionOutput(dir));
     }
 
-    try tmp.dir.writeFile(.{ .sub_path = "model.safetensors", .data = "x" });
+    {
+        var empty = try tmp.dir.createFile("model.safetensors", .{});
+        empty.close();
+    }
+    {
+        var dir = try tmp.dir.openDir(".", .{});
+        defer dir.close();
+        try std.testing.expect(!isCompleteConversionOutput(dir));
+    }
+
+    const tmp_real_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_real_path);
+    var builder = safetensors.Builder.init(allocator);
+    defer builder.deinit();
+    const data = [_]u8{1};
+    try builder.addTensor("w", .u8, &[_]usize{1}, &data);
+    try builder.save(tmp_real_path, "model.safetensors");
     {
         var dir = try tmp.dir.openDir(".", .{});
         defer dir.close();

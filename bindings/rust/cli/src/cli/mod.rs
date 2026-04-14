@@ -1171,14 +1171,14 @@ mod tests {
             "--scheme",
             "mxfp8",
             "--profile",
-            "balanced",
+            "good",
         ])
         .expect("parse should succeed");
 
         match cli.command {
             Some(Commands::Convert(args)) => {
                 assert_eq!(args.scheme, "mxfp8");
-                assert_eq!(args.profile, "balanced");
+                assert_eq!(args.profile, "good");
                 assert_eq!(args.seed, 42);
                 assert!(args.profile_overrides.is_empty());
             }
@@ -1202,7 +1202,7 @@ mod tests {
         match cli.command {
             Some(Commands::Convert(args)) => {
                 assert_eq!(args.scheme, "mxfp8");
-                assert_eq!(args.profile, "fast");
+                assert_eq!(args.profile, "good");
                 assert_eq!(args.seed, 1234);
             }
             _ => panic!("expected convert command"),

@@ -225,10 +225,7 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
     let model_uri_only = args.model_uri_only;
     let quiet = args.quiet;
     let profile = ConvertProfile::parse(&args.profile).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Unknown profile '{}'. Use: best|good|balanced|fast|custom",
-            args.profile
-        )
+        anyhow::anyhow!("Unknown profile '{}'. Use: best|good|custom", args.profile)
     })?;
     let custom_overrides = parse_custom_overrides(&args.profile_overrides)?;
 
@@ -482,7 +479,7 @@ Arguments:
 
 Options:
   --scheme NAME     Quantization scheme (default: tq4)
-  --profile NAME    Quality profile: best|good|balanced|fast|custom (default: fast)
+  --profile NAME    Quality profile: best|good|custom (default: good)
   --seed N          Deterministic calibration seed (default: 42)
   --output DIR      Output directory (default: $TALU_HOME/models)
   -f, --force       Overwrite existing output
