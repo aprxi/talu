@@ -857,6 +857,7 @@ pub fn build(b: *std.Build) void {
 
     var core_pkgs = CorePackages.init(b, target, optimize);
     wireCorePackageImports(&core_pkgs);
+    core_pkgs.compute_pkg.addImport("cuda_assets", cuda_assets_mod);
     addCorePackageBuildImportsAndDeps(
         b,
         &core_pkgs,
