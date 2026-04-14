@@ -113,26 +113,50 @@ array linear_decode_maybe_quantized(
             return out;
         }
         if (nvfp4_ready) {
-            array out = quantized_matmul(
-                x,
-                q_w,
-                q_scales,
-                std::nullopt,
-                true,
-                std::nullopt,
-                std::nullopt,
-                "nvfp4"
-            );
-            // NVFP4 stores 1/global_scale in q_biases as a scalar post-multiply.
-            // Avoid explicit eval/sync in the hot path; read scalar directly.
-            if (q_biases.size() == 1 && q_biases.dtype() == float32) {
-                const float inv_gs = q_biases.item<float>();
-                if (inv_gs != 1.0f) {
-                    out = out * array(inv_gs, out.dtype());
+            array out = array(0.0f);
+            int flat_rows = 1;
+            if (x.ndim() > 2) {
+                for (int axis = 0; axis < x.ndim() - 1; ++axis) {
+                    flat_rows *= x.shape(axis);
                 }
             }
-            if (should_compare_quant(true)) emit_quant_compare(out);
-            return out;
+            const bool requires_flatten = x.ndim() > 2 && flat_rows > 1;
+            if (requires_flatten) {
+                const int in_features = x.shape(x.ndim() - 1);
+                const int out_features = q_w.shape(0);
+                const array x_flat = reshape(x, {flat_rows, in_features});
+                const array out_flat = quantized_matmul(
+                    x_flat,
+                    q_w,
+                    q_scales,
+                    std::nullopt,
+                    true,
+                    std::nullopt,
+                    std::nullopt,
+                    "nvfp4"
+                );
+                Shape out_shape;
+                out_shape.reserve(static_cast<size_t>(x.ndim()));
+                for (int axis = 0; axis < x.ndim() - 1; ++axis) {
+                    out_shape.push_back(x.shape(axis));
+                }
+                out_shape.push_back(out_features);
+                out = reshape(out_flat, out_shape);
+            } else {
+                out = quantized_matmul(
+                    x,
+                    q_w,
+                    q_scales,
+                    std::nullopt,
+                    true,
+                    std::nullopt,
+                    std::nullopt,
+                    "nvfp4"
+                );
+            }
+            const array scaled_out = apply_nvfp4_post_scale(out, q_biases);
+            if (should_compare_quant(true)) emit_quant_compare(scaled_out);
+            return scaled_out;
         }
         const array out = quantized_matmul(
             x,

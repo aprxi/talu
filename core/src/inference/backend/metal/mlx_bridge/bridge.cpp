@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -108,6 +110,7 @@ thread_local std::vector<array> g_decode_batch_logits_flat_scratch;
 thread_local std::vector<array> g_prefill_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_ids_flat_scratch;
+thread_local bool g_nvfp4_mmap_required = false;
 size_t g_qmm_attempts = 0;
 size_t g_qmm_success = 0;
 
@@ -194,6 +197,8 @@ struct mlx_ctx {
     float per_layer_model_projection_scale = 1.0f;
     array per_layer_embedding = array(0.0f); // [vocab, layers*hpl]
     array per_layer_projection_norm_w = array(0.0f); // [hpl]
+    // Retained only in mmap-strict mode to keep zero-copy views alive.
+    std::unordered_map<std::string, array> retained_weight_tensors;
 
     std::vector<LayerWeights> layers;
     std::vector<KVCacheState> kv_cache;

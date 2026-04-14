@@ -330,6 +330,26 @@ void compact_linear_in_proj_weights(LayerWeights* lw) {
     // materializes the combined arrays and releases the graph references.
     lw->lin_in_proj_qkvz_rhs = array(0.0f);
     lw->lin_in_proj_ba_rhs = array(0.0f);
+    lw->lin_in_proj_qkv_rhs = array(0.0f);
+    lw->lin_in_proj_z_rhs = array(0.0f);
+    lw->lin_in_proj_b_rhs = array(0.0f);
+    lw->lin_in_proj_a_rhs = array(0.0f);
+    lw->lin_in_proj_qkv_q_w = array(0.0f);
+    lw->lin_in_proj_qkv_q_scales = array(0.0f);
+    lw->lin_in_proj_qkv_q_biases = array(0.0f);
+    lw->lin_in_proj_qkv_has_q = false;
+    lw->lin_in_proj_z_q_w = array(0.0f);
+    lw->lin_in_proj_z_q_scales = array(0.0f);
+    lw->lin_in_proj_z_q_biases = array(0.0f);
+    lw->lin_in_proj_z_has_q = false;
+    lw->lin_in_proj_b_q_w = array(0.0f);
+    lw->lin_in_proj_b_q_scales = array(0.0f);
+    lw->lin_in_proj_b_q_biases = array(0.0f);
+    lw->lin_in_proj_b_has_q = false;
+    lw->lin_in_proj_a_q_w = array(0.0f);
+    lw->lin_in_proj_a_q_scales = array(0.0f);
+    lw->lin_in_proj_a_q_biases = array(0.0f);
+    lw->lin_in_proj_a_has_q = false;
     lw->lin_in_proj_qkvz_q_w = array(0.0f);
     lw->lin_in_proj_qkvz_q_scales = array(0.0f);
     lw->lin_in_proj_qkvz_q_biases = array(0.0f);
@@ -338,11 +358,6 @@ void compact_linear_in_proj_weights(LayerWeights* lw) {
     lw->lin_in_proj_ba_q_scales = array(0.0f);
     lw->lin_in_proj_ba_q_biases = array(0.0f);
     lw->lin_in_proj_ba_has_q = false;
-    // Also clear individual separate projections if they exist.
-    lw->lin_in_proj_qkv_rhs = array(0.0f);
-    lw->lin_in_proj_z_rhs = array(0.0f);
-    lw->lin_in_proj_a_rhs = array(0.0f);
-    lw->lin_in_proj_b_rhs = array(0.0f);
 }
 
 bool combine_shared_expert_gate_up_weights(LayerWeights* lw) {
@@ -566,11 +581,70 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
     const int S = x_norm.shape(1);
 
     const bool prefill_only_qmm = false;
+    const bool use_native_split_in_proj =
+        (lw.lin_in_proj_qkv_has_q || lw.lin_in_proj_qkv_rhs.size() > 1) &&
+        (lw.lin_in_proj_z_has_q || lw.lin_in_proj_z_rhs.size() > 1) &&
+        (lw.lin_in_proj_b_has_q || lw.lin_in_proj_b_rhs.size() > 1) &&
+        (lw.lin_in_proj_a_has_q || lw.lin_in_proj_a_rhs.size() > 1);
     // Use combined in_proj when available (one matmul instead of two).
     const bool use_combined_in_proj =
         (lw.lin_in_proj_all_has_q || lw.lin_in_proj_all_rhs.size() > 1);
     const int qkvz_cols = lw.lin_conv_dim + lw.lin_value_dim;
     const int ba_cols = 2 * lw.lin_num_v_heads;
+    array qkv = array(0.0f);
+    array z_flat = array(0.0f);
+    array b = array(0.0f);
+    array a = array(0.0f);
+    if (use_native_split_in_proj) {
+        qkv = linear_decode_maybe_quantized(
+            ctx->fp8_decode_qmm_enabled,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            x_norm,
+            lw.lin_in_proj_qkv_rhs,
+            lw.lin_in_proj_qkv_has_q,
+            lw.lin_in_proj_qkv_q_w,
+            lw.lin_in_proj_qkv_q_scales,
+            lw.lin_in_proj_qkv_q_biases,
+            prefill_only_qmm
+        );
+        z_flat = linear_decode_maybe_quantized(
+            ctx->fp8_decode_qmm_enabled,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            x_norm,
+            lw.lin_in_proj_z_rhs,
+            lw.lin_in_proj_z_has_q,
+            lw.lin_in_proj_z_q_w,
+            lw.lin_in_proj_z_q_scales,
+            lw.lin_in_proj_z_q_biases,
+            prefill_only_qmm
+        );
+        b = linear_decode_maybe_quantized(
+            ctx->fp8_decode_qmm_enabled,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            x_norm,
+            lw.lin_in_proj_b_rhs,
+            lw.lin_in_proj_b_has_q,
+            lw.lin_in_proj_b_q_w,
+            lw.lin_in_proj_b_q_scales,
+            lw.lin_in_proj_b_q_biases,
+            prefill_only_qmm
+        );
+        a = linear_decode_maybe_quantized(
+            ctx->fp8_decode_qmm_enabled,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            x_norm,
+            lw.lin_in_proj_a_rhs,
+            lw.lin_in_proj_a_has_q,
+            lw.lin_in_proj_a_q_w,
+            lw.lin_in_proj_a_q_scales,
+            lw.lin_in_proj_a_q_biases,
+            prefill_only_qmm
+        );
+    } else {
     array qkvz = array(0.0f);
     array ba = array(0.0f);
     if (use_combined_in_proj) {
@@ -617,11 +691,12 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
             prefill_only_qmm
         );
     }
-    const array qkv = slice(qkvz, {0, 0, 0}, {B, S, lw.lin_conv_dim});
-    const array z_flat = slice(qkvz, {0, 0, lw.lin_conv_dim}, {B, S, lw.lin_conv_dim + lw.lin_value_dim});
+        qkv = slice(qkvz, {0, 0, 0}, {B, S, lw.lin_conv_dim});
+        z_flat = slice(qkvz, {0, 0, lw.lin_conv_dim}, {B, S, lw.lin_conv_dim + lw.lin_value_dim});
+        b = slice(ba, {0, 0, 0}, {B, S, lw.lin_num_v_heads});
+        a = slice(ba, {0, 0, lw.lin_num_v_heads}, {B, S, 2 * lw.lin_num_v_heads});
+    }
     const array z = reshape(z_flat, {B, S, lw.lin_num_v_heads, lw.lin_head_v_dim});
-    const array b = slice(ba, {0, 0, 0}, {B, S, lw.lin_num_v_heads});
-    const array a = slice(ba, {0, 0, lw.lin_num_v_heads}, {B, S, 2 * lw.lin_num_v_heads});
 
     if (!cache.conv_state.has_value()) {
         cache.conv_state = zeros({B, lw.lin_conv_kernel - 1, lw.lin_conv_dim}, x_norm.dtype());

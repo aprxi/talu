@@ -93,6 +93,7 @@ fn augmentWithPackedNvfp4Companions(
 
     const names = try st.tensorNames(allocator);
     defer allocator.free(names);
+    sortNvfp4TensorNames(names);
 
     var converted_weight_bases = std.StringHashMap(void).init(allocator);
     defer {
@@ -102,6 +103,7 @@ fn augmentWithPackedNvfp4Companions(
     }
 
     var target_weights: usize = 0;
+    var target_blocks_total: u64 = 0;
     var dense_weight_params_total: u64 = 0;
     var max_layer_index: ?u32 = null;
     for (names) |name| {
@@ -149,6 +151,7 @@ fn augmentWithPackedNvfp4Companions(
         if (!shouldConvertDenseWeight(name, weight, options.profile)) continue;
         if (shouldPreserveWeightBySmallModelPolicy(name, small_model_policy)) continue;
         target_weights += 1;
+        target_blocks_total = std.math.add(u64, target_blocks_total, nvfp4TensorBlockWork(weight, options.profile)) catch std.math.maxInt(u64);
 
         const base = name[0 .. name.len - ".weight".len];
         const owned_base = try allocator.dupe(u8, base);
@@ -166,12 +169,15 @@ fn augmentWithPackedNvfp4Companions(
     defer if (activation_cache) |*cache| cache.deinit();
     const activation_sample_count = resolveActivationSampleCount(options);
 
+    emitNvfp4CalibHeader(options);
     progress.addLine(1, "Packing NVFP4", target_weights, null, "weights");
+    errdefer progress.completeLine(1);
+    progress.addLine(2, "Packing blocks", target_blocks_total, null, "blocks");
+    errdefer progress.completeLine(2);
 
     var output_specs = std.ArrayListUnmanaged(OutputTensorSpec){};
     defer deinitOutputSpecs(allocator, &output_specs);
 
-    var packed_done: usize = 0;
     for (names) |name| {
         const weight = st.getTensor(name, null) catch |err| {
             log.warn("convert", "NVFP4 output-spec tensor lookup failed", .{
@@ -214,12 +220,6 @@ fn augmentWithPackedNvfp4Companions(
                 .owns_name = true,
             });
 
-            packed_done += 1;
-            var msg_buf: [256]u8 = undefined;
-            const copy_len = @min(name.len, msg_buf.len - 1);
-            @memcpy(msg_buf[0..copy_len], name[0..copy_len]);
-            msg_buf[copy_len] = 0;
-            progress.updateLine(1, packed_done, @ptrCast(&msg_buf));
             continue;
         }
         if (shouldOmitGroupedAffineTensorForConvertedBase(&converted_weight_bases, name)) continue;
@@ -255,13 +255,23 @@ fn augmentWithPackedNvfp4Companions(
         if (activation_cache) |*cache| cache else null,
         activation_sample_count,
         options.calib_seed,
+        progress,
+        target_weights,
+        target_blocks_total,
     ) catch |err| {
         log.warn("convert", "NVFP4 streamed data write failed", .{ .err = @errorName(err) });
         return err;
     };
+    progress.completeLine(2);
+    const finalize_line_id: u8 = 3;
+    progress.addLine(finalize_line_id, "Finalizing NVFP4", 3, null, "steps");
+    errdefer progress.completeLine(finalize_line_id);
+
+    progress.updateLine(finalize_line_id, 1, "Flushing safetensors to disk");
     try out_file.sync();
     out_file.close();
 
+    progress.updateLine(finalize_line_id, 2, "Replacing model.safetensors");
     std.fs.cwd().rename(tmp_weights_path, output_weights_path) catch |err| switch (err) {
         error.PathAlreadyExists => {
             try std.fs.cwd().deleteFile(output_weights_path);
@@ -270,11 +280,46 @@ fn augmentWithPackedNvfp4Companions(
         else => return err,
     };
 
-    progress.completeLine(1);
+    progress.updateLine(finalize_line_id, 3, "Auditing packed tensors");
     auditPackedNvfp4Output(allocator, output_weights_path, &converted_weight_bases) catch |err| {
         log.warn("convert", "NVFP4 pack audit failed", .{ .err = @errorName(err) });
         return err;
     };
+    progress.completeLine(finalize_line_id);
+    progress.completeLine(1);
+}
+
+fn emitNvfp4CalibHeader(options: ConvertOptions) void {
+    std.debug.print("Calib block loss minimization\n", .{});
+    std.debug.print("Calib scorer backend: {s}\n", .{nvfp4ScorerBackendName()});
+    std.debug.print("Calib optimizer: {s}\n", .{nvfp4OptimizerName(options.profile)});
+    std.debug.print(
+        "Calib tuning args: --profile custom optimizer={s},iters={d},samples={d},seqlen={d},batch_size={d},nblocks={d} --seed {d}\n",
+        .{
+            nvfp4OptimizerName(options.profile),
+            options.calib_iters,
+            options.calib_nsamples,
+            options.calib_seqlen,
+            options.calib_batch_size,
+            options.calib_nblocks,
+            options.calib_seed,
+        },
+    );
+}
+
+fn nvfp4OptimizerName(profile: @TypeOf((grouped_affine.ConvertOptions{}).profile)) []const u8 {
+    return switch (profile) {
+        .best => "clip_search",
+        .good, .custom => "scale_search",
+    };
+}
+
+fn nvfp4ScorerBackendName() []const u8 {
+    const raw = std.posix.getenv("BACKEND") orelse return "auto";
+    if (std.ascii.eqlIgnoreCase(raw, "metal")) return "metal";
+    if (std.ascii.eqlIgnoreCase(raw, "cuda")) return "cuda";
+    if (std.ascii.eqlIgnoreCase(raw, "cpu")) return "cpu";
+    return "auto";
 }
 
 const OutputTensorKind = enum {
@@ -420,6 +465,46 @@ fn extractLayerIndexFromTensorName(name: []const u8) ?u32 {
         return std.fmt.parseInt(u32, name[digits_start..digits_end], 10) catch null;
     }
     return null;
+}
+
+fn extractVisualBlockIndexFromTensorName(name: []const u8) ?u32 {
+    const marker = "visual.blocks.";
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, name, search_start, marker)) |pos| {
+        const digits_start = pos + marker.len;
+        if (digits_start >= name.len or !std.ascii.isDigit(name[digits_start])) {
+            search_start = pos + 1;
+            continue;
+        }
+        var digits_end = digits_start;
+        while (digits_end < name.len and std.ascii.isDigit(name[digits_end])) : (digits_end += 1) {}
+        if (digits_end >= name.len or name[digits_end] != '.') {
+            search_start = pos + 1;
+            continue;
+        }
+        return std.fmt.parseInt(u32, name[digits_start..digits_end], 10) catch null;
+    }
+    return null;
+}
+
+fn nvfp4TensorOrderKey(name: []const u8) u32 {
+    if (std.mem.indexOf(u8, name, "embed_tokens") != null) return 0;
+    if (extractLayerIndexFromTensorName(name)) |layer| return 1000 + layer;
+    if (extractVisualBlockIndexFromTensorName(name)) |block| return 2000 + block;
+    if (std.mem.indexOf(u8, name, "norm") != null) return 100000;
+    if (std.mem.indexOf(u8, name, "lm_head") != null) return 100001;
+    return 200000;
+}
+
+fn sortNvfp4TensorNames(names: [][]const u8) void {
+    std.mem.sort([]const u8, names, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            const ak = nvfp4TensorOrderKey(a);
+            const bk = nvfp4TensorOrderKey(b);
+            if (ak != bk) return ak < bk;
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
 }
 
 const SmallModelPreservePolicy = struct {
@@ -694,6 +779,7 @@ fn collectSampledBlockScales(
     sampled_count: *usize,
     sampled_seen: *usize,
     observed_max_scale: *f32,
+    block_progress: ?*Nvfp4BlockProgress,
 ) void {
     sampled_count.* = 0;
     sampled_seen.* = 0;
@@ -724,6 +810,7 @@ fn collectSampledBlockScales(
                 sampled_importance[idx] = importance;
             }
             sampled_seen.* += 1;
+            if (block_progress) |progress_state| progress_state.bump(1);
         }
     }
 }
@@ -736,6 +823,7 @@ fn estimateNvfp4ForwardProxyMse(
     global_scale: f32,
     clip_multiplier: f32,
     group_importance: ?[]const f32,
+    block_progress: ?*Nvfp4BlockProgress,
 ) f64 {
     if (!(global_scale > 0.0) or !std.math.isFinite(global_scale)) return std.math.inf(f64);
 
@@ -769,6 +857,7 @@ fn estimateNvfp4ForwardProxyMse(
                 total_err += err * err * @as(f64, stable_weight);
                 total_weight += @as(f64, stable_weight);
             }
+            if (block_progress) |progress_state| progress_state.bump(1);
         }
     }
     if (!(total_weight > 0.0) or !std.math.isFinite(total_weight)) return std.math.inf(f64);
@@ -990,12 +1079,203 @@ const PackedNvfp4Data = struct {
     packed_scale: []u8,
     weight_scale_2: f32,
     input_scale: f32,
+    quality: Nvfp4QualityStats,
 
     fn deinit(self: *PackedNvfp4Data, allocator: std.mem.Allocator) void {
         allocator.free(self.packed_weight);
         allocator.free(self.packed_scale);
     }
 };
+
+const Nvfp4QualityMetric = enum {
+    scale_mse,
+    proxy_mse,
+};
+
+const Nvfp4QualityStats = struct {
+    metric: Nvfp4QualityMetric = .scale_mse,
+    baseline: f64 = std.math.nan(f64),
+    selected: f64 = std.math.nan(f64),
+    improvement_pct: f32 = 0.0,
+    clip_multiplier: f32 = 1.0,
+    global_scale: f32 = 1.0,
+    used_activation_importance: bool = false,
+};
+
+fn nvfp4TensorBlockWork(weight: tensor.Tensor, profile: @TypeOf((grouped_affine.ConvertOptions{}).profile)) u64 {
+    if (weight.n_dims != 2 or weight.shape[0] <= 0 or weight.shape[1] <= 0) return 0;
+    const rows: u64 = @intCast(weight.shape[0]);
+    const cols: u64 = @intCast(weight.shape[1]);
+    if (cols == 0 or (cols % nvfp4_group_size) != 0) return 0;
+    const groups = cols / nvfp4_group_size;
+    const blocks_per_pass = std.math.mul(u64, rows, groups) catch return std.math.maxInt(u64);
+    const clip_count: u64 = @intCast(clipMultipliersForProfile(profile).len);
+    const pass_count: u64 = if (useAdvancedNvfp4Search(profile))
+        (clip_count * 2) + 2
+    else
+        2;
+    return std.math.mul(u64, blocks_per_pass, pass_count) catch std.math.maxInt(u64);
+}
+
+fn nvfp4ImprovementPct(baseline: f64, selected: f64) f32 {
+    if (!(baseline > 0.0) or !std.math.isFinite(baseline) or !std.math.isFinite(selected)) return 0.0;
+    const pct = ((baseline - selected) / baseline) * 100.0;
+    return @floatCast(pct);
+}
+
+const Nvfp4BlockProgress = struct {
+    ctx: grouped_affine.ProgressContext,
+    line_id: u8,
+    total: u64,
+    base_done: u64,
+    step: u64,
+    done: u64 = 0,
+    last_emitted: u64 = 0,
+    message: ?[*:0]const u8 = null,
+
+    fn init(
+        ctx: grouped_affine.ProgressContext,
+        line_id: u8,
+        total: u64,
+        base_done: u64,
+        message: ?[*:0]const u8,
+    ) Nvfp4BlockProgress {
+        // Throttle updates to avoid progress I/O dominating conversion time.
+        const step = if (total <= 64) 1 else @max(@as(u64, 1), total / 32);
+        return .{
+            .ctx = ctx,
+            .line_id = line_id,
+            .total = total,
+            .base_done = base_done,
+            .step = step,
+            .message = message,
+        };
+    }
+
+    fn bump(self: *Nvfp4BlockProgress, inc: u64) void {
+        if (!self.ctx.isActive() or self.total == 0) return;
+        const next = @min(self.total, self.done + inc);
+        self.done = next;
+        if (self.done == self.total or (self.done - self.last_emitted) >= self.step) {
+            self.last_emitted = self.done;
+            self.ctx.updateLine(self.line_id, self.base_done + self.done, self.message);
+        }
+    }
+
+    fn finish(self: *Nvfp4BlockProgress) void {
+        if (!self.ctx.isActive() or self.total == 0) return;
+        self.done = self.total;
+        self.last_emitted = self.total;
+        self.ctx.updateLine(self.line_id, self.base_done + self.total, self.message);
+    }
+
+    fn setMessage(self: *Nvfp4BlockProgress, message: ?[*:0]const u8) void {
+        self.message = message;
+        if (!self.ctx.isActive() or self.total == 0) return;
+        self.ctx.updateLine(self.line_id, self.base_done + self.done, self.message);
+    }
+};
+
+fn setNvfp4BlockPhase(
+    block_progress: ?*Nvfp4BlockProgress,
+    message_buf: *[320]u8,
+    source_weight_name: []const u8,
+    phase: []const u8,
+) void {
+    const progress_state = block_progress orelse return;
+    const source_len = @min(source_weight_name.len, 220);
+    const msg = std.fmt.bufPrintZ(message_buf, "{s} | {s}", .{ source_weight_name[0..source_len], phase }) catch blk: {
+        const fallback = std.fmt.bufPrintZ(message_buf, "{s}", .{phase}) catch return;
+        break :blk fallback;
+    };
+    progress_state.setMessage(msg.ptr);
+}
+
+fn setNvfp4WritePhaseWithMetrics(
+    block_progress: ?*Nvfp4BlockProgress,
+    message_buf: *[320]u8,
+    source_weight_name: []const u8,
+    quality: Nvfp4QualityStats,
+) void {
+    var phase_buf: [128]u8 = undefined;
+    const sign = if (quality.improvement_pct >= 0.0) "+" else "";
+    const act = if (quality.used_activation_importance) "on" else "off";
+    const phase = switch (quality.metric) {
+        .proxy_mse => std.fmt.bufPrint(
+            &phase_buf,
+            "Write packed nibbles | proxy={e}->{e} ({s}{d:.2}%) clip={d:.2} g={e} act={s}",
+            .{
+                quality.baseline,
+                quality.selected,
+                sign,
+                quality.improvement_pct,
+                quality.clip_multiplier,
+                quality.global_scale,
+                act,
+            },
+        ) catch "Write packed nibbles",
+        .scale_mse => std.fmt.bufPrint(
+            &phase_buf,
+            "Write packed nibbles | scale={e}->{e} ({s}{d:.2}%) g={e} act={s}",
+            .{
+                quality.baseline,
+                quality.selected,
+                sign,
+                quality.improvement_pct,
+                quality.global_scale,
+                act,
+            },
+        ) catch "Write packed nibbles",
+    };
+    setNvfp4BlockPhase(block_progress, message_buf, source_weight_name, phase);
+}
+
+fn formatNvfp4WeightProgressMessage(
+    out_buf: *[448]u8,
+    tensor_name: []const u8,
+    quality: Nvfp4QualityStats,
+    global_improvement_pct: ?f32,
+) [*:0]const u8 {
+    const name_len = @min(tensor_name.len, 160);
+    const sign = if (quality.improvement_pct >= 0.0) "+" else "";
+    const global_value = global_improvement_pct orelse quality.improvement_pct;
+    const global_sign = if (global_value >= 0.0) "+" else "";
+    const act = if (quality.used_activation_importance) "on" else "off";
+    const rendered = switch (quality.metric) {
+        .proxy_mse => std.fmt.bufPrintZ(
+            out_buf,
+            "{s} | mode=best proxy={e}->{e} ({s}{d:.2}%) clip={d:.2} g={e} act={s} | global={s}{d:.2}%",
+            .{
+                tensor_name[0..name_len],
+                quality.baseline,
+                quality.selected,
+                sign,
+                quality.improvement_pct,
+                quality.clip_multiplier,
+                quality.global_scale,
+                act,
+                global_sign,
+                global_value,
+            },
+        ),
+        .scale_mse => std.fmt.bufPrintZ(
+            out_buf,
+            "{s} | mode=good scale={e}->{e} ({s}{d:.2}%) g={e} act={s} | global={s}{d:.2}%",
+            .{
+                tensor_name[0..name_len],
+                quality.baseline,
+                quality.selected,
+                sign,
+                quality.improvement_pct,
+                quality.global_scale,
+                act,
+                global_sign,
+                global_value,
+            },
+        ),
+    } catch std.fmt.bufPrintZ(out_buf, "{s}", .{tensor_name[0..name_len]}) catch unreachable;
+    return rendered.ptr;
+}
 
 fn writeStreamedSafetensorsData(
     allocator: std.mem.Allocator,
@@ -1006,9 +1286,20 @@ fn writeStreamedSafetensorsData(
     activation_cache: ?*const calibration_capture.LayerActivationCache,
     activation_sample_count: usize,
     calib_seed: u64,
+    progress: grouped_affine.ProgressContext,
+    total_weights: usize,
+    total_blocks: u64,
 ) !void {
     var packed_cache: ?PackedNvfp4Data = null;
     defer if (packed_cache) |*cache| cache.deinit(allocator);
+    var packed_done: usize = 0;
+    var packed_blocks_done: u64 = 0;
+    var current_tensor_blocks_total: u64 = 0;
+    var current_source_name: ?[]const u8 = null;
+    var global_baseline_weighted: f64 = 0.0;
+    var global_selected_weighted: f64 = 0.0;
+    var global_quality_weight: f64 = 0.0;
+    const block_line_id: u8 = 2;
 
     for (specs) |spec| {
         switch (spec.kind) {
@@ -1033,6 +1324,26 @@ fn writeStreamedSafetensorsData(
                         });
                         return err;
                     };
+                    current_source_name = source_name;
+                    var tensor_msg_buf: [256]u8 = undefined;
+                    const msg_copy_len = @min(source_name.len, tensor_msg_buf.len - 1);
+                    @memcpy(tensor_msg_buf[0..msg_copy_len], source_name[0..msg_copy_len]);
+                    tensor_msg_buf[msg_copy_len] = 0;
+                    const tensor_msg: ?[*:0]const u8 = @ptrCast(&tensor_msg_buf);
+
+                    const rows: u64 = @intCast(source.shape[0]);
+                    const cols: u64 = @intCast(source.shape[1]);
+                    const groups = cols / nvfp4_group_size;
+                    const blocks_per_pass = rows * groups;
+                    const clip_count: u64 = @intCast(clipMultipliersForProfile(profile).len);
+                    const pass_count: u64 = if (useAdvancedNvfp4Search(profile))
+                        (clip_count * 2) + 2
+                    else
+                        2;
+                    const total_block_work = blocks_per_pass * pass_count;
+                    current_tensor_blocks_total = total_block_work;
+                    var block_progress = Nvfp4BlockProgress.init(progress, block_line_id, total_block_work, packed_blocks_done, tensor_msg);
+                    progress.updateLine(1, packed_done, tensor_msg);
                     packed_cache = packDenseWeightToNvfp4(
                         allocator,
                         source_name,
@@ -1041,6 +1352,7 @@ fn writeStreamedSafetensorsData(
                         activation_cache,
                         activation_sample_count,
                         calib_seed,
+                        if (total_block_work > 0) &block_progress else null,
                     ) catch |err| {
                         log.warn("convert", "NVFP4 dense-to-packed conversion failed", .{
                             .tensor = source_name,
@@ -1048,6 +1360,7 @@ fn writeStreamedSafetensorsData(
                         });
                         return err;
                     };
+                    block_progress.finish();
                 }
                 const cache = &packed_cache.?;
                 switch (spec.kind) {
@@ -1060,8 +1373,30 @@ fn writeStreamedSafetensorsData(
                     .converted_input_scale => {
                         var input_scale = cache.input_scale;
                         try file.writeAll(std.mem.asBytes(&input_scale));
+                        const quality_weight_u64: u64 = @max(current_tensor_blocks_total, 1);
+                        const quality_weight: f64 = @floatFromInt(quality_weight_u64);
+                        if (std.math.isFinite(cache.quality.baseline) and
+                            std.math.isFinite(cache.quality.selected) and
+                            cache.quality.baseline > 0.0)
+                        {
+                            global_baseline_weighted += cache.quality.baseline * quality_weight;
+                            global_selected_weighted += cache.quality.selected * quality_weight;
+                            global_quality_weight += quality_weight;
+                        }
+                        const global_improvement_pct: ?f32 = if (global_quality_weight > 0.0 and global_baseline_weighted > 0.0)
+                            @floatCast(((global_baseline_weighted - global_selected_weighted) / global_baseline_weighted) * 100.0)
+                        else
+                            null;
+
+                        var weight_msg_buf: [448]u8 = undefined;
+                        const display_name = current_source_name orelse source_name;
+                        const progress_msg = formatNvfp4WeightProgressMessage(&weight_msg_buf, display_name, cache.quality, global_improvement_pct);
                         cache.deinit(allocator);
                         packed_cache = null;
+                        packed_blocks_done = std.math.add(u64, packed_blocks_done, current_tensor_blocks_total) catch std.math.maxInt(u64);
+                        current_tensor_blocks_total = 0;
+                        packed_done += 1;
+                        progress.updateLine(1, packed_done, progress_msg);
                     },
                     else => unreachable,
                 }
@@ -1069,6 +1404,8 @@ fn writeStreamedSafetensorsData(
         }
     }
 
+    if (packed_done != total_weights) return error.InvalidConfig;
+    if (packed_blocks_done != total_blocks) return error.InvalidConfig;
     if (packed_cache != null) return error.InvalidConfig;
 }
 
@@ -1080,6 +1417,7 @@ fn packDenseWeightToNvfp4(
     activation_cache: ?*const calibration_capture.LayerActivationCache,
     activation_sample_count: usize,
     calib_seed: u64,
+    block_progress: ?*Nvfp4BlockProgress,
 ) !PackedNvfp4Data {
     if (!shouldConvertDenseWeight(source_weight_name, weight, profile)) return error.InvalidConfig;
     const rows: usize = @intCast(weight.shape[0]);
@@ -1107,20 +1445,27 @@ fn packDenseWeightToNvfp4(
         calib_seed,
     );
     defer if (group_importance) |weights| allocator.free(weights);
+    const used_activation_importance = group_importance != null;
 
     var sampled_scales: [global_scale_sample_limit]f32 = undefined;
     var sampled_importance: [global_scale_sample_limit]f32 = undefined;
+    var phase_msg_buf: [320]u8 = undefined;
+    var quality: Nvfp4QualityStats = .{};
     var global_scale: f32 = 1.0;
     var clip_multiplier: f32 = 1.0;
     if (useAdvancedNvfp4Search(profile)) {
         var best_global_scale: f32 = 1.0;
         var best_clip_multiplier: f32 = 1.0;
         var best_proxy_mse: f64 = std.math.inf(f64);
+        var baseline_proxy_mse: ?f64 = null;
         var fallback_global_scale: f32 = 1.0;
         var have_fallback = false;
 
         const clip_candidates = clipMultipliersForProfile(profile);
         for (clip_candidates) |candidate_clip_multiplier| {
+            var sample_phase_buf: [64]u8 = undefined;
+            const sample_phase = std.fmt.bufPrint(&sample_phase_buf, "Sample scales (clip={d:.2}, metric=pending)", .{candidate_clip_multiplier}) catch "Sample scales";
+            setNvfp4BlockPhase(block_progress, &phase_msg_buf, source_weight_name, sample_phase);
             var sampled_count: usize = 0;
             var sampled_seen: usize = 0;
             var observed_max_scale: f32 = 0.0;
@@ -1136,6 +1481,7 @@ fn packDenseWeightToNvfp4(
                 &sampled_count,
                 &sampled_seen,
                 &observed_max_scale,
+                block_progress,
             );
             if (sampled_count == 0) continue;
 
@@ -1148,6 +1494,9 @@ fn packDenseWeightToNvfp4(
                 fallback_global_scale = candidate_global_scale;
                 have_fallback = true;
             }
+            var eval_phase_buf: [64]u8 = undefined;
+            const eval_phase = std.fmt.bufPrint(&eval_phase_buf, "Eval proxy loss (clip={d:.2})", .{candidate_clip_multiplier}) catch "Eval proxy loss";
+            setNvfp4BlockPhase(block_progress, &phase_msg_buf, source_weight_name, eval_phase);
             const candidate_proxy_mse = estimateNvfp4ForwardProxyMse(
                 source,
                 rows,
@@ -1156,16 +1505,45 @@ fn packDenseWeightToNvfp4(
                 candidate_global_scale,
                 candidate_clip_multiplier,
                 if (group_importance) |weights| weights else null,
+                block_progress,
             );
+            if (std.math.approxEqAbs(f32, candidate_clip_multiplier, 1.0, 0.0001) and std.math.isFinite(candidate_proxy_mse)) {
+                baseline_proxy_mse = candidate_proxy_mse;
+            }
             if (candidate_proxy_mse < best_proxy_mse) {
                 best_proxy_mse = candidate_proxy_mse;
                 best_global_scale = candidate_global_scale;
                 best_clip_multiplier = candidate_clip_multiplier;
             }
+            if (std.math.isFinite(candidate_proxy_mse)) {
+                const baseline_for_display = baseline_proxy_mse orelse candidate_proxy_mse;
+                const best_for_display = if (std.math.isFinite(best_proxy_mse)) best_proxy_mse else candidate_proxy_mse;
+                const improvement_for_display = nvfp4ImprovementPct(baseline_for_display, best_for_display);
+                const sign = if (improvement_for_display >= 0.0) "+" else "";
+                var metric_phase_buf: [160]u8 = undefined;
+                const metric_phase = std.fmt.bufPrint(
+                    &metric_phase_buf,
+                    "Eval proxy loss (clip={d:.2}) | best={d:.6} ({s}{d:.2}%)",
+                    .{ candidate_clip_multiplier, best_for_display, sign, improvement_for_display },
+                ) catch "Eval proxy loss";
+                setNvfp4BlockPhase(block_progress, &phase_msg_buf, source_weight_name, metric_phase);
+            }
         }
         global_scale = if (std.math.isFinite(best_proxy_mse)) best_global_scale else fallback_global_scale;
         clip_multiplier = if (std.math.isFinite(best_proxy_mse)) best_clip_multiplier else @as(f32, 1.0);
+        const selected_proxy = if (std.math.isFinite(best_proxy_mse)) best_proxy_mse else (baseline_proxy_mse orelse std.math.inf(f64));
+        const baseline_proxy = baseline_proxy_mse orelse selected_proxy;
+        quality = .{
+            .metric = .proxy_mse,
+            .baseline = baseline_proxy,
+            .selected = selected_proxy,
+            .improvement_pct = nvfp4ImprovementPct(baseline_proxy, selected_proxy),
+            .clip_multiplier = clip_multiplier,
+            .global_scale = global_scale,
+            .used_activation_importance = used_activation_importance,
+        };
     } else {
+        setNvfp4BlockPhase(block_progress, &phase_msg_buf, source_weight_name, "Sample scales (metric=pending)");
         var sampled_count: usize = 0;
         var sampled_seen: usize = 0;
         var observed_max_scale: f32 = 0.0;
@@ -1181,6 +1559,7 @@ fn packDenseWeightToNvfp4(
             &sampled_count,
             &sampled_seen,
             &observed_max_scale,
+            block_progress,
         );
         if (sampled_count > 0) {
             global_scale = chooseNvfp4GlobalScale(
@@ -1188,10 +1567,41 @@ fn packDenseWeightToNvfp4(
                 sampled_importance[0..sampled_count],
                 observed_max_scale,
             );
+            const baseline_scale = @as(f64, scaledBlockMse(
+                sampled_scales[0..sampled_count],
+                sampled_importance[0..sampled_count],
+                1.0,
+            ));
+            const selected_scale = @as(f64, scaledBlockMse(
+                sampled_scales[0..sampled_count],
+                sampled_importance[0..sampled_count],
+                global_scale,
+            ));
+            quality = .{
+                .metric = .scale_mse,
+                .baseline = baseline_scale,
+                .selected = selected_scale,
+                .improvement_pct = nvfp4ImprovementPct(baseline_scale, selected_scale),
+                .clip_multiplier = 1.0,
+                .global_scale = global_scale,
+                .used_activation_importance = used_activation_importance,
+            };
+            const sign = if (quality.improvement_pct >= 0.0) "+" else "";
+            var metric_ready_buf: [128]u8 = undefined;
+            const metric_ready = std.fmt.bufPrint(
+                &metric_ready_buf,
+                "Scale metric ready | scale={d:.6} ({s}{d:.2}%)",
+                .{ quality.selected, sign, quality.improvement_pct },
+            ) catch "Scale metric ready";
+            setNvfp4BlockPhase(block_progress, &phase_msg_buf, source_weight_name, metric_ready);
         }
         clip_multiplier = 1.0;
     }
 
+    quality.clip_multiplier = clip_multiplier;
+    quality.global_scale = global_scale;
+    quality.used_activation_importance = used_activation_importance;
+    setNvfp4WritePhaseWithMetrics(block_progress, &phase_msg_buf, source_weight_name, quality);
     var block_vals: [nvfp4_group_size]f32 = undefined;
     for (0..rows) |r| {
         for (0..groups) |g| {
@@ -1217,6 +1627,7 @@ fn packDenseWeightToNvfp4(
                 const dst_idx = r * packed_cols + g * (nvfp4_group_size / 2) + pair_idx;
                 packed_bytes[dst_idx] = lo | (hi << 4);
             }
+            if (block_progress) |progress_state| progress_state.bump(1);
         }
     }
 
@@ -1226,6 +1637,7 @@ fn packDenseWeightToNvfp4(
         .packed_scale = packed_scales,
         .weight_scale_2 = global_scale,
         .input_scale = input_scale,
+        .quality = quality,
     };
 }
 
@@ -1369,7 +1781,7 @@ test "estimateNvfp4ForwardProxyMse is finite for simple tensor" {
         0.1, 0.2, -0.3, 0.4,
     };
     const view: DenseWeightView = .{ .f32 = values[0..] };
-    const mse = estimateNvfp4ForwardProxyMse(view, 1, 16, 1, 1.0, 1.0, null);
+    const mse = estimateNvfp4ForwardProxyMse(view, 1, 16, 1, 1.0, 1.0, null, null);
     try std.testing.expect(std.math.isFinite(mse));
     try std.testing.expect(mse >= 0.0);
 }

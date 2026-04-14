@@ -243,13 +243,7 @@ array embedding_lookup(mlx_ctx* ctx, const array& ids) {
             std::nullopt,
             bfloat16
         );
-        // Native NVFP4 stores 1/global_scale as a scalar post-scale factor.
-        if (q_biases.size() == 1 && q_biases.dtype() == float32) {
-            const float inv_gs = q_biases.item<float>();
-            if (inv_gs != 1.0f) {
-                dequant = dequant * array(inv_gs, dequant.dtype());
-            }
-        }
+        dequant = apply_nvfp4_post_scale(dequant, q_biases);
     } else {
         dequant = dequantize(
             q_w,
@@ -379,11 +373,7 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                               lm_input, ctx->lm_head_q_w, ctx->lm_head_q_scales,
                               std::nullopt, true, std::nullopt,
                               std::nullopt, "nvfp4");
-                          if (ctx->lm_head_q_biases.size() == 1 && ctx->lm_head_q_biases.dtype() == float32) {
-                              const float inv_gs = ctx->lm_head_q_biases.item<float>();
-                              if (inv_gs != 1.0f) out = out * array(inv_gs, out.dtype());
-                          }
-                          return out;
+                          return apply_nvfp4_post_scale(out, ctx->lm_head_q_biases);
                       }()
               : quantized_matmul(
                     lm_input,
@@ -442,11 +432,7 @@ array forward_logits_from_hidden(mlx_ctx* ctx, const array& normed_hidden) {
     if (lm_head_nvfp4) {
         array out = quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,
             std::nullopt, true, std::nullopt, std::nullopt, "nvfp4");
-        if (ctx->lm_head_q_biases.size() == 1 && ctx->lm_head_q_biases.dtype() == float32) {
-            const float inv_gs = ctx->lm_head_q_biases.item<float>();
-            if (inv_gs != 1.0f) out = out * array(inv_gs, out.dtype());
-        }
-        return out;
+        return apply_nvfp4_post_scale(out, ctx->lm_head_q_biases);
     }
     if (lm_head_q_ready) {
         return quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,

@@ -28,6 +28,12 @@ int32_t mlx_validate_config(const char* model_path) {
     }
 }
 
+static bool should_enable_nvfp4_mmap_strict(bool has_nvfp4_meta, bool has_grouped_affine_meta) {
+    // Native NVFP4 capture keeps tensor views into the safetensors mapping.
+    // Pure-NVFP4 checkpoints must retain source tensors for context lifetime.
+    return has_nvfp4_meta && !has_grouped_affine_meta;
+}
+
 static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, int32_t seed, const mlx_model_flags* flags) {
     bool wired_limit_acquired = false;
     bool rng_entered = false;
@@ -83,6 +89,9 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             return nullptr;
         }
 
+        g_nvfp4_mmap_required = false;
+        const bool converted_nvfp4_model = model_has_talu_meta_scheme(ctx->model_path, "NVFP4");
+
         auto tensors = load_weight_tensors(ctx->model_path);
         sanitize_model_tensors(tensors, ctx->cfg.tie_word_embeddings, parsed_cfg.allow_norm_shift);
         const bool has_fp8_meta = has_fp8_quant_metadata(tensors);
@@ -92,6 +101,11 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         bool has_grouped_affine_meta = has_grouped_affine_quant_metadata(tensors);
         const bool has_nvfp4_meta = has_nvfp4_quant_metadata(tensors);
         const bool nvfp4_only_checkpoint = has_nvfp4_meta && !has_grouped_affine_meta;
+        const bool nvfp4_mmap_required = should_enable_nvfp4_mmap_strict(
+            has_nvfp4_meta,
+            has_grouped_affine_meta
+        );
+        g_nvfp4_mmap_required = nvfp4_mmap_required;
         if (has_grouped_affine_meta && has_nvfp4_meta) {
             // Hybrid artifacts preserve grouped-affine execution tensors.
             ctx->cfg.quant_bits = 4;
@@ -714,13 +728,93 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                         has_nvfp4_metadata_for_key(tensors, z_key) ||
                         has_nvfp4_metadata_for_key(tensors, b_key) ||
                         has_nvfp4_metadata_for_key(tensors, a_key);
-                    // Split native NVFP4 tensors carry per-tensor global scaling
-                    // (`weight_scale_2`) and must not be concatenated through
-                    // grouped-affine/synthetic quantization paths.
-                    const bool allow_split_affine_qmm = !split_has_nvfp4;
+                    const bool split_all_nvfp4 =
+                        has_nvfp4_metadata_for_key(tensors, qkv_key) &&
+                        has_nvfp4_metadata_for_key(tensors, z_key) &&
+                        has_nvfp4_metadata_for_key(tensors, b_key) &&
+                        has_nvfp4_metadata_for_key(tensors, a_key);
+                    const bool disable_native_split_nvfp4_capture = env_truthy(
+                        "TALU_METAL_NVFP4_DISABLE_NATIVE_SPLIT_CAPTURE",
+                        false
+                    );
+                    if (nvfp4_mmap_required && disable_native_split_nvfp4_capture) {
+                        throw std::runtime_error(
+                            "nvfp4 mmap-strict mode requires native split capture "
+                            "(set TALU_METAL_NVFP4_DISABLE_NATIVE_SPLIT_CAPTURE=0)"
+                        );
+                    }
+                    // Split native NVFP4 tensors carry per-tensor global scale.
+                    // Capture them on the native path first, then fuse with
+                    // explicit post-scale composition (row-wise when needed).
+                    bool allow_split_affine_qmm =
+                        !split_all_nvfp4 || disable_native_split_nvfp4_capture;
                     lw.lin_in_proj_quant_optional = split_has_nvfp4;
                     bool lin_qkvz_q_captured = false;
                     bool lin_ba_q_captured = false;
+                    if (split_has_nvfp4 &&
+                        enable_mlp_qmm &&
+                        !disable_native_split_nvfp4_capture)
+                    {
+                        lw.lin_in_proj_qkv_has_q = capture_native_nvfp4_quant(
+                            tensors,
+                            qkv_key,
+                            &lw.lin_in_proj_qkv_q_w,
+                            &lw.lin_in_proj_qkv_q_scales,
+                            &lw.lin_in_proj_qkv_q_biases
+                        );
+                        lw.lin_in_proj_z_has_q = capture_native_nvfp4_quant(
+                            tensors,
+                            z_key,
+                            &lw.lin_in_proj_z_q_w,
+                            &lw.lin_in_proj_z_q_scales,
+                            &lw.lin_in_proj_z_q_biases
+                        );
+                        lin_qkvz_q_captured = lw.lin_in_proj_qkv_has_q && lw.lin_in_proj_z_has_q;
+                        lw.lin_in_proj_qkvz_has_q = lin_qkvz_q_captured;
+                        if (lin_qkvz_q_captured) {
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+
+                        lw.lin_in_proj_b_has_q = capture_native_nvfp4_quant(
+                            tensors,
+                            b_key,
+                            &lw.lin_in_proj_b_q_w,
+                            &lw.lin_in_proj_b_q_scales,
+                            &lw.lin_in_proj_b_q_biases
+                        );
+                        lw.lin_in_proj_a_has_q = capture_native_nvfp4_quant(
+                            tensors,
+                            a_key,
+                            &lw.lin_in_proj_a_q_w,
+                            &lw.lin_in_proj_a_q_scales,
+                            &lw.lin_in_proj_a_q_biases
+                        );
+                        lin_ba_q_captured = lw.lin_in_proj_b_has_q && lw.lin_in_proj_a_has_q;
+                        lw.lin_in_proj_ba_has_q = lin_ba_q_captured;
+                        if (lin_ba_q_captured) {
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                        // Keep native split NVFP4 execution on qkv/z + b/a.
+                        // Avoid the extra all-in-proj fusion here until native
+                        // split parity is fully validated.
+                        lw.lin_in_proj_all_q_w = array(0.0f);
+                        lw.lin_in_proj_all_q_scales = array(0.0f);
+                        lw.lin_in_proj_all_q_biases = array(0.0f);
+                        lw.lin_in_proj_all_has_q = false;
+                        if (!lin_qkvz_q_captured || !lin_ba_q_captured) {
+                            if (nvfp4_mmap_required) {
+                                throw std::runtime_error(
+                                    "nvfp4 mmap-strict mode failed to capture native split linear-attn projections"
+                                );
+                            }
+                            // Native split-NVFP4 capture is preferred, but if any split
+                            // projection misses we still allow fallback quantized capture
+                            // to avoid dense in-proj residency and decode regressions.
+                            allow_split_affine_qmm = true;
+                        }
+                    }
                     if (allow_split_affine_qmm &&
                         enable_mlp_qmm &&
                         env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true))
@@ -953,8 +1047,20 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                         const array a_rhs = to_rhs(ensure_a_weight_dense(), a_key);
                         lw.lin_in_proj_ba_rhs = concatenate({ b_rhs, a_rhs }, 1);
                     }
-                    // Always combine qkvz + ba into a single projection
-                    // tensor so the reference path can use one matmul.
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkv_has_q) {
+                        lw.lin_in_proj_qkv_rhs = to_rhs(ensure_qkv_weight_dense(), qkv_key);
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_z_has_q) {
+                        lw.lin_in_proj_z_rhs = to_rhs(ensure_z_weight_dense(), z_key);
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_b_has_q) {
+                        lw.lin_in_proj_b_rhs = to_rhs(ensure_b_weight_dense(), b_key);
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_a_has_q) {
+                        lw.lin_in_proj_a_rhs = to_rhs(ensure_a_weight_dense(), a_key);
+                    }
+                    // Optionally combine qkvz + ba into one projection tensor
+                    // when compatible quant metadata is available.
                     combine_linear_in_proj_weights(&lw);
                     compact_linear_in_proj_weights(&lw);
                 } else {
@@ -1579,9 +1685,14 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     record_strict(true, lw.mlp_down_has_q, "layer" + std::to_string(layer_idx) + ".mlp_down");
                 }
             }
+            if (nvfp4_mmap_required && dense_fallback_bytes > 0) {
+                throw std::runtime_error(
+                    "nvfp4 mmap-strict mode detected dense fallback tensors during init"
+                );
+            }
             std::fprintf(
                 stderr,
-                "[mlx][nvfp4] model=%s nvfp4=%d gaffine=%d decode_qmm=%d lm_head_q=%d layers_q=%zu/%zu group=%d bits=%d per_layer=%d/%zu hpl=%d gelu=%d\n",
+                "[mlx][nvfp4] model=%s nvfp4=%d gaffine=%d decode_qmm=%d lm_head_q=%d layers_q=%zu/%zu group=%d bits=%d per_layer=%d/%zu hpl=%d gelu=%d converted=%d mmap_strict=%d\n",
                 ctx->model_id.c_str(),
                 has_nvfp4_meta ? 1 : 0,
                 ctx->has_grouped_affine_meta ? 1 : 0,
@@ -1594,7 +1705,9 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 ctx->per_layer_input_enabled ? 1 : 0,
                 layer_per_layer_count,
                 ctx->per_layer_hidden_size,
-                ctx->cfg.use_gelu ? 1 : 0
+                ctx->cfg.use_gelu ? 1 : 0,
+                converted_nvfp4_model ? 1 : 0,
+                nvfp4_mmap_required ? 1 : 0
             );
             if (ssm_qkvz_total > 0 || attn_qkv_total > 0) {
                 std::fprintf(
@@ -1716,6 +1829,10 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     &lw.attn_v_q_w, &lw.attn_v_q_scales, &lw.attn_v_q_biases,
                     &lw.attn_qkv_q_w, &lw.attn_qkv_q_scales, &lw.attn_qkv_q_biases,
                     &lw.attn_o_q_w, &lw.attn_o_q_scales, &lw.attn_o_q_biases,
+                    &lw.lin_in_proj_qkv_q_w, &lw.lin_in_proj_qkv_q_scales, &lw.lin_in_proj_qkv_q_biases,
+                    &lw.lin_in_proj_z_q_w, &lw.lin_in_proj_z_q_scales, &lw.lin_in_proj_z_q_biases,
+                    &lw.lin_in_proj_b_q_w, &lw.lin_in_proj_b_q_scales, &lw.lin_in_proj_b_q_biases,
+                    &lw.lin_in_proj_a_q_w, &lw.lin_in_proj_a_q_scales, &lw.lin_in_proj_a_q_biases,
                     &lw.lin_in_proj_qkvz_q_w, &lw.lin_in_proj_qkvz_q_scales, &lw.lin_in_proj_qkvz_q_biases,
                     &lw.lin_in_proj_ba_q_w, &lw.lin_in_proj_ba_q_scales, &lw.lin_in_proj_ba_q_biases,
                     &lw.lin_in_proj_all_q_w, &lw.lin_in_proj_all_q_scales, &lw.lin_in_proj_all_q_biases,
@@ -1730,6 +1847,8 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     &lw.mlp_gate_rhs, &lw.mlp_up_rhs, &lw.mlp_down_rhs, &lw.mlp_gate_up_rhs,
                     &lw.attn_q_rhs, &lw.attn_k_rhs, &lw.attn_v_rhs, &lw.attn_qkv_rhs, &lw.attn_o_rhs,
                     &lw.attn_qkv_prefill_rhs,
+                    &lw.lin_in_proj_qkv_rhs, &lw.lin_in_proj_z_rhs,
+                    &lw.lin_in_proj_b_rhs, &lw.lin_in_proj_a_rhs,
                     &lw.lin_in_proj_qkvz_rhs, &lw.lin_in_proj_qkvz_prefill_rhs,
                     &lw.lin_in_proj_ba_rhs, &lw.lin_in_proj_all_rhs,
                     &lw.lin_out_proj_rhs,
@@ -1772,19 +1891,28 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             );
         }
 
-        // Release the safetensors tensor map. Per-layer weights already hold
-        // their own references to the arrays they need; clearing the map drops
-        // reference counts on any arrays only referenced here (unused metadata
-        // tensors, __metadata__ entries, redundant aliases).
-        tensors.clear();
+        if (nvfp4_mmap_required) {
+            // mmap-strict mode keeps source tensors alive so captured native
+            // NVFP4 views can remain zero-copy and valid for the context life.
+            ctx->retained_weight_tensors = std::move(tensors);
+        } else {
+            // Release the safetensors tensor map. Per-layer weights already hold
+            // their own references to the arrays they need; clearing the map drops
+            // reference counts on any arrays only referenced here (unused metadata
+            // tensors, __metadata__ entries, redundant aliases).
+            tensors.clear();
+        }
 
+        g_nvfp4_mmap_required = false;
         return ctx.release();
     } catch (const std::exception& e) {
+        g_nvfp4_mmap_required = false;
         if (wired_limit_acquired) release_wired_limit();
         if (rng_entered) leave_rng_epoch();
         g_last_error = e.what();
         return nullptr;
     } catch (...) {
+        g_nvfp4_mmap_required = false;
         if (wired_limit_acquired) release_wired_limit();
         if (rng_entered) leave_rng_epoch();
         g_last_error = "unknown error in mlx_create";
@@ -1848,6 +1976,7 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         ctx->per_layer_model_projection_scale = source_ctx->per_layer_model_projection_scale;
         ctx->per_layer_embedding = source_ctx->per_layer_embedding;
         ctx->per_layer_projection_norm_w = source_ctx->per_layer_projection_norm_w;
+        ctx->retained_weight_tensors = source_ctx->retained_weight_tensors;
         ctx->layers = source_ctx->layers;
         ctx->profile_layers = source_ctx->profile_layers;
 

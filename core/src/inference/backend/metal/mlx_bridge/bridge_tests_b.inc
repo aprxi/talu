@@ -582,6 +582,182 @@ int32_t mlx_test_linear_attention_fused_quant_inproj_reuse(void) {
     }
 }
 
+int32_t mlx_test_nvfp4_rowwise_post_scale_linear_decode(void) {
+    try {
+        constexpr int batch = 1;
+        constexpr int seq = 2;
+        constexpr int in_dim = 32;
+        constexpr int qkvz_rows = 6;
+        constexpr int ba_rows = 4;
+        constexpr int total_rows = qkvz_rows + ba_rows;
+        constexpr int packed_cols = in_dim / 8;
+        constexpr int scale_cols = in_dim / 16;
+
+        std::vector<float> input_values(static_cast<size_t>(batch * seq * in_dim));
+        for (size_t i = 0; i < input_values.size(); ++i) {
+            input_values[i] = static_cast<float>((static_cast<int>(i * 7) % 19) - 9) * 0.0625f;
+        }
+
+        std::vector<uint32_t> qkvz_packed(static_cast<size_t>(qkvz_rows * packed_cols));
+        std::vector<uint8_t> qkvz_scales(static_cast<size_t>(qkvz_rows * scale_cols));
+        std::vector<uint32_t> ba_packed(static_cast<size_t>(ba_rows * packed_cols));
+        std::vector<uint8_t> ba_scales(static_cast<size_t>(ba_rows * scale_cols));
+        for (size_t i = 0; i < qkvz_packed.size(); ++i) {
+            qkvz_packed[i] = static_cast<uint32_t>((i * 13 + 0x55) & 0xFFFFFFFFu);
+        }
+        for (size_t i = 0; i < ba_packed.size(); ++i) {
+            ba_packed[i] = static_cast<uint32_t>((i * 17 + 0xAA) & 0xFFFFFFFFu);
+        }
+        for (size_t i = 0; i < qkvz_scales.size(); ++i) {
+            qkvz_scales[i] = static_cast<uint8_t>(32 + (i % 96));
+        }
+        for (size_t i = 0; i < ba_scales.size(); ++i) {
+            ba_scales[i] = static_cast<uint8_t>(48 + (i % 80));
+        }
+
+        const array x(input_values.data(), Shape{batch, seq, in_dim}, float32);
+        const array qkvz_q_w(qkvz_packed.data(), Shape{qkvz_rows, packed_cols}, uint32);
+        const array qkvz_q_scales(qkvz_scales.data(), Shape{qkvz_rows, scale_cols}, uint8);
+        const array ba_q_w(ba_packed.data(), Shape{ba_rows, packed_cols}, uint32);
+        const array ba_q_scales(ba_scales.data(), Shape{ba_rows, scale_cols}, uint8);
+        const array qkvz_post_scale = stop_gradient(array(0.875f, float32));
+        const array ba_post_scale = stop_gradient(array(1.125f, float32));
+
+        const array qkvz_out = linear_decode_maybe_quantized(
+            true,
+            16,
+            4,
+            x,
+            array(0.0f),
+            true,
+            qkvz_q_w,
+            qkvz_q_scales,
+            qkvz_post_scale,
+            false
+        );
+        const array ba_out = linear_decode_maybe_quantized(
+            true,
+            16,
+            4,
+            x,
+            array(0.0f),
+            true,
+            ba_q_w,
+            ba_q_scales,
+            ba_post_scale,
+            false
+        );
+
+        array fused_post_scale = array(0.0f);
+        if (!concat_nvfp4_post_scales_for_rows(
+                qkvz_post_scale,
+                qkvz_rows,
+                ba_post_scale,
+                ba_rows,
+                &fused_post_scale))
+        {
+            g_last_error = "mlx_test_nvfp4_rowwise_post_scale_linear_decode: failed to build fused post-scale";
+            return 0;
+        }
+
+        const array fused_q_w = concatenate({qkvz_q_w, ba_q_w}, 0);
+        const array fused_q_scales = concatenate({qkvz_q_scales, ba_q_scales}, 0);
+        const array fused_out = linear_decode_maybe_quantized(
+            true,
+            16,
+            4,
+            x,
+            array(0.0f),
+            true,
+            fused_q_w,
+            fused_q_scales,
+            fused_post_scale,
+            false
+        );
+
+        const array fused_qkvz = slice(fused_out, {0, 0, 0}, {batch, seq, qkvz_rows});
+        const array fused_ba = slice(fused_out, {0, 0, qkvz_rows}, {batch, seq, total_rows});
+        const array qkvz_diff = max(reshape(
+            abs(astype(qkvz_out, float32) - astype(fused_qkvz, float32)),
+            {static_cast<int>(qkvz_out.size())}
+        ));
+        const array ba_diff = max(reshape(
+            abs(astype(ba_out, float32) - astype(fused_ba, float32)),
+            {static_cast<int>(ba_out.size())}
+        ));
+        eval({qkvz_diff, ba_diff});
+        synchronize();
+
+        const float* qkvz_diff_ptr = qkvz_diff.data<float>();
+        const float* ba_diff_ptr = ba_diff.data<float>();
+        if (!qkvz_diff_ptr || !ba_diff_ptr) {
+            g_last_error = "mlx_test_nvfp4_rowwise_post_scale_linear_decode: failed to materialize diffs";
+            return 0;
+        }
+        if (qkvz_diff_ptr[0] > 1e-5f) {
+            g_last_error = "mlx_test_nvfp4_rowwise_post_scale_linear_decode: qkvz output mismatch";
+            return 0;
+        }
+        if (ba_diff_ptr[0] > 1e-5f) {
+            g_last_error = "mlx_test_nvfp4_rowwise_post_scale_linear_decode: ba output mismatch";
+            return 0;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_test_nvfp4_rowwise_post_scale_linear_decode";
+        return 0;
+    }
+}
+
+int32_t mlx_test_talu_meta_nvfp4_detection(void) {
+    try {
+        namespace fs = std::filesystem;
+        const fs::path base = fs::temp_directory_path() /
+            fs::path("talu_mlx_meta_test_" + std::to_string(std::time(nullptr)));
+        fs::create_directories(base);
+        const fs::path meta = base / "talu_meta.json";
+
+        {
+            std::ofstream out(meta);
+            if (!out) {
+                g_last_error = "mlx_test_talu_meta_nvfp4_detection: failed to create meta file";
+                fs::remove_all(base);
+                return 0;
+            }
+            out << "{\n  \"scheme\": \"NVFP4\",\n  \"source_model_id\": \"Qwen/Qwen3.5-9B\"\n}\n";
+        }
+
+        const bool detected = model_has_talu_meta_scheme(base.string(), "NVFP4");
+        const bool wrong = model_has_talu_meta_scheme(base.string(), "TQ4");
+        fs::remove_all(base);
+        if (!detected || wrong) {
+            g_last_error = "mlx_test_talu_meta_nvfp4_detection: detection mismatch";
+            return 0;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_test_talu_meta_nvfp4_detection";
+        return 0;
+    }
+}
+
+int32_t mlx_test_nvfp4_mmap_strict_policy(void) {
+    const bool pure_nvfp4 = should_enable_nvfp4_mmap_strict(true, false);
+    const bool hybrid = should_enable_nvfp4_mmap_strict(true, true);
+    const bool no_nvfp4 = should_enable_nvfp4_mmap_strict(false, false);
+    if (!pure_nvfp4 || hybrid || no_nvfp4) {
+        g_last_error = "mlx_test_nvfp4_mmap_strict_policy: unexpected strict policy decision";
+        return 0;
+    }
+    return 1;
+}
+
 int32_t mlx_test_grouped_affine_embedding_lookup_matches_reference(void) {
     try {
         constexpr int vocab = 5;

@@ -75,16 +75,24 @@ impl UnifiedProgressCtx {
             update.current,
             update.total,
             false,
+            true,
         );
     }
 
     /// Handle a progress update from convert.
     pub(super) fn on_convert_update(&mut self, update: &talu::ConvertProgress) {
+        // Hide noisy high-frequency sub-lines from convert (block/finalize internals).
+        // Keep only ordered milestone lines.
+        if update.line_id >= 2 {
+            return;
+        }
         let action = match update.action {
             talu::ConvertProgressAction::Add => RepoProgressAction::Add,
             talu::ConvertProgressAction::Update => RepoProgressAction::Update,
             talu::ConvertProgressAction::Complete => RepoProgressAction::Complete,
         };
+        // Only print ordered completion-style history lines for main packing line.
+        let emit_history_line = update.line_id == 1;
         self.on_update(
             action,
             update.line_id,
@@ -92,7 +100,8 @@ impl UnifiedProgressCtx {
             &update.message,
             update.current,
             update.total,
-            true,
+            emit_history_line,
+            false,
         );
     }
 
@@ -106,6 +115,7 @@ impl UnifiedProgressCtx {
         current: u64,
         total: u64,
         emit_history_line: bool,
+        animate: bool,
     ) {
         match action {
             RepoProgressAction::Add => {
@@ -125,32 +135,72 @@ impl UnifiedProgressCtx {
                 // Create new progress bar
                 let bar = if total > 0 {
                     let bar = self.multi.add(ProgressBar::new(total));
-                    bar.set_style(
-                        ProgressStyle::default_bar()
-                            .template("{spinner:.cyan} {prefix} [{bar:40.cyan/bright.black}] {pos}/{len} {msg}")
-                            .unwrap()
-                            .progress_chars("#-"),
-                    );
+                    if animate {
+                        bar.set_style(
+                            ProgressStyle::default_bar()
+                                .template(
+                                    "{spinner:.cyan} {prefix} [{bar:40.cyan/bright.black}] {pos}/{len} {msg}",
+                                )
+                                .unwrap()
+                                .progress_chars("#-"),
+                        );
+                    } else {
+                        bar.set_style(
+                            ProgressStyle::default_bar()
+                                .template("{prefix} [{bar:40.cyan/bright.black}] {pos}/{len} {msg}")
+                                .unwrap()
+                                .progress_chars("#-"),
+                        );
+                    }
                     bar.set_prefix(label.to_string());
                     bar.set_message(message.to_string());
-                    bar.enable_steady_tick(std::time::Duration::from_millis(100));
+                    if animate {
+                        bar.enable_steady_tick(std::time::Duration::from_millis(100));
+                    }
                     bar
                 } else {
                     // Indeterminate (spinner)
                     let bar = self.multi.add(ProgressBar::new_spinner());
-                    bar.set_style(
-                        ProgressStyle::default_spinner()
-                            .template("{spinner:.cyan} {prefix} {msg}")
-                            .unwrap(),
-                    );
+                    if animate {
+                        bar.set_style(
+                            ProgressStyle::default_spinner()
+                                .template("{spinner:.cyan} {prefix} {msg}")
+                                .unwrap(),
+                        );
+                    } else {
+                        bar.set_style(
+                            ProgressStyle::default_spinner()
+                                .template("{prefix} {msg}")
+                                .unwrap(),
+                        );
+                    }
                     bar.set_prefix(label.to_string());
                     bar.set_message(message.to_string());
-                    bar.enable_steady_tick(std::time::Duration::from_millis(100));
-                    bar.tick(); // Force immediate first render
+                    if animate {
+                        bar.enable_steady_tick(std::time::Duration::from_millis(100));
+                        bar.tick(); // Force immediate first render
+                    }
                     bar
                 };
 
                 self.bars.insert(line_id, bar);
+                if emit_history_line {
+                    let history_line = if !message.is_empty()
+                        && message.starts_with("Calib tuning args:")
+                    {
+                        message.to_string()
+                    } else {
+                        let label_text = if label.is_empty() { "Progress" } else { label };
+                        if total > 0 {
+                            format!("{label_text} 0/{total} {message}")
+                        } else if message.is_empty() {
+                            format!("{label_text} 0")
+                        } else {
+                            format!("{label_text} 0 {message}")
+                        }
+                    };
+                    let _ = self.multi.println(history_line);
+                }
             }
             RepoProgressAction::Update => {
                 if let Some(bar) = self.bars.get(&line_id) {
@@ -159,12 +209,23 @@ impl UnifiedProgressCtx {
                     if total > 0 && bar.length() != Some(total) {
                         bar.set_length(total);
                         // Switch to bar style for byte display
-                        bar.set_style(
-                            ProgressStyle::default_bar()
-                                .template("{spinner:.cyan} {prefix} [{bar:40.cyan/bright.black}] {bytes}/{total_bytes}")
-                                .unwrap()
-                                .progress_chars("#-"),
-                        );
+                        if animate {
+                            bar.set_style(
+                                ProgressStyle::default_bar()
+                                    .template(
+                                        "{spinner:.cyan} {prefix} [{bar:40.cyan/bright.black}] {bytes}/{total_bytes}",
+                                    )
+                                    .unwrap()
+                                    .progress_chars("#-"),
+                            );
+                        } else {
+                            bar.set_style(
+                                ProgressStyle::default_bar()
+                                    .template("{prefix} [{bar:40.cyan/bright.black}] {bytes}/{total_bytes}")
+                                    .unwrap()
+                                    .progress_chars("#-"),
+                            );
+                        }
                     }
 
                     // Update position

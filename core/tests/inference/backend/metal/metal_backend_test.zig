@@ -26,6 +26,9 @@ extern fn mlx_test_gated_delta_no_double_qk_norm() c_int;
 extern fn mlx_test_rmsnorm_gated_kernel_matches_reference() c_int;
 extern fn mlx_test_chunked_prefill_tail_matches_full_prompt() c_int;
 extern fn mlx_test_linear_attention_fused_quant_inproj_reuse() c_int;
+extern fn mlx_test_nvfp4_rowwise_post_scale_linear_decode() c_int;
+extern fn mlx_test_talu_meta_nvfp4_detection() c_int;
+extern fn mlx_test_nvfp4_mmap_strict_policy() c_int;
 extern fn mlx_test_grouped_affine_embedding_lookup_matches_reference() c_int;
 extern fn mlx_test_topk_candidate_extraction_multi() c_int;
 extern fn mlx_last_error() [*:0]const u8;
@@ -352,6 +355,34 @@ test "metal bridge fused linear grouped-affine in-proj reuses captured quantized
     const status = mlx_test_linear_attention_fused_quant_inproj_reuse();
     if (status != 1) {
         std.debug.print("mlx fused linear in-proj reuse self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge nvfp4 fused in-proj row-wise post-scale matches split decode" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_nvfp4_rowwise_post_scale_linear_decode();
+    if (status != 1) {
+        std.debug.print("mlx nvfp4 row post-scale self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge detects nvfp4 scheme in talu_meta json" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_talu_meta_nvfp4_detection();
+    if (status != 1) {
+        std.debug.print("mlx meta detection self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge enables mmap strict mode for pure nvfp4 checkpoints" {
+    const status = mlx_test_nvfp4_mmap_strict_policy();
+    if (status != 1) {
+        std.debug.print("mlx nvfp4 mmap strict policy self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
     }
     try std.testing.expectEqual(@as(c_int, 1), status);
 }

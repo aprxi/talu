@@ -226,6 +226,21 @@ bool has_nvfp4_metadata_for_key(
     return false;
 }
 
+bool read_scalar_f32(const array& value, float* out) {
+    if (!out || value.size() <= 0) return false;
+    if (value.dtype() != float32) return false;
+    array flat = value;
+    if (flat.ndim() != 1 || flat.shape(0) != 1) {
+        flat = reshape(flat, {static_cast<int>(flat.size())});
+        if (flat.ndim() != 1 || flat.shape(0) < 1) return false;
+    }
+    eval(flat);
+    const float* ptr = flat.data<float>();
+    if (ptr == nullptr) return false;
+    *out = ptr[0];
+    return true;
+}
+
 const array& nvfp4_unit_global_scale() {
     static thread_local std::optional<array> scale;
     if (!scale.has_value()) {
@@ -274,13 +289,14 @@ array dequantize_nvfp4_weight(
     if (has_tensor(tensors, base + ".weight_global_scale")) {
         // compressed-tensors: stored as 1/scale (divide directly)
         const array global_f32 = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
-        eval(global_f32);
-        if (global_f32.size() > 0) global_scale = global_f32.item<float>();
+        float scalar = 1.0f;
+        if (read_scalar_f32(global_f32, &scalar)) global_scale = scalar;
     } else if (has_tensor(tensors, base + ".weight_scale_2")) {
         // modelopt: stored as multiplier — invert for the division formula
         const array gs2_f32 = astype(require_tensor(tensors, base + ".weight_scale_2"), float32);
-        eval(gs2_f32);
-        const float s2 = gs2_f32.item<float>();
+        float s2 = 0.0f;
+        const bool ok = read_scalar_f32(gs2_f32, &s2);
+        if (!ok) s2 = 0.0f;
         if (s2 != 0.0f && std::isfinite(s2)) global_scale = 1.0f / s2;
     }
     if (global_scale == 0.0f) {
@@ -420,7 +436,14 @@ bool capture_native_nvfp4_quant(
     const std::string packed_key = use_packed_key ? (base + ".weight_packed") : weight_key;
     const array packed_src = astype(require_tensor(tensors, packed_key), uint8);
     const array raw_scale = require_tensor(tensors, base + ".weight_scale");
-    const array scale_src = view(raw_scale, uint8);
+    array scale_src = array(0.0f);
+    if (raw_scale.dtype() == uint8) {
+        scale_src = raw_scale;
+    } else if (size_of(raw_scale.dtype()) == 1) {
+        scale_src = view(raw_scale, uint8);
+    } else {
+        return false;
+    }
     eval(packed_src);
     eval(scale_src);
 
@@ -461,17 +484,27 @@ bool capture_native_nvfp4_quant(
     float inv_gs = 1.0f;
     if (has_tensor(tensors, base + ".weight_global_scale")) {
         const array gs_f32 = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
-        eval(gs_f32);
-        const float gs = gs_f32.item<float>();
+        float gs = 0.0f;
+        const bool ok = read_scalar_f32(gs_f32, &gs);
+        if (!ok) gs = 0.0f;
         if (gs != 0.0f && std::isfinite(gs)) inv_gs = 1.0f / gs;
     } else if (has_tensor(tensors, base + ".weight_scale_2")) {
         const array gs2_f32 = astype(require_tensor(tensors, base + ".weight_scale_2"), float32);
-        eval(gs2_f32);
-        const float s2 = gs2_f32.item<float>();
+        float s2 = 0.0f;
+        const bool ok = read_scalar_f32(gs2_f32, &s2);
+        if (!ok) s2 = 0.0f;
         if (s2 != 0.0f && std::isfinite(s2)) inv_gs = s2;
     }
 
     array packed_for_q = packed_src;
+    if (g_nvfp4_mmap_required &&
+        (env_truthy("TALU_METAL_NVFP4_SWAP_NIBBLES", false) ||
+         env_truthy("TALU_METAL_NVFP4_SWAP_WORD_BYTES", false)))
+    {
+        throw std::runtime_error(
+            "nvfp4 mmap-strict mode does not allow packed-byte debug rewrites"
+        );
+    }
     if (env_truthy("TALU_METAL_NVFP4_SWAP_NIBBLES", false)) {
         const uint8_t* src_ptr = packed_src.data<uint8_t>();
         std::vector<uint8_t> swapped(static_cast<size_t>(rows) * static_cast<size_t>(packed_byte_cols));
@@ -493,12 +526,119 @@ bool capture_native_nvfp4_quant(
         packed_for_q = stop_gradient(copy(array(swapped.begin(), Shape{rows, packed_byte_cols}, uint8)));
     }
 
-    *out_q_w = stop_gradient(copy(reshape(view(packed_for_q, uint32), {rows, packed_byte_cols / 4})));
-    *out_q_scales = stop_gradient(copy(scale_src));
-    // Store inv_gs (1/global_scale) as scalar — dispatch multiplies result by this.
+    if (g_nvfp4_mmap_required) {
+        *out_q_w = stop_gradient(reshape(view(packed_for_q, uint32), {rows, packed_byte_cols / 4}));
+        *out_q_scales = stop_gradient(scale_src);
+    } else {
+        *out_q_w = stop_gradient(copy(reshape(view(packed_for_q, uint32), {rows, packed_byte_cols / 4})));
+        *out_q_scales = stop_gradient(copy(scale_src));
+    }
+    // Store inv_gs (1/global_scale) as scalar — decode can route this through
+    // qqmm global-scale support or a post-scale multiply fallback.
     *out_q_biases = stop_gradient(array(inv_gs, float32));
     eval(*out_q_biases);
     return true;
+}
+
+bool append_nvfp4_post_scale_rows(
+    const array& post_scale,
+    int rows,
+    std::vector<float>* out_values
+) {
+    if (!out_values || rows <= 0) return false;
+    if (post_scale.size() == 1) {
+        if (post_scale.dtype() != float32) return false;
+        float value = 0.0f;
+        if (!read_scalar_f32(post_scale, &value)) return false;
+        out_values->insert(out_values->end(), static_cast<size_t>(rows), value);
+        return true;
+    }
+    if (post_scale.dtype() != float32) return false;
+    if (post_scale.ndim() == 1 && post_scale.shape(0) == rows) {
+        eval(post_scale);
+        const float* ptr = post_scale.data<float>();
+        if (ptr == nullptr) return false;
+        out_values->insert(out_values->end(), ptr, ptr + rows);
+        return true;
+    }
+    if (post_scale.ndim() == 2 && post_scale.shape(0) == rows && post_scale.shape(1) == 1) {
+        const array flat = reshape(post_scale, {rows});
+        eval(flat);
+        const float* ptr = flat.data<float>();
+        if (ptr == nullptr) return false;
+        out_values->insert(out_values->end(), ptr, ptr + rows);
+        return true;
+    }
+    if (post_scale.ndim() == 2 && post_scale.shape(0) == 1 && post_scale.shape(1) == rows) {
+        const array flat = reshape(post_scale, {rows});
+        eval(flat);
+        const float* ptr = flat.data<float>();
+        if (ptr == nullptr) return false;
+        out_values->insert(out_values->end(), ptr, ptr + rows);
+        return true;
+    }
+    return false;
+}
+
+bool concat_nvfp4_post_scales_for_rows(
+    const array& first_scale,
+    int first_rows,
+    const array& second_scale,
+    int second_rows,
+    array* out_scale
+) {
+    if (!out_scale || first_rows <= 0 || second_rows <= 0) return false;
+    if (first_scale.size() == 1 &&
+        second_scale.size() == 1 &&
+        first_scale.dtype() == float32 &&
+        second_scale.dtype() == float32)
+    {
+        float lhs = 0.0f;
+        float rhs = 0.0f;
+        if (!read_scalar_f32(first_scale, &lhs)) return false;
+        if (!read_scalar_f32(second_scale, &rhs)) return false;
+        if (lhs == rhs) {
+            *out_scale = stop_gradient(array(lhs, float32));
+            return true;
+        }
+    }
+
+    std::vector<float> values;
+    values.reserve(static_cast<size_t>(first_rows + second_rows));
+    if (!append_nvfp4_post_scale_rows(first_scale, first_rows, &values)) return false;
+    if (!append_nvfp4_post_scale_rows(second_scale, second_rows, &values)) return false;
+    *out_scale = stop_gradient(copy(array(values.begin(), Shape{first_rows + second_rows}, float32)));
+    return true;
+}
+
+array apply_nvfp4_post_scale(const array& value, const array& post_scale) {
+    if (post_scale.size() <= 0) return value;
+    if (post_scale.size() == 1) {
+        if (post_scale.dtype() != float32) return value;
+        const float* scalar_ptr = post_scale.data<float>();
+        if (scalar_ptr != nullptr && scalar_ptr[0] == 1.0f) return value;
+        return value * astype(post_scale, value.dtype());
+    }
+    if (post_scale.dtype() != float32) return value;
+    const int value_ndim = value.ndim();
+    if (value_ndim <= 0) return value;
+    const int out_cols = value.shape(value_ndim - 1);
+    if (out_cols <= 0) return value;
+
+    array row_scale = array(0.0f);
+    if (post_scale.ndim() == 1 && post_scale.shape(0) == out_cols) {
+        row_scale = post_scale;
+    } else if (post_scale.ndim() == 2 && post_scale.shape(0) == out_cols && post_scale.shape(1) == 1) {
+        row_scale = reshape(post_scale, {out_cols});
+    } else if (post_scale.ndim() == 2 && post_scale.shape(0) == 1 && post_scale.shape(1) == out_cols) {
+        row_scale = reshape(post_scale, {out_cols});
+    } else {
+        return value;
+    }
+
+    Shape scale_shape(static_cast<size_t>(value_ndim), 1);
+    scale_shape.back() = out_cols;
+    return value * reshape(row_scale, scale_shape);
 }
 
 void materialize_nvfp4_affine_execution_tensors(
@@ -732,6 +872,11 @@ array load_linear_weight(
     const BridgeModelConfig& cfg,
     const std::string& weight_key
 ) {
+    if (g_nvfp4_mmap_required && has_nvfp4_metadata_for_key(tensors, weight_key)) {
+        throw std::runtime_error(
+            "nvfp4 mmap-strict mode forbids dense materialization for: " + weight_key
+        );
+    }
     const array& raw_weight = require_tensor(tensors, weight_key);
     const array grouped = maybe_dequantize_grouped_affine_weight(tensors, cfg, weight_key, raw_weight);
     array out = array(0.0f);

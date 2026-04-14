@@ -760,6 +760,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
                         update.current,
                         update.total,
                         false,
+                        true,
                     );
                 }
             }))

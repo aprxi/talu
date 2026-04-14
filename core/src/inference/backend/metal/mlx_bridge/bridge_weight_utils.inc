@@ -26,6 +26,32 @@ std::string read_file(const std::filesystem::path& path) {
     return text;
 }
 
+bool model_has_talu_meta_scheme(const std::string& model_path, const char* scheme_name) {
+    if (scheme_name == nullptr || std::strlen(scheme_name) == 0) return false;
+    const std::filesystem::path meta_path = std::filesystem::path(model_path) / "talu_meta.json";
+    if (!std::filesystem::exists(meta_path)) return false;
+    std::string text;
+    try {
+        text = read_file(meta_path);
+    } catch (...) {
+        return false;
+    }
+
+    static const std::regex scheme_re("\\\"scheme\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+    std::smatch match;
+    if (!std::regex_search(text, match, scheme_re) || match.size() < 2) return false;
+
+    std::string actual = match[1].str();
+    std::string expected = scheme_name;
+    std::transform(actual.begin(), actual.end(), actual.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    std::transform(expected.begin(), expected.end(), expected.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    return actual == expected;
+}
+
 std::vector<std::string> discover_weight_files(const std::string& model_path) {
     namespace fs = std::filesystem;
     const fs::path model_dir(model_path);
