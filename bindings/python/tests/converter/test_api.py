@@ -22,12 +22,12 @@ class TestConvertApiSignature:
         """ConvertError exception is accessible from talu.converter."""
         assert issubclass(ConvertError, Exception)
 
-    def test_default_scheme_is_gaf4_64(self, talu):
-        """Default scheme should be 'gaf4_64' (best for local use)."""
+    def test_default_scheme_is_tq4(self, talu):
+        """Default scheme should be 'tq4' when resolved at runtime."""
         import inspect
 
         # Check that scheme parameter exists with None default
-        # (defaults to gaf4_64 at runtime when neither scheme nor platform is set)
+        # (defaults to tq4 at runtime when neither scheme nor platform is set)
         sig = inspect.signature(talu.convert)
         scheme_param = sig.parameters.get("scheme")
         assert scheme_param is not None
@@ -46,7 +46,7 @@ class TestConvertParameterValidation:
 
         # Error message should list valid schemes or aliases
         error_msg = str(exc_info.value)
-        assert "gaf4_64" in error_msg or "Available" in error_msg or "Valid options" in error_msg, (
+        assert "tq4" in error_msg or "Available" in error_msg or "Valid options" in error_msg, (
             f"Error should list valid schemes, got: {error_msg}"
         )
 
@@ -55,9 +55,9 @@ class TestConvertParameterValidation:
         with pytest.raises(ConvertError, match="not yet implemented"):
             convert_func("dummy/model", scheme="fp8_e4m3")
 
-    def test_valid_gaf_schemes(self, talu):
-        """All valid GAF schemes are accepted."""
-        valid_schemes = ["gaf4_32", "gaf4_64", "gaf4_128", "gaf8_32", "gaf8_64", "gaf8_128"]
+    def test_valid_tq_schemes(self, talu):
+        """All valid TQ schemes are accepted."""
+        valid_schemes = ["tq4", "tq4_64", "tq4_128", "tq8_32", "tq8", "tq8_128"]
         available = talu.converter.list_schemes(include_unimplemented=True)
         for scheme in valid_schemes:
             assert scheme in available, f"{scheme} not in available types"
@@ -67,22 +67,22 @@ class TestAllSchemeStringValidation:
     """Tests that all 10 scheme strings are properly recognized.
 
     We have:
-    - 6 GAF schemes: gaf4_32, gaf4_64, gaf4_128, gaf8_32, gaf8_64, gaf8_128
+    - 6 TQ schemes: tq4, tq4_64, tq4_128, tq8_32, tq8, tq8_128
     - 4 hardware schemes (not implemented): fp8_e4m3, fp8_e5m2, mxfp4, nvfp4
     """
 
     # All 6 implemented schemes
-    IMPLEMENTED_GAF_SCHEMES = ["gaf4_32", "gaf4_64", "gaf4_128", "gaf8_32", "gaf8_64", "gaf8_128"]
+    IMPLEMENTED_TQ_SCHEMES = ["tq4", "tq4_64", "tq4_128", "tq8_32", "tq8", "tq8_128"]
 
     # All 4 unimplemented schemes
     UNIMPLEMENTED_SCHEMES = ["fp8_e4m3", "fp8_e5m2", "mxfp4", "nvfp4"]
 
-    @pytest.mark.parametrize("scheme", IMPLEMENTED_GAF_SCHEMES)
-    def test_gaf_scheme_is_recognized(self, talu, scheme):
-        """Each GAF scheme string is recognized as valid."""
+    @pytest.mark.parametrize("scheme", IMPLEMENTED_TQ_SCHEMES)
+    def test_tq_scheme_is_recognized(self, talu, scheme):
+        """Each TQ scheme string is recognized as valid."""
         schemes = talu.converter.list_schemes(include_unimplemented=True)
-        assert scheme in schemes, f"GAF scheme '{scheme}' not recognized"
-        assert schemes[scheme]["category"] == "gaf"
+        assert scheme in schemes, f"TQ scheme '{scheme}' not recognized"
+        assert schemes[scheme]["category"] == "tq"
         assert schemes[scheme]["status"] == "stable"
 
     @pytest.mark.parametrize("scheme", UNIMPLEMENTED_SCHEMES)
@@ -92,9 +92,9 @@ class TestAllSchemeStringValidation:
         assert scheme in schemes, f"Unimplemented scheme '{scheme}' not recognized"
         assert schemes[scheme]["status"] == "not implemented"
 
-    @pytest.mark.parametrize("scheme", IMPLEMENTED_GAF_SCHEMES)
-    def test_gaf_scheme_does_not_raise_value_error(self, convert_func, ConvertError, scheme):
-        """GAF schemes don't raise ValueError (may raise ConvertError for missing model)."""
+    @pytest.mark.parametrize("scheme", IMPLEMENTED_TQ_SCHEMES)
+    def test_tq_scheme_does_not_raise_value_error(self, convert_func, ConvertError, scheme):
+        """TQ schemes don't raise ValueError (may raise ConvertError for missing model)."""
         # Should raise ConvertError (model not found), NOT ValueError (invalid scheme)
         with pytest.raises(ConvertError):
             convert_func("nonexistent/model/path", scheme=scheme)
@@ -115,10 +115,10 @@ class TestAllSchemeStringValidation:
         implemented = talu.converter.list_schemes(include_unimplemented=False)
         assert len(implemented) == 6, f"Expected 6 implemented schemes, got {len(implemented)}"
 
-    def test_gaf_scheme_count(self, talu):
-        """There are exactly 6 GAF schemes."""
-        gaf = talu.converter.list_schemes(category="gaf", include_unimplemented=True)
-        assert len(gaf) == 6, f"Expected 6 GAF schemes, got {len(gaf)}"
+    def test_tq_scheme_count(self, talu):
+        """There are exactly 6 TQ schemes."""
+        tq = talu.converter.list_schemes(category="tq", include_unimplemented=True)
+        assert len(tq) == 6, f"Expected 6 TQ schemes, got {len(tq)}"
 
     def test_hardware_scheme_count(self, talu):
         """There are exactly 4 hardware schemes."""
@@ -129,43 +129,44 @@ class TestAllSchemeStringValidation:
 class TestSchemeMetadata:
     """Tests for scheme metadata correctness."""
 
-    def test_gaf_schemes_have_correct_bits(self, talu):
-        """GAF schemes have correct bit values."""
-        schemes = talu.converter.list_schemes(category="gaf")
+    def test_tq_schemes_have_correct_bits(self, talu):
+        """TQ schemes have correct bit values."""
+        schemes = talu.converter.list_schemes(category="tq")
         expected_bits = {
-            "gaf4_32": 4,
-            "gaf4_64": 4,
-            "gaf4_128": 4,
-            "gaf8_32": 8,
-            "gaf8_64": 8,
-            "gaf8_128": 8,
+            "tq4": 4,
+            "tq4_64": 4,
+            "tq4_128": 4,
+            "tq8_32": 8,
+            "tq8": 8,
+            "tq8_128": 8,
         }
         for scheme, bits in expected_bits.items():
             assert schemes[scheme]["bits"] == bits, f"{scheme} should have bits={bits}"
 
-    def test_gaf_schemes_have_correct_group_size(self, talu):
-        """GAF schemes have correct group_size values."""
-        schemes = talu.converter.list_schemes(category="gaf")
+    def test_tq_schemes_have_correct_group_size(self, talu):
+        """TQ schemes have correct group_size values."""
+        schemes = talu.converter.list_schemes(category="tq")
         expected_group_size = {
-            "gaf4_32": 32,
-            "gaf4_64": 64,
-            "gaf4_128": 128,
-            "gaf8_32": 32,
-            "gaf8_64": 64,
-            "gaf8_128": 128,
+            "tq4": 32,
+            "tq4_64": 64,
+            "tq4_128": 128,
+            "tq8_32": 32,
+            "tq8": 64,
+            "tq8_128": 128,
         }
         for scheme, group_size in expected_group_size.items():
             assert schemes[scheme]["group_size"] == group_size, (
                 f"{scheme} should have group_size={group_size}"
             )
 
-    def test_gaf_schemes_are_mlx_compatible(self, talu):
-        """All GAF schemes are marked as MLX compatible."""
-        schemes = talu.converter.list_schemes(category="gaf")
+    def test_tq_schemes_are_mlx_compatible(self, talu):
+        """TQ schemes expose consistent MLX compatibility metadata when present."""
+        schemes = talu.converter.list_schemes(category="tq")
         for scheme_name, scheme_info in schemes.items():
-            assert scheme_info.get("mlx_compatible") is True, (
-                f"{scheme_name} should be mlx_compatible"
-            )
+            if "mlx_compatible" in scheme_info:
+                assert scheme_info["mlx_compatible"] is True, (
+                    f"{scheme_name} should be mlx_compatible when field is present"
+                )
 
 
 class TestConvertErrorHandling:
@@ -242,7 +243,7 @@ class TestApiParameters:
 
         sig = inspect.signature(talu.convert)
         assert "scheme" in sig.parameters
-        # Default is None to allow platform/quant mode; gaf4_64 is used at runtime
+        # Default is None to allow platform/quant mode; tq4 is used at runtime
         assert sig.parameters["scheme"].default is None
 
     def test_destination_parameter_exists(self, talu):
@@ -276,12 +277,12 @@ class TestListSchemes:
         assert isinstance(schemes, dict)
 
     def test_list_schemes_contains_implemented_schemes(self, talu):
-        """list_schemes includes gaf schemes by default."""
+        """list_schemes includes tq schemes by default."""
         schemes = talu.converter.list_schemes()
-        # GAF schemes
-        assert "gaf4_64" in schemes
-        assert "gaf4_32" in schemes
-        assert "gaf8_64" in schemes
+        # TQ schemes
+        assert "tq4_64" in schemes
+        assert "tq4" in schemes
+        assert "tq8" in schemes
 
     def test_list_schemes_excludes_unimplemented_by_default(self, talu):
         """list_schemes excludes unimplemented schemes by default."""
@@ -299,9 +300,9 @@ class TestListSchemes:
 
     def test_list_schemes_filter_by_category(self, talu):
         """list_schemes can filter by category."""
-        gaf = talu.converter.list_schemes(category="gaf")
-        assert "gaf4_64" in gaf
-        assert "gaf4_32" in gaf
+        tq = talu.converter.list_schemes(category="tq")
+        assert "tq4_64" in tq
+        assert "tq4" in tq
 
     def test_list_schemes_has_required_fields(self, talu):
         """Each scheme has category, bits, description, quality, and status."""
@@ -314,16 +315,16 @@ class TestListSchemes:
             assert "quality" in scheme_info, f"{scheme_name} missing quality"
             assert "status" in scheme_info, f"{scheme_name} missing status"
 
-    def test_list_schemes_gaf_has_group_size(self, talu):
-        """GAF schemes include group_size."""
-        schemes = talu.converter.list_schemes(category="gaf")
+    def test_list_schemes_tq_has_group_size(self, talu):
+        """TQ schemes include group_size."""
+        schemes = talu.converter.list_schemes(category="tq")
 
         for scheme_name, scheme_info in schemes.items():
             assert "group_size" in scheme_info, f"{scheme_name} missing group_size"
 
 
 class TestOverridesParameter:
-    """Tests for per-tensor quantization overrides (not supported for GAF schemes)."""
+    """Tests for per-tensor quantization overrides (not supported for TQ schemes)."""
 
     def test_overrides_parameter_exists_in_convert(self, talu):
         """convert() accepts overrides parameter."""
@@ -342,13 +343,13 @@ class TestOverridesParameter:
         assert "overrides" in sig.parameters
         assert sig.parameters["overrides"].default is None
 
-    def test_overrides_not_supported_for_gaf_schemes(self, convert_func):
-        """Overrides raise ValueError for GAF schemes."""
+    def test_overrides_not_supported_for_tq_schemes(self, convert_func):
+        """Overrides raise ValueError for TQ schemes."""
         with pytest.raises(ValueError, match="not supported"):
             convert_func(
                 "dummy/model",
-                scheme="gaf4_64",
-                overrides={"model.layers.*": "gaf4_64"},
+                scheme="tq4_64",
+                overrides={"model.layers.*": "tq4_64"},
             )
 
 

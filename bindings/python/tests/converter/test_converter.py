@@ -75,15 +75,15 @@ class TestSchemes:
         result = schemes()
         assert isinstance(result, list)
 
-    def test_schemes_contains_gaf_schemes(self):
-        """schemes() contains grouped affine (GAF) schemes."""
+    def test_schemes_contains_tq_schemes(self):
+        """schemes() contains grouped affine (TQ) schemes."""
         result = schemes()
-        assert "gaf4_32" in result
-        assert "gaf4_64" in result
-        assert "gaf4_128" in result
-        assert "gaf8_32" in result
-        assert "gaf8_64" in result
-        assert "gaf8_128" in result
+        assert "tq4" in result
+        assert "tq4_64" in result
+        assert "tq4_128" in result
+        assert "tq8_32" in result
+        assert "tq8" in result
+        assert "tq8_128" in result
 
     def test_schemes_is_sorted(self):
         """schemes() returns sorted list."""

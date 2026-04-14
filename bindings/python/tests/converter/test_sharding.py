@@ -183,7 +183,7 @@ class TestMaxShardSizeParameter:
         with pytest.raises(ConvertError):
             convert_func(
                 "nonexistent/model",
-                scheme="gaf4_64",
+                scheme="tq4_64",
                 max_shard_size="5GB",
             )
 

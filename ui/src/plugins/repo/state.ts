@@ -102,12 +102,12 @@ export const repoState = {
 /**
  * Infer the family key for a model.
  * Uses source_model_id if available, otherwise strips quant suffixes
- * like -GAF4, -GAF8, -GAF4-G32 from managed model IDs.
+ * like -TQ4, -TQ8, -TQ4_64, -TQ4-G32 from managed model IDs.
  */
 export function inferFamilyKey(model: CachedModel): string {
   if (model.source_model_id) return model.source_model_id;
   if (model.source === "managed") {
-    const stripped = model.id.replace(/-GAF\d+(-G\d+)?$/, "");
+    const stripped = model.id.replace(/-TQ\d+(?:_\d+|-G\d+)?$/, "");
     if (stripped !== model.id) return stripped;
   }
   return model.id;

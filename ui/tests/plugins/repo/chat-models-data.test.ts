@@ -78,50 +78,50 @@ beforeEach(() => {
 describe("chat-models-data", () => {
   test("loadChatModels filters non-string entries and emits grouped families", async () => {
     repoState.models = [
-      makeModel("llama-3-GAF4", { source_model_id: "llama-3", quant_scheme: "GAF4" }),
-      makeModel("llama-3-GAF8", { source_model_id: "llama-3", quant_scheme: "GAF8" }),
+      makeModel("llama-3-TQ4", { source_model_id: "llama-3", quant_scheme: "TQ4" }),
+      makeModel("llama-3-TQ8", { source_model_id: "llama-3", quant_scheme: "TQ8" }),
     ];
     kvGetResult = {
       ok: true,
-      data: { value: JSON.stringify(["llama-3-GAF4", 123, "llama-3-GAF8", null]) },
+      data: { value: JSON.stringify(["llama-3-TQ4", 123, "llama-3-TQ8", null]) },
     };
 
     await loadChatModels();
 
-    expect(repoState.chatModels).toEqual(["llama-3-GAF4", "llama-3-GAF8"]);
+    expect(repoState.chatModels).toEqual(["llama-3-TQ4", "llama-3-TQ8"]);
     expect(emitted).toHaveLength(1);
     expect(emitted[0]!.name).toBe("repo.chatModels.changed");
     expect(emitted[0]!.data.families).toEqual([
       {
         familyId: "llama-3",
-        defaultVariant: "llama-3-GAF4",
+        defaultVariant: "llama-3-TQ4",
         variants: [
-          { id: "llama-3-GAF4", label: "GAF4", size_bytes: 1024 },
-          { id: "llama-3-GAF8", label: "GAF8", size_bytes: 1024 },
+          { id: "llama-3-TQ4", label: "TQ4", size_bytes: 1024 },
+          { id: "llama-3-TQ8", label: "TQ8", size_bytes: 1024 },
         ],
       },
     ]);
   });
 
   test("addChatModel persists and renders newly added family", async () => {
-    repoState.models = [makeModel("llama-3-GAF4", { source_model_id: "llama-3" })];
+    repoState.models = [makeModel("llama-3-TQ4", { source_model_id: "llama-3" })];
 
-    await addChatModel("llama-3-GAF4");
+    await addChatModel("llama-3-TQ4");
 
-    expect(repoState.chatModels).toEqual(["llama-3-GAF4"]);
+    expect(repoState.chatModels).toEqual(["llama-3-TQ4"]);
     expect(apiCalls).toContainEqual({
       method: "kvPut",
-      args: ["chat_models", "models", JSON.stringify(["llama-3-GAF4"])],
+      args: ["chat_models", "models", JSON.stringify(["llama-3-TQ4"])],
     });
     expect(getRepoDom().chatModelsList.textContent).toContain("llama-3");
   });
 
   test("removeChatModelFamily removes all family variants but preserves remote models", async () => {
     repoState.models = [
-      makeModel("llama-3-GAF4", { source_model_id: "llama-3" }),
-      makeModel("llama-3-GAF8", { source_model_id: "llama-3" }),
+      makeModel("llama-3-TQ4", { source_model_id: "llama-3" }),
+      makeModel("llama-3-TQ8", { source_model_id: "llama-3" }),
     ];
-    repoState.chatModels = ["llama-3-GAF4", "openai::gpt-4o", "llama-3-GAF8"];
+    repoState.chatModels = ["llama-3-TQ4", "openai::gpt-4o", "llama-3-TQ8"];
 
     await removeChatModelFamily("llama-3");
 

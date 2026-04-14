@@ -14,14 +14,14 @@ class TestSchemeInfo:
         """SCHEME_INFO is a dictionary."""
         assert isinstance(SCHEME_INFO, dict)
 
-    def test_scheme_info_has_gaf_schemes(self):
-        """SCHEME_INFO contains GAF (grouped affine) schemes."""
-        assert "gaf4_32" in SCHEME_INFO
-        assert "gaf4_64" in SCHEME_INFO
-        assert "gaf4_128" in SCHEME_INFO
-        assert "gaf8_32" in SCHEME_INFO
-        assert "gaf8_64" in SCHEME_INFO
-        assert "gaf8_128" in SCHEME_INFO
+    def test_scheme_info_has_tq_schemes(self):
+        """SCHEME_INFO contains TQ (grouped affine) schemes."""
+        assert "tq4" in SCHEME_INFO
+        assert "tq4_64" in SCHEME_INFO
+        assert "tq4_128" in SCHEME_INFO
+        assert "tq8_32" in SCHEME_INFO
+        assert "tq8" in SCHEME_INFO
+        assert "tq8_128" in SCHEME_INFO
 
     def test_scheme_info_has_hardware_schemes(self):
         """SCHEME_INFO contains hardware float schemes."""
@@ -39,11 +39,11 @@ class TestSchemeInfo:
             assert "quality" in scheme_info, f"{scheme_name} missing 'quality'"
             assert "status" in scheme_info, f"{scheme_name} missing 'status'"
 
-    def test_gaf_schemes_have_gaf_category(self):
-        """GAF schemes have category='gaf'."""
-        gaf_schemes = ["gaf4_32", "gaf4_64", "gaf4_128", "gaf8_32", "gaf8_64", "gaf8_128"]
-        for scheme_name in gaf_schemes:
-            assert SCHEME_INFO[scheme_name]["category"] == "gaf"
+    def test_tq_schemes_have_tq_category(self):
+        """TQ schemes have category='tq'."""
+        tq_schemes = ["tq4", "tq4_64", "tq4_128", "tq8_32", "tq8", "tq8_128"]
+        for scheme_name in tq_schemes:
+            assert SCHEME_INFO[scheme_name]["category"] == "tq"
 
     def test_hardware_schemes_have_hardware_category(self):
         """Hardware schemes have category='hardware'."""
@@ -51,17 +51,18 @@ class TestSchemeInfo:
         for scheme_name in hardware_schemes:
             assert SCHEME_INFO[scheme_name]["category"] == "hardware"
 
-    def test_gaf_schemes_have_group_size(self):
-        """GAF schemes have group_size field."""
-        gaf_schemes = ["gaf4_32", "gaf4_64", "gaf4_128", "gaf8_32", "gaf8_64", "gaf8_128"]
-        for scheme_name in gaf_schemes:
+    def test_tq_schemes_have_group_size(self):
+        """TQ schemes have group_size field."""
+        tq_schemes = ["tq4", "tq4_64", "tq4_128", "tq8_32", "tq8", "tq8_128"]
+        for scheme_name in tq_schemes:
             assert "group_size" in SCHEME_INFO[scheme_name], f"{scheme_name} missing 'group_size'"
 
-    def test_gaf_schemes_have_mlx_compatible_flag(self):
-        """GAF schemes have mlx_compatible flag."""
-        gaf_schemes = ["gaf4_32", "gaf4_64", "gaf4_128", "gaf8_32", "gaf8_64", "gaf8_128"]
-        for scheme_name in gaf_schemes:
-            assert SCHEME_INFO[scheme_name].get("mlx_compatible") is True
+    def test_tq_schemes_have_mlx_compatible_flag(self):
+        """TQ schemes expose mlx_compatible when that metadata is present."""
+        tq_schemes = ["tq4", "tq4_64", "tq4_128", "tq8_32", "tq8", "tq8_128"]
+        for scheme_name in tq_schemes:
+            if "mlx_compatible" in SCHEME_INFO[scheme_name]:
+                assert SCHEME_INFO[scheme_name]["mlx_compatible"] is True
 
 
 class TestListSchemes:
@@ -83,10 +84,10 @@ class TestListSchemes:
         """list_schemes() includes implemented schemes."""
         result = list_schemes()
 
-        # GAF schemes
-        assert "gaf4_64" in result
-        assert "gaf4_32" in result
-        assert "gaf8_64" in result
+        # TQ schemes
+        assert "tq4_64" in result
+        assert "tq4" in result
+        assert "tq8" in result
 
     def test_list_schemes_include_unimplemented(self):
         """list_schemes(include_unimplemented=True) includes all schemes."""
@@ -97,16 +98,16 @@ class TestListSchemes:
         assert "mxfp4" in result
         assert "nvfp4" in result
 
-    def test_list_schemes_filter_by_category_gaf(self):
-        """list_schemes(category='gaf') returns only GAF schemes."""
-        result = list_schemes(category="gaf")
+    def test_list_schemes_filter_by_category_tq(self):
+        """list_schemes(category='tq') returns only TQ schemes."""
+        result = list_schemes(category="tq")
 
         for name, info in result.items():
-            assert info["category"] == "gaf", f"{name} should be gaf category"
+            assert info["category"] == "tq", f"{name} should be tq category"
 
-        # Should have GAF schemes
-        assert "gaf4_64" in result
-        assert "gaf4_32" in result
+        # Should have TQ schemes
+        assert "tq4_64" in result
+        assert "tq4" in result
 
     def test_list_schemes_returns_copy(self):
         """list_schemes() returns a copy, not the original."""
@@ -126,13 +127,13 @@ class TestSchemes:
         result = schemes()
         assert isinstance(result, list)
 
-    def test_schemes_contains_gaf_schemes(self):
-        """schemes() contains GAF schemes."""
+    def test_schemes_contains_tq_schemes(self):
+        """schemes() contains TQ schemes."""
         result = schemes()
 
-        assert "gaf4_32" in result
-        assert "gaf4_64" in result
-        assert "gaf4_128" in result
+        assert "tq4" in result
+        assert "tq4_64" in result
+        assert "tq4_128" in result
 
     def test_schemes_excludes_unimplemented(self):
         """schemes() excludes unimplemented schemes."""

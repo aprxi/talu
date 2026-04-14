@@ -75,7 +75,7 @@ talu ls LiquidAI/LFM2-350M
 
 # Convert quantization
 talu convert LiquidAI/LFM2-350M
-talu convert LiquidAI/LFM2-350M --scheme gaf8_64
+talu convert LiquidAI/LFM2-350M --scheme tq8
 
 # Remove from cache
 talu rm LiquidAI/LFM2-350M

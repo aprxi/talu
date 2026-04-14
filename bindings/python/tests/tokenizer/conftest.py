@@ -312,7 +312,7 @@ def hf_tokenizer_cache(transformers) -> dict:
 def load_hf_tokenizer(model_path: str, cache: dict, transformers):
     """Load HuggingFace tokenizer with caching.
 
-    Resolves model URIs (e.g., "Qwen/Qwen3-0.6B-GAF4") to local paths
+    Resolves model URIs (e.g., "Qwen/Qwen3-0.6B-TQ4") to local paths
     via talu's repository before passing to AutoTokenizer.
     """
     if model_path not in cache:

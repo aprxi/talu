@@ -167,7 +167,7 @@ class TestAutoStrategyWithModelType:
     def test_gguf_filename_works(self):
         gen = get_generator(
             "auto",
-            model_name="model-gaf4_64.gguf",
+            model_name="model-tq4_64.gguf",
             model_type="mistral",
         )
         assert isinstance(gen, TypeScriptGenerator)

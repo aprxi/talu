@@ -44,7 +44,7 @@ else:
     print("Full precision (FP16) - can be quantized")
 
 # After conversion - verify quantization
-path = talu.convert("Qwen/Qwen3-0.6B", scheme="gaf4_64")
+path = talu.convert("Qwen/Qwen3-0.6B", scheme="tq4_64")
 info_quantized = describe(path)
 
 print(f"Quantized: {info_quantized.is_quantized}")  # True
@@ -120,7 +120,7 @@ print(f"  Already quantized: {info.is_quantized}")
 
 # Convert if not already quantized
 if not info.is_quantized:
-    path = converter("Qwen/Qwen3-0.6B", scheme="gaf4_64")
+    path = converter("Qwen/Qwen3-0.6B", scheme="tq4_64")
     print(f"  Converted to: {path}")
 
 """

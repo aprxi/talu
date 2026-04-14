@@ -150,14 +150,14 @@ class TestQuantizationAlignmentRegression:
         """Get path to reference model for conversion tests."""
         return test_model_path
 
-    def test_gaf4_64_conversion_no_bus_error(self, reference_model, tmp_path):
-        """GAF4_64 conversion should not cause Bus errors from alignment issues."""
+    def test_tq4_64_conversion_no_bus_error(self, reference_model, tmp_path):
+        """TQ4_64 conversion should not cause Bus errors from alignment issues."""
         from talu.converter import convert
 
-        output_dir = tmp_path / "gaf4_64_output"
+        output_dir = tmp_path / "tq4_64_output"
 
         try:
-            result = convert(reference_model, scheme="gaf4_64", output_dir=str(output_dir))
+            result = convert(reference_model, scheme="tq4_64", output_dir=str(output_dir))
             assert result is not None
         except Exception as e:
             # Check it's not a Bus error (other errors may be acceptable)
@@ -167,14 +167,14 @@ class TestQuantizationAlignmentRegression:
             assert "bus error" not in error_str
             assert "sigbus" not in error_str
 
-    def test_gaf8_64_conversion_no_bus_error(self, reference_model, tmp_path):
-        """GAF8_64 conversion should not cause Bus errors from alignment issues."""
+    def test_tq8_conversion_no_bus_error(self, reference_model, tmp_path):
+        """TQ8 conversion should not cause Bus errors from alignment issues."""
         from talu.converter import convert
 
-        output_dir = tmp_path / "gaf8_64_output"
+        output_dir = tmp_path / "tq8_output"
 
         try:
-            result = convert(reference_model, scheme="gaf8_64", output_dir=str(output_dir))
+            result = convert(reference_model, scheme="tq8", output_dir=str(output_dir))
             assert result is not None
         except Exception as e:
             error_str = str(e).lower()
@@ -196,8 +196,8 @@ class TestRepeatedConversionStability:
         """Get path to reference model."""
         return test_model_path
 
-    def test_repeated_gaf4_64_conversions(self, reference_model, tmp_path):
-        """Multiple GAF4_64 conversions should all succeed without crashes.
+    def test_repeated_tq4_64_conversions(self, reference_model, tmp_path):
+        """Multiple TQ4_64 conversions should all succeed without crashes.
 
         This test runs multiple conversions to catch intermittent alignment
         issues that only manifest with certain memory allocation patterns.
@@ -206,13 +206,13 @@ class TestRepeatedConversionStability:
 
         num_iterations = 3
         for i in range(num_iterations):
-            output_dir = tmp_path / f"gaf4_64_run_{i}"
+            output_dir = tmp_path / f"tq4_64_run_{i}"
             try:
-                result = convert(reference_model, scheme="gaf4_64", output_dir=str(output_dir))
+                result = convert(reference_model, scheme="tq4_64", output_dir=str(output_dir))
                 assert result is not None, f"Iteration {i} returned None"
             except Exception as e:
                 error_str = str(e).lower()
-                # Skip if model is already quantized (GAF4 test model)
+                # Skip if model is already quantized (TQ4 test model)
                 if "already quantized" in error_str:
                     pytest.skip("Test requires FP16 source model, got quantized model")
                 assert "bus error" not in error_str, f"Bus error on iteration {i}"
@@ -229,7 +229,7 @@ class TestRepeatedConversionStability:
         """
         from talu.converter import convert
 
-        schemes = ["gaf4_32", "gaf4_64", "gaf8_64"]
+        schemes = ["tq4", "tq4_64", "tq8"]
 
         for scheme in schemes:
             output_dir = tmp_path / f"{scheme}_run"
@@ -238,7 +238,7 @@ class TestRepeatedConversionStability:
                 assert result is not None, f"Scheme {scheme} returned None"
             except Exception as e:
                 error_str = str(e).lower()
-                # Skip if model is already quantized (GAF4 test model)
+                # Skip if model is already quantized (TQ4 test model)
                 if "already quantized" in error_str:
                     pytest.skip("Test requires FP16 source model, got quantized model")
                 assert "bus error" not in error_str, f"Bus error with scheme {scheme}"

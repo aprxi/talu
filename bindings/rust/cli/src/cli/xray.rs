@@ -6044,7 +6044,7 @@ mod tests {
         )
         .expect("write target");
 
-        let result = compare_full_token_transcripts("Qwen/Qwen3.5-0.8B-GAF4", &source, &target, 2)
+        let result = compare_full_token_transcripts("Qwen/Qwen3.5-0.8B-TQ4", &source, &target, 2)
             .expect("compare should succeed");
         assert!(!result.passed);
         assert!(result.report.contains("----- BEGIN cpu -----"));
@@ -6057,7 +6057,7 @@ mod tests {
     #[test]
     fn reference_cache_key_changes_when_prompt_changes() {
         let a = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a story",
             42,
             100,
@@ -6065,7 +6065,7 @@ mod tests {
             "bin_fp_a",
         );
         let b = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a poem",
             42,
             100,
@@ -6078,7 +6078,7 @@ mod tests {
     #[test]
     fn reference_cache_key_changes_when_seed_changes() {
         let a = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a story",
             42,
             100,
@@ -6086,7 +6086,7 @@ mod tests {
             "bin_fp_a",
         );
         let b = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a story",
             43,
             100,
@@ -6099,7 +6099,7 @@ mod tests {
     #[test]
     fn reference_cache_key_changes_when_reference_backend_changes() {
         let cpu = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a story",
             42,
             100,
@@ -6107,7 +6107,7 @@ mod tests {
             "bin_fp_a",
         );
         let metal = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a story",
             42,
             100,
@@ -6120,7 +6120,7 @@ mod tests {
     #[test]
     fn reference_cache_key_changes_when_binary_changes() {
         let a = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a story",
             42,
             100,
@@ -6128,7 +6128,7 @@ mod tests {
             "bin_fp_a",
         );
         let b = reference_cache_key(
-            "Qwen/Qwen3.5-0.8B-GAF4",
+            "Qwen/Qwen3.5-0.8B-TQ4",
             "tell me a story",
             42,
             100,
@@ -6150,7 +6150,7 @@ mod tests {
     #[test]
     fn default_dev_reference_path_separates_full_and_token_caches() {
         let args = XrayArgs {
-            model: "Qwen/Qwen3.5-0.8B-GAF4".to_string(),
+            model: "Qwen/Qwen3.5-0.8B-TQ4".to_string(),
             input: false,
             output: false,
             json: false,

@@ -174,7 +174,7 @@ function deduplicateByFamily(models: ModelEntry[]): ModelEntry[] {
   for (const m of models) {
     let familyKey = m.id;
     if (m.source === "managed") {
-      const stripped = m.id.replace(/-GAF\d+(-G\d+)?$/, "");
+      const stripped = m.id.replace(/-TQ\d+(?:_\d+|-G\d+)?$/, "");
       if (stripped !== m.id) familyKey = stripped;
     }
     const label = familyKey !== m.id
@@ -274,9 +274,9 @@ async function fetchBenchModels(): Promise<void> {
       for (const id of chatModelIds) {
         if (id.includes("::")) continue; // remote models handled separately
         const managed = allManaged.find((m) => m.id === id);
-        // Infer family key: strip -GAF\d+(-G\d+)? suffix.
+        // Infer family key: strip -TQ\d+(?:_\d+|-G\d+)? suffix.
         let familyKey = id;
-        const stripped = id.replace(/-GAF\d+(-G\d+)?$/, "");
+        const stripped = id.replace(/-TQ\d+(?:_\d+|-G\d+)?$/, "");
         if (stripped !== id) familyKey = stripped;
         if (!familyMap.has(familyKey)) {
           familyMap.set(familyKey, { defaultVariant: id, variants: [] });

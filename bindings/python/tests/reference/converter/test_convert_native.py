@@ -1,8 +1,8 @@
 """
-Tests for GAF scheme conversion.
+Tests for TQ scheme conversion.
 
-Tests conversion using grouped affine quantization schemes (gaf4_32, gaf4_64, gaf4_128, etc.).
-GAF schemes are the default and offer excellent quality with MLX compatibility.
+Tests conversion using grouped affine quantization schemes (tq4, tq4_64, tq4_128, etc.).
+TQ schemes are the default and offer excellent quality with MLX compatibility.
 """
 
 import json
@@ -14,18 +14,18 @@ import pytest
 pytestmark = [pytest.mark.slow, pytest.mark.requires_model]
 
 
-class TestGAFSchemeConversion:
-    """Tests for GAF scheme conversion."""
+class TestTQSchemeConversion:
+    """Tests for TQ scheme conversion."""
 
     @pytest.mark.slow
-    def test_convert_gaf4_64(self, convert_func, small_test_model, temp_output_dir):
-        """Convert to GAF4_64 scheme (default)."""
+    def test_convert_tq4_64(self, convert_func, small_test_model, temp_output_dir):
+        """Convert to TQ4_64 scheme (balanced)."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4_64",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -37,14 +37,14 @@ class TestGAFSchemeConversion:
         assert (Path(result_path) / "model.safetensors").exists()
 
     @pytest.mark.slow
-    def test_convert_gaf4_32(self, convert_func, small_test_model, temp_output_dir):
-        """Convert to GAF4_32 scheme (higher accuracy)."""
+    def test_convert_tq4(self, convert_func, small_test_model, temp_output_dir):
+        """Convert to TQ4 scheme (higher accuracy)."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_32",
+            scheme="tq4",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -53,14 +53,14 @@ class TestGAFSchemeConversion:
         assert (Path(result_path) / "config.json").exists()
 
     @pytest.mark.slow
-    def test_convert_gaf8_64(self, convert_func, small_test_model, temp_output_dir):
-        """Convert to GAF8_64 scheme (near-lossless)."""
+    def test_convert_tq8(self, convert_func, small_test_model, temp_output_dir):
+        """Convert to TQ8 scheme (near-lossless)."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf8_64",
+            scheme="tq8",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -69,14 +69,14 @@ class TestGAFSchemeConversion:
         assert (Path(result_path) / "config.json").exists()
 
     @pytest.mark.slow
-    def test_convert_gaf4_128(self, convert_func, small_test_model, temp_output_dir):
-        """Convert to GAF4_128 scheme (smallest)."""
+    def test_convert_tq4_128(self, convert_func, small_test_model, temp_output_dir):
+        """Convert to TQ4_128 scheme (smallest)."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_128",
+            scheme="tq4_128",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -84,18 +84,18 @@ class TestGAFSchemeConversion:
         assert Path(result_path).exists()
 
 
-class TestGAFSchemeOutputStructure:
-    """Tests for GAF scheme output structure."""
+class TestTQSchemeOutputStructure:
+    """Tests for TQ scheme output structure."""
 
     @pytest.mark.slow
     def test_output_has_required_files(self, convert_func, small_test_model, temp_output_dir):
-        """GAF scheme output has all required files."""
+        """TQ scheme output has all required files."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4_64",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -116,7 +116,7 @@ class TestGAFSchemeOutputStructure:
 
         result_path = convert_func(
             small_test_model,
-            scheme="gaf4_64",
+            scheme="tq4_64",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -131,14 +131,14 @@ class TestGAFSchemeOutputStructure:
         assert "hidden_size" in config
 
     @pytest.mark.slow
-    def test_gaf_scheme_smaller_than_original(self, convert_func, synthetic_model, temp_output_dir):
+    def test_tq_scheme_smaller_than_original(self, convert_func, synthetic_model, temp_output_dir):
         """Quantized model should be significantly smaller than original.
 
-        STRICT SIZE CHECK for GAF4_64 quantization:
+        STRICT SIZE CHECK for TQ4_64 quantization:
 
         Expected compression ratio:
         - Original: 32-bit (float32) = 4 bytes per weight
-        - GAF4_64: 4-bit + scales/biases = ~0.5-0.6 bytes per weight
+        - TQ4_64: 4-bit + scales/biases = ~0.5-0.6 bytes per weight
         - Expected ratio: 12-20% of original
 
         We use 35% threshold (< original_size * 0.35) which:
@@ -147,7 +147,7 @@ class TestGAFSchemeOutputStructure:
         - Allows for small models where overhead is proportionally larger
 
         Uses synthetic_model (hidden_size=64) instead of a cached model
-        to ensure dimensions are divisible by the GAF4_64 group size (64).
+        to ensure dimensions are divisible by the TQ4_64 group size (64).
         Models with hidden_size < 64 cannot be quantized with this scheme.
 
         If this test fails, investigate:
@@ -162,7 +162,7 @@ class TestGAFSchemeOutputStructure:
         # Convert to 4-bit
         result_path = convert_func(
             str(synthetic_model.path),
-            scheme="gaf4_64",
+            scheme="tq4_64",
             output_dir=temp_output_dir,
             force=True,
         )
@@ -174,10 +174,10 @@ class TestGAFSchemeOutputStructure:
         # Calculate actual compression ratio for diagnostics
         actual_ratio = converted_size / original_size
 
-        # GAF4_64 should achieve significant compression
+        # TQ4_64 should achieve significant compression
         # We use 35% threshold to allow for overhead while catching conversion bugs
         assert converted_size < original_size * 0.35, (
-            f"GAF4_64 conversion achieved only {actual_ratio:.1%} compression "
+            f"TQ4_64 conversion achieved only {actual_ratio:.1%} compression "
             f"(converted: {converted_size / 1024:.1f}KB, original: {original_size / 1024:.1f}KB). "
             f"Expected <35% - quantization may not be applied correctly."
         )
@@ -187,18 +187,18 @@ class TestDefaultScheme:
     """Tests for default scheme behavior."""
 
     @pytest.mark.slow
-    def test_default_uses_gaf4_64(self, convert_func, small_test_model, temp_output_dir):
-        """Without explicit scheme, uses default gaf4_64 quantization."""
+    def test_default_uses_tq4(self, convert_func, small_test_model, temp_output_dir):
+        """Without explicit scheme, uses default tq4 quantization."""
         if small_test_model is None:
             pytest.skip("No unquantized test model available in cache")
 
         result_path = convert_func(
             small_test_model,
-            # No scheme= uses default (gaf4_64)
+            # No scheme= uses default (tq4)
             output_dir=temp_output_dir,
             force=True,
         )
 
         assert Path(result_path).exists()
-        # Default is GAF4 quantization
-        assert "GAF4" in result_path or "gaf4" in result_path.lower()
+        # Default is TQ4 quantization
+        assert "TQ4" in result_path or "tq4" in result_path.lower()

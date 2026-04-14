@@ -156,10 +156,10 @@ def ops():
 TEST_MODEL_URI_TEXT_RANDOM = os.environ.get(
     "TEST_MODEL_URI_TEXT_RANDOM", "llamafactory/tiny-random-Llama-3"
 )
-TEST_MODEL_URI_TEXT = os.environ.get("TEST_MODEL_URI_TEXT", "LiquidAI/LFM2-350M-GAF4")
-TEST_MODEL_URI_TEXT_THINK = os.environ.get("TEST_MODEL_URI_TEXT_THINK", "Qwen/Qwen3-0.6B-GAF4")
+TEST_MODEL_URI_TEXT = os.environ.get("TEST_MODEL_URI_TEXT", "LiquidAI/LFM2-350M-TQ4")
+TEST_MODEL_URI_TEXT_THINK = os.environ.get("TEST_MODEL_URI_TEXT_THINK", "Qwen/Qwen3-0.6B-TQ4")
 TEST_MODEL_URI_EMBEDDING = os.environ.get(
-    "TEST_MODEL_URI_EMBEDDING", "sentence-transformers/all-MiniLM-L6-v2-GAF8"
+    "TEST_MODEL_URI_EMBEDDING", "sentence-transformers/all-MiniLM-L6-v2-TQ8"
 )
 
 # HuggingFace model IDs for cross-model tokenizer/template comparison tests.

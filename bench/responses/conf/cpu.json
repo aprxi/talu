@@ -1,6 +1,6 @@
 {
   "model_uri": ["Qwen/Qwen3-0.6B"],
-  "precision": ["original", "GAF4"],
+  "precision": ["original", "TQ4"],
   "env": {
     "BACKEND": "cpu"
   },

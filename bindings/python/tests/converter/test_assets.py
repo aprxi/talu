@@ -232,7 +232,7 @@ class TestConfigPatcherBehavior:
         # This is what copyConfigFileWithQuantization adds
         quant_config = {
             "quant_method": "talu",
-            "quant_type": "gaf4_64",
+            "quant_type": "tq4_64",
             "bits": 4,
         }
 
@@ -254,7 +254,7 @@ class TestConfigPatcherBehavior:
         # After patching, the new quantization_config should completely replace old
         new_quant = {
             "quant_method": "talu",
-            "quant_type": "gaf4_64",
+            "quant_type": "tq4_64",
             "bits": 4,
         }
 

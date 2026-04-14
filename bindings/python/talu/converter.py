@@ -216,6 +216,15 @@ def scheme_to_enum(scheme: str) -> int:
     ValidationError
         If the scheme name is not recognized.
     """
+    scheme_lower = scheme.lower()
+
+    # Canonical scheme names defined in Python should resolve directly.
+    # This keeps Python's public scheme surface stable even if Zig parser
+    # aliases evolve independently.
+    direct = SCHEME_NAME_TO_ENUM.get(scheme_lower)
+    if direct is not None:
+        return direct
+
     lib = _get_convert_lib()
     code = lib.talu_convert_parse_scheme(scheme.encode("utf-8"))
 
@@ -229,7 +238,7 @@ def scheme_to_enum(scheme: str) -> int:
             for v in scheme_data.values():
                 if v:
                     aliases.extend(v)
-            all_valid = sorted(set(valid) | set(aliases))
+            all_valid = sorted(set(valid) | set(aliases) | set(ALL_SCHEMES))
         except (json.JSONDecodeError, KeyError, TypeError):
             all_valid = sorted(ALL_SCHEMES)
 

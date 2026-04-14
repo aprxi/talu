@@ -209,4 +209,4 @@ class TestPlatformQuantValidation:
         """Explicit scheme takes precedence over platform/quant."""
         # When scheme is set, platform should be ignored
         with pytest.raises(ConvertError):
-            convert_func("nonexistent/model", scheme="gaf4_32", platform="metal")
+            convert_func("nonexistent/model", scheme="tq4", platform="metal")

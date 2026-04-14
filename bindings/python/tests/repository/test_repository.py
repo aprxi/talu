@@ -163,7 +163,7 @@ class TestListModelsSourceField:
         from talu.repository import _call_repo_list_models as call_repo_list_models
 
         talu_home = tmp_path / "talu_home"
-        model_dir = talu_home / "models" / "TestOrg" / "TestModel-GAF4"
+        model_dir = talu_home / "models" / "TestOrg" / "TestModel-TQ4"
         model_dir.mkdir(parents=True)
 
         # Create a weights file so require_weights passes
@@ -173,8 +173,8 @@ class TestListModelsSourceField:
 
         entries = list(call_repo_list_models(True))
         local_entries = [(mid, p, s) for mid, p, s in entries if s == "managed"]
-        assert any(mid == "TestOrg/TestModel-GAF4" for mid, _, _ in local_entries), (
-            f"Expected TestOrg/TestModel-GAF4 in local entries, got: {local_entries}"
+        assert any(mid == "TestOrg/TestModel-TQ4" for mid, _, _ in local_entries), (
+            f"Expected TestOrg/TestModel-TQ4 in local entries, got: {local_entries}"
         )
 
 

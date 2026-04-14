@@ -19,7 +19,7 @@ import { navigate, onRouteChange } from "../../kernel/system/router.ts";
 import type { ModelEntry } from "../../types.ts";
 
 /** Collapse quant variants into one entry per family.
- *  Managed models with GAF suffixes (e.g. Qwen/Qwen3-0.6B-GAF4) share
+ *  Managed models with TQ suffixes (e.g. Qwen/Qwen3-0.6B-TQ4) share
  *  the same parent (Qwen/Qwen3-0.6B). Only the first variant per family
  *  appears in the selector, with the family name as display_name. */
 function deduplicateByFamily(models: ModelEntry[]): ModelEntry[] {
@@ -27,7 +27,7 @@ function deduplicateByFamily(models: ModelEntry[]): ModelEntry[] {
   for (const m of models) {
     let familyKey = m.id;
     if (m.source === "managed") {
-      const stripped = m.id.replace(/-GAF\d+(-G\d+)?$/, "");
+      const stripped = m.id.replace(/-TQ\d+(?:_\d+|-G\d+)?$/, "");
       if (stripped !== m.id) familyKey = stripped;
     }
     const label = familyKey !== m.id

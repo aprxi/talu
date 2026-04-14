@@ -310,7 +310,7 @@ export const chatPlugin: PluginDefinition = {
         for (const v of entry.variants) {
           const pill = document.createElement("button");
           pill.className = "welcome-variant-pill";
-          // Format: "GAF4 · 2.5 GB" or just label
+          // Format: "TQ4 · 2.5 GB" or just label
           let text = v.label;
           if (v.size_bytes && v.size_bytes > 0) {
             text += ` \u00b7 ${formatBytes(v.size_bytes)}`;

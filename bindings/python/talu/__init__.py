@@ -146,7 +146,7 @@ Async server pattern:
 
 Convert a model to 4-bit quantized format:
 
-    >>> path = talu.convert("Qwen/Qwen3-0.6B", scheme="gaf4_64")
+    >>> path = talu.convert("Qwen/Qwen3-0.6B", scheme="tq4")
     >>> chat = Chat(path)
 
 

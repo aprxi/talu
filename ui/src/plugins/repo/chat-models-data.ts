@@ -16,7 +16,7 @@ function emitChanged(): void {
     if (!familyMap.has(key)) {
       familyMap.set(key, { defaultVariant: id, variants: [] });
     }
-    // Use quant_scheme for label (e.g. "GAF4"), fall back to suffix.
+    // Use quant_scheme for label (e.g. "TQ4"), fall back to suffix.
     const suffix = key !== id ? id.slice(key.length + 1) : (id.split("/").pop() ?? id);
     const label = model?.quant_scheme || suffix;
     familyMap.get(key)!.variants.push({ id, label, size_bytes: model?.size_bytes ?? 0 });

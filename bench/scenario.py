@@ -7,7 +7,7 @@ Config model fields:
     model_uri:   List of base model IDs (or comma-separated string via CLI).
                  e.g. ["Qwen/Qwen3-0.6B", "Qwen/Qwen3.5-2B"]
     precision:   List of precision schemes (or comma-separated string via CLI).
-                 e.g. ["original", "GAF4"]
+                 e.g. ["original", "TQ4"]
                  "original" = unmodified model (no URI suffix).
                  Every model × precision combination is benchmarked.
 """
@@ -64,7 +64,7 @@ SAMPLING_PRESETS: dict[str, dict[str, float | int]] = {
 
 _DEFAULT_CONFIG: dict = {
     "model_uri": ["Qwen/Qwen3.5-0.8B"],
-    "precision": ["original", "GAF8", "GAF4"],
+    "precision": ["original", "TQ8", "TQ4"],
     "env": {},
     "streaming": False,
     "seed": 42,

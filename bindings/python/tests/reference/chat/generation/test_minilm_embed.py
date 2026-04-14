@@ -1,7 +1,7 @@
 """Reference tests for MiniLM embedding quality vs PyTorch.
 
 Requires:
-    - TALU_TEST_MINILM env var pointing to converted MiniLM-L6-v2-GAF8 model
+    - TALU_TEST_MINILM env var pointing to converted MiniLM-L6-v2-TQ8 model
     - sentence-transformers/all-MiniLM-L6-v2 available via transformers
 """
 
@@ -103,7 +103,7 @@ class TestMiniLMEmbedBasic:
 class TestMiniLMEmbedAccuracy:
     """Numerical accuracy vs PyTorch reference.
 
-    Tolerances account for GAF8 quantization. Full-precision models
+    Tolerances account for TQ8 quantization. Full-precision models
     would allow tighter bounds (cosine > 0.9999).
     """
 
@@ -143,14 +143,14 @@ class TestMiniLMEmbedAccuracy:
         assert 0.95 < ratio < 1.05, f"Norm ratio {ratio:.4f} outside [0.95, 1.05]"
 
     def test_max_absolute_difference(self, router, hf_model):
-        """Per-element max difference bounded for GAF8 quantized model."""
+        """Per-element max difference bounded for TQ8 quantized model."""
         tokenizer, model = hf_model
         text = "Hello world"
         talu_emb = np.array(router.embed(text, normalize=False, pooling="mean"))
         hf_emb = _hf_embed(tokenizer, model, text, pooling="mean")
 
         max_diff = np.max(np.abs(talu_emb - hf_emb))
-        # GAF8 quantization introduces small errors; 0.05 is generous
+        # TQ8 quantization introduces small errors; 0.05 is generous
         assert max_diff < 0.05, (
             f"Max abs diff {max_diff:.6f} >= 0.05 | "
             f"talu_norm={np.linalg.norm(talu_emb):.4f} "

@@ -9,7 +9,7 @@ Examples:
     python bench/run.py list
     python bench/run.py responses/perf/hello --config cuda
     python bench/run.py responses/perf/hello --config cuda --rounds 3
-    python bench/run.py responses/perf/hello --config cuda --set precision=original,GAF4
+    python bench/run.py responses/perf/hello --config cuda --set precision=original,TQ4
     python bench/run.py responses/perf/hello --config cuda --set model_uri=Qwen/Qwen3-0.6B,Qwen/Qwen3.5-2B
     python bench/run.py responses/perf/hello --config cuda --env BACKEND=cpu
     python bench/run.py responses/evals/mmlu --samples 100
@@ -223,7 +223,7 @@ def cmd_list() -> None:
     print(f"  python {argv0} {first}")
     print(f"  python {argv0} {first} --config cuda --rounds 3")
     print(f"  python {argv0} {first} --set model_uri=Qwen/Qwen3-0.6B,Qwen/Qwen3.5-0.8B")
-    print(f"  python {argv0} {first} --set precision=original,GAF4")
+    print(f"  python {argv0} {first} --set precision=original,TQ4")
     print(f"  python {argv0} {first} --set preset=coding")
     print(f"  python {argv0} {first} --set preset=coding --set temperature=0.3")
     if first_db:
@@ -673,10 +673,10 @@ def _print_model_table(
             ttft_mx = f"{max(ttft_vals):.0f}ms"
         else:
             ttft_avg = ttft_mn = ttft_mx = "—"
-        # Derive precision label from model_info (includes group size for GAF).
+        # Derive precision label from model_info (includes group size for TQ).
         dtype = mi.get("weight_dtype", "")
         gs = mi.get("gaffine_group_size", 0)
-        if dtype and dtype.startswith("GAF") and gs > 0:
+        if dtype and dtype.startswith("TQ") and gs > 0:
             label = f"{dtype}_{gs}"
         elif dtype:
             label = dtype
@@ -905,7 +905,7 @@ def _print_eval_model_table(
         # Precision label.
         dtype = mi.get("weight_dtype", "")
         gs = mi.get("gaffine_group_size", 0)
-        if dtype and dtype.startswith("GAF") and gs > 0:
+        if dtype and dtype.startswith("TQ") and gs > 0:
             label = f"{dtype}_{gs}"
         elif dtype:
             label = dtype

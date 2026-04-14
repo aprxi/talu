@@ -16,10 +16,10 @@ from pathlib import Path
 # =============================================================================
 
 # Convert with platform-aware defaults (recommended)
-path = talu.convert("Qwen/Qwen3-0.6B", platform="cpu")  # -> gaf4_64
+path = talu.convert("Qwen/Qwen3-0.6B", platform="cpu")  # -> tq4
 
 # Or with explicit scheme
-path = talu.convert("Qwen/Qwen3-0.6B", scheme="gaf4_64")
+path = talu.convert("Qwen/Qwen3-0.6B", scheme="tq4_64")
 
 # Use the converted model directly
 chat = talu.Chat(path)
@@ -34,7 +34,7 @@ print(response)
 # No auto-naming - the model is written exactly where you specify
 path = talu.convert(
     "Qwen/Qwen3-0.6B",
-    scheme="gaf4_64",
+    scheme="tq4_64",
     destination="./models/qwen3-0.6b-q4",
 )
 assert path.endswith("qwen3-0.6b-q4")  # Predictable!
@@ -42,7 +42,7 @@ assert path.endswith("qwen3-0.6b-q4")  # Predictable!
 # Perfect for CI pipelines and deployment scripts
 path = talu.convert(
     "Qwen/Qwen3-0.6B",
-    scheme="gaf4_64",
+    scheme="tq4_64",
     destination="/opt/models/production-model",
     force=True,
 )
@@ -54,16 +54,16 @@ path = talu.convert(
 # Without destination, Talu auto-generates a name in output_dir
 path = talu.convert(
     "Qwen/Qwen3-0.6B",
-    scheme="gaf4_64",
+    scheme="tq4_64",
     output_dir="./my-models",  # Parent directory
 )
-print(f"Auto-named: {path}")  # ./my-models/Qwen/Qwen3-0.6B-GAF4_64
+print(f"Auto-named: {path}")  # ./my-models/Qwen/Qwen3-0.6B-TQ4_64
 
 # Using the Converter class for multiple conversions
 converter = talu.Converter(output_dir="./quantized")
 
-path1 = converter("Qwen/Qwen3-0.6B", scheme="gaf4_64")
-path2 = converter("Qwen/Qwen3-0.6B", scheme="gaf8_64")
+path1 = converter("Qwen/Qwen3-0.6B", scheme="tq4_64")
+path2 = converter("Qwen/Qwen3-0.6B", scheme="tq8")
 
 print(f"4-bit: {path1}")
 print(f"8-bit: {path2}")
@@ -74,12 +74,12 @@ print(f"8-bit: {path2}")
 
 # By default, convert() errors if output already exists
 # Use force=True to overwrite
-path = talu.convert("Qwen/Qwen3-0.6B", scheme="gaf4_64", force=True)
+path = talu.convert("Qwen/Qwen3-0.6B", scheme="tq4_64", force=True)
 
 # Works with destination too
 path = talu.convert(
     "Qwen/Qwen3-0.6B",
-    scheme="gaf4_64",
+    scheme="tq4_64",
     destination="./models/qwen3",
     force=True,
 )

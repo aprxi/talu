@@ -71,22 +71,22 @@ cat test.jpeg | talu ask -m Qwen/Qwen3-VL-2B-Instruct "What objects are visible?
 
 ```bash
 talu convert LiquidAI/LFM2-350M
-talu set LiquidAI/LFM2-350M-GAF4
+talu set LiquidAI/LFM2-350M-TQ4
 talu ask "Explain quantization in one sentence."
 ```
 
-Converts the model to 4-bit (default scheme: `gaf4_64`). Converted models are saved with a `-GAF4` suffix; the original remains available.
+Converts the model to 4-bit (default scheme: `tq4`). Converted models are saved with a `-TQ4` suffix; the original remains available.
 
-Available schemes (Grouped Affine):
+Available schemes (Talu Quantized):
 
 | Scheme | Description |
 |---|---|
-| `gaf4_32` | 4-bit, group 32 — highest accuracy, largest |
-| `gaf4_64` | 4-bit, group 64 — balanced (default) |
-| `gaf4_128` | 4-bit, group 128 — smallest 4-bit |
-| `gaf8_32` | 8-bit, group 32 — near-original quality |
-| `gaf8_64` | 8-bit, group 64 |
-| `gaf8_128` | 8-bit, group 128 |
+| `tq4` | 4-bit, group 32 — highest accuracy, largest (default) |
+| `tq4_64` | 4-bit, group 64 — balanced |
+| `tq4_128` | 4-bit, group 128 — smallest 4-bit |
+| `tq8_32` | 8-bit, group 32 — near-original quality |
+| `tq8` | 8-bit, group 64 |
+| `tq8_128` | 8-bit, group 128 |
 
 4-bit reduces model size ~4x with some quality loss. 8-bit preserves more quality at ~2x reduction. Smaller group sizes improve accuracy but increase file size.
 
