@@ -142,23 +142,39 @@ class TestVerifyModel:
 class TestVerifyModelIntegration:
     """Integration tests for verify() requiring a real model."""
 
-    def test_verify_valid_model(self, test_model_path):
+    @pytest.fixture(scope="class")
+    def generation_model_path(self, test_model_path):
+        """Return a model URI that can actually create a generation backend."""
+        from talu.chat import Chat
+
+        try:
+            with Chat(test_model_path) as chat:
+                chat("ping", max_tokens=1, stream=False)
+        except Exception as exc:
+            pytest.skip(
+                "Verification integration requires a generation-capable model. "
+                f"Current model is unusable for chat inference: {exc}"
+            )
+
+        return test_model_path
+
+    def test_verify_valid_model(self, generation_model_path):
         """verify() succeeds for valid model."""
-        result = verify(test_model_path, max_tokens=3)
+        result = verify(generation_model_path, max_tokens=3)
 
         assert result.success is True
         assert result.tokens_generated >= 0
 
-    def test_verify_with_custom_prompt(self, test_model_path):
+    def test_verify_with_custom_prompt(self, generation_model_path):
         """verify() uses custom prompt."""
-        result = verify(test_model_path, prompt="2 + 2 =", max_tokens=3)
+        result = verify(generation_model_path, prompt="2 + 2 =", max_tokens=3)
 
         assert result.success is True
         assert result.tokens_generated >= 0
 
-    def test_verify_result_can_be_used_in_condition(self, test_model_path):
+    def test_verify_result_can_be_used_in_condition(self, generation_model_path):
         """VerificationResult works in if statements."""
-        result = verify(test_model_path, max_tokens=3)
+        result = verify(generation_model_path, max_tokens=3)
 
         if result:
             passed = True

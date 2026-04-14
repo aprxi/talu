@@ -26,11 +26,28 @@ pub const ValidationResult = struct {
     valid: bool,
 
     pub fn deinit(self: *ValidationResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.required);
-        allocator.free(self.optional);
-        allocator.free(self.extra);
+        freeOwnedNameList(allocator, self.required);
+        freeOwnedNameList(allocator, self.optional);
+        freeOwnedNameList(allocator, self.extra);
     }
 };
+
+fn freeOwnedNameList(allocator: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |name| {
+        allocator.free(name);
+    }
+    allocator.free(names);
+}
+
+fn appendDupName(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged([]const u8),
+    name: []const u8,
+) !void {
+    const dup = try allocator.dupe(u8, name);
+    errdefer allocator.free(dup);
+    try list.append(allocator, dup);
+}
 
 /// Built-in names that should not be considered input variables
 const builtin_names = std.StaticStringMap(void).initComptime(.{
@@ -401,35 +418,50 @@ pub fn validate(
 
     // Find missing required: in required but not in provided
     var required_list = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (required_list.items) |name| allocator.free(name);
+        required_list.deinit(allocator);
+    }
     var req_iter = extracted.required.iterator();
     while (req_iter.next()) |entry| {
         if (!provided.contains(entry.key_ptr.*)) {
-            try required_list.append(allocator, entry.key_ptr.*);
+            try appendDupName(allocator, &required_list, entry.key_ptr.*);
         }
     }
 
     // Find missing optional: in optional but not in provided
     // (and not already in required - a variable can be both if used in multiple places)
     var optional_list = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (optional_list.items) |name| allocator.free(name);
+        optional_list.deinit(allocator);
+    }
     var opt_iter = extracted.optional.iterator();
     while (opt_iter.next()) |entry| {
         if (!provided.contains(entry.key_ptr.*) and !extracted.required.contains(entry.key_ptr.*)) {
-            try optional_list.append(allocator, entry.key_ptr.*);
+            try appendDupName(allocator, &optional_list, entry.key_ptr.*);
         }
     }
 
     // Find extra: in provided but not in required or optional
     var extra_list = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (extra_list.items) |name| allocator.free(name);
+        extra_list.deinit(allocator);
+    }
     var provided_iter = provided.iterator();
     while (provided_iter.next()) |entry| {
         if (!extracted.required.contains(entry.key_ptr.*) and !extracted.optional.contains(entry.key_ptr.*)) {
-            try extra_list.append(allocator, entry.key_ptr.*);
+            try appendDupName(allocator, &extra_list, entry.key_ptr.*);
         }
     }
 
     const required_missing = try required_list.toOwnedSlice(allocator);
+    errdefer freeOwnedNameList(allocator, required_missing);
     const optional_missing = try optional_list.toOwnedSlice(allocator);
+    errdefer freeOwnedNameList(allocator, optional_missing);
     const extra = try extra_list.toOwnedSlice(allocator);
+    errdefer freeOwnedNameList(allocator, extra);
 
     return .{
         .required = required_missing,

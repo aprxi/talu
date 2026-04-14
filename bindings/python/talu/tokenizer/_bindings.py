@@ -36,6 +36,16 @@ def create_dlpack_capsule(dlpack_ptr: Any) -> Any:
 _lib = get_lib()
 
 
+def _decode_u8_cstr(ptr: Any) -> str | None:
+    """Decode a C string pointer typed as POINTER(c_uint8) or c_char_p."""
+    if not ptr:
+        return None
+    raw = ctypes.cast(ptr, ctypes.c_char_p).value
+    if raw is None:
+        return None
+    return raw.decode("utf-8")
+
+
 def call_apply_chat_template(
     model_path: bytes, messages_json: bytes, add_generation_prompt: bool
 ) -> tuple[int, str | None]:
@@ -197,7 +207,7 @@ def call_tokenizer_decode(
     result = _lib.talu_tokenizer_decode(ptr, tokens_ptr, num_tokens, ctypes.byref(options))
 
     if result.error_msg:
-        return (None, result.error_msg.decode("utf-8"))
+        return (None, _decode_u8_cstr(result.error_msg) or "Decode failed")
 
     if not result.text or result.text_len == 0:
         return ("", None)
@@ -332,7 +342,7 @@ def call_tokenizer_get_vocab(ptr: int) -> tuple[dict[str, int], str | None]:
     result = _lib.talu_tokenizer_get_vocab(ptr)
 
     if result.error_msg:
-        return ({}, result.error_msg.decode("utf-8"))
+        return ({}, _decode_u8_cstr(result.error_msg) or "Vocab extraction failed")
 
     if result.num_entries == 0:
         return ({}, None)

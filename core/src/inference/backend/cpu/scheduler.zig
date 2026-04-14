@@ -1941,6 +1941,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const can_use_top_k_streaming = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
+                // Route non-stream top-k through candidate sampling. Some backends
+                // expose a fast streaming bridge that is callback-oriented; using
+                // it for non-stream requests can fail even when candidate decode
+                // is supported.
+                submit_config.callback != null and
                 submit_config.vision_input == null and
                 submit_config.stop_sequences.len == 0 and
                 submit_config.grammar_sampler == null and

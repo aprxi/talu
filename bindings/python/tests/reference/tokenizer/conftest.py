@@ -1,8 +1,8 @@
-"""
-Reference tokenizer test fixtures.
+"""Reference tokenizer fixtures.
 
-Expose shared tokenizer fixtures to the reference tokenizer subtree without
-registering them globally for the full test suite.
+Pytest 9 removed support for ``pytest_plugins`` declarations in non-top-level
+conftest files. Re-export tokenizer fixtures directly for this subtree.
 """
 
-pytest_plugins = ["tests.tokenizer.conftest"]
+from tests.tokenizer.conftest import *  # noqa: F401,F403
+

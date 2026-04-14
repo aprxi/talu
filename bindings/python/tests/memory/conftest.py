@@ -146,10 +146,22 @@ def memory_tracker():
                     page_size = os.sysconf("SC_PAGE_SIZE")
                     return resident_pages * page_size
             except (OSError, FileNotFoundError):
-                # Fallback for non-Linux (less accurate)
-                import resource
+                # Fallback for non-Linux.
+                # Prefer current RSS from psutil; ru_maxrss is peak RSS and
+                # produces false leak positives in long-running test processes.
+                try:
+                    import psutil
 
-                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+                    return psutil.Process().memory_info().rss
+                except ImportError:
+                    import resource
+                    import sys
+
+                    ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    # macOS returns bytes, Linux typically returns KiB.
+                    if sys.platform == "darwin":
+                        return ru_maxrss
+                    return ru_maxrss * 1024
 
         def capture_baseline(self):
             """Capture current memory as baseline."""

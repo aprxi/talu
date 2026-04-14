@@ -65,48 +65,48 @@ class TestRouterErrorMessages:
 class TestRouterEmbedIntegration:
     """Integration tests for Router.embed() requiring a real model."""
 
-    def test_embed_returns_list_of_floats(self, test_model_path):
+    def test_embed_returns_list_of_floats(self, embedding_model_path):
         """embed() returns a list of floats."""
-        router = Router(models=[test_model_path])
+        router = Router(models=[embedding_model_path])
         embedding = router.embed("Hello, world!")
         assert isinstance(embedding, list)
         assert len(embedding) > 0
         assert all(isinstance(x, float) for x in embedding)
         router.close()
 
-    def test_embed_dimension_matches_model(self, test_model_path):
+    def test_embed_dimension_matches_model(self, embedding_model_path):
         """embed() returns correct dimension for model."""
-        router = Router(models=[test_model_path])
+        router = Router(models=[embedding_model_path])
         dim = router.embedding_dim()
         embedding = router.embed("Hello, world!")
         assert len(embedding) == dim
         assert dim > 0  # Should be d_model (e.g., 1024)
         router.close()
 
-    def test_embed_normalized_unit_length(self, test_model_path):
+    def test_embed_normalized_unit_length(self, embedding_model_path):
         """Normalized embedding has approximately unit L2 norm."""
         import math
 
-        router = Router(models=[test_model_path])
+        router = Router(models=[embedding_model_path])
         embedding = router.embed("Hello, world!", normalize=True)
         norm = math.sqrt(sum(x * x for x in embedding))
         assert abs(norm - 1.0) < 0.01  # Close to unit length
         router.close()
 
-    def test_embed_unnormalized_not_unit_length(self, test_model_path):
+    def test_embed_unnormalized_not_unit_length(self, embedding_model_path):
         """Unnormalized embedding may not have unit length."""
         import math
 
-        router = Router(models=[test_model_path])
+        router = Router(models=[embedding_model_path])
         embedding = router.embed("Hello, world!", normalize=False)
         norm = math.sqrt(sum(x * x for x in embedding))
         # Just verify we got a valid embedding, norm could be anything
         assert norm > 0
         router.close()
 
-    def test_embed_pooling_strategies_produce_different_results(self, test_model_path):
+    def test_embed_pooling_strategies_produce_different_results(self, embedding_model_path):
         """Different pooling strategies produce different embeddings."""
-        router = Router(models=[test_model_path])
+        router = Router(models=[embedding_model_path])
         emb_last = router.embed("Hello, world!", pooling="last")
         emb_mean = router.embed("Hello, world!", pooling="mean")
         emb_first = router.embed("Hello, world!", pooling="first")
@@ -116,16 +116,16 @@ class TestRouterEmbedIntegration:
         assert emb_last != emb_mean or emb_last != emb_first
         router.close()
 
-    def test_embed_different_texts_produce_different_embeddings(self, test_model_path):
+    def test_embed_different_texts_produce_different_embeddings(self, embedding_model_path):
         """Different texts produce different embeddings."""
-        router = Router(models=[test_model_path])
+        router = Router(models=[embedding_model_path])
         emb1 = router.embed("Hello, world!")
         emb2 = router.embed("Goodbye, world!")
         # Embeddings should be different
         assert emb1 != emb2
         router.close()
 
-    def test_embed_same_text_produces_similar_embedding(self, test_model_path):
+    def test_embed_same_text_produces_similar_embedding(self, embedding_model_path):
         """Same text produces consistent embeddings.
 
         Uses separate Router instances to isolate state. Transformers
@@ -135,11 +135,11 @@ class TestRouterEmbedIntegration:
         """
         import math
 
-        router1 = Router(models=[test_model_path])
+        router1 = Router(models=[embedding_model_path])
         emb1 = router1.embed("Hello, world!")
         router1.close()
 
-        router2 = Router(models=[test_model_path])
+        router2 = Router(models=[embedding_model_path])
         emb2 = router2.embed("Hello, world!")
         router2.close()
 

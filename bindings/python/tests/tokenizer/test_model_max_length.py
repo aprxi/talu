@@ -35,7 +35,12 @@ class TestModelMaxLength:
         assert 512 <= max_len <= 2_000_000
 
     def test_model_max_length_matches_config(self, tokenizer):
-        """model_max_length matches value from tokenizer_config.json."""
+        """model_max_length matches tokenizer_config when value is practical.
+
+        HuggingFace tokenizer configs often use extremely large sentinel values
+        (effectively "unbounded"). Core normalizes those to a usable context
+        length fallback, so exact equality is only asserted for practical values.
+        """
         import json
         from pathlib import Path
 
@@ -45,7 +50,10 @@ class TestModelMaxLength:
                 config = json.load(f)
             if "model_max_length" in config:
                 expected = config["model_max_length"]
-                assert tokenizer.model_max_length == expected
+                if isinstance(expected, int) and 0 < expected <= 2_000_000:
+                    assert tokenizer.model_max_length == expected
+                else:
+                    assert tokenizer.model_max_length > 0
 
 
 class TestTruncationWithModelMaxLength:

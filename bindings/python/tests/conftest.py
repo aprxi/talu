@@ -257,10 +257,13 @@ def _is_model_available(model_uri: str) -> bool:
 
 def _missing_model_msg(env_var: str, model_uri: str) -> str:
     """Build a concise, actionable missing-model message."""
+    example_line = ""
+    if "/" in model_uri and "::" not in model_uri:
+        example_line = f"\nExample: talu get {model_uri}"
     return (
         f"Required test model is missing: {model_uri!r} ({env_var}).\n"
         f"Set {env_var} to an available local model URI/path, or cache the default model first.\n"
-        "Example: talu get llamafactory/tiny-random-Llama-3\n"
+        f"{example_line}\n"
         "If you only want model-free tests: pytest -m 'not requires_model'."
     )
 
@@ -281,6 +284,33 @@ def _validate_model_loadable_for_tokenizer(model_uri: str) -> str | None:
 
         tokenizer = talu.Tokenizer(model_uri)
         tokenizer.close()
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _validate_model_loadable_for_generation(model_uri: str) -> str | None:
+    """Return an error string if chat generation fails for model_uri."""
+    try:
+        import talu
+
+        with talu.Chat(model_uri) as chat:
+            chat("ping", max_tokens=1, stream=False)
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _validate_model_loadable_for_embeddings(model_uri: str) -> str | None:
+    """Return an error string if embedding APIs fail for model_uri."""
+    try:
+        from talu.router import Router
+
+        router = Router(models=[model_uri])
+        try:
+            _ = router.embedding_dim(model_uri)
+        finally:
+            router.close()
     except Exception as exc:
         return str(exc)
     return None
@@ -309,13 +339,34 @@ def _preflight_models_for_selected_suites(config) -> None:
 
     args = tuple(config.invocation_params.args)
     suite_model_targets = (
-        ("tests/tokenizer", "TEST_MODEL_URI_TEXT_RANDOM", TEST_MODEL_URI_TEXT_RANDOM),
-        ("tests/memory", "TEST_MODEL_URI_TEXT_RANDOM", TEST_MODEL_URI_TEXT_RANDOM),
-        ("tests/reference", "TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT),
+        (
+            "tests/tokenizer",
+            "TEST_MODEL_URI_TEXT_RANDOM",
+            TEST_MODEL_URI_TEXT_RANDOM,
+            _validate_model_loadable_for_tokenizer,
+        ),
+        (
+            "tests/memory",
+            "TEST_MODEL_URI_TEXT_RANDOM",
+            TEST_MODEL_URI_TEXT_RANDOM,
+            _validate_model_loadable_for_tokenizer,
+        ),
+        (
+            "tests/chat",
+            "TEST_MODEL_URI_TEXT",
+            TEST_MODEL_URI_TEXT,
+            _validate_model_loadable_for_generation,
+        ),
+        (
+            "tests/reference",
+            "TEST_MODEL_URI_TEXT",
+            TEST_MODEL_URI_TEXT,
+            _validate_model_loadable_for_tokenizer,
+        ),
     )
     selected = [
-        (env_var, model_uri)
-        for suite_path, env_var, model_uri in suite_model_targets
+        (env_var, model_uri, validator)
+        for suite_path, env_var, model_uri, validator in suite_model_targets
         if _arg_targets_path(args, suite_path)
     ]
     if not selected:
@@ -325,10 +376,10 @@ def _preflight_models_for_selected_suites(config) -> None:
     if library_reason is not None:
         return
 
-    for env_var, model_uri in selected:
+    for env_var, model_uri, validator in selected:
         if not _is_model_available(model_uri):
             pytest.exit(_missing_model_msg(env_var, model_uri), returncode=2)
-        load_error = _validate_model_loadable_for_tokenizer(model_uri)
+        load_error = validator(model_uri)
         if load_error is not None:
             pytest.exit(_unusable_model_msg(env_var, model_uri, load_error), returncode=2)
 
@@ -380,16 +431,23 @@ def memory_tracker():
     class MemoryTracker:
         @staticmethod
         def get_rss():
-            """Get current RSS (Resident Set Size) in bytes."""
-            try:
-                import resource
+            """Get current RSS (Resident Set Size) in bytes.
 
-                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-            except ImportError:
-                # Windows fallback
+            Prefer psutil for current RSS. resource.getrusage().ru_maxrss reports
+            peak RSS, which produces false leak positives on macOS.
+            """
+            try:
                 import psutil
 
                 return psutil.Process().memory_info().rss
+            except ImportError:
+                import resource
+
+                ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                # macOS reports bytes, Linux typically reports KiB.
+                if sys.platform == "darwin":
+                    return ru_maxrss
+                return ru_maxrss * 1024
 
         @staticmethod
         def force_gc():

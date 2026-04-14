@@ -283,12 +283,14 @@ class TestDecodeCorrectnessComprehensive:
         Invalid token IDs should raise in both implementations.
         """
         try:
-            hf_decoded = hf_tokenizer.decode([token_id])
+            # Compare raw decode output. HF defaults to preserving specials,
+            # while talu defaults to skipping them.
+            hf_decoded = hf_tokenizer.decode([token_id], skip_special_tokens=False)
         except Exception:
             # If HF can't decode it, we don't expect talu to either
             pytest.skip(f"Token ID {token_id} is invalid in this tokenizer")
 
-        talu_decoded = tokenizer.decode([token_id])
+        talu_decoded = tokenizer.decode([token_id], skip_special_tokens=False)
 
         assert talu_decoded == hf_decoded, (
             f"Single token {token_id} mismatch:\n"

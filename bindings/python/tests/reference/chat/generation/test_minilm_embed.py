@@ -13,14 +13,24 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from talu.router import Router
-from tests.conftest import TEST_MODEL_HF_MINILM, TEST_MODEL_URI_EMBEDDING
+from tests.conftest import (
+    TEST_MODEL_HF_MINILM,
+    TEST_MODEL_URI_EMBEDDING,
+    _is_model_available,
+    _missing_model_msg,
+    _unusable_model_msg,
+    _validate_model_loadable_for_embeddings,
+)
 
 
 @pytest.fixture(scope="module")
 def minilm_path():
     path = TEST_MODEL_URI_EMBEDDING
-    if path is None:
-        pytest.skip("MiniLM model not found. Set TALU_TEST_MINILM or place under models/.")
+    if not _is_model_available(path):
+        pytest.skip(_missing_model_msg("TEST_MODEL_URI_EMBEDDING", path))
+    load_error = _validate_model_loadable_for_embeddings(path)
+    if load_error is not None:
+        pytest.skip(_unusable_model_msg("TEST_MODEL_URI_EMBEDDING", path, load_error))
     return path
 
 

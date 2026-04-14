@@ -507,8 +507,8 @@ class TestPoint:
         assert Point.EMBED.value == 0
         assert Point.EMBED_POS.value == 1
         assert Point.LAYER_INPUT.value == 2
-        assert Point.LM_HEAD.value == 21
-        assert Point.LOGITS_SCALED.value == 22
+        assert Point.LM_HEAD.value == 27
+        assert Point.LOGITS_SCALED.value == 28
 
     def test_point_names(self):
         """Point names are correct."""
@@ -522,9 +522,10 @@ class TestCaptureMode:
 
     def test_capture_mode_values(self):
         """CaptureMode enum has expected values."""
-        assert CaptureMode.STATS.value == 0
-        assert CaptureMode.SAMPLE.value == 1
-        assert CaptureMode.FULL.value == 2
+        assert CaptureMode.TIMING.value == 0
+        assert CaptureMode.STATS.value == 1
+        assert CaptureMode.SAMPLE.value == 2
+        assert CaptureMode.FULL.value == 3
 
 
 class TestPointBitmasks:
@@ -533,14 +534,14 @@ class TestPointBitmasks:
     def test_bitmask_values(self):
         """Bitmask constants have expected values."""
         assert POINT_EMBED == 1 << 0
-        assert POINT_LM_HEAD == 1 << 21
-        assert POINT_BLOCK_OUT == 1 << 15
-        assert POINT_ALL == 0x7FFFFF  # 23 points
+        assert POINT_LM_HEAD == 1 << 27
+        assert POINT_BLOCK_OUT == 1 << 21
+        assert POINT_ALL == 0xFFFFFFFF  # 32 mask bits
 
     def test_bitmask_combination(self):
         """Bitmasks can be combined."""
         combined = POINT_EMBED | POINT_LM_HEAD
-        assert combined == (1 << 0) | (1 << 21)
+        assert combined == (1 << 0) | (1 << 27)
 
 
 class TestMultipleInspectors:

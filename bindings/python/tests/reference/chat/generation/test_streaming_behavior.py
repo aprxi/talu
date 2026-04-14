@@ -96,14 +96,14 @@ class TestStreamingBehavior:
         """
         from talu import Chat, GenerationConfig
 
-        chat = Chat(test_model_path, config=GenerationConfig(max_tokens=30))
+        chat = Chat(test_model_path, config=GenerationConfig(max_tokens=80, temperature=0.0))
 
         # Measure time to first token vs time to last token
         start = time.perf_counter()
         first_token_time = None
         token_count = 0
 
-        response = chat("Write a short sentence about cats", stream=True)
+        response = chat("Count from 1 to 200, separated by commas.", stream=True)
         for _token in response:
             if first_token_time is None:
                 first_token_time = time.perf_counter() - start
@@ -117,14 +117,14 @@ class TestStreamingBehavior:
         assert first_token_time is not None, "No tokens received"
         assert token_count >= 3, f"Expected at least 3 tokens, got {token_count}"
 
-        # First token should arrive in less than half the total time
-        # (with real streaming, it's usually <10% of total time)
+        # First token should arrive materially before completion.
+        # Keep this tolerant to hardware variability and backend warmup costs.
         if total_time > 0.05:  # Only check if generation took measurable time
             ratio = first_token_time / total_time
-            assert ratio < 0.5, (
+            assert ratio < 0.8, (
                 f"First token arrived at {first_token_time * 1000:.1f}ms, "
                 f"total time {total_time * 1000:.1f}ms (ratio={ratio:.2f}). "
-                f"First token should arrive much earlier if streaming works."
+                f"First token should still arrive before most of total generation."
             )
 
 

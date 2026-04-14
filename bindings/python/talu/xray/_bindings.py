@@ -27,9 +27,10 @@ _lib = get_lib()
 class CaptureMode(IntEnum):
     """What data to capture from each tensor."""
 
-    STATS = 0  # Statistics only: min, max, mean, rms, nan_count, inf_count
-    SAMPLE = 1  # Statistics + first N tensor values
-    FULL = 2  # Complete tensor data copy
+    TIMING = 0  # Metadata/timing only (no stats/value scans)
+    STATS = 1  # Statistics only: min, max, mean, rms, nan_count, inf_count
+    SAMPLE = 2  # Statistics + first N tensor values
+    FULL = 3  # Complete tensor data copy
 
 
 class Point(IntEnum):
@@ -45,24 +46,31 @@ class Point(IntEnum):
     ATTN_Q = 4  # AttentionKernel.forward() - Q projection
     ATTN_K = 5  # AttentionKernel.forward() - K projection
     ATTN_V = 6  # AttentionKernel.forward() - V projection
-    ATTN_QK = 7
-    ATTN_WEIGHTS = 8
-    ATTN_OUT = 9  # AttentionKernel.forward() - output projection
-    LAYER_FFN_NORM = 10
-    FFN_GATE = 11  # FfnKernel.forward() - gate/up projection
-    FFN_UP = 12
-    FFN_ACT = 13
-    FFN_DOWN = 14  # FfnKernel.forward() - down projection
-    BLOCK_OUT = 15  # model.forward() - after residual add
-    MAMBA_OUT = 16  # MambaKernel.forward()
-    CONV_IN_PROJ = 17  # ShortConvKernel - input projection
-    CONV_CONV = 18  # ShortConvKernel - depthwise convolution
-    CONV_OUT_PROJ = 19  # ShortConvKernel - output projection
-    FINAL_NORM = 20
-    LM_HEAD = 21  # lm_head matmul
-    LOGITS_SCALED = 22
-    LOGITS_READY = 23  # logits materialized and ready for selection
-    TOKEN_SELECT = 24  # next-token selection (argmax/sampling)
+    ATTN_Q_PROJ_RAW = 7  # Raw Q projection before compaction
+    ATTN_K_PROJ_RAW = 8  # Raw K projection before reshape/norm/RoPE
+    ATTN_Q_NORM = 9  # Q after QK norm, before RoPE
+    ATTN_K_NORM = 10  # K after QK norm, before RoPE
+    ATTN_Q_ROPE = 11  # Q after RoPE
+    ATTN_K_ROPE = 12  # K after RoPE
+    ATTN_QK = 13
+    ATTN_WEIGHTS = 14
+    ATTN_OUT = 15  # AttentionKernel.forward() - output projection
+    LAYER_FFN_NORM = 16
+    FFN_GATE = 17  # FfnKernel.forward() - gate/up projection
+    FFN_UP = 18
+    FFN_ACT = 19
+    FFN_DOWN = 20  # FfnKernel.forward() - down projection
+    BLOCK_OUT = 21  # model.forward() - after residual add
+    MAMBA_OUT = 22  # MambaKernel.forward()
+    CONV_IN_PROJ = 23  # ShortConvKernel - input projection
+    CONV_CONV = 24  # ShortConvKernel - depthwise convolution
+    CONV_OUT_PROJ = 25  # ShortConvKernel - output projection
+    FINAL_NORM = 26
+    LM_HEAD = 27  # lm_head matmul
+    LOGITS_SCALED = 28
+    LOGITS_READY = 29  # logits materialized and ready for selection
+    TOKEN_SELECT = 30  # next-token selection (argmax/sampling)
+    FFN_ACT_MAP = 31  # activation map stage
 
 
 # Point bitmasks for configuration
@@ -73,25 +81,32 @@ POINT_LAYER_ATTN_NORM = 1 << 3
 POINT_ATTN_Q = 1 << 4
 POINT_ATTN_K = 1 << 5
 POINT_ATTN_V = 1 << 6
-POINT_ATTN_QK = 1 << 7
-POINT_ATTN_WEIGHTS = 1 << 8
-POINT_ATTN_OUT = 1 << 9
-POINT_LAYER_FFN_NORM = 1 << 10
-POINT_FFN_GATE = 1 << 11
-POINT_FFN_UP = 1 << 12
-POINT_FFN_ACT = 1 << 13
-POINT_FFN_DOWN = 1 << 14
-POINT_BLOCK_OUT = 1 << 15
-POINT_MAMBA_OUT = 1 << 16
-POINT_CONV_IN_PROJ = 1 << 17
-POINT_CONV_CONV = 1 << 18
-POINT_CONV_OUT_PROJ = 1 << 19
-POINT_FINAL_NORM = 1 << 20
-POINT_LM_HEAD = 1 << 21
-POINT_LOGITS_SCALED = 1 << 22
-POINT_LOGITS_READY = 1 << 23
-POINT_TOKEN_SELECT = 1 << 24
-POINT_ALL = 0x1FFFFFF  # All 25 points
+POINT_ATTN_Q_PROJ_RAW = 1 << 7
+POINT_ATTN_K_PROJ_RAW = 1 << 8
+POINT_ATTN_Q_NORM = 1 << 9
+POINT_ATTN_K_NORM = 1 << 10
+POINT_ATTN_Q_ROPE = 1 << 11
+POINT_ATTN_K_ROPE = 1 << 12
+POINT_ATTN_QK = 1 << 13
+POINT_ATTN_WEIGHTS = 1 << 14
+POINT_ATTN_OUT = 1 << 15
+POINT_LAYER_FFN_NORM = 1 << 16
+POINT_FFN_GATE = 1 << 17
+POINT_FFN_UP = 1 << 18
+POINT_FFN_ACT = 1 << 19
+POINT_FFN_DOWN = 1 << 20
+POINT_BLOCK_OUT = 1 << 21
+POINT_MAMBA_OUT = 1 << 22
+POINT_CONV_IN_PROJ = 1 << 23
+POINT_CONV_CONV = 1 << 24
+POINT_CONV_OUT_PROJ = 1 << 25
+POINT_FINAL_NORM = 1 << 26
+POINT_LM_HEAD = 1 << 27
+POINT_LOGITS_SCALED = 1 << 28
+POINT_LOGITS_READY = 1 << 29
+POINT_TOKEN_SELECT = 1 << 30
+POINT_FFN_ACT_MAP = 1 << 31
+POINT_ALL = 0xFFFFFFFF  # All 32 points currently configurable via bitmask
 
 
 def points_to_mask(points: Sequence[str | Point]) -> int:
@@ -99,8 +114,8 @@ def points_to_mask(points: Sequence[str | Point]) -> int:
     mask = 0
     for p in points:
         if isinstance(p, str):
-            # Convert string to Point enum
-            p = Point[p.upper()]
+            # Accept both enum-style (lm_head) and native point-style (attn.q)
+            p = Point[p.upper().replace(".", "_")]
         mask |= 1 << p.value
     return mask
 

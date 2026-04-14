@@ -60,6 +60,14 @@ class TestTokenizerResultCleanup:
 
     def test_vocab_result_freed(self, tokenizer, memory_tracker):
         """Vocabulary result is freed."""
+        # Warm up repeated accesses first so tokenizer/runtime one-time cache
+        # growth is excluded from per-call leak checks.
+        for _ in range(20):
+            warmup = tokenizer.get_vocab()
+            _ = len(warmup)
+            del warmup
+        gc.collect()
+
         memory_tracker.capture_baseline()
 
         for _ in range(20):

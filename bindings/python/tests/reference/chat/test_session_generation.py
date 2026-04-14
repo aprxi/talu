@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from talu import AsyncChat, Chat, Client, GenerationConfig
 from talu.chat import AsyncResponse, Response, StreamingResponse
+from talu.exceptions import IncompleteJSONError
 from talu.router import Grammar
 from tests.conftest import TEST_MODEL_URI_TEXT as MODEL_URI
 from tests.conftest import TEST_MODEL_URI_TEXT_THINK as THINK_MODEL_URI
@@ -138,8 +139,12 @@ class TestResponseFormat:
 
             assert isinstance(response, Response)
             # parsed may be populated if valid JSON was generated
-            if response.parsed is not None:
-                assert hasattr(response.parsed, "answer")
+            try:
+                parsed = response.parsed
+            except IncompleteJSONError:
+                parsed = None
+            if parsed is not None:
+                assert hasattr(parsed, "answer")
         finally:
             del chat
 
@@ -192,8 +197,12 @@ class TestResponseFormat:
             # Verify grammar.response_format is preserved for hydration
             assert grammar.response_format is SimpleAnswer
             # Check parsed output if model produced valid JSON
-            if response.parsed is not None:
-                assert hasattr(response.parsed, "answer")
+            try:
+                parsed = response.parsed
+            except IncompleteJSONError:
+                parsed = None
+            if parsed is not None:
+                assert hasattr(parsed, "answer")
         finally:
             del chat
 

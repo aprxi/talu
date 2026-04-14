@@ -688,6 +688,7 @@ class TestErrorCodeInvariants:
         - 600-699: Template errors
         - 700-799: Storage errors
         - 900-999: System errors
+        - 1000-1099: Training errors
         """
         from talu._bindings import ERROR_MAP
         from talu.exceptions import (
@@ -698,12 +699,13 @@ class TestErrorCodeInvariants:
             StorageError,
             TaluError,
             TemplateError,
+            TrainingError,
             TokenizerError,
         )
 
         for code, (error_class, string_code) in ERROR_MAP.items():
             # Each code must be in a valid range
-            valid_ranges = (100 <= code < 800) or (900 <= code < 1000)
+            valid_ranges = (100 <= code < 800) or (900 <= code < 1000) or (1000 <= code < 1100)
             assert valid_ranges, f"Code {code} is outside valid ranges"
 
             # String code must be a valid string
@@ -743,6 +745,10 @@ class TestErrorCodeInvariants:
                 # System errors can be various types
                 assert issubclass(error_class, TaluError), (
                     f"Code {code} should map to TaluError subclass, got {error_class}"
+                )
+            elif 1000 <= code < 1100:
+                assert issubclass(error_class, TrainingError), (
+                    f"Code {code} should map to TrainingError subclass, got {error_class}"
                 )
 
     def test_io_errors_in_error_map(self):

@@ -17,6 +17,7 @@ from typing import Any
 from .._bindings import check, get_lib
 from .._native import (
     BackendCreateOptions,
+    CGenerateConfig,
     CLogitBiasEntry,
 )
 from .._native import (
@@ -166,58 +167,30 @@ class CContentPart(ctypes.Structure):
     ]
 
 
-class RouterGenerateConfig(ctypes.Structure):
+class RouterGenerateConfig(CGenerateConfig):
     """Configuration for router generation (C struct).
 
     Must match CGenerateConfig in core/src/router/capi_bridge.zig exactly.
     """
 
-    _fields_ = [
-        ("max_tokens", ctypes.c_size_t),
-        ("temperature", ctypes.c_float),
-        ("top_k", ctypes.c_size_t),
-        ("top_p", ctypes.c_float),
-        ("min_p", ctypes.c_float),
-        ("repetition_penalty", ctypes.c_float),
-        ("stop_sequences", ctypes.POINTER(ctypes.c_char_p)),  # Array of null-terminated strings
-        ("stop_sequence_count", ctypes.c_size_t),
-        ("logit_bias", ctypes.POINTER(CLogitBiasEntry)),  # Array of logit bias entries
-        ("logit_bias_count", ctypes.c_size_t),
-        ("seed", ctypes.c_uint64),  # Random seed for reproducibility (0 = don't reseed)
-        ("template_override", ctypes.c_char_p),  # Custom chat template (null = use model's)
-        ("extra_context_json", ctypes.c_char_p),  # Extra context JSON object (null = none)
-        # Tool calling fields (Story 1)
-        ("tools_json", ctypes.c_char_p),  # Tool definitions as JSON array
-        (
-            "tool_choice",
-            ctypes.c_char_p,
-        ),  # Tool choice: "auto", "required", "none", or function name
-        # Cancellation support - pointer to atomic bool, set to true to stop generation
-        ("stop_flag", ctypes.c_void_p),  # Pointer to std.atomic.Value(bool)
-        # Extra body JSON for remote API requests (provider-specific parameters)
-        ("extra_body_json", ctypes.c_char_p),
-        # Preserve raw model output (no reasoning-tag filtering)
-        ("raw_output", ctypes.c_size_t),
-        # Completions mode: no thinking intervention, no reasoning separation
-        ("completions_mode", ctypes.c_size_t),
-        # Prefill progress callback: fn(completed_layers, total_layers, userdata)
-        ("prefill_progress_fn", ctypes.c_void_p),
-        ("prefill_progress_data", ctypes.c_void_p),
-    ]
-
     def __init__(
         self,
         max_tokens: int = 0,
+        max_completion_tokens: int = 0,
+        max_reasoning_tokens: int | None = None,
         temperature: float = -1.0,
         top_k: int = 0,
         top_p: float = -1.0,
         min_p: float = -1.0,
-        repetition_penalty: float = 0.0,
+        repetition_penalty: float = -1.0,
+        presence_penalty: float = -1.0,
+        frequency_penalty: float = -1.0,
         stop_sequences: list[str] | None = None,
         logit_bias: dict[int, float] | None = None,
         seed: int = 0,
         chat_template: str | None = None,
         extra_context: dict | None = None,
+        reasoning_effort: str | None = None,
         tools_json: str | None = None,
         tool_choice: str | None = None,
         stop_flag: StopFlag | None = None,
@@ -227,11 +200,17 @@ class RouterGenerateConfig(ctypes.Structure):
     ):
         super().__init__()
         self.max_tokens = max_tokens
+        self.max_completion_tokens = max_completion_tokens
+        self.max_reasoning_tokens = (
+            ctypes.c_size_t(-1).value if max_reasoning_tokens is None else max_reasoning_tokens
+        )
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
         self.min_p = min_p
         self.repetition_penalty = repetition_penalty
+        self.presence_penalty = presence_penalty
+        self.frequency_penalty = frequency_penalty
         self.seed = seed
 
         # Store stop sequences - we need to keep references alive
@@ -243,9 +222,7 @@ class RouterGenerateConfig(ctypes.Structure):
             self._stop_sequence_strs = [s.encode("utf-8") for s in stop_sequences]
             arr_type = ctypes.c_char_p * len(self._stop_sequence_strs)
             self._stop_sequence_array = arr_type(*self._stop_sequence_strs)
-            self.stop_sequences = ctypes.cast(
-                self._stop_sequence_array, ctypes.POINTER(ctypes.c_char_p)
-            )
+            self.stop_sequences = ctypes.cast(self._stop_sequence_array, ctypes.c_void_p)
             self.stop_sequence_count = len(self._stop_sequence_strs)
         else:
             self.stop_sequences = None
@@ -285,6 +262,14 @@ class RouterGenerateConfig(ctypes.Structure):
             self.extra_context_json = self._extra_context_bytes
         else:
             self.extra_context_json = None
+
+        # Store reasoning effort - keep reference alive
+        self._reasoning_effort_bytes: bytes | None = None
+        if reasoning_effort:
+            self._reasoning_effort_bytes = reasoning_effort.encode("utf-8")
+            self.reasoning_effort = self._reasoning_effort_bytes
+        else:
+            self.reasoning_effort = None
 
         # Store tools JSON - keep reference alive
         self._tools_json_bytes: bytes | None = None

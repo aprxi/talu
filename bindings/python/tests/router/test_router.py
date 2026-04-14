@@ -325,7 +325,7 @@ class TestRouterGenerateConfig:
         assert config.top_k == 0
         assert config.top_p == -1.0
         assert config.min_p == -1.0
-        assert config.repetition_penalty == 0.0
+        assert config.repetition_penalty == -1.0
         # ctypes pointers are falsy when null, check count instead
         assert config.stop_sequence_count == 0
         assert config.logit_bias_count == 0

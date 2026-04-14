@@ -297,16 +297,26 @@ class TestCtypesStructs:
 class TestSchemeToEnumWithMocking:
     """Tests for scheme_to_enum function with mocked C library."""
 
-    def test_scheme_to_enum_returns_code(self):
-        """scheme_to_enum returns code from C library."""
+    def test_scheme_to_enum_alias_returns_code(self):
+        """Non-canonical aliases are resolved via C parser."""
         mock_lib = MagicMock()
-        mock_lib.talu_convert_parse_scheme.return_value = 11  # TQ4_64
+        mock_lib.talu_convert_parse_scheme.return_value = 11  # TQ4_64 alias resolves to enum
+
+        with patch("talu.converter._get_convert_lib", return_value=mock_lib):
+            result = scheme_to_enum("4bit")
+
+            assert result == 11
+            mock_lib.talu_convert_parse_scheme.assert_called_once_with(b"4bit")
+
+    def test_scheme_to_enum_canonical_resolves_without_c_parser(self):
+        """Canonical scheme names resolve from Python mapping without C call."""
+        mock_lib = MagicMock()
 
         with patch("talu.converter._get_convert_lib", return_value=mock_lib):
             result = scheme_to_enum("tq4_64")
 
-            assert result == 11
-            mock_lib.talu_convert_parse_scheme.assert_called_once_with(b"tq4_64")
+            assert result == Scheme.TQ4_64
+            mock_lib.talu_convert_parse_scheme.assert_not_called()
 
     def test_scheme_to_enum_invalid_raises_validation_error(self):
         """scheme_to_enum raises ValidationError for invalid scheme."""

@@ -218,7 +218,7 @@ def scheme_to_enum(scheme: str) -> int:
     """
     scheme_lower = scheme.lower()
 
-    # Canonical scheme names defined in Python should resolve directly.
+    # Canonical scheme names defined in Python resolve directly.
     # This keeps Python's public scheme surface stable even if Zig parser
     # aliases evolve independently.
     direct = SCHEME_NAME_TO_ENUM.get(scheme_lower)
@@ -440,12 +440,24 @@ class ConvertOptions(ctypes.Structure):
         ("max_shard_size", ctypes.c_uint64),
         # Dry run mode - estimate conversion without writing files
         ("dry_run", ctypes.c_bool),
+        # If true, return model ID instead of filesystem path
+        ("return_model_id", ctypes.c_bool),
         # Platform for scheme resolution (cpu=0, metal=1, cuda=2)
         ("platform", ctypes.c_uint32),
         # Quant level for scheme resolution (q4=0, q8=1, q16=2)
         ("quant", ctypes.c_uint32),
         # If true, resolve scheme from platform/quant instead of using scheme
         ("use_platform_quant", ctypes.c_bool),
+        # Calibration profile (best=0, good=1, custom=2)
+        ("calibration_profile", ctypes.c_uint32),
+        # Deterministic calibration seed
+        ("calibration_seed", ctypes.c_uint64),
+        # Calibration overrides (0 => use profile defaults)
+        ("calibration_iters", ctypes.c_uint32),
+        ("calibration_nsamples", ctypes.c_uint32),
+        ("calibration_seqlen", ctypes.c_uint32),
+        ("calibration_batch_size", ctypes.c_uint32),
+        ("calibration_nblocks", ctypes.c_uint32),
         # Progress callback: fn(current, total, message, user_data) or NULL
         # Using c_void_p allows null values (CFUNCTYPE doesn't accept None)
         ("progress_callback", ctypes.c_void_p),
@@ -1329,6 +1341,7 @@ def _verify_model_impl(
     """Verify a model after conversion."""
     # Import here to avoid circular imports
     from .chat import Chat
+    from .exceptions import TaluError
     from .tokenizer import Tokenizer
 
     test_prompt = prompt or _VERIFY_PROMPT
@@ -1350,7 +1363,15 @@ def _verify_model_impl(
             tokens_generated=tokens_generated,
         )
 
-    except (ImportError, FileNotFoundError, ValueError, TypeError, RuntimeError, OSError) as e:
+    except (
+        ImportError,
+        FileNotFoundError,
+        ValueError,
+        TypeError,
+        RuntimeError,
+        OSError,
+        TaluError,
+    ) as e:
         return VerificationResult(
             success=False,
             model_path=model_path,
@@ -1589,6 +1610,15 @@ def convert(
     opts.destination = destination.encode("utf-8") if destination else None
     opts.max_shard_size = _parse_size(max_shard_size) if max_shard_size else 0
     opts.dry_run = dry_run
+    opts.return_model_id = False
+    # Keep parity with Zig defaults for stable calibration behavior.
+    opts.calibration_profile = 1  # good
+    opts.calibration_seed = 42
+    opts.calibration_iters = 0
+    opts.calibration_nsamples = 0
+    opts.calibration_seqlen = 0
+    opts.calibration_batch_size = 0
+    opts.calibration_nblocks = 0
 
     if use_platform_quant:
         # Platform/quant mode: let Zig resolve the scheme

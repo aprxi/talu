@@ -29,7 +29,11 @@ class TestRawComplete:
 
     def test_raw_complete_returns_response(self, test_model_path):
         """raw_complete() returns a Response object."""
-        response = talu.raw_complete(test_model_path, "Hello", max_tokens=3)
+        response = talu.raw_complete(
+            test_model_path,
+            "Hello",
+            config=GenerationConfig(max_tokens=3, temperature=0.0, seed=42),
+        )
 
         assert isinstance(response, Response)
         assert response.usage.completion_tokens > 0
@@ -44,7 +48,7 @@ class TestRawComplete:
 
     def test_raw_complete_kwargs_override_config(self, test_model_path):
         """Kwargs override config values."""
-        config = GenerationConfig(max_tokens=100)
+        config = GenerationConfig(max_tokens=100, temperature=0.0, seed=42)
         response = talu.raw_complete(test_model_path, "Hello", config=config, max_tokens=3)
 
         # max_tokens=3 from kwargs should take precedence
@@ -52,7 +56,11 @@ class TestRawComplete:
 
     def test_raw_complete_response_has_usage(self, test_model_path):
         """Response includes usage stats."""
-        response = talu.raw_complete(test_model_path, "Hello", max_tokens=3)
+        response = talu.raw_complete(
+            test_model_path,
+            "Hello",
+            config=GenerationConfig(max_tokens=3, temperature=0.0, seed=42),
+        )
 
         assert response.usage is not None
         assert response.usage.completion_tokens > 0
@@ -64,7 +72,7 @@ class TestRawComplete:
             test_model_path,
             "Hello",
             system="You are helpful.",
-            max_tokens=5,
+            config=GenerationConfig(max_tokens=5, temperature=0.0, seed=42),
         )
 
         assert isinstance(response, Response)
@@ -80,7 +88,7 @@ class TestRawComplete:
             test_model_path,
             "Continue: ",
             completion_opts=opts,
-            max_tokens=5,
+            config=GenerationConfig(max_tokens=5, temperature=0.0, seed=42),
         )
 
         assert isinstance(response, Response)
@@ -92,7 +100,11 @@ class TestRawComplete:
         tokenizer = Tokenizer(test_model_path)
         token_ids = tokenizer.encode(prompt, special_tokens=False)
 
-        response = talu.raw_complete(test_model_path, prompt, max_tokens=3)
+        response = talu.raw_complete(
+            test_model_path,
+            prompt,
+            config=GenerationConfig(max_tokens=3, temperature=0.0, seed=42),
+        )
 
         assert response.usage is not None
         # Backend may prepend a BOS token; allow +1 tolerance.
@@ -160,7 +172,7 @@ class TestAsk:
 
     def test_ask_returns_response(self, test_model_path):
         """ask() returns a Response object."""
-        response = talu.ask(test_model_path, "Hello", max_tokens=3)
+        response = talu.ask(test_model_path, "Hello", max_tokens=3, temperature=0.0, seed=42)
 
         assert isinstance(response, Response)
         assert response.usage.completion_tokens > 0
@@ -172,6 +184,8 @@ class TestAsk:
             "Who are you?",
             system="You are a helpful assistant named Bob.",
             max_tokens=10,
+            temperature=0.0,
+            seed=42,
         )
 
         assert isinstance(response, Response)
@@ -179,14 +193,14 @@ class TestAsk:
 
     def test_ask_with_config(self, test_model_path):
         """ask() accepts GenerationConfig."""
-        config = GenerationConfig(max_tokens=5, seed=42)
+        config = GenerationConfig(max_tokens=5, temperature=0.0, seed=42)
         response = talu.ask(test_model_path, "Hello", config=config)
 
         assert isinstance(response, Response)
 
     def test_ask_response_is_detached(self, test_model_path):
         """ask() returns a detached Response that cannot be replied to."""
-        response = talu.ask(test_model_path, "Hello", max_tokens=3)
+        response = talu.ask(test_model_path, "Hello", max_tokens=3, temperature=0.0, seed=42)
 
         # Response should be detached (no associated Chat)
         assert response._chat is None
@@ -200,7 +214,7 @@ class TestAsk:
         # This would leak resources with the old talu.chat() API
         results = []
         for question in ["Hello", "Hi"]:
-            response = talu.ask(test_model_path, question, max_tokens=2)
+            response = talu.ask(test_model_path, question, max_tokens=2, temperature=0.0, seed=42)
             results.append(str(response))
 
         assert len(results) == 2

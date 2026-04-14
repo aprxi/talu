@@ -478,11 +478,19 @@ class TestConverterStructLayouts:
             ("destination", ctypes.c_char_p),
             ("overrides", OverrideRule * MAX_OVERRIDES),
             ("num_overrides", ctypes.c_uint32),
-            ("max_shard_size", ctypes.c_size_t),
+            ("max_shard_size", ctypes.c_uint64),
             ("dry_run", ctypes.c_bool),
+            ("return_model_id", ctypes.c_bool),
             ("platform", ctypes.c_uint32),
             ("quant", ctypes.c_uint32),
             ("use_platform_quant", ctypes.c_bool),
+            ("calibration_profile", ctypes.c_uint32),
+            ("calibration_seed", ctypes.c_uint64),
+            ("calibration_iters", ctypes.c_uint32),
+            ("calibration_nsamples", ctypes.c_uint32),
+            ("calibration_seqlen", ctypes.c_uint32),
+            ("calibration_batch_size", ctypes.c_uint32),
+            ("calibration_nblocks", ctypes.c_uint32),
             # Unified progress callback (CProgressCallback)
             ("progress_callback", ctypes.c_void_p),
             ("progress_user_data", ctypes.c_void_p),
@@ -555,10 +563,10 @@ class TestConverterStructLayouts:
         size = ctypes.sizeof(ConvertOptions)
         # ConvertOptions contains:
         # - scheme: u32 (4 bytes)
-        # - force: bool (1 byte, padded)
-        # - offline: bool (1 byte, padded)
+        # - force/offline/dry_run/return_model_id/use_platform_quant: bools (padded)
         # - destination: pointer (8 bytes on 64-bit)
         # - overrides: 32 * OverrideRule (32 * 16 = 512 bytes on 64-bit)
-        # - num_overrides: u32 (4 bytes)
-        # Total: ~530+ bytes with padding
-        assert 500 <= size <= 600, f"Unexpected ConvertOptions size: {size} bytes"
+        # - calibration controls (profile/seed/iters/nsamples/seqlen/batch/nblocks)
+        # - progress callback + user data pointers
+        # Total: ~600+ bytes with padding on 64-bit
+        assert 580 <= size <= 700, f"Unexpected ConvertOptions size: {size} bytes"

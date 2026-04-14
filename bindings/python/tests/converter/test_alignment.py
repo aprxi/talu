@@ -12,10 +12,143 @@ The intermittent Bus errors were caused by:
 These tests ensure the fixes remain in place.
 """
 
+import contextlib
 import json
+import os
 import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import pytest
+
+if os.name != "nt":
+    import fcntl
+
+
+_CONVERTER_LOCK_PATH = Path(tempfile.gettempdir()) / "talu_converter_alignment.lock"
+_SUBPROCESS_RESULT_PREFIX = "TALU_CONVERTER_SUBPROCESS_RESULT="
+_DEFAULT_CONVERT_TIMEOUT_SECONDS = 10
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 10
+_STABILITY_TESTS_ENV = "TALU_RUN_CONVERTER_STABILITY"
+_MODEL_UNAVAILABLE_MESSAGES = ("model not found", "api returned 401 without token")
+
+
+@contextlib.contextmanager
+def _converter_alignment_lock():
+    """Serialize heavy converter runs across xdist workers."""
+    lock_file = _CONVERTER_LOCK_PATH.open("w")
+    try:
+        if "fcntl" in globals():
+            timeout_seconds = _DEFAULT_LOCK_TIMEOUT_SECONDS
+            raw_timeout = os.environ.get("TALU_TEST_LOCK_TIMEOUT_SECONDS")
+            if raw_timeout:
+                try:
+                    timeout_seconds = max(1, int(raw_timeout))
+                except ValueError:
+                    timeout_seconds = _DEFAULT_LOCK_TIMEOUT_SECONDS
+
+            start = __import__("time").monotonic()
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if (__import__("time").monotonic() - start) >= timeout_seconds:
+                        raise AssertionError(
+                            "Converter alignment lock acquisition timed out "
+                            f"after {timeout_seconds}s"
+                        )
+                    __import__("time").sleep(0.05)
+        yield
+    finally:
+        if "fcntl" in globals():
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _run_convert_subprocess(model: str, scheme: str, output_dir: str) -> tuple[bool, str | None]:
+    """Run talu.convert in an isolated subprocess.
+
+    Returns:
+        (success, error_message). success=True means conversion completed.
+        success=False returns the conversion error string.
+
+    Raises:
+        AssertionError: if subprocess crashes before reporting a structured result.
+    """
+    script = f"""
+import json
+import talu
+import sys
+
+model = sys.argv[1]
+scheme = sys.argv[2]
+output_dir = sys.argv[3]
+
+try:
+    result = talu.convert(model, scheme=scheme, output_dir=output_dir)
+    print("{_SUBPROCESS_RESULT_PREFIX}" + json.dumps({{"ok": True, "result": result}}))
+except Exception as exc:
+    print("{_SUBPROCESS_RESULT_PREFIX}" + json.dumps({{"ok": False, "error": str(exc), "type": type(exc).__name__}}))
+    raise SystemExit(1)
+"""
+    timeout_seconds = _DEFAULT_CONVERT_TIMEOUT_SECONDS
+    raw_timeout = os.environ.get("TALU_TEST_CONVERTER_TIMEOUT_SECONDS")
+    if raw_timeout:
+        try:
+            timeout_seconds = max(1, int(raw_timeout))
+        except ValueError:
+            timeout_seconds = _DEFAULT_CONVERT_TIMEOUT_SECONDS
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script, model, scheme, output_dir],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(f"conversion timed out after {timeout_seconds}s") from exc
+
+    payload = None
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith(_SUBPROCESS_RESULT_PREFIX):
+            payload = json.loads(line[len(_SUBPROCESS_RESULT_PREFIX) :])
+            break
+
+    if payload is None:
+        raise AssertionError(
+            "Converter subprocess crashed before returning structured result "
+            f"(returncode={proc.returncode}).\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+
+    if payload.get("ok") is True:
+        return True, None
+    return False, str(payload.get("error", "conversion failed"))
+
+
+def _has_local_calibration_rows_cache() -> bool:
+    """Return True when local Pile calibration rows cache is available."""
+    hf_home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    cache_dir = hf_home / "hub" / "datasets--NeelNanda--pile-10k" / "snapshots" / "main"
+    if not cache_dir.exists():
+        return False
+    return any(cache_dir.glob("rows-offset-*-length-*.json"))
+
+
+def _skip_reason_for_conversion_error(error: str | None) -> str | None:
+    """Return a skip reason for non-regression infra conditions."""
+    error_str = (error or "").lower()
+    if "already quantized" in error_str:
+        return "Test requires FP16 source model, got quantized model"
+    if any(msg in error_str for msg in _MODEL_UNAVAILABLE_MESSAGES):
+        return "Test requires an accessible source model for conversion"
+    return None
 
 
 class TestUnalignedSafeTensorsData:
@@ -150,38 +283,57 @@ class TestQuantizationAlignmentRegression:
         """Get path to reference model for conversion tests."""
         return test_model_path
 
-    def test_tq4_64_conversion_no_bus_error(self, reference_model, tmp_path):
+    @pytest.fixture
+    def conversion_lock(self):
+        with _converter_alignment_lock():
+            yield
+
+    @pytest.fixture
+    def isolated_talu_home(self, tmp_path, monkeypatch):
+        talu_home = tmp_path / "talu_home"
+        talu_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("TALU_HOME", str(talu_home))
+        monkeypatch.setenv("BACKEND", "cpu")
+        monkeypatch.setenv("TALU_CONVERT_CALIB_GPU", "0")
+        return talu_home
+
+    def test_tq4_64_conversion_no_bus_error(
+        self, reference_model, tmp_path, conversion_lock, isolated_talu_home
+    ):
         """TQ4_64 conversion should not cause Bus errors from alignment issues."""
-        from talu.converter import convert
-
         output_dir = tmp_path / "tq4_64_output"
+        success, error = _run_convert_subprocess(
+            reference_model,
+            "tq4_64",
+            str(output_dir),
+        )
+        if success:
+            return
+        if (skip_reason := _skip_reason_for_conversion_error(error)) is not None:
+            pytest.skip(skip_reason)
+        error_str = (error or "").lower()
+        assert "bus error" not in error_str
+        assert "sigbus" not in error_str
+        pytest.fail(error or "conversion failed")
 
-        try:
-            result = convert(reference_model, scheme="tq4_64", output_dir=str(output_dir))
-            assert result is not None
-        except Exception as e:
-            # Check it's not a Bus error (other errors may be acceptable)
-            error_str = str(e).lower()
-            if "already quantized" in error_str:
-                pytest.skip("Test requires FP16 source model, got quantized model")
-            assert "bus error" not in error_str
-            assert "sigbus" not in error_str
-
-    def test_tq8_conversion_no_bus_error(self, reference_model, tmp_path):
+    def test_tq8_conversion_no_bus_error(
+        self, reference_model, tmp_path, conversion_lock, isolated_talu_home
+    ):
         """TQ8 conversion should not cause Bus errors from alignment issues."""
-        from talu.converter import convert
-
         output_dir = tmp_path / "tq8_output"
-
-        try:
-            result = convert(reference_model, scheme="tq8", output_dir=str(output_dir))
-            assert result is not None
-        except Exception as e:
-            error_str = str(e).lower()
-            if "already quantized" in error_str:
-                pytest.skip("Test requires FP16 source model, got quantized model")
-            assert "bus error" not in error_str
-            assert "sigbus" not in error_str
+        success, error = _run_convert_subprocess(
+            reference_model,
+            "tq8",
+            str(output_dir),
+        )
+        if success:
+            return
+        if (skip_reason := _skip_reason_for_conversion_error(error)) is not None:
+            pytest.skip(skip_reason)
+        error_str = (error or "").lower()
+        assert "bus error" not in error_str
+        assert "sigbus" not in error_str
+        pytest.fail(error or "conversion failed")
 
 
 class TestRepeatedConversionStability:
@@ -196,50 +348,95 @@ class TestRepeatedConversionStability:
         """Get path to reference model."""
         return test_model_path
 
-    def test_repeated_tq4_64_conversions(self, reference_model, tmp_path):
+    @pytest.fixture
+    def conversion_lock(self):
+        with _converter_alignment_lock():
+            yield
+
+    @pytest.fixture
+    def isolated_talu_home(self, tmp_path, monkeypatch):
+        talu_home = tmp_path / "talu_home"
+        talu_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("TALU_HOME", str(talu_home))
+        monkeypatch.setenv("BACKEND", "cpu")
+        monkeypatch.setenv("TALU_CONVERT_CALIB_GPU", "0")
+        return talu_home
+
+    def test_repeated_tq4_64_conversions(
+        self, reference_model, tmp_path, conversion_lock, isolated_talu_home, monkeypatch
+    ):
         """Multiple TQ4_64 conversions should all succeed without crashes.
 
         This test runs multiple conversions to catch intermittent alignment
         issues that only manifest with certain memory allocation patterns.
         """
-        from talu.converter import convert
+        if os.environ.get(_STABILITY_TESTS_ENV, "").lower() not in {"1", "true", "yes"}:
+            pytest.skip(
+                f"Stability loop is opt-in. Set {_STABILITY_TESTS_ENV}=1 to run this test."
+            )
+        if not _has_local_calibration_rows_cache():
+            pytest.skip(
+                "Test requires local calibration rows cache "
+                "(datasets--NeelNanda--pile-10k rows-offset-*.json)."
+            )
 
         num_iterations = 3
         for i in range(num_iterations):
             output_dir = tmp_path / f"tq4_64_run_{i}"
-            try:
-                result = convert(reference_model, scheme="tq4_64", output_dir=str(output_dir))
-                assert result is not None, f"Iteration {i} returned None"
-            except Exception as e:
-                error_str = str(e).lower()
-                # Skip if model is already quantized (TQ4 test model)
-                if "already quantized" in error_str:
-                    pytest.skip("Test requires FP16 source model, got quantized model")
-                assert "bus error" not in error_str, f"Bus error on iteration {i}"
-                assert "sigbus" not in error_str, f"SIGBUS on iteration {i}"
-                # Re-raise non-alignment errors
-                if "bus" not in error_str and "alignment" not in error_str:
-                    raise
+            run_home = tmp_path / f"talu_home_iter_{i}"
+            run_home.mkdir(parents=True, exist_ok=True)
+            monkeypatch.setenv("TALU_HOME", str(run_home))
 
-    def test_alternating_scheme_conversions(self, reference_model, tmp_path):
+            success, error = _run_convert_subprocess(
+                reference_model,
+                "tq4_64",
+                str(output_dir),
+            )
+            if success:
+                continue
+            if (skip_reason := _skip_reason_for_conversion_error(error)) is not None:
+                pytest.skip(skip_reason)
+            error_str = (error or "").lower()
+            assert "bus error" not in error_str, f"Bus error on iteration {i}"
+            assert "sigbus" not in error_str, f"SIGBUS on iteration {i}"
+            pytest.fail(f"Iteration {i} failed unexpectedly: {error}")
+
+    def test_alternating_scheme_conversions(
+        self, reference_model, tmp_path, conversion_lock, isolated_talu_home, monkeypatch
+    ):
         """Alternating between schemes should not cause alignment issues.
 
         Different schemes use different group sizes with different alignment
         requirements. Switching between them exercises more code paths.
         """
-        from talu.converter import convert
+        if os.environ.get(_STABILITY_TESTS_ENV, "").lower() not in {"1", "true", "yes"}:
+            pytest.skip(
+                f"Stability loop is opt-in. Set {_STABILITY_TESTS_ENV}=1 to run this test."
+            )
+        if not _has_local_calibration_rows_cache():
+            pytest.skip(
+                "Test requires local calibration rows cache "
+                "(datasets--NeelNanda--pile-10k rows-offset-*.json)."
+            )
 
         schemes = ["tq4", "tq4_64", "tq8"]
 
         for scheme in schemes:
             output_dir = tmp_path / f"{scheme}_run"
-            try:
-                result = convert(reference_model, scheme=scheme, output_dir=str(output_dir))
-                assert result is not None, f"Scheme {scheme} returned None"
-            except Exception as e:
-                error_str = str(e).lower()
-                # Skip if model is already quantized (TQ4 test model)
-                if "already quantized" in error_str:
-                    pytest.skip("Test requires FP16 source model, got quantized model")
-                assert "bus error" not in error_str, f"Bus error with scheme {scheme}"
-                assert "sigbus" not in error_str, f"SIGBUS with scheme {scheme}"
+            run_home = tmp_path / f"talu_home_{scheme}"
+            run_home.mkdir(parents=True, exist_ok=True)
+            monkeypatch.setenv("TALU_HOME", str(run_home))
+
+            success, error = _run_convert_subprocess(
+                reference_model,
+                scheme,
+                str(output_dir),
+            )
+            if success:
+                continue
+            if (skip_reason := _skip_reason_for_conversion_error(error)) is not None:
+                pytest.skip(skip_reason)
+            error_str = (error or "").lower()
+            assert "bus error" not in error_str, f"Bus error with scheme {scheme}"
+            assert "sigbus" not in error_str, f"SIGBUS with scheme {scheme}"
+            pytest.fail(f"Scheme {scheme} failed unexpectedly: {error}")

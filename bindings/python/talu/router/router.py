@@ -370,7 +370,7 @@ class Router:
                 top_k=config.top_k if config else 0,
                 top_p=config.top_p if config else -1.0,
                 min_p=config.min_p if config else -1.0,
-                repetition_penalty=config.repetition_penalty if config else 0.0,
+                repetition_penalty=config.repetition_penalty if config else -1.0,
                 stop_sequences=config.stop_sequences if config else None,
                 logit_bias=config.logit_bias if config else None,
                 seed=(config.seed if config.seed is not None else 0) if config else 0,
@@ -606,7 +606,10 @@ class Router:
         model = self._resolve_model(model)
 
         # Use caller's stop flag or create an internal one for cancellation
-        internal_stop = stop_flag or StopFlag()
+        # Important: StopFlag defines __bool__ as the underlying flag value.
+        # A valid unsignaled StopFlag is therefore falsy; using `or` would
+        # incorrectly replace caller-provided flags and break cancellation.
+        internal_stop = stop_flag if stop_flag is not None else StopFlag()
 
         # Build C config struct
         chat_template_str = self._resolve_chat_template(config.chat_template) if config else None
@@ -616,7 +619,7 @@ class Router:
             top_k=config.top_k if config else 0,
             top_p=config.top_p if config else -1.0,
             min_p=config.min_p if config else -1.0,
-            repetition_penalty=config.repetition_penalty if config else 0.0,
+            repetition_penalty=config.repetition_penalty if config else -1.0,
             stop_sequences=config.stop_sequences if config else None,
             logit_bias=config.logit_bias if config else None,
             seed=(config.seed if config.seed is not None else 0) if config else 0,
@@ -643,9 +646,23 @@ class Router:
         backend_handle = self._get_or_create_backend(model)
 
         # Token queue: callback pushes StreamToken, generator pulls.
+        # Use bounded capacity to prevent unbounded buffering. Without backpressure,
+        # fast models can enqueue hundreds of tokens before Python signals stop.
         # None sentinel signals end of generation.
-        token_queue: queue.Queue[StreamToken | None] = queue.Queue()
+        token_queue: queue.Queue[StreamToken | None] = queue.Queue(maxsize=8)
         gen_error: list[BaseException | None] = [None]
+        stream_closed = threading.Event()
+
+        def _enqueue_token(token: StreamToken) -> bool:
+            """Enqueue with cancellation-aware backpressure."""
+            while True:
+                if stream_closed.is_set() or internal_stop.is_set():
+                    return False
+                try:
+                    token_queue.put(token, timeout=0.01)
+                    return True
+                except queue.Full:
+                    continue
 
         # Define the C callback that receives tokens from Zig.
         # Must be kept alive for the duration of the call.
@@ -653,10 +670,13 @@ class Router:
         def on_token(text_ptr, text_len, item_type, content_type, is_final, _userdata):
             if is_final:
                 return 1
+            if stream_closed.is_set() or internal_stop.is_set():
+                return 0
             if text_len > 0:
                 text = ctypes.string_at(text_ptr, text_len).decode("utf-8", errors="replace")
-                token_queue.put(StreamToken(text, item_type, content_type))
-            return 0 if internal_stop.is_set() else 1
+                if not _enqueue_token(StreamToken(text, item_type, content_type)):
+                    return 0
+            return 0 if (stream_closed.is_set() or internal_stop.is_set()) else 1
 
         def run_generation():
             try:
@@ -681,7 +701,12 @@ class Router:
             except BaseException as e:
                 gen_error[0] = e
             finally:
-                token_queue.put(None)
+                while not stream_closed.is_set():
+                    try:
+                        token_queue.put(None, timeout=0.01)
+                        break
+                    except queue.Full:
+                        continue
 
         gen_thread = threading.Thread(target=run_generation, daemon=True)
 
@@ -700,9 +725,11 @@ class Router:
         except GeneratorExit:
             # Generator closed early (e.g., break in for loop) — cancel generation
             internal_stop.signal()
+            stream_closed.set()
             gen_thread.join()
             raise
         finally:
+            stream_closed.set()
             gen_thread.join()
             # Keep data_refs and on_token alive until generation thread completes
             del data_refs
