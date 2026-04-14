@@ -217,17 +217,52 @@ array embedding_lookup(mlx_ctx* ctx, const array& ids) {
     const array flat_ids = reshape(astype(ids, int32), {static_cast<int>(ids.size())});
     const array q_w = take(ctx->embed_tokens_q_w, flat_ids, 0);
     const array q_scales = take(ctx->embed_tokens_q_scales, flat_ids, 0);
-    const array q_biases = take(ctx->embed_tokens_q_biases, flat_ids, 0);
-    const array dequant = dequantize(
-        q_w,
-        q_scales,
-        std::optional<array>(q_biases),
-        ctx->cfg.quant_group_size,
-        bits,
-        "affine",
-        std::nullopt,
-        bfloat16
-    );
+    const array q_biases = (ctx->embed_tokens_q_biases.ndim() == 0 || ctx->embed_tokens_q_biases.size() == 1)
+        ? ctx->embed_tokens_q_biases
+        : take(ctx->embed_tokens_q_biases, flat_ids, 0);
+    const bool nvfp4_ready =
+        bits == 4 &&
+        ctx->cfg.quant_group_size == 16 &&
+        q_w.dtype() == uint32 &&
+        q_scales.dtype() == uint8 &&
+        q_w.ndim() == 2 &&
+        q_scales.ndim() == 2 &&
+        q_w.shape(0) == q_scales.shape(0) &&
+        q_w.shape(1) > 0 &&
+        (q_w.shape(1) % 2) == 0 &&
+        q_scales.shape(1) == (q_w.shape(1) / 2);
+    array dequant = array(0.0f);
+    if (nvfp4_ready) {
+        dequant = dequantize(
+            q_w,
+            q_scales,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            "nvfp4",
+            std::nullopt,
+            bfloat16
+        );
+        // Native NVFP4 stores 1/global_scale as a scalar post-scale factor.
+        if (q_biases.size() == 1 && q_biases.dtype() == float32) {
+            eval(q_biases);
+            const float inv_gs = q_biases.item<float>();
+            if (inv_gs != 1.0f) {
+                dequant = dequant * array(inv_gs, dequant.dtype());
+            }
+        }
+    } else {
+        dequant = dequantize(
+            q_w,
+            q_scales,
+            std::optional<array>(q_biases),
+            ctx->cfg.quant_group_size,
+            bits,
+            "affine",
+            std::nullopt,
+            bfloat16
+        );
+    }
     return reshape(dequant, out_shape);
 }
 
@@ -342,8 +377,8 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                     ? [&]() {
                           array out = quantized_matmul(
                               lm_input, ctx->lm_head_q_w, ctx->lm_head_q_scales,
-                              std::nullopt, true, ctx->cfg.quant_group_size,
-                              ctx->cfg.quant_bits, "nvfp4");
+                              std::nullopt, true, std::nullopt,
+                              std::nullopt, "nvfp4");
                           if (ctx->lm_head_q_biases.size() == 1 && ctx->lm_head_q_biases.dtype() == float32) {
                               eval(ctx->lm_head_q_biases);
                               const float inv_gs = ctx->lm_head_q_biases.item<float>();
@@ -391,10 +426,29 @@ array forward_logits_from_hidden(mlx_ctx* ctx, const array& normed_hidden) {
     const bool lm_head_affine = lm_head_q_ready &&
         ctx->lm_head_q_biases.ndim() == 2 && ctx->lm_head_q_biases.size() > 1 &&
         ctx->cfg.quant_group_size > 0 && (lm_bits == 4 || lm_bits == 8);
+    const bool lm_head_nvfp4 = lm_head_q_ready &&
+        !lm_head_affine &&
+        ctx->lm_head_q_w.dtype() == uint32 &&
+        ctx->lm_head_q_scales.dtype() == uint8 &&
+        ctx->cfg.quant_group_size == 16 &&
+        ctx->cfg.quant_bits == 4 &&
+        ctx->lm_head_q_w.ndim() == 2 &&
+        ctx->lm_head_q_scales.ndim() == 2 &&
+        ctx->lm_head_q_scales.shape(1) == ctx->lm_head_q_w.shape(1) / 2;
     if (lm_head_affine) {
         return quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,
             std::optional<array>(ctx->lm_head_q_biases), true,
             ctx->cfg.quant_group_size, lm_bits, "affine");
+    }
+    if (lm_head_nvfp4) {
+        array out = quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,
+            std::nullopt, true, std::nullopt, std::nullopt, "nvfp4");
+        if (ctx->lm_head_q_biases.size() == 1 && ctx->lm_head_q_biases.dtype() == float32) {
+            eval(ctx->lm_head_q_biases);
+            const float inv_gs = ctx->lm_head_q_biases.item<float>();
+            if (inv_gs != 1.0f) out = out * array(inv_gs, out.dtype());
+        }
+        return out;
     }
     if (lm_head_q_ready) {
         return quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,

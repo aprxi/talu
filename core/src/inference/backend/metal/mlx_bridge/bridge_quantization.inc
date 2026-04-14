@@ -185,6 +185,32 @@ float fp4_e2m1_nibble_to_f32(uint8_t nibble) {
     return codebook[nibble & 0x0F];
 }
 
+float fp8_e4m3_byte_to_f32(uint8_t value) {
+    const uint32_t sign = (static_cast<uint32_t>(value >> 7) << 31);
+    const uint32_t exp = (value >> 3) & 0x0F;
+    const uint32_t mant = value & 0x07;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            float zero = 0.0f;
+            const uint32_t sign_bits = sign;
+            std::memcpy(&zero, &sign_bits, sizeof(float));
+            return zero;
+        }
+        const float sub = static_cast<float>(mant) * (1.0f / 512.0f);
+        return sign != 0 ? -sub : sub;
+    }
+    if (exp == 0x0F && mant == 0x07) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    const uint32_t exp_f32 = (exp + 120) << 23;
+    const uint32_t mant_f32 = mant << 20;
+    const uint32_t bits = sign | exp_f32 | mant_f32;
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(float));
+    return out;
+}
+
 bool has_nvfp4_metadata_for_key(
     const std::unordered_map<std::string, array>& tensors,
     const std::string& weight_key
@@ -217,25 +243,32 @@ array dequantize_nvfp4_weight(
     const bool use_packed_key = has_tensor(tensors, base + ".weight_packed");
     const std::string packed_key = use_packed_key ? (base + ".weight_packed") : weight_key;
     const array packed_u8 = astype(require_tensor(tensors, packed_key), uint8);
-    const array scales_f32 = astype(require_tensor(tensors, base + ".weight_scale"), float32);
+    const array raw_scale = require_tensor(tensors, base + ".weight_scale");
     eval(packed_u8);
-    eval(scales_f32);
+    eval(raw_scale);
 
-    if (packed_u8.ndim() != 2 || scales_f32.ndim() != 2) {
+    if (packed_u8.ndim() != 2 || raw_scale.ndim() != 2) {
         throw std::runtime_error("nvfp4 packed/scales must be rank-2 for " + weight_key);
     }
 
     const int rows = packed_u8.shape(0);
     const int packed_cols = packed_u8.shape(1);
     const int cols = packed_cols * 2;
-    if (scales_f32.shape(0) != rows) {
+    if (raw_scale.shape(0) != rows) {
         throw std::runtime_error("nvfp4 scales row mismatch for " + weight_key);
     }
-    const int scale_cols = scales_f32.shape(1);
+    const int scale_cols = raw_scale.shape(1);
     if (scale_cols <= 0 || cols % scale_cols != 0) {
         throw std::runtime_error("invalid nvfp4 scales shape for " + weight_key);
     }
     const int group_size = cols / scale_cols;
+
+    array scales_f32 = array(0.0f);
+    const bool scales_are_e4m3_bytes = raw_scale.dtype() == uint8 || raw_scale.dtype() == int8;
+    if (!scales_are_e4m3_bytes) {
+        scales_f32 = astype(raw_scale, float32);
+        eval(scales_f32);
+    }
 
     float global_scale = 1.0f;
     if (has_tensor(tensors, base + ".weight_global_scale")) {
@@ -255,7 +288,18 @@ array dequantize_nvfp4_weight(
     }
 
     const uint8_t* packed_ptr = packed_u8.data<uint8_t>();
-    const float* scale_ptr = scales_f32.data<float>();
+    array scale_bytes_u8 = array(0.0f);
+    const uint8_t* scale_byte_ptr = nullptr;
+    if (scales_are_e4m3_bytes) {
+        if (raw_scale.dtype() == uint8) {
+            scale_byte_ptr = raw_scale.data<uint8_t>();
+        } else {
+            scale_bytes_u8 = view(raw_scale, uint8);
+            eval(scale_bytes_u8);
+            scale_byte_ptr = scale_bytes_u8.data<uint8_t>();
+        }
+    }
+    const float* scale_ptr = scales_are_e4m3_bytes ? nullptr : scales_f32.data<float>();
     std::vector<float> decoded(static_cast<size_t>(rows) * static_cast<size_t>(cols));
     for (int r = 0; r < rows; ++r) {
         const size_t packed_row_off = static_cast<size_t>(r) * static_cast<size_t>(packed_cols);
@@ -264,7 +308,10 @@ array dequantize_nvfp4_weight(
         for (int c = 0; c < cols; ++c) {
             const uint8_t packed = packed_ptr[packed_row_off + static_cast<size_t>(c / 2)];
             const uint8_t nibble = (c & 1) == 0 ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
-            const float local_scale = scale_ptr[scale_row_off + static_cast<size_t>(c / group_size)];
+            const size_t scale_idx = scale_row_off + static_cast<size_t>(c / group_size);
+            const float local_scale = scales_are_e4m3_bytes
+                ? fp8_e4m3_byte_to_f32(scale_byte_ptr[scale_idx])
+                : scale_ptr[scale_idx];
             decoded[out_row_off + static_cast<size_t>(c)] = fp4_e2m1_nibble_to_f32(nibble) * (local_scale / global_scale);
         }
     }
@@ -372,9 +419,31 @@ bool capture_native_nvfp4_quant(
     const bool use_packed_key = has_tensor(tensors, base + ".weight_packed");
     const std::string packed_key = use_packed_key ? (base + ".weight_packed") : weight_key;
     const array packed_src = astype(require_tensor(tensors, packed_key), uint8);
-    const array scale_src = view(require_tensor(tensors, base + ".weight_scale"), uint8);
+    const array raw_scale = require_tensor(tensors, base + ".weight_scale");
+    const array scale_src = view(raw_scale, uint8);
     eval(packed_src);
     eval(scale_src);
+
+    if (env_truthy("TALU_METAL_NVFP4_DEBUG", false)) {
+        static int debug_prints = 0;
+        if (debug_prints < 8) {
+            std::fprintf(
+                stderr,
+                "[mlx][nvfp4_debug] key=%s packed_dtype=%d packed_shape=[%d,%d] scale_dtype=%d scale_shape=[%d,%d] scale_view_dtype=%d scale_view_shape=[%d,%d]\n",
+                weight_key.c_str(),
+                static_cast<int>(static_cast<Dtype::Val>(packed_src.dtype())),
+                packed_src.ndim() > 0 ? packed_src.shape(0) : -1,
+                packed_src.ndim() > 1 ? packed_src.shape(1) : -1,
+                static_cast<int>(static_cast<Dtype::Val>(raw_scale.dtype())),
+                raw_scale.ndim() > 0 ? raw_scale.shape(0) : -1,
+                raw_scale.ndim() > 1 ? raw_scale.shape(1) : -1,
+                static_cast<int>(static_cast<Dtype::Val>(scale_src.dtype())),
+                scale_src.ndim() > 0 ? scale_src.shape(0) : -1,
+                scale_src.ndim() > 1 ? scale_src.shape(1) : -1
+            );
+            debug_prints += 1;
+        }
+    }
 
     if (packed_src.ndim() != 2 || scale_src.ndim() != 2) return false;
     const int rows = packed_src.shape(0);
@@ -402,7 +471,29 @@ bool capture_native_nvfp4_quant(
         if (s2 != 0.0f && std::isfinite(s2)) inv_gs = s2;
     }
 
-    *out_q_w = stop_gradient(copy(reshape(view(packed_src, uint32), {rows, packed_byte_cols / 4})));
+    array packed_for_q = packed_src;
+    if (env_truthy("TALU_METAL_NVFP4_SWAP_NIBBLES", false)) {
+        const uint8_t* src_ptr = packed_src.data<uint8_t>();
+        std::vector<uint8_t> swapped(static_cast<size_t>(rows) * static_cast<size_t>(packed_byte_cols));
+        for (size_t i = 0; i < swapped.size(); ++i) {
+            const uint8_t byte = src_ptr[i];
+            swapped[i] = static_cast<uint8_t>((byte << 4) | (byte >> 4));
+        }
+        packed_for_q = stop_gradient(copy(array(swapped.begin(), Shape{rows, packed_byte_cols}, uint8)));
+    }
+    if (env_truthy("TALU_METAL_NVFP4_SWAP_WORD_BYTES", false)) {
+        const uint8_t* src_ptr = packed_for_q.data<uint8_t>();
+        std::vector<uint8_t> swapped(static_cast<size_t>(rows) * static_cast<size_t>(packed_byte_cols));
+        for (size_t i = 0; i < swapped.size(); i += 4) {
+            swapped[i + 0] = src_ptr[i + 3];
+            swapped[i + 1] = src_ptr[i + 2];
+            swapped[i + 2] = src_ptr[i + 1];
+            swapped[i + 3] = src_ptr[i + 0];
+        }
+        packed_for_q = stop_gradient(copy(array(swapped.begin(), Shape{rows, packed_byte_cols}, uint8)));
+    }
+
+    *out_q_w = stop_gradient(copy(reshape(view(packed_for_q, uint32), {rows, packed_byte_cols / 4})));
     *out_q_scales = stop_gradient(copy(scale_src));
     // Store inv_gs (1/global_scale) as scalar — dispatch multiplies result by this.
     *out_q_biases = stop_gradient(array(inv_gs, float32));
@@ -734,9 +825,10 @@ void maybe_quantize_mxfp8_matrix(
         }
     }
 
-    if (out_q_biases != nullptr &&
+    const bool nvfp4_only_key =
         has_nvfp4_metadata_for_key(tensors, weight_key) &&
-        !has_grouped_affine_metadata_for_key(tensors, weight_key))
+        !has_grouped_affine_metadata_for_key(tensors, weight_key);
+    if (out_q_biases != nullptr && nvfp4_only_key)
     {
         if (capture_native_nvfp4_quant(
                 tensors,
@@ -749,6 +841,9 @@ void maybe_quantize_mxfp8_matrix(
             g_qmm_success += 1;
             return;
         }
+        // Pure NVFP4 keys must never silently fall back to another quant mode.
+        *out_has_q = false;
+        return;
     }
 
     const bool enforce_grouped_affine_lossless = env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true);

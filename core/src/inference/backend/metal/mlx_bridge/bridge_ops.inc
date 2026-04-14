@@ -91,7 +91,13 @@ array linear_decode_maybe_quantized(
             q_w.dtype() == uint32 &&
             q_scales.dtype() == uint8 &&
             quant_group_size == 16 &&
-            quant_bits == 4;
+            quant_bits == 4 &&
+            q_w.ndim() == 2 &&
+            q_scales.ndim() == 2 &&
+            q_w.shape(0) == q_scales.shape(0) &&
+            q_w.shape(1) > 0 &&
+            (q_w.shape(1) % 2) == 0 &&
+            q_scales.shape(1) == (q_w.shape(1) / 2);
         if (affine_ready) {
             const array out = quantized_matmul(
                 x,
@@ -113,8 +119,8 @@ array linear_decode_maybe_quantized(
                 q_scales,
                 std::nullopt,
                 true,
-                quant_group_size,
-                quant_bits,
+                std::nullopt,
+                std::nullopt,
                 "nvfp4"
             );
             // NVFP4 stores 1/global_scale in q_biases as a scalar post-multiply.

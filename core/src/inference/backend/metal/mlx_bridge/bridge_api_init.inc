@@ -91,6 +91,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         ctx->has_mxfp8_meta = has_mxfp8_meta;
         bool has_grouped_affine_meta = has_grouped_affine_quant_metadata(tensors);
         const bool has_nvfp4_meta = has_nvfp4_quant_metadata(tensors);
+        const bool nvfp4_only_checkpoint = has_nvfp4_meta && !has_grouped_affine_meta;
         if (has_grouped_affine_meta && has_nvfp4_meta) {
             // Hybrid artifacts preserve grouped-affine execution tensors.
             ctx->cfg.quant_bits = 4;
@@ -109,6 +110,12 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         // Callers can still force on/off via TALU_METAL_FP8_DECODE_QMM.
         const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta;
         ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
+        if (nvfp4_only_checkpoint && !ctx->fp8_decode_qmm_enabled) {
+            throw std::runtime_error(
+                "nvfp4-only checkpoint requires TALU_METAL_FP8_DECODE_QMM=1 "
+                "(decode fallback paths are disabled for nvfp4-only checkpoints)"
+            );
+        }
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
         // v3 cache/runtime policy: quantized path is allowed for prefill too,
         // so dense RHS is not retained by default.
@@ -202,11 +209,26 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         const std::string embed_weight_key = has_tensor(tensors, text_prefix + "embed_tokens.weight")
             ? text_prefix + "embed_tokens.weight"
             : "model.embed_tokens.weight";
+        const bool nvfp4_only_checkpoint_for_embed = has_nvfp4_meta && !has_grouped_affine_meta;
         const bool enable_quantized_embed_lookup = env_truthy(
             "TALU_METAL_GROUPED_AFFINE_EMBED_LOOKUP",
-            has_grouped_affine_meta
+            has_grouped_affine_meta || nvfp4_only_checkpoint_for_embed
         );
-        if (enable_quantized_embed_lookup && has_grouped_affine_metadata_for_key(tensors, embed_weight_key)) {
+        if (enable_quantized_embed_lookup &&
+            has_nvfp4_metadata_for_key(tensors, embed_weight_key) &&
+            !has_grouped_affine_metadata_for_key(tensors, embed_weight_key))
+        {
+            if (capture_native_nvfp4_quant(
+                    tensors,
+                    embed_weight_key,
+                    &ctx->embed_tokens_q_w,
+                    &ctx->embed_tokens_q_scales,
+                    &ctx->embed_tokens_q_biases))
+            {
+                ctx->embed_tokens_has_q = true;
+                ctx->embed_tokens_q_bits = 4;
+            }
+        } else if (enable_quantized_embed_lookup && has_grouped_affine_metadata_for_key(tensors, embed_weight_key)) {
             int embed_bits = 0;
             const array packed_embed = require_tensor(tensors, embed_weight_key);
             ctx->embed_tokens_has_q = maybe_capture_grouped_affine_quant(
@@ -932,6 +954,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             std::to_string(expected_cols) + " got cols=" + std::to_string(fused_cols)
                         );
                     }
+                    const bool fused_is_nvfp4 = has_nvfp4_metadata_for_key(tensors, fused_key);
                     bool lin_qkvz_q_captured = false;
                     bool lin_ba_q_captured = false;
                     if (enable_mlp_qmm && env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true)) {
@@ -976,6 +999,46 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             g_qmm_success += 2;
                         }
                     }
+                    if (enable_mlp_qmm && (!lin_qkvz_q_captured || !lin_ba_q_captured) &&
+                        has_nvfp4_metadata_for_key(tensors, fused_key))
+                    {
+                        // Native NVFP4 capture for fused mixer.in_proj: keep the
+                        // packed payload/scales and slice qkvz/ba row ranges.
+                        array fused_q_w = array(0.0f);
+                        array fused_q_scales = array(0.0f);
+                        array fused_q_biases = array(0.0f);
+                        if (capture_native_nvfp4_quant(
+                                tensors,
+                                fused_key,
+                                &fused_q_w,
+                                &fused_q_scales,
+                                &fused_q_biases) &&
+                            fused_q_w.ndim() == 2 &&
+                            fused_q_scales.ndim() == 2 &&
+                            fused_q_w.shape(0) == expected_cols &&
+                            fused_q_scales.shape(0) == expected_cols)
+                        {
+                            const int packed_cols = fused_q_w.shape(1);
+                            const int group_cols = fused_q_scales.shape(1);
+                            lw.lin_in_proj_qkvz_q_w = slice(fused_q_w, {0, 0}, {qkvz_cols, packed_cols});
+                            lw.lin_in_proj_ba_q_w = slice(fused_q_w, {qkvz_cols, 0}, {expected_cols, packed_cols});
+                            lw.lin_in_proj_qkvz_q_scales = slice(fused_q_scales, {0, 0}, {qkvz_cols, group_cols});
+                            lw.lin_in_proj_ba_q_scales = slice(fused_q_scales, {qkvz_cols, 0}, {expected_cols, group_cols});
+                            // Native NVFP4 stores a scalar post-scale factor.
+                            lw.lin_in_proj_qkvz_q_biases = fused_q_biases;
+                            lw.lin_in_proj_ba_q_biases = fused_q_biases;
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lw.lin_in_proj_ba_has_q = true;
+                            lw.lin_in_proj_all_q_w = fused_q_w;
+                            lw.lin_in_proj_all_q_scales = fused_q_scales;
+                            lw.lin_in_proj_all_q_biases = fused_q_biases;
+                            lw.lin_in_proj_all_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 2;
+                            g_qmm_success += 2;
+                        }
+                    }
                     std::optional<array> fused_in_proj_weight_dense;
                     const auto ensure_fused_in_proj_weight_dense = [&]() -> const array& {
                         if (!fused_in_proj_weight_dense.has_value()) {
@@ -990,17 +1053,21 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             {0, 0},
                             {qkvz_cols, fused_in_proj_weight.shape(1)}
                         );
-                        maybe_quantize_mxfp8_matrix(
-                            tensors,
-                            ctx->cfg,
-                            p + "mixer.in_proj.qkvz_slice",
-                            qkvz_weight,
-                            enable_mlp_qmm,
-                            &lw.lin_in_proj_qkvz_q_w,
-                            &lw.lin_in_proj_qkvz_q_scales,
-                            &lw.lin_in_proj_qkvz_q_biases,
-                            &lw.lin_in_proj_qkvz_has_q
-                        );
+                        if (!fused_is_nvfp4) {
+                            maybe_quantize_mxfp8_matrix(
+                                tensors,
+                                ctx->cfg,
+                                p + "mixer.in_proj.qkvz_slice",
+                                qkvz_weight,
+                                enable_mlp_qmm,
+                                &lw.lin_in_proj_qkvz_q_w,
+                                &lw.lin_in_proj_qkvz_q_scales,
+                                &lw.lin_in_proj_qkvz_q_biases,
+                                &lw.lin_in_proj_qkvz_has_q
+                            );
+                        } else {
+                            lw.lin_in_proj_qkvz_has_q = false;
+                        }
                     }
                     if (!lin_ba_q_captured) {
                         const array& fused_in_proj_weight = ensure_fused_in_proj_weight_dense();
@@ -1009,17 +1076,21 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                             {qkvz_cols, 0},
                             {expected_cols, fused_in_proj_weight.shape(1)}
                         );
-                        maybe_quantize_mxfp8_matrix(
-                            tensors,
-                            ctx->cfg,
-                            p + "mixer.in_proj.ba_slice",
-                            ba_weight,
-                            enable_mlp_qmm,
-                            &lw.lin_in_proj_ba_q_w,
-                            &lw.lin_in_proj_ba_q_scales,
-                            &lw.lin_in_proj_ba_q_biases,
-                            &lw.lin_in_proj_ba_has_q
-                        );
+                        if (!fused_is_nvfp4) {
+                            maybe_quantize_mxfp8_matrix(
+                                tensors,
+                                ctx->cfg,
+                                p + "mixer.in_proj.ba_slice",
+                                ba_weight,
+                                enable_mlp_qmm,
+                                &lw.lin_in_proj_ba_q_w,
+                                &lw.lin_in_proj_ba_q_scales,
+                                &lw.lin_in_proj_ba_q_biases,
+                                &lw.lin_in_proj_ba_has_q
+                            );
+                        } else {
+                            lw.lin_in_proj_ba_has_q = false;
+                        }
                     }
                     if ((keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) ||
                         (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q)) {
@@ -1385,8 +1456,10 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             size_t dense_fallback_bytes = 0;
             const bool quantized_checkpoint =
                 has_mxfp8_meta || ctx->has_grouped_affine_meta || has_nvfp4_meta;
+            const bool nvfp4_only_quantized_checkpoint =
+                has_nvfp4_meta && !ctx->has_grouped_affine_meta && !has_mxfp8_meta;
             const bool strict_quantized_decode_requested =
-                env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", false);
+                env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", nvfp4_only_quantized_checkpoint);
             const bool strict_quantized_decode_active =
                 strict_quantized_decode_requested && quantized_checkpoint;
             if (strict_quantized_decode_active && !ctx->fp8_decode_qmm_enabled) {
