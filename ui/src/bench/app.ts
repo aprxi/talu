@@ -7,6 +7,7 @@ import {
   CHEVRON_DOWN_ICON,
   CHEVRON_RIGHT_ICON,
 } from "../icons.ts";
+import { writeClipboardText } from "../kernel/system/clipboard.ts";
 import { populateModelSelect, relativeTime } from "../render/helpers.ts";
 import type { ModelEntry } from "../types.ts";
 
@@ -2919,7 +2920,7 @@ async function copyBenchEventsLog(): Promise<boolean> {
     return false;
   }
   try {
-    await navigator.clipboard.writeText(text);
+    await writeClipboardText(text);
     return true;
   } catch (_err) {
     return false;
@@ -4335,7 +4336,7 @@ function wireUi(activeScenarios: BenchScenario[]): void {
     const el = document.getElementById("bench-log");
     const text = el?.textContent?.trim() ?? "";
     if (text) {
-      try { await navigator.clipboard.writeText(text); } catch (_) { /* noop */ }
+      try { await writeClipboardText(text); } catch (_) { /* noop */ }
     }
   });
   wireBenchEventLevelFilters();

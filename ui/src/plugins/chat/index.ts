@@ -195,9 +195,16 @@ export const chatPlugin: PluginDefinition = {
     pd.panelHttpCopy.addEventListener("click", () => {
       const text = pd.panelHttpCurl.textContent ?? "";
       if (text && text !== "No request yet") {
-        void navigator.clipboard.writeText(text);
-        pd.panelHttpCopy.title = "Copied!";
-        setTimeout(() => { pd.panelHttpCopy.title = "Copy curl"; }, 1500);
+        void ctx.clipboard.writeText(text).then(
+          () => {
+            pd.panelHttpCopy.title = "Copied!";
+            setTimeout(() => { pd.panelHttpCopy.title = "Copy curl"; }, 1500);
+          },
+          () => {
+            pd.panelHttpCopy.title = "Copy failed";
+            setTimeout(() => { pd.panelHttpCopy.title = "Copy curl"; }, 1500);
+          },
+        );
       }
     });
     setupAttachmentEvents();

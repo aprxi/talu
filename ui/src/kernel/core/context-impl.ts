@@ -35,6 +35,7 @@ import { GlobalEventManager } from "../system/global-events.ts";
 import { StorageFacadeImpl, KvStorageFacade } from "../system/storage.ts";
 import { NetworkAccessImpl, type NetworkConnectivity } from "../system/network.ts";
 import { FormatAccessImpl } from "../system/format.ts";
+import { writeClipboardText } from "../system/clipboard.ts";
 import { resolveKeybinding } from "../registries/keybindings.ts";
 import type { StatusBarManager } from "../ui/status-bar.ts";
 import type { ViewManager } from "../ui/view-manager.ts";
@@ -312,7 +313,7 @@ export function createPluginContext(
     },
     format: new FormatAccessImpl(),
     clipboard: {
-      writeText: (text) => navigator.clipboard.writeText(text),
+      writeText: (text) => writeClipboardText(text),
     },
     download: {
       save: (blob, filename) => {
