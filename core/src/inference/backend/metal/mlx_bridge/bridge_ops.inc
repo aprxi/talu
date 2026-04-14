@@ -124,9 +124,8 @@ array linear_decode_maybe_quantized(
                 "nvfp4"
             );
             // NVFP4 stores 1/global_scale in q_biases as a scalar post-multiply.
-            // This avoids lossy FP8 round-trip from folding global_scale into scales.
+            // Avoid explicit eval/sync in the hot path; read scalar directly.
             if (q_biases.size() == 1 && q_biases.dtype() == float32) {
-                eval(q_biases);
                 const float inv_gs = q_biases.item<float>();
                 if (inv_gs != 1.0f) {
                     out = out * array(inv_gs, out.dtype());

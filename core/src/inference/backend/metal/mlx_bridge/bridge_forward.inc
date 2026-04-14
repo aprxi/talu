@@ -245,7 +245,6 @@ array embedding_lookup(mlx_ctx* ctx, const array& ids) {
         );
         // Native NVFP4 stores 1/global_scale as a scalar post-scale factor.
         if (q_biases.size() == 1 && q_biases.dtype() == float32) {
-            eval(q_biases);
             const float inv_gs = q_biases.item<float>();
             if (inv_gs != 1.0f) {
                 dequant = dequant * array(inv_gs, dequant.dtype());
@@ -332,8 +331,9 @@ array forward_hidden(
 array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* trace_frame = nullptr) {
     const array hidden = forward_hidden(ctx, input_ids, true, trace_frame);
     array lm_input = hidden;
-    if ((ctx->has_fp8_meta or ctx->has_grouped_affine_meta) &&
+    if (ctx->lm_head_q_decode_enabled &&
         hidden.ndim() == 3 &&
+        hidden.shape(0) == 1 &&
         hidden.shape(1) > 1 &&
         ctx->cfg.hidden_size_per_layer_input <= 0)
     {
@@ -380,7 +380,6 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                               std::nullopt, true, std::nullopt,
                               std::nullopt, "nvfp4");
                           if (ctx->lm_head_q_biases.size() == 1 && ctx->lm_head_q_biases.dtype() == float32) {
-                              eval(ctx->lm_head_q_biases);
                               const float inv_gs = ctx->lm_head_q_biases.item<float>();
                               if (inv_gs != 1.0f) out = out * array(inv_gs, out.dtype());
                           }
@@ -444,7 +443,6 @@ array forward_logits_from_hidden(mlx_ctx* ctx, const array& normed_hidden) {
         array out = quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,
             std::nullopt, true, std::nullopt, std::nullopt, "nvfp4");
         if (ctx->lm_head_q_biases.size() == 1 && ctx->lm_head_q_biases.dtype() == float32) {
-            eval(ctx->lm_head_q_biases);
             const float inv_gs = ctx->lm_head_q_biases.item<float>();
             if (inv_gs != 1.0f) out = out * array(inv_gs, out.dtype());
         }
@@ -590,8 +588,8 @@ std::pair<array, array> fused_lm_head_topk_candidate_arrays(
         try {
             const array w_chunk = slice_rows_2d(ctx->lm_head_q_w, row_start, row_end);
             const array scales_chunk = slice_rows_2d(ctx->lm_head_q_scales, row_start, row_end);
-            const array biases_chunk = slice_rows_2d(ctx->lm_head_q_biases, row_start, row_end);
             const int lm_bits_chunk = ctx->lm_head_q_bits > 0 ? ctx->lm_head_q_bits : ctx->cfg.quant_bits;
+            const array biases_chunk = slice_rows_2d(ctx->lm_head_q_biases, row_start, row_end);
             const array logits_chunk = quantized_matmul(
                 hidden,
                 w_chunk,
