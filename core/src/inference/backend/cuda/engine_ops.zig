@@ -58,6 +58,14 @@ fn recordPhaseGateUpPath(self: anytype, path: ProjectionPath) void {
     }
 }
 
+fn phaseEventTimingEnabled(self: anytype) bool {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "phase_event_timing_enabled")) {
+        return self.phase_event_timing_enabled;
+    }
+    return false;
+}
+
 fn tryPrepareNvfp4LtInput(
     self: anytype,
     input: *const compute.cuda.Buffer,
@@ -170,9 +178,36 @@ pub fn linearForwardRows(
     weight: *const LinearWeight,
     out: *compute.cuda.Buffer,
 ) !void {
+    const SelfType = @TypeOf(self.*);
     const linear_start_ns: i128 = std.time.nanoTimestamp();
+    var linear_event_timing_active = false;
+    if (comptime @hasField(SelfType, "phase_linear_start_event")) {
+        if (phaseEventTimingEnabled(self)) {
+            if (self.phase_linear_start_event) |start_evt| {
+                if (self.phase_linear_stop_event != null) {
+                    self.device.recordEvent(start_evt, self.compute_stream) catch {};
+                    linear_event_timing_active = true;
+                }
+            }
+        }
+    }
     defer {
-        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - linear_start_ns);
+        var elapsed_ns: u64 = 0;
+        if (comptime @hasField(SelfType, "phase_linear_start_event")) {
+            if (linear_event_timing_active) {
+                if (self.phase_linear_start_event) |start_evt| {
+                    if (self.phase_linear_stop_event) |stop_evt| {
+                        self.device.recordEvent(stop_evt, self.compute_stream) catch {};
+                        self.device.synchronizeEvent(stop_evt) catch {};
+                        elapsed_ns = self.device.elapsedEventNs(start_evt, stop_evt) catch 0;
+                    }
+                }
+            }
+        }
+        if (elapsed_ns == 0) {
+            const elapsed_i128 = std.time.nanoTimestamp() - linear_start_ns;
+            elapsed_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+        }
         recordPhaseLinearNs(self, elapsed_ns);
     }
     if (rows == 0) return error.InvalidArgument;

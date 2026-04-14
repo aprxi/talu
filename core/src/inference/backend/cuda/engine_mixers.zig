@@ -44,10 +44,32 @@ fn debugKernelSyncEnabled() bool {
     return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
 }
 
-fn recordAttentionPhase(self: anytype, path: AttentionPath, start_ns: i128, is_causal: bool) void {
-    const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
-    const elapsed_ns: u64 = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+fn phaseEventTimingEnabled(self: anytype) bool {
     const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "phase_event_timing_enabled")) {
+        return self.phase_event_timing_enabled;
+    }
+    return false;
+}
+
+fn recordAttentionPhase(self: anytype, path: AttentionPath, start_ns: i128, is_causal: bool) void {
+    const SelfType = @TypeOf(self.*);
+    var elapsed_ns: u64 = 0;
+    if (comptime @hasField(SelfType, "phase_attention_start_event")) {
+        if (phaseEventTimingEnabled(self)) {
+            if (self.phase_attention_start_event) |start_evt| {
+                if (self.phase_attention_stop_event) |stop_evt| {
+                    self.device.recordEvent(stop_evt, self.compute_stream) catch {};
+                    self.device.synchronizeEvent(stop_evt) catch {};
+                    elapsed_ns = self.device.elapsedEventNs(start_evt, stop_evt) catch 0;
+                }
+            }
+        }
+    }
+    if (elapsed_ns == 0) {
+        const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
+        elapsed_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+    }
     if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
         self.nvfp4_phase_counters.recordAttention(path, elapsed_ns);
         self.nvfp4_phase_counters.recordAttentionCausality(is_causal);
@@ -2729,6 +2751,13 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
 
     if (can_any_fused_prefill) {
         const attention_start_ns: i128 = std.time.nanoTimestamp();
+        if (comptime @hasField(@TypeOf(self.*), "phase_attention_start_event")) {
+            if (phaseEventTimingEnabled(self)) {
+                if (self.phase_attention_start_event) |start_evt| {
+                    self.device.recordEvent(start_evt, self.compute_stream) catch {};
+                }
+            }
+        }
         var attention_path: AttentionPath = .heads_f32_kv;
         const sliding_window_u32 = std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32);
         switch (self.kv_cache_dtype) {
@@ -2736,9 +2765,10 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                 const use_gqa = kv_groups_u32 >= 2 and
                     attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function != null;
 
-                // GEMM-based attention: cuBLAS strided batched GEMM for Q×K^T and
-                // probs×V. Preferred for long-sequence prefill because cuBLAS
-                // tensor-core GEMMs amortize better as sequence grows.
+                // Real fused prefill routing:
+                // Prefer flash/fused prefill kernels whenever they are available.
+                // Keep GEMM attention only as correctness fallback when fused
+                // prefill kernels are unavailable on this runtime.
                 const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
                 const can_gemm_attn = true;
                 if (can_gemm_attn) {
@@ -2771,8 +2801,6 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                     const hd: usize = head_dim_u32;
                     const sl: usize = seq_len_u32;
                     const qr: usize = stage_rows;
-
-                    // Cast Q from f32 to f16 for tensor-core GEMM (f16×f16→f32).
                     const q_f16_elems = std.math.mul(usize, qr, cfg.q_projection_dim) catch return error.InvalidArgument;
                     const q_f16_bytes = std.math.mul(usize, q_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
                     const probs_f16_elems = std.math.mul(usize, std.math.mul(usize, n_kv, qr) catch return error.InvalidArgument, sl) catch return error.InvalidArgument;
@@ -3557,6 +3585,13 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
 
     if (can_any_fused_prefill) {
         const attention_start_ns: i128 = std.time.nanoTimestamp();
+        if (comptime @hasField(@TypeOf(self.*), "phase_attention_start_event")) {
+            if (phaseEventTimingEnabled(self)) {
+                if (self.phase_attention_start_event) |start_evt| {
+                    self.device.recordEvent(start_evt, self.compute_stream) catch {};
+                }
+            }
+        }
         var attention_path: AttentionPath = .heads_f32_kv;
         const sliding_window_u32_wq = std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32);
         switch (self.kv_cache_dtype) {
@@ -3564,7 +3599,10 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                 const use_gqa = kv_groups_u32 >= 2 and
                     attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function != null;
 
-                // GEMM-based attention (see NoQueryGate path for full commentary).
+                // Real fused prefill routing:
+                // Prefer flash/fused prefill kernels whenever they are available.
+                // Keep GEMM attention only as correctness fallback when fused
+                // prefill kernels are unavailable on this runtime.
                 const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
                 const can_gemm_attn = true;
                 if (can_gemm_attn) {
@@ -3595,8 +3633,6 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                     const hd: usize = head_dim_u32;
                     const sl: usize = seq_len_u32;
                     const qr: usize = stage_rows;
-
-                    // Cast Q from f32 to f16 for tensor-core GEMM.
                     const q_f16_elems = std.math.mul(usize, qr, cfg.q_dim) catch return error.InvalidArgument;
                     const q_f16_bytes = std.math.mul(usize, q_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
                     const probs_f16_elems = std.math.mul(usize, std.math.mul(usize, n_kv, qr) catch return error.InvalidArgument, sl) catch return error.InvalidArgument;

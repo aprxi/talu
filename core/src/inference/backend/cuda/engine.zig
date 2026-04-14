@@ -98,6 +98,7 @@ const GatedDeltaRuntimeState = engine_types.GatedDeltaRuntimeState;
 const KvRuntimeState = engine_types.KvRuntimeState;
 const saturatingU64FromU128 = engine_types.saturatingU64FromU128;
 const saturatingAddUsize = engine_types.saturatingAddUsize;
+const resolveEnvBool = engine_types.resolveEnvBool;
 const resolveCudaFixedAllocMode = engine_types.resolveCudaFixedAllocMode;
 const resolveCudaRequireFitCheck = engine_types.resolveCudaRequireFitCheck;
 const resolveCudaStrictMemoryMode = engine_types.resolveCudaStrictMemoryMode;
@@ -501,6 +502,7 @@ pub const CudaBackend = struct {
     fixed_alloc_mode: bool = false,
     require_fit_check: bool = false,
     strict_memory_mode: bool = false,
+    phase_event_timing_enabled: bool = false,
     gaffine_u4_tile8_enabled: bool = false,
     gaffine_u4_decode_i8_enabled: bool = false,
     gated_delta_ssm_i8_state_enabled: bool = false,
@@ -532,6 +534,10 @@ pub const CudaBackend = struct {
     nvfp4_route_window_start: Nvfp4RouteCounters = .{},
     nvfp4_phase_counters: Nvfp4PhaseBudgetCounters = .{},
     nvfp4_phase_window_start: Nvfp4PhaseBudgetCounters = .{},
+    phase_linear_start_event: ?compute.cuda.EventHandle = null,
+    phase_linear_stop_event: ?compute.cuda.EventHandle = null,
+    phase_attention_start_event: ?compute.cuda.EventHandle = null,
+    phase_attention_stop_event: ?compute.cuda.EventHandle = null,
     layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     layer_program_slot_buffers: []compute.cuda.Buffer = &.{},
@@ -1280,6 +1286,15 @@ pub const CudaBackend = struct {
         const resolved_max_seq_len = resolveCudaMaxSeqLen(model_max_seq_len);
         const resolved_kv_init_tokens = resolveCudaInitialKvCacheTokens(resolved_max_seq_len);
         const resolved_prefill_chunk_rows_cap = resolveCudaPrefillChunkRowsCap(resolved_max_seq_len);
+        const prefill_chunk_rows_override = std.posix.getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null;
+        const is_staged_topology = init_options.topology_mode != .single or init_options.init_layer_range != null;
+        // Staged topologies (pipeline/cpu+gpu variants) benefit from smaller
+        // prefill chunks to enable overlap between stages. Keep single-device
+        // default unchanged, and always respect explicit env overrides.
+        const staged_prefill_chunk_rows_cap: usize = if (is_staged_topology and !prefill_chunk_rows_override)
+            @min(resolved_prefill_chunk_rows_cap, @as(usize, 256))
+        else
+            resolved_prefill_chunk_rows_cap;
         const resolved_require_fit_check = resolveCudaRequireFitCheck();
         const resolved_strict_memory_mode = resolveCudaStrictMemoryMode();
         const resolved_memory_reserve_bytes = resolveCudaMemoryReserveBytes();
@@ -1311,11 +1326,12 @@ pub const CudaBackend = struct {
             .attention_scale = 0.0,
             .kv_storage_mode = resolveCudaKvStorageMode(),
             .kv_init_tokens = resolved_kv_init_tokens,
-            .prefill_chunk_rows_cap = resolved_prefill_chunk_rows_cap,
+            .prefill_chunk_rows_cap = staged_prefill_chunk_rows_cap,
             .max_batch_size = max_batch_size,
             .fixed_alloc_mode = resolveCudaFixedAllocMode(),
             .require_fit_check = resolved_require_fit_check,
             .strict_memory_mode = resolved_strict_memory_mode,
+            .phase_event_timing_enabled = resolveEnvBool("TALU_CUDA_PHASE_EVENT_TIMING", false),
             .gaffine_u4_tile8_enabled = resolveCudaGaffineU4Tile8Decode(),
             .gaffine_u4_decode_i8_enabled = resolveCudaGaffineU4DecodeI8(),
             .gated_delta_ssm_i8_state_enabled = resolveCudaGatedDeltaSsmI8State(default_gated_delta_ssm_i8_state),
@@ -1425,6 +1441,35 @@ pub const CudaBackend = struct {
             backend.device.setLaunchStream(null);
             if (backend.compute_stream) |stream| backend.device.destroyStream(stream);
             backend.compute_stream = null;
+        }
+        if (backend.phase_event_timing_enabled) {
+            if (!backend.device.supportsEventTiming()) {
+                log.warn("inference", "CUDA disabling phase event timing (timing event API unavailable)", .{});
+                backend.phase_event_timing_enabled = false;
+            } else {
+                backend.phase_linear_start_event = backend.device.createTimingEvent() catch null;
+                backend.phase_linear_stop_event = backend.device.createTimingEvent() catch null;
+                backend.phase_attention_start_event = backend.device.createTimingEvent() catch null;
+                backend.phase_attention_stop_event = backend.device.createTimingEvent() catch null;
+                if (backend.phase_linear_start_event == null or
+                    backend.phase_linear_stop_event == null or
+                    backend.phase_attention_start_event == null or
+                    backend.phase_attention_stop_event == null)
+                {
+                    if (backend.phase_linear_start_event) |evt| backend.device.destroyEvent(evt);
+                    if (backend.phase_linear_stop_event) |evt| backend.device.destroyEvent(evt);
+                    if (backend.phase_attention_start_event) |evt| backend.device.destroyEvent(evt);
+                    if (backend.phase_attention_stop_event) |evt| backend.device.destroyEvent(evt);
+                    backend.phase_linear_start_event = null;
+                    backend.phase_linear_stop_event = null;
+                    backend.phase_attention_start_event = null;
+                    backend.phase_attention_stop_event = null;
+                    backend.phase_event_timing_enabled = false;
+                    log.warn("inference", "CUDA disabling phase event timing (event allocation failed)", .{});
+                } else {
+                    log.info("inference", "CUDA phase event timing enabled", .{});
+                }
+            }
         }
         backend.kernel_registry = compute.cuda.Registry.init(allocator, &backend.device);
         errdefer backend.kernel_registry.deinit();
@@ -2328,6 +2373,22 @@ pub const CudaBackend = struct {
         if (self.pipeline_stage0_event) |event| {
             self.device.destroyEvent(event);
             self.pipeline_stage0_event = null;
+        }
+        if (self.phase_linear_start_event) |event| {
+            self.device.destroyEvent(event);
+            self.phase_linear_start_event = null;
+        }
+        if (self.phase_linear_stop_event) |event| {
+            self.device.destroyEvent(event);
+            self.phase_linear_stop_event = null;
+        }
+        if (self.phase_attention_start_event) |event| {
+            self.device.destroyEvent(event);
+            self.phase_attention_start_event = null;
+        }
+        if (self.phase_attention_stop_event) |event| {
+            self.device.destroyEvent(event);
+            self.phase_attention_stop_event = null;
         }
         self.block_runtime.deinit(self.allocator, &self.device);
         self.runtime_buffers.deinit(self.allocator, &self.device);

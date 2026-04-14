@@ -58,7 +58,7 @@ const kvCacheBytesForCapacityDtype = engine_weights.kvCacheBytesForCapacityDtype
 const allocDeviceKvPairWithScales = engine_weights.allocDeviceKvPairWithScales;
 
 pub const prototype_eps: f32 = 1e-5;
-pub const initial_kv_cache_tokens: usize = 256;
+pub const initial_kv_cache_tokens: usize = 512;
 pub const KvCacheDtype = enum(u8) {
     f16,
     i8,
@@ -86,7 +86,7 @@ pub fn resolveKvCacheDtype() KvCacheDtype {
     if (std.ascii.eqlIgnoreCase(raw, "fp8") or std.ascii.eqlIgnoreCase(raw, "e4m3")) return .fp8;
     return .i8;
 }
-pub const enable_fused_attention_f16_kv: bool = true;
+pub const enable_fused_attention_f16_kv: bool = false;
 pub const max_fused_attention_f16_kv_seq_len: u32 = 384;
 pub const default_prefill_chunk_rows_cap: usize = 1024;
 pub const enable_device_embedding_lookup: bool = false;

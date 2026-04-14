@@ -68,6 +68,8 @@ const CuMemcpyPeerAsyncFn = *const fn (u64, ?*anyopaque, u64, ?*anyopaque, usize
 const CuEventCreateFn = *const fn (*?*anyopaque, u32) callconv(.c) c_int;
 const CuEventDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CuEventRecordFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
+const CuEventSynchronizeFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuEventElapsedTimeFn = *const fn (*f32, ?*anyopaque, ?*anyopaque) callconv(.c) c_int;
 const CuStreamWaitEventFn = *const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int;
 
 pub const ModuleHandle = *anyopaque;
@@ -126,6 +128,8 @@ const DriverApi = struct {
     cu_event_create: ?CuEventCreateFn,
     cu_event_destroy: ?CuEventDestroyFn,
     cu_event_record: ?CuEventRecordFn,
+    cu_event_synchronize: ?CuEventSynchronizeFn,
+    cu_event_elapsed_time: ?CuEventElapsedTimeFn,
     cu_stream_wait_event: ?CuStreamWaitEventFn,
 };
 
@@ -611,11 +615,22 @@ pub const Device = struct {
     }
 
     pub fn createEvent(self: *Device) !EventHandle {
+        // Prefer disable-timing events for lightweight stream ordering.
+        // Some driver/runtime combinations can reject this flag; fall back
+        // to a timing-enabled event so cross-stream dependency still works.
+        return self.createEventWithFlags(0x2) catch self.createEventWithFlags(0);
+    }
+
+    /// Create an event with timing enabled.
+    pub fn createTimingEvent(self: *Device) !EventHandle {
+        return self.createEventWithFlags(0);
+    }
+
+    fn createEventWithFlags(self: *Device, flags: u32) !EventHandle {
         const cu_event_create = self.api.cu_event_create orelse return error.CudaEventApiUnavailable;
         try self.makeCurrent();
         var event: ?*anyopaque = null;
-        // CU_EVENT_DISABLE_TIMING = 0x2 — avoids timing overhead.
-        if (cu_event_create(&event, 0x2) != cuda_success or event == null) {
+        if (cu_event_create(&event, flags) != cuda_success or event == null) {
             return error.CudaEventCreateFailed;
         }
         return event.?;
@@ -635,6 +650,26 @@ pub const Device = struct {
         if (cu_event_record(event, stream) != cuda_success) return error.CudaEventRecordFailed;
     }
 
+    /// Block until an event has completed.
+    pub fn synchronizeEvent(self: *Device, event: EventHandle) !void {
+        const cu_event_synchronize = self.api.cu_event_synchronize orelse return error.CudaEventApiUnavailable;
+        try self.makeCurrent();
+        if (cu_event_synchronize(event) != cuda_success) return error.CudaEventSynchronizeFailed;
+    }
+
+    /// Return elapsed GPU time between two timing-enabled events.
+    pub fn elapsedEventNs(self: *Device, start: EventHandle, stop: EventHandle) !u64 {
+        const cu_event_elapsed_time = self.api.cu_event_elapsed_time orelse return error.CudaEventApiUnavailable;
+        try self.makeCurrent();
+        var elapsed_ms: f32 = 0.0;
+        if (cu_event_elapsed_time(&elapsed_ms, start, stop) != cuda_success) return error.CudaEventElapsedTimeFailed;
+        if (elapsed_ms <= 0.0) return 0;
+        const elapsed_ns = @as(f64, @floatCast(elapsed_ms)) * 1_000_000.0;
+        const u64_max_f64 = @as(f64, @floatFromInt(std.math.maxInt(u64)));
+        if (elapsed_ns >= u64_max_f64) return std.math.maxInt(u64);
+        return @intFromFloat(elapsed_ns);
+    }
+
     /// Make a stream wait for an event. The stream will not execute any
     /// subsequently queued work until the event fires. Works across devices.
     pub fn streamWaitEvent(self: *Device, stream: ?StreamHandle, event: EventHandle) !void {
@@ -648,6 +683,12 @@ pub const Device = struct {
             self.api.cu_event_destroy != null and
             self.api.cu_event_record != null and
             self.api.cu_stream_wait_event != null;
+    }
+
+    pub fn supportsEventTiming(self: *const Device) bool {
+        return self.supportsEvents() and
+            self.api.cu_event_synchronize != null and
+            self.api.cu_event_elapsed_time != null;
     }
 
     pub fn graphInstantiate(self: *Device, graph: GraphHandle) !GraphExecHandle {
@@ -1018,6 +1059,8 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_event_create = lookupOptionalAny(CuEventCreateFn, lib, &.{ "cuEventCreate" }),
         .cu_event_destroy = lookupOptionalAny(CuEventDestroyFn, lib, &.{ "cuEventDestroy_v2", "cuEventDestroy" }),
         .cu_event_record = lookupOptionalAny(CuEventRecordFn, lib, &.{ "cuEventRecord" }),
+        .cu_event_synchronize = lookupOptionalAny(CuEventSynchronizeFn, lib, &.{ "cuEventSynchronize" }),
+        .cu_event_elapsed_time = lookupOptionalAny(CuEventElapsedTimeFn, lib, &.{ "cuEventElapsedTime" }),
         .cu_stream_wait_event = lookupOptionalAny(CuStreamWaitEventFn, lib, &.{ "cuStreamWaitEvent" }),
     };
 }

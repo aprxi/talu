@@ -2513,9 +2513,14 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     // data lives in device buffers updated before this function, so the graph
     // topology is identical every token. All setup (embedding lookup, pointer
     // table uploads) runs before the graph region and before persistent replay.
+    const event_timing_enabled = if (comptime @hasField(@TypeOf(self.*), "phase_event_timing_enabled"))
+        self.phase_event_timing_enabled
+    else
+        false;
     const no_graph = std.posix.getenv("TALU_NO_GRAPH") != null;
     const graph_eligible = self.compute_stream != null and
         !trace.isEnabled() and deepstack_layer_features_opt == null and
+        !event_timing_enabled and
         !no_graph;
 
     var graph_capture_active = false;
@@ -3309,7 +3314,11 @@ fn computeBatchedDecodeLogitsWithMode(
         // Capture only on first steady-state step (state 2).
         var graph_capture_active = false;
         if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
-            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and !gemma4_branch_active) {
+            const event_timing_enabled = if (comptime @hasField(SelfType, "phase_event_timing_enabled"))
+                self.phase_event_timing_enabled
+            else
+                false;
+            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and !gemma4_branch_active and !event_timing_enabled) {
                 try self.device.streamBeginCapture(self.compute_stream.?);
                 graph_capture_active = true;
             }
