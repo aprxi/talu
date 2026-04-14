@@ -1,4 +1,4 @@
-.PHONY: all deps build static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
+.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
 
 # Detect platform-specific settings
 UNAME_S := $(shell uname -s)
@@ -323,10 +323,16 @@ endif
 	@cd deps/pdfium/cmake-build && cmake --build . --config Release -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 	@echo "PDFium installed to deps/pdfium/cmake-build/"
 
-build: deps sync-version gen-bindings ui
+build: deps sync-version ui
 	zig build release $(ZIG_BUILD_FLAGS)
 
-cuda: deps sync-version gen-bindings ui
+core: deps sync-version ui
+	zig build core $(ZIG_BUILD_FLAGS)
+
+inference: deps sync-version
+	zig build inference $(ZIG_BUILD_FLAGS)
+
+cuda: deps sync-version ui
 	@if [ -z "$(CUDA_NVCC)" ]; then \
 		echo "Error: nvcc not found. Install CUDA toolkit or add nvcc to PATH." >&2; \
 		exit 1; \

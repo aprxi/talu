@@ -59,8 +59,8 @@
 //! ```
 
 const std = @import("std");
-const log = @import("../../log.zig");
-const progress_api = @import("../../capi/progress.zig");
+const log = @import("log_pkg");
+const progress_api = @import("progress_pkg");
 
 // Re-export core types
 pub const Bundle = @import("bundle.zig").Bundle;
@@ -70,7 +70,6 @@ pub const cache = @import("cache.zig");
 pub const talu_cache = @import("talu_cache.zig");
 pub const scheme = @import("scheme.zig");
 pub const source = @import("source.zig");
-pub const meta = @import("meta.zig");
 
 // Re-export scheme types
 pub const Scheme = scheme.Scheme;
@@ -101,7 +100,7 @@ pub const CacheOrigin = cache.CacheOrigin;
 pub const ListOptions = cache.ListOptions;
 
 /// Re-export unified progress types for consumers
-pub const ProgressContext = progress_api.ProgressContext;
+pub const ProgressContext = progress_api.Context;
 
 /// Configuration for resolving model URIs.
 pub const ResolutionConfig = struct {

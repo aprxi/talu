@@ -6,11 +6,11 @@
 //! imports with engine.zig.
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
-const tensor = @import("../../../tensor.zig");
-const dtype = @import("../../../dtype.zig");
-const log = @import("../../../log.zig");
-const trace = @import("../../../xray/trace.zig");
+const compute = @import("compute_pkg");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const log = @import("log_pkg");
+const trace = @import("xray_pkg").trace;
 const attention_mod = @import("attention.zig");
 const cpu_kernels = @import("../cpu/kernels/root.zig");
 const cpu_conv1d = compute.cpu.conv1d_depthwise;

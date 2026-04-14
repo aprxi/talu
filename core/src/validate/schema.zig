@@ -1,7 +1,7 @@
 //! JSON Schema parser and grammar compiler.
 
 const std = @import("std");
-const io = @import("../io/root.zig");
+const io = @import("io_pkg");
 const ast = @import("ast.zig");
 const generic = @import("generic.zig");
 const regex = @import("regex.zig");

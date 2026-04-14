@@ -4,18 +4,18 @@
 //! Forward orchestration lives in `model.zig`.
 
 const std = @import("std");
-const log = @import("../../../../log.zig");
-const tensor_mod = @import("../../../../tensor.zig");
+const log = @import("log_pkg");
+const tensor_mod = @import("tensor_pkg");
 const Tensor = tensor_mod.Tensor;
-const models = @import("../../../../models/root.zig");
-const dtype_mod = @import("../../../../dtype.zig");
-const compute = @import("../../../../compute/root.zig");
+const models = @import("models_pkg");
+const dtype_mod = @import("dtype_pkg");
+const compute = @import("compute_pkg");
 const mlx_graph = compute.metal.graph;
 const runtime_graph = @import("../runtime_graph.zig");
-const topology = @import("../../../../models/op_types.zig");
+const topology = @import("models_pkg").op_types;
 const models_registry = models.registry;
 const plan_compiler = models.plan.compiler;
-const runtime_contract = @import("../../../runtime_contract/root.zig");
+const runtime_contract = @import("runtime_contract_pkg");
 
 const builtin = @import("builtin");
 const LoadedModel = models.LoadedModel;

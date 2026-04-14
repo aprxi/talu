@@ -4,8 +4,8 @@
 //! This has zero runtime overhead: checks run at comptime only.
 
 const std = @import("std");
-const topology = @import("../../models/op_types.zig");
-const runtime_contract = @import("../runtime_contract/root.zig");
+const topology = @import("models_pkg").op_types;
+const runtime_contract = @import("runtime_contract_pkg");
 
 /// Pooling strategy for embedding extraction.
 pub const PoolingStrategy = enum(u8) {

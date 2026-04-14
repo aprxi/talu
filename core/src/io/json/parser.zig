@@ -1,7 +1,7 @@
 //! JSON parsing helpers with size limits and consistent errors.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 
 var parse_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 

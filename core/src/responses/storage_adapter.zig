@@ -3,8 +3,8 @@
 //! Translates ItemRecord events into TaluDB block columns and restores them.
 
 const std = @import("std");
-const json = @import("../io/json/root.zig");
-const kvbuf = @import("../io/kvbuf/root.zig");
+const json = @import("io_pkg").json;
+const kvbuf = @import("io_pkg").kvbuf;
 const db_writer = @import("../db/writer.zig");
 const db_reader = @import("../db/reader.zig");
 const block_reader = @import("../db/block_reader.zig");

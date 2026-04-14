@@ -103,9 +103,15 @@ bool has_grouped_affine_quant_metadata(const std::unordered_map<std::string, arr
 
 bool has_nvfp4_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
     for (const auto& kv : tensors) {
-        if (!ends_with(kv.first, ".weight_packed")) continue;
-        const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight_packed").size());
-        if (tensors.find(base + ".weight_scale") != tensors.end()) {
+        // compressed-tensors: .weight_packed + .weight_scale
+        if (ends_with(kv.first, ".weight_packed")) {
+            const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight_packed").size());
+            if (tensors.find(base + ".weight_scale") != tensors.end()) {
+                return true;
+            }
+        }
+        // modelopt: .weight_scale_2 is unique to NVFP4 modelopt format
+        if (ends_with(kv.first, ".weight_scale_2")) {
             return true;
         }
     }
@@ -315,7 +321,7 @@ size_t model_weight_bytes_on_disk(const std::string& model_path) {
     return total;
 }
 
-int estimate_full_attention_layer_count(const Qwen35Config& cfg) {
+int estimate_full_attention_layer_count(const BridgeModelConfig& cfg) {
     const bool hybrid =
         cfg.linear_num_value_heads > 0 &&
         cfg.linear_num_key_heads > 0 &&
@@ -328,7 +334,7 @@ int estimate_full_attention_layer_count(const Qwen35Config& cfg) {
     return (cfg.num_hidden_layers + interval - 1) / interval;
 }
 
-size_t estimate_kv_cache_bytes(const Qwen35Config& cfg, int context_tokens, int active_slots) {
+size_t estimate_kv_cache_bytes(const BridgeModelConfig& cfg, int context_tokens, int active_slots) {
     if (context_tokens <= 0 || active_slots <= 0) return 0;
     const int full_layers = estimate_full_attention_layer_count(cfg);
     const size_t elems =
@@ -341,7 +347,7 @@ size_t estimate_kv_cache_bytes(const Qwen35Config& cfg, int context_tokens, int 
     return elems * sizeof(uint16_t); // bf16
 }
 
-size_t estimate_linear_state_bytes(const Qwen35Config& cfg) {
+size_t estimate_linear_state_bytes(const BridgeModelConfig& cfg) {
     const bool has_linear =
         cfg.linear_num_value_heads > 0 &&
         cfg.linear_num_key_heads > 0 &&
@@ -372,7 +378,7 @@ size_t estimate_linear_state_bytes(const Qwen35Config& cfg) {
 
 std::optional<MemoryBudgetEstimate> estimate_memory_budget(
     const std::string& model_path,
-    const Qwen35Config& cfg
+    const BridgeModelConfig& cfg
 ) {
     const std::optional<size_t> memory_size = device_memory_size_bytes();
     if (!memory_size.has_value()) return std::nullopt;
@@ -407,7 +413,7 @@ std::optional<MemoryBudgetEstimate> estimate_memory_budget(
     return estimate;
 }
 
-bool validate_memory_budget_or_set_error(const std::string& model_path, const Qwen35Config& cfg) {
+bool validate_memory_budget_or_set_error(const std::string& model_path, const BridgeModelConfig& cfg) {
     const std::optional<MemoryBudgetEstimate> estimate_opt = estimate_memory_budget(model_path, cfg);
     if (!estimate_opt.has_value()) return true;
 

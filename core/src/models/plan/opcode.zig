@@ -27,6 +27,7 @@ pub const Opcode = enum(u8) {
     // Reserved 9..15 for structural/vision expansion.
     // Future macro-ops MUST use 32..63.
     gated_delta_net = 32,
+    per_layer_branch = 33,
 
     // Primitive ops (v1 compatibility path for existing LayerOp programs)
     mul = 64,
@@ -71,6 +72,7 @@ pub fn isMacro(opcode: Opcode) bool {
         .moe,
         .mamba_mixer,
         .gated_delta_net,
+        .per_layer_branch,
         .shortconv,
         .mla_attention,
         .embedding,

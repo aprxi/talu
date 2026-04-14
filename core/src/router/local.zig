@@ -23,28 +23,30 @@
 //!     defer result.deinit(allocator);
 
 const std = @import("std");
-const inference = @import("../inference/root.zig");
-const models = @import("../models/root.zig");
-const tensor = @import("../tensor.zig");
+const inference_bridge = @import("inference_bridge.zig");
+const inference = inference_bridge.root;
+const models = @import("models_pkg");
+const tensor = @import("tensor_pkg");
 const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const protocol = @import("protocol/root.zig");
 const sampler = inference.sampling;
 const inference_types = inference.types;
 const FinishReason = inference_types.FinishReason;
-const backend_root = @import("../inference/backend/root.zig");
+const backend_root = inference_bridge.backend;
 const Backend = backend_root.Backend;
 const vision_types = inference.vision_types;
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 pub const PoolingStrategy = backend_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
-const io = @import("../io/root.zig");
-const image_mod = @import("../image/root.zig");
-const io_json = @import("../io/json/root.zig");
-const gen_config_mod = @import("../inference/config/generation.zig");
-const preproc_mod = @import("../inference/config/preprocessor.zig");
-const validate_mod = @import("../validate/root.zig");
-const error_context = @import("../error_context.zig");
+const io = @import("io_pkg");
+const repository = @import("io_pkg").repository.root;
+const image_mod = @import("image_pkg");
+const io_json = @import("io_pkg").json;
+const gen_config_mod = inference_bridge.generation_config;
+const preproc_mod = inference_bridge.preprocessor_config;
+const validate_mod = @import("validate_pkg");
+const error_context = @import("error_context_pkg");
 const ConstrainedSampler = validate_mod.sampler.ConstrainedSampler;
 const GrammarConfig = validate_mod.sampler.GrammarConfig;
 const tool_schema_mod = @import("tool_schema.zig");
@@ -52,10 +54,10 @@ const reasoning_parser_mod = responses_mod.reasoning_parser;
 const commit_mod = @import("commit.zig");
 const chat_template = @import("../template/chat_template.zig");
 const template_mod = @import("../template/root.zig");
-const progress_mod = @import("../capi/progress.zig");
+const progress_mod = @import("progress_pkg");
 const runtime_contract = inference.runtime_contract;
 
-pub const ResolutionConfig = io.repository.ResolutionConfig;
+pub const ResolutionConfig = repository.ResolutionConfig;
 pub const BackendInitOptions = backend_root.InitOptions;
 
 // Re-export scheduler types for router API
@@ -551,12 +553,12 @@ pub const LocalEngine = struct {
     /// Ownership: The engine does not retain the input slice; it resolves and
     /// owns its internal model path copy for the engine lifetime.
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8) !LocalEngine {
-        return initWithSeedAndResolutionConfig(allocator, model_path, 42, .{}, .{}, progress_mod.ProgressContext.NONE);
+        return initWithSeedAndResolutionConfig(allocator, model_path, 42, .{}, .{}, progress_mod.Context.NONE);
     }
 
     /// Initialize engine with a specific random seed.
     pub fn initWithSeed(allocator: std.mem.Allocator, model_path: []const u8, seed: u64) !LocalEngine {
-        return initWithSeedAndResolutionConfig(allocator, model_path, seed, .{}, .{}, progress_mod.ProgressContext.NONE);
+        return initWithSeedAndResolutionConfig(allocator, model_path, seed, .{}, .{}, progress_mod.Context.NONE);
     }
 
     /// Initialize engine with resolution configuration.
@@ -565,7 +567,7 @@ pub const LocalEngine = struct {
         model_path: []const u8,
         config: ResolutionConfig,
     ) !LocalEngine {
-        return initWithSeedAndResolutionConfig(allocator, model_path, 42, config, .{}, progress_mod.ProgressContext.NONE);
+        return initWithSeedAndResolutionConfig(allocator, model_path, 42, config, .{}, progress_mod.Context.NONE);
     }
 
     /// Initialize engine with a specific random seed and resolution configuration.
@@ -575,17 +577,17 @@ pub const LocalEngine = struct {
         seed: u64,
         config: ResolutionConfig,
         backend_init_options: BackendInitOptions,
-        progress: progress_mod.ProgressContext,
+        progress: progress_mod.Context,
     ) !LocalEngine {
         var timing_start_ns: i128 = std.time.nanoTimestamp();
 
         // Resolve model path using centralized repository logic.
         // Handles: local paths, model IDs (HF Hub), cache paths
-        const resolved_model_path = try io.repository.resolveModelPath(allocator, model_path, config);
+        const resolved_model_path = try repository.resolveModelPath(allocator, model_path, config);
         errdefer allocator.free(resolved_model_path);
 
         // Find model files
-        var model_bundle = try io.repository.resolve(allocator, resolved_model_path, .{});
+        var model_bundle = try repository.resolve(allocator, resolved_model_path, .{});
         defer model_bundle.deinit();
 
         // Validate files exist
@@ -637,7 +639,7 @@ pub const LocalEngine = struct {
             config_path: []const u8,
             weights_path: []const u8,
             load_options: models.LoadOptions,
-            prog: progress_mod.ProgressContext,
+            prog: progress_mod.Context,
             loaded_model: ?models.LoadedModel = null,
             err: ?anyerror = null,
             use_metadata_only: bool,
@@ -1184,7 +1186,7 @@ pub const LocalEngine = struct {
         var scheduler = try SchedulerType.init(self.allocator, &self.backend, .{
             .default_eos_token_ids = self.gen_config.eos_token_ids,
             .default_sampling = sampling_config,
-            .tokenizer = &self.tok,
+            .tokenizer = inference.scheduler.TokenizerView.fromTokenizer(&self.tok),
             .state_descriptors = self.scheduler_state_descriptors,
         });
         defer scheduler.deinit();
@@ -1902,7 +1904,7 @@ pub const LocalEngine = struct {
             merged_config.default_eos_token_ids = self.gen_config.eos_token_ids;
         }
         if (merged_config.tokenizer == null) {
-            merged_config.tokenizer = &self.tok;
+            merged_config.tokenizer = inference.scheduler.TokenizerView.fromTokenizer(&self.tok);
         }
         if (merged_config.state_descriptors.len == 0) {
             merged_config.state_descriptors = self.scheduler_state_descriptors;

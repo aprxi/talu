@@ -3,8 +3,8 @@
 const std = @import("std");
 const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
-const log = @import("../../../log.zig");
-const trace = @import("../../../xray/trace.zig");
+const log = @import("log_pkg");
+const trace = @import("xray_pkg").trace;
 
 fn slotIndexSupported(self: anytype, slot_index: usize) bool {
     const SelfType = @TypeOf(self.*);

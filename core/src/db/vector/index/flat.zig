@@ -1,8 +1,8 @@
 //! Exact flat index implementation (dot-product scan).
 
 const std = @import("std");
-const dot_product = @import("../../../compute/cpu/linalg.zig").dot;
-const parallel = @import("../../../system/parallel.zig");
+const dot_product = @import("compute_pkg").cpu.linalg.dot;
+const parallel = @import("compute_pkg").parallel;
 const vector_filter = @import("../filter.zig");
 
 const Allocator = std.mem.Allocator;

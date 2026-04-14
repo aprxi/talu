@@ -7,7 +7,7 @@ const std = @import("std");
 const ct = @import("c_types.zig");
 const json_utils = @import("json_utils.zig");
 const utils = @import("utils.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 const tok_fns = @import("pipeline.zig");
 

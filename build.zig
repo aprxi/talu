@@ -142,6 +142,70 @@ fn mlxIncludeFingerprintFlag(b: *std.Build) []const u8 {
     return b.fmt("-DTALU_MLX_INCLUDE_FP=0x{x}", .{h});
 }
 
+fn isAllowedInferenceBoundaryImport(rel_path: []const u8, import_path: []const u8) bool {
+    if (std.mem.eql(u8, rel_path, "router/inference_bridge.zig")) {
+        return std.mem.eql(u8, import_path, "inference_pkg");
+    }
+    if (std.mem.eql(u8, rel_path, "converter/calibration_capture.zig")) {
+        return std.mem.eql(u8, import_path, "inference_pkg");
+    }
+    if (std.mem.eql(u8, rel_path, "lib_dev.zig")) {
+        return std.mem.eql(u8, import_path, "inference_pkg");
+    }
+    return false;
+}
+
+fn validateInferenceBoundaryImports(b: *std.Build) void {
+    var root_dir = std.fs.cwd().openDir("core/src", .{ .iterate = true }) catch |err| {
+        std.debug.panic("failed to open core/src for boundary validation: {s}", .{@errorName(err)});
+    };
+    defer root_dir.close();
+
+    var walker = root_dir.walk(b.allocator) catch |err| {
+        std.debug.panic("failed to walk core/src for boundary validation: {s}", .{@errorName(err)});
+    };
+    defer walker.deinit();
+
+    var has_violations = false;
+    while (walker.next() catch |err| {
+        std.debug.panic("failed during boundary validation walk: {s}", .{@errorName(err)});
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (std.mem.startsWith(u8, entry.path, "inference/")) continue;
+
+        const abs_path = b.fmt("core/src/{s}", .{entry.path});
+        const source = std.fs.cwd().readFileAlloc(b.allocator, abs_path, 16 * 1024 * 1024) catch |err| {
+            std.debug.panic("failed reading {s} for boundary validation: {s}", .{ abs_path, @errorName(err) });
+        };
+        defer b.allocator.free(source);
+
+        const import_prefix = "@import(\"";
+        var search_start: usize = 0;
+        while (std.mem.indexOfPos(u8, source, search_start, import_prefix)) |match_start| {
+            const path_start = match_start + import_prefix.len;
+            const path_end = std.mem.indexOfPos(u8, source, path_start, "\"") orelse break;
+            search_start = path_end + 1;
+
+            const import_path = source[path_start..path_end];
+            const targets_inference = std.mem.indexOf(u8, import_path, "inference/") != null or
+                std.mem.eql(u8, import_path, "inference_pkg");
+            if (!targets_inference) continue;
+            if (isAllowedInferenceBoundaryImport(entry.path, import_path)) continue;
+
+            has_violations = true;
+            std.debug.print(
+                "inference boundary violation: core/src/{s} imports {s}; route via inference_pkg bridge\n",
+                .{ entry.path, import_path },
+            );
+        }
+    }
+
+    if (has_violations) {
+        std.debug.panic("inference import boundary validation failed", .{});
+    }
+}
+
 // =============================================================================
 // Dependencies — each built from ports/<dep>/build.zig
 // =============================================================================
@@ -164,6 +228,163 @@ const LibMagic = libmagic_port.LibMagic;
 const TreeSitter = tree_sitter_port.TreeSitter;
 const Sqlite3 = sqlite_port.Sqlite3;
 
+const CorePackages = struct {
+    models_pkg: *std.Build.Module,
+    tensor_pkg: *std.Build.Module,
+    compute_pkg: *std.Build.Module,
+    log_pkg: *std.Build.Module,
+    io_pkg: *std.Build.Module,
+    dtype_pkg: *std.Build.Module,
+    xray_pkg: *std.Build.Module,
+    runtime_contract_pkg: *std.Build.Module,
+    progress_pkg: *std.Build.Module,
+    validate_pkg: *std.Build.Module,
+    image_pkg: *std.Build.Module,
+    error_context_pkg: *std.Build.Module,
+
+    fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) CorePackages {
+        return .{
+            .models_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/models/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .tensor_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/tensor.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .compute_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/compute_pkg.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .log_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/log.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .io_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/io_pkg.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .dtype_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/dtype.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .xray_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/xray/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .runtime_contract_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/runtime_contract/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .progress_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/progress.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .validate_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/validate/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .image_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/image/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .error_context_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/error_context.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        };
+    }
+};
+
+fn addCorePackageImports(mod: *std.Build.Module, pkgs: *const CorePackages) void {
+    mod.addImport("models_pkg", pkgs.models_pkg);
+    if (mod != pkgs.tensor_pkg) mod.addImport("tensor_pkg", pkgs.tensor_pkg);
+    mod.addImport("compute_pkg", pkgs.compute_pkg);
+    if (mod != pkgs.log_pkg) mod.addImport("log_pkg", pkgs.log_pkg);
+    if (mod != pkgs.io_pkg) mod.addImport("io_pkg", pkgs.io_pkg);
+    if (mod != pkgs.dtype_pkg) mod.addImport("dtype_pkg", pkgs.dtype_pkg);
+    mod.addImport("xray_pkg", pkgs.xray_pkg);
+    if (mod != pkgs.runtime_contract_pkg) mod.addImport("runtime_contract_pkg", pkgs.runtime_contract_pkg);
+    if (mod != pkgs.progress_pkg) mod.addImport("progress_pkg", pkgs.progress_pkg);
+    if (mod != pkgs.validate_pkg) mod.addImport("validate_pkg", pkgs.validate_pkg);
+    if (mod != pkgs.image_pkg) mod.addImport("image_pkg", pkgs.image_pkg);
+    if (mod != pkgs.error_context_pkg) mod.addImport("error_context_pkg", pkgs.error_context_pkg);
+}
+
+fn wireCorePackageImports(pkgs: *const CorePackages) void {
+    addCorePackageImports(pkgs.models_pkg, pkgs);
+    addCorePackageImports(pkgs.tensor_pkg, pkgs);
+    addCorePackageImports(pkgs.compute_pkg, pkgs);
+    addCorePackageImports(pkgs.log_pkg, pkgs);
+    addCorePackageImports(pkgs.io_pkg, pkgs);
+    addCorePackageImports(pkgs.dtype_pkg, pkgs);
+    addCorePackageImports(pkgs.xray_pkg, pkgs);
+    addCorePackageImports(pkgs.runtime_contract_pkg, pkgs);
+    addCorePackageImports(pkgs.progress_pkg, pkgs);
+    addCorePackageImports(pkgs.validate_pkg, pkgs);
+    addCorePackageImports(pkgs.image_pkg, pkgs);
+    addCorePackageImports(pkgs.error_context_pkg, pkgs);
+}
+
+fn addCorePackageBuildImportsAndDeps(
+    b: *std.Build,
+    pkgs: *const CorePackages,
+    build_options_mod: *std.Build.Module,
+    cacert_mod: *std.Build.Module,
+    magic_db_mod: *std.Build.Module,
+    pcre2: Pcre2,
+    miniz: Miniz,
+    libmagic: LibMagic,
+    jpeg_turbo: JpegTurbo,
+    spng: Spng,
+    webp: Webp,
+    sqlite3: Sqlite3,
+    tree_sitter: TreeSitter,
+) void {
+    const modules = [_]*std.Build.Module{
+        pkgs.models_pkg,
+        pkgs.tensor_pkg,
+        pkgs.compute_pkg,
+        pkgs.log_pkg,
+        pkgs.io_pkg,
+        pkgs.dtype_pkg,
+        pkgs.xray_pkg,
+        pkgs.runtime_contract_pkg,
+        pkgs.progress_pkg,
+        pkgs.validate_pkg,
+        pkgs.image_pkg,
+        pkgs.error_context_pkg,
+    };
+    inline for (modules) |mod| {
+        mod.addImport("build_options", build_options_mod);
+        addCDependencies(b, mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    }
+}
+
 // =============================================================================
 // Helper to add C dependencies to a module
 // =============================================================================
@@ -171,6 +392,8 @@ const Sqlite3 = sqlite_port.Sqlite3;
 fn addCDependencies(
     b: *std.Build,
     mod: *std.Build.Module,
+    cacert_mod: *std.Build.Module,
+    magic_db_mod: *std.Build.Module,
     pcre2: Pcre2,
     miniz: Miniz,
     libmagic: LibMagic,
@@ -197,14 +420,10 @@ fn addCDependencies(
     mod.addIncludePath(tree_sitter.include_dir);
 
     // Mozilla CA certificates bundle for HTTPS - generated during `make deps`
-    mod.addImport("cacert", b.createModule(.{
-        .root_source_file = b.path("deps/cacert.zig"),
-    }));
+    mod.addImport("cacert", cacert_mod);
 
     // Compiled magic database for file type detection - generated during `make deps`
-    mod.addImport("magic_db", b.createModule(.{
-        .root_source_file = b.path("deps/magic_db.zig"),
-    }));
+    mod.addImport("magic_db", magic_db_mod);
 }
 
 fn linkCDependencies(
@@ -354,6 +573,10 @@ const UnitTestCfg = struct {
     optimize: std.builtin.OptimizeMode,
     build_options: *std.Build.Step.Options,
     cuda_assets_mod: *std.Build.Module,
+    inference_pkg_mod: *std.Build.Module,
+    cacert_mod: *std.Build.Module,
+    magic_db_mod: *std.Build.Module,
+    core_pkgs: *const CorePackages,
     pcre2: Pcre2,
     miniz: Miniz,
     libmagic: LibMagic,
@@ -376,8 +599,10 @@ const UnitTestCfg = struct {
             .link_libc = true,
         });
         mod.addImport("cuda_assets", self.cuda_assets_mod);
+        mod.addImport("inference_pkg", self.inference_pkg_mod);
+        addCorePackageImports(mod, self.core_pkgs);
         mod.addOptions("build_options", self.build_options);
-        addCDependencies(self.b, mod, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter);
+        addCDependencies(self.b, mod, self.cacert_mod, self.magic_db_mod, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter);
 
         const test_artifact = self.b.addTest(.{
             .root_module = mod,
@@ -569,6 +794,9 @@ pub fn build(b: *std.Build) void {
     const xray_bridge = b.option(bool, "xray_bridge", "Enable xray bridge instrumentation hooks (default: on in Debug, off in Release)") orelse xray_bridge_default;
     const version = getVersion(b);
 
+    // Enforce inference modular boundary for non-inference modules.
+    validateInferenceBoundaryImports(b);
+
     const gen_cuda_kernels_step = b.step("gen-cuda-kernels", "Generate CUDA kernel module assets (requires nvcc)");
     {
         const ensure_cuda_assets_dir = b.addSystemCommand(&.{
@@ -596,6 +824,20 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "dump_tensors", dump_tensors);
     build_options.addOption(bool, "xray_bridge", xray_bridge);
     build_options.addOption([]const u8, "version", version);
+    const build_options_mod = build_options.createModule();
+
+    const cacert_mod = b.createModule(.{
+        .root_source_file = b.path("deps/cacert.zig"),
+    });
+    const magic_db_mod = b.createModule(.{
+        .root_source_file = b.path("deps/magic_db.zig"),
+    });
+    const inference_pkg_mod = b.createModule(.{
+        .root_source_file = b.path("core/src/inference/abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
 
     const cuda_assets_mod = b.createModule(.{
         .root_source_file = b.path("core/cuda_assets.zig"),
@@ -613,6 +855,55 @@ pub fn build(b: *std.Build) void {
     const sqlite3 = sqlite_port.add(b, target, optimize);
     const tree_sitter = tree_sitter_port.add(b, target, optimize);
 
+    var core_pkgs = CorePackages.init(b, target, optimize);
+    wireCorePackageImports(&core_pkgs);
+    addCorePackageBuildImportsAndDeps(
+        b,
+        &core_pkgs,
+        build_options_mod,
+        cacert_mod,
+        magic_db_mod,
+        pcre2,
+        miniz,
+        libmagic,
+        jpeg_turbo,
+        spng,
+        webp,
+        sqlite3,
+        tree_sitter,
+    );
+    addCorePackageImports(inference_pkg_mod, &core_pkgs);
+    inference_pkg_mod.addImport("build_options", build_options_mod);
+    addCDependencies(b, inference_pkg_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+
+    // ==========================================================================
+    // Internal inference library (inference + models + compute)
+    // ==========================================================================
+    const inference_mod = b.createModule(.{
+        .root_source_file = b.path("core/src/inference/boundary.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    inference_mod.addImport("cuda_assets", cuda_assets_mod);
+    inference_mod.addImport("inference_pkg", inference_pkg_mod);
+    addCorePackageImports(inference_mod, &core_pkgs);
+    inference_mod.addImport("build_options", build_options_mod);
+    addCDependencies(b, inference_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+
+    const inference_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "talu-inference",
+        .root_module = inference_mod,
+    });
+    // Keep this archive self-contained for internal linking; external archives
+    // are linked by final binaries/shared libs.
+    linkCDependencies(b, inference_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, true);
+    addMetalSupport(b, inference_mod, inference_lib, enable_metal);
+
+    const inference_step = b.step("inference", "Build internal inference library (inference + models + compute)");
+    inference_step.dependOn(&b.addInstallArtifact(inference_lib, .{}).step);
+
     // ==========================================================================
     // Native shared library
     // ==========================================================================
@@ -623,8 +914,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     lib_mod.addImport("cuda_assets", cuda_assets_mod);
-    lib_mod.addOptions("build_options", build_options);
-    addCDependencies(b, lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    lib_mod.addImport("inference_pkg", inference_pkg_mod);
+    addCorePackageImports(lib_mod, &core_pkgs);
+    lib_mod.addImport("build_options", build_options_mod);
+    addCDependencies(b, lib_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
@@ -656,6 +949,26 @@ pub fn build(b: *std.Build) void {
     );
     python_install_step.dependOn(&copy_to_python.step);
 
+    const mlx_metallib_path = if (target.result.os.tag == .macos) findMlxMetallib(b) else null;
+    if (mlx_metallib_path) |path| {
+        // MLX resolves the default metallib relative to the loaded shared
+        // library image path (libtalu.dylib), so keep mlx.metallib colocated
+        // with libtalu in zig-out/lib.
+        const copy_mlx_metallib_lib = b.addInstallFileWithDir(
+            .{ .cwd_relative = path },
+            .lib,
+            "mlx.metallib",
+        );
+        install_lib.step.dependOn(&copy_mlx_metallib_lib.step);
+
+        // Keep Python wheel/runtime layout self-contained as well.
+        const copy_mlx_metallib_python = b.addInstallFile(
+            .{ .cwd_relative = path },
+            "../bindings/python/talu/mlx.metallib",
+        );
+        python_install_step.dependOn(&copy_mlx_metallib_python.step);
+    }
+
     // ==========================================================================
     // Native static library
     // ==========================================================================
@@ -666,9 +979,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     static_lib_mod.addImport("cuda_assets", cuda_assets_mod);
+    static_lib_mod.addImport("inference_pkg", inference_pkg_mod);
+    addCorePackageImports(static_lib_mod, &core_pkgs);
 
-    static_lib_mod.addOptions("build_options", build_options);
-    addCDependencies(b, static_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    static_lib_mod.addImport("build_options", build_options_mod);
+    addCDependencies(b, static_lib_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
     const static_lib = b.addLibrary(.{
         .linkage = .static,
@@ -681,13 +996,14 @@ pub fn build(b: *std.Build) void {
 
     const static_step = b.step("static", "Build static library");
     static_step.dependOn(&b.addInstallArtifact(static_lib, .{}).step);
+    const core_step = b.step("core", "Build core shared library/runtime artifact");
+    core_step.dependOn(&install_lib.step);
 
     // ==========================================================================
     // Native CLI (requires cargo/Rust toolchain)
     // ==========================================================================
     const has_cargo = if (b.findProgram(&.{"cargo"}, &.{})) |_| true else |_| false;
     var install_exe_step: ?*std.Build.Step = null;
-    var install_mlx_metallib_step: ?*std.Build.Step.InstallFile = null;
 
     if (has_cargo) {
         const cli_mod = b.createModule(.{
@@ -703,7 +1019,9 @@ pub fn build(b: *std.Build) void {
         });
         const cargo_cmd = b.addSystemCommand(&.{ "cargo", "build", "--release", "--manifest-path", "bindings/rust/Cargo.toml" });
         exe.step.dependOn(&cargo_cmd.step);
-        exe.linkLibrary(static_lib);
+        // Link CLI against the shared core library to avoid compiling core twice
+        // (shared + static) in the release path.
+        exe.linkLibrary(lib);
         // Link all deps including external .a archives (curl, mbedtls)
         linkCDependencies(b, exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
         exe.addObjectFile(b.path("bindings/rust/target/release/libtalu_cli.a"));
@@ -711,11 +1029,14 @@ pub fn build(b: *std.Build) void {
         // Link platform-specific runtime libraries for Rust CLI
         const cli_target_os = exe.rootModuleTarget().os.tag;
         if (cli_target_os == .linux) {
+            exe.root_module.addRPathSpecial("$ORIGIN/../lib");
             exe.linkSystemLibrary("unwind");
             exe.linkSystemLibrary("gcc_s");
             exe.linkSystemLibrary("dl");
             exe.linkSystemLibrary("pthread");
             exe.linkSystemLibrary("m");
+        } else if (cli_target_os == .macos) {
+            exe.root_module.addRPathSpecial("@executable_path/../lib");
         }
         // macOS frameworks already linked via linkCDependencies
 
@@ -723,16 +1044,15 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_exe.step);
         install_exe_step = &install_exe.step;
 
-        if (target.result.os.tag == .macos) {
-            if (findMlxMetallib(b)) |mlx_metallib_path| {
-                const copy_mlx_metallib = b.addInstallFileWithDir(
-                    .{ .cwd_relative = mlx_metallib_path },
-                    .bin,
-                    "mlx.metallib",
-                );
-                b.getInstallStep().dependOn(&copy_mlx_metallib.step);
-                install_mlx_metallib_step = copy_mlx_metallib;
-            }
+        if (mlx_metallib_path) |path| {
+            const copy_mlx_metallib_bin = b.addInstallFileWithDir(
+                .{ .cwd_relative = path },
+                .bin,
+                "mlx.metallib",
+            );
+            // Keep mlx.metallib next to CLI executable for direct colocated
+            // lookup paths as well.
+            install_exe.step.dependOn(&copy_mlx_metallib_bin.step);
         }
 
         const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "talu")});
@@ -748,19 +1068,34 @@ pub fn build(b: *std.Build) void {
         std.debug.print("NOTE: cargo not found — skipping CLI build (library still builds)\n", .{});
     }
 
+    const lib_step = b.step("lib", "Build and install dynamic library only");
+    lib_step.dependOn(&install_lib.step);
+
+    const cli_step = b.step("cli", "Build CLI executable only (no Python install)");
+    if (install_exe_step) |step| {
+        cli_step.dependOn(step);
+    } else {
+        const cli_fail_step = FailStep.create(b,
+            \\
+            \\ERROR: 'cli' step requires cargo (Rust toolchain).
+            \\
+            \\Install cargo, then run: zig build cli -Drelease
+            \\
+        );
+        cli_step.dependOn(&cli_fail_step.step);
+    }
+
     // ==========================================================================
     // Release step - recommended full build
     // ==========================================================================
     // Builds library, copies to Python, and builds CLI - all in ReleaseFast.
     // This is the recommended build command for development and agents.
     const release_step = b.step("release", "Build library + CLI and copy to Python (recommended)");
-    release_step.dependOn(&install_lib.step);
+    release_step.dependOn(inference_step);
+    release_step.dependOn(core_step);
     release_step.dependOn(python_install_step);
     if (install_exe_step) |step| {
         release_step.dependOn(step);
-    }
-    if (install_mlx_metallib_step) |step| {
-        release_step.dependOn(&step.step);
     }
 
     // Enforce release mode for the release step
@@ -811,14 +1146,16 @@ pub fn build(b: *std.Build) void {
 
         // Static library with dump instrumentation
         const dump_lib_mod = b.createModule(.{
-            .root_source_file = b.path("core/src/lib.zig"),
+            .root_source_file = b.path("core/src/lib_dev.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         dump_lib_mod.addImport("cuda_assets", cuda_assets_mod);
+        dump_lib_mod.addImport("inference_pkg", inference_pkg_mod);
+        addCorePackageImports(dump_lib_mod, &core_pkgs);
         dump_lib_mod.addOptions("build_options", dump_build_options);
-        addCDependencies(b, dump_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+        addCDependencies(b, dump_lib_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
         const dump_static_lib = b.addLibrary(.{
             .linkage = .static,
@@ -909,6 +1246,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .build_options = unit_test_build_options,
         .cuda_assets_mod = cuda_assets_mod,
+        .inference_pkg_mod = inference_pkg_mod,
+        .cacert_mod = cacert_mod,
+        .magic_db_mod = magic_db_mod,
+        .core_pkgs = &core_pkgs,
         .pcre2 = pcre2,
         .miniz = miniz,
         .libmagic = libmagic,
@@ -918,27 +1259,27 @@ pub fn build(b: *std.Build) void {
         .sqlite3 = sqlite3,
         .tree_sitter = tree_sitter,
     };
-    ut.addLazy("tokenizer", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("tokenizer", b.path("core/src/lib_dev.zig"), &.{
         "wordpiece",
         "tokenizer",
         "SentencePiece",
     });
-    ut.addLazy("validate", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("validate", b.path("core/src/lib_dev.zig"), &.{
         "sampler",
         "mask ",
         "grammar",
     });
-    ut.addLazy("io", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("io", b.path("core/src/lib_dev.zig"), &.{
         "Http",
         "fetch ",
         "download",
     });
-    ut.addLazy("db", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("db", b.path("core/src/lib_dev.zig"), &.{
         "index build",
         "vector",
         "bench",
     });
-    ut.addLazy("collab", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("collab", b.path("core/src/lib_dev.zig"), &.{
         "ResourceStore",
         "SessionStore",
         "OperationEnvelope",
@@ -947,23 +1288,23 @@ pub fn build(b: *std.Build) void {
         "LamportClock",
         "collab",
     });
-    ut.addLazy("template", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("template", b.path("core/src/lib_dev.zig"), &.{
         "TemplateInput",
         "TemplateTokenizer",
         "template",
     });
-    ut.addLazy("policy", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("policy", b.path("core/src/lib_dev.zig"), &.{
         "parsePolicy",
         "globMatch",
         "Policy.evaluate",
         "evaluate ",
     });
-    ut.addLazy("models", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("models", b.path("core/src/lib_dev.zig"), &.{
         "registry",
         "compileLayerProgram",
         "plan",
     });
-    ut.addLazy("responses", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("responses", b.path("core/src/lib_dev.zig"), &.{
         "TableAdapter",
         "responses",
         "storage",
@@ -972,22 +1313,22 @@ pub fn build(b: *std.Build) void {
         "generateCallId",
         "parseToolCall",
     });
-    ut.addLazy("converter", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("converter", b.path("core/src/lib_dev.zig"), &.{
         "QuantConfig",
         "ConvertOptions",
         "converter",
     });
-    ut.addLazy("xray", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("xray", b.path("core/src/lib_dev.zig"), &.{
         "estimatePerf",
         "LayerGeometry",
         "xray",
     });
-    ut.addLazy("image", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("image", b.path("core/src/lib_dev.zig"), &.{
         "stripAlpha",
         "compositeRgbaToRgb",
         "image",
     });
-    ut.addLazy("compute", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("compute", b.path("core/src/lib_dev.zig"), &.{
         "validateArgs",
         "mmap",
         "compute",
@@ -995,23 +1336,23 @@ pub fn build(b: *std.Build) void {
     // The inference subtree imports shared modules via `../../..` paths.
     // Building tests from `core/src/inference/root.zig` as module root trips
     // Zig's module-path guard ("import of file outside module path").
-    // Run inference tests from `core/src/lib.zig` with focused filters instead.
-    ut.addLazy("inference", b.path("core/src/lib.zig"), &.{
+    // Run inference tests from `core/src/lib_dev.zig` with focused filters instead.
+    ut.addLazy("inference", b.path("core/src/lib_dev.zig"), &.{
         "inference",
         "Scheduler",
         "Vision",
         "layer program",
     });
-    ut.addLazy("inference-cpu", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("inference-cpu", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.cpu",
     });
-    ut.addLazy("inference-metal", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("inference-metal", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.metal",
     });
-    ut.addLazy("inference-cuda", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("inference-cuda", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.cuda",
     });
-    ut.addLazy("agent", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("agent", b.path("core/src/lib_dev.zig"), &.{
         "ToolRegistry",
         "MessageBus",
         "buildSystemPrompt",
@@ -1026,7 +1367,7 @@ pub fn build(b: *std.Build) void {
         "TaluCapabilityReport",
         "validate_strict_ext",
     });
-    ut.addLazy("train", b.path("core/src/lib.zig"), &.{
+    ut.addLazy("train", b.path("core/src/lib_dev.zig"), &.{
         "GradTensor",
         "LoraLayer",
         "LoraAdapter",
@@ -1059,7 +1400,7 @@ pub fn build(b: *std.Build) void {
         "TrainingSession",
         "capi_bridge",
     });
-    // Build integration tests against a separate copy of core/src/lib.zig.
+    // Build integration tests against a separate copy of core/src/lib_dev.zig.
     // Keep integration on CPU-only to avoid MLX/Metal runtime coupling and
     // ensure deterministic behavior across host GPU setups.
     const integration_build_options = b.addOptions();
@@ -1072,14 +1413,16 @@ pub fn build(b: *std.Build) void {
     integration_build_options.addOption([]const u8, "version", version);
 
     const integration_main_mod = b.createModule(.{
-        .root_source_file = b.path("core/src/lib.zig"),
+        .root_source_file = b.path("core/src/lib_dev.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     integration_main_mod.addImport("cuda_assets", cuda_assets_mod);
+    integration_main_mod.addImport("inference_pkg", inference_pkg_mod);
+    addCorePackageImports(integration_main_mod, &core_pkgs);
     integration_main_mod.addOptions("build_options", integration_build_options);
-    addCDependencies(b, integration_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    addCDependencies(b, integration_main_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("core/tests/root.zig"),
@@ -1115,14 +1458,16 @@ pub fn build(b: *std.Build) void {
         integration_metal_build_options.addOption([]const u8, "version", version);
 
         const integration_metal_main_mod = b.createModule(.{
-            .root_source_file = b.path("core/src/lib.zig"),
+            .root_source_file = b.path("core/src/lib_dev.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         integration_metal_main_mod.addImport("cuda_assets", cuda_assets_mod);
+        integration_metal_main_mod.addImport("inference_pkg", inference_pkg_mod);
+        addCorePackageImports(integration_metal_main_mod, &core_pkgs);
         integration_metal_main_mod.addOptions("build_options", integration_metal_build_options);
-        addCDependencies(b, integration_metal_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+        addCDependencies(b, integration_metal_main_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
         const integration_metal_test_mod = b.createModule(.{
             .root_source_file = b.path("core/tests/inference/backend/metal/root.zig"),
@@ -1145,8 +1490,8 @@ pub fn build(b: *std.Build) void {
             b.getInstallPath(.bin, "test-integration-inference-metal"),
         });
         run_integration_metal_tests.step.dependOn(&install_integration_metal_tests.step);
-        if (findMlxMetallib(b)) |mlx_metallib_path| {
-            run_integration_metal_tests.setEnvironmentVariable("MLX_METALLIB", mlx_metallib_path);
+        if (mlx_metallib_path) |path| {
+            run_integration_metal_tests.setEnvironmentVariable("MLX_METALLIB", path);
         }
         // Harden allocator diagnostics for intermittent heap corruption on Metal paths.
         run_integration_metal_tests.setEnvironmentVariable("MallocScribble", "1");
@@ -1425,9 +1770,9 @@ pub fn build(b: *std.Build) void {
         const install_bench_metal_compute = b.addInstallArtifact(bench_metal_compute_exe, .{});
         const run_bench_metal_compute = b.addSystemCommand(&.{b.getInstallPath(.bin, "bench-metal-compute")});
         run_bench_metal_compute.step.dependOn(&install_bench_metal_compute.step);
-        if (findMlxMetallib(b)) |mlx_metallib_path| {
+        if (mlx_metallib_path) |path| {
             const copy_bench_mlx_metallib = b.addInstallFileWithDir(
-                .{ .cwd_relative = mlx_metallib_path },
+                .{ .cwd_relative = path },
                 .bin,
                 "mlx.metallib",
             );

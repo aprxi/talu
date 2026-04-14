@@ -3,11 +3,11 @@
 //! Shared routines for orienting weights, dequantizing, and fusing projections.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const dtype = @import("../../dtype.zig");
-const st_loader = @import("../../io/safetensors/root.zig");
-const log = @import("../../log.zig");
-const op_types = @import("../op_types.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const st_loader = @import("io_pkg").safetensors.root;
+const log = @import("log_pkg");
+const op_types = @import("models_pkg").op_types;
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
@@ -1757,7 +1757,9 @@ pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeT
         return error.MissingScales;
     }
 
-    if ((embed_tensor.dtype == .u8 or embed_tensor.dtype == .i8) and std.mem.endsWith(u8, name, ".weight_packed")) {
+    if ((embed_tensor.dtype == .u8 or embed_tensor.dtype == .i8) and
+        (std.mem.endsWith(u8, name, ".weight_packed") or std.mem.endsWith(u8, name, ".weight")))
+    {
         return dequantizeNvfp4WeightToBf16(allocator, st, name, embed_tensor);
     }
 
@@ -2322,7 +2324,7 @@ test "convertToF32 returns error for empty tensor" {
 
 test "orientWeight transposes f32 weight when needed" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2365,7 +2367,7 @@ test "orientWeight transposes f32 weight when needed" {
 
 test "orientWeight returns untransposed when rows equals expected_in" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight_notr";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2402,7 +2404,7 @@ test "orientWeight returns untransposed when rows equals expected_in" {
 
 test "orientWeight detects MXFP8 scales from weight_scale suffix" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight_mxfp8_weight_scale";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2440,7 +2442,7 @@ test "orientWeight detects MXFP8 scales from weight_scale suffix" {
 
 test "orientWeight dequantizes NVFP4 packed weights to BF16" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_weight_nvfp4";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2649,7 +2651,7 @@ test "buildGatedDeltaSplitInProj preserves NVFP4 dequantized values across globa
 
 test "orientEmbedding keeps f16 embedding dtype" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_embed";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2693,7 +2695,7 @@ test "orientEmbedding keeps f16 embedding dtype" {
 
 test "orientEmbedding passes through f32 embedding unchanged" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_embed_f32";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2727,7 +2729,7 @@ test "orientEmbedding passes through f32 embedding unchanged" {
 
 test "orientEmbedding dequantizes NVFP4 packed embedding to BF16" {
     const allocator = std.testing.allocator;
-    const writer = @import("../../io/safetensors/writer.zig");
+    const writer = @import("io_pkg").safetensors.writer;
 
     const tmp_dir_path = "/tmp/test_orient_embed_nvfp4";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -2760,6 +2762,53 @@ test "orientEmbedding dequantizes NVFP4 packed embedding to BF16" {
     var config = std.mem.zeroes(ModelConfig);
     config.d_model = 4;
     const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed.weight_packed", config, false);
+
+    try std.testing.expectEqual(DType.bf16, result.dtype);
+    try std.testing.expectEqual(@as(i64, 2), result.shape[0]);
+    try std.testing.expectEqual(@as(i64, 4), result.shape[1]);
+
+    const out = result.asSlice(u16);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), dtype.bf16ToF32(out[0]), 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dtype.bf16ToF32(out[1]), 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), dtype.bf16ToF32(out[2]), 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), dtype.bf16ToF32(out[3]), 0.06);
+}
+
+test "orientEmbedding dequantizes NVFP4 modelopt embedding to BF16" {
+    const allocator = std.testing.allocator;
+    const writer = @import("io_pkg").safetensors.writer;
+
+    const tmp_dir_path = "/tmp/test_orient_embed_nvfp4_modelopt";
+    std.fs.cwd().makeDir(tmp_dir_path) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir_path) catch {};
+
+    const packed_bytes = [_]u8{
+        0x21, 0xA9,
+        0x43, 0x65,
+    };
+    const scales = [_]u8{
+        0x38, 0x38,
+        0x38, 0x38,
+    };
+    const scale_2 = [_]f32{1.0};
+
+    const entries = [_]writer.TensorEntry{
+        .{ .name = "embed.weight", .dtype = .u8, .shape = &[_]usize{ 2, 2 }, .data = packed_bytes[0..] },
+        .{ .name = "embed.weight_scale", .dtype = .f8_e4m3, .shape = &[_]usize{ 2, 2 }, .data = scales[0..] },
+        .{ .name = "embed.weight_scale_2", .dtype = .f32, .shape = &[_]usize{1}, .data = std.mem.sliceAsBytes(&scale_2) },
+    };
+    const model_path = tmp_dir_path ++ "/model.safetensors";
+    try writer.write(allocator, model_path, &entries);
+
+    var st = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer st.deinit();
+
+    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+    defer arena_alloc.deinit();
+
+    var config = std.mem.zeroes(ModelConfig);
+    config.d_model = 4;
+    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed.weight", config, false);
 
     try std.testing.expectEqual(DType.bf16, result.dtype);
     try std.testing.expectEqual(@as(i64, 2), result.shape[0]);

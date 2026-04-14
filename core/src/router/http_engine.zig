@@ -34,8 +34,8 @@ const std = @import("std");
 const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const protocol = @import("protocol/root.zig");
-const io = @import("../io/root.zig");
-const log = @import("../log.zig");
+const io = @import("io_pkg");
+const log = @import("log_pkg");
 
 const c = @cImport({
     @cInclude("curl/curl.h");

@@ -4,9 +4,9 @@
 //! Supports multi-turn conversations, tool calls, and custom context.
 
 const std = @import("std");
-const io = @import("../io/root.zig");
+const io = @import("io_pkg");
 const template_engine = @import("root.zig");
-const error_context = @import("../error_context.zig");
+const error_context = @import("error_context_pkg");
 
 pub const Error = template_engine.Error || error{InvalidMessages};
 

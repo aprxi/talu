@@ -20,17 +20,17 @@
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const Tensor = tensor.Tensor;
-const log = @import("../../../../log.zig");
-const compute = @import("../../../../compute/root.zig");
+const log = @import("log_pkg");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_activation = compute.cpu.activation;
 const cpu_norm = compute.cpu.normalization;
 const cpu_state_space = compute.cpu.recurrence.state_space;
 const ssm_scan_mod = compute.cpu.simd.ssm_scan;
-const inspect = @import("../../../../xray/root.zig");
+const inspect = @import("xray_pkg");
 const trace = inspect.trace;
 
 /// Mamba2 SSM configuration.

@@ -4,10 +4,10 @@
 //! lazy tensor loading with memory mapping support.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const dtype = @import("../../dtype.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
 const json = @import("../json/root.zig");
-const mmap_policy = @import("../../compute/mmap_policy.zig");
+const mmap_policy = @import("compute_pkg").mmap_policy;
 
 const Tensor = tensor.Tensor;
 const DType = dtype.DType;

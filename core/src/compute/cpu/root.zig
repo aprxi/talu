@@ -31,6 +31,7 @@ pub const rotary = @import("rotary.zig");
 pub const conv1d_depthwise = @import("conv1d_depthwise.zig");
 pub const topk = @import("topk.zig");
 pub const reduction = @import("reduction.zig");
+pub const math_fast = @import("math_fast.zig");
 pub const softmax = @import("softmax.zig");
 pub const sampling_ops = @import("sampling_ops.zig");
 pub const sdpa_rowwise = @import("sdpa_rowwise.zig");
@@ -66,6 +67,7 @@ test {
     _ = conv1d_depthwise;
     _ = topk;
     _ = reduction;
+    _ = math_fast;
     _ = softmax;
     _ = sampling_ops;
     _ = sdpa_rowwise;

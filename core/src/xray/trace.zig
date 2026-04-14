@@ -160,7 +160,7 @@ pub const DType = enum(u8) {
 
 /// Convert compute DType (from dtype.zig) to trace DType.
 /// Since both enums have matching u8 values, we can cast directly.
-pub fn convertDType(compute_dtype: @import("../dtype.zig").DType) DType {
+pub fn convertDType(compute_dtype: @import("dtype_pkg").DType) DType {
     return @enumFromInt(@intFromEnum(compute_dtype));
 }
 

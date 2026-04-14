@@ -4,7 +4,7 @@
 //! Jinja2 filters needed for LLM chat templates.
 
 const std = @import("std");
-const io = @import("../../io/root.zig");
+const io = @import("io_pkg");
 const types = @import("types.zig");
 
 // Import filter modules

@@ -18,9 +18,9 @@ const ivf_flat_index = @import("index/ivfflat.zig");
 const vector_planner = @import("planner.zig");
 const vector_cdc = @import("cdc.zig");
 const vector_ttl = @import("ttl.zig");
-const tensor_mod = @import("../../tensor.zig");
-const dot_product = @import("../../compute/cpu/linalg.zig").dot;
-const parallel = @import("../../system/parallel.zig");
+const tensor_mod = @import("tensor_pkg");
+const dot_product = @import("compute_pkg").cpu.linalg.dot;
+const parallel = @import("compute_pkg").parallel;
 
 const Allocator = std.mem.Allocator;
 

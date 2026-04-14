@@ -3,9 +3,9 @@
 //! Keeps startup smoke coverage out of engine orchestration logic.
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
-const dtype = @import("../../../dtype.zig");
-const log = @import("../../../log.zig");
+const compute = @import("compute_pkg");
+const dtype = @import("dtype_pkg");
+const log = @import("log_pkg");
 
 const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
 

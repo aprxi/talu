@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const backend = @import("backend.zig");
-const kvbuf = @import("../io/kvbuf/root.zig");
+const kvbuf = @import("io_pkg").kvbuf;
 
 const ItemRecord = backend.ItemRecord;
 const ItemVariantRecord = backend.ItemVariantRecord;

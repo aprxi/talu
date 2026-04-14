@@ -10,15 +10,15 @@
 //! before text prefill.
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
-const layer_ops = @import("../../../../models/layer_ops.zig");
-const opcode_map = @import("../../../../models/plan/opcode_map.zig");
-const models = @import("../../../../models/root.zig");
-const compute = @import("../../../../compute/root.zig");
-const runtime_contract = @import("../../../runtime_contract/root.zig");
+const tensor = @import("tensor_pkg");
+const layer_ops = @import("models_pkg").layer_ops;
+const opcode_map = @import("models_pkg").plan.opcode_map;
+const models = @import("models_pkg");
+const compute = @import("compute_pkg");
+const runtime_contract = @import("runtime_contract_pkg");
 const cpu_blocks = @import("../executor/weights.zig");
 const exec_block = @import("../executor/block.zig");
-const image_mod = @import("../../../../image/root.zig");
+const image_mod = @import("image_pkg");
 const common_vision = @import("types.zig");
 const vision_tensor_convert = @import("tensor_convert.zig");
 const vision_program_mod = @import("../../../vision_program.zig");
@@ -35,7 +35,7 @@ const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_memory = compute.cpu.memory;
-const log = @import("../../../../log.zig");
+const log = @import("log_pkg");
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;

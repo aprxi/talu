@@ -4,13 +4,13 @@
 //! metadata from `core/src/models/*`.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
+const tensor = @import("tensor_pkg");
 const op_types = @import("op_types.zig");
 const cfg_loader = @import("config/root.zig");
 const weights_impl = @import("load/weights.zig");
 const models_registry = @import("registry.zig");
-const log = @import("../log.zig");
-const progress_mod = @import("../progress.zig");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
 const validation = @import("load/validation.zig");
 
 // Re-export types
@@ -149,6 +149,7 @@ pub fn applyRuntimeArchitectureMetadata(
     loaded_model.runtime.has_shortconv = runtime_architecture.has_shortconv;
     loaded_model.runtime.has_mla = runtime_architecture.has_mla;
     loaded_model.runtime.explicit_qk_norm_ops = runtime_architecture.explicit_qk_norm_ops;
+    loaded_model.runtime.norm_weights_pre_shifted = runtime_architecture.norm_weights_pre_shifted;
     log.debug("load", "Set runtime architecture metadata", .{
         .architecture = runtime_architecture.name,
     }, @src());

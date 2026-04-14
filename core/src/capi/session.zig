@@ -5,15 +5,14 @@
 //! For tokenization, see tokenizer.zig.
 
 const std = @import("std");
-const gen_config_mod = @import("../inference/config/generation.zig");
-const cfg_root = @import("../models/config/root.zig");
-const io = @import("../io/root.zig");
-const repository = io.repository;
-const transport = io.transport;
+const gen_config_mod = @import("../config/generation.zig");
+const cfg_root = @import("models_pkg").config;
+const repository = @import("io_pkg").repository.root;
+const transport = @import("io_pkg").transport;
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
-const log = @import("../log.zig");
-const models_registry = @import("../models/registry.zig");
+const log = @import("log_pkg");
+const models_registry = @import("models_pkg").registry;
 
 // Import tokenizer types and functions
 const tokenizer_mod = @import("tokenizer.zig");

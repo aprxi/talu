@@ -4,7 +4,7 @@
 //! No dependencies on TableAdapter or scan logic.
 
 const std = @import("std");
-const kvbuf = @import("../io/kvbuf/root.zig");
+const kvbuf = @import("io_pkg").kvbuf;
 const responses = @import("root.zig");
 
 const Allocator = std.mem.Allocator;

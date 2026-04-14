@@ -1,15 +1,15 @@
 const std = @import("std");
 const contract = @import("../contract.zig");
-const runtime_contract = @import("../../runtime_contract/root.zig");
-const models = @import("../../../models/root.zig");
-const tensor = @import("../../../tensor.zig");
-const log = @import("../../../log.zig");
-const progress_mod = @import("../../../progress.zig");
+const runtime_contract = @import("runtime_contract_pkg");
+const models = @import("models_pkg");
+const tensor = @import("tensor_pkg");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
 const metal_vision = @import("vision/root.zig");
 const cpu_engine = @import("../cpu/engine.zig");
 const sampling = @import("../cpu/sampling.zig");
-const compute = @import("../../../compute/root.zig");
-const trace = @import("../../../xray/trace.zig");
+const compute = @import("compute_pkg");
+const trace = @import("xray_pkg").trace;
 const cpu_sampling_ops = compute.cpu.sampling_ops;
 const ModelConfig = tensor.ModelConfig;
 const ModelRuntime = tensor.ModelRuntime;
@@ -20,13 +20,24 @@ const default_max_batch_size: usize = 8;
 
 const mlx_ctx = opaque {};
 
+const MlxModelFlags = extern struct {
+    use_layer_q_norm_head_dim: u8 = 0,
+    allow_norm_shift: u8 = 1,
+    use_v_norm: u8 = 0,
+    _pad: u8 = 0,
+    embedding_multiplier: f32 = 1.0,
+    attention_multiplier: f32 = 0.0,
+};
+
 extern fn mlx_is_available() c_int;
 extern fn mlx_validate_config(model_path: [*:0]const u8) c_int;
 extern fn mlx_create(model_id: [*:0]const u8, model_path: [*:0]const u8, seed: c_int) ?*mlx_ctx;
+extern fn mlx_create_with_flags(model_id: [*:0]const u8, model_path: [*:0]const u8, seed: c_int, flags: *const MlxModelFlags) ?*mlx_ctx;
 extern fn mlx_clone(source_ctx: ?*mlx_ctx, seed: c_int) ?*mlx_ctx;
 extern fn mlx_destroy(ctx: ?*mlx_ctx) void;
 extern fn mlx_reset(ctx: ?*mlx_ctx) c_int;
 extern fn mlx_last_error() ?[*:0]const u8;
+extern fn mlx_runtime_binary_dir() ?[*:0]const u8;
 
 extern fn mlx_prefill_first(
     ctx: ?*mlx_ctx,
@@ -255,6 +266,7 @@ pub const MetalBackend = struct {
     model_id_z: [:0]u8,
     model_path_z: [:0]u8,
     seed: c_int,
+    bridge_flags: MlxModelFlags,
 
     vocab_size: usize,
     d_model: usize,
@@ -385,6 +397,68 @@ pub const MetalBackend = struct {
         return std.mem.sliceTo(raw, 0);
     }
 
+    fn runtimeBinaryDir() ?[]const u8 {
+        const raw = mlx_runtime_binary_dir() orelse return null;
+        const dir = std.mem.sliceTo(raw, 0);
+        if (dir.len == 0) return null;
+        return dir;
+    }
+
+    fn pathExists(path: []const u8) bool {
+        if (path.len == 0) return false;
+        if (std.fs.path.isAbsolute(path)) {
+            std.fs.accessAbsolute(path, .{}) catch return false;
+            return true;
+        }
+        std.fs.cwd().access(path, .{}) catch return false;
+        return true;
+    }
+
+    fn ensureMlxMetallibColocated(allocator: std.mem.Allocator) void {
+        const runtime_dir = runtimeBinaryDir() orelse return;
+        var dst_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/mlx.metallib", .{runtime_dir}) catch return;
+        if (pathExists(dst)) return;
+
+        var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_dir = std.fs.selfExeDirPath(&exe_dir_buf) catch "";
+        var cand1_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var cand2_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const candidate_exe = if (exe_dir.len > 0)
+            (std.fmt.bufPrint(&cand1_buf, "{s}/mlx.metallib", .{exe_dir}) catch "")
+        else
+            "";
+        const candidate_exe_lib = if (exe_dir.len > 0)
+            (std.fmt.bufPrint(&cand2_buf, "{s}/../lib/mlx.metallib", .{exe_dir}) catch "")
+        else
+            "";
+        const candidate_env = std.posix.getenv("MLX_METALLIB") orelse "";
+        const candidates = [_][]const u8{
+            candidate_env,
+            candidate_exe,
+            candidate_exe_lib,
+            "mlx.metallib",
+            "zig-out/lib/mlx.metallib",
+            "deps/mlx/lib/mlx.metallib",
+        };
+
+        for (candidates) |src| {
+            if (!pathExists(src)) continue;
+            std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{}) catch continue;
+            log.info("inference", "metal colocated mlx.metallib for runtime loader", .{
+                .src = src,
+                .dst = dst,
+            });
+            return;
+        }
+
+        log.warn("inference", "metal mlx.metallib missing at runtime lookup path", .{
+            .runtime_dir = runtime_dir,
+            .runtime_path = dst,
+        });
+        _ = allocator;
+    }
+
     fn envTruthy(name: []const u8, fallback: bool) bool {
         const raw = std.posix.getenv(name) orelse return fallback;
         if (raw.len == 0) return true;
@@ -510,7 +584,7 @@ pub const MetalBackend = struct {
             }
         }
         if (created == null) {
-            created = mlx_create(self.model_id_z.ptr, self.model_path_z.ptr, self.seed);
+            created = mlx_create_with_flags(self.model_id_z.ptr, self.model_path_z.ptr, self.seed, &self.bridge_flags);
         }
         const ctx = created orelse {
             log.warn("inference", "metal slot context creation failed", .{
@@ -834,19 +908,47 @@ pub const MetalBackend = struct {
         const model_id_z = try allocator.dupeZ(u8, model_id_src);
         errdefer allocator.free(model_id_z);
 
+        ensureMlxMetallibColocated(allocator);
+
         const seed = readSeedFromEnv(allocator);
         const max_batch_size = resolveMaxBatchSize(allocator);
-        const ctx = mlx_create(model_id_z.ptr, model_path_z.ptr, seed) orelse {
+        const model_flags = MlxModelFlags{
+            .use_layer_q_norm_head_dim = if (loaded.config.global_head_dim > 0 and loaded.config.global_head_dim != loaded.config.head_dim) 1 else 0,
+            .allow_norm_shift = if (loaded.runtime.norm_weights_pre_shifted) 0 else 1,
+            .use_v_norm = if (loaded.config.use_v_norm) 1 else 0,
+            .embedding_multiplier = loaded.config.embedding_multiplier,
+            .attention_multiplier = loaded.config.attention_multiplier,
+        };
+        const ctx = mlx_create_with_flags(model_id_z.ptr, model_path_z.ptr, seed, &model_flags) orelse {
             const mlx_error = resolveLastError();
+            const runtime_dir = runtimeBinaryDir() orelse "";
+            var runtime_metal_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const runtime_metal_path = if (runtime_dir.len > 0)
+                (std.fmt.bufPrint(&runtime_metal_buf, "{s}/mlx.metallib", .{runtime_dir}) catch "")
+            else
+                "";
+            const runtime_has_metallib = pathExists(runtime_metal_path);
             if (isMemoryError(mlx_error)) {
                 if (init_config.memory_fit_is_error) {
-                    log.err("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error }, @src());
+                    log.err("inference", "metal mlx_create failed", .{
+                        .mlx_error = mlx_error,
+                        .mlx_runtime_dir = runtime_dir,
+                        .mlx_runtime_has_metallib = @as(u8, @intFromBool(runtime_has_metallib)),
+                    }, @src());
                 } else {
-                    log.warn("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error });
+                    log.warn("inference", "metal mlx_create failed", .{
+                        .mlx_error = mlx_error,
+                        .mlx_runtime_dir = runtime_dir,
+                        .mlx_runtime_has_metallib = @as(u8, @intFromBool(runtime_has_metallib)),
+                    });
                 }
                 return error.OutOfMemory;
             }
-            log.warn("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error });
+            log.warn("inference", "metal mlx_create failed", .{
+                .mlx_error = mlx_error,
+                .mlx_runtime_dir = runtime_dir,
+                .mlx_runtime_has_metallib = @as(u8, @intFromBool(runtime_has_metallib)),
+            });
             return error.InvalidArgument;
         };
 
@@ -920,6 +1022,7 @@ pub const MetalBackend = struct {
             .model_id_z = model_id_z,
             .model_path_z = model_path_z,
             .seed = seed,
+            .bridge_flags = model_flags,
             .vocab_size = vocab_size,
             .d_model = d_model,
             .max_batch_size = max_batch_size,
@@ -1104,11 +1207,40 @@ pub const MetalBackend = struct {
         }
         const ctx = try self.ensureSlotCtx(0);
 
-        const produced = try self.decodeStream(ctx, first_token, budget, eos_token_ids, output_tokens);
-        if (callback) |cb| {
-            for (output_tokens[0..produced]) |token| cb(token, callback_data);
+        if (callback != null) {
+            // Per-token decode loop: fire callback after each token for true
+            // streaming. The bulk bridge path (mlx_decode_stream) generates all
+            // tokens internally and cannot call back per-token.
+            var produced: usize = 0;
+            var current_token = first_token;
+            const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
+            defer self.allocator.free(logits_buf);
+            while (produced < budget) {
+                try self.decodeLogits(ctx, current_token, logits_buf);
+                var best_idx: usize = 0;
+                var best_val: f32 = -std.math.inf(f32);
+                for (logits_buf, 0..) |value, idx| {
+                    if (value > best_val) {
+                        best_val = value;
+                        best_idx = idx;
+                    }
+                }
+                current_token = @intCast(best_idx);
+                output_tokens[produced] = current_token;
+                produced += 1;
+                if (callback) |cb| cb(current_token, callback_data);
+                for (eos_token_ids) |eos_id| {
+                    if (current_token == eos_id) {
+                        self.slot_positions[0] = start_position + produced;
+                        return produced;
+                    }
+                }
+            }
+            self.slot_positions[0] = start_position + produced;
+            return produced;
         }
 
+        const produced = try self.decodeStream(ctx, first_token, budget, eos_token_ids, output_tokens);
         self.slot_positions[0] = start_position + produced;
         return produced;
     }
@@ -1130,6 +1262,41 @@ pub const MetalBackend = struct {
 
         const budget = @min(max_tokens, output_tokens.len);
         const ctx = try self.ensureSlotCtx(0);
+
+        if (callback != null) {
+            // Per-token decode loop with host-side TopK sampling for true
+            // streaming. The bulk bridge path (mlx_decode_topk_stream) generates
+            // all tokens internally and cannot call back per-token.
+            var produced: usize = 0;
+            var current_token = first_token;
+            const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
+            defer self.allocator.free(logits_buf);
+            while (produced < budget) {
+                try self.decodeLogits(ctx, current_token, logits_buf);
+                applySamplingMutationsToLogits(logits_buf[0..self.vocab_size], sampling_config);
+                const candidate_count = @min(sampling_config.top_k, self.vocab_size);
+                const candidate_logits = try self.allocator.alloc(f32, candidate_count);
+                defer self.allocator.free(candidate_logits);
+                const candidate_ids = try self.allocator.alloc(u32, candidate_count);
+                defer self.allocator.free(candidate_ids);
+                const n = fillTopKFromLogits(logits_buf[0..self.vocab_size], candidate_count, candidate_logits, candidate_ids);
+                if (n == 0) return error.InvalidArgument;
+                // Greedy from top-k candidates (temperature/top-p applied by scheduler).
+                current_token = candidate_ids[0];
+                output_tokens[produced] = current_token;
+                produced += 1;
+                if (callback) |cb| cb(current_token, callback_data);
+                for (eos_token_ids) |eos_id| {
+                    if (current_token == eos_id) {
+                        self.slot_positions[0] = start_position + produced;
+                        return produced;
+                    }
+                }
+            }
+            self.slot_positions[0] = start_position + produced;
+            return produced;
+        }
+
         const produced = try self.decodeTopKStream(
             ctx,
             first_token,
@@ -1138,9 +1305,6 @@ pub const MetalBackend = struct {
             sampling_config,
             output_tokens,
         );
-        if (callback) |cb| {
-            for (output_tokens[0..produced]) |token| cb(token, callback_data);
-        }
         self.slot_positions[0] = start_position + produced;
         return produced;
     }
@@ -1150,14 +1314,17 @@ pub const MetalBackend = struct {
         return true;
     }
 
-    fn hasGemma4TopKStreamingRegression(self: *const MetalBackend) bool {
+    fn hasTopKStreamingRegression(self: *const MetalBackend) bool {
+        // Models with per-layer-input branches require non-streaming TopK.
         if (self.model_config.hidden_size_per_layer_input > 0) return true;
-        const arch_id = self.model_runtime.architecture_id orelse return false;
-        return std.mem.eql(u8, arch_id, "gemma3");
+        // Models with (1+w) norm formulation AND scaled embeddings have a
+        // numerical divergence in the streaming TopK path.
+        if (self.model_runtime.weight_offset != 0.0 and self.model_config.embedding_multiplier != 1.0) return true;
+        return false;
     }
 
     pub fn supportsSchedulerBackendTopKDecodeRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
-        if (sampling_config.strategy == .top_k and self.hasGemma4TopKStreamingRegression()) return false;
+        if (sampling_config.strategy == .top_k and self.hasTopKStreamingRegression()) return false;
         return switch (sampling_config.strategy) {
             .top_k => sampling_config.top_k > 0 and
                 sampling_config.top_k <= topk_route_candidate_capacity,
@@ -1177,7 +1344,7 @@ pub const MetalBackend = struct {
         self: *const MetalBackend,
         sampling_config: *const sampling.SamplingConfig,
     ) bool {
-        if (self.hasGemma4TopKStreamingRegression()) return false;
+        if (self.hasTopKStreamingRegression()) return false;
         return sampling_config.strategy == .top_k and
             sampling_config.top_k > 0 and
             sampling_config.top_k <= topk_route_candidate_capacity and

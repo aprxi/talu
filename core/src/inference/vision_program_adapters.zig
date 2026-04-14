@@ -8,8 +8,8 @@
 //! `layer_program_adapter_table`).
 
 const std = @import("std");
-const runtime_contract = @import("runtime_contract/root.zig");
-const image_mod = @import("../image/root.zig");
+const runtime_contract = @import("runtime_contract_pkg");
+const image_mod = @import("image_pkg");
 
 const missing_register_storage_byte: u8 = 0;
 const invalid_physical_id: u16 = std.math.maxInt(u16);
@@ -435,7 +435,6 @@ fn scatterExecutionState(ctx: *runtime_contract.ExecutionContext) !*ScatterExecu
     const raw_state = ctx.workspace.any orelse return error.InvalidDispatchState;
     return @ptrCast(@alignCast(raw_state));
 }
-
 
 // --- Adapter functions (KernelAdapterFn signature) ---
 

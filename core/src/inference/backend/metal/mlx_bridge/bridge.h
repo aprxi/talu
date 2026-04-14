@@ -8,6 +8,15 @@ extern "C" {
 
 typedef struct mlx_ctx mlx_ctx;
 
+typedef struct mlx_model_flags {
+    uint8_t use_layer_q_norm_head_dim;
+    uint8_t allow_norm_shift;
+    uint8_t use_v_norm;
+    uint8_t _pad;
+    float embedding_multiplier;
+    float attention_multiplier;
+} mlx_model_flags;
+
 typedef struct mlx_result {
     int32_t prompt_tokens;
     int32_t decode_tokens;
@@ -20,6 +29,7 @@ int32_t mlx_is_available(void);
 int32_t mlx_validate_config(const char* model_path);
 
 mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed);
+mlx_ctx* mlx_create_with_flags(const char* model_id, const char* model_path, int32_t seed, const mlx_model_flags* flags);
 mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed);
 void mlx_destroy(mlx_ctx* ctx);
 int32_t mlx_reset(mlx_ctx* ctx);
@@ -148,6 +158,7 @@ int32_t mlx_decode_topk_stream(
 void mlx_tokens_free(int32_t* ids);
 
 const char* mlx_last_error(void);
+const char* mlx_runtime_binary_dir(void);
 
 int32_t mlx_test_grouped_affine_moe_gpu_path(void);
 int32_t mlx_test_depthwise_conv_decode_step(void);

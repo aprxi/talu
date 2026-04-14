@@ -13,8 +13,8 @@ const postprocess = @import("postprocess.zig");
 const buffers = @import("encoding_buffers.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
-const log = @import("../log.zig");
-const parallel = @import("../system/parallel.zig");
+const log = @import("log_pkg");
+const parallel = @import("compute_pkg").parallel;
 const c = @cImport({
     @cInclude("utf8proc.h");
 });

@@ -4,8 +4,8 @@
 //! temperature scaling, repetition penalty, and logit biasing.
 
 const std = @import("std");
-const compute = @import("../../../compute/root.zig");
-const validate = @import("../../../validate/root.zig");
+const compute = @import("compute_pkg");
+const validate = @import("validate_pkg");
 const cpu_softmax = compute.cpu.softmax;
 const cpu_sampling_ops = compute.cpu.sampling_ops;
 const cpu_topk = compute.cpu.topk;
@@ -177,8 +177,8 @@ pub const Sampler = struct {
 
     fn sampleImpl(self: *Sampler, logits: []const f32, config: SamplingConfig) !usize {
         // Import xray and trace once for use throughout the function
-        const xray = @import("../../../xray/root.zig");
-        const trace = @import("../../../xray/trace.zig");
+        const xray = @import("xray_pkg");
+        const trace = @import("xray_pkg").trace;
 
         // Check for teacher forcing (verification mode)
         if (xray.getNextForcedToken()) |forced_token| {

@@ -1,7 +1,7 @@
 //! Tensor layout transform primitives for CPU compute path.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const matmul = @import("matmul_primitives.zig");
 
 const Tensor = tensor.Tensor;

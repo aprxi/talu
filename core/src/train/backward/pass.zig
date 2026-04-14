@@ -14,7 +14,7 @@
 //!   5. Embedding backward → grad_token_embedding
 
 const std = @import("std");
-const compute = @import("../../compute/root.zig");
+const compute = @import("compute_pkg");
 const model_config = @import("../model_config.zig");
 const model_weights_mod = @import("../model_weights.zig");
 const activations_mod = @import("../activations.zig");
@@ -435,7 +435,7 @@ fn layerBackward(
 /// We didn't save this intermediate in the forward pass, so recompute it here.
 fn recomputeSwiglu(output: []f32, gate: []const f32, up: []const f32, len: usize) void {
     @setFloatMode(.optimized);
-    const fast = @import("../../compute/cpu/math_fast.zig");
+    const fast = @import("compute_pkg").cpu.math_fast;
 
     const one: F32Vec = @splat(1.0);
     var i: usize = 0;

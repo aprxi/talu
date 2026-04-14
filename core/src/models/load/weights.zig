@@ -5,18 +5,18 @@
 //! components (QKV, gate/up projections).
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const dtype = @import("../../dtype.zig");
-const log = @import("../../log.zig");
-const progress_mod = @import("../../progress.zig");
-const runtime_blocks = @import("../runtime_blocks.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
+const runtime_blocks = @import("models_pkg").runtime_blocks;
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
-const st_loader = @import("../../io/safetensors/root.zig");
-const model_types = @import("../op_types.zig");
+const st_loader = @import("io_pkg").safetensors.root;
+const model_types = @import("models_pkg").op_types;
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
 
@@ -179,7 +179,16 @@ pub fn loadModelMetadataOnly(
     return LoadedModel{
         .arena = arena_alloc,
         .config = model_config,
-        .runtime = .{},
+        .runtime = .{
+            .architecture_id = arch.name,
+            .has_moe = arch.has_moe,
+            .has_mamba = arch.has_mamba,
+            .has_gated_delta = arch.has_gated_delta,
+            .has_shortconv = arch.has_shortconv,
+            .has_mla = arch.has_mla,
+            .explicit_qk_norm_ops = arch.explicit_qk_norm_ops,
+            .norm_weights_pre_shifted = arch.norm_weights_pre_shifted,
+        },
         .st = safetensors_file,
         .ln_final = null,
         .lm_head = null,
@@ -238,8 +247,10 @@ fn findWeightSpecById(specs: []const model_types.WeightSpec, id: []const u8) ?*c
     return null;
 }
 
-/// Try to get a tensor by name, with GPTQ .qweight fallback.
-/// When a name ending in .weight is not found, replaces .weight with .qweight.
+/// Try to get a tensor by name, with GPTQ .qweight and NVFP4 fallbacks.
+/// When a name ending in .weight is not found, tries .qweight and .weight_packed.
+/// When the resolved tensor is U8/I8 with a companion .weight_scale, recognizes
+/// NVFP4 and returns grouped_affine_u4 (the effective dtype after transcoding).
 fn getTensorOrGptqFallback(
     allocator: std.mem.Allocator,
     safetensors_file: *st_loader.UnifiedSafeTensors,
@@ -247,7 +258,9 @@ fn getTensorOrGptqFallback(
     name_resolver: *generic_weights.NameResolver,
     qweight_buf: []u8,
 ) !?DType {
-    return name_resolver.resolveDType(allocator, safetensors_file, name, qweight_buf);
+    const resolved = try name_resolver.resolve(allocator, safetensors_file, name, qweight_buf) orelse return null;
+    const t = safetensors_file.getTensor(resolved, null) catch return null;
+    return resolveNvfp4EffectiveDtype(t.dtype, safetensors_file, resolved);
 }
 
 fn detectOriginalWeightDType(
@@ -293,6 +306,35 @@ fn detectOriginalWeightDType(
     }
 
     return error.MissingWeightDTypeSourceWeight;
+}
+
+/// NVFP4 packed weights are stored as U8/I8 in safetensors with companion
+/// scale tensors (.weight_scale). Both compressed-tensors (.weight_packed)
+/// and modelopt (.weight) formats use this convention.
+/// Returns grouped_affine_u4 when NVFP4 metadata is present — the effective
+/// dtype Metal (and CPU) will transcode/dequantize to at load time.
+fn resolveNvfp4EffectiveDtype(
+    raw_dtype: DType,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    resolved_name: []const u8,
+) DType {
+    if (raw_dtype != .u8 and raw_dtype != .i8) return raw_dtype;
+    // Derive the base for the scale key:
+    //   modelopt:          "...gate_proj.weight"        → base = up to ".weight"
+    //   compressed-tensors: "...gate_proj.weight_packed" → base = up to ".weight"
+    const base_len = if (std.mem.endsWith(u8, resolved_name, ".weight_packed"))
+        resolved_name.len - ".weight_packed".len + ".weight".len
+    else if (std.mem.endsWith(u8, resolved_name, ".weight"))
+        resolved_name.len
+    else
+        return raw_dtype;
+    var scale_buf: [512]u8 = undefined;
+    const scale_len = base_len + "_scale".len;
+    if (scale_len > scale_buf.len) return raw_dtype;
+    @memcpy(scale_buf[0..base_len], resolved_name[0..base_len]);
+    @memcpy(scale_buf[base_len..scale_len], "_scale");
+    if (safetensors_file.hasTensor(scale_buf[0..scale_len])) return .grouped_affine_u4;
+    return raw_dtype;
 }
 
 fn maybeAddFusedWeights(

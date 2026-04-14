@@ -85,7 +85,7 @@ std::unordered_map<std::string, array> load_weight_tensors(const std::string& mo
     return tensors;
 }
 
-std::vector<int> resolve_shared_kv_source_layers(const Qwen35Config& cfg) {
+std::vector<int> resolve_shared_kv_source_layers(const BridgeModelConfig& cfg) {
     const int n_layers = cfg.num_hidden_layers;
     std::vector<int> sources(static_cast<size_t>(std::max(0, n_layers)), -1);
     if (cfg.num_kv_shared_layers <= 0 || n_layers <= 0) return sources;
@@ -108,10 +108,10 @@ std::vector<int> resolve_shared_kv_source_layers(const Qwen35Config& cfg) {
     return sources;
 }
 
-void sanitize_qwen35_tensors(
+void sanitize_model_tensors(
     std::unordered_map<std::string, array>& tensors,
     bool tie_word_embeddings,
-    bool allow_qwen_norm_shift
+    bool allow_norm_shift
 ) {
     bool has_mtp_weights = false;
     bool has_unsanitized_conv1d = false;
@@ -144,7 +144,7 @@ void sanitize_qwen35_tensors(
         filtered.erase("model.lm_head.weight");
     }
 
-    const bool should_shift_norm = allow_qwen_norm_shift && (has_mtp_weights || has_unsanitized_conv1d);
+    const bool should_shift_norm = allow_norm_shift && (has_mtp_weights || has_unsanitized_conv1d);
 
     const std::vector<std::string> norm_suffixes = {
         ".input_layernorm.weight",

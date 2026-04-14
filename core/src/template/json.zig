@@ -8,7 +8,7 @@
 //! This module is the primary interface for C API and Python bindings.
 
 const std = @import("std");
-const io = @import("../io/root.zig");
+const io = @import("io_pkg");
 const root = @import("root.zig");
 const input_mod = @import("input.zig");
 const eval_mod = @import("eval.zig");

@@ -5,7 +5,7 @@
 //! and validation.
 
 const std = @import("std");
-const xray = @import("../xray/root.zig");
+const xray = @import("xray_pkg");
 const trace = xray.trace;
 const capture = xray.capture;
 const query = xray.query;

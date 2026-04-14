@@ -1,8 +1,8 @@
 //! Normalization operations: RMSNorm, LayerNorm.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const dtype_mod = @import("../../dtype.zig");
+const tensor = @import("tensor_pkg");
+const dtype_mod = @import("dtype_pkg");
 const simd = @import("simd/arch/root.zig");
 
 const VEC_LEN = simd.f32_vec_len;

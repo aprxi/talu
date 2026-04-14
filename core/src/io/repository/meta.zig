@@ -1,7 +1,7 @@
 //! Repository metadata domain store built on top of generic KV state storage.
 
 const std = @import("std");
-const kvbuf = @import("../kvbuf/root.zig");
+const kvbuf = @import("io_pkg").kvbuf;
 const kv_store = @import("../../db/kv/store.zig");
 
 const Allocator = std.mem.Allocator;

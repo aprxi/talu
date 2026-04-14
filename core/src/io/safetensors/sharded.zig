@@ -7,8 +7,8 @@
 const std = @import("std");
 const json = @import("../json/root.zig");
 const reader = @import("reader.zig");
-const tensor = @import("../../tensor.zig");
-const dtype = @import("../../dtype.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
 
 const SafeTensors = reader.SafeTensors;
 const Tensor = tensor.Tensor;

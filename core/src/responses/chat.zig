@@ -14,8 +14,8 @@
 const std = @import("std");
 const conversation_mod = @import("conversation.zig");
 const items_mod = @import("items.zig");
-const validate_mod = @import("../validate/root.zig");
-const io = @import("../io/root.zig");
+const validate_mod = @import("validate_pkg");
+const repository = @import("io_pkg").repository.root;
 
 pub const Conversation = conversation_mod.Conversation;
 pub const Item = items_mod.Item;
@@ -28,7 +28,7 @@ pub const ContentPart = items_mod.ContentPart;
 const ConstrainedSampler = validate_mod.sampler.ConstrainedSampler;
 
 /// Configuration for model resolution (e.g., offline mode).
-pub const ResolutionConfig = io.repository.ResolutionConfig;
+pub const ResolutionConfig = repository.ResolutionConfig;
 
 /// Lightweight chat state for conversations.
 ///

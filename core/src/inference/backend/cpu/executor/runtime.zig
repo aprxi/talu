@@ -4,13 +4,13 @@
 //! This module owns allocation/deallocation for temporary buffers and caches.
 
 const std = @import("std");
-const compute = @import("../../../../compute/root.zig");
-const graph_types = @import("../../../../models/op_types.zig");
-const log = @import("../../../../log.zig");
-const runtime_contract = @import("../../../runtime_contract/root.zig");
+const compute = @import("compute_pkg");
+const graph_types = @import("models_pkg").op_types;
+const log = @import("log_pkg");
+const runtime_contract = @import("runtime_contract_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
-const tensor = @import("../../../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const Tensor = tensor.Tensor;
 
 const attn = @import("../kernels/attention.zig");

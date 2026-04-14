@@ -36,7 +36,7 @@
 //! 5. Reasoning: Configurable - strip or emit summary as system message.
 
 const std = @import("std");
-const io = @import("../../io/root.zig");
+const io = @import("io_pkg");
 const responses_mod = @import("../../responses/root.zig");
 const Conversation = responses_mod.Conversation;
 const Item = responses_mod.Item;

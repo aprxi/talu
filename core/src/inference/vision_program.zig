@@ -4,9 +4,9 @@
 //! vision pipeline metadata.
 
 const std = @import("std");
-const layer_ops = @import("../models/layer_ops.zig");
-const runtime_contract = @import("runtime_contract/root.zig");
-const plan_compiler = @import("../models/plan/compiler.zig");
+const layer_ops = @import("models_pkg").layer_ops;
+const runtime_contract = @import("runtime_contract_pkg");
+const plan_compiler = @import("models_pkg").plan.compiler;
 
 pub const ParsedVisionProgram = struct {
     spatial_merge_size: usize,
@@ -321,7 +321,7 @@ test "compileVisionStagePlans accepts register-level mismatched handoff when dty
 }
 
 test "validateVisionStageHandoff rejects mismatched dtype" {
-    const DType = @import("../dtype.zig").DType;
+    const DType = @import("dtype_pkg").DType;
     const reg0 = runtime_contract.registerFromIndex(0);
     const reg1 = runtime_contract.registerFromIndex(1);
 

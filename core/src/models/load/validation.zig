@@ -4,9 +4,9 @@
 
 const std = @import("std");
 const weights = @import("weights.zig");
-const tensor = @import("../../tensor.zig");
-const log = @import("../../log.zig");
-const op_types = @import("../op_types.zig");
+const tensor = @import("tensor_pkg");
+const log = @import("log_pkg");
+const op_types = @import("models_pkg").op_types;
 
 pub const Error = error{ValidationFailed};
 

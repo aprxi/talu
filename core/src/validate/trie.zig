@@ -13,7 +13,7 @@
 const std = @import("std");
 const engine_mod = @import("engine.zig");
 const mask_mod = @import("mask.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 const Engine = engine_mod.Engine;
 const StackSet = engine_mod.StackSet;

@@ -110,7 +110,7 @@ pub const CallbackTokenizer = struct {
 // Tensor Validation Utilities
 // =============================================================================
 
-const tensor_mod = @import("../tensor.zig");
+const tensor_mod = @import("tensor_pkg");
 
 /// Check if a dtype is a float type (f32, f16, bf16).
 /// Used for validating tensor dtypes in ops.

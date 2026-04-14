@@ -10,7 +10,7 @@
 //! - `sampling`
 
 const engine_mod = @import("engine.zig");
-const compute = @import("../../../compute/root.zig");
+const compute = @import("compute_pkg");
 
 pub const BackendType = engine_mod.FusedCpuBackend;
 pub const FusedCpuBackend = engine_mod.FusedCpuBackend;

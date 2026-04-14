@@ -4,7 +4,7 @@
 //! stable names while core modules avoid depending on capi internals.
 
 const std = @import("std");
-const core_progress = @import("../progress.zig");
+const core_progress = @import("progress_pkg");
 
 pub const ProgressAction = core_progress.ProgressAction;
 pub const ProgressUpdate = core_progress.ProgressUpdate;

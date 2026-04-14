@@ -13,8 +13,8 @@
 //! arithmetic intensity over separate transpose + matmul + accumulate.
 
 const std = @import("std");
-const parallel = @import("../../system/parallel.zig");
-const tensor_mod = @import("../../tensor.zig");
+const parallel = @import("compute_pkg").parallel;
+const tensor_mod = @import("tensor_pkg");
 const simd = @import("simd/arch/root.zig");
 const matmul_primitives = @import("matmul_primitives.zig");
 

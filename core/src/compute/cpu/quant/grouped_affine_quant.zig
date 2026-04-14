@@ -1,7 +1,7 @@
 //! Shared grouped-affine quantization helpers for 4-bit and 8-bit kernels.
 
 const std = @import("std");
-const dtype = @import("../../../dtype.zig");
+const dtype = @import("dtype_pkg");
 const simd = @import("../simd/arch/root.zig");
 
 pub const DType = dtype.DType;

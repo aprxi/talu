@@ -3,7 +3,7 @@
 //! Compute owns primitive array/lazy graph operations. Inference owns cache
 //! state containers and runtime decode state lifecycles.
 
-const compute = @import("../../../compute/root.zig");
+const compute = @import("compute_pkg");
 
 const mlx_graph = compute.metal.graph;
 

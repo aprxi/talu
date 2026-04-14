@@ -65,6 +65,10 @@ pub const getNextForcedToken = teacher_forcing.getNextToken;
 pub const kernel_info = @import("kernel_info.zig");
 pub const perf_estimate = @import("perf_estimate.zig");
 pub const execution_plan = @import("execution_plan.zig");
+pub const dump = struct {
+    pub const root = @import("dump/root.zig");
+    pub const capture = @import("dump/capture.zig");
+};
 
 // Re-export commonly used types
 pub const KernelInfo = kernel_info.KernelInfo;

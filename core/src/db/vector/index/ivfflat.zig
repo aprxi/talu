@@ -1,7 +1,7 @@
 //! Persisted IVF-Flat index backend with exact fallback guarantees.
 
 const std = @import("std");
-const dot_product = @import("../../../compute/cpu/linalg.zig").dot;
+const dot_product = @import("compute_pkg").cpu.linalg.dot;
 const vector_filter = @import("../filter.zig");
 const flat_mod = @import("flat.zig");
 

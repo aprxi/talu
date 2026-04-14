@@ -1,6 +1,7 @@
 #include "bridge.h"
 #include "config_parse.h"
 
+#include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/compile.h"
 #include "mlx/fast.h"
@@ -167,7 +168,7 @@ struct mlx_ctx {
     std::string model_id;
     std::string model_path;
 
-    Qwen35Config cfg;
+    BridgeModelConfig cfg;
 
     array embed_tokens = array(0.0f); // [vocab, hidden]
     array embed_tokens_q_w = array(0.0f); // [vocab, hidden * bits / 32] packed
@@ -242,6 +243,11 @@ void mlx_tokens_free(int32_t* ids) {
 
 const char* mlx_last_error(void) {
     return g_last_error.c_str();
+}
+
+const char* mlx_runtime_binary_dir(void) {
+    thread_local std::string dir = current_binary_dir().string();
+    return dir.c_str();
 }
 
 } // extern "C"

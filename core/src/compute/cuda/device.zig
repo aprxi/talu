@@ -6,7 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 
 const cuda_success: c_int = 0;
 const cuda_error_out_of_memory: c_int = 2;

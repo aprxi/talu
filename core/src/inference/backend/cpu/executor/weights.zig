@@ -8,24 +8,24 @@
 //! containers (`TransformerBlock`) that the engine references.
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
-const dtype = @import("../../../../dtype.zig");
-const compute = @import("../../../../compute/root.zig");
+const tensor = @import("tensor_pkg");
+const dtype = @import("dtype_pkg");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_copy = compute.cpu.memory.copy;
 const cpu_layout = compute.cpu.layout;
 const cpu_common = compute.cpu.common;
-const layer_ops = @import("../../../../models/layer_ops.zig");
+const layer_ops = @import("models_pkg").layer_ops;
 const fmt = @import("../kernels/describe_fmt.zig");
 const runtime_mod = @import("runtime.zig");
-const inspect = @import("../../../../xray/root.zig");
+const inspect = @import("xray_pkg");
 const trace = inspect.trace;
-const log = @import("../../../../log.zig");
-const progress_mod = @import("../../../../progress.zig");
-const runtime_blocks = @import("../../../../models/runtime_blocks.zig");
-const topology = @import("../../../../models/op_types.zig");
-const models_registry = @import("../../../../models/registry.zig");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
+const runtime_blocks = @import("models_pkg").runtime_blocks;
+const topology = @import("models_pkg").op_types;
+const models_registry = @import("models_pkg").registry;
 
 pub const BufferId = layer_ops.BufferId;
 
@@ -1377,17 +1377,17 @@ pub const TransformerBlock = struct {
                 .use_swiglu_variant = runtime.use_swiglu_variant,
                 .use_transposed_weights = runtime.use_transposed_mxfp4,
                 .use_gelu = use_gelu,
-                // Shared MLP (Gemma4 MoE)
+                // Shared MLP (fused MoE)
                 .shared_gate_proj = moe_w.shared_w1,
                 .shared_up_proj = moe_w.shared_w3,
                 .shared_down_proj = moe_w.shared_w2,
                 .shared_d_ff = if (moe_w.shared_w1) |t| @intCast(t.shape[0]) else 0,
                 .shared_expert_gate = moe_w.shared_expert_gate,
-                // Router scaling (Gemma4 MoE)
+                // Router scaling (fused MoE)
                 .router_input_scale = if (moe_w.router_input_scale) |t| t.asSlice(f32) else null,
                 .router_per_expert_scale = if (moe_w.router_per_expert_scale) |t| t.asSlice(f32) else null,
                 .router_scalar_root_size = if (has_shared_mlp) 1.0 / @sqrt(@as(f32, @floatFromInt(d_model))) else 0.0,
-                // Internal norms for fused FFN+MoE (Gemma4 MoE)
+                // Internal norms for fused FFN+MoE (models with pre/post expert norms)
                 .pre_ffn_norm_weight = moe_w.pre_ffn_norm,
                 .post_shared_norm_weight = moe_w.post_shared_norm,
                 .pre_expert_norm_weight = moe_w.pre_expert_norm,
@@ -1396,7 +1396,7 @@ pub const TransformerBlock = struct {
                 .norm_eps = norm_eps,
                 .norm_weight_offset = runtime.weight_offset,
                 .layer_idx = @intCast(block_idx),
-                .kernel_name = if (has_shared_mlp) "moe_gemma4" else if (moe_w.use_mxfp4) "moe_mxfp4" else "moe_f32",
+                .kernel_name = if (has_shared_mlp) "moe_fused" else if (moe_w.use_mxfp4) "moe_mxfp4" else "moe_f32",
             } };
         } else {
             const w2 = weights.w2 orelse return error.MissingFFNWeights;

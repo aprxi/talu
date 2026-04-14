@@ -13,7 +13,7 @@
 //! Thread safety: Functions are stateless and thread-safe.
 
 const std = @import("std");
-const json_mod = @import("../io/json/root.zig");
+const json_mod = @import("io_pkg").json;
 const backend = @import("backend.zig");
 
 const ItemVariantRecord = backend.ItemVariantRecord;

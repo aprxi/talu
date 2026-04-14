@@ -6,10 +6,9 @@
 const std = @import("std");
 const api_mod = @import("api.zig");
 const Tokenizer = api_mod.Tokenizer;
-const gen_config_mod = @import("../inference/config/generation.zig");
+const gen_config_mod = @import("../config/generation.zig");
 const GenerationConfig = gen_config_mod.GenerationConfig;
-const io = @import("../io/root.zig");
-const repository = io.repository;
+const repository = @import("io_pkg").repository.root;
 
 /// A tokenizer with associated model context.
 ///

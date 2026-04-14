@@ -5,31 +5,32 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const log = @import("../../../../log.zig");
-const models = @import("../../../../models/root.zig");
+const log = @import("log_pkg");
+const models = @import("models_pkg");
 const Block = @import("block.zig").Block;
-const layer_ops = @import("../../../../models/layer_ops.zig");
-const tensor_mod = @import("../../../../tensor.zig");
-const dtype_mod = @import("../../../../dtype.zig");
-const st_loader = @import("../../../../io/safetensors/root.zig");
-const compute = @import("../../../../compute/root.zig");
+const layer_ops = @import("models_pkg").layer_ops;
+const tensor_mod = @import("tensor_pkg");
+const dtype_mod = @import("dtype_pkg");
+const st_loader = @import("io_pkg").safetensors.root;
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_memory = compute.cpu.memory;
 const cpu_activation = compute.cpu.activation;
-const inspect = @import("../../../../xray/root.zig");
+const inspect = @import("xray_pkg");
 const kernel_info = inspect.kernel_info;
 const perf_estimate = inspect.perf_estimate;
-const trace = @import("../../../../xray/trace.zig");
-const runtime_contract = @import("../../../runtime_contract/root.zig");
+const trace = @import("xray_pkg").trace;
+const runtime_contract = @import("runtime_contract_pkg");
 const state_bindings = @import("../state_bindings.zig");
-const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
+const dump = if (build_options.dump_tensors) @import("xray_pkg").dump.capture else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
 const embedding_kernel = @import("../kernels/embedding.zig");
 const attn_kernel = @import("../kernels/attention.zig");
 const norm_kernel = @import("../kernels/norm.zig");
+const per_layer_branch_kernel = @import("../kernels/per_layer_branch.zig");
 
 const Tensor = tensor_mod.Tensor;
 const DType = dtype_mod.DType;
@@ -230,7 +231,7 @@ pub const Embedding = struct {
     }
 };
 
-const Gemma4PerLayerScratch = struct {
+const PerLayerBranchScratch = struct {
     projection: []f32,
     per_layer_input: []f32,
     gated: []f32,
@@ -245,7 +246,7 @@ const Gemma4PerLayerScratch = struct {
         row_count: usize,
         hidden_size: usize,
         hidden_size_per_layer_input: usize,
-    ) !Gemma4PerLayerScratch {
+    ) !PerLayerBranchScratch {
         return .{
             .projection = try allocator.alloc(f32, row_count * hidden_size_per_layer_input),
             .per_layer_input = try allocator.alloc(f32, row_count * hidden_size_per_layer_input),
@@ -258,7 +259,7 @@ const Gemma4PerLayerScratch = struct {
         };
     }
 
-    fn deinit(self: *Gemma4PerLayerScratch, allocator: std.mem.Allocator) void {
+    fn deinit(self: *PerLayerBranchScratch, allocator: std.mem.Allocator) void {
         allocator.free(self.projection);
         allocator.free(self.per_layer_input);
         allocator.free(self.gated);
@@ -268,7 +269,7 @@ const Gemma4PerLayerScratch = struct {
     }
 };
 
-const Gemma4PerLayerRuntime = struct {
+const PerLayerBranchRuntime = struct {
     hidden_size_per_layer_input: usize,
     use_gelu: bool,
     per_layer_input_scale: f32,
@@ -278,39 +279,17 @@ const Gemma4PerLayerRuntime = struct {
     per_layer_projection_norm_weight: Tensor,
     per_layer_projection_norm_eps: f32,
     per_layer_model_projection_weights: []Tensor,
-    per_layer_model_projection: []Linear,
     per_layer_input_gate_weights: []Tensor,
-    per_layer_input_gate: []Linear,
     per_layer_projection_weights: []Tensor,
-    per_layer_projection: []Linear,
     post_per_layer_input_norm_weights: []Tensor,
-    post_per_layer_input_norm: []RMSNorm,
     layer_scalars: []f32,
+    matmul_fn: MatmulFn,
 
-    /// Construct the projection norm on-the-fly from stable struct fields.
-    /// The weight pointer references `self.per_layer_projection_norm_weight`
-    /// which is owned by this struct and has a stable address (unlike a
-    /// stack-local variable that would dangle after init returns).
-    fn projectionNorm(self: *const Gemma4PerLayerRuntime) RMSNorm {
-        return .{
-            .weight = &self.per_layer_projection_norm_weight,
-            .dim = self.hidden_size_per_layer_input,
-            .eps = self.per_layer_projection_norm_eps,
-            .weight_offset = 0.0,
-            .trace_point = .layer_ffn_norm,
-            .layer_idx = trace.TraceEmission.NO_LAYER,
-        };
-    }
-
-    fn deinit(self: *Gemma4PerLayerRuntime, allocator: std.mem.Allocator) void {
+    fn deinit(self: *PerLayerBranchRuntime, allocator: std.mem.Allocator) void {
         allocator.free(self.per_layer_model_projection_weights);
-        allocator.free(self.per_layer_model_projection);
         allocator.free(self.per_layer_input_gate_weights);
-        allocator.free(self.per_layer_input_gate);
         allocator.free(self.per_layer_projection_weights);
-        allocator.free(self.per_layer_projection);
         allocator.free(self.post_per_layer_input_norm_weights);
-        allocator.free(self.post_per_layer_input_norm);
         allocator.free(self.layer_scalars);
         self.* = undefined;
     }
@@ -362,16 +341,16 @@ fn loadLayerTensorBySuffix(
     return error.MissingWeight;
 }
 
-fn snapshotGemma4SourceEmbeddings(
-    gemma4_scratch: *Gemma4PerLayerScratch,
+fn snapshotSourceEmbeddings(
+    plb_scratch: *PerLayerBranchScratch,
     input_tensor: *const Tensor,
 ) !Tensor {
     if (input_tensor.dtype != .f32) return error.UnsupportedDType;
     const values = input_tensor.asSlice(f32);
-    const total_values = gemma4_scratch.row_count * gemma4_scratch.hidden_size;
-    if (values.len < total_values or gemma4_scratch.source_embeddings.len < total_values) return error.InvalidShape;
-    @memcpy(gemma4_scratch.source_embeddings[0..total_values], values[0..total_values]);
-    return Tensor.view3DSlice(gemma4_scratch.source_embeddings[0..total_values], gemma4_scratch.row_count, gemma4_scratch.hidden_size);
+    const total_values = plb_scratch.row_count * plb_scratch.hidden_size;
+    if (values.len < total_values or plb_scratch.source_embeddings.len < total_values) return error.InvalidShape;
+    @memcpy(plb_scratch.source_embeddings[0..total_values], values[0..total_values]);
+    return Tensor.view3DSlice(plb_scratch.source_embeddings[0..total_values], plb_scratch.row_count, plb_scratch.hidden_size);
 }
 
 fn matrixRowsView(
@@ -400,11 +379,11 @@ fn matrixRowsView(
     return view;
 }
 
-fn initGemma4PerLayerRuntime(
+fn initPerLayerBranchRuntime(
     allocator: std.mem.Allocator,
     loaded: *LoadedModel,
     layer_count: usize,
-) !?Gemma4PerLayerRuntime {
+) !?PerLayerBranchRuntime {
     if (loaded.config.hidden_size_per_layer_input <= 0) return null;
     if (loaded.st == null) return error.MissingWeight;
     const safetensors = &(loaded.st.?);
@@ -446,20 +425,12 @@ fn initGemma4PerLayerRuntime(
 
     const per_layer_model_projection_weights = try allocator.alloc(Tensor, layer_count);
     errdefer allocator.free(per_layer_model_projection_weights);
-    const per_layer_model_projection = try allocator.alloc(Linear, layer_count);
-    errdefer allocator.free(per_layer_model_projection);
     const per_layer_input_gate_weights = try allocator.alloc(Tensor, layer_count);
     errdefer allocator.free(per_layer_input_gate_weights);
-    const per_layer_input_gate = try allocator.alloc(Linear, layer_count);
-    errdefer allocator.free(per_layer_input_gate);
     const per_layer_projection_weights = try allocator.alloc(Tensor, layer_count);
     errdefer allocator.free(per_layer_projection_weights);
-    const per_layer_projection = try allocator.alloc(Linear, layer_count);
-    errdefer allocator.free(per_layer_projection);
     const post_per_layer_input_norm_weights = try allocator.alloc(Tensor, layer_count);
     errdefer allocator.free(post_per_layer_input_norm_weights);
-    const post_per_layer_input_norm = try allocator.alloc(RMSNorm, layer_count);
-    errdefer allocator.free(post_per_layer_input_norm);
     const layer_scalars = try allocator.alloc(f32, layer_count);
     errdefer allocator.free(layer_scalars);
 
@@ -486,6 +457,12 @@ fn initGemma4PerLayerRuntime(
         {
             return error.InvalidShape;
         }
+        // All projection weights must share the same dtype for cached matmul dispatch.
+        if (gate_weight.dtype != per_layer_model_projection_weight.dtype or
+            projection_weight.dtype != per_layer_model_projection_weight.dtype)
+        {
+            return error.UnsupportedDType;
+        }
 
         const row_start = layer_idx * hidden_size_per_layer_input;
         const proj_weight_view = try matrixRowsView(
@@ -496,39 +473,9 @@ fn initGemma4PerLayerRuntime(
         );
 
         per_layer_model_projection_weights[layer_idx] = proj_weight_view;
-        per_layer_model_projection[layer_idx] = try Linear.initWithDims(
-            &per_layer_model_projection_weights[layer_idx],
-            null,
-            hidden_size,
-            hidden_size_per_layer_input,
-        );
-
         per_layer_input_gate_weights[layer_idx] = gate_weight;
-        per_layer_input_gate[layer_idx] = try Linear.initWithDims(
-            &per_layer_input_gate_weights[layer_idx],
-            null,
-            hidden_size,
-            hidden_size_per_layer_input,
-        );
-
         per_layer_projection_weights[layer_idx] = projection_weight;
-        per_layer_projection[layer_idx] = try Linear.initWithDims(
-            &per_layer_projection_weights[layer_idx],
-            null,
-            hidden_size_per_layer_input,
-            hidden_size,
-        );
-
         post_per_layer_input_norm_weights[layer_idx] = post_norm_weight;
-        post_per_layer_input_norm[layer_idx] = .{
-            .weight = &post_per_layer_input_norm_weights[layer_idx],
-            .dim = hidden_size,
-            .eps = loaded.config.norm_eps,
-            .weight_offset = 0.0,
-            .trace_point = .block_out,
-            .layer_idx = @intCast(layer_idx),
-        };
-
         layer_scalars[layer_idx] = try tensorScalarToF32(&layer_scalar);
     }
 
@@ -542,14 +489,11 @@ fn initGemma4PerLayerRuntime(
         .per_layer_projection_norm_weight = per_layer_projection_norm_weight,
         .per_layer_projection_norm_eps = loaded.config.norm_eps,
         .per_layer_model_projection_weights = per_layer_model_projection_weights,
-        .per_layer_model_projection = per_layer_model_projection,
         .per_layer_input_gate_weights = per_layer_input_gate_weights,
-        .per_layer_input_gate = per_layer_input_gate,
         .per_layer_projection_weights = per_layer_projection_weights,
-        .per_layer_projection = per_layer_projection,
         .post_per_layer_input_norm_weights = post_per_layer_input_norm_weights,
-        .post_per_layer_input_norm = post_per_layer_input_norm,
         .layer_scalars = layer_scalars,
+        .matmul_fn = (try cpu_linalg.matmulKernel(per_layer_model_projection_weight.dtype)).func,
     };
 }
 
@@ -596,7 +540,7 @@ pub const Transformer = struct {
 
     // File info for summary (from LoadedModel)
     file_size: usize = 0,
-    gemma4_per_layer: ?Gemma4PerLayerRuntime = null,
+    per_layer_branch: ?PerLayerBranchRuntime = null,
 
     // Per-layer scalar multiplier applied to the residual stream at the end of
     // each decoder layer. Loaded independently of the PLE system so models
@@ -633,16 +577,16 @@ pub const Transformer = struct {
         return null;
     }
 
-    fn validateGemma4TokenIds(
+    fn validatePerLayerBranchTokenIds(
         self: *const Transformer,
-        gemma4: *const Gemma4PerLayerRuntime,
+        plb: *const PerLayerBranchRuntime,
         token_ids: ?[]const u32,
         row_count: usize,
     ) ![]const u32 {
         _ = self;
         const ids = token_ids orelse return error.InvalidArgument;
         if (ids.len != row_count) return error.InvalidArgument;
-        const vocab_limit: usize = @intCast(gemma4.per_layer_embedding.shape[0]);
+        const vocab_limit: usize = @intCast(plb.per_layer_embedding.shape[0]);
         for (ids) |token_id| {
             if (token_id >= vocab_limit) return error.InvalidToken;
         }
@@ -682,131 +626,49 @@ pub const Transformer = struct {
         });
     }
 
-    fn gatherGemma4PerLayerEmbedding(
-        gemma4: *const Gemma4PerLayerRuntime,
-        token_ids: []const u32,
-        layer_idx: usize,
-        out: []f32,
-    ) !void {
-        const embed = &gemma4.per_layer_embedding;
-        const total_width: usize = @intCast(embed.shape[1]);
-        const layer_offset = layer_idx * gemma4.hidden_size_per_layer_input;
-        switch (embed.dtype) {
-            .f32 => {
-                const values = embed.asSlice(f32);
-                for (token_ids, 0..) |token_id, row_idx| {
-                    const src_base = @as(usize, token_id) * total_width + layer_offset;
-                    const dst_base = row_idx * gemma4.hidden_size_per_layer_input;
-                    for (0..gemma4.hidden_size_per_layer_input) |col| {
-                        out[dst_base + col] += values[src_base + col] * gemma4.per_layer_embed_scale;
-                    }
-                }
-            },
-            .bf16 => {
-                const values = embed.asSlice(u16);
-                for (token_ids, 0..) |token_id, row_idx| {
-                    const src_base = @as(usize, token_id) * total_width + layer_offset;
-                    const dst_base = row_idx * gemma4.hidden_size_per_layer_input;
-                    for (0..gemma4.hidden_size_per_layer_input) |col| {
-                        out[dst_base + col] += dtype_mod.bf16ToF32(values[src_base + col]) * gemma4.per_layer_embed_scale;
-                    }
-                }
-            },
-            .f16 => {
-                const values = embed.asSlice(u16);
-                for (token_ids, 0..) |token_id, row_idx| {
-                    const src_base = @as(usize, token_id) * total_width + layer_offset;
-                    const dst_base = row_idx * gemma4.hidden_size_per_layer_input;
-                    for (0..gemma4.hidden_size_per_layer_input) |col| {
-                        out[dst_base + col] += dtype_mod.fp16ToF32(values[src_base + col]) * gemma4.per_layer_embed_scale;
-                    }
-                }
-            },
-            else => return error.UnsupportedDType,
-        }
-    }
-
-    fn applyGemma4PerLayerBranch(
+    fn applyPerLayerBranch(
         self: *const Transformer,
-        gemma4: *const Gemma4PerLayerRuntime,
-        gemma4_scratch: *Gemma4PerLayerScratch,
+        plb: *const PerLayerBranchRuntime,
+        plb_scratch: *PerLayerBranchScratch,
         layer_idx: usize,
         source_embeddings: *const Tensor,
         hidden_states: *Tensor,
         token_ids: []const u32,
         scratch: *ScratchBuffer,
     ) !void {
-        const row_count = gemma4_scratch.row_count;
-        std.debug.assert(layer_idx < gemma4.layer_scalars.len);
-        std.debug.assert(token_ids.len == row_count);
-        std.debug.assert(@as(usize, @intCast(hidden_states.shape[1])) == row_count);
-        std.debug.assert(@as(usize, @intCast(source_embeddings.shape[1])) == row_count);
-
-        var projection_tensor = Tensor.view3DSlice(
-            gemma4_scratch.projection,
-            row_count,
-            gemma4.hidden_size_per_layer_input,
-        );
-        var per_layer_input_tensor = Tensor.view3DSlice(
-            gemma4_scratch.per_layer_input,
-            row_count,
-            gemma4.hidden_size_per_layer_input,
-        );
-        var gated_tensor = Tensor.view3DSlice(
-            gemma4_scratch.gated,
-            row_count,
-            gemma4.hidden_size_per_layer_input,
-        );
-        var branch_tensor = Tensor.view3DSlice(
-            gemma4_scratch.branch,
-            row_count,
-            self.hidden_size,
-        );
-
-        gemma4.per_layer_model_projection[layer_idx].forward(
-            source_embeddings,
-            &projection_tensor,
-            &scratch.matmul_scratch,
-        );
-        cpu_rowwise.scaleInPlace(gemma4_scratch.projection, gemma4.per_layer_model_projection_scale);
-
-        const projection_norm = gemma4.projectionNorm();
-        projection_norm.forward(&projection_tensor, &per_layer_input_tensor);
-        try gatherGemma4PerLayerEmbedding(
-            gemma4,
-            token_ids,
-            layer_idx,
-            gemma4_scratch.per_layer_input,
-        );
-        cpu_rowwise.scaleInPlace(gemma4_scratch.per_layer_input, gemma4.per_layer_input_scale);
-
-        gemma4.per_layer_input_gate[layer_idx].forward(
-            hidden_states,
-            &gated_tensor,
-            &scratch.matmul_scratch,
-        );
-        for (gemma4_scratch.gated) |*value| {
-            value.* = if (gemma4.use_gelu)
-                cpu_activation.geluApprox(value.*)
-            else
-                cpu_activation.silu(value.*);
-        }
-        for (gemma4_scratch.gated, 0..) |*value, idx| {
-            value.* *= gemma4_scratch.per_layer_input[idx];
-        }
-
-        gemma4.per_layer_projection[layer_idx].forward(
-            &gated_tensor,
-            &branch_tensor,
-            &scratch.matmul_scratch,
-        );
-        gemma4.post_per_layer_input_norm[layer_idx].forward(&branch_tensor, &branch_tensor);
-
-        const hidden_values = hidden_states.asSliceMut(f32);
-        for (hidden_values, 0..) |*hidden_value, idx| {
-            hidden_value.* += gemma4_scratch.branch[idx];
-        }
-        cpu_rowwise.scaleInPlace(hidden_values, gemma4.layer_scalars[layer_idx]);
+        var kernel_scratch = per_layer_branch_kernel.PerLayerBranchScratch{
+            .projection = plb_scratch.projection,
+            .per_layer_input = plb_scratch.per_layer_input,
+            .gated = plb_scratch.gated,
+            .branch = plb_scratch.branch,
+        };
+        const params = per_layer_branch_kernel.ForwardParams{
+            .hidden_states = hidden_states,
+            .source_embeddings = source_embeddings,
+            .token_ids = token_ids,
+            .per_layer_embedding = &plb.per_layer_embedding,
+            .model_projection_weight = &plb.per_layer_model_projection_weights[layer_idx],
+            .projection_norm_weight = &plb.per_layer_projection_norm_weight,
+            .input_gate_weight = &plb.per_layer_input_gate_weights[layer_idx],
+            .projection_weight = &plb.per_layer_projection_weights[layer_idx],
+            .post_norm_weight = &plb.post_per_layer_input_norm_weights[layer_idx],
+            .config = .{
+                .hidden_size = self.hidden_size,
+                .hidden_size_per_layer_input = plb.hidden_size_per_layer_input,
+                .use_gelu = plb.use_gelu,
+                .per_layer_input_scale = plb.per_layer_input_scale,
+                .per_layer_embed_scale = plb.per_layer_embed_scale,
+                .per_layer_model_projection_scale = plb.per_layer_model_projection_scale,
+                .norm_eps = plb.per_layer_projection_norm_eps,
+                .norm_weight_offset = 0.0,
+                .layer_scalar = plb.layer_scalars[layer_idx],
+                .layer_idx = layer_idx,
+            },
+            .scratch = &kernel_scratch,
+            .matmul_scratch = &scratch.matmul_scratch,
+            .matmul_fn = plb.matmul_fn,
+        };
+        try per_layer_branch_kernel.forward(&params);
     }
 
     /// Forward pass through transformer layers only (not embedding or final norm).
@@ -836,22 +698,22 @@ pub const Transformer = struct {
         }
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, row_count);
 
-        var gemma4_scratch: ?Gemma4PerLayerScratch = null;
-        defer if (gemma4_scratch) |*state| state.deinit(scratch.allocator);
+        var plb_scratch: ?PerLayerBranchScratch = null;
+        defer if (plb_scratch) |*state| state.deinit(scratch.allocator);
         var resolved_token_ids: ?[]const u32 = null;
-        var gemma4_source_embeddings: Tensor = undefined;
-        var has_gemma4_source_embeddings = false;
-        if (self.gemma4_per_layer) |*gemma4| {
-            resolved_token_ids = try self.validateGemma4TokenIds(gemma4, token_ids, row_count);
-            gemma4_scratch = try Gemma4PerLayerScratch.init(
+        var plb_source_embeddings: Tensor = undefined;
+        var has_plb_source_embeddings = false;
+        if (self.per_layer_branch) |*plb| {
+            resolved_token_ids = try self.validatePerLayerBranchTokenIds(plb, token_ids, row_count);
+            plb_scratch = try PerLayerBranchScratch.init(
                 scratch.allocator,
                 row_count,
                 self.hidden_size,
-                gemma4.hidden_size_per_layer_input,
+                plb.hidden_size_per_layer_input,
             );
-            const gemma4_state = if (gemma4_scratch) |*state| state else unreachable;
-            gemma4_source_embeddings = try snapshotGemma4SourceEmbeddings(gemma4_state, input_tensor);
-            has_gemma4_source_embeddings = true;
+            const plb_state = if (plb_scratch) |*state| state else unreachable;
+            plb_source_embeddings = try snapshotSourceEmbeddings(plb_state, input_tensor);
+            has_plb_source_embeddings = true;
         }
 
         // Use pre-allocated scratch buffer for alternating input/output
@@ -881,12 +743,12 @@ pub const Transformer = struct {
                 try layer.forward(current_input_tensor, output_tensor, scratch, use_cache);
                 layer_output_tensor = output_tensor;
             }
-            if (self.gemma4_per_layer) |*gemma4| {
-                const gemma4_state = if (gemma4_scratch) |*state| state else unreachable;
-                const source_embeddings = if (has_gemma4_source_embeddings) &gemma4_source_embeddings else unreachable;
-                try self.applyGemma4PerLayerBranch(
-                    gemma4,
-                    gemma4_state,
+            if (self.per_layer_branch) |*plb| {
+                const plb_state = if (plb_scratch) |*state| state else unreachable;
+                const source_embeddings = if (has_plb_source_embeddings) &plb_source_embeddings else unreachable;
+                try self.applyPerLayerBranch(
+                    plb,
+                    plb_state,
                     layer_idx,
                     source_embeddings,
                     layer_output_tensor,
@@ -1095,7 +957,7 @@ pub const Transformer = struct {
         layer_end: usize,
     ) !void {
         if (layer_end < layer_start or layer_end > self.layers.len) return error.InvalidArgument;
-        if (self.gemma4_per_layer != null and layer_start != 0) return error.InvalidArgument;
+        if (self.per_layer_branch != null and layer_start != 0) return error.InvalidArgument;
         const layered_cache = resolveLayeredCache(state_blocks);
         if (!use_cache and layer_start == 0) {
             if (layered_cache) |cache| cache.resetSlot(slot_index);
@@ -1107,22 +969,22 @@ pub const Transformer = struct {
         }
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
 
-        var gemma4_scratch: ?Gemma4PerLayerScratch = null;
-        defer if (gemma4_scratch) |*state| state.deinit(scratch.allocator);
+        var plb_scratch: ?PerLayerBranchScratch = null;
+        defer if (plb_scratch) |*state| state.deinit(scratch.allocator);
         var resolved_token_ids: ?[]const u32 = null;
-        var gemma4_source_embeddings: Tensor = undefined;
-        var has_gemma4_source_embeddings = false;
-        if (self.gemma4_per_layer) |*gemma4| {
-            resolved_token_ids = try self.validateGemma4TokenIds(gemma4, token_ids, seq_len);
-            gemma4_scratch = try Gemma4PerLayerScratch.init(
+        var plb_source_embeddings: Tensor = undefined;
+        var has_plb_source_embeddings = false;
+        if (self.per_layer_branch) |*plb| {
+            resolved_token_ids = try self.validatePerLayerBranchTokenIds(plb, token_ids, seq_len);
+            plb_scratch = try PerLayerBranchScratch.init(
                 scratch.allocator,
                 seq_len,
                 self.hidden_size,
-                gemma4.hidden_size_per_layer_input,
+                plb.hidden_size_per_layer_input,
             );
-            const gemma4_state = if (gemma4_scratch) |*state| state else unreachable;
-            gemma4_source_embeddings = try snapshotGemma4SourceEmbeddings(gemma4_state, input_tensor);
-            has_gemma4_source_embeddings = true;
+            const plb_state = if (plb_scratch) |*state| state else unreachable;
+            plb_source_embeddings = try snapshotSourceEmbeddings(plb_state, input_tensor);
+            has_plb_source_embeddings = true;
         }
 
         // Use pre-allocated scratch buffer for alternating input/output
@@ -1164,12 +1026,12 @@ pub const Transformer = struct {
                 }
             }
             dumpCpuHiddenState(layer_output_tensor.asSlice(f32), self.hidden_size, layer_idx, "post_layer");
-            if (self.gemma4_per_layer) |*gemma4| {
-                const gemma4_state = if (gemma4_scratch) |*state| state else unreachable;
-                const source_embeddings = if (has_gemma4_source_embeddings) &gemma4_source_embeddings else unreachable;
-                try self.applyGemma4PerLayerBranch(
-                    gemma4,
-                    gemma4_state,
+            if (self.per_layer_branch) |*plb| {
+                const plb_state = if (plb_scratch) |*state| state else unreachable;
+                const source_embeddings = if (has_plb_source_embeddings) &plb_source_embeddings else unreachable;
+                try self.applyPerLayerBranch(
+                    plb,
+                    plb_state,
                     layer_idx,
                     source_embeddings,
                     layer_output_tensor,
@@ -1271,22 +1133,22 @@ pub const Transformer = struct {
         }
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, batch_size);
 
-        var gemma4_scratch: ?Gemma4PerLayerScratch = null;
-        defer if (gemma4_scratch) |*state| state.deinit(scratch.allocator);
+        var plb_scratch: ?PerLayerBranchScratch = null;
+        defer if (plb_scratch) |*state| state.deinit(scratch.allocator);
         var resolved_token_ids: ?[]const u32 = null;
-        var gemma4_source_embeddings: Tensor = undefined;
-        var has_gemma4_source_embeddings = false;
-        if (self.gemma4_per_layer) |*gemma4| {
-            resolved_token_ids = try self.validateGemma4TokenIds(gemma4, token_ids, batch_size);
-            gemma4_scratch = try Gemma4PerLayerScratch.init(
+        var plb_source_embeddings: Tensor = undefined;
+        var has_plb_source_embeddings = false;
+        if (self.per_layer_branch) |*plb| {
+            resolved_token_ids = try self.validatePerLayerBranchTokenIds(plb, token_ids, batch_size);
+            plb_scratch = try PerLayerBranchScratch.init(
                 scratch.allocator,
                 batch_size,
                 self.hidden_size,
-                gemma4.hidden_size_per_layer_input,
+                plb.hidden_size_per_layer_input,
             );
-            const gemma4_state = if (gemma4_scratch) |*state| state else unreachable;
-            gemma4_source_embeddings = try snapshotGemma4SourceEmbeddings(gemma4_state, input_tensor);
-            has_gemma4_source_embeddings = true;
+            const plb_state = if (plb_scratch) |*state| state else unreachable;
+            plb_source_embeddings = try snapshotSourceEmbeddings(plb_state, input_tensor);
+            has_plb_source_embeddings = true;
         }
 
         var scratch_tensor_view = Tensor.view3DSlice(scratch.tmp[0], batch_size, self.hidden_size);
@@ -1314,12 +1176,12 @@ pub const Transformer = struct {
                 try layer.forwardWithBatchedCacheSlots(current_input_tensor, output_tensor, scratch, state_blocks, slot_indices, use_cache);
                 layer_output_tensor = output_tensor;
             }
-            if (self.gemma4_per_layer) |*gemma4| {
-                const gemma4_state = if (gemma4_scratch) |*state| state else unreachable;
-                const source_embeddings = if (has_gemma4_source_embeddings) &gemma4_source_embeddings else unreachable;
-                try self.applyGemma4PerLayerBranch(
-                    gemma4,
-                    gemma4_state,
+            if (self.per_layer_branch) |*plb| {
+                const plb_state = if (plb_scratch) |*state| state else unreachable;
+                const source_embeddings = if (has_plb_source_embeddings) &plb_source_embeddings else unreachable;
+                try self.applyPerLayerBranch(
+                    plb,
+                    plb_state,
                     layer_idx,
                     source_embeddings,
                     layer_output_tensor,
@@ -1707,7 +1569,7 @@ pub const Transformer = struct {
             null
         else
             null;
-        const gemma4_per_layer = try initGemma4PerLayerRuntime(allocator, loaded, layer_count);
+        const per_layer_branch = try initPerLayerBranchRuntime(allocator, loaded, layer_count);
         const layer_scalars = try initStandaloneLayerScalars(allocator, loaded, layer_count);
 
         // Model type for debug output.
@@ -1726,7 +1588,7 @@ pub const Transformer = struct {
             .weight_dtype = loaded.original_weight_dtype,
             .file_size = loaded.file_size,
             .tensor_count = loaded.tensor_count,
-            .gemma4_per_layer = gemma4_per_layer,
+            .per_layer_branch = per_layer_branch,
             .layer_scalars = layer_scalars,
         };
     }
@@ -1772,7 +1634,7 @@ pub const Transformer = struct {
 
     /// Free model allocated by build
     pub fn deinit(self: *Transformer, allocator: std.mem.Allocator) void {
-        if (self.gemma4_per_layer) |*gemma4| gemma4.deinit(allocator);
+        if (self.per_layer_branch) |*plb| plb.deinit(allocator);
         if (self.layer_scalars) |s| allocator.free(s);
         for (self.layers) |*layer| layer.deinit(allocator);
         allocator.free(self.layers);
@@ -2113,11 +1975,11 @@ test "forwardWithBatchedCacheLayerRange processes valid empty range" {
     try std.testing.expectEqualSlices(f32, input_storage[0..], output_storage[0..]);
 }
 
-test "snapshotGemma4SourceEmbeddings preserves source when input buffer mutates" {
+test "snapshotSourceEmbeddings preserves source when input buffer mutates" {
     const allocator = std.testing.allocator;
 
-    var gemma4_scratch = try Gemma4PerLayerScratch.init(allocator, 2, 4, 2);
-    defer gemma4_scratch.deinit(allocator);
+    var plb_scratch = try PerLayerBranchScratch.init(allocator, 2, 4, 2);
+    defer plb_scratch.deinit(allocator);
 
     var input_storage = [_]f32{
         1.0, 2.0, 3.0, 4.0,
@@ -2125,7 +1987,7 @@ test "snapshotGemma4SourceEmbeddings preserves source when input buffer mutates"
     };
     const input_tensor = Tensor.view3DSlice(input_storage[0..], 2, 4);
 
-    const snapshot_tensor = try snapshotGemma4SourceEmbeddings(&gemma4_scratch, &input_tensor);
+    const snapshot_tensor = try snapshotSourceEmbeddings(&plb_scratch, &input_tensor);
     const snapshot_values = snapshot_tensor.asSlice(f32);
 
     @memset(input_storage[0..], -1.0);

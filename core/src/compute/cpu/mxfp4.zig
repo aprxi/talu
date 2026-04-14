@@ -4,8 +4,8 @@
 //! This module provides optimized matmul operations for MXFP4 tensors.
 
 const std = @import("std");
-const parallel = @import("../../system/parallel.zig");
-const log = @import("../../log.zig");
+const parallel = @import("compute_pkg").parallel;
+const log = @import("log_pkg");
 
 // =============================================================================
 // MXFP4 Constants and Helpers

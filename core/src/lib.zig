@@ -30,33 +30,6 @@ pub export fn talu_get_abi_version() callconv(.c) i32 {
     return ABI_VERSION;
 }
 
-// Additional exports needed by integration tests
-pub const core = @import("root.zig");
-pub const tokenizer = @import("tokenizer/root.zig");
-pub const template = @import("template/root.zig");
-pub const nn = struct {
-    pub const sampling = inference.sampling;
-};
-pub const io = @import("io/root.zig");
-pub const models = struct {
-    pub const dispatcher = @import("models/root.zig");
-};
-pub const inference = @import("inference/root.zig");
-pub const responses = @import("responses/root.zig");
-pub const router = @import("router/root.zig");
-pub const generation_config = @import("inference/config/generation.zig");
-pub const converter = @import("converter/root.zig");
-pub const compute = @import("compute/root.zig");
-pub const tensor = @import("tensor.zig");
-pub const xray = @import("xray/root.zig");
-pub const validate = @import("validate/root.zig");
-pub const db = @import("db/root.zig");
-pub const collab = @import("collab/root.zig");
-pub const policy = @import("agent/policy/root.zig");
-pub const dump = @import("xray/dump/root.zig");
-pub const agent = @import("agent/root.zig");
-pub const train = @import("train/root.zig");
-
 // Force the linker to export these symbols by referencing them in a comptime block
 comptime {
     // ABI Version (Global Handshake)

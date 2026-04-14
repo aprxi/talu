@@ -1,5 +1,5 @@
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
+const tensor = @import("tensor_pkg");
 
 pub fn getObjectIntField(obj: std.json.ObjectMap, key: []const u8) ?i32 {
     const value = obj.get(key) orelse return null;

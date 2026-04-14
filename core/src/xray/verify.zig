@@ -15,7 +15,7 @@ const reference_mod = @import("reference.zig");
 const teacher_forcing = @import("teacher_forcing.zig");
 const dump_capture_mod = @import("dump/capture.zig");
 const dump_npz_mod = @import("dump/npz.zig");
-const core_dtype = @import("../dtype.zig");
+const core_dtype = @import("dtype_pkg");
 const handler_slot_mod = @import("handler_slot.zig");
 const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
 

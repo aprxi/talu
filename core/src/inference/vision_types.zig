@@ -3,7 +3,7 @@
 //! This module defines backend-agnostic image/prefill data structures.
 
 const std = @import("std");
-const image_mod = @import("../image/root.zig");
+const image_mod = @import("image_pkg");
 
 pub const PrefillVisionImage = struct {
     pixels: []f32,

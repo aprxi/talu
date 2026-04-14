@@ -4,8 +4,8 @@
 //! and inference runtime wiring.
 
 const std = @import("std");
-const tensor = @import("../tensor.zig");
-const runtime_contract = @import("../inference/runtime_contract/root.zig");
+const tensor = @import("tensor_pkg");
+const runtime_contract = @import("runtime_contract_pkg");
 const perf_hints = @import("perf_hints.zig");
 const sampling_presets = @import("sampling_presets.zig");
 
@@ -21,6 +21,7 @@ pub const OpType = enum {
     mamba_mixer, // Mamba2 SSM layer (monolithic)
     gated_delta_net,
     shortconv, // Gated short convolution (monolithic)
+    per_layer_branch, // Per-layer gated embedding branch (e.g. Gemma4 PLE)
 
     // Residual connection
     add,
@@ -423,6 +424,9 @@ pub const Architecture = struct {
     use_swiglu_oss: bool = false, // SwiGLU variant: alpha=1.702, ±7 clipping, (up+1)
     norm_weight_offset: f32 = 0.0,
     explicit_qk_norm_ops: bool = false,
+    /// When true, published weights already include the (1+w) norm offset and
+    /// the bridge must NOT apply an additional shift during weight sanitization.
+    norm_weights_pre_shifted: bool = false,
 
     // Pre-block flags
     embedding_multiplier: f32 = 1.0, // Scaling factor after embedding (e.g., sqrt(hidden_size))

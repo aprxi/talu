@@ -13,8 +13,8 @@
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("../../../../tensor.zig");
-const compute = @import("../../../../compute/root.zig");
+const tensor = @import("tensor_pkg");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_layout = compute.cpu.layout;
 const cpu_norm = compute.cpu.normalization;
@@ -23,7 +23,7 @@ const cpu_rotary = compute.cpu.rotary;
 const cpu_softmax = compute.cpu.softmax;
 const cpu_common = compute.cpu.common;
 const rope_kernel = @import("rope.zig");
-const trace = @import("../../../../xray/root.zig").trace;
+const trace = @import("xray_pkg").trace;
 
 const Tensor = tensor.Tensor;
 const MatmulFn = cpu_linalg.MatmulFn;

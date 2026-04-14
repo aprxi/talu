@@ -14,7 +14,7 @@ int32_t mlx_validate_config(const char* model_path) {
         if (!std::filesystem::exists(model_path)) {
             throw std::runtime_error(std::string("resolved model_path does not exist: ") + model_path);
         }
-        const ParsedModelConfig parsed = parse_qwen35_config(model_path);
+        const ParsedModelConfig parsed = parse_model_config(model_path);
         if (!validate_memory_budget_or_set_error(model_path, parsed.cfg)) {
             return 0;
         }
@@ -28,7 +28,7 @@ int32_t mlx_validate_config(const char* model_path) {
     }
 }
 
-mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) {
+static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, int32_t seed, const mlx_model_flags* flags) {
     bool wired_limit_acquired = false;
     bool rng_entered = false;
     const bool qmm_debug = []() {
@@ -77,20 +77,21 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             wired_limit_acquired = acquire_wired_limit();
         }
 
-        const ParsedModelConfig parsed_cfg = parse_qwen35_config(ctx->model_path);
+        const ParsedModelConfig parsed_cfg = parse_model_config(ctx->model_path, flags);
         ctx->cfg = parsed_cfg.cfg;
         if (!validate_memory_budget_or_set_error(ctx->model_path, ctx->cfg)) {
             return nullptr;
         }
 
         auto tensors = load_weight_tensors(ctx->model_path);
-        sanitize_qwen35_tensors(tensors, ctx->cfg.tie_word_embeddings, parsed_cfg.allow_qwen_norm_shift);
+        sanitize_model_tensors(tensors, ctx->cfg.tie_word_embeddings, parsed_cfg.allow_norm_shift);
         const bool has_fp8_meta = has_fp8_quant_metadata(tensors);
         ctx->has_fp8_meta = has_fp8_meta;
         const bool has_mxfp8_meta = has_mxfp8_quant_metadata(tensors);
         ctx->has_mxfp8_meta = has_mxfp8_meta;
         bool has_grouped_affine_meta = has_grouped_affine_quant_metadata(tensors);
         const bool has_nvfp4_meta = has_nvfp4_quant_metadata(tensors);
+        const bool nvfp4_only_checkpoint = has_nvfp4_meta && !has_grouped_affine_meta;
         if (has_grouped_affine_meta && has_nvfp4_meta) {
             // Hybrid artifacts preserve grouped-affine execution tensors.
             ctx->cfg.quant_bits = 4;
@@ -99,6 +100,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             // Pure NVFP4 must stay on the native MLX NVFP4 path.
             ctx->cfg.quant_bits = 4;
             ctx->cfg.quant_group_size = 16;
+            ctx->cfg.quant_mode = "nvfp4";
         }
         ctx->has_grouped_affine_meta = has_grouped_affine_meta;
         // Decode-time QMM defaults on for quantized checkpoints:
@@ -108,6 +110,12 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         // Callers can still force on/off via TALU_METAL_FP8_DECODE_QMM.
         const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta;
         ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
+        if (nvfp4_only_checkpoint && !ctx->fp8_decode_qmm_enabled) {
+            throw std::runtime_error(
+                "nvfp4-only checkpoint requires TALU_METAL_FP8_DECODE_QMM=1 "
+                "(decode fallback paths are disabled for nvfp4-only checkpoints)"
+            );
+        }
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
         // v3 cache/runtime policy: quantized path is allowed for prefill too,
         // so dense RHS is not retained by default.
@@ -172,7 +180,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
 
         auto maybe_quantize_mxfp8_matrix = [&](
             const std::unordered_map<std::string, array>& tensors_ref,
-            const Qwen35Config& cfg_ref,
+            const BridgeModelConfig& cfg_ref,
             const std::string& weight_key,
             const array& lhs_weight,
             bool enabled,
@@ -201,11 +209,26 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         const std::string embed_weight_key = has_tensor(tensors, text_prefix + "embed_tokens.weight")
             ? text_prefix + "embed_tokens.weight"
             : "model.embed_tokens.weight";
+        const bool nvfp4_only_checkpoint_for_embed = has_nvfp4_meta && !has_grouped_affine_meta;
         const bool enable_quantized_embed_lookup = env_truthy(
             "TALU_METAL_GROUPED_AFFINE_EMBED_LOOKUP",
-            has_grouped_affine_meta
+            has_grouped_affine_meta || nvfp4_only_checkpoint_for_embed
         );
-        if (enable_quantized_embed_lookup && has_grouped_affine_metadata_for_key(tensors, embed_weight_key)) {
+        if (enable_quantized_embed_lookup &&
+            has_nvfp4_metadata_for_key(tensors, embed_weight_key) &&
+            !has_grouped_affine_metadata_for_key(tensors, embed_weight_key))
+        {
+            if (capture_native_nvfp4_quant(
+                    tensors,
+                    embed_weight_key,
+                    &ctx->embed_tokens_q_w,
+                    &ctx->embed_tokens_q_scales,
+                    &ctx->embed_tokens_q_biases))
+            {
+                ctx->embed_tokens_has_q = true;
+                ctx->embed_tokens_q_bits = 4;
+            }
+        } else if (enable_quantized_embed_lookup && has_grouped_affine_metadata_for_key(tensors, embed_weight_key)) {
             int embed_bits = 0;
             const array packed_embed = require_tensor(tensors, embed_weight_key);
             ctx->embed_tokens_has_q = maybe_capture_grouped_affine_quant(
@@ -381,6 +404,9 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             if (has_tensor(tensors, p + "post_feedforward_layernorm.weight")) {
                 lw.post_feedforward_layernorm_w = require_tensor(tensors, p + "post_feedforward_layernorm.weight");
             }
+            if (has_tensor(tensors, p + "layer_scalar")) {
+                lw.layer_scalar = scalar_to_f32(require_tensor(tensors, p + "layer_scalar"), p + "layer_scalar");
+            }
             if (ctx->per_layer_input_enabled) {
                 const int hpl = ctx->per_layer_hidden_size;
                 const int row_start = i * hpl;
@@ -390,8 +416,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     per_layer_model_projection_weight.shape(1) == ctx->cfg.hidden_size &&
                     has_tensor(tensors, p + "per_layer_input_gate.weight") &&
                     has_tensor(tensors, p + "per_layer_projection.weight") &&
-                    has_tensor(tensors, p + "post_per_layer_input_norm.weight") &&
-                    has_tensor(tensors, p + "layer_scalar"))
+                    has_tensor(tensors, p + "post_per_layer_input_norm.weight"))
                 {
                     const array per_layer_model_projection_slice = slice(
                         per_layer_model_projection_weight,
@@ -405,7 +430,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     lw.per_layer_input_gate_rhs = load_rhs_weight(p + "per_layer_input_gate.weight");
                     lw.per_layer_projection_rhs = load_rhs_weight(p + "per_layer_projection.weight");
                     lw.post_per_layer_input_norm_w = require_tensor(tensors, p + "post_per_layer_input_norm.weight");
-                    lw.layer_scalar = scalar_to_f32(require_tensor(tensors, p + "layer_scalar"), p + "layer_scalar");
                     lw.has_per_layer_input = true;
                 }
             }
@@ -568,23 +592,14 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 // talu convert). This avoids a concatenate+copy at runtime that
                 // duplicates weight data already in the mmap.
                 const std::string gate_up_key = p + "mlp.gate_up_proj.weight";
-                if (has_tensor(tensors, gate_up_key) &&
-                    has_grouped_affine_metadata_for_key(tensors, gate_up_key))
-                {
+                if (has_tensor(tensors, gate_up_key)) {
                     const array& gate_up_weight = require_tensor(tensors, gate_up_key);
                     if (gate_up_weight.ndim() == 2 && gate_up_weight.shape(0) > 0) {
                         lw.mlp_gate_width = gate_up_weight.shape(0) / 2;
-                        maybe_capture_grouped_affine_quant(
-                            tensors, ctx->cfg, gate_up_key, gate_up_weight,
-                            &lw.mlp_gate_up_q_w,
-                            &lw.mlp_gate_up_q_scales,
-                            &lw.mlp_gate_up_q_biases
+                        maybe_quantize_mxfp8_matrix(
+                            tensors, ctx->cfg, gate_up_key, gate_up_weight, enable_mlp_qmm,
+                            &lw.mlp_gate_up_q_w, &lw.mlp_gate_up_q_scales, &lw.mlp_gate_up_q_biases, &lw.mlp_gate_up_has_q
                         );
-                        lw.mlp_gate_up_has_q = lw.mlp_gate_up_q_w.ndim() == 2;
-                        if (lw.mlp_gate_up_has_q) {
-                            g_qmm_attempts += 1;
-                            g_qmm_success += 1;
-                        }
                         if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_up_has_q) {
                             lw.mlp_gate_up_rhs = load_rhs_weight(gate_up_key);
                         }
@@ -939,6 +954,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                             std::to_string(expected_cols) + " got cols=" + std::to_string(fused_cols)
                         );
                     }
+                    const bool fused_is_nvfp4 = has_nvfp4_metadata_for_key(tensors, fused_key);
                     bool lin_qkvz_q_captured = false;
                     bool lin_ba_q_captured = false;
                     if (enable_mlp_qmm && env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true)) {
@@ -983,6 +999,46 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                             g_qmm_success += 2;
                         }
                     }
+                    if (enable_mlp_qmm && (!lin_qkvz_q_captured || !lin_ba_q_captured) &&
+                        has_nvfp4_metadata_for_key(tensors, fused_key))
+                    {
+                        // Native NVFP4 capture for fused mixer.in_proj: keep the
+                        // packed payload/scales and slice qkvz/ba row ranges.
+                        array fused_q_w = array(0.0f);
+                        array fused_q_scales = array(0.0f);
+                        array fused_q_biases = array(0.0f);
+                        if (capture_native_nvfp4_quant(
+                                tensors,
+                                fused_key,
+                                &fused_q_w,
+                                &fused_q_scales,
+                                &fused_q_biases) &&
+                            fused_q_w.ndim() == 2 &&
+                            fused_q_scales.ndim() == 2 &&
+                            fused_q_w.shape(0) == expected_cols &&
+                            fused_q_scales.shape(0) == expected_cols)
+                        {
+                            const int packed_cols = fused_q_w.shape(1);
+                            const int group_cols = fused_q_scales.shape(1);
+                            lw.lin_in_proj_qkvz_q_w = slice(fused_q_w, {0, 0}, {qkvz_cols, packed_cols});
+                            lw.lin_in_proj_ba_q_w = slice(fused_q_w, {qkvz_cols, 0}, {expected_cols, packed_cols});
+                            lw.lin_in_proj_qkvz_q_scales = slice(fused_q_scales, {0, 0}, {qkvz_cols, group_cols});
+                            lw.lin_in_proj_ba_q_scales = slice(fused_q_scales, {qkvz_cols, 0}, {expected_cols, group_cols});
+                            // Native NVFP4 stores a scalar post-scale factor.
+                            lw.lin_in_proj_qkvz_q_biases = fused_q_biases;
+                            lw.lin_in_proj_ba_q_biases = fused_q_biases;
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lw.lin_in_proj_ba_has_q = true;
+                            lw.lin_in_proj_all_q_w = fused_q_w;
+                            lw.lin_in_proj_all_q_scales = fused_q_scales;
+                            lw.lin_in_proj_all_q_biases = fused_q_biases;
+                            lw.lin_in_proj_all_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 2;
+                            g_qmm_success += 2;
+                        }
+                    }
                     std::optional<array> fused_in_proj_weight_dense;
                     const auto ensure_fused_in_proj_weight_dense = [&]() -> const array& {
                         if (!fused_in_proj_weight_dense.has_value()) {
@@ -997,17 +1053,21 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                             {0, 0},
                             {qkvz_cols, fused_in_proj_weight.shape(1)}
                         );
-                        maybe_quantize_mxfp8_matrix(
-                            tensors,
-                            ctx->cfg,
-                            p + "mixer.in_proj.qkvz_slice",
-                            qkvz_weight,
-                            enable_mlp_qmm,
-                            &lw.lin_in_proj_qkvz_q_w,
-                            &lw.lin_in_proj_qkvz_q_scales,
-                            &lw.lin_in_proj_qkvz_q_biases,
-                            &lw.lin_in_proj_qkvz_has_q
-                        );
+                        if (!fused_is_nvfp4) {
+                            maybe_quantize_mxfp8_matrix(
+                                tensors,
+                                ctx->cfg,
+                                p + "mixer.in_proj.qkvz_slice",
+                                qkvz_weight,
+                                enable_mlp_qmm,
+                                &lw.lin_in_proj_qkvz_q_w,
+                                &lw.lin_in_proj_qkvz_q_scales,
+                                &lw.lin_in_proj_qkvz_q_biases,
+                                &lw.lin_in_proj_qkvz_has_q
+                            );
+                        } else {
+                            lw.lin_in_proj_qkvz_has_q = false;
+                        }
                     }
                     if (!lin_ba_q_captured) {
                         const array& fused_in_proj_weight = ensure_fused_in_proj_weight_dense();
@@ -1016,17 +1076,21 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                             {qkvz_cols, 0},
                             {expected_cols, fused_in_proj_weight.shape(1)}
                         );
-                        maybe_quantize_mxfp8_matrix(
-                            tensors,
-                            ctx->cfg,
-                            p + "mixer.in_proj.ba_slice",
-                            ba_weight,
-                            enable_mlp_qmm,
-                            &lw.lin_in_proj_ba_q_w,
-                            &lw.lin_in_proj_ba_q_scales,
-                            &lw.lin_in_proj_ba_q_biases,
-                            &lw.lin_in_proj_ba_has_q
-                        );
+                        if (!fused_is_nvfp4) {
+                            maybe_quantize_mxfp8_matrix(
+                                tensors,
+                                ctx->cfg,
+                                p + "mixer.in_proj.ba_slice",
+                                ba_weight,
+                                enable_mlp_qmm,
+                                &lw.lin_in_proj_ba_q_w,
+                                &lw.lin_in_proj_ba_q_scales,
+                                &lw.lin_in_proj_ba_q_biases,
+                                &lw.lin_in_proj_ba_has_q
+                            );
+                        } else {
+                            lw.lin_in_proj_ba_has_q = false;
+                        }
                     }
                     if ((keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) ||
                         (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q)) {
@@ -1147,29 +1211,22 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
 
                 // Prefer fused qkv_proj if the checkpoint has it (produced by talu convert).
                 const std::string qkv_proj_key = p + "self_attn.qkv_proj.weight";
-                if (has_tensor(tensors, qkv_proj_key) &&
-                    has_grouped_affine_metadata_for_key(tensors, qkv_proj_key))
-                {
+                if (has_tensor(tensors, qkv_proj_key)) {
                     const array& qkv_weight = require_tensor(tensors, qkv_proj_key);
                     if (qkv_weight.ndim() == 2) {
                         // Detect Q/K/V widths from config.
                         // Q proj width is the total output rows of the Q projection.
-                        // For gated attention (Qwen3.5), Q carries both q and gate,
+                        // For gated attention, Q carries both q and gate,
                         // so width = 2 * num_heads * head_dim. Detect from tensor shape.
                         lw.attn_q_proj_width = qkv_weight.shape(0)
                             - lw.attn_num_kv_heads * lw.attn_head_dim   // K
                             - lw.attn_num_kv_heads * lw.attn_head_dim;  // V
                         lw.attn_k_proj_width = lw.attn_num_kv_heads * lw.attn_head_dim;
                         lw.attn_v_proj_width = lw.attn_num_kv_heads * lw.attn_head_dim;
-                        maybe_capture_grouped_affine_quant(
-                            tensors, ctx->cfg, qkv_proj_key, qkv_weight,
-                            &lw.attn_qkv_q_w, &lw.attn_qkv_q_scales, &lw.attn_qkv_q_biases
+                        maybe_quantize_mxfp8_matrix(
+                            tensors, ctx->cfg, qkv_proj_key, qkv_weight, enable_mlp_qmm,
+                            &lw.attn_qkv_q_w, &lw.attn_qkv_q_scales, &lw.attn_qkv_q_biases, &lw.attn_qkv_has_q
                         );
-                        lw.attn_qkv_has_q = lw.attn_qkv_q_w.ndim() == 2;
-                        if (lw.attn_qkv_has_q) {
-                            g_qmm_attempts += 1;
-                            g_qmm_success += 1;
-                        }
                         if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_qkv_has_q) {
                             lw.attn_qkv_rhs = load_rhs_weight(qkv_proj_key);
                         }
@@ -1180,7 +1237,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 if (!lw.attn_qkv_has_q && lw.attn_qkv_rhs.size() <= 1) {
                     const std::string q_proj_key = p + "self_attn.q_proj.weight";
                     const std::string k_proj_key = p + "self_attn.k_proj.weight";
-                    const std::string v_proj_key = p + "self_attn.v_proj.weight";
+                    // attention_k_eq_v: V shares K weights when v_proj is absent
+                    const std::string v_proj_key = has_tensor(tensors, p + "self_attn.v_proj.weight")
+                        ? p + "self_attn.v_proj.weight"
+                        : k_proj_key;
                     const array& q_proj_weight = require_tensor(tensors, q_proj_key);
                     const array& k_proj_weight = require_tensor(tensors, k_proj_key);
                     const array& v_proj_weight = require_tensor(tensors, v_proj_key);
@@ -1396,8 +1456,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             size_t dense_fallback_bytes = 0;
             const bool quantized_checkpoint =
                 has_mxfp8_meta || ctx->has_grouped_affine_meta || has_nvfp4_meta;
+            const bool nvfp4_only_quantized_checkpoint =
+                has_nvfp4_meta && !ctx->has_grouped_affine_meta && !has_mxfp8_meta;
             const bool strict_quantized_decode_requested =
-                env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", false);
+                env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", nvfp4_only_quantized_checkpoint);
             const bool strict_quantized_decode_active =
                 strict_quantized_decode_requested && quantized_checkpoint;
             if (strict_quantized_decode_active && !ctx->fp8_decode_qmm_enabled) {
@@ -1709,6 +1771,14 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         g_last_error = "unknown error in mlx_create";
         return nullptr;
     }
+}
+
+mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) {
+    return mlx_create_impl(model_id, model_path, seed, nullptr);
+}
+
+mlx_ctx* mlx_create_with_flags(const char* model_id, const char* model_path, int32_t seed, const mlx_model_flags* flags) {
+    return mlx_create_impl(model_id, model_path, seed, flags);
 }
 
 mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {

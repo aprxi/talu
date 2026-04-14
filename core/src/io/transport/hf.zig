@@ -8,11 +8,11 @@ const cache = @import("../repository/cache.zig");
 const resolver = @import("../repository/resolver.zig");
 const Bundle = @import("../repository/bundle.zig").Bundle;
 const json_mod = @import("../json/root.zig");
-const capi = @import("../../capi/error.zig");
-const log = @import("../../log.zig");
-const progress_api = @import("../../capi/progress.zig");
+const error_context = @import("error_context_pkg");
+const log = @import("log_pkg");
+const progress_api = @import("progress_pkg");
 
-const ProgressContext = progress_api.ProgressContext;
+const ProgressContext = progress_api.Context;
 
 /// Context for byte-level progress callback bridge.
 /// Adapts http.ProgressCallback to the unified progress API.
@@ -292,7 +292,7 @@ pub fn fetchFileList(
         .token = download_config.token,
         .max_response_bytes = 10 * 1024 * 1024,
     }) catch |err| {
-        capi.setContext("url={s}", .{model_api_url});
+        error_context.setContext("url={s}", .{model_api_url});
         return err;
     };
     defer allocator.free(response_bytes);
@@ -304,7 +304,7 @@ pub fn fetchFileList(
         .max_string_bytes = 1 * 1024 * 1024,
         .ignore_unknown_fields = true,
     }) catch |err| {
-        capi.setContext("model_id={s}", .{model_id});
+        error_context.setContext("model_id={s}", .{model_id});
         return switch (err) {
             error.InputTooLarge => DownloadError.ApiResponseParseError,
             error.InputTooDeep => DownloadError.ApiResponseParseError,
@@ -379,7 +379,7 @@ pub fn fetchModel(
     }
 
     if (repo_file_names.len == 0) {
-        capi.setContext("model_id={s}", .{model_id});
+        error_context.setContext("model_id={s}", .{model_id});
         return DownloadError.ModelNotFound;
     }
 
@@ -496,7 +496,7 @@ pub fn fetchModel(
             // Only error for essential files, skip others silently
             if (std.mem.eql(u8, filename, "config.json")) {
                 progress.completeLine(0);
-                capi.setContext("file={s}, model_id={s}, err={s}", .{ filename, model_id, @errorName(err) });
+                error_context.setContext("file={s}, model_id={s}, err={s}", .{ filename, model_id, @errorName(err) });
                 // Return filesystem errors directly, wrap HTTP errors as ConfigNotFound
                 return switch (err) {
                     DownloadError.PermissionDenied,
@@ -525,7 +525,7 @@ pub fn fetchModel(
 
     // Verify we have the minimum required files
     if (!has_config) {
-        capi.setContext("model_id={s}", .{model_id});
+        error_context.setContext("model_id={s}", .{model_id});
         return DownloadError.ConfigNotFound;
     }
     // Note: missing weights is not a fatal error - the download still succeeds
@@ -624,7 +624,7 @@ pub fn fetchFile(
         !download_config.force,
         download_config.cancel_flag,
     ) catch |err| {
-        capi.setContext("file={s}, model_id={s}", .{ filename, model_id });
+        error_context.setContext("file={s}, model_id={s}", .{ filename, model_id });
         return err;
     };
 

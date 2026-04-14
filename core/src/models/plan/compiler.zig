@@ -3,10 +3,10 @@
 //! Compiles existing `LayerOp` programs into typed runtime `CompiledPlan`.
 
 const std = @import("std");
-const layer_ops = @import("../layer_ops.zig");
-const op_types = @import("../op_types.zig");
-const registry = @import("../registry.zig");
-const runtime_contract = @import("../../inference/runtime_contract/root.zig");
+const layer_ops = @import("models_pkg").layer_ops;
+const op_types = @import("models_pkg").op_types;
+const registry = @import("models_pkg").registry;
+const runtime_contract = @import("runtime_contract_pkg");
 const opcode_map = @import("opcode_map.zig");
 const llama3 = @import("../llama/llama3.zig");
 const granite_hybrid = @import("../granite/granite_hybrid.zig");

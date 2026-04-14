@@ -558,6 +558,8 @@ array run_layer(
         array branch = linear(gated, lw.per_layer_projection_rhs);
         branch = fast::rms_norm(branch, std::optional<array>(lw.post_per_layer_input_norm_w), ctx->cfg.rms_norm_eps);
         out = (out + branch) * array(lw.layer_scalar, out.dtype());
+    } else if (std::fabs(lw.layer_scalar - 1.0f) > 1.0e-6f) {
+        out = out * array(lw.layer_scalar, out.dtype());
     }
     if (trace_frame) {
         xray_emit_array_f32(
@@ -591,4 +593,3 @@ array run_layer(
 // decode steps). KV caches and offset flow through explicit inputs so
 // compile() sees fixed shapes and traces once.
 // ---------------------------------------------------------------------------
-

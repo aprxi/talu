@@ -2,7 +2,7 @@
 //!
 //! Provides FFI-safe tensor creation and manipulation functions.
 const std = @import("std");
-const tensor_mod = @import("../tensor.zig");
+const tensor_mod = @import("tensor_pkg");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 

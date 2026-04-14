@@ -6,8 +6,8 @@
 //! the vision encoder's hardware limit (see Backend.visionMaxPixels).
 
 const std = @import("std");
-const json = @import("../../io/json/root.zig");
-const log = @import("../../log.zig");
+const json = @import("io_pkg").json;
+const log = @import("log_pkg");
 
 // =============================================================================
 // Preprocessor Config

@@ -3,7 +3,7 @@
 const std = @import("std");
 const tv = @import("tensor_view.zig");
 const math = @import("math.zig");
-const parallel = @import("../../system/parallel.zig");
+const parallel = @import("compute_pkg").parallel;
 
 /// Maximum sequence length for stack-allocated score buffers.
 /// Sequences longer than this will use heap allocation.
@@ -26,7 +26,7 @@ const fastExp = math.fastExp;
 const fastExpScalar = math.fastExpScalar;
 
 /// Dtype conversion helpers - wrapped to remove inline calling convention
-const dtype_mod = @import("../../dtype.zig");
+const dtype_mod = @import("dtype_pkg");
 
 fn fp16ToF32(x: u16) f32 {
     return dtype_mod.fp16ToF32(x);

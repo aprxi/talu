@@ -12,12 +12,12 @@ const std = @import("std");
 // Core Submodules
 // =============================================================================
 
-pub const tensor = @import("tensor.zig");
-pub const dtype = @import("dtype.zig");
-pub const compute = @import("compute/root.zig");
-pub const validate = @import("validate/root.zig");
+pub const tensor = @import("tensor_pkg");
+pub const dtype = @import("dtype_pkg");
+pub const compute = @import("compute_pkg");
+pub const validate = @import("validate_pkg");
 pub const db = @import("db/root.zig");
-pub const image = @import("image/root.zig");
+pub const image = @import("image_pkg");
 pub const collab = @import("collab/root.zig");
 
 // =============================================================================

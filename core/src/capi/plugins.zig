@@ -6,7 +6,7 @@
 const std = @import("std");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
-const scanner = @import("../io/plugins/scanner.zig");
+const scanner = @import("io_pkg").plugins.scanner;
 
 const allocator = std.heap.c_allocator;
 

@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const error_codes = @import("error_codes.zig");
-const error_context = @import("../error_context.zig");
+const error_context = @import("error_context_pkg");
 const ErrorCode = error_codes.ErrorCode;
 const errorToCode = error_codes.errorToCode;
 

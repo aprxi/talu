@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const transport = @import("../../io/transport/root.zig");
+const transport = @import("io_pkg").transport;
 const Tool = @import("../tool.zig").Tool;
 const ToolResult = @import("../tool.zig").ToolResult;
 

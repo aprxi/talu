@@ -1,12 +1,12 @@
 //! Rotary position embeddings (RoPE) forward pass for training.
 
 const std = @import("std");
-const compute = @import("../../compute/root.zig");
+const compute = @import("compute_pkg");
 
 const simd = compute.cpu.simd.arch;
 const VEC = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;
-const math_fast = @import("../../compute/cpu/math_fast.zig");
+const math_fast = @import("compute_pkg").cpu.math_fast;
 const fastSinCos = math_fast.fastSinCos;
 const fastSinCosScalar = math_fast.fastSinCosScalar;
 

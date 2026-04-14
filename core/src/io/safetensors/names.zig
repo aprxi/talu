@@ -4,9 +4,9 @@
 //! conventions used by different model packaging formats.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const st_loader = @import("root.zig");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 
 pub const Tensor = tensor.Tensor;
 

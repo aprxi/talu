@@ -5,14 +5,14 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const parallel = @import("../../system/parallel.zig");
-const tensor_mod = @import("../../tensor.zig");
-const dtype_mod = @import("../../dtype.zig");
+const parallel = @import("compute_pkg").parallel;
+const tensor_mod = @import("tensor_pkg");
+const dtype_mod = @import("dtype_pkg");
 const simd = @import("simd/arch/root.zig");
 const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
 const multi_row = @import("matmul_prefill.zig");
 const rowwise = @import("rowwise.zig");
-const log = @import("../../log.zig");
+const log = @import("log_pkg");
 const accelerate = @import("accelerate.zig");
 
 // Re-export types

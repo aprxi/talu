@@ -39,7 +39,7 @@ const allocator = std.heap.c_allocator;
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const signal_guard = @import("signal_guard.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 // =============================================================================
 // Signal-Safe Memory Validation

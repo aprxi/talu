@@ -26,28 +26,28 @@
 //! 6. Residual add (hidden += ffn_out * residual_multiplier)
 
 const std = @import("std");
-const tensor = @import("../../../tensor.zig");
+const tensor = @import("tensor_pkg");
 const Tensor = tensor.Tensor;
 const OwnedTensor = tensor.OwnedTensor;
-const compute = @import("../../../compute/root.zig");
+const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_reduction = compute.cpu.reduction;
 const cpu_memory = compute.cpu.memory;
 const cpu_rotary = compute.cpu.rotary;
-const models = @import("../../../models/root.zig");
+const models = @import("models_pkg");
 const rope_scaling = models.rope_scaling;
 const contract = @import("../contract.zig");
-const log = @import("../../../log.zig");
-const progress_mod = @import("../../../progress.zig");
+const log = @import("log_pkg");
+const progress_mod = @import("progress_pkg");
 
 const cpu_executor = @import("executor/root.zig");
 const Transformer = cpu_executor.Model;
 const cpu_blocks = cpu_executor.weights;
-const runtime_contract = @import("../../runtime_contract/root.zig");
+const runtime_contract = @import("runtime_contract_pkg");
 const common_mrope = @import("vision/mrope.zig");
-const trace = @import("../../../xray/trace.zig");
-const xray = @import("../../../xray/root.zig");
+const trace = @import("xray_pkg").trace;
+const xray = @import("xray_pkg");
 const PoolingStrategy = contract.PoolingStrategy;
 const LoadedModel = models.LoadedModel;
 const kernels = @import("kernels/root.zig");

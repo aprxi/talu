@@ -4,10 +4,10 @@
 //! RoPE scaling parameters, quantization settings, and tied embeddings.
 
 const std = @import("std");
-const json = @import("../../io/json/root.zig");
-const tensor = @import("../../tensor.zig");
-const model_types = @import("../op_types.zig");
-const registry = @import("../registry.zig");
+const json = @import("io_pkg").json;
+const tensor = @import("tensor_pkg");
+const model_types = @import("models_pkg").op_types;
+const registry = @import("models_pkg").registry;
 
 const ModelConfig = tensor.ModelConfig;
 

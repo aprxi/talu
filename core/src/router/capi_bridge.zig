@@ -13,12 +13,13 @@ const spec = @import("spec.zig");
 const http_engine_mod = @import("http_engine.zig");
 const commit_mod = @import("commit.zig");
 const responses_mod = @import("../responses/root.zig");
-const inference_types = @import("../inference/root.zig").types;
-const sampler = @import("../inference/root.zig").sampling;
+const inference_bridge = @import("inference_bridge.zig");
+const inference_types = inference_bridge.types;
+const sampler = inference_bridge.sampling;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const error_codes = @import("../capi/error_codes.zig");
 const capi_error = @import("../capi/error.zig");
-const log = @import("../log.zig");
+const log = @import("log_pkg");
 
 const LocalEngine = local.LocalEngine;
 const HttpEngine = http_engine_mod.HttpEngine;
