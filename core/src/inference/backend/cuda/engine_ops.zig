@@ -412,6 +412,115 @@ pub fn linearForwardRows(
                 return;
             }
 
+            // On-demand I8 tensor core path: dequant U4→I8 into scratch per
+            // linear op, then cuBLAS I8×I8→I32 GEMM. No persistent I8 cache
+            // needed — uses existing scratch buffers. ~2× faster than F16 path.
+            if (self.gaffine_u4_to_i8_function != null and self.i8_blas_supported) on_demand_i8: {
+                const to_i8_fn = self.gaffine_u4_to_i8_function.?;
+                const quant_fn = self.quantize_f32_to_i8_simple_function orelse break :on_demand_i8;
+                const dequant_fn = self.dequant_i32_scales_function orelse break :on_demand_i8;
+
+                const in_dim = w.rows;
+                const out_dim = w.cols;
+                const weight_i8_bytes = std.math.mul(usize, in_dim, out_dim) catch break :on_demand_i8;
+                const col_scale_bytes = std.math.mul(usize, out_dim, @sizeOf(f32)) catch break :on_demand_i8;
+
+                // Layout scratch: [I8 weights | F32 col scales] in dequant_f16_dev,
+                //                 [I8 input | F32 row scales] in activation_u16_dev,
+                //                 [I32 output] needs separate space.
+                if (self.runtime_buffers.dequant_f16_dev.size < weight_i8_bytes + col_scale_bytes)
+                    break :on_demand_i8;
+
+                var i8_weight_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_i8_bytes) catch break :on_demand_i8;
+                var col_scale_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, weight_i8_bytes, col_scale_bytes) catch break :on_demand_i8;
+
+                // Step 0: Dequant U4 weights → I8 + per-col F32 scales (on the fly).
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&w.packed_data) catch break :on_demand_i8;
+                self.kernel_arg_pack.appendBufferPtr(&w.scales) catch break :on_demand_i8;
+                self.kernel_arg_pack.appendBufferPtr(&w.biases) catch break :on_demand_i8;
+                self.kernel_arg_pack.appendBufferPtr(&i8_weight_buf) catch break :on_demand_i8;
+                self.kernel_arg_pack.appendBufferPtr(&col_scale_buf) catch break :on_demand_i8;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :on_demand_i8;
+                self.kernel_arg_pack.appendScalar(u32, w.group_size) catch break :on_demand_i8;
+                self.kernel_arg_pack.appendScalar(u32, w.scales_dtype_tag) catch break :on_demand_i8;
+                compute.cuda.launch.launchWithFamily(&self.device, to_i8_fn, .{
+                    .grid_x = @intCast(out_dim),
+                    .block_x = 256,
+                }, &self.kernel_arg_pack, .other) catch break :on_demand_i8;
+
+                // Chunked I8 GEMM (same pattern as cached path).
+                const act_per_row = in_dim + @sizeOf(f32);
+                const i32_per_row = std.math.mul(usize, out_dim, @sizeOf(i32)) catch break :on_demand_i8;
+                const max_chunk = @min(
+                    self.runtime_buffers.activation_u16_dev.size / act_per_row,
+                    // I32 output goes into the tail of dequant_f16_dev after weights+scales.
+                    (self.runtime_buffers.dequant_f16_dev.size - weight_i8_bytes - col_scale_bytes) / i32_per_row,
+                );
+                if (max_chunk == 0) break :on_demand_i8;
+
+                const i32_buf_offset = weight_i8_bytes + col_scale_bytes;
+                var done: usize = 0;
+                while (done < rows) {
+                    const chunk = @min(rows - done, max_chunk);
+                    const i8_input_bytes = chunk * in_dim;
+                    const row_scales_bytes = chunk * @sizeOf(f32);
+                    const i32_out_bytes = std.math.mul(usize, chunk * out_dim, @sizeOf(i32)) catch break :on_demand_i8;
+
+                    var i8_input_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, i8_input_bytes) catch break :on_demand_i8;
+                    var row_scales_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, i8_input_bytes, row_scales_bytes) catch break :on_demand_i8;
+                    var i32_out_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, i32_buf_offset, i32_out_bytes) catch break :on_demand_i8;
+
+                    const in_off = done * in_dim * @sizeOf(f32);
+                    const out_off = done * out_dim * @sizeOf(f32);
+                    var chunk_input = bufferSlice(&packed_input, in_off, chunk * in_dim * @sizeOf(f32)) catch break :on_demand_i8;
+                    var chunk_output = bufferSlice(&packed_out, out_off, chunk * out_dim * @sizeOf(f32)) catch break :on_demand_i8;
+
+                    // Step 1: Quantize F32 input → I8 + per-row scales.
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&chunk_input) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendBufferPtr(&i8_input_buf) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :on_demand_i8;
+                    compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+                        .grid_x = @intCast(chunk),
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :on_demand_i8;
+
+                    // Step 2: INT8 GEMM — I8 input × I8 weight → I32 output.
+                    self.blas.matmulI8I8I32(
+                        &self.device,
+                        &i8_input_buf,
+                        chunk,
+                        in_dim,
+                        &i8_weight_buf,
+                        out_dim,
+                        &i32_out_buf,
+                    ) catch {
+                        self.i8_blas_supported = false;
+                        break :on_demand_i8;
+                    };
+
+                    // Step 3: Dequantize I32 → F32 with per-row × per-col scales.
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&i32_out_buf) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendBufferPtr(&col_scale_buf) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendBufferPtr(&chunk_output) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(chunk)) catch break :on_demand_i8;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :on_demand_i8;
+                    const dequant_blocks_x = std.math.cast(u32, std.math.divCeil(usize, out_dim, 256) catch break :on_demand_i8) orelse break :on_demand_i8;
+                    compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
+                        .grid_x = dequant_blocks_x,
+                        .grid_y = @intCast(chunk),
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :on_demand_i8;
+
+                    done += chunk;
+                }
+                if (done == rows) return;
+            }
+
             // Fallback: F16 dequant + cuBLAS GEMM path for prefill.
             if (self.cast_f32_to_f16_function) |cast_fn| {
                 if (self.u16_blas_f16_supported) dequant_blas: {

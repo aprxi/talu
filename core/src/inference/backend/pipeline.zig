@@ -153,9 +153,24 @@ pub fn PipelineRuntime(comptime Stage0Type: type, comptime Stage1Type: type, com
             activation_byte_count: usize,
         ) !void {
             try self.stage0.executeLayers(stage0_input, 0, self.split_layer);
-            try self.stage0.synchronize();
+            // When the custom transfer uses event-based sync (records an event
+            // on stage0's stream and makes stage1's stream wait on it), the
+            // explicit stage0 synchronize is unnecessary — it would stall the
+            // CPU for the full stage0 compute duration with no benefit.
+            if (!self.transferHandlesSync()) {
+                try self.stage0.synchronize();
+            }
             try self.transferActivation(activation_byte_count);
             try self.stage1.executeLayers(stage1_input, self.split_layer, self.total_layers);
+        }
+
+        fn transferHandlesSync(self: *const Self) bool {
+            if (HasCustomTransfer) {
+                if (@hasDecl(@TypeOf(self.custom_transfer), "handlesStageSync")) {
+                    return self.custom_transfer.handlesStageSync();
+                }
+            }
+            return false;
         }
 
         fn transferActivation(self: *Self, byte_count: usize) !void {

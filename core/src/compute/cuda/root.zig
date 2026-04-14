@@ -115,6 +115,7 @@ pub const matmul_u16 = @import("matmul_u16.zig");
 pub const Device = device.Device;
 pub const Buffer = device.Buffer;
 pub const StreamHandle = device.StreamHandle;
+pub const EventHandle = device.EventHandle;
 pub const GraphHandle = device.GraphHandle;
 pub const GraphExecHandle = device.GraphExecHandle;
 pub const Probe = device.Probe;

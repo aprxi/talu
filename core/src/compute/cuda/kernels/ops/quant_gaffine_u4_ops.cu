@@ -730,17 +730,17 @@ extern "C" __global__ void talu_gaffine_u4_to_i8(
     const unsigned short* scale_row = scales + (unsigned long long)row * num_groups;
     const unsigned short* bias_row = biases + (unsigned long long)row * num_groups;
 
-    // Pass 1: dequant to F32 in registers and find per-row absmax.
+    // Phase 1: compute per-row absmax from scale/bias arrays only.
+    // U4 nibbles are [0,15], so per-group value range is [bias, 15*scale+bias]
+    // (or reversed if scale < 0). The extremes are always at nibble=0 and nibble=15.
+    // This avoids reading the U4 weight data entirely — only num_groups iterations
+    // (typically 30-160×) fewer than in_dim.
     __shared__ float smem[8];
     float local_max = 0.0f;
-    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        const unsigned int g = i / group_size;
+    for (unsigned int g = threadIdx.x; g < num_groups; g += blockDim.x) {
         const float s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
         const float b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
-        const unsigned int word = row_packed[i / 8];
-        const unsigned int nibble = (word >> ((i & 7u) * 4)) & 0xFu;
-        const float val = s * static_cast<float>(nibble) + b;
-        local_max = fmaxf(local_max, fabsf(val));
+        local_max = fmaxf(local_max, fmaxf(fabsf(b), fabsf(15.0f * s + b)));
     }
     for (int offset = 16; offset >= 1; offset >>= 1)
         local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFu, local_max, offset));
@@ -759,7 +759,7 @@ extern "C" __global__ void talu_gaffine_u4_to_i8(
     const float inv_scale = 1.0f / scale;
     if (threadIdx.x == 0) out_row_scales[row] = scale;
 
-    // Pass 2: dequant + quantize to I8.
+    // Phase 2: single pass — dequant U4 + quantize to I8.
     for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
         const unsigned int g = i / group_size;
         const float s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);

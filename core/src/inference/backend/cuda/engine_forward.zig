@@ -1441,6 +1441,13 @@ fn runPipeline2WithPipelineRuntime(
             try t.owner.transferPipelineActivation(dst.backend, byte_count);
         }
 
+        /// Event-based transfer records an event on stage0's stream and makes
+        /// stage1's stream wait on it, so the caller can skip explicit stage0
+        /// synchronization.
+        pub fn handlesStageSync(t: *const @This()) bool {
+            return t.owner.pipeline_stage0_event != null;
+        }
+
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
     };
     var ctx = Ctx{
@@ -1863,10 +1870,6 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     use_preloaded_input: bool,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    const gemma4_branch_active = if (comptime @hasField(SelfType, "gemma4_per_layer"))
-        self.gemma4_per_layer != null
-    else
-        false;
     if (comptime @hasDecl(SelfType, "pipelineStage1") and
         @hasDecl(SelfType, "transferPipelineActivation"))
     {
@@ -2450,15 +2453,26 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
 
     // CUDA graph capture: record all GPU kernels (layer loop + final norm + lm_head)
     // into a graph, then replay with near-zero scheduling gaps between kernels.
-    // Requires: named stream, no tracing (trace downloads break capture), no deepstack
-    // (sync memcpy during capture is not stream-ordered), not a pipeline stage
-    // (input comes from H2D copy outside the graph).
+    // Graph capture eliminates per-kernel launch overhead by recording the layer
+    // sequence and replaying it as a single launch.  Re-captures every decode step
+    // to pick up changed arguments (position, seq_len); graphExecUpdate patches
+    // the existing exec in-place when topology matches (very fast).
+    // Restricted to single-row decode: prefill has synchronous KV operations and
+    // varying row counts that break graph topology stability.
+    // Pipeline2 stage1 excluded: receives activation via external transfer.
+    // Persistent graph replay: on the first decode step, capture the layer
+    // sequence into a CUDA graph and instantiate it. On subsequent steps,
+    // replay the existing graph without re-capture — the position/seq_len
+    // data lives in device buffers updated before this function, so the graph
+    // topology is identical every token. All setup (embedding lookup, pointer
+    // table uploads) runs before the graph region and before persistent replay.
     const no_graph = std.posix.getenv("TALU_NO_GRAPH") != null;
-    var graph_capture_active = false;
-    if (self.compute_stream != null and compute_logits and
+    const graph_eligible = self.compute_stream != null and
         !trace.isEnabled() and deepstack_layer_features_opt == null and
-        !gemma4_branch_active and !use_preloaded_input and !no_graph)
-    {
+        !no_graph;
+
+    var graph_capture_active = false;
+    if (graph_eligible) {
         if (self.device.streamBeginCapture(self.compute_stream.?)) {
             graph_capture_active = true;
         } else |_| {}
@@ -2613,6 +2627,25 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         // row to input_dev so the next stage can consume a deterministic buffer.
         if (final_hidden.pointer != self.runtime_buffers.input_dev.pointer) {
             try self.runtime_buffers.input_dev.copyFrom(&self.device, &final_hidden, row_bytes);
+        }
+        // Finalize graph capture for non-logit stage (Pipeline2 stage0).
+        // The copyFrom above uses async DtoD when a stream is set, so it is
+        // captured into the graph alongside the layer kernels.
+        if (graph_capture_active) {
+            const new_graph = self.device.streamEndCapture(self.compute_stream.?) catch
+                return error.CudaGraphCaptureFailed;
+            defer self.device.graphDestroy(new_graph);
+            if (self.decode_graph_exec) |exec| {
+                self.device.graphExecUpdate(exec, new_graph) catch {
+                    self.device.graphExecDestroy(exec);
+                    self.decode_graph_exec = self.device.graphInstantiate(new_graph) catch
+                        return error.CudaGraphInstantiateFailed;
+                };
+            } else {
+                self.decode_graph_exec = self.device.graphInstantiate(new_graph) catch
+                    return error.CudaGraphInstantiateFailed;
+            }
+            try self.device.graphLaunch(self.decode_graph_exec.?, self.compute_stream);
         }
         return;
     }

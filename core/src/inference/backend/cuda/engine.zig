@@ -472,6 +472,10 @@ pub const CudaBackend = struct {
     pipeline_backend1: ?*CudaBackend = null,
     /// Activation transfer mechanism (pipeline2 only).
     pipeline_transfer_mode: PipelineTransferMode = .none,
+    /// Event for non-blocking pipeline stage synchronization. Recorded on
+    /// stage0's compute stream after layer execution; stage1's stream waits on
+    /// it before reading the transferred activation.
+    pipeline_stage0_event: ?compute.cuda.EventHandle = null,
     pipeline_host_staging: ?[]align(4096) u8 = null,
     pipeline_host_staging_stage12: ?[]align(4096) u8 = null,
     pipeline_boundary_dtype: backend_root.pipeline.BoundaryDType = .f32,
@@ -1813,6 +1817,11 @@ pub const CudaBackend = struct {
                     backend.pipeline_host_staging = null;
                 };
 
+                // Create event for non-blocking pipeline synchronization.
+                if (backend.device.supportsEvents()) {
+                    backend.pipeline_stage0_event = backend.device.createEvent() catch null;
+                }
+
                 const stage0_budget = backend.computeDeviceMemoryBudget();
                 const stage1_budget = stage1_ptr.computeDeviceMemoryBudget();
                 log.info("inference", "CUDA pipeline2 topology", .{
@@ -2290,6 +2299,10 @@ pub const CudaBackend = struct {
             self.allocator.free(buf);
             self.pipeline_host_staging = null;
         }
+        if (self.pipeline_stage0_event) |event| {
+            self.device.destroyEvent(event);
+            self.pipeline_stage0_event = null;
+        }
         self.block_runtime.deinit(self.allocator, &self.device);
         self.runtime_buffers.deinit(self.allocator, &self.device);
         self.blas.deinit(&self.device);
@@ -2358,18 +2371,39 @@ pub const CudaBackend = struct {
         if (byte_count == 0) return;
         switch (self.pipeline_transfer_mode) {
             .peer_to_peer => {
-                try self.device.memcpyPeerAsync(
-                    dst.runtime_buffers.input_dev.pointer,
-                    dst.device.context,
-                    self.runtime_buffers.input_dev.pointer,
-                    self.device.context,
-                    byte_count,
-                    self.compute_stream,
-                );
-                if (self.compute_stream) |stream| {
-                    try self.device.synchronizeStream(stream);
+                // Event-based non-blocking transfer: record an event on stage0's
+                // stream, make stage1's stream wait on it, then issue the P2P copy
+                // on stage1's stream. This eliminates CPU blocking between stages.
+                if (self.pipeline_stage0_event) |event| {
+                    // Record event on GPU0 stream — fires when GPU0 layers complete.
+                    try self.device.recordEvent(event, self.compute_stream);
+                    // GPU1 stream waits for GPU0 event before reading activation.
+                    try dst.device.streamWaitEvent(dst.compute_stream, event);
+                    // Issue P2P copy on GPU1's stream (ordered after the wait).
+                    try dst.device.makeCurrent();
+                    try self.device.memcpyPeerAsync(
+                        dst.runtime_buffers.input_dev.pointer,
+                        dst.device.context,
+                        self.runtime_buffers.input_dev.pointer,
+                        self.device.context,
+                        byte_count,
+                        dst.compute_stream,
+                    );
                 } else {
-                    try self.device.synchronize();
+                    // Fallback: blocking sync (no event support).
+                    try self.device.memcpyPeerAsync(
+                        dst.runtime_buffers.input_dev.pointer,
+                        dst.device.context,
+                        self.runtime_buffers.input_dev.pointer,
+                        self.device.context,
+                        byte_count,
+                        self.compute_stream,
+                    );
+                    if (self.compute_stream) |stream| {
+                        try self.device.synchronizeStream(stream);
+                    } else {
+                        try self.device.synchronize();
+                    }
                 }
             },
             .host_staged => {

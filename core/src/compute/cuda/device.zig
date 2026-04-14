@@ -27,8 +27,10 @@ const CuMemAllocFn = *const fn (*u64, usize) callconv(.c) c_int;
 const CuMemFreeFn = *const fn (u64) callconv(.c) c_int;
 const CuMemGetInfoFn = *const fn (*usize, *usize) callconv(.c) c_int;
 const CuMemcpyHtoDFn = *const fn (u64, *const anyopaque, usize) callconv(.c) c_int;
+const CuMemcpyHtoDAsyncFn = *const fn (u64, *const anyopaque, usize, ?*anyopaque) callconv(.c) c_int;
 const CuMemcpyDtoHFn = *const fn (*anyopaque, u64, usize) callconv(.c) c_int;
 const CuMemcpyDtoDFn = *const fn (u64, u64, usize) callconv(.c) c_int;
+const CuMemcpyDtoDAsyncFn = *const fn (u64, u64, usize, ?*anyopaque) callconv(.c) c_int;
 const CuDeviceGetNameFn = *const fn ([*]u8, c_int, c_int) callconv(.c) c_int;
 const CuDeviceTotalMemFn = *const fn (*usize, c_int) callconv(.c) c_int;
 const CuDeviceGetAttributeFn = *const fn (*c_int, c_int, c_int) callconv(.c) c_int;
@@ -62,10 +64,15 @@ const CuLaunchKernelFn = *const fn (
 const CuDeviceCanAccessPeerFn = *const fn (*c_int, c_int, c_int) callconv(.c) c_int;
 const CuCtxEnablePeerAccessFn = *const fn (?*anyopaque, u32) callconv(.c) c_int;
 const CuMemcpyPeerAsyncFn = *const fn (u64, ?*anyopaque, u64, ?*anyopaque, usize, ?*anyopaque) callconv(.c) c_int;
+const CuEventCreateFn = *const fn (*?*anyopaque, u32) callconv(.c) c_int;
+const CuEventDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuEventRecordFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
+const CuStreamWaitEventFn = *const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int;
 
 pub const ModuleHandle = *anyopaque;
 pub const FunctionHandle = *anyopaque;
 pub const StreamHandle = *anyopaque;
+pub const EventHandle = *anyopaque;
 pub const GraphHandle = *anyopaque;
 pub const GraphExecHandle = *anyopaque;
 
@@ -90,8 +97,10 @@ const DriverApi = struct {
     cu_mem_free: CuMemFreeFn,
     cu_mem_get_info: ?CuMemGetInfoFn,
     cu_memcpy_htod: CuMemcpyHtoDFn,
+    cu_memcpy_htod_async: ?CuMemcpyHtoDAsyncFn,
     cu_memcpy_dtoh: CuMemcpyDtoHFn,
     cu_memcpy_dtod: CuMemcpyDtoDFn,
+    cu_memcpy_dtod_async: ?CuMemcpyDtoDAsyncFn,
     cu_device_get_name: CuDeviceGetNameFn,
     cu_device_total_mem: ?CuDeviceTotalMemFn,
     cu_device_get_attribute: ?CuDeviceGetAttributeFn,
@@ -112,6 +121,10 @@ const DriverApi = struct {
     cu_device_can_access_peer: ?CuDeviceCanAccessPeerFn,
     cu_ctx_enable_peer_access: ?CuCtxEnablePeerAccessFn,
     cu_memcpy_peer_async: ?CuMemcpyPeerAsyncFn,
+    cu_event_create: ?CuEventCreateFn,
+    cu_event_destroy: ?CuEventDestroyFn,
+    cu_event_record: ?CuEventRecordFn,
+    cu_stream_wait_event: ?CuStreamWaitEventFn,
 };
 
 const cu_device_attribute_compute_capability_major: c_int = 75;
@@ -594,6 +607,46 @@ pub const Device = struct {
         if (cu_stream_synchronize(stream) != cuda_success) return error.CudaSynchronizeFailed;
     }
 
+    pub fn createEvent(self: *Device) !EventHandle {
+        const cu_event_create = self.api.cu_event_create orelse return error.CudaEventApiUnavailable;
+        try self.makeCurrent();
+        var event: ?*anyopaque = null;
+        // CU_EVENT_DISABLE_TIMING = 0x2 — avoids timing overhead.
+        if (cu_event_create(&event, 0x2) != cuda_success or event == null) {
+            return error.CudaEventCreateFailed;
+        }
+        return event.?;
+    }
+
+    pub fn destroyEvent(self: *Device, event: EventHandle) void {
+        const cu_event_destroy = self.api.cu_event_destroy orelse return;
+        self.makeCurrent() catch return;
+        _ = cu_event_destroy(event);
+    }
+
+    /// Record an event on a stream. The event fires when all preceding work
+    /// on the stream completes.
+    pub fn recordEvent(self: *Device, event: EventHandle, stream: ?StreamHandle) !void {
+        const cu_event_record = self.api.cu_event_record orelse return error.CudaEventApiUnavailable;
+        try self.makeCurrent();
+        if (cu_event_record(event, stream) != cuda_success) return error.CudaEventRecordFailed;
+    }
+
+    /// Make a stream wait for an event. The stream will not execute any
+    /// subsequently queued work until the event fires. Works across devices.
+    pub fn streamWaitEvent(self: *Device, stream: ?StreamHandle, event: EventHandle) !void {
+        const cu_stream_wait_event = self.api.cu_stream_wait_event orelse return error.CudaEventApiUnavailable;
+        try self.makeCurrent();
+        if (cu_stream_wait_event(stream, event, 0) != cuda_success) return error.CudaStreamWaitEventFailed;
+    }
+
+    pub fn supportsEvents(self: *const Device) bool {
+        return self.api.cu_event_create != null and
+            self.api.cu_event_destroy != null and
+            self.api.cu_event_record != null and
+            self.api.cu_stream_wait_event != null;
+    }
+
     pub fn graphInstantiate(self: *Device, graph: GraphHandle) !GraphExecHandle {
         const cu_graph_instantiate_with_flags = self.api.cu_graph_instantiate_with_flags orelse return error.CudaGraphApiUnavailable;
         try self.makeCurrent();
@@ -815,6 +868,16 @@ pub const Buffer = struct {
         if (data.len == 0) return;
 
         try device.makeCurrent();
+        // Use async upload when a launch stream is set (required during graph
+        // capture; also safe in normal execution via stream ordering).
+        if (device.launch_stream) |stream| {
+            if (device.api.cu_memcpy_htod_async) |cu_memcpy_htod_async| {
+                if (cu_memcpy_htod_async(self.pointer, @ptrCast(data.ptr), data.len, stream) != cuda_success) {
+                    return error.CudaCopyFailed;
+                }
+                return;
+            }
+        }
         if (device.api.cu_memcpy_htod(self.pointer, @ptrCast(data.ptr), data.len) != cuda_success) {
             return error.CudaCopyFailed;
         }
@@ -824,6 +887,17 @@ pub const Buffer = struct {
         if (byte_count > self.size or byte_count > src.size) return error.InvalidArgument;
         if (byte_count == 0) return;
         try device.makeCurrent();
+        // Use async copy when a launch stream is set (required during graph
+        // capture; also safe in normal execution since stream ordering
+        // guarantees the same sequencing as the synchronous variant).
+        if (device.launch_stream) |stream| {
+            if (device.api.cu_memcpy_dtod_async) |cu_memcpy_dtod_async| {
+                if (cu_memcpy_dtod_async(self.pointer, src.pointer, byte_count, stream) != cuda_success) {
+                    return error.CudaCopyFailed;
+                }
+                return;
+            }
+        }
         if (device.api.cu_memcpy_dtod(self.pointer, src.pointer, byte_count) != cuda_success) {
             return error.CudaCopyFailed;
         }
@@ -891,8 +965,10 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_mem_free = try lookupRequiredAny(CuMemFreeFn, lib, &.{ "cuMemFree_v2", "cuMemFree" }),
         .cu_mem_get_info = lookupOptionalAny(CuMemGetInfoFn, lib, &.{ "cuMemGetInfo_v2", "cuMemGetInfo" }),
         .cu_memcpy_htod = try lookupRequiredAny(CuMemcpyHtoDFn, lib, &.{ "cuMemcpyHtoD_v2", "cuMemcpyHtoD" }),
+        .cu_memcpy_htod_async = lookupOptionalAny(CuMemcpyHtoDAsyncFn, lib, &.{ "cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync" }),
         .cu_memcpy_dtoh = try lookupRequiredAny(CuMemcpyDtoHFn, lib, &.{ "cuMemcpyDtoH_v2", "cuMemcpyDtoH" }),
         .cu_memcpy_dtod = try lookupRequiredAny(CuMemcpyDtoDFn, lib, &.{ "cuMemcpyDtoD_v2", "cuMemcpyDtoD" }),
+        .cu_memcpy_dtod_async = lookupOptionalAny(CuMemcpyDtoDAsyncFn, lib, &.{ "cuMemcpyDtoDAsync_v2", "cuMemcpyDtoDAsync" }),
         .cu_device_get_name = try lookupRequired(CuDeviceGetNameFn, lib, "cuDeviceGetName"),
         .cu_device_total_mem = lookupOptionalAny(CuDeviceTotalMemFn, lib, &.{ "cuDeviceTotalMem_v2", "cuDeviceTotalMem" }),
         .cu_device_get_attribute = lookupOptional(CuDeviceGetAttributeFn, lib, "cuDeviceGetAttribute"),
@@ -913,6 +989,10 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_device_can_access_peer = lookupOptional(CuDeviceCanAccessPeerFn, lib, "cuDeviceCanAccessPeer"),
         .cu_ctx_enable_peer_access = lookupOptional(CuCtxEnablePeerAccessFn, lib, "cuCtxEnablePeerAccess"),
         .cu_memcpy_peer_async = lookupOptionalAny(CuMemcpyPeerAsyncFn, lib, &.{ "cuMemcpyPeerAsync_v2", "cuMemcpyPeerAsync" }),
+        .cu_event_create = lookupOptionalAny(CuEventCreateFn, lib, &.{ "cuEventCreate" }),
+        .cu_event_destroy = lookupOptionalAny(CuEventDestroyFn, lib, &.{ "cuEventDestroy_v2", "cuEventDestroy" }),
+        .cu_event_record = lookupOptionalAny(CuEventRecordFn, lib, &.{ "cuEventRecord" }),
+        .cu_stream_wait_event = lookupOptionalAny(CuStreamWaitEventFn, lib, &.{ "cuStreamWaitEvent" }),
     };
 }
 
