@@ -30,6 +30,7 @@ const bufferF32RowCount = engine_types.bufferF32RowCount;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 const KvCacheDtype = engine_types.KvCacheDtype;
 const MoEWeightRefs = engine_types.MoEWeightRefs;
+const AttentionPath = engine_types.AttentionPath;
 const enable_fused_attention_f16_kv = engine_types.enable_fused_attention_f16_kv;
 const max_fused_attention_f16_kv_seq_len = engine_types.max_fused_attention_f16_kv_seq_len;
 const max_supported_fused_f16_kv_head_dim = engine_types.max_supported_fused_f16_kv_head_dim;
@@ -41,6 +42,92 @@ const min_flash_decode_blocks_low_kv_heads: u32 = 1024;
 fn debugKernelSyncEnabled() bool {
     const raw = std.posix.getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
     return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
+fn recordAttentionPhase(self: anytype, path: AttentionPath, start_ns: i128, is_causal: bool) void {
+    const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns: u64 = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
+        self.nvfp4_phase_counters.recordAttention(path, elapsed_ns);
+        self.nvfp4_phase_counters.recordAttentionCausality(is_causal);
+        self.nvfp4_phase_counters.recordAttentionBatchedPrefill();
+    }
+}
+
+fn applyPrefillRopeRows(
+    self: anytype,
+    q_stage: *compute.cuda.Buffer,
+    stage_rows: usize,
+    row_stride_elems: usize,
+    n_heads_u32: u32,
+    head_dim_u32: u32,
+    rope_dim_u32: u32,
+    position_base_u32: u32,
+    theta: f32,
+    rope_function: compute.cuda.Function,
+) !void {
+    const expected_row_stride = std.math.mul(usize, @as(usize, n_heads_u32), @as(usize, head_dim_u32)) catch return error.InvalidArgument;
+    if (self.rope_rows_ptrs_function) |rope_rows_ptrs_fn| {
+        if (row_stride_elems == expected_row_stride) {
+            const positions_bytes = std.math.mul(usize, stage_rows, @sizeOf(u32)) catch return error.InvalidArgument;
+            var positions_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, positions_bytes);
+            const rows_u32: u32 = @intCast(stage_rows);
+            const need_upload = self.prefill_rope_positions_cached_dirty or
+                !self.prefill_rope_positions_cached_valid or
+                self.prefill_rope_positions_cached_rows != rows_u32 or
+                self.prefill_rope_positions_cached_base != position_base_u32;
+            if (need_upload) {
+                if (self.prefill_rope_positions_host.len < stage_rows) {
+                    if (self.prefill_rope_positions_host.len > 0) self.allocator.free(self.prefill_rope_positions_host);
+                    self.prefill_rope_positions_host = try self.allocator.alloc(u32, stage_rows);
+                }
+                const positions_host = self.prefill_rope_positions_host[0..stage_rows];
+                var row: usize = 0;
+                while (row < stage_rows) : (row += 1) {
+                    positions_host[row] = position_base_u32 + @as(u32, @intCast(row));
+                }
+                try positions_dev.upload(&self.device, std.mem.sliceAsBytes(positions_host));
+                self.prefill_rope_positions_cached_valid = true;
+                self.prefill_rope_positions_cached_dirty = false;
+                self.prefill_rope_positions_cached_rows = rows_u32;
+                self.prefill_rope_positions_cached_base = position_base_u32;
+            }
+            try compute.cuda.rope_rows_ptrs.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rope_rows_ptrs_fn,
+                q_stage,
+                &positions_dev,
+                @intCast(stage_rows),
+                n_heads_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                theta,
+            );
+            return;
+        }
+    }
+
+    // Fallback for non-standard row stride layouts.
+    const q_row_bytes_rope = std.math.mul(usize, row_stride_elems, @sizeOf(f32)) catch return error.InvalidArgument;
+    var rope_row_idx: usize = 0;
+    while (rope_row_idx < stage_rows) : (rope_row_idx += 1) {
+        const q_row_offset = std.math.mul(usize, rope_row_idx, q_row_bytes_rope) catch return error.InvalidArgument;
+        var q_row = try bufferSlice(q_stage, q_row_offset, q_row_bytes_rope);
+        const pos = position_base_u32 + @as(u32, @intCast(rope_row_idx));
+        try compute.cuda.rope.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            rope_function,
+            &q_row,
+            n_heads_u32,
+            head_dim_u32,
+            rope_dim_u32,
+            pos,
+            theta,
+        );
+    }
 }
 
 fn effectiveLayerRopeTheta(
@@ -2641,6 +2728,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
     }
 
     if (can_any_fused_prefill) {
+        const attention_start_ns: i128 = std.time.nanoTimestamp();
+        var attention_path: AttentionPath = .heads_f32_kv;
         const sliding_window_u32 = std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32);
         switch (self.kv_cache_dtype) {
             .f16 => {
@@ -2648,12 +2737,133 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                     attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function != null;
 
                 // GEMM-based attention: cuBLAS strided batched GEMM for Q×K^T and
-                // probs×V.  Preferred for prefill because cuBLAS leverages tensor
-                // cores and reads K/V once per KV head instead of once per Q row.
-                const can_gemm_attn = use_gqa and
-                    attention_kernels.causal_attn_softmax_f32_function != null;
+                // probs×V. Preferred for long-sequence prefill because cuBLAS
+                // tensor-core GEMMs amortize better as sequence grows.
+                const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
+                const can_gemm_attn = true;
+                if (can_gemm_attn) {
+                    // Apply RoPE to Q for all rows (each row has a different position).
+                    // Use batched row kernel when row stride matches n_heads*head_dim.
+                    try applyPrefillRopeRows(
+                        self,
+                        &attn_q_stage,
+                        stage_rows,
+                        cfg.q_projection_dim,
+                        n_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_base_u32,
+                        layer_rope_theta,
+                        rope_function,
+                    );
 
-                if (can_flash_prefill) {
+                    // GEMM-based attention per KV head.
+                    const n_kv: u32 = n_heads_u32 / kv_groups_u32;
+                    var scores_buf = try ensureAttnScoresWorkspace(
+                        self,
+                        n_kv,
+                        @intCast(stage_rows),
+                        seq_len_u32,
+                    );
+                    const q_ld: usize = cfg.q_projection_dim;
+                    const kv_ld: usize = cfg.kv_dim;
+                    const ctx_ld: usize = o_proj.rows();
+                    const hd: usize = head_dim_u32;
+                    const sl: usize = seq_len_u32;
+                    const qr: usize = stage_rows;
+
+                    // Cast Q from f32 to f16 for tensor-core GEMM (f16×f16→f32).
+                    const q_f16_elems = std.math.mul(usize, qr, cfg.q_projection_dim) catch return error.InvalidArgument;
+                    const q_f16_bytes = std.math.mul(usize, q_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+                    const probs_f16_elems = std.math.mul(usize, std.math.mul(usize, n_kv, qr) catch return error.InvalidArgument, sl) catch return error.InvalidArgument;
+                    const probs_f16_bytes = std.math.mul(usize, probs_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+                    var u16_ws = try ensureAttnU16Workspace(self, q_f16_bytes + probs_f16_bytes);
+                    var q_f16_buf = try bufferSlice(&u16_ws, 0, q_f16_bytes);
+                    var probs_f16_buf = try bufferSlice(&u16_ws, q_f16_bytes, probs_f16_bytes);
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &attn_q_stage,
+                        &q_f16_buf,
+                        @intCast(q_f16_elems),
+                    );
+
+                    var group_idx: u32 = 0;
+                    while (group_idx < kv_groups_u32) : (group_idx += 1) {
+                        const k_ptr = read_k_cache.pointer;
+                        const v_ptr = read_v_cache.pointer;
+                        const q_f16_ptr = q_f16_buf.pointer + @as(usize, group_idx) * hd * @sizeOf(u16);
+                        const out_ptr = attn_context_stage.pointer + @as(usize, group_idx) * hd * @sizeOf(f32);
+
+                        // Q × K^T over all KV heads for this query group.
+                        // Batch dimension is n_kv (each batch = one KV head).
+                        try self.blas.gemmU16StridedBatched(
+                            &self.device,
+                            true, // transa=T for K
+                            sl, // m = seq_len
+                            qr, // n = q_rows
+                            hd, // k = head_dim
+                            attention_scale,
+                            k_ptr,
+                            kv_ld, // lda = kv_dim
+                            hd, // strideA in u16 elements (next KV head)
+                            q_f16_ptr,
+                            q_ld, // ldb = q_projection_dim
+                            kv_groups_u32 * hd, // strideB in u16 elements (next KV head in this group)
+                            0.0,
+                            scores_buf.pointer,
+                            sl, // ldc = seq_len
+                            qr * sl, // strideC in f32 elements
+                            n_kv,
+                        );
+
+                        // Causal mask + softmax over [n_kv * q_rows, seq_len].
+                        try compute.cuda.causal_attn_softmax_f32.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            causal_softmax_f32_fn,
+                            &scores_buf,
+                            n_kv * @as(u32, @intCast(stage_rows)),
+                            seq_len_u32,
+                            @intCast(stage_rows),
+                            position_base_u32,
+                            sliding_window_u32,
+                        );
+
+                        // Cast probs from f32 to f16 for the V GEMM.
+                        try compute.cuda.cast_f32_to_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                            &scores_buf,
+                            &probs_f16_buf,
+                            @intCast(probs_f16_elems),
+                        );
+
+                        // probs × V over all KV heads for this query group.
+                        try self.blas.gemmU16StridedBatched(
+                            &self.device,
+                            false, // transa=N for V
+                            hd, // m = head_dim
+                            qr, // n = q_rows
+                            sl, // k = seq_len
+                            1.0,
+                            v_ptr,
+                            kv_ld, // lda = kv_dim
+                            hd, // strideA in u16 elements (next KV head)
+                            probs_f16_buf.pointer,
+                            sl, // ldb = seq_len
+                            qr * sl, // strideB in u16 elements
+                            0.0,
+                            out_ptr,
+                            ctx_ld, // ldc = context_dim
+                            kv_groups_u32 * hd, // strideC in f32 elements (next KV head in this group)
+                            n_kv,
+                        );
+                    }
+                    attention_path = .heads_f16_kv;
+                } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runF16(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -2674,133 +2884,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
-                } else if (can_gemm_attn) {
-                    // Apply RoPE to Q (per-row, each row has a different position).
-                    // The fused kernels do this internally; the GEMM path needs it upfront.
-                    const q_row_dim = cfg.q_projection_dim;
-                    const q_row_bytes_rope = std.math.mul(usize, q_row_dim, @sizeOf(f32)) catch return error.InvalidArgument;
-                    var rope_row_idx: usize = 0;
-                    while (rope_row_idx < stage_rows) : (rope_row_idx += 1) {
-                        const q_row_offset = std.math.mul(usize, rope_row_idx, q_row_bytes_rope) catch return error.InvalidArgument;
-                        var q_row = try bufferSlice(&attn_q_stage, q_row_offset, q_row_bytes_rope);
-                        const pos = position_base_u32 + @as(u32, @intCast(rope_row_idx));
-                        try compute.cuda.rope.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            rope_function,
-                            &q_row,
-                            n_heads_u32,
-                            head_dim_u32,
-                            rope_dim_u32,
-                            pos,
-                            layer_rope_theta,
-                        );
-                    }
-
-                    // GEMM-based attention per KV head.
-                    var scores_buf = try ensureAttnScoresWorkspace(
-                        self,
-                        kv_groups_u32,
-                        @intCast(stage_rows),
-                        seq_len_u32,
-                    );
-                    const q_ld: usize = cfg.q_projection_dim;
-                    const kv_ld: usize = cfg.kv_dim;
-                    const ctx_ld: usize = o_proj.rows();
-                    const hd: usize = head_dim_u32;
-                    const sl: usize = seq_len_u32;
-                    const qr: usize = stage_rows;
-                    const n_kv: u32 = n_heads_u32 / kv_groups_u32;
-
-                    // Cast Q from f32 to f16 for tensor-core GEMM (f16×f16→f32).
-                    const q_f16_elems = std.math.mul(usize, qr, cfg.q_projection_dim) catch return error.InvalidArgument;
-                    const q_f16_bytes = std.math.mul(usize, q_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
-                    const probs_f16_elems = std.math.mul(usize, std.math.mul(usize, kv_groups_u32, qr) catch return error.InvalidArgument, sl) catch return error.InvalidArgument;
-                    const probs_f16_bytes = std.math.mul(usize, probs_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
-                    var u16_ws = try ensureAttnU16Workspace(self, q_f16_bytes + probs_f16_bytes);
-                    var q_f16_buf = try bufferSlice(&u16_ws, 0, q_f16_bytes);
-                    var probs_f16_buf = try bufferSlice(&u16_ws, q_f16_bytes, probs_f16_bytes);
-                    try compute.cuda.cast_f32_to_f16.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                        &attn_q_stage,
-                        &q_f16_buf,
-                        @intCast(q_f16_elems),
-                    );
-
-                    var kv_h: u32 = 0;
-                    while (kv_h < n_kv) : (kv_h += 1) {
-                        const k_ptr = read_k_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
-                        const v_ptr = read_v_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
-                        const q_f16_ptr = q_f16_buf.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(u16);
-                        const out_ptr = attn_context_stage.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(f32);
-
-                        // Q × K^T → scores [kv_groups × q_rows × seq_len].
-                        // f16 × f16 → f32 via tensor cores.
-                        var g: u32 = 0;
-                        while (g < kv_groups_u32) : (g += 1) {
-                            try self.blas.gemmU16(
-                                &self.device,
-                                true, // transa=T for K
-                                sl, // m = seq_len
-                                qr, // n = q_rows
-                                hd, // k = head_dim
-                                attention_scale,
-                                k_ptr,
-                                kv_ld, // lda = kv_dim
-                                q_f16_ptr + @as(usize, g) * hd * @sizeOf(u16),
-                                q_ld, // ldb = q_projection_dim
-                                0.0,
-                                scores_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(f32),
-                                sl, // ldc = seq_len
-                            );
-                        }
-
-                        // Causal mask + softmax (operates on f32 scores).
-                        try compute.cuda.causal_attn_softmax_f32.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            attention_kernels.causal_attn_softmax_f32_function.?,
-                            &scores_buf,
-                            kv_groups_u32 * @as(u32, @intCast(stage_rows)),
-                            seq_len_u32,
-                            @intCast(stage_rows),
-                            position_base_u32,
-                            sliding_window_u32,
-                        );
-
-                        // Cast probs from f32 to f16 for the V GEMM.
-                        try compute.cuda.cast_f32_to_f16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                            &scores_buf,
-                            &probs_f16_buf,
-                            @intCast(probs_f16_elems),
-                        );
-
-                        // probs × V → output [kv_groups × q_rows × head_dim].
-                        // f16 × f16 → f32 via tensor cores.
-                        g = 0;
-                        while (g < kv_groups_u32) : (g += 1) {
-                            try self.blas.gemmU16(
-                                &self.device,
-                                false, // transa=N for V
-                                hd, // m = head_dim
-                                qr, // n = q_rows
-                                sl, // k = seq_len
-                                1.0,
-                                v_ptr,
-                                kv_ld, // lda = kv_dim
-                                probs_f16_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(u16),
-                                sl, // ldb = seq_len
-                                0.0,
-                                out_ptr + @as(usize, g) * hd * @sizeOf(f32),
-                                ctx_ld, // ldc = context_dim
-                            );
-                        }
-                    }
+                    attention_path = .fused_heads_f16_kv;
                 } else if (use_gqa) {
                     try compute.cuda.attn_fused_prefill_heads_f16_kv_gqa.runWithFunction(
                         &self.kernel_arg_pack,
@@ -2822,6 +2906,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_f16_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_f16_kv.runWithFunction(
                         &self.kernel_arg_pack,
@@ -2843,6 +2928,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_f16_kv;
                 }
             },
             .i8 => {
@@ -2876,6 +2962,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_i8_kv;
                 } else if (use_gqa_i8) {
                     try compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.runWithFunction(
                         &self.kernel_arg_pack,
@@ -2900,6 +2987,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_i8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_i8_kv.runWithFunction(
                         &self.kernel_arg_pack,
@@ -2924,6 +3012,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_i8_kv;
                 }
             },
             .fp8 => {
@@ -2957,6 +3046,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_fp8_kv;
                 } else if (use_gqa_fp8) {
                     try compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.runWithFunction(
                         &self.kernel_arg_pack,
@@ -2981,6 +3071,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_fp8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_fp8_kv.runWithFunction(
                         &self.kernel_arg_pack,
@@ -3005,9 +3096,11 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_fp8_kv;
                 }
             },
         }
+        recordAttentionPhase(self, attention_path, attention_start_ns, cfg.is_causal);
     }
 
     engine_ops.linearForwardRows(self, &attn_context_stage, stage_rows, o_proj, output) catch |err| {
@@ -3463,6 +3556,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
     }
 
     if (can_any_fused_prefill) {
+        const attention_start_ns: i128 = std.time.nanoTimestamp();
+        var attention_path: AttentionPath = .heads_f32_kv;
         const sliding_window_u32_wq = std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32);
         switch (self.kv_cache_dtype) {
             .f16 => {
@@ -3470,10 +3565,128 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                     attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function != null;
 
                 // GEMM-based attention (see NoQueryGate path for full commentary).
-                const can_gemm_attn = use_gqa and
-                    attention_kernels.causal_attn_softmax_f32_function != null;
+                const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
+                const can_gemm_attn = true;
+                if (can_gemm_attn) {
+                    // Apply RoPE to Q for all rows.
+                    try applyPrefillRopeRows(
+                        self,
+                        &attn_q_stage,
+                        stage_rows,
+                        cfg.q_dim,
+                        n_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_base_u32,
+                        layer_rope_theta,
+                        rope_function,
+                    );
 
-                if (can_flash_prefill) {
+                    const n_kv: u32 = n_heads_u32 / kv_groups_u32;
+                    var scores_buf = try ensureAttnScoresWorkspace(
+                        self,
+                        n_kv,
+                        @intCast(stage_rows),
+                        seq_len_u32,
+                    );
+                    const q_ld: usize = cfg.q_dim;
+                    const kv_ld: usize = cfg.kv_dim;
+                    const ctx_ld: usize = o_proj.rows();
+                    const hd: usize = head_dim_u32;
+                    const sl: usize = seq_len_u32;
+                    const qr: usize = stage_rows;
+
+                    // Cast Q from f32 to f16 for tensor-core GEMM.
+                    const q_f16_elems = std.math.mul(usize, qr, cfg.q_dim) catch return error.InvalidArgument;
+                    const q_f16_bytes = std.math.mul(usize, q_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+                    const probs_f16_elems = std.math.mul(usize, std.math.mul(usize, n_kv, qr) catch return error.InvalidArgument, sl) catch return error.InvalidArgument;
+                    const probs_f16_bytes = std.math.mul(usize, probs_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+                    var u16_ws = try ensureAttnU16Workspace(self, q_f16_bytes + probs_f16_bytes);
+                    var q_f16_buf = try bufferSlice(&u16_ws, 0, q_f16_bytes);
+                    var probs_f16_buf = try bufferSlice(&u16_ws, q_f16_bytes, probs_f16_bytes);
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &attn_q_stage,
+                        &q_f16_buf,
+                        @intCast(q_f16_elems),
+                    );
+
+                    var group_idx: u32 = 0;
+                    while (group_idx < kv_groups_u32) : (group_idx += 1) {
+                        const k_ptr = read_k_cache.pointer;
+                        const v_ptr = read_v_cache.pointer;
+                        const q_f16_ptr = q_f16_buf.pointer + @as(usize, group_idx) * hd * @sizeOf(u16);
+                        const out_ptr = attn_context_stage.pointer + @as(usize, group_idx) * hd * @sizeOf(f32);
+
+                        // Q × K^T over all KV heads for this query group.
+                        try self.blas.gemmU16StridedBatched(
+                            &self.device,
+                            true,
+                            sl,
+                            qr,
+                            hd,
+                            attention_scale,
+                            k_ptr,
+                            kv_ld,
+                            hd,
+                            q_f16_ptr,
+                            q_ld,
+                            kv_groups_u32 * hd,
+                            0.0,
+                            scores_buf.pointer,
+                            sl,
+                            qr * sl,
+                            n_kv,
+                        );
+
+                        // Causal mask + softmax over [n_kv * q_rows, seq_len].
+                        try compute.cuda.causal_attn_softmax_f32.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            causal_softmax_f32_fn,
+                            &scores_buf,
+                            n_kv * @as(u32, @intCast(stage_rows)),
+                            seq_len_u32,
+                            @intCast(stage_rows),
+                            position_base_u32,
+                            sliding_window_u32_wq,
+                        );
+
+                        // Cast probs from f32 to f16 for V GEMM.
+                        try compute.cuda.cast_f32_to_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                            &scores_buf,
+                            &probs_f16_buf,
+                            @intCast(probs_f16_elems),
+                        );
+
+                        // probs × V over all KV heads for this query group.
+                        try self.blas.gemmU16StridedBatched(
+                            &self.device,
+                            false,
+                            hd,
+                            qr,
+                            sl,
+                            1.0,
+                            v_ptr,
+                            kv_ld,
+                            hd,
+                            probs_f16_buf.pointer,
+                            sl,
+                            qr * sl,
+                            0.0,
+                            out_ptr,
+                            ctx_ld,
+                            kv_groups_u32 * hd,
+                            n_kv,
+                        );
+                    }
+                    attention_path = .heads_f16_kv;
+                } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runF16(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -3494,129 +3707,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
-                } else if (can_gemm_attn) {
-                    // Apply RoPE to Q (per-row).
-                    const q_row_dim_wq = cfg.q_dim;
-                    const q_row_bytes_rope_wq = std.math.mul(usize, q_row_dim_wq, @sizeOf(f32)) catch return error.InvalidArgument;
-                    var rope_row_idx: usize = 0;
-                    while (rope_row_idx < stage_rows) : (rope_row_idx += 1) {
-                        const q_row_offset = std.math.mul(usize, rope_row_idx, q_row_bytes_rope_wq) catch return error.InvalidArgument;
-                        var q_row = try bufferSlice(&attn_q_stage, q_row_offset, q_row_bytes_rope_wq);
-                        const pos = position_base_u32 + @as(u32, @intCast(rope_row_idx));
-                        try compute.cuda.rope.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            rope_function,
-                            &q_row,
-                            n_heads_u32,
-                            head_dim_u32,
-                            rope_dim_u32,
-                            pos,
-                            layer_rope_theta,
-                        );
-                    }
-
-                    var scores_buf = try ensureAttnScoresWorkspace(
-                        self,
-                        kv_groups_u32,
-                        @intCast(stage_rows),
-                        seq_len_u32,
-                    );
-                    const q_ld: usize = cfg.q_dim;
-                    const kv_ld: usize = cfg.kv_dim;
-                    const ctx_ld: usize = o_proj.rows();
-                    const hd: usize = head_dim_u32;
-                    const sl: usize = seq_len_u32;
-                    const qr: usize = stage_rows;
-                    const n_kv: u32 = n_heads_u32 / kv_groups_u32;
-
-                    // Cast Q from f32 to f16 for tensor-core GEMM.
-                    const q_f16_elems = std.math.mul(usize, qr, cfg.q_dim) catch return error.InvalidArgument;
-                    const q_f16_bytes = std.math.mul(usize, q_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
-                    const probs_f16_elems = std.math.mul(usize, std.math.mul(usize, kv_groups_u32, qr) catch return error.InvalidArgument, sl) catch return error.InvalidArgument;
-                    const probs_f16_bytes = std.math.mul(usize, probs_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
-                    var u16_ws = try ensureAttnU16Workspace(self, q_f16_bytes + probs_f16_bytes);
-                    var q_f16_buf = try bufferSlice(&u16_ws, 0, q_f16_bytes);
-                    var probs_f16_buf = try bufferSlice(&u16_ws, q_f16_bytes, probs_f16_bytes);
-                    try compute.cuda.cast_f32_to_f16.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                        &attn_q_stage,
-                        &q_f16_buf,
-                        @intCast(q_f16_elems),
-                    );
-
-                    var kv_h: u32 = 0;
-                    while (kv_h < n_kv) : (kv_h += 1) {
-                        const k_ptr = read_k_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
-                        const v_ptr = read_v_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
-                        const q_f16_ptr = q_f16_buf.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(u16);
-                        const out_ptr = attn_context_stage.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(f32);
-
-                        // Q × K^T: f16 × f16 → f32.
-                        var g: u32 = 0;
-                        while (g < kv_groups_u32) : (g += 1) {
-                            try self.blas.gemmU16(
-                                &self.device,
-                                true,
-                                sl,
-                                qr,
-                                hd,
-                                attention_scale,
-                                k_ptr,
-                                kv_ld,
-                                q_f16_ptr + @as(usize, g) * hd * @sizeOf(u16),
-                                q_ld,
-                                0.0,
-                                scores_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(f32),
-                                sl,
-                            );
-                        }
-
-                        // Causal mask + softmax (f32).
-                        try compute.cuda.causal_attn_softmax_f32.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            attention_kernels.causal_attn_softmax_f32_function.?,
-                            &scores_buf,
-                            kv_groups_u32 * @as(u32, @intCast(stage_rows)),
-                            seq_len_u32,
-                            @intCast(stage_rows),
-                            position_base_u32,
-                            sliding_window_u32_wq,
-                        );
-
-                        // Cast probs from f32 to f16 for V GEMM.
-                        try compute.cuda.cast_f32_to_f16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                            &scores_buf,
-                            &probs_f16_buf,
-                            @intCast(probs_f16_elems),
-                        );
-
-                        // probs × V: f16 × f16 → f32.
-                        g = 0;
-                        while (g < kv_groups_u32) : (g += 1) {
-                            try self.blas.gemmU16(
-                                &self.device,
-                                false,
-                                hd,
-                                qr,
-                                sl,
-                                1.0,
-                                v_ptr,
-                                kv_ld,
-                                probs_f16_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(u16),
-                                sl,
-                                0.0,
-                                out_ptr + @as(usize, g) * hd * @sizeOf(f32),
-                                ctx_ld,
-                            );
-                        }
-                    }
+                    attention_path = .fused_heads_f16_kv;
                 } else if (use_gqa) {
                     try compute.cuda.attn_fused_prefill_heads_f16_kv_gqa.runWithFunction(
                         &self.kernel_arg_pack,
@@ -3638,6 +3729,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_f16_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_f16_kv.runWithFunction(
                         &self.kernel_arg_pack,
@@ -3659,6 +3751,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_f16_kv;
                 }
             },
             .i8 => {
@@ -3690,6 +3783,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_i8_kv;
                 } else if (use_gqa_i8) {
                     try compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.runWithFunction(
                         &self.kernel_arg_pack,
@@ -3714,6 +3808,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_i8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_i8_kv.runWithFunction(
                         &self.kernel_arg_pack,
@@ -3738,6 +3833,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_i8_kv;
                 }
             },
             .fp8 => {
@@ -3769,6 +3865,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_fp8_kv;
                 } else if (use_gqa_fp8) {
                     try compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.runWithFunction(
                         &self.kernel_arg_pack,
@@ -3793,6 +3890,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_fp8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_fp8_kv.runWithFunction(
                         &self.kernel_arg_pack,
@@ -3817,9 +3915,11 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
+                    attention_path = .fused_heads_fp8_kv;
                 }
             },
         }
+        recordAttentionPhase(self, attention_path, attention_start_ns, cfg.is_causal);
     }
 
     // Apply output gate before O projection.

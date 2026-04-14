@@ -254,31 +254,45 @@ fn pipelineActivationByteCountFor(self: anytype) !usize {
 /// For P2P: single bulk memcpyPeerAsync + sync.
 /// For host-staged: loops row-by-row through the small staging buffer, using
 /// bufferSlice offsets into each engine's input_dev.
-fn transferPipelineActivationMultiRow(self: anytype, dst: anytype, total_bytes: usize, row_bytes: usize) !void {
+fn transferPipelineActivationMultiRow(self: anytype, dst: anytype, total_bytes: usize) !void {
     if (total_bytes == 0) return;
     switch (self.pipeline_transfer_mode) {
         .peer_to_peer => {
-            try self.device.memcpyPeerAsync(
-                dst.runtime_buffers.input_dev.pointer,
-                dst.device.context,
-                self.runtime_buffers.input_dev.pointer,
-                self.device.context,
-                total_bytes,
-                self.compute_stream,
-            );
-            if (self.compute_stream) |stream| {
-                try self.device.synchronizeStream(stream);
+            // Prefer event-based non-blocking transfer to avoid host stalls.
+            if (self.pipeline_stage0_event) |event| {
+                try self.device.recordEvent(event, self.compute_stream);
+                try dst.device.streamWaitEvent(dst.compute_stream, event);
+                try dst.device.makeCurrent();
+                try self.device.memcpyPeerAsync(
+                    dst.runtime_buffers.input_dev.pointer,
+                    dst.device.context,
+                    self.runtime_buffers.input_dev.pointer,
+                    self.device.context,
+                    total_bytes,
+                    dst.compute_stream,
+                );
             } else {
-                try self.device.synchronize();
+                try self.device.memcpyPeerAsync(
+                    dst.runtime_buffers.input_dev.pointer,
+                    dst.device.context,
+                    self.runtime_buffers.input_dev.pointer,
+                    self.device.context,
+                    total_bytes,
+                    self.compute_stream,
+                );
+                if (self.compute_stream) |stream| {
+                    try self.device.synchronizeStream(stream);
+                } else {
+                    try self.device.synchronize();
+                }
             }
         },
         .host_staged => {
             const staging = self.pipeline_host_staging orelse return error.PipelineTransferNotInitialized;
-            // Staging buffer is sized for one row. Transfer row-by-row.
-            if (row_bytes > staging.len) return error.PipelineTransferBufferTooSmall;
+            if (staging.len == 0) return error.PipelineTransferBufferTooSmall;
             var offset: usize = 0;
             while (offset < total_bytes) {
-                const chunk = @min(row_bytes, total_bytes - offset);
+                const chunk = @min(staging.len, total_bytes - offset);
                 var src_slice = try bufferSlice(&self.runtime_buffers.input_dev, offset, chunk);
                 try src_slice.download(&self.device, staging[0..chunk]);
                 var dst_slice = try bufferSlice(&dst.runtime_buffers.input_dev, offset, chunk);
@@ -287,6 +301,49 @@ fn transferPipelineActivationMultiRow(self: anytype, dst: anytype, total_bytes: 
             }
         },
         .none => return error.InvalidTopologyConfig,
+    }
+}
+
+/// Transfer stage1->stage2 activations for cpu+gpu+gpu prefill.
+/// Uses a single peer copy when possible; otherwise uses host staging in
+/// chunks up to `pipeline_host_staging_stage12.len`.
+fn transferPipelineActivationStage12MultiRow(self: anytype, src: anytype, total_bytes: usize) !void {
+    if (total_bytes == 0) return;
+
+    if (self.device.canAccessPeer(&src.device)) {
+        // Best effort: peer access can already be enabled or unavailable at runtime.
+        self.device.enablePeerAccess(&src.device) catch {};
+        src.device.enablePeerAccess(&self.device) catch {};
+        if (src.device.memcpyPeerAsync(
+            self.runtime_buffers.input_dev.pointer,
+            self.device.context,
+            src.runtime_buffers.input_dev.pointer,
+            src.device.context,
+            total_bytes,
+            src.compute_stream,
+        )) {
+            if (src.compute_stream) |stream| {
+                try src.device.synchronizeStream(stream);
+            } else {
+                try src.device.synchronize();
+            }
+            return;
+        } else |_| {
+            // Fall through to host-staged transfer.
+        }
+    }
+
+    const staging = self.pipeline_host_staging_stage12 orelse return error.PipelineTransferNotInitialized;
+    if (staging.len == 0) return error.PipelineTransferBufferTooSmall;
+
+    var offset: usize = 0;
+    while (offset < total_bytes) {
+        const chunk = @min(staging.len, total_bytes - offset);
+        var src_slice = try bufferSlice(&src.runtime_buffers.input_dev, offset, chunk);
+        try src_slice.download(&src.device, staging[0..chunk]);
+        var dst_slice = try bufferSlice(&self.runtime_buffers.input_dev, offset, chunk);
+        try dst_slice.upload(&self.device, staging[0..chunk]);
+        offset += chunk;
     }
 }
 
@@ -676,20 +733,9 @@ fn computeBatchedPrefillCpuGpuGpu(
         try self.runtime_buffers.ensureRowCapacity(&self.device, rows, self.fixed_alloc_mode);
         try self.ensureLayerProgramSlotRowCapacity(rows, self.fixed_alloc_mode);
 
-        // Host-staged row-by-row transfer GPU1 → GPU2.
-        const staging12 = self.pipeline_host_staging_stage12 orelse return error.PipelineTransferNotInitialized;
-        {
-            var xfer_offset: usize = 0;
-            const transfer_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
-            while (xfer_offset < transfer_bytes) {
-                const xfer_chunk = @min(row_bytes, transfer_bytes - xfer_offset);
-                var src_slice = try bufferSlice(&gpu_stage1.runtime_buffers.input_dev, xfer_offset, xfer_chunk);
-                try src_slice.download(&gpu_stage1.device, staging12[0..xfer_chunk]);
-                var dst_slice = try bufferSlice(&self.runtime_buffers.input_dev, xfer_offset, xfer_chunk);
-                try dst_slice.upload(&self.device, staging12[0..xfer_chunk]);
-                xfer_offset += xfer_chunk;
-            }
-        }
+        // Bulk stage1→stage2 transfer for the full chunk.
+        const transfer_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
+        try transferPipelineActivationStage12MultiRow(self, gpu_stage1, transfer_bytes);
 
         // Upload source embeddings for GPU2 Gemma4 per-layer branch.
         var gemma_source_embeddings_2: ?compute.cuda.Buffer = null;
@@ -925,6 +971,7 @@ fn computeBatchedPrefillPipeline2(
                     if (self.embedding_lookup_u16_rows_function) |kernel| {
                         const token_bytes = std.math.mul(usize, rows, @sizeOf(u32)) catch return error.InvalidArgument;
                         var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
+                        self.prefill_rope_positions_cached_dirty = true;
                         try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(chunk_tokens));
                         try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
                             &self.kernel_arg_pack,
@@ -1137,7 +1184,7 @@ fn computeBatchedPrefillPipeline2(
 
         // ── Bulk transfer stage0 → stage1 ──
         const transfer_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
-        try transferPipelineActivationMultiRow(self, stage1, transfer_bytes, row_bytes);
+        try transferPipelineActivationMultiRow(self, stage1, transfer_bytes);
 
         // Upload source embeddings for this chunk to stage1's deepstack_add_dev.
         var gemma_source_embeddings_1: ?compute.cuda.Buffer = null;
@@ -2937,6 +2984,7 @@ fn computeBatchedDecodeLogitsWithMode(
                 if (self.embedding_lookup_u16_rows_function) |kernel| {
                     const token_bytes = std.math.mul(usize, n_usize, @sizeOf(u32)) catch return error.InvalidArgument;
                     var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
+                    self.prefill_rope_positions_cached_dirty = true;
                     try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(tokens));
                     var input_rows = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
                     try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
@@ -3585,6 +3633,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                     if (self.embedding_lookup_u16_rows_function) |kernel| {
                         const token_bytes = std.math.mul(usize, rows, @sizeOf(u32)) catch return error.InvalidArgument;
                         var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
+                        self.prefill_rope_positions_cached_dirty = true;
                         try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(chunk_tokens));
                         try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
                             &self.kernel_arg_pack,

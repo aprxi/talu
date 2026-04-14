@@ -452,6 +452,180 @@ pub const ProjectionPath = enum {
     unfused,
 };
 
+pub const Nvfp4RouteKind = enum {
+    native_cublaslt,
+    bf16_fallback,
+    small_rows_matvec,
+    fused_qkv,
+    fused_gate_up,
+};
+
+pub const Nvfp4RouteCounters = struct {
+    native_cublaslt: u64 = 0,
+    bf16_fallback: u64 = 0,
+    small_rows_matvec: u64 = 0,
+    fused_qkv: u64 = 0,
+    fused_gate_up: u64 = 0,
+
+    pub fn record(self: *Nvfp4RouteCounters, kind: Nvfp4RouteKind) void {
+        switch (kind) {
+            .native_cublaslt => self.native_cublaslt += 1,
+            .bf16_fallback => self.bf16_fallback += 1,
+            .small_rows_matvec => self.small_rows_matvec += 1,
+            .fused_qkv => self.fused_qkv += 1,
+            .fused_gate_up => self.fused_gate_up += 1,
+        }
+    }
+
+    fn saturatingSub(current: u64, start: u64) u64 {
+        return if (current >= start) current - start else 0;
+    }
+
+    pub fn delta(current: Nvfp4RouteCounters, start: Nvfp4RouteCounters) Nvfp4RouteCounters {
+        return .{
+            .native_cublaslt = saturatingSub(current.native_cublaslt, start.native_cublaslt),
+            .bf16_fallback = saturatingSub(current.bf16_fallback, start.bf16_fallback),
+            .small_rows_matvec = saturatingSub(current.small_rows_matvec, start.small_rows_matvec),
+            .fused_qkv = saturatingSub(current.fused_qkv, start.fused_qkv),
+            .fused_gate_up = saturatingSub(current.fused_gate_up, start.fused_gate_up),
+        };
+    }
+
+    pub fn total(self: *const Nvfp4RouteCounters) u64 {
+        const total_u128 = @as(u128, self.native_cublaslt) +
+            @as(u128, self.bf16_fallback) +
+            @as(u128, self.small_rows_matvec) +
+            @as(u128, self.fused_qkv) +
+            @as(u128, self.fused_gate_up);
+        return saturatingU64FromU128(total_u128);
+    }
+};
+
+pub const Nvfp4PhaseBudgetCounters = struct {
+    linear_calls: u64 = 0,
+    linear_ns: u64 = 0,
+    attention_calls: u64 = 0,
+    attention_ns: u64 = 0,
+    attention_causal_calls: u64 = 0,
+    attention_noncausal_calls: u64 = 0,
+    attention_context_calls: u64 = 0,
+    attention_batched_prefill_calls: u64 = 0,
+    layer_scalar_calls: u64 = 0,
+    layer_scalar_ns: u64 = 0,
+    qkv_calls: u64 = 0,
+    qkv_fused_calls: u64 = 0,
+    qkv_unfused_calls: u64 = 0,
+    gate_up_calls: u64 = 0,
+    gate_up_fused_calls: u64 = 0,
+    gate_up_unfused_calls: u64 = 0,
+    attention_fused_heads_f16_kv: u64 = 0,
+    attention_heads_f16_kv: u64 = 0,
+    attention_fused_heads_i8_kv: u64 = 0,
+    attention_heads_i8_kv: u64 = 0,
+    attention_fused_heads_fp8_kv: u64 = 0,
+    attention_heads_fp8_kv: u64 = 0,
+    attention_heads_f32_kv: u64 = 0,
+
+    fn saturatingAddU64(a: u64, b: u64) u64 {
+        return std.math.add(u64, a, b) catch std.math.maxInt(u64);
+    }
+
+    fn saturatingSub(current: u64, start: u64) u64 {
+        return if (current >= start) current - start else 0;
+    }
+
+    pub fn recordLinear(self: *Nvfp4PhaseBudgetCounters, elapsed_ns: u64) void {
+        self.linear_calls = saturatingAddU64(self.linear_calls, 1);
+        self.linear_ns = saturatingAddU64(self.linear_ns, elapsed_ns);
+    }
+
+    pub fn recordAttention(self: *Nvfp4PhaseBudgetCounters, path: AttentionPath, elapsed_ns: u64) void {
+        self.attention_calls = saturatingAddU64(self.attention_calls, 1);
+        self.attention_ns = saturatingAddU64(self.attention_ns, elapsed_ns);
+        switch (path) {
+            .fused_heads_f16_kv => self.attention_fused_heads_f16_kv = saturatingAddU64(self.attention_fused_heads_f16_kv, 1),
+            .heads_f16_kv => self.attention_heads_f16_kv = saturatingAddU64(self.attention_heads_f16_kv, 1),
+            .fused_heads_i8_kv => self.attention_fused_heads_i8_kv = saturatingAddU64(self.attention_fused_heads_i8_kv, 1),
+            .heads_i8_kv => self.attention_heads_i8_kv = saturatingAddU64(self.attention_heads_i8_kv, 1),
+            .fused_heads_fp8_kv => self.attention_fused_heads_fp8_kv = saturatingAddU64(self.attention_fused_heads_fp8_kv, 1),
+            .heads_fp8_kv => self.attention_heads_fp8_kv = saturatingAddU64(self.attention_heads_fp8_kv, 1),
+            .heads_f32_kv => self.attention_heads_f32_kv = saturatingAddU64(self.attention_heads_f32_kv, 1),
+        }
+    }
+
+    pub fn recordAttentionCausality(self: *Nvfp4PhaseBudgetCounters, is_causal: bool) void {
+        if (is_causal) {
+            self.attention_causal_calls = saturatingAddU64(self.attention_causal_calls, 1);
+        } else {
+            self.attention_noncausal_calls = saturatingAddU64(self.attention_noncausal_calls, 1);
+        }
+    }
+
+    pub fn recordAttentionContext(self: *Nvfp4PhaseBudgetCounters) void {
+        self.attention_context_calls = saturatingAddU64(self.attention_context_calls, 1);
+    }
+
+    pub fn recordAttentionBatchedPrefill(self: *Nvfp4PhaseBudgetCounters) void {
+        self.attention_batched_prefill_calls = saturatingAddU64(self.attention_batched_prefill_calls, 1);
+    }
+
+    pub fn recordLayerScalar(self: *Nvfp4PhaseBudgetCounters, elapsed_ns: u64) void {
+        self.layer_scalar_calls = saturatingAddU64(self.layer_scalar_calls, 1);
+        self.layer_scalar_ns = saturatingAddU64(self.layer_scalar_ns, elapsed_ns);
+    }
+
+    pub fn recordQkv(self: *Nvfp4PhaseBudgetCounters, path: ProjectionPath) void {
+        self.qkv_calls = saturatingAddU64(self.qkv_calls, 1);
+        switch (path) {
+            .fused => self.qkv_fused_calls = saturatingAddU64(self.qkv_fused_calls, 1),
+            .unfused => self.qkv_unfused_calls = saturatingAddU64(self.qkv_unfused_calls, 1),
+        }
+    }
+
+    pub fn recordGateUp(self: *Nvfp4PhaseBudgetCounters, path: ProjectionPath) void {
+        self.gate_up_calls = saturatingAddU64(self.gate_up_calls, 1);
+        switch (path) {
+            .fused => self.gate_up_fused_calls = saturatingAddU64(self.gate_up_fused_calls, 1),
+            .unfused => self.gate_up_unfused_calls = saturatingAddU64(self.gate_up_unfused_calls, 1),
+        }
+    }
+
+    pub fn knownNs(self: *const Nvfp4PhaseBudgetCounters) u64 {
+        const total_u128 = @as(u128, self.linear_ns) +
+            @as(u128, self.attention_ns) +
+            @as(u128, self.layer_scalar_ns);
+        return saturatingU64FromU128(total_u128);
+    }
+
+    pub fn delta(current: Nvfp4PhaseBudgetCounters, start: Nvfp4PhaseBudgetCounters) Nvfp4PhaseBudgetCounters {
+        return .{
+            .linear_calls = saturatingSub(current.linear_calls, start.linear_calls),
+            .linear_ns = saturatingSub(current.linear_ns, start.linear_ns),
+            .attention_calls = saturatingSub(current.attention_calls, start.attention_calls),
+            .attention_ns = saturatingSub(current.attention_ns, start.attention_ns),
+            .attention_causal_calls = saturatingSub(current.attention_causal_calls, start.attention_causal_calls),
+            .attention_noncausal_calls = saturatingSub(current.attention_noncausal_calls, start.attention_noncausal_calls),
+            .attention_context_calls = saturatingSub(current.attention_context_calls, start.attention_context_calls),
+            .attention_batched_prefill_calls = saturatingSub(current.attention_batched_prefill_calls, start.attention_batched_prefill_calls),
+            .layer_scalar_calls = saturatingSub(current.layer_scalar_calls, start.layer_scalar_calls),
+            .layer_scalar_ns = saturatingSub(current.layer_scalar_ns, start.layer_scalar_ns),
+            .qkv_calls = saturatingSub(current.qkv_calls, start.qkv_calls),
+            .qkv_fused_calls = saturatingSub(current.qkv_fused_calls, start.qkv_fused_calls),
+            .qkv_unfused_calls = saturatingSub(current.qkv_unfused_calls, start.qkv_unfused_calls),
+            .gate_up_calls = saturatingSub(current.gate_up_calls, start.gate_up_calls),
+            .gate_up_fused_calls = saturatingSub(current.gate_up_fused_calls, start.gate_up_fused_calls),
+            .gate_up_unfused_calls = saturatingSub(current.gate_up_unfused_calls, start.gate_up_unfused_calls),
+            .attention_fused_heads_f16_kv = saturatingSub(current.attention_fused_heads_f16_kv, start.attention_fused_heads_f16_kv),
+            .attention_heads_f16_kv = saturatingSub(current.attention_heads_f16_kv, start.attention_heads_f16_kv),
+            .attention_fused_heads_i8_kv = saturatingSub(current.attention_fused_heads_i8_kv, start.attention_fused_heads_i8_kv),
+            .attention_heads_i8_kv = saturatingSub(current.attention_heads_i8_kv, start.attention_heads_i8_kv),
+            .attention_fused_heads_fp8_kv = saturatingSub(current.attention_fused_heads_fp8_kv, start.attention_fused_heads_fp8_kv),
+            .attention_heads_fp8_kv = saturatingSub(current.attention_heads_fp8_kv, start.attention_heads_fp8_kv),
+            .attention_heads_f32_kv = saturatingSub(current.attention_heads_f32_kv, start.attention_heads_f32_kv),
+        };
+    }
+};
+
 pub const AttentionPath = enum {
     fused_heads_f16_kv,
     heads_f16_kv,

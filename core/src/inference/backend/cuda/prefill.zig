@@ -37,6 +37,9 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     self.slot_rope_position_deltas[0] = 0;
     try self.beginParityPrefillCapture(tokens.len);
     defer self.endParityPrefillCapture();
+    self.beginPrefillDispatchWindow();
+    self.beginNvfp4RouteWindow();
+    self.beginPhaseBudgetWindow();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
     self.parity_prefill_token_index = tokens.len - 1;
     self.computeGpuPrototypePrefillLogitsWithLayerLimit(
@@ -53,6 +56,8 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     };
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill", tokens.len, prefill_elapsed_ns);
+    self.logNvfp4RouteSummaryImpl("prefill", tokens.len);
+    self.logPhaseBudgetSummaryImpl("prefill", tokens.len, prefill_elapsed_ns);
     @memcpy(logits_out, self.slotLogits(0));
     trace.emitFinal(
         .logits_ready,
@@ -110,6 +115,9 @@ pub fn prefillSlot(
     }
     try self.beginParityPrefillCapture(tokens.len);
     defer self.endParityPrefillCapture();
+    self.beginPrefillDispatchWindow();
+    self.beginNvfp4RouteWindow();
+    self.beginPhaseBudgetWindow();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
     self.parity_prefill_token_index = tokens.len - 1;
     self.computeGpuPrototypePrefillLogitsWithLayerLimit(
@@ -133,6 +141,8 @@ pub fn prefillSlot(
     }
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill_slot", tokens.len, prefill_elapsed_ns);
+    self.logNvfp4RouteSummaryImpl("prefill_slot", tokens.len);
+    self.logPhaseBudgetSummaryImpl("prefill_slot", tokens.len, prefill_elapsed_ns);
     @memcpy(logits_out, self.slotLogits(slot_index));
     trace.emitFinal(
         .logits_ready,
@@ -165,6 +175,11 @@ const MockBackend = struct {
     slot_logits: []f32 = undefined,
     ensure_kv_capacity_calls: usize = 0,
     ensure_state_binding_calls: usize = 0,
+    begin_prefill_dispatch_window_calls: usize = 0,
+    begin_nvfp4_route_window_calls: usize = 0,
+    begin_phase_budget_window_calls: usize = 0,
+    log_nvfp4_route_summary_calls: usize = 0,
+    log_phase_budget_summary_calls: usize = 0,
     slot_state_bound: bool = true,
     compute_calls: usize = 0,
     timing_calls: usize = 0,
@@ -199,6 +214,31 @@ const MockBackend = struct {
 
     fn endParityPrefillCapture(self: *MockBackend) void {
         _ = self;
+    }
+
+    fn beginPrefillDispatchWindow(self: *MockBackend) void {
+        self.begin_prefill_dispatch_window_calls += 1;
+    }
+
+    fn beginNvfp4RouteWindow(self: *MockBackend) void {
+        self.begin_nvfp4_route_window_calls += 1;
+    }
+
+    fn beginPhaseBudgetWindow(self: *MockBackend) void {
+        self.begin_phase_budget_window_calls += 1;
+    }
+
+    fn logNvfp4RouteSummaryImpl(self: *MockBackend, mode: []const u8, token_count: usize) void {
+        _ = mode;
+        _ = token_count;
+        self.log_nvfp4_route_summary_calls += 1;
+    }
+
+    fn logPhaseBudgetSummaryImpl(self: *MockBackend, mode: []const u8, token_count: usize, elapsed_ns: u64) void {
+        _ = mode;
+        _ = token_count;
+        _ = elapsed_ns;
+        self.log_phase_budget_summary_calls += 1;
     }
 
     fn computeGpuPrototypePrefillLogitsWithLayerLimit(
@@ -236,6 +276,11 @@ test "prefill executes batched prefill path" {
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(@as(usize, 1), backend.compute_calls);
+    try testing.expectEqual(@as(usize, 1), backend.begin_prefill_dispatch_window_calls);
+    try testing.expectEqual(@as(usize, 1), backend.begin_nvfp4_route_window_calls);
+    try testing.expectEqual(@as(usize, 1), backend.begin_phase_budget_window_calls);
+    try testing.expectEqual(@as(usize, 1), backend.log_nvfp4_route_summary_calls);
+    try testing.expectEqual(@as(usize, 1), backend.log_phase_budget_summary_calls);
     try testing.expectEqual(tokens.len, backend.slot_positions[0]);
 }
 
@@ -249,6 +294,11 @@ test "prefillSlot executes batched prefill path" {
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(@as(usize, 1), backend.compute_calls);
+    try testing.expectEqual(@as(usize, 1), backend.begin_prefill_dispatch_window_calls);
+    try testing.expectEqual(@as(usize, 1), backend.begin_nvfp4_route_window_calls);
+    try testing.expectEqual(@as(usize, 1), backend.begin_phase_budget_window_calls);
+    try testing.expectEqual(@as(usize, 1), backend.log_nvfp4_route_summary_calls);
+    try testing.expectEqual(@as(usize, 1), backend.log_phase_budget_summary_calls);
     try testing.expectEqual(tokens.len, backend.slot_positions[0]);
 }
 

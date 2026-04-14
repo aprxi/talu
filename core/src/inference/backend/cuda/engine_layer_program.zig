@@ -70,6 +70,7 @@ const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 const GaffineU4LinearWeight = engine_types.GaffineU4LinearWeight;
 const GaffineU8LinearWeight = engine_types.GaffineU8LinearWeight;
 const AttentionPath = engine_types.AttentionPath;
+const gqa_prefill_f16_dynamic_smem_bytes: u32 = 65536;
 
 // --- Compute ops from engine_ops.zig ---
 const engine_ops = @import("engine_ops.zig");
@@ -1265,6 +1266,7 @@ pub fn dispatchLayerProgramInstruction(
         &ctx.layer.compiled_plan.?.plan,
         state_blocks.slice(),
     );
+
     try adapter(
         &rt_ctx,
         insn,
@@ -1448,6 +1450,7 @@ pub fn runAttentionContext(
     position_u32: u32,
     theta: f32,
 ) !AttentionPath {
+    const attention_start_ns: i128 = std.time.nanoTimestamp();
     var effective_seq_len_u32 = seq_len_u32;
     var k_cache_view = k_cache.*;
     var v_cache_view = v_cache.*;
@@ -1514,7 +1517,7 @@ pub fn runAttentionContext(
                     });
                     return err;
                 };
-                return .fused_heads_f16_kv;
+                return finishAttentionRecord(self, .fused_heads_f16_kv, attention_start_ns, cfg.is_causal);
             }
 
             const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
@@ -1580,7 +1583,7 @@ pub fn runAttentionContext(
                 });
                 return err;
             };
-            return .heads_f16_kv;
+            return finishAttentionRecord(self, .heads_f16_kv, attention_start_ns, cfg.is_causal);
         },
         .i8 => {
             const n_kv_heads_u32 = n_heads_u32 / kv_groups_u32;
@@ -1629,7 +1632,7 @@ pub fn runAttentionContext(
                     };
                     break :blk true;
                 };
-                if (fused_i8_ok) return .fused_heads_i8_kv;
+                if (fused_i8_ok) return finishAttentionRecord(self, .fused_heads_i8_kv, attention_start_ns, cfg.is_causal);
             }
 
             const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
@@ -1699,7 +1702,7 @@ pub fn runAttentionContext(
                 });
                 return err;
             };
-            return .heads_i8_kv;
+            return finishAttentionRecord(self, .heads_i8_kv, attention_start_ns, cfg.is_causal);
         },
         .fp8 => {
             const n_kv_heads_u32 = n_heads_u32 / kv_groups_u32;
@@ -1732,7 +1735,7 @@ pub fn runAttentionContext(
                     position_u32,
                     theta,
                 );
-                return .fused_heads_fp8_kv;
+                return finishAttentionRecord(self, .fused_heads_fp8_kv, attention_start_ns, cfg.is_causal);
             }
 
             const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
@@ -1777,9 +1780,21 @@ pub fn runAttentionContext(
                 kv_groups_u32,
                 head_dim_u32,
             );
-            return .heads_fp8_kv;
+            return finishAttentionRecord(self, .heads_fp8_kv, attention_start_ns, cfg.is_causal);
         },
     }
+}
+
+fn finishAttentionRecord(self: anytype, path: AttentionPath, start_ns: i128, is_causal: bool) AttentionPath {
+    const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns: u64 = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
+        self.nvfp4_phase_counters.recordAttention(path, elapsed_ns);
+        self.nvfp4_phase_counters.recordAttentionCausality(is_causal);
+        self.nvfp4_phase_counters.recordAttentionContext();
+    }
+    return path;
 }
 
 pub fn initKernelFunctions(self: anytype) !void {
@@ -2447,6 +2462,15 @@ pub fn assignResolvedKernel(
         .attn_fused_prefill_heads_f16_kv_gqa => {
             self.attn_fused_prefill_heads_f16_kv_gqa_function = resolved.function;
             self.attn_fused_prefill_heads_f16_kv_gqa_source = resolved.source;
+            self.device.setFunctionMaxDynamicSharedMemory(
+                resolved.function.handle,
+                gqa_prefill_f16_dynamic_smem_bytes,
+            ) catch |err| {
+                log.warn("inference", "CUDA could not raise dynamic shared memory for fused prefill f16 GQA", .{
+                    .requested_bytes = gqa_prefill_f16_dynamic_smem_bytes,
+                    .reason = @errorName(err),
+                });
+            };
         },
         .causal_attn_softmax_f32 => {
             self.causal_attn_softmax_f32_function = resolved.function;

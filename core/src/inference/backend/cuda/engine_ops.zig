@@ -18,6 +18,7 @@ const LinearWeight = engine_types.LinearWeight;
 const U16LinearWeight = engine_types.U16LinearWeight;
 const DeviceTensor = engine_types.DeviceTensor;
 const ProjectionPath = engine_types.ProjectionPath;
+const Nvfp4RouteKind = engine_types.Nvfp4RouteKind;
 const enable_dispatch_observability = engine_types.enable_dispatch_observability;
 const bufferF32RowCount = engine_types.bufferF32RowCount;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
@@ -28,6 +29,74 @@ const layer_ops = models.layer_ops;
 // --- Utility functions from engine_weights.zig ---
 const engine_weights = @import("engine_weights.zig");
 const bufferSlice = engine_weights.bufferSlice;
+
+fn recordNvfp4Route(self: anytype, comptime kind: Nvfp4RouteKind) void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "nvfp4_route_counters")) {
+        self.nvfp4_route_counters.record(kind);
+    }
+}
+
+fn recordPhaseLinearNs(self: anytype, elapsed_ns: u64) void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
+        self.nvfp4_phase_counters.recordLinear(elapsed_ns);
+    }
+}
+
+fn recordPhaseQkvPath(self: anytype, path: ProjectionPath) void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
+        self.nvfp4_phase_counters.recordQkv(path);
+    }
+}
+
+fn recordPhaseGateUpPath(self: anytype, path: ProjectionPath) void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
+        self.nvfp4_phase_counters.recordGateUp(path);
+    }
+}
+
+fn tryPrepareNvfp4LtInput(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    in_dim: usize,
+    rows: usize,
+    input_fp4_out: *compute.cuda.Buffer,
+    input_scales_out: *compute.cuda.Buffer,
+) !bool {
+    const quant_fn = self.quantize_f32_to_nvfp4_function orelse return false;
+    const packed_in_cols = (in_dim + 1) / 2;
+    const input_fp4_bytes = std.math.mul(usize, rows, packed_in_cols) catch return false;
+    const input_scale_bytes = engine_types.Nvfp4LinearWeight.cublasLtScaleTensorSize(in_dim, rows);
+    if (self.runtime_buffers.activation_u16_dev.size < input_fp4_bytes) return false;
+    if (self.runtime_buffers.dequant_f16_dev.size < input_scale_bytes) return false;
+
+    input_fp4_out.* = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_fp4_bytes) catch return false;
+    input_scales_out.* = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, input_scale_bytes) catch return false;
+
+    const padded_outer: u32 = @intCast(engine_types.Nvfp4LinearWeight.roundoff(rows, 128));
+    const sf_k = (in_dim + 15) / 16;
+    const padded_sf_k: u32 = @intCast(engine_types.Nvfp4LinearWeight.roundoff(sf_k, 4));
+    const quant_grid_x = std.math.cast(u32, sf_k) orelse return false;
+
+    self.kernel_arg_pack.reset();
+    self.kernel_arg_pack.appendBufferPtr(input) catch return false;
+    self.kernel_arg_pack.appendBufferPtr(input_fp4_out) catch return false;
+    self.kernel_arg_pack.appendBufferPtr(input_scales_out) catch return false;
+    self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch return false;
+    self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch return false;
+    self.kernel_arg_pack.appendScalar(u32, padded_outer) catch return false;
+    self.kernel_arg_pack.appendScalar(u32, padded_sf_k) catch return false;
+    compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+        .grid_x = quant_grid_x,
+        .grid_y = padded_outer,
+        .block_x = 32,
+    }, &self.kernel_arg_pack, .other) catch return false;
+
+    return true;
+}
 
 pub fn compactQueryGateProjection(
     self: anytype,
@@ -101,6 +170,11 @@ pub fn linearForwardRows(
     weight: *const LinearWeight,
     out: *compute.cuda.Buffer,
 ) !void {
+    const linear_start_ns: i128 = std.time.nanoTimestamp();
+    defer {
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - linear_start_ns);
+        recordPhaseLinearNs(self, elapsed_ns);
+    }
     if (rows == 0) return error.InvalidArgument;
     const input_row_width = weight.rows();
     const output_row_width = weight.cols();
@@ -1272,6 +1346,7 @@ pub fn linearForwardRows(
                     in_dim,
                     alpha_scale,
                 ) catch break :nvfp4_native_blas;
+                recordNvfp4Route(self, .native_cublaslt);
                 return;
             }
 
@@ -1335,6 +1410,7 @@ pub fn linearForwardRows(
                     self.u16_blas_bf16_supported = false;
                     break :nvfp4_dequant_blas;
                 };
+                recordNvfp4Route(self, .bf16_fallback);
                 return;
             }
 
@@ -1369,6 +1445,7 @@ pub fn linearForwardRows(
                         .block_x = 128,
                     }, &self.kernel_arg_pack, .matvec);
                 }
+                recordNvfp4Route(self, .small_rows_matvec);
                 return;
             }
 
@@ -1398,6 +1475,7 @@ pub fn linearForwardRows(
                 .grid_y = (batch_rows + nvfp4_batch_tile - 1) / nvfp4_batch_tile,
                 .block_x = 128,
             }, &self.kernel_arg_pack, .matvec);
+            recordNvfp4Route(self, .small_rows_matvec);
             return;
         },
     }
@@ -1415,11 +1493,21 @@ pub fn runQkvProjection(
     const q_bytes = std.math.mul(usize, rows, q_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const k_bytes = std.math.mul(usize, rows, k_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const v_bytes = std.math.mul(usize, rows, v_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
+    const prefer_nvfp4_lt_fused = rows > 1 and switch (q_proj.*) {
+        .nvfp4 => switch (k_proj.*) {
+            .nvfp4 => switch (v_proj.*) {
+                .nvfp4 => true,
+                else => false,
+            },
+            else => false,
+        },
+        else => false,
+    };
     const allow_fused_qkv = self.loaded.config.hidden_size_per_layer_input <= 0 and
         q_proj.cols() == k_proj.cols() and
         q_proj.cols() == v_proj.cols();
     const prefer_i8_concat = self.active_qkv_concat != null and rows > 1 and self.i8_blas_supported;
-    if (allow_fused_qkv and !prefer_i8_concat and q_out_dest.size >= q_bytes) {
+    if (!prefer_nvfp4_lt_fused and allow_fused_qkv and !prefer_i8_concat and q_out_dest.size >= q_bytes) {
         const fused_ok = tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest) catch |err| blk: {
             if (err == error.CudaKernelLaunchFailed) {
                 log.warn("inference", "CUDA fused QKV launch failed; falling back to unfused projections", .{
@@ -1432,7 +1520,10 @@ pub fn runQkvProjection(
             }
             return err;
         };
-        if (fused_ok) return .fused;
+        if (fused_ok) {
+            recordPhaseQkvPath(self, .fused);
+            return .fused;
+        }
     }
     var q_out = if (q_out_dest.size == q_bytes)
         q_out_dest.*
@@ -1440,6 +1531,11 @@ pub fn runQkvProjection(
         try bufferSlice(q_out_dest, 0, q_bytes);
     var k_out = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, k_bytes);
     var v_out = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, v_bytes);
+
+    if (try tryFusedNvfp4QkvLtForward(self, input, q_proj, k_proj, v_proj, rows, &q_out, &k_out, &v_out)) {
+        recordPhaseQkvPath(self, .fused);
+        return .fused;
+    }
 
     // Fused I8 QKV prefill: single GEMM with concatenated I8 weights.
     // When the full batch doesn't fit in scratch, process in row-chunks.
@@ -1528,6 +1624,7 @@ pub fn runQkvProjection(
 
                 done += chunk;
             }
+            recordPhaseQkvPath(self, .unfused);
             return .unfused;
         }
     }
@@ -1547,7 +1644,10 @@ pub fn runQkvProjection(
             }
             return err;
         };
-        if (fused_ok_retry) return .fused;
+        if (fused_ok_retry) {
+            recordPhaseQkvPath(self, .fused);
+            return .fused;
+        }
     }
 
     linearForwardRows(self, input, rows, q_proj, &q_out) catch |err| {
@@ -1577,6 +1677,7 @@ pub fn runQkvProjection(
         });
         return err;
     };
+    recordPhaseQkvPath(self, .unfused);
     return .unfused;
 }
 
@@ -1596,14 +1697,31 @@ pub fn runGateUpProjectionWithWeights(
     up_weight: *const LinearWeight,
     rows: usize,
 ) !ProjectionPath {
-    if (try tryFusedGateUpForward(self, input, gate_weight, up_weight, rows)) return .fused;
+    const prefer_nvfp4_lt_fused = rows > 1 and switch (gate_weight.*) {
+        .nvfp4 => switch (up_weight.*) {
+            .nvfp4 => true,
+            else => false,
+        },
+        else => false,
+    };
+    if (!prefer_nvfp4_lt_fused) {
+        if (try tryFusedGateUpForward(self, input, gate_weight, up_weight, rows)) {
+            recordPhaseGateUpPath(self, .fused);
+            return .fused;
+        }
+    }
 
     const gate_bytes = std.math.mul(usize, rows, gate_weight.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const up_bytes = std.math.mul(usize, rows, up_weight.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     var gate_out = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, 0, gate_bytes);
     var up_out = try bufferSlice(&self.runtime_buffers.ffn_up_dev, 0, up_bytes);
+    if (try tryFusedNvfp4GateUpLtForward(self, input, gate_weight, up_weight, rows, &gate_out, &up_out)) {
+        recordPhaseGateUpPath(self, .fused);
+        return .fused;
+    }
     try linearForwardRows(self, input, rows, gate_weight, &gate_out);
     try linearForwardRows(self, input, rows, up_weight, &up_out);
+    recordPhaseGateUpPath(self, .unfused);
     return .unfused;
 }
 
@@ -2323,6 +2441,80 @@ pub fn tryFusedNvfp4QkvForward(
         .grid_y = (batch_rows + nvfp4_batch_tile - 1) / nvfp4_batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec_qkv);
+    recordNvfp4Route(self, .fused_qkv);
+    return true;
+}
+
+pub fn tryFusedNvfp4QkvLtForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    q_proj: *const LinearWeight,
+    k_proj: *const LinearWeight,
+    v_proj: *const LinearWeight,
+    rows: usize,
+    q_out: *compute.cuda.Buffer,
+    k_out: *compute.cuda.Buffer,
+    v_out: *compute.cuda.Buffer,
+) !bool {
+    if (rows <= 32) return false;
+    var blas_lt = self.blas_lt orelse return false;
+    const q = switch (q_proj.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const k = switch (k_proj.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const v = switch (v_proj.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    if (q.rows != k.rows or q.rows != v.rows) return false;
+    if (q.weight_global_scale == 0.0 or k.weight_global_scale == 0.0 or v.weight_global_scale == 0.0) return false;
+    if (q.scales_lt_buffer.size == 0 or k.scales_lt_buffer.size == 0 or v.scales_lt_buffer.size == 0) return false;
+
+    var input_fp4_buf: compute.cuda.Buffer = undefined;
+    var input_scales_buf: compute.cuda.Buffer = undefined;
+    if (!(try tryPrepareNvfp4LtInput(self, input, q.rows, rows, &input_fp4_buf, &input_scales_buf))) return false;
+
+    blas_lt.matmulNvfp4(
+        &self.device,
+        &q.buffer,
+        &q.scales_lt_buffer,
+        &input_fp4_buf,
+        &input_scales_buf,
+        q_out,
+        rows,
+        q.cols,
+        q.rows,
+        1.0 / q.weight_global_scale,
+    ) catch return false;
+    blas_lt.matmulNvfp4(
+        &self.device,
+        &k.buffer,
+        &k.scales_lt_buffer,
+        &input_fp4_buf,
+        &input_scales_buf,
+        k_out,
+        rows,
+        k.cols,
+        k.rows,
+        1.0 / k.weight_global_scale,
+    ) catch return false;
+    blas_lt.matmulNvfp4(
+        &self.device,
+        &v.buffer,
+        &v.scales_lt_buffer,
+        &input_fp4_buf,
+        &input_scales_buf,
+        v_out,
+        rows,
+        v.cols,
+        v.rows,
+        1.0 / v.weight_global_scale,
+    ) catch return false;
+    recordNvfp4Route(self, .fused_qkv);
     return true;
 }
 
@@ -2856,6 +3048,7 @@ pub fn tryFusedNvfp4GateUpSiluForward(
         .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec_gate_up_silu);
+    recordNvfp4Route(self, .fused_gate_up);
     return true;
 }
 
@@ -2922,6 +3115,7 @@ pub fn tryFusedNvfp4GateUpGeluForward(
         .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec_gate_up_silu);
+    recordNvfp4Route(self, .fused_gate_up);
     return true;
 }
 
@@ -3051,6 +3245,62 @@ pub fn tryFusedNvfp4GateUpForward(
         .grid_y = (batch_rows + nvfp4_batch_tile - 1) / nvfp4_batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec);
+    recordNvfp4Route(self, .fused_gate_up);
+    return true;
+}
+
+pub fn tryFusedNvfp4GateUpLtForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+    gate_out: *compute.cuda.Buffer,
+    up_out: *compute.cuda.Buffer,
+) !bool {
+    if (rows <= 32) return false;
+    var blas_lt = self.blas_lt orelse return false;
+    const gate = switch (gate_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    if (gate.rows != up.rows) return false;
+    if (gate.weight_global_scale == 0.0 or up.weight_global_scale == 0.0) return false;
+    if (gate.scales_lt_buffer.size == 0 or up.scales_lt_buffer.size == 0) return false;
+
+    var input_fp4_buf: compute.cuda.Buffer = undefined;
+    var input_scales_buf: compute.cuda.Buffer = undefined;
+    if (!(try tryPrepareNvfp4LtInput(self, input, gate.rows, rows, &input_fp4_buf, &input_scales_buf))) return false;
+
+    blas_lt.matmulNvfp4(
+        &self.device,
+        &gate.buffer,
+        &gate.scales_lt_buffer,
+        &input_fp4_buf,
+        &input_scales_buf,
+        gate_out,
+        rows,
+        gate.cols,
+        gate.rows,
+        1.0 / gate.weight_global_scale,
+    ) catch return false;
+    blas_lt.matmulNvfp4(
+        &self.device,
+        &up.buffer,
+        &up.scales_lt_buffer,
+        &input_fp4_buf,
+        &input_scales_buf,
+        up_out,
+        rows,
+        up.cols,
+        up.rows,
+        1.0 / up.weight_global_scale,
+    ) catch return false;
+    recordNvfp4Route(self, .fused_gate_up);
     return true;
 }
 

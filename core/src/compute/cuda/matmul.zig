@@ -108,6 +108,7 @@ pub const Blas = struct {
     lib: std.DynLib,
     api: CublasApi,
     handle: ?*anyopaque,
+    cached_stream: ?*anyopaque = null,
 
     pub fn init(device: *device_mod.Device) !Blas {
         try device.makeCurrent();
@@ -130,6 +131,7 @@ pub const Blas = struct {
             .lib = lib,
             .api = api,
             .handle = handle,
+            .cached_stream = null,
         };
     }
 
@@ -139,7 +141,19 @@ pub const Blas = struct {
             _ = self.api.cublas_destroy(handle);
             self.handle = null;
         }
+        self.cached_stream = null;
         self.lib.close();
+    }
+
+    fn prepareLaunch(self: *Blas, device: *device_mod.Device) !void {
+        try device.makeCurrent();
+        const launch_stream = device.getLaunchStream();
+        if (self.cached_stream != launch_stream) {
+            if (self.api.cublas_set_stream(self.handle, launch_stream) != cublas_status_success) {
+                return error.CublasStreamSetFailed;
+            }
+            self.cached_stream = launch_stream;
+        }
     }
 
     /// F32 matrix multiplication: C = A @ B.
@@ -160,10 +174,7 @@ pub const Blas = struct {
         if (b.size < k * n * @sizeOf(f32)) return error.InvalidArgument;
         if (c.size < m * n * @sizeOf(f32)) return error.InvalidArgument;
 
-        try device.makeCurrent();
-        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
-            return error.CublasStreamSetFailed;
-        }
+        try self.prepareLaunch(device);
 
         // cuBLAS is column-major. For row-major C=A@B, compute C^T=B^T@A^T by
         // swapping operands and dimensions in the column-major GEMM call.
@@ -216,10 +227,7 @@ pub const Blas = struct {
         if (weight_u16.size < out_dim * in_dim * @sizeOf(u16)) return error.InvalidArgument;
         if (out_f32.size < rows * out_dim * @sizeOf(f32)) return error.InvalidArgument;
 
-        try device.makeCurrent();
-        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
-            return error.CublasStreamSetFailed;
-        }
+        try self.prepareLaunch(device);
 
         const alpha: f32 = 1.0;
         const beta: f32 = 0.0;
@@ -283,10 +291,7 @@ pub const Blas = struct {
         if (weight_u16.size < out_dim * in_dim * @sizeOf(u16)) return error.InvalidArgument;
         if (out_f32.size < rows * out_dim * @sizeOf(f32)) return error.InvalidArgument;
 
-        try device.makeCurrent();
-        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
-            return error.CublasStreamSetFailed;
-        }
+        try self.prepareLaunch(device);
 
         const alpha: f32 = 1.0;
         const beta: f32 = 0.0;
@@ -350,10 +355,7 @@ pub const Blas = struct {
         if (weight_i8.size < out_dim * in_dim) return error.InvalidArgument;
         if (out_i32.size < rows * out_dim * @sizeOf(i32)) return error.InvalidArgument;
 
-        try device.makeCurrent();
-        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
-            return error.CublasStreamSetFailed;
-        }
+        try self.prepareLaunch(device);
 
         const alpha: i32 = 1;
         const beta: i32 = 0;
@@ -410,10 +412,7 @@ pub const Blas = struct {
         if (weight_fp8.size < out_dim * in_dim) return error.InvalidArgument;
         if (out_f32.size < rows * out_dim * @sizeOf(f32)) return error.InvalidArgument;
 
-        try device.makeCurrent();
-        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
-            return error.CublasStreamSetFailed;
-        }
+        try self.prepareLaunch(device);
 
         const beta: f32 = 0.0;
         const input_dev: ?*const anyopaque = @ptrFromInt(input_fp8.pointer);
@@ -451,6 +450,68 @@ pub const Blas = struct {
     /// A is u16 (f16/bf16), B and C are f32.
     /// Column-major convention: op(A) is [m x k], op(B) is [k x n], C is [m x n].
     /// Strides are in elements of the respective type.
+    pub fn gemmU16StridedBatched(
+        self: *Blas,
+        device: *device_mod.Device,
+        transa: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a_ptr: usize,
+        lda: usize,
+        stride_a_elems: usize,
+        b_ptr: usize,
+        ldb: usize,
+        stride_b_elems: usize,
+        beta: f32,
+        c_ptr: usize,
+        ldc: usize,
+        stride_c_elems: usize,
+        batch_count: usize,
+    ) !void {
+        if (self.handle == null) return error.CublasHandleInvalid;
+        if (!dimsFitCublas(m, n, k)) return error.InvalidArgument;
+        if (batch_count == 0) return error.InvalidArgument;
+
+        const batch_count_ci = std.math.cast(c_int, batch_count) orelse return error.InvalidArgument;
+        const stride_a = std.math.cast(c_longlong, stride_a_elems) orelse return error.InvalidArgument;
+        const stride_b = std.math.cast(c_longlong, stride_b_elems) orelse return error.InvalidArgument;
+        const stride_c = std.math.cast(c_longlong, stride_c_elems) orelse return error.InvalidArgument;
+
+        try self.prepareLaunch(device);
+
+        const op_a: c_int = if (transa) cublas_op_t else cublas_op_n;
+
+        const status = self.api.cublas_gemm_strided_batched_ex(
+            self.handle,
+            op_a,
+            cublas_op_n,
+            @intCast(m),
+            @intCast(n),
+            @intCast(k),
+            @ptrCast(&alpha),
+            @ptrFromInt(a_ptr),
+            cuda_r_16f,
+            @intCast(lda),
+            stride_a,
+            @ptrFromInt(b_ptr),
+            cuda_r_16f,
+            @intCast(ldb),
+            stride_b,
+            @ptrCast(&beta),
+            @ptrFromInt(c_ptr),
+            cuda_r_32f,
+            @intCast(ldc),
+            stride_c,
+            batch_count_ci,
+            cublas_compute_32f,
+            cublas_gemm_default,
+        );
+        if (status == cublas_status_alloc_failed) return error.OutOfMemory;
+        if (status != cublas_status_success) return error.CublasMatmulFailed;
+    }
+
     /// Non-batched GEMM with explicit leading dimensions, both inputs u16.
     /// C = alpha * op(A) @ B + beta * C.
     /// A and B are u16 (f16), C is f32.  Leverages tensor cores.
@@ -474,10 +535,7 @@ pub const Blas = struct {
         if (self.handle == null) return error.CublasHandleInvalid;
         if (!dimsFitCublas(m, n, k)) return error.InvalidArgument;
 
-        try device.makeCurrent();
-        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
-            return error.CublasStreamSetFailed;
-        }
+        try self.prepareLaunch(device);
 
         const op_a: c_int = if (transa) cublas_op_t else cublas_op_n;
 

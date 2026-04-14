@@ -65,6 +65,8 @@ const KernelSlot = engine_types.KernelSlot;
 const RequiredKernel = engine_types.RequiredKernel;
 const required_kernels = engine_types.required_kernels;
 const ProjectionPath = engine_types.ProjectionPath;
+const Nvfp4RouteCounters = engine_types.Nvfp4RouteCounters;
+const Nvfp4PhaseBudgetCounters = engine_types.Nvfp4PhaseBudgetCounters;
 const AttentionPath = engine_types.AttentionPath;
 const KvCacheStorageMode = engine_types.KvCacheStorageMode;
 const AttentionKernelSet = engine_types.AttentionKernelSet;
@@ -242,6 +244,11 @@ pub const CudaBackend = struct {
     attn_weighted_sum_heads_i8_kv_source: ?compute.cuda.registry.KernelSource = null,
     rope_rows_ptrs_function: ?compute.cuda.Function = null,
     rope_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    prefill_rope_positions_host: []u32 = &.{},
+    prefill_rope_positions_cached_valid: bool = false,
+    prefill_rope_positions_cached_dirty: bool = true,
+    prefill_rope_positions_cached_rows: u32 = 0,
+    prefill_rope_positions_cached_base: u32 = 0,
     attn_scores_heads_f16_kv_ptrs_function: ?compute.cuda.Function = null,
     attn_scores_heads_f16_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     attn_scores_heads_i8_kv_ptrs_function: ?compute.cuda.Function = null,
@@ -521,6 +528,10 @@ pub const CudaBackend = struct {
     state_descriptor_count: u8 = 0,
     slot_state_bindings: []SlotStateBinding = &.{},
     runtime_dispatch_counters: runtime_contract.DispatchCounters = .{},
+    nvfp4_route_counters: Nvfp4RouteCounters = .{},
+    nvfp4_route_window_start: Nvfp4RouteCounters = .{},
+    nvfp4_phase_counters: Nvfp4PhaseBudgetCounters = .{},
+    nvfp4_phase_window_start: Nvfp4PhaseBudgetCounters = .{},
     layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     layer_program_slot_buffers: []compute.cuda.Buffer = &.{},
@@ -1162,6 +1173,7 @@ pub const CudaBackend = struct {
 
         const layer_scalar = gemma4.layer_scalars[layer_idx];
         if (self.enable_layer_scalars and layer_scalar != 1.0) {
+            const layer_scalar_start_ns: i128 = std.time.nanoTimestamp();
             try compute.cuda.vector_add_scaled.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
@@ -1172,6 +1184,8 @@ pub const CudaBackend = struct {
                 layer_scalar - 1.0,
                 std.math.mul(u32, rows_u32, d_model_u32) catch return error.InvalidArgument,
             );
+            const layer_scalar_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - layer_scalar_start_ns);
+            self.nvfp4_phase_counters.recordLayerScalar(layer_scalar_elapsed_ns);
         }
     }
 
@@ -1191,6 +1205,7 @@ pub const CudaBackend = struct {
         if (scalar == 1.0) return;
         const d_model_u32: u32 = @intCast(self.d_model);
         const rows_u32: u32 = @intCast(rows);
+        const layer_scalar_start_ns: i128 = std.time.nanoTimestamp();
         try compute.cuda.vector_add_scaled.runWithFunction(
             &self.kernel_arg_pack,
             &self.device,
@@ -1201,6 +1216,8 @@ pub const CudaBackend = struct {
             scalar - 1.0,
             std.math.mul(u32, rows_u32, d_model_u32) catch return error.InvalidArgument,
         );
+        const layer_scalar_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - layer_scalar_start_ns);
+        self.nvfp4_phase_counters.recordLayerScalar(layer_scalar_elapsed_ns);
     }
 
     const DeviceMemoryBudget = struct {
@@ -1323,6 +1340,10 @@ pub const CudaBackend = struct {
             .state_descriptor_count = 0,
             .slot_state_bindings = &.{},
             .runtime_dispatch_counters = .{},
+            .nvfp4_route_counters = .{},
+            .nvfp4_route_window_start = .{},
+            .nvfp4_phase_counters = .{},
+            .nvfp4_phase_window_start = .{},
             .layer_program_dispatch_total = [_]u64{0} ** 256,
             .prefill_dispatch_window_start = [_]u64{0} ** 256,
             .layer_program_slot_buffers = &.{},
@@ -1805,7 +1826,9 @@ pub const CudaBackend = struct {
                     backend.pipeline_transfer_mode = .peer_to_peer;
                     log.info("inference", "CUDA pipeline2 using peer-copy transfer", .{});
                 } else {
-                    const transfer_bytes = try backend.pipelineActivationByteCount();
+                    const transfer_row_bytes = try backend.pipelineActivationByteCount();
+                    const transfer_rows = @max(@as(usize, 1), @min(backend.prefill_chunk_rows_cap, stage1_ptr.prefill_chunk_rows_cap));
+                    const transfer_bytes = std.math.mul(usize, transfer_row_bytes, transfer_rows) catch transfer_row_bytes;
                     backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer_bytes);
                     backend.pipeline_transfer_mode = .host_staged;
                     log.info("inference", "CUDA pipeline2 using host-staged transfer", .{
@@ -2000,7 +2023,9 @@ pub const CudaBackend = struct {
                     allocator.free(backend.pipeline_host_staging.?);
                     backend.pipeline_host_staging = null;
                 }
-                backend.pipeline_host_staging_stage12 = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer01_bytes);
+                const transfer12_rows = @max(@as(usize, 1), backend.prefill_chunk_rows_cap);
+                const transfer12_bytes = std.math.mul(usize, transfer01_bytes, transfer12_rows) catch transfer01_bytes;
+                backend.pipeline_host_staging_stage12 = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer12_bytes);
                 errdefer {
                     allocator.free(backend.pipeline_host_staging_stage12.?);
                     backend.pipeline_host_staging_stage12 = null;
@@ -2260,6 +2285,7 @@ pub const CudaBackend = struct {
         if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
         if (self.gated_delta_stage_mid_host.len > 0) self.allocator.free(self.gated_delta_stage_mid_host);
         if (self.gated_delta_stage_output_host.len > 0) self.allocator.free(self.gated_delta_stage_output_host);
+        if (self.prefill_rope_positions_host.len > 0) self.allocator.free(self.prefill_rope_positions_host);
         if (self.cpu_rope_local) |rope| {
             rope.deinit(self.allocator);
             self.allocator.destroy(rope);
@@ -3627,6 +3653,8 @@ pub const CudaBackend = struct {
         self.slot_rope_position_deltas[slot_index] = 0;
         self.activateKvSlot(slot_index);
         self.beginPrefillDispatchWindow();
+        self.beginNvfp4RouteWindow();
+        self.beginPhaseBudgetWindow();
         const prefill_start_ns: i128 = std.time.nanoTimestamp();
         try engine_forward.ensureKvCapacity(self, tokens.len);
 
@@ -3706,6 +3734,8 @@ pub const CudaBackend = struct {
 
         const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
         self.logPrefillTimingImpl("prefill_slot_vision", tokens.len, prefill_elapsed_ns);
+        self.logNvfp4RouteSummaryImpl("prefill_slot_vision", tokens.len);
+        self.logPhaseBudgetSummaryImpl("prefill_slot_vision", tokens.len, prefill_elapsed_ns);
         @memcpy(logits_out, self.slotLogits(slot_index));
         self.slot_positions[slot_index] = tokens.len;
     }
@@ -3853,6 +3883,144 @@ pub const CudaBackend = struct {
         @memcpy(self.prefill_dispatch_window_start[0..], self.layer_program_dispatch_total[0..]);
     }
 
+    fn saturatingAddU64(a: u64, b: u64) u64 {
+        return std.math.add(u64, a, b) catch std.math.maxInt(u64);
+    }
+
+    fn mergeNvfp4RouteCounters(primary: Nvfp4RouteCounters, secondary: Nvfp4RouteCounters) Nvfp4RouteCounters {
+        return .{
+            .native_cublaslt = saturatingAddU64(primary.native_cublaslt, secondary.native_cublaslt),
+            .bf16_fallback = saturatingAddU64(primary.bf16_fallback, secondary.bf16_fallback),
+            .small_rows_matvec = saturatingAddU64(primary.small_rows_matvec, secondary.small_rows_matvec),
+            .fused_qkv = saturatingAddU64(primary.fused_qkv, secondary.fused_qkv),
+            .fused_gate_up = saturatingAddU64(primary.fused_gate_up, secondary.fused_gate_up),
+        };
+    }
+
+    fn mergeNvfp4PhaseBudgetCounters(primary: Nvfp4PhaseBudgetCounters, secondary: Nvfp4PhaseBudgetCounters) Nvfp4PhaseBudgetCounters {
+        return .{
+            .linear_calls = saturatingAddU64(primary.linear_calls, secondary.linear_calls),
+            .linear_ns = saturatingAddU64(primary.linear_ns, secondary.linear_ns),
+            .attention_calls = saturatingAddU64(primary.attention_calls, secondary.attention_calls),
+            .attention_ns = saturatingAddU64(primary.attention_ns, secondary.attention_ns),
+            .attention_causal_calls = saturatingAddU64(primary.attention_causal_calls, secondary.attention_causal_calls),
+            .attention_noncausal_calls = saturatingAddU64(primary.attention_noncausal_calls, secondary.attention_noncausal_calls),
+            .attention_context_calls = saturatingAddU64(primary.attention_context_calls, secondary.attention_context_calls),
+            .attention_batched_prefill_calls = saturatingAddU64(primary.attention_batched_prefill_calls, secondary.attention_batched_prefill_calls),
+            .layer_scalar_calls = saturatingAddU64(primary.layer_scalar_calls, secondary.layer_scalar_calls),
+            .layer_scalar_ns = saturatingAddU64(primary.layer_scalar_ns, secondary.layer_scalar_ns),
+            .qkv_calls = saturatingAddU64(primary.qkv_calls, secondary.qkv_calls),
+            .qkv_fused_calls = saturatingAddU64(primary.qkv_fused_calls, secondary.qkv_fused_calls),
+            .qkv_unfused_calls = saturatingAddU64(primary.qkv_unfused_calls, secondary.qkv_unfused_calls),
+            .gate_up_calls = saturatingAddU64(primary.gate_up_calls, secondary.gate_up_calls),
+            .gate_up_fused_calls = saturatingAddU64(primary.gate_up_fused_calls, secondary.gate_up_fused_calls),
+            .gate_up_unfused_calls = saturatingAddU64(primary.gate_up_unfused_calls, secondary.gate_up_unfused_calls),
+            .attention_fused_heads_f16_kv = saturatingAddU64(primary.attention_fused_heads_f16_kv, secondary.attention_fused_heads_f16_kv),
+            .attention_heads_f16_kv = saturatingAddU64(primary.attention_heads_f16_kv, secondary.attention_heads_f16_kv),
+            .attention_fused_heads_i8_kv = saturatingAddU64(primary.attention_fused_heads_i8_kv, secondary.attention_fused_heads_i8_kv),
+            .attention_heads_i8_kv = saturatingAddU64(primary.attention_heads_i8_kv, secondary.attention_heads_i8_kv),
+            .attention_fused_heads_fp8_kv = saturatingAddU64(primary.attention_fused_heads_fp8_kv, secondary.attention_fused_heads_fp8_kv),
+            .attention_heads_fp8_kv = saturatingAddU64(primary.attention_heads_fp8_kv, secondary.attention_heads_fp8_kv),
+            .attention_heads_f32_kv = saturatingAddU64(primary.attention_heads_f32_kv, secondary.attention_heads_f32_kv),
+        };
+    }
+
+    pub fn beginNvfp4RouteWindow(self: *CudaBackend) void {
+        self.nvfp4_route_window_start = self.nvfp4_route_counters;
+        if (self.pipeline_backend1) |stage1| {
+            stage1.beginNvfp4RouteWindow();
+        }
+    }
+
+    pub fn nvfp4RouteWindowDelta(self: *const CudaBackend) Nvfp4RouteCounters {
+        const primary = Nvfp4RouteCounters.delta(self.nvfp4_route_counters, self.nvfp4_route_window_start);
+        if (self.pipeline_backend1) |stage1| {
+            return mergeNvfp4RouteCounters(primary, stage1.nvfp4RouteWindowDelta());
+        }
+        return primary;
+    }
+
+    pub fn logNvfp4RouteSummaryImpl(self: *const CudaBackend, mode: []const u8, token_count: usize) void {
+        const route_delta = self.nvfp4RouteWindowDelta();
+        log.warn("inference", "CUDA NVFP4 route summary", .{
+            .mode = mode,
+            .tokens = token_count,
+            .native_cublaslt = route_delta.native_cublaslt,
+            .bf16_fallback = route_delta.bf16_fallback,
+            .small_rows_matvec = route_delta.small_rows_matvec,
+            .fused_qkv = route_delta.fused_qkv,
+            .fused_gate_up = route_delta.fused_gate_up,
+            .total = route_delta.total(),
+        });
+    }
+
+    pub fn beginPhaseBudgetWindow(self: *CudaBackend) void {
+        self.nvfp4_phase_window_start = self.nvfp4_phase_counters;
+        if (self.pipeline_backend1) |stage1| {
+            stage1.beginPhaseBudgetWindow();
+        }
+    }
+
+    pub fn phaseBudgetWindowDelta(self: *const CudaBackend) Nvfp4PhaseBudgetCounters {
+        const primary = Nvfp4PhaseBudgetCounters.delta(self.nvfp4_phase_counters, self.nvfp4_phase_window_start);
+        if (self.pipeline_backend1) |stage1| {
+            return mergeNvfp4PhaseBudgetCounters(primary, stage1.phaseBudgetWindowDelta());
+        }
+        return primary;
+    }
+
+    pub fn logPhaseBudgetSummaryImpl(self: *const CudaBackend, mode: []const u8, token_count: usize, elapsed_ns: u64) void {
+        const phase_delta = self.phaseBudgetWindowDelta();
+        const known_ns = phase_delta.knownNs();
+        const other_ns: u64 = if (elapsed_ns >= known_ns) elapsed_ns - known_ns else 0;
+        const ns_to_ms = 1_000_000.0;
+        log.warn("inference", "CUDA phase budget summary", .{
+            .mode = mode,
+            .tokens = token_count,
+            .elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / ns_to_ms,
+            .linear_ms = @as(f64, @floatFromInt(phase_delta.linear_ns)) / ns_to_ms,
+            .attention_ms = @as(f64, @floatFromInt(phase_delta.attention_ns)) / ns_to_ms,
+            .layer_scalar_ms = @as(f64, @floatFromInt(phase_delta.layer_scalar_ns)) / ns_to_ms,
+            .other_ms = @as(f64, @floatFromInt(other_ns)) / ns_to_ms,
+            .linear_calls = phase_delta.linear_calls,
+            .attention_calls = phase_delta.attention_calls,
+            .attention_causal_calls = phase_delta.attention_causal_calls,
+            .attention_noncausal_calls = phase_delta.attention_noncausal_calls,
+            .attention_context_calls = phase_delta.attention_context_calls,
+            .attention_batched_prefill_calls = phase_delta.attention_batched_prefill_calls,
+            .layer_scalar_calls = phase_delta.layer_scalar_calls,
+            .qkv_calls = phase_delta.qkv_calls,
+            .qkv_fused = phase_delta.qkv_fused_calls,
+            .qkv_unfused = phase_delta.qkv_unfused_calls,
+            .gate_up_calls = phase_delta.gate_up_calls,
+            .gate_up_fused = phase_delta.gate_up_fused_calls,
+            .gate_up_unfused = phase_delta.gate_up_unfused_calls,
+            .attn_fused_f16 = phase_delta.attention_fused_heads_f16_kv,
+            .attn_heads_f16 = phase_delta.attention_heads_f16_kv,
+            .attn_fused_i8 = phase_delta.attention_fused_heads_i8_kv,
+            .attn_heads_i8 = phase_delta.attention_heads_i8_kv,
+            .attn_fused_fp8 = phase_delta.attention_fused_heads_fp8_kv,
+            .attn_heads_fp8 = phase_delta.attention_heads_fp8_kv,
+            .attn_heads_f32 = phase_delta.attention_heads_f32_kv,
+        });
+        log.warn("inference", "CUDA attention path summary", .{
+            .mode = mode,
+            .tokens = token_count,
+            .attention_calls = phase_delta.attention_calls,
+            .attention_causal_calls = phase_delta.attention_causal_calls,
+            .attention_noncausal_calls = phase_delta.attention_noncausal_calls,
+            .attention_context_calls = phase_delta.attention_context_calls,
+            .attention_batched_prefill_calls = phase_delta.attention_batched_prefill_calls,
+            .attn_fused_f16 = phase_delta.attention_fused_heads_f16_kv,
+            .attn_heads_f16 = phase_delta.attention_heads_f16_kv,
+            .attn_fused_i8 = phase_delta.attention_fused_heads_i8_kv,
+            .attn_heads_i8 = phase_delta.attention_heads_i8_kv,
+            .attn_fused_fp8 = phase_delta.attention_fused_heads_fp8_kv,
+            .attn_heads_fp8 = phase_delta.attention_heads_fp8_kv,
+            .attn_heads_f32 = phase_delta.attention_heads_f32_kv,
+        });
+    }
+
     pub fn logPrefillTimingImpl(self: *const CudaBackend, mode: []const u8, token_count: usize, elapsed_ns: u64) void {
         logPrefillTiming(self, mode, token_count, elapsed_ns);
     }
@@ -3989,7 +4157,26 @@ pub const CudaBackend = struct {
         position_u32: u32,
         theta: f32,
     ) !AttentionPath {
-        return engine_layer_program.runAttentionContext(self, cfg, q_stage, context_stage, k_cache, v_cache, k_scale, v_scale, kernels, seq_len_u32, head_dim_u32, kv_dim_u32, kv_groups_u32, n_heads_u32, attention_scale, rope_dim_u32, position_u32, theta);
+        return engine_layer_program.runAttentionContext(
+            self,
+            cfg,
+            q_stage,
+            context_stage,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            kernels,
+            seq_len_u32,
+            head_dim_u32,
+            kv_dim_u32,
+            kv_groups_u32,
+            n_heads_u32,
+            attention_scale,
+            rope_dim_u32,
+            position_u32,
+            theta,
+        );
     }
 
     pub fn prefillDispatchDelta(self: *const CudaBackend, opcode: opcode_map.Opcode) u64 {

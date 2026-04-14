@@ -36,6 +36,7 @@ const CuDeviceTotalMemFn = *const fn (*usize, c_int) callconv(.c) c_int;
 const CuDeviceGetAttributeFn = *const fn (*c_int, c_int, c_int) callconv(.c) c_int;
 const CuModuleLoadDataFn = *const fn (*?*anyopaque, *const anyopaque) callconv(.c) c_int;
 const CuModuleGetFunctionFn = *const fn (*?*anyopaque, ?*anyopaque, [*:0]const u8) callconv(.c) c_int;
+const CuFuncSetAttributeFn = *const fn (?*anyopaque, c_int, c_int) callconv(.c) c_int;
 const CuModuleUnloadFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CuStreamCreateFn = *const fn (*?*anyopaque, u32) callconv(.c) c_int;
 const CuStreamDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
@@ -106,6 +107,7 @@ const DriverApi = struct {
     cu_device_get_attribute: ?CuDeviceGetAttributeFn,
     cu_module_load_data: ?CuModuleLoadDataFn,
     cu_module_get_function: ?CuModuleGetFunctionFn,
+    cu_func_set_attribute: ?CuFuncSetAttributeFn,
     cu_module_unload: ?CuModuleUnloadFn,
     cu_stream_create: ?CuStreamCreateFn,
     cu_stream_destroy: ?CuStreamDestroyFn,
@@ -129,6 +131,7 @@ const DriverApi = struct {
 
 const cu_device_attribute_compute_capability_major: c_int = 75;
 const cu_device_attribute_compute_capability_minor: c_int = 76;
+const cu_function_attribute_max_dynamic_shared_size_bytes: c_int = 8;
 const cu_stream_capture_mode_global: c_int = 0;
 
 pub const LaunchFamily = enum(u8) {
@@ -712,6 +715,15 @@ pub const Device = struct {
         return function_handle.?;
     }
 
+    pub fn setFunctionMaxDynamicSharedMemory(self: *Device, function: FunctionHandle, bytes: u32) !void {
+        const cu_func_set_attribute = self.api.cu_func_set_attribute orelse return error.CudaModuleApiUnavailable;
+        const value: c_int = std.math.cast(c_int, bytes) orelse return error.InvalidArgument;
+        try self.makeCurrent();
+        if (cu_func_set_attribute(function, cu_function_attribute_max_dynamic_shared_size_bytes, value) != cuda_success) {
+            return error.CudaModuleApiUnavailable;
+        }
+    }
+
     pub fn moduleUnload(self: *Device, module: ModuleHandle) void {
         const cu_module_unload = self.api.cu_module_unload orelse return;
         self.makeCurrent() catch return;
@@ -766,7 +778,7 @@ pub const Device = struct {
         else
             null;
 
-        if (cu_launch_kernel(
+        const launch_rc = cu_launch_kernel(
             function,
             grid_x,
             grid_y,
@@ -778,7 +790,20 @@ pub const Device = struct {
             if (stream) |s| s else null,
             params_ptr,
             null, // extra
-        ) != cuda_success) {
+        );
+        if (launch_rc != cuda_success) {
+            log.warn("compute", "CUDA kernel launch failed", .{
+                .rc = launch_rc,
+                .phase = @tagName(self.launch_phase),
+                .family = @tagName(self.launch_family),
+                .grid_x = grid_x,
+                .grid_y = grid_y,
+                .grid_z = grid_z,
+                .block_x = block_x,
+                .block_y = block_y,
+                .block_z = block_z,
+                .shared_mem = shared_mem_bytes,
+            });
             return error.CudaKernelLaunchFailed;
         }
         if (self.launch_stats_enabled) {
@@ -974,6 +999,7 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_device_get_attribute = lookupOptional(CuDeviceGetAttributeFn, lib, "cuDeviceGetAttribute"),
         .cu_module_load_data = lookupOptional(CuModuleLoadDataFn, lib, "cuModuleLoadData"),
         .cu_module_get_function = lookupOptional(CuModuleGetFunctionFn, lib, "cuModuleGetFunction"),
+        .cu_func_set_attribute = lookupOptional(CuFuncSetAttributeFn, lib, "cuFuncSetAttribute"),
         .cu_module_unload = lookupOptional(CuModuleUnloadFn, lib, "cuModuleUnload"),
         .cu_stream_create = lookupOptional(CuStreamCreateFn, lib, "cuStreamCreate"),
         .cu_stream_destroy = lookupOptionalAny(CuStreamDestroyFn, lib, &.{ "cuStreamDestroy_v2", "cuStreamDestroy" }),
