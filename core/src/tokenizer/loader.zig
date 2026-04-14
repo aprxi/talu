@@ -377,7 +377,7 @@ fn validateModelOptions(model_type_name: []const u8, model_json: []const u8) !vo
         }
     }
     if (findJsonFieldValue(model_json, "\"ignore_merges\"")) |value| {
-        if (!std.mem.eql(u8, value, "false")) {
+        if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "true")) {
             log.warn("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "ignore_merges",
                 .value_len = value.len,
@@ -4003,6 +4003,51 @@ test "tokenizer_loader_from_json_string accepts Gemma-style BPE options with byt
         tokenizer.destroy();
         std.heap.c_allocator.destroy(tokenizer);
     }
+}
+
+test "tokenizer_loader_from_json_string applies ignore_merges when enabled" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "ignore_merges": true,
+        \\    "vocab": { "<unk>": 0, "a": 1, "b": 2, "c": 3, "ab": 4, "abc": 5 },
+        \\    "merges": [["a", "b"]]
+        \\  },
+        \\  "added_tokens": [],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": null,
+        \\  "post_processor": null,
+        \\  "decoder": null
+        \\}
+    ;
+    const json_z = try allocator.dupeZ(u8, json);
+    defer allocator.free(json_z);
+
+    const tokenizer = tokenizer_loader_from_json_string(json_z.ptr) orelse return error.TestUnexpectedResult;
+    defer {
+        tokenizer.destroy();
+        std.heap.c_allocator.destroy(tokenizer);
+    }
+
+    var encoding = std.mem.zeroes(ct.TokenizerEncoding);
+    defer @import("encode.zig").tokenizer_encoding_free_struct(&encoding);
+
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        @import("encode.zig").tokenizer_encode_struct_with_options(
+            tokenizer,
+            "abc",
+            &encoding,
+            .{ .add_special_tokens = false },
+        ),
+    );
+
+    const ids: [*]i32 = @ptrCast(encoding.ids.?);
+    try std.testing.expectEqual(@as(usize, 1), encoding.ids_len);
+    try std.testing.expectEqual(@as(i32, 5), ids[0]);
 }
 
 test "load_from_slice_streaming rejects fuse_unk without byte_fallback" {

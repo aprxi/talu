@@ -75,6 +75,38 @@ def _get_lib_path() -> Path:
         return ZIG_OUT_LIB / "libtalu.so"
 
 
+def _ensure_library_ready() -> str | None:
+    """Ensure shared library exists and is loadable, returning skip reason on failure."""
+    lib_path = _get_lib_path()
+
+    if not lib_path.exists():
+        print(f"\nLibrary not found at {lib_path}, attempting build...")
+        try:
+            result = subprocess.run(
+                ["zig", "build"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+            )
+            if result.returncode != 0:
+                return f"Failed to build library:\n{result.stderr}"
+        except FileNotFoundError:
+            return "Zig compiler not found. Install Zig to run tests."
+        except subprocess.TimeoutExpired:
+            return "Build timed out after 5 minutes."
+
+    if not lib_path.exists():
+        return f"Library not found at {lib_path} after build attempt."
+
+    try:
+        ctypes.CDLL(str(lib_path))
+    except OSError as e:
+        return f"Cannot load library: {e}"
+
+    return None
+
+
 # =============================================================================
 # Build Fixtures
 # =============================================================================
@@ -91,33 +123,9 @@ def ensure_library_built():
     Raises:
         pytest.skip: If build fails or library cannot be found
     """
-    lib_path = _get_lib_path()
-
-    if not lib_path.exists():
-        print(f"\nLibrary not found at {lib_path}, attempting build...")
-        try:
-            result = subprocess.run(
-                ["zig", "build"],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 minute timeout
-            )
-            if result.returncode != 0:
-                pytest.skip(f"Failed to build library:\n{result.stderr}")
-        except FileNotFoundError:
-            pytest.skip("Zig compiler not found. Install Zig to run tests.")
-        except subprocess.TimeoutExpired:
-            pytest.skip("Build timed out after 5 minutes.")
-
-    if not lib_path.exists():
-        pytest.skip(f"Library not found at {lib_path} after build attempt.")
-
-    # Verify library can be loaded
-    try:
-        ctypes.CDLL(str(lib_path))
-    except OSError as e:
-        pytest.skip(f"Cannot load library: {e}")
+    reason = _ensure_library_ready()
+    if reason is not None:
+        pytest.skip(reason)
 
 
 # =============================================================================
@@ -210,10 +218,136 @@ MODEL_REGISTRY = {
 }
 
 
+def _find_talu_managed_model_path(model_uri: str) -> Path | None:
+    """Find a TALU_HOME-managed model directory for a model URI."""
+    if "/" not in model_uri:
+        return None
+    talu_home = Path(os.environ.get("TALU_HOME", str(Path.home() / ".cache" / "talu")))
+    model_dir = talu_home / "models" / model_uri
+    if model_dir.exists() and (model_dir / "config.json").exists():
+        return model_dir
+    return None
+
+
+def _is_model_available(model_uri: str) -> bool:
+    """Best-effort availability check for local/HF/managed model URIs."""
+    from tests.fixtures import find_cached_model_path
+
+    # Local paths
+    if model_uri.startswith("/") or model_uri.startswith("./") or model_uri.startswith("../"):
+        return Path(model_uri).exists()
+
+    # Remote backend refs can't be checked locally here.
+    if "::" in model_uri:
+        return True
+
+    # Managed converted model URI (e.g., org/model-TQ4)
+    if "-TQ" in model_uri:
+        if _find_talu_managed_model_path(model_uri) is not None:
+            return True
+        base_model = model_uri.split("-TQ", 1)[0]
+        return find_cached_model_path(base_model) is not None
+
+    # HuggingFace model ID
+    if "/" in model_uri:
+        return find_cached_model_path(model_uri) is not None
+
+    return Path(model_uri).exists()
+
+
+def _missing_model_msg(env_var: str, model_uri: str) -> str:
+    """Build a concise, actionable missing-model message."""
+    return (
+        f"Required test model is missing: {model_uri!r} ({env_var}).\n"
+        f"Set {env_var} to an available local model URI/path, or cache the default model first.\n"
+        "Example: talu get llamafactory/tiny-random-Llama-3\n"
+        "If you only want model-free tests: pytest -m 'not requires_model'."
+    )
+
+
+def _unusable_model_msg(env_var: str, model_uri: str, error: str) -> str:
+    """Build a concise, actionable message for unusable model artifacts."""
+    return (
+        f"Required test model is present but unusable: {model_uri!r} ({env_var}).\n"
+        "Set the env var to a working model URI/path and re-run tests.\n"
+        f"Underlying error: {error}"
+    )
+
+
+def _validate_model_loadable_for_tokenizer(model_uri: str) -> str | None:
+    """Return an error string if tokenizer creation fails for model_uri."""
+    try:
+        import talu
+
+        tokenizer = talu.Tokenizer(model_uri)
+        tokenizer.close()
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _arg_targets_path(args: tuple[str, ...], target: str) -> bool:
+    """Return True when pytest invocation args include a given test path target."""
+    normalized_target = target.replace("\\", "/")
+    for arg in args:
+        if arg.startswith("-"):
+            continue
+        normalized_arg = arg.replace("\\", "/")
+        if normalized_target in normalized_arg:
+            return True
+    return False
+
+
+def _preflight_models_for_selected_suites(config) -> None:
+    """Fail fast on main process for suites that require model-backed tokenizer fixtures."""
+    if hasattr(config, "workerinput"):
+        return
+
+    markexpr = config.option.markexpr or ""
+    if "not requires_model" in markexpr:
+        return
+
+    args = tuple(config.invocation_params.args)
+    suite_model_targets = (
+        ("tests/tokenizer", "TEST_MODEL_URI_TEXT_RANDOM", TEST_MODEL_URI_TEXT_RANDOM),
+        ("tests/memory", "TEST_MODEL_URI_TEXT_RANDOM", TEST_MODEL_URI_TEXT_RANDOM),
+        ("tests/reference", "TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT),
+    )
+    selected = [
+        (env_var, model_uri)
+        for suite_path, env_var, model_uri in suite_model_targets
+        if _arg_targets_path(args, suite_path)
+    ]
+    if not selected:
+        return
+
+    library_reason = _ensure_library_ready()
+    if library_reason is not None:
+        return
+
+    for env_var, model_uri in selected:
+        if not _is_model_available(model_uri):
+            pytest.exit(_missing_model_msg(env_var, model_uri), returncode=2)
+        load_error = _validate_model_loadable_for_tokenizer(model_uri)
+        if load_error is not None:
+            pytest.exit(_unusable_model_msg(env_var, model_uri, load_error), returncode=2)
+
+
 @pytest.fixture(scope="session")
-def test_model_path():
+def test_model_path(ensure_library_built):
     """Return the text model URI (TEST_MODEL_URI_TEXT_RANDOM env var or default)."""
-    return TEST_MODEL_URI_TEXT_RANDOM
+    model_uri = TEST_MODEL_URI_TEXT_RANDOM
+    if _is_model_available(model_uri):
+        load_error = _validate_model_loadable_for_tokenizer(model_uri)
+        if load_error is None:
+            return model_uri
+        pytest.exit(
+            _unusable_model_msg("TEST_MODEL_URI_TEXT_RANDOM", model_uri, load_error),
+            returncode=2,
+        )
+
+    msg = _missing_model_msg("TEST_MODEL_URI_TEXT_RANDOM", model_uri)
+    pytest.exit(msg, returncode=2)
 
 
 # Note: The old `session` fixture that created Chat(model_path) is removed.
@@ -294,3 +428,4 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "integration: marks integration tests (subprocess-heavy, external deps)"
     )
+    _preflight_models_for_selected_suites(config)

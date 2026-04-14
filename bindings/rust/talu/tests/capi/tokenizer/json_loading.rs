@@ -1453,15 +1453,19 @@ fn bpe_unsupported_fuse_unk_returns_error() {
     );
 }
 
-/// Unsupported explicit BPE byte_fallback configuration must also be rejected
-/// rather than silently ignored.
+/// BPE byte_fallback is supported and must load when explicitly enabled.
 #[test]
-fn bpe_unsupported_byte_fallback_flag_returns_error() {
+fn bpe_byte_fallback_enabled_loads() {
     let json = r#"{
   "version": "1.0",
   "model": {
     "type": "BPE",
-    "vocab": {"<unk>": 0, "a": 1},
+    "vocab": {
+      "<unk>": 0,
+      "<0x00>": 1,
+      "<0x01>": 2,
+      "<0x02>": 3
+    },
     "merges": [],
     "byte_fallback": true
   },
@@ -1469,13 +1473,10 @@ fn bpe_unsupported_byte_fallback_flag_returns_error() {
   "normalizer": null,
   "pre_tokenizer": null,
   "post_processor": null,
-  "decoder": null
+  "decoder": {"type": "ByteFallback"}
 }"#;
-    assert_rejected_valid_json(
-        json,
-        talu_sys::ErrorCode::InternalError,
-        "unsupported explicit BPE byte_fallback flag must be rejected, not ignored",
-    );
+    let handle = try_load(json).expect("explicit byte_fallback=true must load");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
 }
 
 /// BPE must reject unsupported WordPiece-style continuing_subword_prefix rather
@@ -1528,16 +1529,33 @@ fn bpe_unsupported_end_of_word_suffix_returns_error() {
     );
 }
 
-/// BPE must reject unsupported ignore_merges rather than silently ignoring a
-/// flag that changes the core tokenization algorithm.
+/// BPE `ignore_merges` must be applied, not rejected and not silently ignored.
 #[test]
-fn bpe_unsupported_ignore_merges_returns_error() {
-    let json = r#"{
+fn bpe_ignore_merges_changes_tokenization_when_vocab_contains_full_token() {
+    let json_ignore_false = r#"{
   "version": "1.0",
   "model": {
     "type": "BPE",
-    "vocab": {"<unk>": 0, "a": 1},
-    "merges": [],
+    "vocab": {"<unk>": 0, "a": 1, "b": 2, "c": 3, "ab": 4, "abc": 5},
+    "merges": [["a", "b"]],
+    "ignore_merges": false
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx_false = TokenizerTestContext::from_json(json_ignore_false);
+    let ids_false = ctx_false.encode_with("abc", &no_bos());
+    assert_eq!(ids_false, vec![4, 3], "ignore_merges=false must use merge path");
+
+    let json_ignore_true = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "a": 1, "b": 2, "c": 3, "ab": 4, "abc": 5},
+    "merges": [["a", "b"]],
     "ignore_merges": true
   },
   "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
@@ -1546,10 +1564,12 @@ fn bpe_unsupported_ignore_merges_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert_rejected_valid_json(
-        json,
-        talu_sys::ErrorCode::InternalError,
-        "unsupported BPE ignore_merges must be rejected, not ignored",
+    let ctx_true = TokenizerTestContext::from_json(json_ignore_true);
+    let ids_true = ctx_true.encode_with("abc", &no_bos());
+    assert_eq!(
+        ids_true,
+        vec![5],
+        "ignore_merges=true must prefer full-token vocab match",
     );
 }
 

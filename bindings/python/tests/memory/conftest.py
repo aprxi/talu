@@ -15,7 +15,13 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import TEST_MODEL_URI_TEXT_RANDOM
+from tests.conftest import (
+    TEST_MODEL_URI_TEXT_RANDOM,
+    _is_model_available,
+    _missing_model_msg,
+    _unusable_model_msg,
+    _validate_model_loadable_for_tokenizer,
+)
 
 # =============================================================================
 # Model Discovery
@@ -23,8 +29,23 @@ from tests.conftest import TEST_MODEL_URI_TEXT_RANDOM
 
 
 @pytest.fixture(scope="module")
-def test_model_path():
+def test_model_path(ensure_library_built):
     """Return the model URI (TEST_MODEL_URI_TEXT env var or default)."""
+    if not _is_model_available(TEST_MODEL_URI_TEXT_RANDOM):
+        pytest.exit(
+            _missing_model_msg("TEST_MODEL_URI_TEXT_RANDOM", TEST_MODEL_URI_TEXT_RANDOM),
+            returncode=2,
+        )
+    load_error = _validate_model_loadable_for_tokenizer(TEST_MODEL_URI_TEXT_RANDOM)
+    if load_error is not None:
+        pytest.exit(
+            _unusable_model_msg(
+                "TEST_MODEL_URI_TEXT_RANDOM",
+                TEST_MODEL_URI_TEXT_RANDOM,
+                load_error,
+            ),
+            returncode=2,
+        )
     return TEST_MODEL_URI_TEXT_RANDOM
 
 

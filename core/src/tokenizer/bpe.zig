@@ -100,6 +100,10 @@ pub const BpeModel = struct {
     // which uses orig_byte_vocab_ids for O(1) symbol init per byte.
     use_raw_byte_init: bool,
 
+    // Mirrors HuggingFace BPE `ignore_merges` option. When enabled, encoding
+    // prefers a direct full-token vocab match before applying merge rules.
+    ignore_merges: bool,
+
     // Config
     unk_token: [16]u8,
     unk_id: i32,
@@ -170,6 +174,7 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
         .byte_vocab_ids = [_]i32{-1} ** 256,
         .orig_byte_vocab_ids = [_]i32{-1} ** 256,
         .use_raw_byte_init = false,
+        .ignore_merges = parseIgnoreMergesOption(json_buffer),
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -525,6 +530,76 @@ fn findSectionStart(json: []const u8, key: []const u8) ?usize {
     return @intFromPtr(section.ptr) - @intFromPtr(json.ptr);
 }
 
+fn findJsonKeyPos(json_bytes: []const u8, field_bytes: []const u8) ?usize {
+    var cursor: usize = 0;
+    while (cursor < json_bytes.len) {
+        if (json_bytes[cursor] == '"') {
+            const key_start = cursor;
+            cursor += 1;
+            while (cursor < json_bytes.len) {
+                if (json_bytes[cursor] == '\\' and cursor + 1 < json_bytes.len) {
+                    cursor += 2;
+                } else if (json_bytes[cursor] == '"') {
+                    cursor += 1;
+                    break;
+                } else {
+                    cursor += 1;
+                }
+            }
+            const key_end = cursor;
+            if (key_end - key_start == field_bytes.len and
+                std.mem.eql(u8, json_bytes[key_start..key_end], field_bytes))
+            {
+                return key_start;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    return null;
+}
+
+fn findJsonFieldValue(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
+    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
+    var cursor = pos + field_bytes.len;
+    while (cursor < json_bytes.len and
+        (json_bytes[cursor] == ' ' or
+            json_bytes[cursor] == ':' or
+            json_bytes[cursor] == '\t' or
+            json_bytes[cursor] == '\n' or
+            json_bytes[cursor] == '\r')) : (cursor += 1)
+    {}
+    if (cursor >= json_bytes.len) return null;
+
+    const value_start = cursor;
+    while (cursor < json_bytes.len and
+        json_bytes[cursor] != ',' and
+        json_bytes[cursor] != '}' and
+        json_bytes[cursor] != ']' and
+        json_bytes[cursor] != ' ' and
+        json_bytes[cursor] != '\n' and
+        json_bytes[cursor] != '\r') : (cursor += 1)
+    {}
+    return json_bytes[value_start..cursor];
+}
+
+fn parseIgnoreMergesOption(json: []const u8) bool {
+    var search_scope = json;
+    if (findSectionStart(json, "\"model\"")) |model_start| {
+        const model_section = json[model_start..];
+        if (model_section.len > 0 and model_section[0] == '{') {
+            if (utils.findMatchingBrace(model_section, '{', '}')) |model_len| {
+                search_scope = model_section[0..model_len];
+            }
+        }
+    }
+
+    if (findJsonFieldValue(search_scope, "\"ignore_merges\"")) |value| {
+        return std.mem.eql(u8, value, "true");
+    }
+    return false;
+}
+
 /// Build byte fallback lookup table for SentencePiece models
 /// Looks for tokens like "<0x00>", "<0x01>", ..., "<0xFF>" in vocab
 fn initByteFallback(model: *BpeModel) void {
@@ -683,11 +758,38 @@ fn encodeWordAppend(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_
     return encodeWordCore(model, tok, word, out_ids);
 }
 
+fn lookupWholeWordId(model: *BpeModel, word: []const u8, use_raw_byte_init: bool) ?i32 {
+    if (use_raw_byte_init) {
+        // Raw-byte fast path stores symbols as original bytes, but vocab keys
+        // are byte-level encoded strings. Re-encode through byte_to_unicode.
+        var enc_buf: [MAX_WORD_SYMBOLS * 4]u8 = undefined;
+        var enc_len: usize = 0;
+        for (word) |byte| {
+            const encoded = model.byte_to_unicode[byte];
+            if (encoded.len == 0 or enc_len + encoded.len > enc_buf.len) return null;
+            @memcpy(enc_buf[enc_len..][0..encoded.len], encoded);
+            enc_len += encoded.len;
+        }
+        return model.vocab_hash.get(enc_buf[0..enc_len]);
+    }
+    return model.vocab_hash.get(word);
+}
+
 /// Core BPE encode: symbol init → merge loop → collect. No added-token check.
 /// Used by the direct encode path where added tokens are pre-separated.
 fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *IdList) !void {
     const allocator = model.allocator;
     const is_byte_level = tok.pretokenizer.byte_level != 0;
+    const use_raw_byte_init = is_byte_level and model.use_raw_byte_init and tok.pretokenizer.is_sequence == 0;
+
+    // HuggingFace `ignore_merges=true`: prefer direct vocab hit for the full
+    // pretokenized word before running the merge algorithm.
+    if (model.ignore_merges) {
+        if (lookupWholeWordId(model, word, use_raw_byte_init)) |id| {
+            try out_ids.append(allocator, id);
+            return;
+        }
+    }
 
     // --- Linked-list BPE merge with integer pair lookups ---
 
@@ -704,7 +806,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
 
     var syms: []Symbol = &stack_syms;
 
-    if (is_byte_level and model.use_raw_byte_init and tok.pretokenizer.is_sequence == 0) {
+    if (use_raw_byte_init) {
         // Byte-level BPE with raw byte init: each byte maps directly to a
         // vocab token via orig_byte_vocab_ids. No UTF-8 parsing or hash
         // lookups needed. Requires applyByteLevel to be skipped (non-sequence
@@ -997,26 +1099,9 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
             si = syms[@intCast(si)].next;
         }
         if (!all_known) {
-            if (used_raw_byte_init) {
-                // Raw byte init path: word contains original bytes, but vocab_hash
-                // keys are byte-level encoded. Convert through byte_to_unicode.
-                var enc_buf: [MAX_WORD_SYMBOLS * 4]u8 = undefined;
-                var enc_len: usize = 0;
-                for (word) |byte| {
-                    const encoded = model.byte_to_unicode[byte];
-                    if (encoded.len == 0 or enc_len + encoded.len > enc_buf.len) break;
-                    @memcpy(enc_buf[enc_len..][0..encoded.len], encoded);
-                    enc_len += encoded.len;
-                }
-                if (model.vocab_hash.get(enc_buf[0..enc_len])) |id| {
-                    try out_ids.append(allocator, id);
-                    return;
-                }
-            } else {
-                if (model.vocab_hash.get(word)) |id| {
-                    try out_ids.append(allocator, id);
-                    return;
-                }
+            if (lookupWholeWordId(model, word, used_raw_byte_init)) |id| {
+                try out_ids.append(allocator, id);
+                return;
             }
         }
     }
@@ -1456,6 +1541,7 @@ fn createFromSpec(allocator: std.mem.Allocator, spec: *const ct.BpeModelSpec) !*
         .byte_vocab_ids = [_]i32{-1} ** 256,
         .orig_byte_vocab_ids = [_]i32{-1} ** 256,
         .use_raw_byte_init = false,
+        .ignore_merges = false,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -1922,6 +2008,7 @@ test "tokenizer_bpe_create_from_spec: initByteMap creates valid mappings" {
         .byte_vocab_ids = [_]i32{-1} ** 256,
         .orig_byte_vocab_ids = [_]i32{-1} ** 256,
         .use_raw_byte_init = false,
+        .ignore_merges = false,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -2003,6 +2090,7 @@ test "tokenizer_bpe_create_from_spec: initByteMap handles control characters wit
         .byte_vocab_ids = [_]i32{-1} ** 256,
         .orig_byte_vocab_ids = [_]i32{-1} ** 256,
         .use_raw_byte_init = false,
+        .ignore_merges = false,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -2069,4 +2157,52 @@ test "encodeWordDirect handles long words above MAX_WORD_SYMBOLS without cache o
         try std.testing.expectEqual(merged_id, id);
     }
     try std.testing.expectEqual(@as(i32, 0), first_ids.items[first_ids.items.len - 1]);
+}
+
+test "encodeWordDirect keeps merge behavior when ignore_merges is false" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "ignore_merges": false,
+        \\    "vocab": {"<unk>": 0, "a": 1, "b": 2, "c": 3, "ab": 4, "abc": 5},
+        \\    "merges": [["a", "b"]]
+        \\  }
+        \\}
+    ;
+
+    const tokenizer = try createBpeTokenizer(allocator, json, false);
+    defer allocator.destroy(tokenizer);
+    defer tokenizer.destroy();
+
+    const model: *BpeModel = @ptrCast(@alignCast(tokenizer.model.?));
+    var ids = IdList{};
+    defer ids.deinit(allocator);
+    try model.encodeWordDirect(tokenizer, "abc", &ids);
+    try std.testing.expectEqualSlices(i32, &.{ 4, 3 }, ids.items);
+}
+
+test "encodeWordDirect prefers direct token when ignore_merges is true" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "ignore_merges": true,
+        \\    "vocab": {"<unk>": 0, "a": 1, "b": 2, "c": 3, "ab": 4, "abc": 5},
+        \\    "merges": [["a", "b"]]
+        \\  }
+        \\}
+    ;
+
+    const tokenizer = try createBpeTokenizer(allocator, json, false);
+    defer allocator.destroy(tokenizer);
+    defer tokenizer.destroy();
+
+    const model: *BpeModel = @ptrCast(@alignCast(tokenizer.model.?));
+    var ids = IdList{};
+    defer ids.deinit(allocator);
+    try model.encodeWordDirect(tokenizer, "abc", &ids);
+    try std.testing.expectEqualSlices(i32, &.{5}, ids.items);
 }
