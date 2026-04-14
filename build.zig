@@ -1859,10 +1859,10 @@ pub fn build(b: *std.Build) void {
     }
 
     // ==========================================================================
-    // Python Binding Generator (core/tests/helpers/gen_bindings.zig)
+    // Python Binding Generator (core/helpers/gen_bindings_python.zig)
     // ==========================================================================
     // Python bindings generator
-    const gen_bindings_path = "core/tests/helpers/gen_bindings.zig";
+    const gen_bindings_path = "core/helpers/gen_bindings_python.zig";
     if (std.fs.cwd().access(gen_bindings_path, .{})) |_| {
         const host_target = b.resolveTargetQuery(.{});
 
@@ -1872,7 +1872,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         });
         const gen_exe = b.addExecutable(.{
-            .name = "gen_bindings",
+            .name = "gen_bindings_python",
             .root_module = gen_mod,
         });
         b.installArtifact(gen_exe);
@@ -1894,7 +1894,10 @@ pub fn build(b: *std.Build) void {
         });
         copy_native.step.dependOn(&format_cmd.step);
 
-        const gen_step = b.step("gen-bindings", "Generate Python ctypes bindings from C API");
+        const gen_step = b.step(
+            "gen-bindings-python",
+            "Generate Python ctypes bindings from C API",
+        );
         gen_step.dependOn(&copy_native.step);
 
         // Release step generates _native.py but skips the cp to bindings/python/
@@ -1905,7 +1908,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // Rust bindings generator
-    const gen_bindings_rust_path = "core/tests/helpers/gen_bindings_rust.zig";
+    const gen_bindings_rust_path = "core/helpers/gen_bindings_rust.zig";
     if (std.fs.cwd().access(gen_bindings_rust_path, .{})) |_| {
         const host_target = b.resolveTargetQuery(.{});
 

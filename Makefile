@@ -1,4 +1,4 @@
-.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
+.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings-python ui
 
 # Detect platform-specific settings
 UNAME_S := $(shell uname -s)
@@ -341,8 +341,8 @@ cuda: deps sync-version ui
 	PATH="$(CUDA_BIN_DIR):$$PATH" zig build release $(CUDA_BUILD_FLAGS)
 
 # Generate Python ctypes bindings from Zig C API
-gen-bindings:
-	zig build gen-bindings -Drelease
+gen-bindings-python:
+	zig build gen-bindings-python -Drelease
 	zig build gen-bindings-rust -Drelease
 
 # Sync VERSION to binding vendor directories

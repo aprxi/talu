@@ -11,7 +11,7 @@ import pytest
 
 from talu.converter import (
     ALL_SCHEMES,
-    GAF_SCHEMES,
+    TQ_SCHEMES,
     HARDWARE_SCHEMES,
     IMPLEMENTED_SCHEMES,
     MAX_OVERRIDES,
@@ -24,7 +24,7 @@ from talu.converter import (
     QuantLevel,
     Scheme,
     get_schemes_json,
-    is_gaf_scheme,
+    is_tq_scheme,
     is_implemented,
     platform_to_enum,
     quant_to_enum,
@@ -36,17 +36,17 @@ from talu.exceptions import ValidationError
 class TestSchemeConstants:
     """Tests for Scheme class constants."""
 
-    def test_gaf4_schemes_have_correct_values(self):
-        """GAF4 schemes have expected enum values."""
-        assert Scheme.GAF4_32 == 10
-        assert Scheme.GAF4_64 == 11
-        assert Scheme.GAF4_128 == 12
+    def test_tq4_schemes_have_correct_values(self):
+        """TQ4 schemes have expected enum values."""
+        assert Scheme.TQ4_32 == 10
+        assert Scheme.TQ4_64 == 11
+        assert Scheme.TQ4_128 == 12
 
-    def test_gaf8_schemes_have_correct_values(self):
-        """GAF8 schemes have expected enum values."""
-        assert Scheme.GAF8_32 == 13
-        assert Scheme.GAF8_64 == 14
-        assert Scheme.GAF8_128 == 15
+    def test_tq8_schemes_have_correct_values(self):
+        """TQ8 schemes have expected enum values."""
+        assert Scheme.TQ8_32 == 13
+        assert Scheme.TQ8_64 == 14
+        assert Scheme.TQ8_128 == 15
 
     def test_hardware_schemes_have_correct_values(self):
         """Hardware float schemes have expected enum values."""
@@ -62,14 +62,14 @@ class TestSchemeNameMappings:
     def test_all_schemes_contains_all_scheme_names(self):
         """ALL_SCHEMES contains all 10 scheme names."""
         assert len(ALL_SCHEMES) == 10
-        assert "gaf4_64" in ALL_SCHEMES
+        assert "tq4_64" in ALL_SCHEMES
         assert "fp8_e4m3" in ALL_SCHEMES
 
-    def test_gaf_schemes_contains_only_gaf(self):
-        """GAF_SCHEMES contains only GAF schemes."""
-        assert len(GAF_SCHEMES) == 6
-        for scheme in GAF_SCHEMES:
-            assert scheme.startswith("gaf")
+    def test_tq_schemes_contains_only_tq(self):
+        """TQ_SCHEMES contains only TQ schemes."""
+        assert len(TQ_SCHEMES) == 6
+        for scheme in TQ_SCHEMES:
+            assert scheme.startswith("tq")
 
     def test_hardware_schemes_contains_only_hardware(self):
         """HARDWARE_SCHEMES contains only hardware schemes."""
@@ -77,48 +77,48 @@ class TestSchemeNameMappings:
         expected = {"fp8_e4m3", "fp8_e5m2", "mxfp4", "nvfp4"}
         assert HARDWARE_SCHEMES == expected
 
-    def test_implemented_schemes_equals_gaf(self):
-        """IMPLEMENTED_SCHEMES currently equals GAF_SCHEMES."""
-        assert IMPLEMENTED_SCHEMES == GAF_SCHEMES
+    def test_implemented_schemes_equals_tq(self):
+        """IMPLEMENTED_SCHEMES currently equals TQ_SCHEMES."""
+        assert IMPLEMENTED_SCHEMES == TQ_SCHEMES
 
     def test_scheme_name_to_enum_maps_correctly(self):
         """SCHEME_NAME_TO_ENUM maps scheme names to enum values."""
-        assert SCHEME_NAME_TO_ENUM["gaf4_64"] == Scheme.GAF4_64
+        assert SCHEME_NAME_TO_ENUM["tq4_64"] == Scheme.TQ4_64
         assert SCHEME_NAME_TO_ENUM["fp8_e4m3"] == Scheme.FP8_E4M3
 
 
-class TestIsGafScheme:
-    """Tests for is_gaf_scheme function."""
+class TestIsTqScheme:
+    """Tests for is_tq_scheme function."""
 
-    def test_gaf_schemes_return_true(self):
-        """GAF scheme names return True."""
-        assert is_gaf_scheme("gaf4_32") is True
-        assert is_gaf_scheme("gaf4_64") is True
-        assert is_gaf_scheme("gaf8_128") is True
+    def test_tq_schemes_return_true(self):
+        """TQ scheme names return True."""
+        assert is_tq_scheme("tq4") is True
+        assert is_tq_scheme("tq4_64") is True
+        assert is_tq_scheme("tq8_128") is True
 
     def test_hardware_schemes_return_false(self):
         """Hardware scheme names return False."""
-        assert is_gaf_scheme("fp8_e4m3") is False
-        assert is_gaf_scheme("mxfp4") is False
+        assert is_tq_scheme("fp8_e4m3") is False
+        assert is_tq_scheme("mxfp4") is False
 
     def test_case_insensitive(self):
-        """is_gaf_scheme is case insensitive."""
-        assert is_gaf_scheme("GAF4_64") is True
-        assert is_gaf_scheme("Gaf8_32") is True
+        """is_tq_scheme is case insensitive."""
+        assert is_tq_scheme("TQ4_64") is True
+        assert is_tq_scheme("Tq8_32") is True
 
     def test_invalid_scheme_returns_false(self):
         """Invalid scheme names return False."""
-        assert is_gaf_scheme("invalid") is False
-        assert is_gaf_scheme("") is False
+        assert is_tq_scheme("invalid") is False
+        assert is_tq_scheme("") is False
 
 
 class TestIsImplemented:
     """Tests for is_implemented function."""
 
-    def test_gaf_schemes_are_implemented(self):
-        """GAF schemes return True (implemented)."""
-        assert is_implemented("gaf4_64") is True
-        assert is_implemented("gaf8_32") is True
+    def test_tq_schemes_are_implemented(self):
+        """TQ schemes return True (implemented)."""
+        assert is_implemented("tq4_64") is True
+        assert is_implemented("tq8_32") is True
 
     def test_hardware_schemes_not_implemented(self):
         """Hardware schemes return False (not implemented)."""
@@ -127,7 +127,7 @@ class TestIsImplemented:
 
     def test_case_insensitive(self):
         """is_implemented is case insensitive."""
-        assert is_implemented("GAF4_64") is True
+        assert is_implemented("TQ4_64") is True
         assert is_implemented("FP8_E4M3") is False
 
 
@@ -300,13 +300,13 @@ class TestSchemeToEnumWithMocking:
     def test_scheme_to_enum_returns_code(self):
         """scheme_to_enum returns code from C library."""
         mock_lib = MagicMock()
-        mock_lib.talu_convert_parse_scheme.return_value = 11  # GAF4_64
+        mock_lib.talu_convert_parse_scheme.return_value = 11  # TQ4_64
 
         with patch("talu.converter._get_convert_lib", return_value=mock_lib):
-            result = scheme_to_enum("gaf4_64")
+            result = scheme_to_enum("tq4_64")
 
             assert result == 11
-            mock_lib.talu_convert_parse_scheme.assert_called_once_with(b"gaf4_64")
+            mock_lib.talu_convert_parse_scheme.assert_called_once_with(b"tq4_64")
 
     def test_scheme_to_enum_invalid_raises_validation_error(self):
         """scheme_to_enum raises ValidationError for invalid scheme."""
@@ -315,7 +315,7 @@ class TestSchemeToEnumWithMocking:
 
         with patch("talu.converter._get_convert_lib", return_value=mock_lib):
             with patch(
-                "talu.converter.get_schemes_json", return_value='{"gaf4_64": ["mlx"]}'
+                "talu.converter.get_schemes_json", return_value='{"tq4_64": ["mlx"]}'
             ):
                 with pytest.raises(ValidationError) as exc_info:
                     scheme_to_enum("invalid_scheme")

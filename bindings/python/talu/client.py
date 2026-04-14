@@ -78,7 +78,6 @@ from .router import (
 if TYPE_CHECKING:
     from .chat.hooks import Hook, HookManager
     from .chat.session import AsyncChat
-    from .profile import Profile
     from .router import BackendSpec, Capabilities, Router
     from .router.config import CompletionOptions, GenerationConfig
     from .template import PromptTemplate
@@ -199,9 +198,6 @@ class Client:
             - **str**: Simple model ID ("Qwen/Qwen3-0.6B", "openai::gpt-4o")
             - **ModelSpec**: Structured config for advanced backend settings
             - **list**: Multiple models for routing/fan-out (coming soon)
-        profile: Optional storage profile inherited by all chats created by
-            this client. If provided, chats persist to
-            ``~/.talu/db/<profile>/`` by default.
         hooks: List of Hook instances for observability (metrics, logging, tracing).
             Hooks receive callbacks at generation start, first token (TTFT), and end.
         base_url: API endpoint URL. When provided, uses OpenAI-compatible backend.
@@ -268,7 +264,6 @@ class Client:
         self,
         model: ModelInput | list[ModelInput],
         *,
-        profile: Profile | None = None,
         hooks: list[Hook] | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
@@ -317,8 +312,6 @@ class Client:
 
         self._closed = False
         self._chats: list[Chat] = []
-        self._profile = profile
-
         # Initialize hook manager for observability
         self._hooks = HookManager(hooks)
 
@@ -504,10 +497,9 @@ class Client:
             messages: Initial message history (for restoring sessions).
             model: Default model for this chat (not yet supported).
             config: Default generation config for this chat.
-                Profile persistence (if configured on Client) is also applied.
             session_id: Optional session identifier for this chat.
             parent_session_id: Optional parent session identifier for forks.
-            marker: Session marker for storage backends (default: "" = normal/unmarked).
+            marker: Session marker (default: "" = normal/unmarked).
                 Values: "pinned", "archived", "deleted", or "" (normal).
             metadata: Optional session metadata dict.
             chat_template: Custom chat template (None uses model default, use
@@ -534,7 +526,6 @@ class Client:
         # Create chat with client reference (Chat gets Router from Client)
         chat_instance = Chat(
             client=self,
-            profile=self._profile,
             system=system,
             model=model,
             config=config,
@@ -1069,7 +1060,7 @@ class AsyncClient:
             config: Default generation config for this chat.
             session_id: Optional session identifier for this chat.
             parent_session_id: Optional parent session identifier for forks.
-            marker: Session marker for storage backends (default: "" = normal/unmarked).
+            marker: Session marker (default: "" = normal/unmarked).
                 Values: "pinned", "archived", "deleted", or "" (normal).
             metadata: Optional session metadata dict.
             chat_template: Custom chat template (None uses model default, use

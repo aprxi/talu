@@ -8,6 +8,6 @@ __all__ = [
     "AsyncChat",
 ]
 
-# Internal helper - not part of public API but needs to be importable
-# by _chat_base.py for storage record conversion
+# Internal helper - not part of public API but imported by _chat_base.py
+# for ItemRecord conversion.
 _build_c_storage_records = _build_c_storage_records

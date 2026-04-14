@@ -3,7 +3,6 @@
 import pytest
 
 from talu.chat import Chat
-from talu.db import Database
 
 
 class TestSourceDocIdProperty:
@@ -32,24 +31,6 @@ class TestSourceDocIdProperty:
             assert chat.source_doc_id == "original-doc"
             chat.source_doc_id = None
             assert chat.source_doc_id is None
-
-
-class TestSourceDocIdWithStorage:
-    """Tests for source_doc_id with TaluDB storage."""
-
-    def test_source_doc_id_persists_in_session_record(self, tmp_path) -> None:
-        """source_doc_id is included in session records when using TaluDB."""
-        db_path = str(tmp_path / "test_db")
-        storage = Database(f"talu://{db_path}")
-
-        with Chat(
-            offline=True,
-            session_id="test-session-1",
-            storage=storage,
-            source_doc_id="persona-v1",
-        ) as chat:
-            # source_doc_id is set
-            assert chat.source_doc_id == "persona-v1"
 
 
 class TestSourceDocIdClosed:

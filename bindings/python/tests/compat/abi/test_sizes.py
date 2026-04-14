@@ -7,7 +7,7 @@ the auto-generated struct definitions in _native.py (generated from Zig C API).
 This catches drift when Zig structs change but manual Python definitions aren't updated.
 
 Auto-generated structs (_native.py) are the source of truth — they are produced
-by `zig build gen-bindings` and always match the C ABI. We validate manually-defined
+by `zig build gen-bindings-python` and always match the C ABI. We validate manually-defined
 structs against them, and also sanity-check that auto-generated structs have
 non-zero size (i.e. they were actually generated).
 

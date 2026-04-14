@@ -130,13 +130,11 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 from talu.router.config import GenerationConfig, Grammar
 from talu.types import ItemRecord, ItemStatus, ItemType, MessageItem, MessageRole
 
-from ...db import Database
 from ...exceptions import (
     SchemaValidationError,
     StateError,
     TaluError,
 )
-from ...profile import Profile, new_session_id
 from ...template import PromptTemplate
 from .._chat_base import ChatBase
 from .._generate import SCHEMA_PLACEHOLDER
@@ -211,23 +209,14 @@ class Chat(ChatBase):
             role="system" (accessible via ``messages[0]``). This follows the
             HuggingFace chat template convention where system prompts are
             part of the messages list, not a separate template variable.
-        profile: Optional storage profile. When provided, chat history is
-            persisted under ``~/.talu/db/<profile>/``. If ``session_id`` is
-            not provided, a UUIDv4 session ID is generated automatically.
-        session_id: Optional session identifier for this conversation. Used by
-            storage backends to group messages by session. When persisting to
-            TaluDB (when using talu://), session_id is hashed to SESSION_HASH for efficient
-            Jump Reads during session restoration.
+        session_id: Optional session identifier for this conversation.
         parent_session_id: Optional parent session identifier for forks.
-        marker: Session marker for storage backends (default: "" = normal/unmarked).
+        marker: Session marker (default: "" = normal/unmarked).
             Values: "pinned", "archived", "deleted", or "" (normal).
         metadata: Optional session metadata dict (tags, UI state, notes).
         chat_template: Custom chat template to use instead of the model's default.
             Can be a PromptTemplate object or a template string. If None (default),
             uses the model's chat_template from tokenizer_config.json.
-        storage: Storage for messages. Defaults to Database(":memory:").
-            Use Database("talu://<path>") for TaluDB persistence (requires session_id).
-            Cannot be combined with ``profile``.
         offline: If True, disallow network access when resolving model URIs.
 
     Attributes
@@ -323,7 +312,6 @@ class Chat(ChatBase):
         client: Client | None = None,
         config: GenerationConfig | None = None,
         system: str | None = None,
-        profile: Profile | None = None,
         session_id: str | None = None,
         parent_session_id: str | None = None,
         group_id: str | None = None,
@@ -333,7 +321,6 @@ class Chat(ChatBase):
         source_doc_id: str | None = None,
         prompt_id: str | None = None,
         chat_template: str | PromptTemplate | None = None,
-        storage: Database | None = None,
         offline: bool = False,
         _defer_session_update: bool = False,
     ):
@@ -342,15 +329,6 @@ class Chat(ChatBase):
             from ...exceptions import ValidationError
 
             raise ValidationError("Provide either 'model' or 'client', not both")
-
-        if profile is not None:
-            if storage is not None:
-                from ...exceptions import ValidationError
-
-                raise ValidationError("Cannot use both 'profile' and 'storage'")
-            storage = profile.database
-            if session_id is None:
-                session_id = new_session_id()
 
         # Set up client/router before calling _init_base
         self._client: Client | AsyncClient | None = None
@@ -383,7 +361,6 @@ class Chat(ChatBase):
             source_doc_id=source_doc_id,
             prompt_id=prompt_id,
             chat_template=chat_template,
-            storage=storage,
             config=config,
             offline=offline,
             _defer_session_update=_defer_session_update,

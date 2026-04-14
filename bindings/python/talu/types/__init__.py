@@ -4,8 +4,8 @@ Open Responses data model.
 This module provides the data definitions for conversation history and storage
 records. It is the Python equivalent of Zig's ``core/src/responses/`` module.
 
-The types here define the "shape" of conversations, enabling ``talu.db`` and
-``talu.chat`` to share a common language without importing each other.
+The types here define the "shape" of conversations and portable item records
+used by ``talu.chat`` serialization APIs.
 
 Three layers:
 
@@ -192,6 +192,6 @@ __all__ = [
     "UnknownItem",
     # Type Aliases
     "ConversationItem",
-    # Storage Records (returned by Database.list_sessions())
+    # Item Records (serialization / restoration)
     "SessionRecord",
 ]

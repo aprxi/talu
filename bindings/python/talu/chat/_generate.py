@@ -227,15 +227,10 @@ def _make_notify_storage(
     chat: Any,
     message: str | list[dict[str, Any]],  # noqa: ARG001
 ) -> Callable[[str], None]:
-    """Create storage notification callback.
-
-    Note: Storage events are handled by TaluDB when a Database with talu://
-    location is used. This callback is a no-op but kept for interface consistency.
-    """
+    """Create post-generation callback (currently a no-op)."""
 
     def notify_storage(assistant_text: str) -> None:  # noqa: ARG001
-        # Storage events are handled by TaluDB directly.
-        # This is a no-op kept for interface consistency with session.py.
+        # Reserved for future post-generation hooks.
         pass
 
     return notify_storage

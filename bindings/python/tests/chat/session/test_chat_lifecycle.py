@@ -451,36 +451,3 @@ class TestConfigOverrideLogic:
         chat = Chat()
         with pytest.raises(talu.ValidationError, match="Unknown"):
             chat._build_effective_config(invalid_param=42)
-
-
-# =============================================================================
-# Storage Tests
-# =============================================================================
-
-
-class TestStorage:
-    """Tests for storage functionality."""
-
-    def test_storage_parameter_accepted(self):
-        """Chat accepts storage parameter."""
-        from talu.db import Database as Storage
-
-        storage = Storage()
-        chat = Chat(storage=storage)
-        assert chat._storage is storage
-
-    def test_default_storage_is_storage(self):
-        """Default storage is Storage."""
-        from talu.db import Database as Storage
-
-        chat = Chat()
-        assert isinstance(chat._storage, Storage)
-
-    def test_fork_preserves_storage(self):
-        """fork() preserves storage reference."""
-        from talu.db import Database
-
-        storage = Database()
-        chat = Chat(system="Test", storage=storage)
-        forked = chat.fork()
-        assert forked._storage is storage

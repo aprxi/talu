@@ -183,13 +183,12 @@ from talu.chat.session import AsyncChat
 
 # Chat - Async (classes only - async users should manage client lifecycle explicitly)
 from talu.client import AsyncClient, Client
-from talu.profile import Profile
 
 # Converter
 from talu.converter import convert
 
 # Validate
-from talu.db import Database
+from talu.validate import Validator
 
 # Exceptions (commonly-used exceptions at root; all via talu.exceptions)
 from talu.exceptions import (
@@ -254,23 +253,6 @@ from talu.template import PromptTemplate, TemplateEnvironment
 
 # Tokenizer
 from talu.tokenizer import Tokenizer
-from talu.validate import Validator
-
-
-def list_sessions(
-    *,
-    profile: str | None = None,
-    search: str | None = None,
-    limit: int = 50,
-) -> list[dict]:
-    """List sessions in a profile.
-
-    Args:
-        profile: Profile name, or None for the default profile.
-        search: Filter sessions by text content.
-        limit: Maximum number of sessions to return.
-    """
-    return Profile(profile).sessions(search=search, limit=limit)
 
 
 def set_log_level(level: str) -> None:
@@ -330,8 +312,6 @@ __all__ = [
     "AsyncChat",
     "AsyncClient",
     "ask",
-    "Profile",
-    "list_sessions",
     # Training
     "TrainingSession",
     # Tokenizer
@@ -343,8 +323,6 @@ __all__ = [
     "convert",
     # Validate
     "Validator",
-    # Database
-    "Database",
     # Exceptions
     "TaluError",
 ]

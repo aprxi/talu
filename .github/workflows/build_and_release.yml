@@ -156,7 +156,7 @@ jobs:
           echo "Building Rust/Zig with version: $VERSION_SEMVER"
 
           # Generate Python ctypes bindings from Zig C API
-          zig build gen-bindings
+          zig build gen-bindings-python
 
           # Sync version to Python _version.py (PEP 440 format)
           cat > bindings/python/talu/_version.py << EOF

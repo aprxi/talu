@@ -11,6 +11,7 @@ After (Pythonic):
     client = Client("gpt-4", base_url="...")
 """
 
+import importlib
 import warnings
 
 import pytest
@@ -303,6 +304,43 @@ class TestAsyncChatInfraKwargsRemoved:
             chat._close_sync()
         finally:
             client._router.close()
+
+
+# =============================================================================
+# Removed Python persistence surface
+# =============================================================================
+
+
+class TestRemovedPythonPersistenceSurface:
+    """Regression tests for removed db/profile Python APIs."""
+
+    def test_client_rejects_profile_kwarg(self) -> None:
+        """Client no longer accepts profile=."""
+        with pytest.raises(TypeError):
+            Client("test-model", profile=None)
+
+    def test_chat_rejects_storage_kwarg(self) -> None:
+        """Chat no longer accepts storage=."""
+        with pytest.raises(TypeError):
+            Chat(storage=None)
+
+    def test_chat_rejects_profile_kwarg(self) -> None:
+        """Chat no longer accepts profile=."""
+        with pytest.raises(TypeError):
+            Chat(profile=None)
+
+    def test_root_module_does_not_export_profile_db_api(self) -> None:
+        """talu root no longer exports Profile/Database/list_sessions."""
+        import talu
+
+        assert "Profile" not in talu.__all__
+        assert "Database" not in talu.__all__
+        assert "list_sessions" not in talu.__all__
+
+    def test_db_submodule_is_removed(self) -> None:
+        """Importing talu.db now fails."""
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("talu.db")
 
 
 # =============================================================================

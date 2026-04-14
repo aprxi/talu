@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 from talu.router.config import GenerationConfig, Grammar
 from talu.types import MessageItem, MessageRole
 
-from ...db import Database
 from ...exceptions import (
     SchemaValidationError,
     StateError,
@@ -70,12 +69,10 @@ class AsyncChat(ChatBase):
         system: Optional system prompt.
         session_id: Optional session identifier for this conversation.
         parent_session_id: Optional parent session identifier for forks.
-        marker: Session marker for storage backends (default: "" = normal/unmarked).
+        marker: Session marker (default: "" = normal/unmarked).
             Values: "pinned", "archived", "deleted", or "" (normal).
         metadata: Optional session metadata dict (tags, UI state, notes).
         chat_template: Custom chat template to use.
-        storage: Storage for messages. Use Database("talu://<path>") for TaluDB
-            persistence (requires session_id).
         offline: If True, disallow network access when resolving model URIs.
 
     Example - Basic async usage:
@@ -127,7 +124,6 @@ class AsyncChat(ChatBase):
         source_doc_id: str | None = None,
         prompt_id: str | None = None,
         chat_template: str | PromptTemplate | None = None,
-        storage: Database | None = None,
         offline: bool = False,
         _defer_session_update: bool = False,
     ):
@@ -168,7 +164,6 @@ class AsyncChat(ChatBase):
             source_doc_id=source_doc_id,
             prompt_id=prompt_id,
             chat_template=chat_template,
-            storage=storage,
             config=config,
             offline=offline,
             _defer_session_update=_defer_session_update,

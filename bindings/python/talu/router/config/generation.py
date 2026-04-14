@@ -60,7 +60,7 @@ class GenerationConfig:
     - "auto" handles 99% of cases without user intervention
     - Session defaults work via ``Chat(config=...)``
     - Per-request flexibility is preserved for experimentation
-    - ``Chat.__init__`` stays clean (identity only: model, system, storage)
+    - ``Chat.__init__`` stays clean (identity only: model/system/session metadata)
 
     Attributes
     ----------

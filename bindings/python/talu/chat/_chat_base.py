@@ -30,7 +30,6 @@ from talu.types import MessageItem
 
 from .._bindings import check
 from .._native import ChatCreateOptions
-from ..db import Database
 from ..exceptions import (
     GenerationError,
     SchemaValidationError,
@@ -86,7 +85,6 @@ class ChatBase:
     _prompt_id: str | None
     _defer_session_update: bool
     _chat_template: PromptTemplate | None
-    _storage: Database
     _last_response: Response | StreamingResponse | AsyncStreamingResponse | None
     config: GenerationConfig
 
@@ -107,7 +105,6 @@ class ChatBase:
         source_doc_id: str | None,
         prompt_id: str | None,
         chat_template: str | PromptTemplate | None,
-        storage: Database | None,
         config: GenerationConfig | None,
         offline: bool,
         _defer_session_update: bool,
@@ -116,7 +113,6 @@ class ChatBase:
 
         Called from subclass __init__ after client/router setup.
         """
-        use_taludb = isinstance(storage, Database) and storage.location.startswith("talu://")
         self._lib = get_chat_lib()
 
         # Session state
@@ -133,8 +129,7 @@ class ChatBase:
 
         # Create Zig Chat handle
         options = ChatCreateOptions(offline=offline)
-        create_system = None if use_taludb else system
-        self._chat_ptr = _c.chat_create(self._lib, create_system, session_id, options)
+        self._chat_ptr = _c.chat_create(self._lib, system, session_id, options)
 
         if not self._chat_ptr:
             raise MemoryError("Failed to create Chat")
@@ -167,30 +162,6 @@ class ChatBase:
         else:
             self._chat_template = chat_template
 
-        # Storage
-        self._storage = storage if storage is not None else Database()
-
-        if self._storage.location.startswith("talu://"):
-            if not self._session_id:
-                raise ValidationError("TaluDB requires session_id to be set.")
-
-            db_path = self._storage.location[len("talu://") :]
-            if not db_path:
-                raise ValidationError("TaluDB location must include a path after 'talu://'.")
-
-            result = self._lib.talu_db_ops_set_storage_db(
-                self._chat_ptr,
-                db_path.encode("utf-8"),
-                self._session_id.encode("utf-8"),
-            )
-            check(result, {"db_path": db_path, "session_id": self._session_id})
-
-            if len(self.items) == 0:
-                if system is not None:
-                    self.system = system
-            else:
-                self._system = self.items.system
-
         # Set prompt_id if provided
         if prompt_id is not None:
             rc = self._lib.talu_chat_set_prompt_id(self._chat_ptr, prompt_id.encode("utf-8"))
@@ -200,30 +171,6 @@ class ChatBase:
                 error = get_last_error() or "unknown error"
                 self._lib.talu_chat_free(self._chat_ptr)
                 raise StateError(f"Failed to set prompt_id: {error}", code="SET_PROMPT_ID_FAILED")
-
-        # Persist session metadata when using TaluDB
-        if use_taludb and not _defer_session_update:
-            rc = self._lib.talu_chat_notify_session_update(
-                self._chat_ptr,
-                None,  # model
-                None,  # title
-                None,  # system_prompt
-                None,  # config_json
-                None,  # marker
-                None,  # parent_session_id
-                None,  # group_id
-                None,  # metadata_json
-                source_doc_id.encode("utf-8") if source_doc_id else None,
-                None,  # project_id
-            )
-            if rc != 0:
-                from .._bindings import get_last_error
-
-                error = get_last_error() or "unknown error"
-                self._lib.talu_chat_free(self._chat_ptr)
-                raise StateError(
-                    f"Failed to persist session: {error}", code="PERSIST_SESSION_FAILED"
-                )
 
         # Track last response
         self._last_response = None
@@ -296,11 +243,7 @@ class ChatBase:
 
     @property
     def source_doc_id(self) -> str | None:
-        """The source document ID for lineage tracking.
-
-        Links this conversation to the prompt/persona document that spawned it.
-        Used for tracking which document was used to create the conversation.
-        """
+        """The source document ID for lineage tracking."""
         return self._source_doc_id
 
     @source_doc_id.setter
@@ -317,26 +260,6 @@ class ChatBase:
         if self._chat_ptr is None:
             raise StateError("Chat is closed", code="CHAT_CLOSED")
 
-        # Notify session update with source_doc_id
-        rc = self._lib.talu_chat_notify_session_update(
-            self._chat_ptr,
-            None,  # model
-            None,  # title
-            None,  # system_prompt
-            None,  # config_json
-            None,  # marker
-            None,  # parent_session_id
-            None,  # group_id
-            None,  # metadata_json
-            doc_id.encode("utf-8") if doc_id else None,  # source_doc_id
-            None,  # project_id
-        )
-        if rc != 0:
-            from .._bindings import get_last_error
-
-            error = get_last_error() or "unknown error"
-            raise StateError(f"Failed to set source_doc_id: {error}", code="SET_SOURCE_DOC_FAILED")
-
         self._source_doc_id = doc_id
 
     @property
@@ -344,11 +267,6 @@ class ChatBase:
         """The prompt document ID for this conversation.
 
         When set, this links the conversation to a prompt/persona document.
-        The prompt document can provide the system prompt content and tags
-        that can be inherited via inherit_tags().
-
-        This is stored on the Chat object and used by inherit_tags().
-        For persistent lineage tracking in session records, use source_doc_id.
         """
         if self._chat_ptr is None:
             return self._prompt_id  # Return cached value if closed
@@ -388,32 +306,6 @@ class ChatBase:
             raise StateError(f"Failed to set prompt_id: {error}", code="SET_PROMPT_ID_FAILED")
 
         self._prompt_id = doc_id
-
-    def inherit_tags(self) -> None:
-        """Copy tags from the prompt document to this conversation.
-
-        Requires both prompt_id and session_id to be set, and requires
-        TaluDB storage to be configured.
-
-        Raises
-        ------
-            StateError: If chat is closed.
-            ValidationError: If prompt_id or session_id is not set.
-            IOError: If tag inheritance fails.
-        """
-        if self._chat_ptr is None:
-            raise StateError("Chat is closed", code="CHAT_CLOSED")
-
-        if not self._storage.location.startswith("talu://"):
-            raise ValidationError("inherit_tags requires TaluDB storage (talu://...)")
-
-        db_path = self._storage.location[len("talu://") :]
-        rc = self._lib.talu_chat_inherit_tags(self._chat_ptr, db_path.encode("utf-8"))
-        if rc != 0:
-            from .._bindings import get_last_error
-
-            error = get_last_error() or "unknown error"
-            raise StateError(f"Failed to inherit tags: {error}", code="INHERIT_TAGS_FAILED")
 
     @property
     def system(self) -> str | None:
@@ -1228,7 +1120,6 @@ class ChatBase:
             client=self._client,  # type: ignore[reportCallIssue]
             config=replace(self.config),  # type: ignore[reportCallIssue]
             chat_template=self._chat_template,  # type: ignore[reportCallIssue]
-            storage=self._storage,  # type: ignore[reportCallIssue]
             session_id=None,  # type: ignore[reportCallIssue]
             parent_session_id=self._session_id,  # type: ignore[reportCallIssue]
             group_id=self._group_id,  # type: ignore[reportCallIssue]
