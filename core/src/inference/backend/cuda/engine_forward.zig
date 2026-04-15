@@ -42,6 +42,17 @@ fn topologyModeIs(self: anytype, comptime expected: []const u8) bool {
     return std.mem.eql(u8, tag, expected);
 }
 
+/// Resolve staged prefill chunk rows for a specific request length.
+/// Keeps explicit env override behavior unchanged.
+pub fn resolveStagedPrefillChunkRows(total_rows: usize, requested_cap: usize, env_override: bool) usize {
+    const clamped = @max(@as(usize, 1), @min(total_rows, requested_cap));
+    if (env_override) return clamped;
+    // Empirical tuning on Blackwell Gemma NVFP4:
+    // medium prefill lengths benefit from a slightly smaller staged chunk.
+    if (total_rows >= 384 and total_rows <= 640 and clamped >= 254) return 254;
+    return clamped;
+}
+
 fn typeHasDecl(comptime T: type, comptime name: []const u8) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, name),
@@ -632,7 +643,12 @@ fn computeBatchedPrefillCpuGpuGpu(
     const attn_kernels_2 = buildAttentionKernelSet(self) catch return error.CudaKernelUnavailable;
 
     // Use min of both GPU chunk caps.
-    const chunk_cap = @min(self.prefill_chunk_rows_cap, gpu_stage1.prefill_chunk_rows_cap);
+    const staged_chunk_cap_base = @min(self.prefill_chunk_rows_cap, gpu_stage1.prefill_chunk_rows_cap);
+    const chunk_cap = resolveStagedPrefillChunkRows(
+        total_rows,
+        staged_chunk_cap_base,
+        std.posix.getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null,
+    );
 
     // ── CPU stage0: batched embed + forward through [0, split_layer) ──
     const prefill_buffer = try self.allocator.alloc(f32, total_rows * d_model);
@@ -874,66 +890,15 @@ fn computeBatchedPrefillPipeline2(
     else
         global_rope_theta;
 
-    const attn_kernels_0 = switch (self.kv_cache_dtype) {
-        .f16 => AttentionKernelSet{
-            .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-            .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-            .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
-            .attn_fused_prefill_heads_f16_kv_function = self.attn_fused_prefill_heads_f16_kv_function,
-            .attn_fused_prefill_heads_f16_kv_gqa_function = self.attn_fused_prefill_heads_f16_kv_gqa_function,
-            .softmax_rows_function = self.softmax_rows_function,
-            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
-        },
-        .i8 => AttentionKernelSet{
-            .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
-            .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
-            .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
-            .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
-            .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
-            .softmax_rows_function = self.softmax_rows_function,
-            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
-        },
-        .fp8 => AttentionKernelSet{
-            .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
-            .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
-            .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
-            .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
-            .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
-            .softmax_rows_function = self.softmax_rows_function,
-            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
-        },
-    };
-    const attn_kernels_1 = switch (self.kv_cache_dtype) {
-        .f16 => AttentionKernelSet{
-            .attn_scores_heads_f16_kv_function = stage1.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-            .attn_weighted_sum_heads_f16_kv_function = stage1.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-            .attn_fused_heads_f16_kv_function = stage1.attn_fused_heads_f16_kv_function,
-            .attn_fused_prefill_heads_f16_kv_function = stage1.attn_fused_prefill_heads_f16_kv_function,
-            .attn_fused_prefill_heads_f16_kv_gqa_function = stage1.attn_fused_prefill_heads_f16_kv_gqa_function,
-            .softmax_rows_function = stage1.softmax_rows_function,
-            .causal_attn_softmax_f32_function = stage1.causal_attn_softmax_f32_function,
-        },
-        .i8 => AttentionKernelSet{
-            .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
-            .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
-            .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
-            .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
-            .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
-            .softmax_rows_function = stage1.softmax_rows_function,
-            .causal_attn_softmax_f32_function = stage1.causal_attn_softmax_f32_function,
-        },
-        .fp8 => AttentionKernelSet{
-            .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
-            .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
-            .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
-            .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
-            .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
-            .softmax_rows_function = stage1.softmax_rows_function,
-            .causal_attn_softmax_f32_function = stage1.causal_attn_softmax_f32_function,
-        },
-    };
+    const attn_kernels_0 = buildAttentionKernelSet(self) catch return error.CudaKernelUnavailable;
+    const attn_kernels_1 = buildAttentionKernelSet(stage1) catch return error.CudaKernelUnavailable;
 
-    const chunk_cap = @min(self.prefill_chunk_rows_cap, stage1.prefill_chunk_rows_cap);
+    const staged_chunk_cap_base = @min(self.prefill_chunk_rows_cap, stage1.prefill_chunk_rows_cap);
+    const chunk_cap = resolveStagedPrefillChunkRows(
+        total_rows,
+        staged_chunk_cap_base,
+        std.posix.getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null,
+    );
 
     // ── Gemma4 per-layer input: compute source embeddings on host ──
     const Stage1Type = @TypeOf(stage1.*);
@@ -1223,9 +1188,9 @@ fn computeBatchedPrefillPipeline2(
                     local_rope_theta,
                     stage1.rope_function orelse return error.CudaKernelUnavailable,
                     stage1.copy_function orelse return error.CudaKernelUnavailable,
-                    if (self.kv_cache_dtype == .f16) (stage1.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable) else null,
-                    if (self.kv_cache_dtype == .f16) stage1.kv_write_f16_function else null,
-                    if (self.kv_cache_dtype == .f16) stage1.rope_store_f16_function else null,
+                    if (stage1.kv_cache_dtype == .f16) (stage1.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable) else null,
+                    if (stage1.kv_cache_dtype == .f16) stage1.kv_write_f16_function else null,
+                    if (stage1.kv_cache_dtype == .f16) stage1.rope_store_f16_function else null,
                     stage1.shortconv_step_function orelse return error.CudaKernelUnavailable,
                     attn_kernels_1,
                     null,
@@ -1376,7 +1341,7 @@ fn runPipeline2WithPipelineRuntime(
             if (input.len != 0) return error.InvalidArgument;
             if (layer_end < layer_start) return error.InvalidArgument;
             const local_layer_limit = layer_end - layer_start;
-            try computeGpuPrototypeLogitsWithLayerLimit(
+            computeGpuPrototypeLogitsWithLayerLimit(
                 stage.backend,
                 stage.ctx.token,
                 stage.ctx.position,
@@ -1392,7 +1357,18 @@ fn runPipeline2WithPipelineRuntime(
                 null,
                 null,
                 false,
-            );
+            ) catch |err| {
+                log.warn("inference", "CUDA pipeline2 stage0 executeLayers failed", .{
+                    .slot = stage.ctx.slot_index,
+                    .position = stage.ctx.position,
+                    .layer_start = layer_start,
+                    .layer_end = layer_end,
+                    .local_layer_limit = local_layer_limit,
+                    .ensure_kv_capacity = @as(u8, @intFromBool(stage.ctx.ensure_kv_capacity)),
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
         }
 
         pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
@@ -1430,7 +1406,7 @@ fn runPipeline2WithPipelineRuntime(
             if (input.len != 0) return error.InvalidArgument;
             if (layer_end < layer_start) return error.InvalidArgument;
             const local_layer_limit = layer_end - layer_start;
-            try computeGpuPrototypeLogitsWithLayerLimit(
+            computeGpuPrototypeLogitsWithLayerLimit(
                 stage.backend,
                 stage.ctx.token,
                 stage.ctx.position,
@@ -1446,7 +1422,18 @@ fn runPipeline2WithPipelineRuntime(
                 null,
                 null,
                 true,
-            );
+            ) catch |err| {
+                log.warn("inference", "CUDA pipeline2 stage1 executeLayers failed", .{
+                    .slot = stage.ctx.slot_index,
+                    .position = stage.ctx.position,
+                    .layer_start = layer_start,
+                    .layer_end = layer_end,
+                    .local_layer_limit = local_layer_limit,
+                    .ensure_kv_capacity = @as(u8, @intFromBool(stage.ctx.ensure_kv_capacity)),
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
         }
 
         pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
@@ -1926,8 +1913,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             !use_preloaded_input)
         {
             if (comptime @hasDecl(SelfType, "pipelineActivationByteCount")) {
-                if (hidden_override == null and deepstack_layer_features_opt == null and deepstack_feature_index_opt == null)
-                {
+                if (hidden_override == null and deepstack_layer_features_opt == null and deepstack_feature_index_opt == null) {
                     var runtime_stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
                     if (runtime_stage1.state_descriptor_count > 0) {
                         try runtime_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
@@ -2209,7 +2195,17 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         );
     }
     if (ensure_kv_capacity) {
-        try ensureKvCapacity(self, position + 1);
+        ensureKvCapacity(self, position + 1) catch |err| {
+            log.warn("inference", "CUDA ensureKvCapacity failed in prototype decode", .{
+                .slot = slot_index,
+                .position = position,
+                .required_tokens = position + 1,
+                .max_seq = self.max_seq_len,
+                .kv_dtype = @tagName(self.kv_cache_dtype),
+                .reason = @errorName(err),
+            });
+            return err;
+        };
     }
     // Sync slot_kv_states after KV growth so that loadKvSlot at the end of
     // this function preserves the new pointers/capacity. Without this, the
@@ -2349,8 +2345,8 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 },
             }
         }
-    if (!used_device_lookup) {
-        const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host) catch |err| switch (err) {
+        if (!used_device_lookup) {
+            const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host) catch |err| switch (err) {
                 error.InvalidArgument => return error.InvalidArgument,
                 else => return err,
             };
@@ -2415,6 +2411,18 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     try proto_seq_lens_dev.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.decode_seq_lens_host[0..1]));
     try proto_positions_dev.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.decode_positions_host[0..1]));
 
+    var slot_set_matches_cache = false;
+    if (comptime @hasField(SelfType, "decode_ptr_tables_cached_rows") and @hasField(SelfType, "decode_ptr_tables_cached_slots")) {
+        slot_set_matches_cache = self.decode_ptr_tables_cached_rows == 1 and
+            self.decode_ptr_tables_cached_slots.len > 0 and
+            self.decode_ptr_tables_cached_slots[0] == slot_index;
+    }
+    const pointer_tables_dirty = if (comptime @hasField(SelfType, "decode_ptr_tables_dirty"))
+        self.decode_ptr_tables_dirty
+    else
+        true;
+    const refresh_pointer_tables = pointer_tables_dirty or !slot_set_matches_cache;
+
     // Set batched attention max seq_len tier (power-of-2 ceiling).
     const model_max_u32: u32 = @intCast(self.max_seq_len);
     self.runtime_buffers.batched_attn_max_seq_len = @min(
@@ -2425,7 +2433,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     // Populate attention pointer tables from block_runtime (authoritative
     // after ensureKvCapacity which may have grown KV buffers).
     const attn_layers = self.block_runtime.attention_block_count;
-    if (attn_layers > 0) {
+    if (attn_layers > 0 and refresh_pointer_tables) {
         const attn_key_ptrs_host = self.runtime_buffers.decode_attn_key_cache_ptrs_table_host[0..attn_layers];
         const attn_value_ptrs_host = self.runtime_buffers.decode_attn_value_cache_ptrs_table_host[0..attn_layers];
         const attn_k_scale_ptrs_host = self.runtime_buffers.decode_attn_k_scale_ptrs_table_host[0..attn_layers];
@@ -2452,7 +2460,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
 
     // Populate gated delta pointer tables from block_runtime.
     const gd_layers = self.block_runtime.gated_delta_block_count;
-    if (gd_layers > 0) {
+    if (gd_layers > 0 and refresh_pointer_tables) {
         const gd_conv_ptrs_host = self.runtime_buffers.decode_gd_conv_state_ptrs_table_host[0..gd_layers];
         const gd_ssm_ptrs_host = self.runtime_buffers.decode_gd_ssm_state_ptrs_table_host[0..gd_layers];
         const gd_ring_heads_host = self.runtime_buffers.decode_gd_conv_ring_heads_table_host[0..gd_layers];
@@ -2474,6 +2482,18 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         try gd_ring_heads_dev.upload(&self.device, std.mem.sliceAsBytes(gd_ring_heads_host));
     }
 
+    if (refresh_pointer_tables and comptime @hasField(SelfType, "decode_ptr_tables_cached_rows") and @hasField(SelfType, "decode_ptr_tables_cached_slots")) {
+        if (self.decode_ptr_tables_cached_slots.len > 0) {
+            self.decode_ptr_tables_cached_slots[0] = slot_index;
+            self.decode_ptr_tables_cached_rows = 1;
+        } else {
+            self.decode_ptr_tables_cached_rows = 0;
+        }
+    }
+    if (refresh_pointer_tables and comptime @hasField(SelfType, "decode_ptr_tables_dirty")) {
+        self.decode_ptr_tables_dirty = false;
+    }
+
     var batch_info = BatchDecodeInfo{
         .slot_indices = &slot_indices_single,
         .positions = &positions_single,
@@ -2491,12 +2511,6 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         .gd_layer_index = 0,
         .sc_layer_index = 0,
     };
-
-    // Invalidate batched decode pointer table cache (prototype path
-    // populates tables for a single row; batched path must re-upload).
-    if (comptime @hasField(SelfType, "decode_ptr_tables_dirty")) {
-        self.decode_ptr_tables_dirty = true;
-    }
 
     // CUDA graph capture: record all GPU kernels (layer loop + final norm + lm_head)
     // into a graph, then replay with near-zero scheduling gaps between kernels.
@@ -2577,7 +2591,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
             },
         };
-        final_hidden = try self.tryExecuteLayerProgram(
+        final_hidden = self.tryExecuteLayerProgram(
             layer,
             slot_index,
             layer_idx,
@@ -2602,7 +2616,18 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             shortconv_step_function,
             attention_kernels,
             &batch_info,
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA decode layer dispatch failed", .{
+                .layer = layer_idx,
+                .slot = slot_index,
+                .position = position,
+                .seq_len = seq_len_u32,
+                .batched_attn_max_seq = self.runtime_buffers.batched_attn_max_seq_len,
+                .kv_dtype = @tagName(self.kv_cache_dtype),
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
         if (layer.gated_delta_binding != null) batch_info.gd_layer_index += 1;
         if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
@@ -2822,6 +2847,81 @@ const BatchedDecodeOutputMode = enum {
     device_only,
 };
 
+const BatchedDecodeExecutionPlan = struct {
+    bypass_topology_prototype: bool = false,
+    use_preloaded_input: bool = false,
+    compute_logits: bool = true,
+    emit_decode_summary: bool = true,
+    summary_label_override: ?[]const u8 = null,
+};
+
+fn computeBatchedDecodePipeline2WithMode(
+    self: anytype,
+    tokens: []const u32,
+    slot_indices: []const usize,
+    positions: []const usize,
+    output_mode: BatchedDecodeOutputMode,
+) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasDecl(SelfType, "pipelineStage1") or !@hasDecl(SelfType, "transferPipelineActivation")) {
+        return error.InvalidTopologyConfig;
+    }
+    var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+
+    // Stage1 state descriptors mirror stage0 bindings per slot.
+    if (stage1.state_descriptor_count > 0 and comptime @hasDecl(@TypeOf(stage1.*), "mirrorSlotStateBlocksFrom")) {
+        for (slot_indices) |slot_idx| {
+            try stage1.mirrorSlotStateBlocksFrom(self, slot_idx);
+        }
+    }
+    // Stage0: run decode layers only (no final norm/LM head).
+    try computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, .device_only, .{
+        .bypass_topology_prototype = true,
+        .use_preloaded_input = false,
+        .compute_logits = false,
+        .emit_decode_summary = false,
+    });
+
+    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+    const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
+    try transferPipelineActivationMultiRow(self, stage1, transfer_bytes);
+
+    // Stage1: consume transferred activations and complete decode.
+    try computeBatchedDecodeLogitsWithPlan(stage1, tokens, slot_indices, positions, output_mode, .{
+        .bypass_topology_prototype = true,
+        .use_preloaded_input = true,
+        .compute_logits = true,
+        .emit_decode_summary = true,
+        .summary_label_override = switch (output_mode) {
+            .host_logits => "decode_pipeline2",
+            .device_only => "decode_device_only_pipeline2",
+        },
+    });
+
+    // decodeBatch() reads host logits from the root backend. Mirror stage1 rows.
+    if (output_mode == .host_logits) {
+        const src_vocab = stage1.runtime_buffers.projected_vocab;
+        const dst_vocab = self.runtime_buffers.projected_vocab;
+        if (src_vocab == 0 or dst_vocab == 0) return;
+        const rows = tokens.len;
+        for (0..rows) |row| {
+            const src_row_start = std.math.mul(usize, row, src_vocab) catch continue;
+            const src_row_end = std.math.add(usize, src_row_start, src_vocab) catch continue;
+            const dst_row_start = std.math.mul(usize, row, dst_vocab) catch continue;
+            const dst_row_end = std.math.add(usize, dst_row_start, dst_vocab) catch continue;
+            if (src_row_end > stage1.runtime_buffers.projected_logits_batch_host.len or
+                dst_row_end > self.runtime_buffers.projected_logits_batch_host.len)
+            {
+                continue;
+            }
+            const src_row = stage1.runtime_buffers.projected_logits_batch_host[src_row_start..src_row_end];
+            const dst_row = self.runtime_buffers.projected_logits_batch_host[dst_row_start..dst_row_end];
+            @memset(dst_row, -1.0e9);
+            @memcpy(dst_row[0..@min(src_row.len, dst_row.len)], src_row[0..@min(src_row.len, dst_row.len)]);
+        }
+    }
+}
+
 fn computeBatchedDecodeLogitsWithMode(
     self: anytype,
     tokens: []const u32,
@@ -2830,6 +2930,38 @@ fn computeBatchedDecodeLogitsWithMode(
     output_mode: BatchedDecodeOutputMode,
 ) !void {
     const SelfType = @TypeOf(self.*);
+    const force_prototype = std.posix.getenv("TALU_FORCE_PROTOTYPE") != null;
+    if (!force_prototype and
+        topologyModeIs(self, "pipeline2") and
+        comptime @hasField(SelfType, "device") and
+            @hasDecl(SelfType, "pipelineStage1") and
+            @hasDecl(SelfType, "transferPipelineActivation"))
+    {
+        return computeBatchedDecodePipeline2WithMode(self, tokens, slot_indices, positions, output_mode);
+    }
+    return computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{});
+}
+
+fn computeBatchedDecodeLogitsWithPlan(
+    self: anytype,
+    tokens: []const u32,
+    slot_indices: []const usize,
+    positions: []const usize,
+    output_mode: BatchedDecodeOutputMode,
+    plan: BatchedDecodeExecutionPlan,
+) !void {
+    const SelfType = @TypeOf(self.*);
+    if (!plan.compute_logits and output_mode == .host_logits) return error.InvalidArgument;
+
+    const decode_summary_enabled = plan.emit_decode_summary and std.posix.getenv("TALU_CUDA_DECODE_SUMMARY") != null;
+    var decode_start_ns: i128 = 0;
+    if (decode_summary_enabled and comptime @hasDecl(SelfType, "beginNvfp4RouteWindow") and
+        @hasDecl(SelfType, "beginPhaseBudgetWindow"))
+    {
+        self.beginNvfp4RouteWindow();
+        self.beginPhaseBudgetWindow();
+        decode_start_ns = std.time.nanoTimestamp();
+    }
     const gemma4_branch_active = if (comptime @hasField(SelfType, "gemma4_per_layer"))
         self.gemma4_per_layer != null
     else
@@ -2839,7 +2971,9 @@ fn computeBatchedDecodeLogitsWithMode(
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
     const force_prototype = std.posix.getenv("TALU_FORCE_PROTOTYPE") != null;
-    if (force_prototype or topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) {
+    if (!plan.bypass_topology_prototype and
+        (force_prototype or topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")))
+    {
         const emit_host_logits = output_mode == .host_logits;
         for (0..n_usize) |i| {
             self.activateKvSlot(slot_indices[i]);
@@ -2884,6 +3018,17 @@ fn computeBatchedDecodeLogitsWithMode(
                     );
                 }
             }
+        }
+        if (decode_summary_enabled and comptime @hasDecl(SelfType, "logNvfp4RouteSummaryImpl") and
+            @hasDecl(SelfType, "logPhaseBudgetSummaryImpl"))
+        {
+            const decode_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - decode_start_ns);
+            const mode_label = plan.summary_label_override orelse switch (output_mode) {
+                .host_logits => "decode_prototype",
+                .device_only => "decode_device_only_prototype",
+            };
+            self.logNvfp4RouteSummaryImpl(mode_label, n_usize);
+            self.logPhaseBudgetSummaryImpl(mode_label, n_usize, decode_elapsed_ns);
         }
         return;
     }
@@ -2977,148 +3122,150 @@ fn computeBatchedDecodeLogitsWithMode(
         },
     };
 
-    // Embedding lookup: N tokens → N rows of input_dev.
-    const embedding_lookup_f32_function = self.embedding_lookup_f32_function;
-    const embedding_lookup_u16_function = self.embedding_lookup_u16_function;
-    const embedding_lookup_gaffine_u4_function = self.embedding_lookup_gaffine_u4_function;
-    var used_rows_device_lookup = false;
-    if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
-        const lookup = &self.runtime_buffers.embedding_lookup.?;
-        switch (lookup.kind) {
-            .f16, .bf16 => {
-                if (self.embedding_lookup_u16_rows_function) |kernel| {
-                    const token_bytes = std.math.mul(usize, n_usize, @sizeOf(u32)) catch return error.InvalidArgument;
-                    var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
-                    self.prefill_rope_positions_cached_dirty = true;
-                    try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(tokens));
-                    var input_rows = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
-                    try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        kernel,
-                        &input_rows,
-                        &lookup.buffer,
-                        &token_ids_dev,
-                        @intCast(n_usize),
-                        lookup.dim0,
-                        lookup.dim1,
-                        lookup.hidden_dim,
-                        lookup.layout_tag,
-                        switch (lookup.kind) {
-                            .f16 => compute.cuda.embedding_lookup_u16_rows.dtype_f16,
-                            .bf16 => compute.cuda.embedding_lookup_u16_rows.dtype_bf16,
-                            else => unreachable,
-                        },
-                        lookup.multiplier,
-                    );
-                    used_rows_device_lookup = true;
-                }
-            },
-            else => {},
+    if (!plan.use_preloaded_input) {
+        // Embedding lookup: N tokens → N rows of input_dev.
+        const embedding_lookup_f32_function = self.embedding_lookup_f32_function;
+        const embedding_lookup_u16_function = self.embedding_lookup_u16_function;
+        const embedding_lookup_gaffine_u4_function = self.embedding_lookup_gaffine_u4_function;
+        var used_rows_device_lookup = false;
+        if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
+            const lookup = &self.runtime_buffers.embedding_lookup.?;
+            switch (lookup.kind) {
+                .f16, .bf16 => {
+                    if (self.embedding_lookup_u16_rows_function) |kernel| {
+                        const token_bytes = std.math.mul(usize, n_usize, @sizeOf(u32)) catch return error.InvalidArgument;
+                        var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
+                        self.prefill_rope_positions_cached_dirty = true;
+                        try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(tokens));
+                        var input_rows = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+                        try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            kernel,
+                            &input_rows,
+                            &lookup.buffer,
+                            &token_ids_dev,
+                            @intCast(n_usize),
+                            lookup.dim0,
+                            lookup.dim1,
+                            lookup.hidden_dim,
+                            lookup.layout_tag,
+                            switch (lookup.kind) {
+                                .f16 => compute.cuda.embedding_lookup_u16_rows.dtype_f16,
+                                .bf16 => compute.cuda.embedding_lookup_u16_rows.dtype_bf16,
+                                else => unreachable,
+                            },
+                            lookup.multiplier,
+                        );
+                        used_rows_device_lookup = true;
+                    }
+                },
+                else => {},
+            }
         }
-    }
 
-    if (!used_rows_device_lookup) {
-        for (0..n_usize) |i| {
-            var input_row = try bufferSlice(&self.runtime_buffers.input_dev, i * row_bytes, row_bytes);
-            var used_device_lookup = false;
-            if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
-                const lookup = &self.runtime_buffers.embedding_lookup.?;
-                switch (lookup.kind) {
-                    .f32 => {
-                        if (embedding_lookup_f32_function) |kernel| {
-                            try compute.cuda.embedding_lookup_f32.runWithFunction(
-                                &self.kernel_arg_pack,
-                                &self.device,
-                                kernel,
-                                &input_row,
-                                &lookup.buffer,
-                                lookup.dim0,
-                                lookup.dim1,
-                                lookup.hidden_dim,
-                                tokens[i],
-                                lookup.layout_tag,
-                                lookup.multiplier,
-                            );
-                            used_device_lookup = true;
-                        }
-                    },
-                    .f16 => {
-                        if (embedding_lookup_u16_function) |kernel| {
-                            try compute.cuda.embedding_lookup_u16.runWithFunction(
-                                &self.kernel_arg_pack,
-                                &self.device,
-                                kernel,
-                                &input_row,
-                                &lookup.buffer,
-                                lookup.dim0,
-                                lookup.dim1,
-                                lookup.hidden_dim,
-                                tokens[i],
-                                lookup.layout_tag,
-                                compute.cuda.embedding_lookup_u16.dtype_f16,
-                                lookup.multiplier,
-                            );
-                            used_device_lookup = true;
-                        }
-                    },
-                    .bf16 => {
-                        if (embedding_lookup_u16_function) |kernel| {
-                            try compute.cuda.embedding_lookup_u16.runWithFunction(
-                                &self.kernel_arg_pack,
-                                &self.device,
-                                kernel,
-                                &input_row,
-                                &lookup.buffer,
-                                lookup.dim0,
-                                lookup.dim1,
-                                lookup.hidden_dim,
-                                tokens[i],
-                                lookup.layout_tag,
-                                compute.cuda.embedding_lookup_u16.dtype_bf16,
-                                lookup.multiplier,
-                            );
-                            used_device_lookup = true;
-                        }
-                    },
-                    .gaffine_u4 => {
-                        if (embedding_lookup_gaffine_u4_function) |kernel| {
-                            if (lookup.scales) |*scales_buf| {
-                                if (lookup.biases) |*biases_buf| {
-                                    try compute.cuda.embedding_lookup_gaffine_u4.runWithFunction(
-                                        &self.kernel_arg_pack,
-                                        &self.device,
-                                        kernel,
-                                        &input_row,
-                                        &lookup.buffer,
-                                        scales_buf,
-                                        biases_buf,
-                                        lookup.dim0,
-                                        lookup.hidden_dim,
-                                        tokens[i],
-                                        lookup.group_size,
-                                        lookup.scales_dtype_tag,
-                                        lookup.multiplier,
-                                    );
-                                    used_device_lookup = true;
+        if (!used_rows_device_lookup) {
+            for (0..n_usize) |i| {
+                var input_row = try bufferSlice(&self.runtime_buffers.input_dev, i * row_bytes, row_bytes);
+                var used_device_lookup = false;
+                if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
+                    const lookup = &self.runtime_buffers.embedding_lookup.?;
+                    switch (lookup.kind) {
+                        .f32 => {
+                            if (embedding_lookup_f32_function) |kernel| {
+                                try compute.cuda.embedding_lookup_f32.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    kernel,
+                                    &input_row,
+                                    &lookup.buffer,
+                                    lookup.dim0,
+                                    lookup.dim1,
+                                    lookup.hidden_dim,
+                                    tokens[i],
+                                    lookup.layout_tag,
+                                    lookup.multiplier,
+                                );
+                                used_device_lookup = true;
+                            }
+                        },
+                        .f16 => {
+                            if (embedding_lookup_u16_function) |kernel| {
+                                try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    kernel,
+                                    &input_row,
+                                    &lookup.buffer,
+                                    lookup.dim0,
+                                    lookup.dim1,
+                                    lookup.hidden_dim,
+                                    tokens[i],
+                                    lookup.layout_tag,
+                                    compute.cuda.embedding_lookup_u16.dtype_f16,
+                                    lookup.multiplier,
+                                );
+                                used_device_lookup = true;
+                            }
+                        },
+                        .bf16 => {
+                            if (embedding_lookup_u16_function) |kernel| {
+                                try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    kernel,
+                                    &input_row,
+                                    &lookup.buffer,
+                                    lookup.dim0,
+                                    lookup.dim1,
+                                    lookup.hidden_dim,
+                                    tokens[i],
+                                    lookup.layout_tag,
+                                    compute.cuda.embedding_lookup_u16.dtype_bf16,
+                                    lookup.multiplier,
+                                );
+                                used_device_lookup = true;
+                            }
+                        },
+                        .gaffine_u4 => {
+                            if (embedding_lookup_gaffine_u4_function) |kernel| {
+                                if (lookup.scales) |*scales_buf| {
+                                    if (lookup.biases) |*biases_buf| {
+                                        try compute.cuda.embedding_lookup_gaffine_u4.runWithFunction(
+                                            &self.kernel_arg_pack,
+                                            &self.device,
+                                            kernel,
+                                            &input_row,
+                                            &lookup.buffer,
+                                            scales_buf,
+                                            biases_buf,
+                                            lookup.dim0,
+                                            lookup.hidden_dim,
+                                            tokens[i],
+                                            lookup.group_size,
+                                            lookup.scales_dtype_tag,
+                                            lookup.multiplier,
+                                        );
+                                        used_device_lookup = true;
+                                    }
                                 }
                             }
-                        }
-                    },
-                }
-            }
-            if (!used_device_lookup) {
-                const used_model = tryPopulateHiddenFromToken(self.loaded, tokens[i], self.runtime_buffers.hidden_host) catch |err| switch (err) {
-                    error.InvalidArgument => return error.InvalidArgument,
-                    else => return err,
-                };
-                if (!used_model) return error.UnsupportedModel;
-                if (self.loaded.config.embedding_multiplier != 1.0) {
-                    for (self.runtime_buffers.hidden_host) |*v| {
-                        v.* *= self.loaded.config.embedding_multiplier;
+                        },
                     }
                 }
-                try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
+                if (!used_device_lookup) {
+                    const used_model = tryPopulateHiddenFromToken(self.loaded, tokens[i], self.runtime_buffers.hidden_host) catch |err| switch (err) {
+                        error.InvalidArgument => return error.InvalidArgument,
+                        else => return err,
+                    };
+                    if (!used_model) return error.UnsupportedModel;
+                    if (self.loaded.config.embedding_multiplier != 1.0) {
+                        for (self.runtime_buffers.hidden_host) |*v| {
+                            v.* *= self.loaded.config.embedding_multiplier;
+                        }
+                    }
+                    try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
+                }
             }
         }
     }
@@ -3289,7 +3436,9 @@ fn computeBatchedDecodeLogitsWithMode(
     compute: {
         // State 3: steady-state replay — cached graph exec + stable batch.
         if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
-            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and !gemma4_branch_active) {
+            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and
+                !gemma4_branch_active and plan.compute_logits)
+            {
                 if (self.batched_decode_graph_exec) |exec| {
                     try self.device.graphLaunch(exec, self.compute_stream.?);
 
@@ -3318,7 +3467,9 @@ fn computeBatchedDecodeLogitsWithMode(
                 self.phase_event_timing_enabled
             else
                 false;
-            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and !gemma4_branch_active and !event_timing_enabled) {
+            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and
+                !gemma4_branch_active and !event_timing_enabled and plan.compute_logits)
+            {
                 try self.device.streamBeginCapture(self.compute_stream.?);
                 graph_capture_active = true;
             }
@@ -3402,25 +3553,27 @@ fn computeBatchedDecodeLogitsWithMode(
             if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
         }
 
-        // Final norm for all N rows.
-        final_hidden = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
-        const norm_out_bytes = n_usize * self.d_model * @sizeOf(f32);
-        var norm_out = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, norm_out_bytes);
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-            &final_hidden,
-            &self.runtime_buffers.norm_weight_dev,
-            &norm_out,
-            n,
-            d_model_u32,
-            self.norm_eps,
-            self.loaded.runtime.weight_offset,
-        );
+        if (plan.compute_logits) {
+            // Final norm for all N rows.
+            final_hidden = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+            const norm_out_bytes = n_usize * self.d_model * @sizeOf(f32);
+            var norm_out = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, norm_out_bytes);
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &final_hidden,
+                &self.runtime_buffers.norm_weight_dev,
+                &norm_out,
+                n,
+                d_model_u32,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
+            );
 
-        // LM head for all rows.
-        try engine_ops.linearForwardRows(self, &norm_out, n_usize, &self.runtime_buffers.projection_weight, &logits_batch);
+            // LM head for all rows.
+            try engine_ops.linearForwardRows(self, &norm_out, n_usize, &self.runtime_buffers.projection_weight, &logits_batch);
+        }
 
         // Keep decode metadata resident on device across token steps.
         if (comptime @hasDecl(SelfType, "incrementDecodeMetadataInPlace")) {
@@ -3445,7 +3598,7 @@ fn computeBatchedDecodeLogitsWithMode(
         self.loadKvSlot(self.active_kv_slot);
     }
 
-    if (output_mode == .host_logits) {
+    if (plan.compute_logits and output_mode == .host_logits) {
         const logits_batch_host = self.runtime_buffers.projected_logits_batch_host[0..logits_elems];
         try logits_batch.download(&self.device, std.mem.sliceAsBytes(logits_batch_host));
 
@@ -3454,6 +3607,18 @@ fn computeBatchedDecodeLogitsWithMode(
             self.loaded.config.logits_scaling,
             self.loaded.config.final_logit_softcapping,
         );
+    }
+
+    if (decode_summary_enabled and comptime @hasDecl(SelfType, "logNvfp4RouteSummaryImpl") and
+        @hasDecl(SelfType, "logPhaseBudgetSummaryImpl"))
+    {
+        const decode_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - decode_start_ns);
+        const mode_label = plan.summary_label_override orelse switch (output_mode) {
+            .host_logits => "decode",
+            .device_only => if (plan.compute_logits) "decode_device_only" else "decode_layers_only",
+        };
+        self.logNvfp4RouteSummaryImpl(mode_label, n_usize);
+        self.logPhaseBudgetSummaryImpl(mode_label, n_usize, decode_elapsed_ns);
     }
 }
 
@@ -3487,8 +3652,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
     // Pipeline2: batched prefill through stage0 → bulk transfer → stage1.
     // Uses comptime guard because anytype monomorphization requires all referenced
     // methods to exist on the type, even in runtime-unreachable branches.
-    if (topologyModeIs(self, "pipeline2") and layer_limit == self.block_runtime.blocks.len)
-    {
+    if (topologyModeIs(self, "pipeline2") and layer_limit == self.block_runtime.blocks.len) {
         if (tokens.len == 0) return error.InvalidArgument;
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         if (logits_out.len != self.vocab_size) return error.InvalidArgument;
@@ -3958,7 +4122,27 @@ pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
         }
         if (new_capacity < required_tokens) return error.InvalidArgument;
 
-        var new_kv_pair = try self.allocKvPair(new_capacity, block.kv_dim);
+        // KV shape can vary per layer (e.g., shared-KV layouts). Derive the
+        // per-layer KV head count from the existing scale buffers when present,
+        // instead of assuming the model-global n_kv_heads.
+        var layer_n_kv_heads: usize = self.n_kv_heads;
+        if (self.kv_cache_dtype.hasPerHeadScales()) {
+            if (block.k_scale.size == 0 or block.v_scale.size == 0) return error.InvalidArgument;
+            const old_scale_elems = std.math.divExact(usize, block.k_scale.size, @sizeOf(f32)) catch return error.InvalidArgument;
+            if (block.kv_capacity == 0) return error.InvalidArgument;
+            layer_n_kv_heads = std.math.divExact(usize, old_scale_elems, block.kv_capacity) catch return error.InvalidArgument;
+            if (layer_n_kv_heads == 0) return error.InvalidArgument;
+        }
+
+        var new_kv_pair = switch (self.kv_storage_mode) {
+            .device => try engine_weights.allocDeviceKvPairWithScales(
+                &self.device,
+                new_capacity,
+                block.kv_dim,
+                layer_n_kv_heads,
+                self.kv_cache_dtype,
+            ),
+        };
         errdefer {
             if (new_kv_pair.v_scale.pointer != 0) new_kv_pair.v_scale.deinit(&self.device);
             if (new_kv_pair.k_scale.pointer != 0) new_kv_pair.k_scale.deinit(&self.device);
@@ -4008,15 +4192,17 @@ pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
                         old_u16_count,
                     );
                     // Copy scale buffers (f32 elements: capacity * n_kv_heads).
-                    const old_scale_elems = std.math.mul(usize, block.kv_capacity, self.n_kv_heads) catch return error.InvalidArgument;
-                    const old_scale_count_u32: u32 = @intCast(old_scale_elems);
+                    const old_k_scale_elems = std.math.divExact(usize, block.k_scale.size, @sizeOf(f32)) catch return error.InvalidArgument;
+                    const old_v_scale_elems = std.math.divExact(usize, block.v_scale.size, @sizeOf(f32)) catch return error.InvalidArgument;
+                    const old_k_scale_count_u32: u32 = @intCast(old_k_scale_elems);
+                    const old_v_scale_count_u32: u32 = @intCast(old_v_scale_elems);
                     try compute.cuda.copy.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
                         copy_function,
                         &block.k_scale,
                         &new_kv_pair.k_scale,
-                        old_scale_count_u32,
+                        old_k_scale_count_u32,
                     );
                     try compute.cuda.copy.runWithFunction(
                         &self.kernel_arg_pack,
@@ -4024,7 +4210,7 @@ pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
                         copy_function,
                         &block.v_scale,
                         &new_kv_pair.v_scale,
-                        old_scale_count_u32,
+                        old_v_scale_count_u32,
                     );
                 },
             }

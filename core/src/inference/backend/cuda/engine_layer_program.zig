@@ -717,6 +717,7 @@ pub fn layerProgramNormAdapter(
     const input = bufferFromTensorHandle(io.inputs[0]);
     const output = bufferFromTensorHandle(io.outputs[0]);
     const weight = deviceTensorFromWeightHandle(weight_handles[0]);
+    const rmsnorm_start_ns: i128 = std.time.nanoTimestamp();
     engine_ops.runRmsnormRowsStrideAware(self, input, &weight.buffer, output, ctx.active_rows_u32, ctx.d_model_u32) catch |err| {
         if (err == error.InvalidArgument) {
             const expected_io_bytes = std.math.mul(usize, @as(usize, ctx.active_rows_u32), @as(usize, ctx.d_model_u32) * @sizeOf(f32)) catch 0;
@@ -735,6 +736,9 @@ pub fn layerProgramNormAdapter(
         }
         return err;
     };
+    const rmsnorm_elapsed_i128: i128 = std.time.nanoTimestamp() - rmsnorm_start_ns;
+    const rmsnorm_elapsed_ns: u64 = if (rmsnorm_elapsed_i128 > 0) @intCast(rmsnorm_elapsed_i128) else 0;
+    self.nvfp4_phase_counters.recordRmsnorm(rmsnorm_elapsed_ns);
 }
 
 pub fn layerProgramAttentionAdapter(
@@ -1207,7 +1211,11 @@ pub fn layerProgramResidualAddAdapter(
         self.skip_next_residual_add = false;
         return;
     }
+    const residual_add_start_ns: i128 = std.time.nanoTimestamp();
     if (try tryFuseResidualAddIntoNextRmsnorm(self, insn, registers, scale, ctx)) {
+        const fused_elapsed_i128: i128 = std.time.nanoTimestamp() - residual_add_start_ns;
+        const fused_elapsed_ns: u64 = if (fused_elapsed_i128 > 0) @intCast(fused_elapsed_i128) else 0;
+        self.nvfp4_phase_counters.recordResidualAdd(fused_elapsed_ns);
         return;
     }
     const io = try instructionIoSlices(insn, registers);
@@ -1226,6 +1234,9 @@ pub fn layerProgramResidualAddAdapter(
         scale,
         output_scale,
     );
+    const residual_add_elapsed_i128: i128 = std.time.nanoTimestamp() - residual_add_start_ns;
+    const residual_add_elapsed_ns: u64 = if (residual_add_elapsed_i128 > 0) @intCast(residual_add_elapsed_i128) else 0;
+    self.nvfp4_phase_counters.recordResidualAdd(residual_add_elapsed_ns);
 }
 
 pub fn dispatchLayerProgramInstruction(
@@ -1318,14 +1329,29 @@ pub fn tryExecuteLayerProgram(
     };
     if (required_slot_count > self.layer_program_slot_buffers.len) return error.UnsupportedModel;
     const handle_capacity = layerProgramInstructionHandleCapacity(&compiled_plan.plan);
-    const instruction_handles = try self.allocator.alloc(runtime_contract.TensorHandle, handle_capacity);
-    defer if (instruction_handles.len > 0) self.allocator.free(instruction_handles);
-    const instruction_views = try self.allocator.alloc(runtime_contract.TensorViewDesc, handle_capacity);
-    defer if (instruction_views.len > 0) self.allocator.free(instruction_views);
+    if (handle_capacity > self.layer_program_instruction_handle_scratch.len) {
+        self.layer_program_instruction_handle_scratch = try self.allocator.realloc(
+            self.layer_program_instruction_handle_scratch,
+            handle_capacity,
+        );
+    }
+    if (handle_capacity > self.layer_program_instruction_view_scratch.len) {
+        self.layer_program_instruction_view_scratch = try self.allocator.realloc(
+            self.layer_program_instruction_view_scratch,
+            handle_capacity,
+        );
+    }
+    if (required_slot_count > self.layer_program_slot_view_scratch.len) {
+        self.layer_program_slot_view_scratch = try self.allocator.realloc(
+            self.layer_program_slot_view_scratch,
+            required_slot_count,
+        );
+    }
+    const instruction_handles = self.layer_program_instruction_handle_scratch[0..handle_capacity];
+    const instruction_views = self.layer_program_instruction_view_scratch[0..handle_capacity];
+    const slot_buffer_views = self.layer_program_slot_view_scratch[0..required_slot_count];
     const active_input_bytes = std.math.mul(usize, @as(usize, active_rows_u32), @as(usize, d_model_u32) * @sizeOf(f32)) catch return error.InvalidArgument;
     const input_view = try bufferSlice(&self.runtime_buffers.input_dev, 0, active_input_bytes);
-    const slot_buffer_views = try self.allocator.alloc(compute.cuda.Buffer, required_slot_count);
-    defer if (slot_buffer_views.len > 0) self.allocator.free(slot_buffer_views);
     for (slot_buffer_views, 0..) |*view, slot_idx| {
         const width = layer.slot_width_hints[slot_idx];
         const bytes = std.math.mul(usize, @as(usize, active_rows_u32), width * @sizeOf(f32)) catch return error.InvalidArgument;
@@ -2516,6 +2542,10 @@ pub fn assignResolvedKernel(
             self.kv_write_i8_rows_ptrs_function = resolved.function;
             self.kv_write_i8_rows_ptrs_source = resolved.source;
         },
+        .dequant_kv_i8_to_f16 => {
+            self.dequant_kv_i8_to_f16_function = resolved.function;
+            self.dequant_kv_i8_to_f16_source = resolved.source;
+        },
         .rope_store_i8 => {
             self.rope_store_i8_function = resolved.function;
             self.rope_store_i8_source = resolved.source;
@@ -2563,6 +2593,10 @@ pub fn assignResolvedKernel(
         .kv_write_fp8_rows_ptrs => {
             self.kv_write_fp8_rows_ptrs_function = resolved.function;
             self.kv_write_fp8_rows_ptrs_source = resolved.source;
+        },
+        .dequant_kv_fp8_to_f16 => {
+            self.dequant_kv_fp8_to_f16_function = resolved.function;
+            self.dequant_kv_fp8_to_f16_source = resolved.source;
         },
         .rope_store_fp8 => {
             self.rope_store_fp8_function = resolved.function;

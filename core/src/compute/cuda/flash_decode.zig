@@ -39,16 +39,27 @@ fn smemBytes(kv_groups: u32, head_dim: u32) u32 {
     return per_group * groups * @sizeOf(f32);
 }
 
-/// Compute optimal n_seq_chunks for split-K.
-/// For decode, attention is rarely the bottleneck (GEMV dominates), so
-/// split-K reduce overhead typically outweighs occupancy gains. The GQA
-/// optimization (reading KV once per KV head) already provides the main
-/// bandwidth win. Only split for extreme cases where a single block per
-/// KV head would be underutilized.
-pub fn computeSeqChunks(n_kv_heads: u32, batch_rows: u32) u32 {
-    _ = n_kv_heads;
-    _ = batch_rows;
-    return 1;
+/// Compute n_seq_chunks for split-K decode.
+/// For long-context low-bit decode, n_kv_heads × batch_rows can be too small
+/// to saturate the GPU. Split-K raises block-level parallelism while retaining
+/// the KV-head-grouped access pattern.
+pub fn computeSeqChunks(n_kv_heads: u32, batch_rows: u32, max_seq_len: u32, prefer_split_k: bool) u32 {
+    if (!prefer_split_k) return 1;
+    if (n_kv_heads == 0 or batch_rows == 0) return 1;
+    if (max_seq_len < 512) return 1;
+
+    const base_blocks = std.math.mul(u32, n_kv_heads, batch_rows) catch return 1;
+    const target_blocks: u32 = if (max_seq_len >= 4096)
+        128
+    else if (max_seq_len >= 2048)
+        96
+    else
+        64;
+    if (base_blocks >= target_blocks) return 1;
+
+    const raw_chunks = std.math.divCeil(u32, target_blocks, base_blocks) catch return 1;
+    const seq_limited_chunks = @max(@as(u32, 1), max_seq_len / 256);
+    return @min(@as(u32, 16), @min(raw_chunks, seq_limited_chunks));
 }
 
 /// Compute partial buffer size in bytes for split-K.
@@ -312,12 +323,21 @@ test "smemBytes computes correct sizes" {
     try std.testing.expectEqual(@as(u32, 4160), smemBytes(1, 128));
 }
 
-test "computeSeqChunks returns 1 (no split-K)" {
-    // Split-K disabled: reduce overhead outweighs occupancy gains for decode.
-    try std.testing.expectEqual(@as(u32, 1), computeSeqChunks(2, 1));
-    try std.testing.expectEqual(@as(u32, 1), computeSeqChunks(2, 4));
-    try std.testing.expectEqual(@as(u32, 1), computeSeqChunks(32, 2));
-    try std.testing.expectEqual(@as(u32, 1), computeSeqChunks(2, 8));
+test "computeSeqChunks keeps split-K off when not preferred" {
+    try std.testing.expectEqual(@as(u32, 1), computeSeqChunks(8, 1, 4096, false));
+}
+
+test "computeSeqChunks remains conservative on short context" {
+    try std.testing.expectEqual(@as(u32, 1), computeSeqChunks(8, 1, 511, true));
+}
+
+test "computeSeqChunks scales low-bit long-context single-row decode" {
+    try std.testing.expect(computeSeqChunks(8, 1, 2048, true) > 1);
+    try std.testing.expect(computeSeqChunks(8, 1, 4096, true) >= computeSeqChunks(8, 1, 2048, true));
+}
+
+test "computeSeqChunks stays off when base parallelism is already high" {
+    try std.testing.expectEqual(@as(u32, 1), computeSeqChunks(32, 4, 4096, true));
 }
 
 test "partialBufBytes" {

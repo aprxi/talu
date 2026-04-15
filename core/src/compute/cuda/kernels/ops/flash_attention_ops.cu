@@ -360,6 +360,12 @@ void talu_flash_decode_i8(
 
     const float log2_theta = log2f(theta);
     const unsigned int half_rope = rope_dim >> 1;
+    const unsigned int per_group = 2u * num_warps + num_warps * head_dim;
+
+    // Shared memory layout per group:
+    // [num_warps] m, [num_warps] s, [num_warps * head_dim] out
+    // Reuse out[0..head_dim) of each group as temporary Q-RoPE staging.
+    extern __shared__ float smem[];
 
     // Load Q + RoPE for all grouped heads.
     float q_rot[FD_MAX_GROUPS][FD_MAX_DIMS_PER_LANE];
@@ -369,26 +375,41 @@ void talu_flash_decode_i8(
         for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k)
             q_rot[g][k] = 0.0f;
     }
+    if (warp_id == 0u) {
+        for (unsigned int g = 0; g < actual_groups; ++g) {
+            const unsigned int head = first_head + g;
+            const float* query_head = query + ((unsigned long long)row * n_heads + head) * head_dim;
+            float* g_m = smem + g * per_group;
+            float* g_out = g_m + 2u * num_warps;
+            #pragma unroll
+            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+                if (k >= dims_per_lane) break;
+                const unsigned int d = lane + (k << 5);
+                if (d >= head_dim) continue;
+                float qv = query_head[d];
+                if (d < rope_dim) {
+                    const unsigned int pair = (d < half_rope) ? d : (d - half_rope);
+                    const float q_lo = query_head[pair];
+                    const float q_hi = query_head[half_rope + pair];
+                    const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                    const float angle = (float)position * inv_freq;
+                    float sn, cn;
+                    __sincosf(angle, &sn, &cn);
+                    qv = (d < half_rope) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
+                }
+                g_out[d] = qv;
+            }
+        }
+    }
+    __syncthreads();
     for (unsigned int g = 0; g < actual_groups; ++g) {
-        const unsigned int head = first_head + g;
-        const float* query_head = query + ((unsigned long long)row * n_heads + head) * head_dim;
+        float* g_m = smem + g * per_group;
+        float* g_out = g_m + 2u * num_warps;
         #pragma unroll
         for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
             if (k >= dims_per_lane) break;
             const unsigned int d = lane + (k << 5);
-            if (d >= head_dim) continue;
-            float qv = query_head[d];
-            if (d < rope_dim) {
-                const unsigned int pair = (d < half_rope) ? d : (d - half_rope);
-                const float q_lo = query_head[pair];
-                const float q_hi = query_head[half_rope + pair];
-                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
-                const float angle = (float)position * inv_freq;
-                float sn, cn;
-                __sincosf(angle, &sn, &cn);
-                qv = (d < half_rope) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
-            }
-            q_rot[g][k] = qv;
+            if (d < head_dim) q_rot[g][k] = g_out[d];
         }
     }
 
@@ -446,8 +467,8 @@ void talu_flash_decode_i8(
             if (g >= actual_groups) continue;
             const float sc = dots[g];
             const float m_new = fmaxf(m_val[g], sc);
-            const float alpha = expf(m_val[g] - m_new);
-            const float beta = expf(sc - m_new);
+            const float alpha = __expf(m_val[g] - m_new);
+            const float beta = __expf(sc - m_new);
             s_val[g] = s_val[g] * alpha + beta;
             m_val[g] = m_new;
             #pragma unroll
@@ -463,9 +484,6 @@ void talu_flash_decode_i8(
     }
 
     // Cross-warp merge.
-    extern __shared__ float smem[];
-    const unsigned int per_group = 2u * num_warps + num_warps * head_dim;
-
     for (unsigned int g = 0; g < actual_groups; ++g) {
         float* g_m = smem + g * per_group;
         float* g_s = g_m + num_warps;
@@ -484,66 +502,64 @@ void talu_flash_decode_i8(
     }
     __syncthreads();
 
-    if (warp_id != 0) return;
+    if (warp_id >= actual_groups) return;
+    const unsigned int g = warp_id;
+    const unsigned int head = first_head + g;
+    float* g_m = smem + g * per_group;
+    float* g_s = g_m + num_warps;
+    float* g_out = g_s + num_warps;
 
-    for (unsigned int g = 0; g < actual_groups; ++g) {
-        const unsigned int head = first_head + g;
-        float* g_m = smem + g * per_group;
-        float* g_s = g_m + num_warps;
-        float* g_out = g_s + num_warps;
-
-        float mg = g_m[0], sg = g_s[0];
-        float merged[FD_MAX_DIMS_PER_LANE];
+    float mg = g_m[0], sg = g_s[0];
+    float merged[FD_MAX_DIMS_PER_LANE];
+    #pragma unroll
+    for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+        const unsigned int d = lane + (k << 5);
+        merged[k] = (k < dims_per_lane && d < head_dim) ? g_out[d] : 0.0f;
+    }
+    for (unsigned int w = 1; w < num_warps; ++w) {
+        const float mw = g_m[w], sw = g_s[w];
+        const float m_new = fmaxf(mg, mw);
+        const float a = __expf(mg - m_new), b = __expf(mw - m_new);
+        sg = sg * a + sw * b;
+        mg = m_new;
         #pragma unroll
         for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+            if (k >= dims_per_lane) break;
             const unsigned int d = lane + (k << 5);
-            merged[k] = (k < dims_per_lane && d < head_dim) ? g_out[d] : 0.0f;
+            if (d < head_dim)
+                merged[k] = merged[k] * a + g_out[w * head_dim + d] * b;
         }
-        for (unsigned int w = 1; w < num_warps; ++w) {
-            const float mw = g_m[w], sw = g_s[w];
-            const float m_new = fmaxf(mg, mw);
-            const float a = expf(mg - m_new), b = expf(mw - m_new);
-            sg = sg * a + sw * b;
-            mg = m_new;
-            #pragma unroll
-            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
-                if (k >= dims_per_lane) break;
-                const unsigned int d = lane + (k << 5);
-                if (d < head_dim)
-                    merged[k] = merged[k] * a + g_out[w * head_dim + d] * b;
-            }
-        }
+    }
 
-        if (n_seq_chunks == 1u) {
-            float* out_head = out + ((unsigned long long)row * n_heads + head) * head_dim;
-            const float inv_s = 1.0f / fmaxf(sg, 1.0e-20f);
-            #pragma unroll
-            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
-                if (k >= dims_per_lane) break;
-                const unsigned int d = lane + (k << 5);
-                if (d < head_dim) {
-                    float result = merged[k] * inv_s;
-                    if (gate_proj) {
-                        const float gate = gate_proj[(unsigned long long)row * gate_proj_stride + (unsigned long long)head * head_dim * 2u + head_dim + d];
-                        result *= 1.0f / (1.0f + expf(-gate));
-                    }
-                    out_head[d] = result;
+    if (n_seq_chunks == 1u) {
+        float* out_head = out + ((unsigned long long)row * n_heads + head) * head_dim;
+        const float inv_s = 1.0f / fmaxf(sg, 1.0e-20f);
+        #pragma unroll
+        for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d < head_dim) {
+                float result = merged[k] * inv_s;
+                if (gate_proj) {
+                    const float gate = gate_proj[(unsigned long long)row * gate_proj_stride + (unsigned long long)head * head_dim * 2u + head_dim + d];
+                    result *= 1.0f / (1.0f + __expf(-gate));
                 }
+                out_head[d] = result;
             }
-        } else {
-            const unsigned long long partial_idx =
-                ((unsigned long long)row * n_heads + head) * n_seq_chunks + chunk_id;
-            if (lane == 0) {
-                partial_m[partial_idx] = mg;
-                partial_s[partial_idx] = sg;
-            }
-            #pragma unroll
-            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
-                if (k >= dims_per_lane) break;
-                const unsigned int d = lane + (k << 5);
-                if (d < head_dim)
-                    partial_out[partial_idx * head_dim + d] = merged[k];
-            }
+        }
+    } else {
+        const unsigned long long partial_idx =
+            ((unsigned long long)row * n_heads + head) * n_seq_chunks + chunk_id;
+        if (lane == 0) {
+            partial_m[partial_idx] = mg;
+            partial_s[partial_idx] = sg;
+        }
+        #pragma unroll
+        for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d < head_dim)
+                partial_out[partial_idx * head_dim + d] = merged[k];
         }
     }
 }
@@ -619,6 +635,12 @@ void talu_flash_decode_fp8(
 
     const float log2_theta = log2f(theta);
     const unsigned int half_rope = rope_dim >> 1;
+    const unsigned int per_group = 2u * num_warps + num_warps * head_dim;
+
+    // Shared memory layout per group:
+    // [num_warps] m, [num_warps] s, [num_warps * head_dim] out
+    // Reuse out[0..head_dim) of each group as temporary Q-RoPE staging.
+    extern __shared__ float smem[];
 
     // Load Q + RoPE.
     float q_rot[FD_MAX_GROUPS][FD_MAX_DIMS_PER_LANE];
@@ -628,26 +650,41 @@ void talu_flash_decode_fp8(
         for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k)
             q_rot[g][k] = 0.0f;
     }
+    if (warp_id == 0u) {
+        for (unsigned int g = 0; g < actual_groups; ++g) {
+            const unsigned int head = first_head + g;
+            const float* query_head = query + ((unsigned long long)row * n_heads + head) * head_dim;
+            float* g_m = smem + g * per_group;
+            float* g_out = g_m + 2u * num_warps;
+            #pragma unroll
+            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+                if (k >= dims_per_lane) break;
+                const unsigned int d = lane + (k << 5);
+                if (d >= head_dim) continue;
+                float qv = query_head[d];
+                if (d < rope_dim) {
+                    const unsigned int pair = (d < half_rope) ? d : (d - half_rope);
+                    const float q_lo = query_head[pair];
+                    const float q_hi = query_head[half_rope + pair];
+                    const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                    const float angle = (float)position * inv_freq;
+                    float sn, cn;
+                    __sincosf(angle, &sn, &cn);
+                    qv = (d < half_rope) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
+                }
+                g_out[d] = qv;
+            }
+        }
+    }
+    __syncthreads();
     for (unsigned int g = 0; g < actual_groups; ++g) {
-        const unsigned int head = first_head + g;
-        const float* query_head = query + ((unsigned long long)row * n_heads + head) * head_dim;
+        float* g_m = smem + g * per_group;
+        float* g_out = g_m + 2u * num_warps;
         #pragma unroll
         for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
             if (k >= dims_per_lane) break;
             const unsigned int d = lane + (k << 5);
-            if (d >= head_dim) continue;
-            float qv = query_head[d];
-            if (d < rope_dim) {
-                const unsigned int pair = (d < half_rope) ? d : (d - half_rope);
-                const float q_lo = query_head[pair];
-                const float q_hi = query_head[half_rope + pair];
-                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
-                const float angle = (float)position * inv_freq;
-                float sn, cn;
-                __sincosf(angle, &sn, &cn);
-                qv = (d < half_rope) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
-            }
-            q_rot[g][k] = qv;
+            if (d < head_dim) q_rot[g][k] = g_out[d];
         }
     }
 
@@ -702,8 +739,8 @@ void talu_flash_decode_fp8(
             if (g >= actual_groups) continue;
             const float sc = dots[g];
             const float m_new = fmaxf(m_val[g], sc);
-            const float alpha = expf(m_val[g] - m_new);
-            const float beta = expf(sc - m_new);
+            const float alpha = __expf(m_val[g] - m_new);
+            const float beta = __expf(sc - m_new);
             s_val[g] = s_val[g] * alpha + beta;
             m_val[g] = m_new;
             #pragma unroll
@@ -720,9 +757,6 @@ void talu_flash_decode_fp8(
     }
 
     // Cross-warp merge.
-    extern __shared__ float smem[];
-    const unsigned int per_group = 2u * num_warps + num_warps * head_dim;
-
     for (unsigned int g = 0; g < actual_groups; ++g) {
         float* g_m = smem + g * per_group;
         float* g_s = g_m + num_warps;
@@ -741,66 +775,64 @@ void talu_flash_decode_fp8(
     }
     __syncthreads();
 
-    if (warp_id != 0) return;
+    if (warp_id >= actual_groups) return;
+    const unsigned int g = warp_id;
+    const unsigned int head = first_head + g;
+    float* g_m = smem + g * per_group;
+    float* g_s = g_m + num_warps;
+    float* g_out = g_s + num_warps;
 
-    for (unsigned int g = 0; g < actual_groups; ++g) {
-        const unsigned int head = first_head + g;
-        float* g_m = smem + g * per_group;
-        float* g_s = g_m + num_warps;
-        float* g_out = g_s + num_warps;
-
-        float mg = g_m[0], sg = g_s[0];
-        float merged[FD_MAX_DIMS_PER_LANE];
+    float mg = g_m[0], sg = g_s[0];
+    float merged[FD_MAX_DIMS_PER_LANE];
+    #pragma unroll
+    for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+        const unsigned int d = lane + (k << 5);
+        merged[k] = (k < dims_per_lane && d < head_dim) ? g_out[d] : 0.0f;
+    }
+    for (unsigned int w = 1; w < num_warps; ++w) {
+        const float mw = g_m[w], sw = g_s[w];
+        const float m_new = fmaxf(mg, mw);
+        const float a = __expf(mg - m_new), b = __expf(mw - m_new);
+        sg = sg * a + sw * b;
+        mg = m_new;
         #pragma unroll
         for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+            if (k >= dims_per_lane) break;
             const unsigned int d = lane + (k << 5);
-            merged[k] = (k < dims_per_lane && d < head_dim) ? g_out[d] : 0.0f;
+            if (d < head_dim)
+                merged[k] = merged[k] * a + g_out[w * head_dim + d] * b;
         }
-        for (unsigned int w = 1; w < num_warps; ++w) {
-            const float mw = g_m[w], sw = g_s[w];
-            const float m_new = fmaxf(mg, mw);
-            const float a = expf(mg - m_new), b = expf(mw - m_new);
-            sg = sg * a + sw * b;
-            mg = m_new;
-            #pragma unroll
-            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
-                if (k >= dims_per_lane) break;
-                const unsigned int d = lane + (k << 5);
-                if (d < head_dim)
-                    merged[k] = merged[k] * a + g_out[w * head_dim + d] * b;
-            }
-        }
+    }
 
-        if (n_seq_chunks == 1u) {
-            float* out_head = out + ((unsigned long long)row * n_heads + head) * head_dim;
-            const float inv_s = 1.0f / fmaxf(sg, 1.0e-20f);
-            #pragma unroll
-            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
-                if (k >= dims_per_lane) break;
-                const unsigned int d = lane + (k << 5);
-                if (d < head_dim) {
-                    float result = merged[k] * inv_s;
-                    if (gate_proj) {
-                        const float gate = gate_proj[(unsigned long long)row * gate_proj_stride + (unsigned long long)head * head_dim * 2u + head_dim + d];
-                        result *= 1.0f / (1.0f + expf(-gate));
-                    }
-                    out_head[d] = result;
+    if (n_seq_chunks == 1u) {
+        float* out_head = out + ((unsigned long long)row * n_heads + head) * head_dim;
+        const float inv_s = 1.0f / fmaxf(sg, 1.0e-20f);
+        #pragma unroll
+        for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d < head_dim) {
+                float result = merged[k] * inv_s;
+                if (gate_proj) {
+                    const float gate = gate_proj[(unsigned long long)row * gate_proj_stride + (unsigned long long)head * head_dim * 2u + head_dim + d];
+                    result *= 1.0f / (1.0f + __expf(-gate));
                 }
+                out_head[d] = result;
             }
-        } else {
-            const unsigned long long partial_idx =
-                ((unsigned long long)row * n_heads + head) * n_seq_chunks + chunk_id;
-            if (lane == 0) {
-                partial_m[partial_idx] = mg;
-                partial_s[partial_idx] = sg;
-            }
-            #pragma unroll
-            for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
-                if (k >= dims_per_lane) break;
-                const unsigned int d = lane + (k << 5);
-                if (d < head_dim)
-                    partial_out[partial_idx * head_dim + d] = merged[k];
-            }
+        }
+    } else {
+        const unsigned long long partial_idx =
+            ((unsigned long long)row * n_heads + head) * n_seq_chunks + chunk_id;
+        if (lane == 0) {
+            partial_m[partial_idx] = mg;
+            partial_s[partial_idx] = sg;
+        }
+        #pragma unroll
+        for (unsigned int k = 0; k < FD_MAX_DIMS_PER_LANE; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d < head_dim)
+                partial_out[partial_idx * head_dim + d] = merged[k];
         }
     }
 }

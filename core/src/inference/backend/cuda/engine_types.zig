@@ -411,6 +411,7 @@ pub const KernelSlot = enum {
     kv_write_i8,
     kv_write_i8_rows,
     kv_write_i8_rows_ptrs,
+    dequant_kv_i8_to_f16,
     rope_store_i8,
     attn_scores_heads_i8_kv,
     attn_weighted_sum_heads_i8_kv,
@@ -423,6 +424,7 @@ pub const KernelSlot = enum {
     kv_write_fp8,
     kv_write_fp8_rows,
     kv_write_fp8_rows_ptrs,
+    dequant_kv_fp8_to_f16,
     rope_store_fp8,
     attn_scores_heads_fp8_kv,
     attn_scores_heads_fp8_kv_ptrs,
@@ -512,6 +514,10 @@ pub const Nvfp4PhaseBudgetCounters = struct {
     attention_batched_prefill_calls: u64 = 0,
     layer_scalar_calls: u64 = 0,
     layer_scalar_ns: u64 = 0,
+    rmsnorm_calls: u64 = 0,
+    rmsnorm_ns: u64 = 0,
+    residual_add_calls: u64 = 0,
+    residual_add_ns: u64 = 0,
     qkv_calls: u64 = 0,
     qkv_fused_calls: u64 = 0,
     qkv_unfused_calls: u64 = 0,
@@ -520,11 +526,20 @@ pub const Nvfp4PhaseBudgetCounters = struct {
     gate_up_unfused_calls: u64 = 0,
     attention_fused_heads_f16_kv: u64 = 0,
     attention_heads_f16_kv: u64 = 0,
+    attention_heads_lowbit_bridge_f16_kv: u64 = 0,
     attention_fused_heads_i8_kv: u64 = 0,
     attention_heads_i8_kv: u64 = 0,
     attention_fused_heads_fp8_kv: u64 = 0,
     attention_heads_fp8_kv: u64 = 0,
     attention_heads_f32_kv: u64 = 0,
+    attention_fused_heads_f16_kv_ns: u64 = 0,
+    attention_heads_f16_kv_ns: u64 = 0,
+    attention_heads_lowbit_bridge_f16_kv_ns: u64 = 0,
+    attention_fused_heads_i8_kv_ns: u64 = 0,
+    attention_heads_i8_kv_ns: u64 = 0,
+    attention_fused_heads_fp8_kv_ns: u64 = 0,
+    attention_heads_fp8_kv_ns: u64 = 0,
+    attention_heads_f32_kv_ns: u64 = 0,
 
     fn saturatingAddU64(a: u64, b: u64) u64 {
         return std.math.add(u64, a, b) catch std.math.maxInt(u64);
@@ -543,13 +558,38 @@ pub const Nvfp4PhaseBudgetCounters = struct {
         self.attention_calls = saturatingAddU64(self.attention_calls, 1);
         self.attention_ns = saturatingAddU64(self.attention_ns, elapsed_ns);
         switch (path) {
-            .fused_heads_f16_kv => self.attention_fused_heads_f16_kv = saturatingAddU64(self.attention_fused_heads_f16_kv, 1),
-            .heads_f16_kv => self.attention_heads_f16_kv = saturatingAddU64(self.attention_heads_f16_kv, 1),
-            .fused_heads_i8_kv => self.attention_fused_heads_i8_kv = saturatingAddU64(self.attention_fused_heads_i8_kv, 1),
-            .heads_i8_kv => self.attention_heads_i8_kv = saturatingAddU64(self.attention_heads_i8_kv, 1),
-            .fused_heads_fp8_kv => self.attention_fused_heads_fp8_kv = saturatingAddU64(self.attention_fused_heads_fp8_kv, 1),
-            .heads_fp8_kv => self.attention_heads_fp8_kv = saturatingAddU64(self.attention_heads_fp8_kv, 1),
-            .heads_f32_kv => self.attention_heads_f32_kv = saturatingAddU64(self.attention_heads_f32_kv, 1),
+            .fused_heads_f16_kv => {
+                self.attention_fused_heads_f16_kv = saturatingAddU64(self.attention_fused_heads_f16_kv, 1);
+                self.attention_fused_heads_f16_kv_ns = saturatingAddU64(self.attention_fused_heads_f16_kv_ns, elapsed_ns);
+            },
+            .heads_f16_kv => {
+                self.attention_heads_f16_kv = saturatingAddU64(self.attention_heads_f16_kv, 1);
+                self.attention_heads_f16_kv_ns = saturatingAddU64(self.attention_heads_f16_kv_ns, elapsed_ns);
+            },
+            .heads_lowbit_bridge_f16_kv => {
+                self.attention_heads_lowbit_bridge_f16_kv = saturatingAddU64(self.attention_heads_lowbit_bridge_f16_kv, 1);
+                self.attention_heads_lowbit_bridge_f16_kv_ns = saturatingAddU64(self.attention_heads_lowbit_bridge_f16_kv_ns, elapsed_ns);
+            },
+            .fused_heads_i8_kv => {
+                self.attention_fused_heads_i8_kv = saturatingAddU64(self.attention_fused_heads_i8_kv, 1);
+                self.attention_fused_heads_i8_kv_ns = saturatingAddU64(self.attention_fused_heads_i8_kv_ns, elapsed_ns);
+            },
+            .heads_i8_kv => {
+                self.attention_heads_i8_kv = saturatingAddU64(self.attention_heads_i8_kv, 1);
+                self.attention_heads_i8_kv_ns = saturatingAddU64(self.attention_heads_i8_kv_ns, elapsed_ns);
+            },
+            .fused_heads_fp8_kv => {
+                self.attention_fused_heads_fp8_kv = saturatingAddU64(self.attention_fused_heads_fp8_kv, 1);
+                self.attention_fused_heads_fp8_kv_ns = saturatingAddU64(self.attention_fused_heads_fp8_kv_ns, elapsed_ns);
+            },
+            .heads_fp8_kv => {
+                self.attention_heads_fp8_kv = saturatingAddU64(self.attention_heads_fp8_kv, 1);
+                self.attention_heads_fp8_kv_ns = saturatingAddU64(self.attention_heads_fp8_kv_ns, elapsed_ns);
+            },
+            .heads_f32_kv => {
+                self.attention_heads_f32_kv = saturatingAddU64(self.attention_heads_f32_kv, 1);
+                self.attention_heads_f32_kv_ns = saturatingAddU64(self.attention_heads_f32_kv_ns, elapsed_ns);
+            },
         }
     }
 
@@ -574,6 +614,16 @@ pub const Nvfp4PhaseBudgetCounters = struct {
         self.layer_scalar_ns = saturatingAddU64(self.layer_scalar_ns, elapsed_ns);
     }
 
+    pub fn recordRmsnorm(self: *Nvfp4PhaseBudgetCounters, elapsed_ns: u64) void {
+        self.rmsnorm_calls = saturatingAddU64(self.rmsnorm_calls, 1);
+        self.rmsnorm_ns = saturatingAddU64(self.rmsnorm_ns, elapsed_ns);
+    }
+
+    pub fn recordResidualAdd(self: *Nvfp4PhaseBudgetCounters, elapsed_ns: u64) void {
+        self.residual_add_calls = saturatingAddU64(self.residual_add_calls, 1);
+        self.residual_add_ns = saturatingAddU64(self.residual_add_ns, elapsed_ns);
+    }
+
     pub fn recordQkv(self: *Nvfp4PhaseBudgetCounters, path: ProjectionPath) void {
         self.qkv_calls = saturatingAddU64(self.qkv_calls, 1);
         switch (path) {
@@ -593,8 +643,42 @@ pub const Nvfp4PhaseBudgetCounters = struct {
     pub fn knownNs(self: *const Nvfp4PhaseBudgetCounters) u64 {
         const total_u128 = @as(u128, self.linear_ns) +
             @as(u128, self.attention_ns) +
-            @as(u128, self.layer_scalar_ns);
+            @as(u128, self.layer_scalar_ns) +
+            @as(u128, self.rmsnorm_ns) +
+            @as(u128, self.residual_add_ns);
         return saturatingU64FromU128(total_u128);
+    }
+
+    /// Approximate tensor-core attention time for current routing.
+    ///
+    /// Contract note:
+    /// `heads_f16_kv` is the GEMM-based f16 route used by the current
+    /// tensor-core-oriented attention implementation.
+    /// `heads_lowbit_bridge_f16_kv` is also GEMM-based (`1-byte KV -> f16`).
+    /// Custom fused kernels (`fused_heads_*`) are intentionally tracked in
+    /// separate buckets and are not counted as tensor-core here.
+    pub fn attentionTensorCoreNsApprox(self: *const Nvfp4PhaseBudgetCounters) u64 {
+        const total_u128 = @as(u128, self.attention_heads_f16_kv_ns) +
+            @as(u128, self.attention_heads_lowbit_bridge_f16_kv_ns);
+        return saturatingU64FromU128(total_u128);
+    }
+
+    /// Approximate scalar/non-GEMM attention time.
+    ///
+    /// Contract note:
+    /// includes i8/fp8 prefill/decode attention paths and f32 heads path.
+    pub fn attentionScalarNsApprox(self: *const Nvfp4PhaseBudgetCounters) u64 {
+        const total_u128 = @as(u128, self.attention_fused_heads_i8_kv_ns) +
+            @as(u128, self.attention_heads_i8_kv_ns) +
+            @as(u128, self.attention_fused_heads_fp8_kv_ns) +
+            @as(u128, self.attention_heads_fp8_kv_ns) +
+            @as(u128, self.attention_heads_f32_kv_ns);
+        return saturatingU64FromU128(total_u128);
+    }
+
+    /// Custom fused f16 attention kernels tracked separately from GEMM f16.
+    pub fn attentionCustomF16Ns(self: *const Nvfp4PhaseBudgetCounters) u64 {
+        return self.attention_fused_heads_f16_kv_ns;
     }
 
     pub fn delta(current: Nvfp4PhaseBudgetCounters, start: Nvfp4PhaseBudgetCounters) Nvfp4PhaseBudgetCounters {
@@ -609,6 +693,10 @@ pub const Nvfp4PhaseBudgetCounters = struct {
             .attention_batched_prefill_calls = saturatingSub(current.attention_batched_prefill_calls, start.attention_batched_prefill_calls),
             .layer_scalar_calls = saturatingSub(current.layer_scalar_calls, start.layer_scalar_calls),
             .layer_scalar_ns = saturatingSub(current.layer_scalar_ns, start.layer_scalar_ns),
+            .rmsnorm_calls = saturatingSub(current.rmsnorm_calls, start.rmsnorm_calls),
+            .rmsnorm_ns = saturatingSub(current.rmsnorm_ns, start.rmsnorm_ns),
+            .residual_add_calls = saturatingSub(current.residual_add_calls, start.residual_add_calls),
+            .residual_add_ns = saturatingSub(current.residual_add_ns, start.residual_add_ns),
             .qkv_calls = saturatingSub(current.qkv_calls, start.qkv_calls),
             .qkv_fused_calls = saturatingSub(current.qkv_fused_calls, start.qkv_fused_calls),
             .qkv_unfused_calls = saturatingSub(current.qkv_unfused_calls, start.qkv_unfused_calls),
@@ -617,22 +705,46 @@ pub const Nvfp4PhaseBudgetCounters = struct {
             .gate_up_unfused_calls = saturatingSub(current.gate_up_unfused_calls, start.gate_up_unfused_calls),
             .attention_fused_heads_f16_kv = saturatingSub(current.attention_fused_heads_f16_kv, start.attention_fused_heads_f16_kv),
             .attention_heads_f16_kv = saturatingSub(current.attention_heads_f16_kv, start.attention_heads_f16_kv),
+            .attention_heads_lowbit_bridge_f16_kv = saturatingSub(current.attention_heads_lowbit_bridge_f16_kv, start.attention_heads_lowbit_bridge_f16_kv),
             .attention_fused_heads_i8_kv = saturatingSub(current.attention_fused_heads_i8_kv, start.attention_fused_heads_i8_kv),
             .attention_heads_i8_kv = saturatingSub(current.attention_heads_i8_kv, start.attention_heads_i8_kv),
             .attention_fused_heads_fp8_kv = saturatingSub(current.attention_fused_heads_fp8_kv, start.attention_fused_heads_fp8_kv),
             .attention_heads_fp8_kv = saturatingSub(current.attention_heads_fp8_kv, start.attention_heads_fp8_kv),
             .attention_heads_f32_kv = saturatingSub(current.attention_heads_f32_kv, start.attention_heads_f32_kv),
+            .attention_fused_heads_f16_kv_ns = saturatingSub(current.attention_fused_heads_f16_kv_ns, start.attention_fused_heads_f16_kv_ns),
+            .attention_heads_f16_kv_ns = saturatingSub(current.attention_heads_f16_kv_ns, start.attention_heads_f16_kv_ns),
+            .attention_heads_lowbit_bridge_f16_kv_ns = saturatingSub(current.attention_heads_lowbit_bridge_f16_kv_ns, start.attention_heads_lowbit_bridge_f16_kv_ns),
+            .attention_fused_heads_i8_kv_ns = saturatingSub(current.attention_fused_heads_i8_kv_ns, start.attention_fused_heads_i8_kv_ns),
+            .attention_heads_i8_kv_ns = saturatingSub(current.attention_heads_i8_kv_ns, start.attention_heads_i8_kv_ns),
+            .attention_fused_heads_fp8_kv_ns = saturatingSub(current.attention_fused_heads_fp8_kv_ns, start.attention_fused_heads_fp8_kv_ns),
+            .attention_heads_fp8_kv_ns = saturatingSub(current.attention_heads_fp8_kv_ns, start.attention_heads_fp8_kv_ns),
+            .attention_heads_f32_kv_ns = saturatingSub(current.attention_heads_f32_kv_ns, start.attention_heads_f32_kv_ns),
         };
     }
 };
 
+/// Runtime-selected attention route classification used by budget counters.
+///
+/// Naming contract:
+/// - `heads_*` typically denotes the GEMM/heads-family route.
+/// - `fused_heads_*` denotes custom fused kernel families.
+/// - Route names encode storage dtype, not necessarily compute dtype.
 pub const AttentionPath = enum {
+    /// Custom fused f16 kernel family (non-GEMM bucket).
     fused_heads_f16_kv,
+    /// GEMM-based f16 heads path (tensor-core-oriented bucket).
     heads_f16_kv,
+    /// Low-bit KV prefill bridge route: dequant to f16 + GEMM f16 heads.
+    heads_lowbit_bridge_f16_kv,
+    /// Custom fused i8 KV kernel family.
     fused_heads_i8_kv,
+    /// Heads-family i8 KV path (currently non-GEMM/scalar-style kernels).
     heads_i8_kv,
+    /// Custom fused fp8 KV kernel family.
     fused_heads_fp8_kv,
+    /// Heads-family fp8 KV path (currently non-GEMM/scalar-style kernels).
     heads_fp8_kv,
+    /// Legacy f32 heads path.
     heads_f32_kv,
 };
 
@@ -758,6 +870,7 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .kv_write_i8, .op_name = compute.cuda.kv_write_i8.op_name, .embedded_symbol = compute.cuda.kv_write_i8.embedded_symbol },
     .{ .slot = .kv_write_i8_rows, .op_name = compute.cuda.kv_write_i8_rows.op_name, .embedded_symbol = compute.cuda.kv_write_i8_rows.embedded_symbol },
     .{ .slot = .kv_write_i8_rows_ptrs, .op_name = compute.cuda.kv_write_i8_rows_ptrs.op_name, .embedded_symbol = compute.cuda.kv_write_i8_rows_ptrs.embedded_symbol },
+    .{ .slot = .dequant_kv_i8_to_f16, .op_name = compute.cuda.dequant_kv_i8_to_f16.op_name, .embedded_symbol = compute.cuda.dequant_kv_i8_to_f16.embedded_symbol },
     .{ .slot = .rope_store_i8, .op_name = compute.cuda.rope_store_i8.op_name, .embedded_symbol = compute.cuda.rope_store_i8.embedded_symbol },
     .{ .slot = .attn_scores_heads_i8_kv, .op_name = compute.cuda.attn_scores_heads_i8_kv.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_i8_kv.embedded_symbol },
     .{ .slot = .attn_weighted_sum_heads_i8_kv, .op_name = compute.cuda.attn_weighted_sum_heads_i8_kv.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_i8_kv.embedded_symbol },
@@ -770,6 +883,7 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .kv_write_fp8, .op_name = compute.cuda.kv_write_fp8.op_name, .embedded_symbol = compute.cuda.kv_write_fp8.embedded_symbol },
     .{ .slot = .kv_write_fp8_rows, .op_name = compute.cuda.kv_write_fp8_rows.op_name, .embedded_symbol = compute.cuda.kv_write_fp8_rows.embedded_symbol },
     .{ .slot = .kv_write_fp8_rows_ptrs, .op_name = compute.cuda.kv_write_fp8_rows_ptrs.op_name, .embedded_symbol = compute.cuda.kv_write_fp8_rows_ptrs.embedded_symbol },
+    .{ .slot = .dequant_kv_fp8_to_f16, .op_name = compute.cuda.dequant_kv_fp8_to_f16.op_name, .embedded_symbol = compute.cuda.dequant_kv_fp8_to_f16.embedded_symbol },
     .{ .slot = .rope_store_fp8, .op_name = compute.cuda.rope_store_fp8.op_name, .embedded_symbol = compute.cuda.rope_store_fp8.embedded_symbol },
     .{ .slot = .attn_scores_heads_fp8_kv, .op_name = compute.cuda.attn_scores_heads_fp8_kv.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_fp8_kv.embedded_symbol },
     .{ .slot = .attn_weighted_sum_heads_fp8_kv, .op_name = compute.cuda.attn_weighted_sum_heads_fp8_kv.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_fp8_kv.embedded_symbol },

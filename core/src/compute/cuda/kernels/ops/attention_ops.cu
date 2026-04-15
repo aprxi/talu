@@ -295,8 +295,8 @@ extern "C" __global__ void talu_attn_fused_heads_f16_kv(
         float beta = 0.0f;
         if (lane == 0) {
             const float m_new = fmaxf(m, score);
-            alpha = expf(m - m_new);
-            beta = expf(score - m_new);
+            alpha = __expf(m - m_new);
+            beta = __expf(score - m_new);
             s = s * alpha + beta;
             m = m_new;
         }
@@ -502,8 +502,8 @@ void talu_attn_fused_decode_heads_f16_kv_ptrs(
         const float mw = smem_m[w];
         const float sw = smem_s[w];
         const float m_new = fmaxf(m, mw);
-        const float alpha = expf(m - m_new);
-        const float beta = expf(mw - m_new);
+        const float alpha = __expf(m - m_new);
+        const float beta = __expf(mw - m_new);
         s = s * alpha + sw * beta;
         m = m_new;
 
@@ -527,7 +527,7 @@ void talu_attn_fused_decode_heads_f16_kv_ptrs(
             float result = out_acc[k] * inv_s;
             if (gate_proj) {
                 const float gate = gate_proj[(unsigned long long)row * gate_proj_stride + (unsigned long long)head * head_dim * 2u + head_dim + d];
-                result *= 1.0f / (1.0f + expf(-gate));
+                result *= 1.0f / (1.0f + __expf(-gate));
             }
             out_head[d] = result;
         }
@@ -621,8 +621,8 @@ extern "C" __global__ void talu_attn_fused_prefill_heads_f16_kv(
         float beta = 0.0f;
         if (lane == 0) {
             const float m_new = fmaxf(m, score);
-            alpha = expf(m - m_new);
-            beta = expf(score - m_new);
+            alpha = __expf(m - m_new);
+            beta = __expf(score - m_new);
             s = s * alpha + beta;
             m = m_new;
         }
@@ -1404,27 +1404,44 @@ void talu_attn_fused_decode_heads_i8_kv_ptrs(
     }
     if (dims_per_lane > 16u) return;
 
-    // Q RoPE.
+    // Shared memory layout:
+    // [num_warps] m, [num_warps] s, [num_warps * head_dim] out.
+    // Reuse out[0..head_dim) as a temporary Q-RoPE staging region.
+    extern __shared__ float smem[];
+    float* smem_m = smem;
+    float* smem_s = smem + num_warps;
+    float* smem_out = smem + 2u * num_warps;
+
+    // Q RoPE: compute once per block (warp 0), then broadcast via shared memory.
     const unsigned int half = rope_dim >> 1;
+    if (warp_id == 0u) {
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d >= head_dim) continue;
+
+            float qv = query_head[d];
+            if (d < rope_dim) {
+                const unsigned int pair = (d < half) ? d : (d - half);
+                const float q_lo = query_head[pair];
+                const float q_hi = query_head[half + pair];
+                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                const float angle = (float)position * inv_freq;
+                float sn = 0.0f;
+                float cn = 0.0f;
+                __sincosf(angle, &sn, &cn);
+                qv = (d < half) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
+            }
+            smem_out[d] = qv;
+        }
+    }
+    __syncthreads();
     #pragma unroll
     for (unsigned int k = 0; k < 16; ++k) {
         if (k >= dims_per_lane) break;
         const unsigned int d = lane + (k << 5);
-        if (d >= head_dim) continue;
-
-        float qv = query_head[d];
-        if (d < rope_dim) {
-            const unsigned int pair = (d < half) ? d : (d - half);
-            const float q_lo = query_head[pair];
-            const float q_hi = query_head[half + pair];
-            const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
-            const float angle = (float)position * inv_freq;
-            float sn = 0.0f;
-            float cn = 0.0f;
-            __sincosf(angle, &sn, &cn);
-            qv = (d < half) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
-        }
-        q_rot[k] = qv;
+        if (d < head_dim) q_rot[k] = smem_out[d];
     }
 
     // Split tokens across warps.
@@ -1482,11 +1499,6 @@ void talu_attn_fused_decode_heads_i8_kv_ptrs(
     s = __shfl_sync(wmask, s, 0);
 
     // Cross-warp merge via shared memory.
-    extern __shared__ float smem[];
-    float* smem_m = smem;
-    float* smem_s = smem + num_warps;
-    float* smem_out = smem + 2u * num_warps;
-
     if (lane == 0) {
         smem_m[warp_id] = m;
         smem_s[warp_id] = s;
@@ -1518,8 +1530,8 @@ void talu_attn_fused_decode_heads_i8_kv_ptrs(
         const float mw = smem_m[w];
         const float sw = smem_s[w];
         const float m_new = fmaxf(m, mw);
-        const float alpha = expf(m - m_new);
-        const float beta = expf(mw - m_new);
+        const float alpha = __expf(m - m_new);
+        const float beta = __expf(mw - m_new);
         s = s * alpha + sw * beta;
         m = m_new;
 
@@ -1542,7 +1554,7 @@ void talu_attn_fused_decode_heads_i8_kv_ptrs(
             float result = out_acc[k] * inv_s;
             if (gate_proj) {
                 const float gate = gate_proj[(unsigned long long)row * gate_proj_stride + (unsigned long long)head * head_dim * 2u + head_dim + d];
-                result *= 1.0f / (1.0f + expf(-gate));
+                result *= 1.0f / (1.0f + __expf(-gate));
             }
             out_head[d] = result;
         }
@@ -1847,6 +1859,40 @@ extern "C" __global__ void talu_attn_fused_prefill_heads_i8_kv_gqa(
     }
 }
 
+// Dequantize full INT8 KV cache rows to F16 using per-token per-head scales.
+// Layout:
+// - key/value_cache_i8: [seq_len, row_stride]
+// - k/v_scales:         [seq_len, n_kv_heads]
+// - out_key/value_f16:  [seq_len, row_stride]
+extern "C" __global__ void talu_dequant_kv_i8_to_f16(
+    unsigned short* out_key_f16,
+    unsigned short* out_value_f16,
+    const signed char* key_cache_i8,
+    const signed char* value_cache_i8,
+    const float* k_scales,
+    const float* v_scales,
+    unsigned int seq_len,
+    unsigned int n_kv_heads,
+    unsigned int row_stride,
+    unsigned int head_dim
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = seq_len * row_stride;
+    if (idx >= total || n_kv_heads == 0 || head_dim == 0) return;
+
+    const unsigned int token = idx / row_stride;
+    const unsigned int within_row = idx - token * row_stride;
+    const unsigned int kv_head = within_row / head_dim;
+    if (kv_head >= n_kv_heads) return;
+
+    const float k_scale = k_scales[token * n_kv_heads + kv_head];
+    const float v_scale = v_scales[token * n_kv_heads + kv_head];
+    const float kf = (float)key_cache_i8[idx] * k_scale;
+    const float vf = (float)value_cache_i8[idx] * v_scale;
+    *reinterpret_cast<__half*>(&out_key_f16[idx]) = __float2half_rn(kf);
+    *reinterpret_cast<__half*>(&out_value_f16[idx]) = __float2half_rn(vf);
+}
+
 // Batched separate attention scores with INT8 K cache + pointer tables.
 // Grid: (ceil(max_seq_len / warps_per_block), n_heads, batch_rows), Block: 128
 extern "C" __global__ void talu_attn_scores_heads_i8_kv_ptrs(
@@ -1973,6 +2019,40 @@ static __device__ __forceinline__ float talu_attn_fp8e4m3_to_f32(__nv_fp8_storag
     __half h;
     memcpy(&h, &hr, sizeof(h));
     return __half2float(h);
+}
+
+// Dequantize full FP8 KV cache rows to F16 using per-token per-head scales.
+// Layout:
+// - key/value_cache_fp8: [seq_len, row_stride]
+// - k/v_scales:          [seq_len, n_kv_heads]
+// - out_key/value_f16:   [seq_len, row_stride]
+extern "C" __global__ void talu_dequant_kv_fp8_to_f16(
+    unsigned short* out_key_f16,
+    unsigned short* out_value_f16,
+    const unsigned char* key_cache_fp8,
+    const unsigned char* value_cache_fp8,
+    const float* k_scales,
+    const float* v_scales,
+    unsigned int seq_len,
+    unsigned int n_kv_heads,
+    unsigned int row_stride,
+    unsigned int head_dim
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = seq_len * row_stride;
+    if (idx >= total || n_kv_heads == 0 || head_dim == 0) return;
+
+    const unsigned int token = idx / row_stride;
+    const unsigned int within_row = idx - token * row_stride;
+    const unsigned int kv_head = within_row / head_dim;
+    if (kv_head >= n_kv_heads) return;
+
+    const float k_scale = k_scales[token * n_kv_heads + kv_head];
+    const float v_scale = v_scales[token * n_kv_heads + kv_head];
+    const float kf = talu_attn_fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>(key_cache_fp8[idx])) * k_scale;
+    const float vf = talu_attn_fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>(value_cache_fp8[idx])) * v_scale;
+    *reinterpret_cast<__half*>(&out_key_f16[idx]) = __float2half_rn(kf);
+    *reinterpret_cast<__half*>(&out_value_f16[idx]) = __float2half_rn(vf);
 }
 
 // Separate attention scores with FP8 K cache.
@@ -2239,27 +2319,44 @@ void talu_attn_fused_decode_heads_fp8_kv_ptrs(
     }
     if (dims_per_lane > 16u) return;
 
-    // Q RoPE.
+    // Shared memory layout:
+    // [num_warps] m, [num_warps] s, [num_warps * head_dim] out.
+    // Reuse out[0..head_dim) as a temporary Q-RoPE staging region.
+    extern __shared__ float smem[];
+    float* smem_m = smem;
+    float* smem_s = smem + num_warps;
+    float* smem_out = smem + 2u * num_warps;
+
+    // Q RoPE: compute once per block (warp 0), then broadcast via shared memory.
     const unsigned int half = rope_dim >> 1;
+    if (warp_id == 0u) {
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d >= head_dim) continue;
+
+            float qv = query_head[d];
+            if (d < rope_dim) {
+                const unsigned int pair = (d < half) ? d : (d - half);
+                const float q_lo = query_head[pair];
+                const float q_hi = query_head[half + pair];
+                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                const float angle = (float)position * inv_freq;
+                float sn = 0.0f;
+                float cn = 0.0f;
+                __sincosf(angle, &sn, &cn);
+                qv = (d < half) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
+            }
+            smem_out[d] = qv;
+        }
+    }
+    __syncthreads();
     #pragma unroll
     for (unsigned int k = 0; k < 16; ++k) {
         if (k >= dims_per_lane) break;
         const unsigned int d = lane + (k << 5);
-        if (d >= head_dim) continue;
-
-        float qv = query_head[d];
-        if (d < rope_dim) {
-            const unsigned int pair = (d < half) ? d : (d - half);
-            const float q_lo = query_head[pair];
-            const float q_hi = query_head[half + pair];
-            const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
-            const float angle = (float)position * inv_freq;
-            float sn = 0.0f;
-            float cn = 0.0f;
-            __sincosf(angle, &sn, &cn);
-            qv = (d < half) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
-        }
-        q_rot[k] = qv;
+        if (d < head_dim) q_rot[k] = smem_out[d];
     }
 
     // Split tokens across warps.
@@ -2317,11 +2414,6 @@ void talu_attn_fused_decode_heads_fp8_kv_ptrs(
     s = __shfl_sync(wmask, s, 0);
 
     // Cross-warp merge via shared memory.
-    extern __shared__ float smem[];
-    float* smem_m = smem;
-    float* smem_s = smem + num_warps;
-    float* smem_out = smem + 2u * num_warps;
-
     if (lane == 0) {
         smem_m[warp_id] = m;
         smem_s[warp_id] = s;

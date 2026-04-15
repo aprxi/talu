@@ -68,12 +68,24 @@ const engine_ops = @import("engine_ops.zig");
 // --- Functions from engine_mixers.zig ---
 const engine_mixers = @import("engine_mixers.zig");
 const engine_forward = @import("engine_forward.zig");
+const resolveStagedPrefillChunkRows = engine_forward.resolveStagedPrefillChunkRows;
 
 test "resolveDenseInOutLayout keeps [in,out] orientation" {
     const layout = try resolveDenseInOutLayout(128, 256, 128);
     try std.testing.expectEqual(@as(usize, 128), layout.in_dim);
     try std.testing.expectEqual(@as(usize, 256), layout.out_dim);
     try std.testing.expect(!layout.needs_transpose);
+}
+
+test "resolveStagedPrefillChunkRows tunes medium staged prefill lengths" {
+    try std.testing.expectEqual(@as(usize, 254), resolveStagedPrefillChunkRows(486, 256, false));
+    try std.testing.expectEqual(@as(usize, 256), resolveStagedPrefillChunkRows(947, 256, false));
+    try std.testing.expectEqual(@as(usize, 254), resolveStagedPrefillChunkRows(486, 512, false));
+}
+
+test "resolveStagedPrefillChunkRows honors explicit env override behavior" {
+    try std.testing.expectEqual(@as(usize, 256), resolveStagedPrefillChunkRows(486, 256, true));
+    try std.testing.expectEqual(@as(usize, 320), resolveStagedPrefillChunkRows(900, 320, true));
 }
 
 test "finalOutputBuffer returns residual when program ends with add" {

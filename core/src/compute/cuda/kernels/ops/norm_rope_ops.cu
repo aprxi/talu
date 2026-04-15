@@ -721,30 +721,81 @@ extern "C" __global__ void talu_kv_write_i8_rows(
     const unsigned int warp_id = tid / 32u;
     const unsigned int num_warps = (blockDim.x + 31u) / 32u;
     const unsigned int position = position_base + row;
-
-    float k_vals[4];
-    float v_vals[4];
+    const bool pair_rope_fast_path =
+        (rope_dim == head_dim) &&
+        ((rope_dim & 1u) == 0u) &&
+        ((rope_dim >> 1) <= blockDim.x);
+    const bool single_elem_per_thread = head_dim <= blockDim.x;
     float k_max = 0.0f;
     float v_max = 0.0f;
+    float k0_pair = 0.0f;
+    float k1_pair = 0.0f;
+    float v0_pair = 0.0f;
+    float v1_pair = 0.0f;
+    bool has_pair = false;
+    float k_val_single = 0.0f;
+    float v_val_single = 0.0f;
+    bool has_single = false;
+    float k_vals[4];
+    float v_vals[4];
     unsigned int count = 0;
 
-    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        float k_val = input_k_f32[input_base + d];
-        if (d < rope_dim) {
-            const unsigned int pair = (d < half_rd) ? d : (d - half_rd);
+    if (pair_rope_fast_path) {
+        if (tid < half_rd) {
+            const unsigned int pair = tid;
             const float x0 = input_k_f32[input_base + pair];
             const float x1 = input_k_f32[input_base + half_rd + pair];
             const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
             const float angle = (float)position * inv_freq;
             float s, c;
             __sincosf(angle, &s, &c);
-            k_val = (d < half_rd) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+            k0_pair = fmaf(x0, c, -x1 * s);
+            k1_pair = fmaf(x0, s, x1 * c);
+            v0_pair = input_v_f32[input_base + pair];
+            v1_pair = input_v_f32[input_base + half_rd + pair];
+            k_max = fmaxf(fabsf(k0_pair), fabsf(k1_pair));
+            v_max = fmaxf(fabsf(v0_pair), fabsf(v1_pair));
+            has_pair = true;
         }
-        k_vals[count] = k_val;
-        v_vals[count] = input_v_f32[input_base + d];
-        k_max = fmaxf(k_max, fabsf(k_val));
-        v_max = fmaxf(v_max, fabsf(v_vals[count]));
-        count++;
+    } else if (single_elem_per_thread) {
+        if (tid < head_dim) {
+            const unsigned int d = tid;
+            float k_val = input_k_f32[input_base + d];
+            if (d < rope_dim) {
+                const unsigned int pair = (d < half_rd) ? d : (d - half_rd);
+                const float x0 = input_k_f32[input_base + pair];
+                const float x1 = input_k_f32[input_base + half_rd + pair];
+                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                const float angle = (float)position * inv_freq;
+                float s, c;
+                __sincosf(angle, &s, &c);
+                k_val = (d < half_rd) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+            }
+            k_val_single = k_val;
+            v_val_single = input_v_f32[input_base + d];
+            k_max = fabsf(k_val_single);
+            v_max = fabsf(v_val_single);
+            has_single = true;
+        }
+    } else {
+        for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+            float k_val = input_k_f32[input_base + d];
+            if (d < rope_dim) {
+                const unsigned int pair = (d < half_rd) ? d : (d - half_rd);
+                const float x0 = input_k_f32[input_base + pair];
+                const float x1 = input_k_f32[input_base + half_rd + pair];
+                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                const float angle = (float)position * inv_freq;
+                float s, c;
+                __sincosf(angle, &s, &c);
+                k_val = (d < half_rd) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+            }
+            k_vals[count] = k_val;
+            v_vals[count] = input_v_f32[input_base + d];
+            k_max = fmaxf(k_max, fabsf(k_val));
+            v_max = fmaxf(v_max, fabsf(v_vals[count]));
+            count++;
+        }
     }
 
     k_max = talu_warp_reduce_max(k_max);
@@ -777,11 +828,25 @@ extern "C" __global__ void talu_kv_write_i8_rows(
     const float v_inv = (v_scale_s > 0.0f) ? (1.0f / v_scale_s) : 0.0f;
 
     const unsigned int out_base = row * row_stride + head * head_dim;
-    count = 0;
-    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        out_k_i8[out_base + d] = (signed char)fminf(fmaxf(roundf(k_vals[count] * k_inv), -127.0f), 127.0f);
-        out_v_i8[out_base + d] = (signed char)fminf(fmaxf(roundf(v_vals[count] * v_inv), -127.0f), 127.0f);
-        count++;
+    if (pair_rope_fast_path) {
+        if (has_pair) {
+            out_k_i8[out_base + tid] = (signed char)fminf(fmaxf(roundf(k0_pair * k_inv), -127.0f), 127.0f);
+            out_k_i8[out_base + half_rd + tid] = (signed char)fminf(fmaxf(roundf(k1_pair * k_inv), -127.0f), 127.0f);
+            out_v_i8[out_base + tid] = (signed char)fminf(fmaxf(roundf(v0_pair * v_inv), -127.0f), 127.0f);
+            out_v_i8[out_base + half_rd + tid] = (signed char)fminf(fmaxf(roundf(v1_pair * v_inv), -127.0f), 127.0f);
+        }
+    } else if (single_elem_per_thread) {
+        if (has_single) {
+            out_k_i8[out_base + tid] = (signed char)fminf(fmaxf(roundf(k_val_single * k_inv), -127.0f), 127.0f);
+            out_v_i8[out_base + tid] = (signed char)fminf(fmaxf(roundf(v_val_single * v_inv), -127.0f), 127.0f);
+        }
+    } else {
+        count = 0;
+        for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+            out_k_i8[out_base + d] = (signed char)fminf(fmaxf(roundf(k_vals[count] * k_inv), -127.0f), 127.0f);
+            out_v_i8[out_base + d] = (signed char)fminf(fmaxf(roundf(v_vals[count] * v_inv), -127.0f), 127.0f);
+            count++;
+        }
     }
 }
 
@@ -1079,67 +1144,110 @@ extern "C" __global__ void talu_kv_write_fp8_rows(
     const unsigned int warp_id = tid / 32u;
     const unsigned int num_warps = (blockDim.x + 31u) / 32u;
     const unsigned int position = position_base + row;
-
-    float k_vals[4];
-    float v_vals[4];
+    const bool pair_rope_fast_path =
+        (rope_dim == head_dim) &&
+        ((rope_dim & 1u) == 0u) &&
+        ((rope_dim >> 1) <= blockDim.x);
+    const bool single_elem_per_thread = head_dim <= blockDim.x;
     float k_max = 0.0f;
     float v_max = 0.0f;
+    float k0_pair = 0.0f;
+    float k1_pair = 0.0f;
+    float v0_pair = 0.0f;
+    float v1_pair = 0.0f;
+    bool has_pair = false;
+    float k_val_single = 0.0f;
+    float v_val_single = 0.0f;
+    bool has_single = false;
+    float k_vals[4];
+    float v_vals[4];
     unsigned int count = 0;
 
-    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        float k_val = input_k_f32[input_base + d];
-        if (d < rope_dim) {
-            const unsigned int pair = (d < half_rd) ? d : (d - half_rd);
+    if (pair_rope_fast_path) {
+        if (tid < half_rd) {
+            const unsigned int pair = tid;
             const float x0 = input_k_f32[input_base + pair];
             const float x1 = input_k_f32[input_base + half_rd + pair];
             const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
             const float angle = (float)position * inv_freq;
             float s, c;
             __sincosf(angle, &s, &c);
-            k_val = (d < half_rd) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+            k0_pair = fmaf(x0, c, -x1 * s);
+            k1_pair = fmaf(x0, s, x1 * c);
+            v0_pair = input_v_f32[input_base + pair];
+            v1_pair = input_v_f32[input_base + half_rd + pair];
+            k_max = fmaxf(fabsf(k0_pair), fabsf(k1_pair));
+            v_max = fmaxf(fabsf(v0_pair), fabsf(v1_pair));
+            has_pair = true;
         }
-        k_vals[count] = k_val;
-        v_vals[count] = input_v_f32[input_base + d];
-        k_max = fmaxf(k_max, fabsf(k_val));
-        v_max = fmaxf(v_max, fabsf(v_vals[count]));
-        count++;
+    } else if (single_elem_per_thread) {
+        if (tid < head_dim) {
+            const unsigned int d = tid;
+            float k_val = input_k_f32[input_base + d];
+            if (d < rope_dim) {
+                const unsigned int pair = (d < half_rd) ? d : (d - half_rd);
+                const float x0 = input_k_f32[input_base + pair];
+                const float x1 = input_k_f32[input_base + half_rd + pair];
+                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                const float angle = (float)position * inv_freq;
+                float s, c;
+                __sincosf(angle, &s, &c);
+                k_val = (d < half_rd) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+            }
+            k_val_single = k_val;
+            v_val_single = input_v_f32[input_base + d];
+            k_max = fabsf(k_val_single);
+            v_max = fabsf(v_val_single);
+            has_single = true;
+        }
+    } else {
+        for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+            float k_val = input_k_f32[input_base + d];
+            if (d < rope_dim) {
+                const unsigned int pair = (d < half_rd) ? d : (d - half_rd);
+                const float x0 = input_k_f32[input_base + pair];
+                const float x1 = input_k_f32[input_base + half_rd + pair];
+                const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+                const float angle = (float)position * inv_freq;
+                float s, c;
+                __sincosf(angle, &s, &c);
+                k_val = (d < half_rd) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+            }
+            k_vals[count] = k_val;
+            v_vals[count] = input_v_f32[input_base + d];
+            k_max = fmaxf(k_max, fabsf(k_val));
+            v_max = fmaxf(v_max, fabsf(v_vals[count]));
+            count++;
+        }
     }
 
-    k_max = talu_warp_reduce_max(k_max);
-    v_max = talu_warp_reduce_max(v_max);
-
-    __shared__ float smem[16];
-    if (lane == 0) {
-        smem[warp_id] = k_max;
-        smem[warp_id + 8] = v_max;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        k_max = (lane < num_warps) ? smem[lane] : 0.0f;
-        v_max = (lane < num_warps) ? smem[lane + 8] : 0.0f;
-        k_max = talu_warp_reduce_max(k_max);
-        v_max = talu_warp_reduce_max(v_max);
-    }
-
-    __shared__ float k_scale_s, v_scale_s;
     if (tid == 0) {
-        k_scale_s = (k_max > 0.0f) ? (k_max / 448.0f) : 0.0f;
-        v_scale_s = (v_max > 0.0f) ? (v_max / 448.0f) : 0.0f;
-        k_scales[row * n_heads + head] = k_scale_s;
-        v_scales[row * n_heads + head] = v_scale_s;
+        // FP8 path uses native E4M3 dynamic range directly.
+        // Keep per-head scale buffers coherent with decode kernels.
+        k_scales[row * n_heads + head] = 1.0f;
+        v_scales[row * n_heads + head] = 1.0f;
     }
-    __syncthreads();
-
-    const float k_inv = (k_scale_s > 0.0f) ? (1.0f / k_scale_s) : 0.0f;
-    const float v_inv = (v_scale_s > 0.0f) ? (1.0f / v_scale_s) : 0.0f;
 
     const unsigned int out_base = row * row_stride + head * head_dim;
-    count = 0;
-    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        out_k_fp8[out_base + d] = __nv_cvt_float_to_fp8(k_vals[count] * k_inv, __NV_SATFINITE, __NV_E4M3);
-        out_v_fp8[out_base + d] = __nv_cvt_float_to_fp8(v_vals[count] * v_inv, __NV_SATFINITE, __NV_E4M3);
-        count++;
+    if (pair_rope_fast_path) {
+        if (has_pair) {
+            out_k_fp8[out_base + tid] = __nv_cvt_float_to_fp8(k0_pair, __NV_SATFINITE, __NV_E4M3);
+            out_k_fp8[out_base + half_rd + tid] = __nv_cvt_float_to_fp8(k1_pair, __NV_SATFINITE, __NV_E4M3);
+            out_v_fp8[out_base + tid] = __nv_cvt_float_to_fp8(v0_pair, __NV_SATFINITE, __NV_E4M3);
+            out_v_fp8[out_base + half_rd + tid] = __nv_cvt_float_to_fp8(v1_pair, __NV_SATFINITE, __NV_E4M3);
+        }
+    } else if (single_elem_per_thread) {
+        if (has_single) {
+            out_k_fp8[out_base + tid] = __nv_cvt_float_to_fp8(k_val_single, __NV_SATFINITE, __NV_E4M3);
+            out_v_fp8[out_base + tid] = __nv_cvt_float_to_fp8(v_val_single, __NV_SATFINITE, __NV_E4M3);
+        }
+    } else {
+        count = 0;
+        for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+            out_k_fp8[out_base + d] = __nv_cvt_float_to_fp8(k_vals[count], __NV_SATFINITE, __NV_E4M3);
+            out_v_fp8[out_base + d] = __nv_cvt_float_to_fp8(v_vals[count], __NV_SATFINITE, __NV_E4M3);
+            count++;
+        }
     }
 }
 

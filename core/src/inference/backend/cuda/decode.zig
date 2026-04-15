@@ -109,11 +109,20 @@ pub fn decodeBatch(
             slot_indices_buf[i] = req.slot_index;
             positions_buf[i] = effective_position;
         }
-        try self.computeBatchedDecodeLogits(
+        self.computeBatchedDecodeLogits(
             tokens_buf[0..requests.len],
             slot_indices_buf[0..requests.len],
             positions_buf[0..requests.len],
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA decodeBatch batched decode failed", .{
+                .batch_rows = requests.len,
+                .slot0 = slot_indices_buf[0],
+                .position0 = positions_buf[0],
+                .token0 = tokens_buf[0],
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         for (requests, results[0..requests.len], 0..) |req, *result, row_i| {
             const position = self.slot_positions[req.slot_index];
             const slot_logits = self.slotLogits(req.slot_index);
@@ -223,6 +232,12 @@ pub fn decodeStreaming(
     var generated: usize = 0;
     var position = self.slot_positions[0];
     const budget = @min(max_tokens, output_tokens.len);
+    log.info("inference", "CUDA decodeStreaming start", .{
+        .slot_position = position,
+        .start_position = start_position,
+        .budget = budget,
+        .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[0])),
+    });
     if (comptime @hasDecl(SelfType, "ensureKvCapacity")) {
         if (budget > 0) {
             const required_capacity = std.math.add(usize, position, budget) catch return error.InvalidArgument;
@@ -231,7 +246,7 @@ pub fn decodeStreaming(
     }
     while (generated < budget) : (generated += 1) {
         const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[0]);
-        try self.computeGpuPrototypeLogitsWithLayerLimit(
+        self.computeGpuPrototypeLogitsWithLayerLimit(
             current_token,
             effective_position,
             0,
@@ -246,7 +261,15 @@ pub fn decodeStreaming(
             null,
             null,
             false,
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA decodeStreaming step failed", .{
+                .generated = generated,
+                .position = position,
+                .effective_position = effective_position,
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         const next_token = try self.selectNextTokenFromDeviceLogitsImpl();
         trace.emitFinal(
             .token_select,

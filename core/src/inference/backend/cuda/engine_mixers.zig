@@ -152,6 +152,197 @@ fn applyPrefillRopeRows(
     }
 }
 
+const LowBitKvKind = enum {
+    i8,
+    fp8,
+};
+
+fn runPrefillAttentionLowBitViaF16Gemm(
+    self: anytype,
+    kind: LowBitKvKind,
+    attn_q_stage: *compute.cuda.Buffer,
+    attn_context_stage: *compute.cuda.Buffer,
+    read_k_cache: *const compute.cuda.Buffer,
+    read_v_cache: *const compute.cuda.Buffer,
+    read_k_scale: *const compute.cuda.Buffer,
+    read_v_scale: *const compute.cuda.Buffer,
+    q_rows: usize,
+    q_row_stride: usize,
+    ctx_row_stride: usize,
+    seq_len_u32: u32,
+    kv_dim_u32: u32,
+    kv_groups_u32: u32,
+    n_heads_u32: u32,
+    n_kv_heads_u32: u32,
+    head_dim_u32: u32,
+    rope_dim_u32: u32,
+    position_base_u32: u32,
+    sliding_window_u32: u32,
+    layer_rope_theta: f32,
+    attention_scale: f32,
+    rope_function: compute.cuda.Function,
+    cast_f32_to_f16_function: ?compute.cuda.Function,
+    causal_softmax_f32_fn: compute.cuda.Function,
+) !void {
+    const cast_f32_to_f16_fn = cast_f32_to_f16_function orelse self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable;
+    const n_kv: u32 = n_heads_u32 / kv_groups_u32;
+    const q_f16_elems = std.math.mul(usize, q_rows, q_row_stride) catch return error.InvalidArgument;
+    const probs_f16_elems = std.math.mul(usize, std.math.mul(usize, n_kv, q_rows) catch return error.InvalidArgument, seq_len_u32) catch return error.InvalidArgument;
+    const kv_f16_elems = std.math.mul(usize, @as(usize, seq_len_u32), @as(usize, kv_dim_u32)) catch return error.InvalidArgument;
+
+    const q_f16_bytes = std.math.mul(usize, q_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+    const probs_f16_bytes = std.math.mul(usize, probs_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+    const kv_f16_bytes = std.math.mul(usize, kv_f16_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+
+    var u16_ws = try ensureAttnU16Workspace(
+        self,
+        q_f16_bytes + probs_f16_bytes + kv_f16_bytes + kv_f16_bytes,
+    );
+    var q_f16_buf = try bufferSlice(&u16_ws, 0, q_f16_bytes);
+    var probs_f16_buf = try bufferSlice(&u16_ws, q_f16_bytes, probs_f16_bytes);
+    var k_f16_buf = try bufferSlice(&u16_ws, q_f16_bytes + probs_f16_bytes, kv_f16_bytes);
+    var v_f16_buf = try bufferSlice(&u16_ws, q_f16_bytes + probs_f16_bytes + kv_f16_bytes, kv_f16_bytes);
+
+    switch (kind) {
+        .i8 => {
+            try compute.cuda.dequant_kv_i8_to_f16.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.dequant_kv_i8_to_f16_function orelse return error.CudaKernelUnavailable,
+                read_k_cache,
+                read_v_cache,
+                read_k_scale,
+                read_v_scale,
+                &k_f16_buf,
+                &v_f16_buf,
+                seq_len_u32,
+                n_kv_heads_u32,
+                kv_dim_u32,
+                head_dim_u32,
+            );
+        },
+        .fp8 => {
+            try compute.cuda.dequant_kv_fp8_to_f16.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.dequant_kv_fp8_to_f16_function orelse return error.CudaKernelUnavailable,
+                read_k_cache,
+                read_v_cache,
+                read_k_scale,
+                read_v_scale,
+                &k_f16_buf,
+                &v_f16_buf,
+                seq_len_u32,
+                n_kv_heads_u32,
+                kv_dim_u32,
+                head_dim_u32,
+            );
+        },
+    }
+
+    try applyPrefillRopeRows(
+        self,
+        attn_q_stage,
+        q_rows,
+        q_row_stride,
+        n_heads_u32,
+        head_dim_u32,
+        rope_dim_u32,
+        position_base_u32,
+        layer_rope_theta,
+        rope_function,
+    );
+
+    try compute.cuda.cast_f32_to_f16.runWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        cast_f32_to_f16_fn,
+        attn_q_stage,
+        &q_f16_buf,
+        @intCast(q_f16_elems),
+    );
+
+    var scores_buf = try ensureAttnScoresWorkspace(
+        self,
+        n_kv,
+        @intCast(q_rows),
+        seq_len_u32,
+    );
+
+    const q_ld: usize = q_row_stride;
+    const kv_ld: usize = kv_dim_u32;
+    const hd: usize = head_dim_u32;
+    const sl: usize = seq_len_u32;
+    const qr: usize = q_rows;
+
+    var group_idx: u32 = 0;
+    while (group_idx < kv_groups_u32) : (group_idx += 1) {
+        const q_f16_ptr = q_f16_buf.pointer + @as(usize, group_idx) * hd * @sizeOf(u16);
+        const out_ptr = attn_context_stage.pointer + @as(usize, group_idx) * hd * @sizeOf(f32);
+
+        try self.blas.gemmU16StridedBatched(
+            &self.device,
+            true,
+            sl,
+            qr,
+            hd,
+            attention_scale,
+            k_f16_buf.pointer,
+            kv_ld,
+            hd,
+            q_f16_ptr,
+            q_ld,
+            kv_groups_u32 * hd,
+            0.0,
+            scores_buf.pointer,
+            sl,
+            qr * sl,
+            n_kv,
+        );
+
+        try compute.cuda.causal_attn_softmax_f32.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            causal_softmax_f32_fn,
+            &scores_buf,
+            n_kv * @as(u32, @intCast(q_rows)),
+            seq_len_u32,
+            @intCast(q_rows),
+            position_base_u32,
+            sliding_window_u32,
+        );
+
+        try compute.cuda.cast_f32_to_f16.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            cast_f32_to_f16_fn,
+            &scores_buf,
+            &probs_f16_buf,
+            @intCast(probs_f16_elems),
+        );
+
+        try self.blas.gemmU16StridedBatched(
+            &self.device,
+            false,
+            hd,
+            qr,
+            sl,
+            1.0,
+            v_f16_buf.pointer,
+            kv_ld,
+            hd,
+            probs_f16_buf.pointer,
+            sl,
+            qr * sl,
+            0.0,
+            out_ptr,
+            ctx_row_stride,
+            kv_groups_u32 * hd,
+            n_kv,
+        );
+    }
+}
+
 fn effectiveLayerRopeTheta(
     self: anytype,
     cfg: *const LayerAttentionExecConfig,
@@ -432,7 +623,7 @@ pub fn runAttentionMixerStep(
         };
     }
     try applyValueNormInPlace(self, &attn_v_stage, stage_rows, n_kv_heads_u32, head_dim_u32);
-    const use_fused_attention_heads_f16_kv = (!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
+    const attention_kernel_applies_q_rope = (!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
         attention_policy_config,
         seq_len_u32,
         cfg.sliding_window,
@@ -440,7 +631,7 @@ pub fn runAttentionMixerStep(
         head_dim_u32,
         attention_kernels.attn_fused_heads_f16_kv_function != null,
     );
-    if (!use_fused_attention_heads_f16_kv) {
+    if (!attention_kernel_applies_q_rope) {
         compute.cuda.rope.runWithFunction(
             &self.kernel_arg_pack,
             &self.device,
@@ -802,16 +993,27 @@ pub fn runBatchedDecodeAttentionMixer(
         .i8 => self.flash_decode_i8_function != null,
         .fp8 => self.flash_decode_fp8_function != null,
     };
+    var max_seq_len_u32: u32 = 0;
+    for (batch.seq_lens[0..n]) |len_u32| {
+        max_seq_len_u32 = @max(max_seq_len_u32, len_u32);
+    }
     // Flash decode is better when there is enough parallel work from
-    // (n_kv_heads × batch_rows). For low-block launches, non-flash batched
-    // decode kernels usually sustain better occupancy.
+    // (n_kv_heads × batch_rows). For low-bit KV, allow single-row flash only
+    // for flash-compatible geometries (head_dim<=256, kv_groups<=4).
+    const lowbit_single_row_flash_compatible =
+        n_rows == 1 and kv_groups > 0 and kv_groups <= 4 and
+        ctx.head_dim_u32 > 0 and ctx.head_dim_u32 <= 256;
+    const allow_lowbit_single_row_flash = lowbit_single_row_flash_compatible and switch (self.kv_cache_dtype) {
+        .i8, .fp8 => true,
+        .f16 => false,
+    };
     const use_flash_decode = shouldUseFlashDecodePath(
         kv_groups,
         ctx.head_dim_u32,
         ctx.n_kv_heads_u32,
         n_rows,
         flash_decode_available,
-    );
+    ) or (allow_lowbit_single_row_flash and flash_decode_available);
     const use_batched_separate_decode_attention = switch (self.kv_cache_dtype) {
         .f16 => (self.rope_rows_ptrs_function != null) and
             (self.attn_scores_heads_f16_kv_ptrs_function != null) and
@@ -826,6 +1028,54 @@ pub fn runBatchedDecodeAttentionMixer(
             (self.softmax_rows_dynamic_cols_ptrs_function != null) and
             (self.attn_weighted_sum_heads_fp8_kv_ptrs_function != null),
     };
+    // Quantized decode prefers fused ptrs kernels first to avoid large
+    // score/prob scratch surfaces on long contexts.
+    const prefer_batched_fused_decode = switch (self.kv_cache_dtype) {
+        // Low-bit fused decode is preferred for typical head sizes. For very
+        // large heads (e.g. 512), separate ptrs kernels can be more efficient.
+        .i8, .fp8 => ctx.head_dim_u32 <= 256,
+        .f16 => false,
+    };
+    const use_batched_fused_decode_path = use_batched_fused_decode_attention and
+        (prefer_batched_fused_decode or !use_batched_separate_decode_attention);
+    const use_batched_separate_decode_path = use_batched_separate_decode_attention and
+        !use_batched_fused_decode_path;
+    if (std.posix.getenv("TALU_CUDA_LOG_DECODE_PATH") != null) {
+        const route = if (use_flash_decode)
+            "flash"
+        else if (use_batched_fused_decode_path)
+            "fused_ptrs"
+        else if (use_batched_separate_decode_path)
+            "separate_ptrs"
+        else
+            "fallback_row";
+        const route_id: u32 = if (use_flash_decode)
+            1
+        else if (use_batched_fused_decode_path)
+            2
+        else if (use_batched_separate_decode_path)
+            3
+        else
+            4;
+        log.warn("inference", "CUDA decode attention route", .{
+            .kv_dtype = @tagName(self.kv_cache_dtype),
+            .rows = n_rows,
+            .head_dim = ctx.head_dim_u32,
+            .n_heads = ctx.n_heads_u32,
+            .n_kv_heads = ctx.n_kv_heads_u32,
+            .route = route,
+            .route_id = route_id,
+            .prefer_batched_fused_decode_u32 = @as(u32, @intFromBool(prefer_batched_fused_decode)),
+            .allow_lowbit_single_row_flash_u32 = @as(u32, @intFromBool(allow_lowbit_single_row_flash)),
+            .n_rows_eq_1_u32 = @as(u32, @intFromBool(n_rows == 1)),
+            .flash_u32 = @as(u32, @intFromBool(use_flash_decode)),
+            .separate_u32 = @as(u32, @intFromBool(use_batched_separate_decode_path)),
+            .fused_u32 = @as(u32, @intFromBool(use_batched_fused_decode_path)),
+            .flash_available_u32 = @as(u32, @intFromBool(flash_decode_available)),
+            .separate_available_u32 = @as(u32, @intFromBool(use_batched_separate_decode_attention)),
+            .fused_available_u32 = @as(u32, @intFromBool(use_batched_fused_decode_attention)),
+        });
+    }
     const sliding_window_u32: u32 = if (cfg.is_causal and cfg.sliding_window > 0)
         (std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32))
     else
@@ -880,7 +1130,7 @@ pub fn runBatchedDecodeAttentionMixer(
 
     // Flash decode preferred (GQA-aware, fewest KV reads), then batched
     // separate (graph-compatible), then fused fallback.
-    const use_batched_decode_attention = use_flash_decode or use_batched_separate_decode_attention or use_batched_fused_decode_attention;
+    const use_batched_decode_attention = use_flash_decode or use_batched_separate_decode_path or use_batched_fused_decode_path;
     const can_skip_row_decode_prep = shared_source_slot_kv_index == null and use_batched_kv_write and use_batched_decode_attention;
     if (!can_skip_row_decode_prep) {
         for (0..n) |row_i| {
@@ -893,7 +1143,7 @@ pub fn runBatchedDecodeAttentionMixer(
             var q_row = try logicalF32RowSlice(&attn_q_stage, n, row_i, cfg.q_dim);
             var k_row_stage = try logicalF32RowSlice(&attn_k_stage, n, row_i, cfg.kv_dim);
             var v_row_stage = try logicalF32RowSlice(&attn_v_stage, n, row_i, cfg.kv_dim);
-            const use_fused_attention_heads_f16_kv = use_flash_decode or use_batched_fused_decode_attention or
+            const decode_attention_path_applies_q_rope = use_flash_decode or use_batched_fused_decode_attention or
                 ((!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
                     attention_policy_config,
                     seq_len_u32,
@@ -904,7 +1154,7 @@ pub fn runBatchedDecodeAttentionMixer(
                 ));
 
             // RoPE on Q (per-row position).
-            if (!use_fused_attention_heads_f16_kv) {
+            if (!decode_attention_path_applies_q_rope) {
                 try compute.cuda.rope.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -1114,7 +1364,16 @@ pub fn runBatchedDecodeAttentionMixer(
         // internally, reads KV once per KV head for all grouped Q heads.
         const gate_proj: ?*const compute.cuda.Buffer = if (cfg.query_gate) &q_projection_stage else null;
         const gate_proj_stride: u32 = if (cfg.query_gate) @intCast(cfg.q_projection_dim) else 0;
-        const n_seq_chunks = compute.cuda.flash_decode.computeSeqChunks(ctx.n_kv_heads_u32, n_rows);
+        const prefer_split_k = switch (self.kv_cache_dtype) {
+            .i8, .fp8 => true,
+            .f16 => false,
+        };
+        const n_seq_chunks = compute.cuda.flash_decode.computeSeqChunks(
+            ctx.n_kv_heads_u32,
+            n_rows,
+            max_seq_len_u32,
+            prefer_split_k,
+        );
 
         // Lazy-allocate partial buffers for split-K when needed.
         var partial_m_buf: compute.cuda.Buffer = undefined;
@@ -1253,7 +1512,7 @@ pub fn runBatchedDecodeAttentionMixer(
                 gate_proj_stride,
             );
         }
-    } else if (use_batched_separate_decode_attention) {
+    } else if (use_batched_separate_decode_path) {
         // Batched separate attention: same high-occupancy kernel design as
         // per-row path, but reads position/seq_len from device buffers and
         // KV cache from pointer tables — fully graph-compatible.
@@ -1420,7 +1679,7 @@ pub fn runBatchedDecodeAttentionMixer(
                 );
             },
         }
-    } else if (use_batched_fused_decode_attention) {
+    } else if (use_batched_fused_decode_path) {
         // Fused path fallback: single kernel does RoPE + scores + softmax +
         // weighted_sum + optional gate fusion.
         const gate_proj: ?*const compute.cuda.Buffer = if (cfg.query_gate) &q_projection_stage else null;
@@ -1542,7 +1801,7 @@ pub fn runBatchedDecodeAttentionMixer(
 
     // Step 4: Query gate — the fused path handles gate internally; batched
     // separate and per-row paths need a separate gate kernel.
-    const fused_path_active = use_flash_decode or (use_batched_fused_decode_attention and !use_batched_separate_decode_attention);
+    const fused_path_active = use_flash_decode or use_batched_fused_decode_path;
     if (cfg.query_gate and !fused_path_active) {
         try engine_ops.applyQueryGateToContextInPlace(self, n, cfg.q_dim, cfg.q_projection_dim, ctx.n_heads_u32, ctx.head_dim_u32);
     }
@@ -2469,7 +2728,14 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
         .i8 => attention_kernels.attn_fused_prefill_heads_i8_kv_function != null,
         .fp8 => attention_kernels.attn_fused_prefill_heads_fp8_kv_function != null,
     };
-    const can_any_fused_prefill = can_flash_prefill or can_fused_prefill_attn;
+    const can_lowbit_gemm_prefill = cfg.is_causal and switch (self.kv_cache_dtype) {
+        .f16 => false,
+        .i8 => self.dequant_kv_i8_to_f16_function != null and (cast_f32_to_f16_function != null or self.cast_f32_to_f16_function != null) and
+            ((attention_kernels.causal_attn_softmax_f32_function != null) or (self.causal_attn_softmax_f32_function != null)),
+        .fp8 => self.dequant_kv_fp8_to_f16_function != null and (cast_f32_to_f16_function != null or self.cast_f32_to_f16_function != null) and
+            ((attention_kernels.causal_attn_softmax_f32_function != null) or (self.causal_attn_softmax_f32_function != null)),
+    };
+    const can_any_fused_prefill = can_flash_prefill or can_fused_prefill_attn or can_lowbit_gemm_prefill;
     const can_batched_kv_write_prefill = can_any_fused_prefill and switch (self.kv_cache_dtype) {
         .f16 => kv_write_f16_function != null and self.kv_write_f16_rows_function != null,
         .i8 => self.kv_write_i8_rows_function != null,
@@ -2697,7 +2963,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                 var q_row = try bufferSlice(&attn_q_stage, q_offset, q_row_bytes);
                 var ctx_row = try bufferSlice(&attn_context_stage, ctx_offset, ctx_row_bytes);
                 const effective_seq_len_u32: u32 = position_u32 + 1;
-                const use_fused_attention_heads_f16_kv = attention_mod.useFusedHeadsF16Kv(
+                const attention_context_path_applies_q_rope = attention_mod.useFusedHeadsF16Kv(
                     attention_policy_config,
                     effective_seq_len_u32,
                     cfg.sliding_window,
@@ -2705,7 +2971,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                     head_dim_u32,
                     attention_kernels.attn_fused_heads_f16_kv_function != null,
                 );
-                if (!use_fused_attention_heads_f16_kv) {
+                if (!attention_context_path_applies_q_rope) {
                     try compute.cuda.rope.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -2765,13 +3031,12 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                 const use_gqa = kv_groups_u32 >= 2 and
                     attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function != null;
 
-                // Real fused prefill routing:
-                // Prefer flash/fused prefill kernels whenever they are available.
-                // Keep GEMM attention only as correctness fallback when fused
-                // prefill kernels are unavailable on this runtime.
+                // Current f16 prefill route contract:
+                // Keep GEMM attention as the selected baseline route in this branch.
+                // Flash/fused prefill kernels remain as non-selected alternatives.
                 const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
-                const can_gemm_attn = true;
-                if (can_gemm_attn) {
+                const use_gemm_prefill_attention = true;
+                if (use_gemm_prefill_attention) {
                     // Apply RoPE to Q for all rows (each row has a different position).
                     // Use batched row kernel when row stride matches n_heads*head_dim.
                     try applyPrefillRopeRows(
@@ -2966,7 +3231,38 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                 const scale_offset_attn = std.math.mul(usize, 0, scale_row_bytes_attn) catch return error.InvalidArgument;
                 var k_scale_attn = try bufferSlice(read_k_scale, scale_offset_attn, read_k_scale.size);
                 var v_scale_attn = try bufferSlice(read_v_scale, scale_offset_attn, read_v_scale.size);
-                if (can_flash_prefill) {
+                if (can_lowbit_gemm_prefill) {
+                    const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse
+                        self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
+                    try runPrefillAttentionLowBitViaF16Gemm(
+                        self,
+                        .i8,
+                        &attn_q_stage,
+                        &attn_context_stage,
+                        read_k_cache,
+                        read_v_cache,
+                        &k_scale_attn,
+                        &v_scale_attn,
+                        stage_rows,
+                        cfg.q_projection_dim,
+                        o_proj.rows(),
+                        seq_len_u32,
+                        kv_dim_u32,
+                        kv_groups_u32,
+                        n_heads_u32,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_base_u32,
+                        sliding_window_u32,
+                        layer_rope_theta,
+                        attention_scale,
+                        rope_function,
+                        cast_f32_to_f16_function,
+                        causal_softmax_f32_fn,
+                    );
+                    attention_path = .heads_lowbit_bridge_f16_kv;
+                } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -2990,31 +3286,72 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
-                    attention_path = .fused_heads_i8_kv;
+                    attention_path = .heads_i8_kv;
                 } else if (use_gqa_i8) {
-                    try compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function.?,
-                        &attn_q_stage,
-                        read_k_cache,
-                        read_v_cache,
-                        &k_scale_attn,
-                        &v_scale_attn,
-                        &attn_context_stage,
-                        n_heads_u32,
-                        n_kv_heads_u32,
-                        @intCast(stage_rows),
-                        seq_len_u32,
-                        kv_dim_u32,
-                        kv_groups_u32,
-                        head_dim_u32,
-                        attention_scale,
-                        rope_dim_u32,
-                        position_base_u32,
-                        sliding_window_u32,
-                        layer_rope_theta,
-                    );
+                    const gqa_i8_ok = blk: {
+                        compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn,
+                            &v_scale_attn,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32,
+                            layer_rope_theta,
+                        ) catch |err| {
+                            if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
+                                log.warn("inference", "CUDA fused prefill i8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                    .q_rows = stage_rows,
+                                    .seq_len = seq_len_u32,
+                                    .head_dim = head_dim_u32,
+                                    .kv_groups = kv_groups_u32,
+                                    .rope_dim = rope_dim_u32,
+                                    .reason = @errorName(err),
+                                });
+                                break :blk false;
+                            }
+                            return err;
+                        };
+                        break :blk true;
+                    };
+                    if (!gqa_i8_ok) {
+                        try compute.cuda.attn_fused_prefill_heads_i8_kv.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_i8_kv_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn,
+                            &v_scale_attn,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32,
+                            layer_rope_theta,
+                        );
+                    }
                     attention_path = .fused_heads_i8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_i8_kv.runWithFunction(
@@ -3050,7 +3387,38 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                 const scale_offset_attn_fp8 = std.math.mul(usize, 0, scale_row_bytes_attn_fp8) catch return error.InvalidArgument;
                 var k_scale_attn_fp8 = try bufferSlice(read_k_scale, scale_offset_attn_fp8, read_k_scale.size);
                 var v_scale_attn_fp8 = try bufferSlice(read_v_scale, scale_offset_attn_fp8, read_v_scale.size);
-                if (can_flash_prefill) {
+                if (can_lowbit_gemm_prefill) {
+                    const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse
+                        self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
+                    try runPrefillAttentionLowBitViaF16Gemm(
+                        self,
+                        .fp8,
+                        &attn_q_stage,
+                        &attn_context_stage,
+                        read_k_cache,
+                        read_v_cache,
+                        &k_scale_attn_fp8,
+                        &v_scale_attn_fp8,
+                        stage_rows,
+                        cfg.q_projection_dim,
+                        o_proj.rows(),
+                        seq_len_u32,
+                        kv_dim_u32,
+                        kv_groups_u32,
+                        n_heads_u32,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_base_u32,
+                        sliding_window_u32,
+                        layer_rope_theta,
+                        attention_scale,
+                        rope_function,
+                        cast_f32_to_f16_function,
+                        causal_softmax_f32_fn,
+                    );
+                    attention_path = .heads_lowbit_bridge_f16_kv;
+                } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -3074,31 +3442,72 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         sliding_window_u32,
                         layer_rope_theta,
                     );
-                    attention_path = .fused_heads_fp8_kv;
+                    attention_path = .heads_fp8_kv;
                 } else if (use_gqa_fp8) {
-                    try compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function.?,
-                        &attn_q_stage,
-                        read_k_cache,
-                        read_v_cache,
-                        &k_scale_attn_fp8,
-                        &v_scale_attn_fp8,
-                        &attn_context_stage,
-                        n_heads_u32,
-                        n_kv_heads_u32,
-                        @intCast(stage_rows),
-                        seq_len_u32,
-                        kv_dim_u32,
-                        kv_groups_u32,
-                        head_dim_u32,
-                        attention_scale,
-                        rope_dim_u32,
-                        position_base_u32,
-                        sliding_window_u32,
-                        layer_rope_theta,
-                    );
+                    const gqa_fp8_ok = blk: {
+                        compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn_fp8,
+                            &v_scale_attn_fp8,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32,
+                            layer_rope_theta,
+                        ) catch |err| {
+                            if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
+                                log.warn("inference", "CUDA fused prefill fp8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                    .q_rows = stage_rows,
+                                    .seq_len = seq_len_u32,
+                                    .head_dim = head_dim_u32,
+                                    .kv_groups = kv_groups_u32,
+                                    .rope_dim = rope_dim_u32,
+                                    .reason = @errorName(err),
+                                });
+                                break :blk false;
+                            }
+                            return err;
+                        };
+                        break :blk true;
+                    };
+                    if (!gqa_fp8_ok) {
+                        try compute.cuda.attn_fused_prefill_heads_fp8_kv.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_fp8_kv_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn_fp8,
+                            &v_scale_attn_fp8,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32,
+                            layer_rope_theta,
+                        );
+                    }
                     attention_path = .fused_heads_fp8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_fp8_kv.runWithFunction(
@@ -3319,7 +3728,14 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
         .i8 => attention_kernels.attn_fused_prefill_heads_i8_kv_function != null,
         .fp8 => attention_kernels.attn_fused_prefill_heads_fp8_kv_function != null,
     };
-    const can_any_fused_prefill = can_flash_prefill or can_fused_prefill_attn;
+    const can_lowbit_gemm_prefill = cfg.is_causal and switch (self.kv_cache_dtype) {
+        .f16 => false,
+        .i8 => self.dequant_kv_i8_to_f16_function != null and (cast_f32_to_f16_function != null or self.cast_f32_to_f16_function != null) and
+            ((attention_kernels.causal_attn_softmax_f32_function != null) or (self.causal_attn_softmax_f32_function != null)),
+        .fp8 => self.dequant_kv_fp8_to_f16_function != null and (cast_f32_to_f16_function != null or self.cast_f32_to_f16_function != null) and
+            ((attention_kernels.causal_attn_softmax_f32_function != null) or (self.causal_attn_softmax_f32_function != null)),
+    };
+    const can_any_fused_prefill = can_flash_prefill or can_fused_prefill_attn or can_lowbit_gemm_prefill;
     const can_batched_kv_write_prefill = can_any_fused_prefill and switch (self.kv_cache_dtype) {
         .f16 => kv_write_f16_function != null and self.kv_write_f16_rows_function != null,
         .i8 => self.kv_write_i8_rows_function != null,
@@ -3599,13 +4015,12 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                 const use_gqa = kv_groups_u32 >= 2 and
                     attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function != null;
 
-                // Real fused prefill routing:
-                // Prefer flash/fused prefill kernels whenever they are available.
-                // Keep GEMM attention only as correctness fallback when fused
-                // prefill kernels are unavailable on this runtime.
+                // Current f16 prefill route contract:
+                // Keep GEMM attention as the selected baseline route in this branch.
+                // Flash/fused prefill kernels remain as non-selected alternatives.
                 const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
-                const can_gemm_attn = true;
-                if (can_gemm_attn) {
+                const use_gemm_prefill_attention = true;
+                if (use_gemm_prefill_attention) {
                     // Apply RoPE to Q for all rows.
                     try applyPrefillRopeRows(
                         self,
@@ -3795,7 +4210,38 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                     attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function != null;
                 var k_scale_attn = try bufferSlice(read_k_scale, 0, read_k_scale.size);
                 var v_scale_attn = try bufferSlice(read_v_scale, 0, read_v_scale.size);
-                if (can_flash_prefill) {
+                if (can_lowbit_gemm_prefill) {
+                    const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse
+                        self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
+                    try runPrefillAttentionLowBitViaF16Gemm(
+                        self,
+                        .i8,
+                        &attn_q_stage,
+                        &attn_context_stage,
+                        read_k_cache,
+                        read_v_cache,
+                        &k_scale_attn,
+                        &v_scale_attn,
+                        stage_rows,
+                        cfg.q_dim,
+                        o_proj.rows(),
+                        seq_len_u32,
+                        kv_dim_u32,
+                        kv_groups_u32,
+                        n_heads_u32,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_base_u32,
+                        sliding_window_u32_wq,
+                        layer_rope_theta,
+                        attention_scale,
+                        rope_function,
+                        cast_f32_to_f16_function,
+                        causal_softmax_f32_fn,
+                    );
+                    attention_path = .heads_lowbit_bridge_f16_kv;
+                } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -3819,31 +4265,72 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
-                    attention_path = .fused_heads_i8_kv;
+                    attention_path = .heads_i8_kv;
                 } else if (use_gqa_i8) {
-                    try compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function.?,
-                        &attn_q_stage,
-                        read_k_cache,
-                        read_v_cache,
-                        &k_scale_attn,
-                        &v_scale_attn,
-                        &attn_context_stage,
-                        n_heads_u32,
-                        n_kv_heads_u32,
-                        @intCast(stage_rows),
-                        seq_len_u32,
-                        kv_dim_u32,
-                        kv_groups_u32,
-                        head_dim_u32,
-                        attention_scale,
-                        rope_dim_u32,
-                        position_base_u32,
-                        sliding_window_u32_wq,
-                        layer_rope_theta,
-                    );
+                    const gqa_i8_ok = blk: {
+                        compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn,
+                            &v_scale_attn,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32_wq,
+                            layer_rope_theta,
+                        ) catch |err| {
+                            if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
+                                log.warn("inference", "CUDA fused prefill i8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                    .q_rows = stage_rows,
+                                    .seq_len = seq_len_u32,
+                                    .head_dim = head_dim_u32,
+                                    .kv_groups = kv_groups_u32,
+                                    .rope_dim = rope_dim_u32,
+                                    .reason = @errorName(err),
+                                });
+                                break :blk false;
+                            }
+                            return err;
+                        };
+                        break :blk true;
+                    };
+                    if (!gqa_i8_ok) {
+                        try compute.cuda.attn_fused_prefill_heads_i8_kv.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_i8_kv_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn,
+                            &v_scale_attn,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32_wq,
+                            layer_rope_theta,
+                        );
+                    }
                     attention_path = .fused_heads_i8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_i8_kv.runWithFunction(
@@ -3877,7 +4364,38 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                     attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function != null;
                 var k_scale_attn_fp8 = try bufferSlice(read_k_scale, 0, read_k_scale.size);
                 var v_scale_attn_fp8 = try bufferSlice(read_v_scale, 0, read_v_scale.size);
-                if (can_flash_prefill) {
+                if (can_lowbit_gemm_prefill) {
+                    const causal_softmax_f32_fn = attention_kernels.causal_attn_softmax_f32_function orelse
+                        self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
+                    try runPrefillAttentionLowBitViaF16Gemm(
+                        self,
+                        .fp8,
+                        &attn_q_stage,
+                        &attn_context_stage,
+                        read_k_cache,
+                        read_v_cache,
+                        &k_scale_attn_fp8,
+                        &v_scale_attn_fp8,
+                        stage_rows,
+                        cfg.q_dim,
+                        o_proj.rows(),
+                        seq_len_u32,
+                        kv_dim_u32,
+                        kv_groups_u32,
+                        n_heads_u32,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_base_u32,
+                        sliding_window_u32_wq,
+                        layer_rope_theta,
+                        attention_scale,
+                        rope_function,
+                        cast_f32_to_f16_function,
+                        causal_softmax_f32_fn,
+                    );
+                    attention_path = .heads_lowbit_bridge_f16_kv;
+                } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -3901,31 +4419,72 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         sliding_window_u32_wq,
                         layer_rope_theta,
                     );
-                    attention_path = .fused_heads_fp8_kv;
+                    attention_path = .heads_fp8_kv;
                 } else if (use_gqa_fp8) {
-                    try compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function.?,
-                        &attn_q_stage,
-                        read_k_cache,
-                        read_v_cache,
-                        &k_scale_attn_fp8,
-                        &v_scale_attn_fp8,
-                        &attn_context_stage,
-                        n_heads_u32,
-                        n_kv_heads_u32,
-                        @intCast(stage_rows),
-                        seq_len_u32,
-                        kv_dim_u32,
-                        kv_groups_u32,
-                        head_dim_u32,
-                        attention_scale,
-                        rope_dim_u32,
-                        position_base_u32,
-                        sliding_window_u32_wq,
-                        layer_rope_theta,
-                    );
+                    const gqa_fp8_ok = blk: {
+                        compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn_fp8,
+                            &v_scale_attn_fp8,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32_wq,
+                            layer_rope_theta,
+                        ) catch |err| {
+                            if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
+                                log.warn("inference", "CUDA fused prefill fp8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                    .q_rows = stage_rows,
+                                    .seq_len = seq_len_u32,
+                                    .head_dim = head_dim_u32,
+                                    .kv_groups = kv_groups_u32,
+                                    .rope_dim = rope_dim_u32,
+                                    .reason = @errorName(err),
+                                });
+                                break :blk false;
+                            }
+                            return err;
+                        };
+                        break :blk true;
+                    };
+                    if (!gqa_fp8_ok) {
+                        try compute.cuda.attn_fused_prefill_heads_fp8_kv.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            attention_kernels.attn_fused_prefill_heads_fp8_kv_function.?,
+                            &attn_q_stage,
+                            read_k_cache,
+                            read_v_cache,
+                            &k_scale_attn_fp8,
+                            &v_scale_attn_fp8,
+                            &attn_context_stage,
+                            n_heads_u32,
+                            n_kv_heads_u32,
+                            @intCast(stage_rows),
+                            seq_len_u32,
+                            kv_dim_u32,
+                            kv_groups_u32,
+                            head_dim_u32,
+                            attention_scale,
+                            rope_dim_u32,
+                            position_base_u32,
+                            sliding_window_u32_wq,
+                            layer_rope_theta,
+                        );
+                    }
                     attention_path = .fused_heads_fp8_kv;
                 } else {
                     try compute.cuda.attn_fused_prefill_heads_fp8_kv.runWithFunction(
