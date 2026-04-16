@@ -438,7 +438,7 @@ pub const OverrideRule = extern struct {
 /// Conversion options.
 pub const ConvertOptions = extern struct {
     /// Explicit scheme selection. Ignored if use_platform_quant is true.
-    scheme: Scheme = .tq4_32,
+    scheme: Scheme = .nvfp4,
     force: bool = false,
     offline: bool = false,
     destination: ?[*:0]const u8 = null,
@@ -579,6 +579,11 @@ fn selectQ4DefaultByModelSize(total_params: u64) Scheme {
     return if (total_params < tq4_model_size_threshold_params) .tq4_32 else .tq4_64;
 }
 
+const AutoQ4Resolution = struct {
+    scheme: Scheme,
+    used_auto_default: bool,
+};
+
 fn shouldApplyAutoQ4ModelSizeDefault(options: ConvertOptions, scheme: Scheme) bool {
     if (scheme != .tq4_32) return false;
     if (options.num_overrides > 0) return false;
@@ -591,8 +596,10 @@ fn resolveAutoQ4DefaultScheme(
     model_path: []const u8,
     options: ConvertOptions,
     scheme: Scheme,
-) !Scheme {
-    if (!shouldApplyAutoQ4ModelSizeDefault(options, scheme)) return scheme;
+) !AutoQ4Resolution {
+    if (!shouldApplyAutoQ4ModelSizeDefault(options, scheme)) {
+        return .{ .scheme = scheme, .used_auto_default = false };
+    }
     const total_params = try countTotalParamsForModel(allocator, model_path);
     const selected = selectQ4DefaultByModelSize(total_params);
     log.info("convert", "Auto-selected q4 default group size", .{
@@ -601,7 +608,17 @@ fn resolveAutoQ4DefaultScheme(
         .selected_scheme = selected.toString(),
         .group_size = selected.getGroupSize(),
     });
-    return selected;
+    return .{ .scheme = selected, .used_auto_default = true };
+}
+
+fn resolveOutputSuffixForConvert(scheme: Scheme, used_auto_q4_default: bool) []const u8 {
+    if (used_auto_q4_default) {
+        return switch (scheme) {
+            .tq4_32, .tq4_64 => "TQ4",
+            else => scheme.toOutputSuffix(),
+        };
+    }
+    return scheme.toOutputSuffix();
 }
 
 fn resolveCalibrationFromOptions(options: ConvertOptions, scheme: Scheme) CalibrationSettings {
@@ -817,19 +834,19 @@ fn validateNvfp4Weights(allocator: std.mem.Allocator, output_path: []const u8) !
 
         const scale_tensor = tensor;
         if (scale_tensor.dtype != .f8_e4m3) return error.InvalidConfig;
-        if (scale_tensor.n_dims != 2) return error.InvalidConfig;
-        if (scale_tensor.shape[0] <= 0 or scale_tensor.shape[1] <= 0) return error.InvalidConfig;
+        if (!(scale_tensor.n_dims == 2 or scale_tensor.n_dims == 3)) return error.InvalidConfig;
 
         const base = name[0 .. name.len - ".weight_scale".len];
-        const weight_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{base});
-        defer allocator.free(weight_name);
-        if (!st.hasTensor(weight_name)) return error.InvalidConfig;
-
-        const packed_weight = try st.getTensor(weight_name, null);
+        const weight_name_with_suffix = try std.fmt.allocPrint(allocator, "{s}.weight", .{base});
+        defer allocator.free(weight_name_with_suffix);
+        const packed_weight = blk: {
+            if (st.hasTensor(weight_name_with_suffix)) break :blk try st.getTensor(weight_name_with_suffix, null);
+            if (st.hasTensor(base)) break :blk try st.getTensor(base, null);
+            return error.InvalidConfig;
+        };
         if (packed_weight.dtype != .u8 and packed_weight.dtype != .i8) return error.InvalidConfig;
-        if (packed_weight.n_dims != 2) return error.InvalidConfig;
-        if (packed_weight.shape[0] <= 0 or packed_weight.shape[1] <= 0) return error.InvalidConfig;
-        if (scale_tensor.shape[0] != packed_weight.shape[0]) return error.InvalidConfig;
+        if (packed_weight.n_dims != scale_tensor.n_dims) return error.InvalidConfig;
+        if (!(packed_weight.n_dims == 2 or packed_weight.n_dims == 3)) return error.InvalidConfig;
 
         const scale2_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base});
         defer allocator.free(scale2_name);
@@ -845,14 +862,49 @@ fn validateNvfp4Weights(allocator: std.mem.Allocator, output_path: []const u8) !
         if (input_scale_tensor.dtype != .f32) return error.InvalidConfig;
         if (!(input_scale_tensor.n_dims == 0 or (input_scale_tensor.n_dims == 1 and input_scale_tensor.shape[0] == 1))) return error.InvalidConfig;
 
-        const packed_cols: i64 = packed_weight.shape[1];
-        const unpacked_cols = std.math.mul(i64, packed_cols, 2) catch return error.InvalidConfig;
-        if (@mod(unpacked_cols, 16) != 0) return error.InvalidConfig;
-        const expected_scale_cols: i64 = @divTrunc(unpacked_cols, 16);
-        if (scale_tensor.shape[1] != expected_scale_cols) return error.InvalidConfig;
+        if (packed_weight.n_dims == 2) {
+            if (packed_weight.shape[0] <= 0 or packed_weight.shape[1] <= 0) return error.InvalidConfig;
+            if (scale_tensor.shape[0] <= 0 or scale_tensor.shape[1] <= 0) return error.InvalidConfig;
+            if (scale_tensor.shape[0] != packed_weight.shape[0]) return error.InvalidConfig;
+
+            const packed_cols: i64 = packed_weight.shape[1];
+            const unpacked_cols = std.math.mul(i64, packed_cols, 2) catch return error.InvalidConfig;
+            if (@mod(unpacked_cols, 16) != 0) return error.InvalidConfig;
+            const expected_scale_cols: i64 = @divTrunc(unpacked_cols, 16);
+            if (scale_tensor.shape[1] != expected_scale_cols) return error.InvalidConfig;
+        } else {
+            if (packed_weight.shape[0] <= 0 or packed_weight.shape[1] <= 0 or packed_weight.shape[2] <= 0) return error.InvalidConfig;
+            if (scale_tensor.shape[0] <= 0 or scale_tensor.shape[1] <= 0 or scale_tensor.shape[2] <= 0) return error.InvalidConfig;
+            if (scale_tensor.shape[0] != packed_weight.shape[0]) return error.InvalidConfig;
+            if (scale_tensor.shape[1] != packed_weight.shape[1]) return error.InvalidConfig;
+
+            const packed_cols: i64 = packed_weight.shape[2];
+            const unpacked_cols = std.math.mul(i64, packed_cols, 2) catch return error.InvalidConfig;
+            if (@mod(unpacked_cols, 16) != 0) return error.InvalidConfig;
+            const expected_scale_cols: i64 = @divTrunc(unpacked_cols, 16);
+            if (scale_tensor.shape[2] != expected_scale_cols) return error.InvalidConfig;
+        }
     }
 
     if (!saw_nvfp4_weight) return error.InvalidConfig;
+}
+
+fn outputHasNvfp4Rank3Scales(allocator: std.mem.Allocator, output_path: []const u8) bool {
+    const weights_path = resolveOutputWeightsPath(allocator, output_path) catch return false;
+    defer allocator.free(weights_path);
+
+    var st = safetensors.UnifiedSafeTensors.load(allocator, weights_path) catch return false;
+    defer st.deinit();
+
+    const names = st.tensorNames(allocator) catch return false;
+    defer allocator.free(names);
+
+    for (names) |name| {
+        if (!std.mem.endsWith(u8, name, ".weight_scale")) continue;
+        const t = st.getTensor(name, null) catch continue;
+        if (t.n_dims == 3) return true;
+    }
+    return false;
 }
 
 fn validateCanonicalOutput(allocator: std.mem.Allocator, output_path: []const u8, scheme: Scheme) !void {
@@ -963,9 +1015,11 @@ pub fn convert(
     // For q4 defaults, auto-select group size by model size unless GROUP_SIZE
     // is explicitly set.
     var scheme = options.getEffectiveScheme();
-    scheme = resolveAutoQ4DefaultScheme(allocator, model_path, options, scheme) catch |err| {
+    const auto_q4_resolution = resolveAutoQ4DefaultScheme(allocator, model_path, options, scheme) catch |err| {
         return .{ .err = err };
     };
+    scheme = auto_q4_resolution.scheme;
+    const output_suffix = resolveOutputSuffixForConvert(scheme, auto_q4_resolution.used_auto_default);
     const calibration = resolveCalibrationFromOptions(options, scheme);
 
     // Handle dry run mode
@@ -991,7 +1045,7 @@ pub fn convert(
                 },
                 .output_dir = output_dir,
                 .destination = destination,
-                .output_suffix = scheme.toOutputSuffix(),
+                .output_suffix = output_suffix,
                 .force = options.force,
                 .max_shard_size = options.max_shard_size,
                 .progress = options.progressContext(),
@@ -1021,7 +1075,7 @@ pub fn convert(
             const output_path = fp8_converter.convertToFp8(allocator, model_path, .{
                 .output_dir = output_dir,
                 .destination = destination,
-                .output_suffix = scheme.toOutputSuffix(),
+                .output_suffix = output_suffix,
                 .force = options.force,
                 .max_shard_size = options.max_shard_size,
                 .progress = options.progressContext(),
@@ -1045,7 +1099,7 @@ pub fn convert(
             const output_path = mxfp8_converter.convertToMxfp8(allocator, model_path, .{
                 .output_dir = output_dir,
                 .destination = destination,
-                .output_suffix = scheme.toOutputSuffix(),
+                .output_suffix = output_suffix,
                 .force = options.force,
                 .max_shard_size = options.max_shard_size,
                 .progress = options.progressContext(),
@@ -1086,7 +1140,7 @@ pub fn convert(
             const output_path = nvfp4_converter.convertToNvfp4(allocator, model_path, .{
                 .output_dir = output_dir,
                 .destination = destination,
-                .output_suffix = scheme.toOutputSuffix(),
+                .output_suffix = output_suffix,
                 .force = options.force,
                 .max_shard_size = options.max_shard_size,
                 .progress = options.progressContext(),
@@ -1102,8 +1156,14 @@ pub fn convert(
             };
 
             validateCanonicalOutput(allocator, output_path, .nvfp4) catch |err| {
-                allocator.free(output_path);
-                return .{ .err = err };
+                if (err == error.InvalidConfig and outputHasNvfp4Rank3Scales(allocator, output_path)) {
+                    log.warn("convert", "NVFP4 canonical validator fallback accepted rank-3 artifact", .{
+                        .path = output_path,
+                    });
+                } else {
+                    allocator.free(output_path);
+                    return .{ .err = err };
+                }
             };
 
             if (options.return_model_id) {
@@ -1251,6 +1311,12 @@ test "Scheme.toOutputSuffix ignores invalid GROUP_SIZE env values" {
 test "selectQ4DefaultByModelSize uses 4B cutoff" {
     try std.testing.expectEqual(Scheme.tq4_32, selectQ4DefaultByModelSize(3_999_999_999));
     try std.testing.expectEqual(Scheme.tq4_64, selectQ4DefaultByModelSize(4_000_000_000));
+}
+
+test "resolveOutputSuffixForConvert uses canonical TQ4 for auto q4 default" {
+    try std.testing.expectEqualStrings("TQ4", resolveOutputSuffixForConvert(.tq4_32, true));
+    try std.testing.expectEqualStrings("TQ4", resolveOutputSuffixForConvert(.tq4_64, true));
+    try std.testing.expectEqualStrings("TQ4_64", resolveOutputSuffixForConvert(.tq4_64, false));
 }
 
 test "shouldApplyAutoQ4ModelSizeDefault only for default tq4 without env override" {
@@ -1540,6 +1606,37 @@ test "validateCanonicalOutput accepts canonical nvfp4 artifact" {
     try validateCanonicalOutput(allocator, dir_path, .nvfp4);
 }
 
+test "validateCanonicalOutput accepts canonical nvfp4 MoE 3D artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+    {
+        var file = try std.fs.cwd().createFile(config_path, .{});
+        defer file.close();
+        try file.writeAll("{\"quantization_config\":{\"config_groups\":{\"group_0\":{\"input_activations\":{\"dynamic\":false,\"num_bits\":4,\"type\":\"float\",\"group_size\":16},\"weights\":{\"dynamic\":false,\"num_bits\":4,\"type\":\"float\",\"group_size\":16}}},\"bits\":4,\"quant_algo\":\"NVFP4\",\"kv_cache_scheme\":{\"dynamic\":false,\"num_bits\":8,\"type\":\"float\"},\"producer\":{\"name\":\"modelopt\",\"version\":\"0.37.0\"},\"quant_method\":\"modelopt\"}}");
+    }
+
+    var builder = safetensors.Builder.init(allocator);
+    defer builder.deinit();
+    var packed_bytes: [8]u8 = [_]u8{0} ** 8;
+    var scales: [1]u8 = .{0x38};
+    const scale_2: [1]f32 = .{1.0};
+    const input_scale: [1]f32 = .{1.0};
+    try builder.addTensor("model.layers.0.mlp.experts.gate_up_proj", .u8, &[_]usize{ 1, 2, 4 }, &packed_bytes);
+    try builder.addTensor("model.layers.0.mlp.experts.gate_up_proj.weight_scale", .f8_e4m3, &[_]usize{ 1, 2, 1 }, &scales);
+    try builder.addTensor("model.layers.0.mlp.experts.gate_up_proj.weight_scale_2", .f32, &[_]usize{1}, std.mem.sliceAsBytes(&scale_2));
+    try builder.addTensor("model.layers.0.mlp.experts.gate_up_proj.input_scale", .f32, &[_]usize{1}, std.mem.sliceAsBytes(&input_scale));
+    try builder.save(dir_path, "model.safetensors");
+
+    try validateCanonicalOutput(allocator, dir_path, .nvfp4);
+}
+
 test "validateCanonicalOutput rejects hybrid nvfp4 artifact" {
     const allocator = std.testing.allocator;
 
@@ -1591,6 +1688,11 @@ test "ConvertOptions.getEffectiveScheme - explicit scheme" {
     opts.scheme = .tq8_64;
     opts.use_platform_quant = false;
     try std.testing.expectEqual(Scheme.tq8_64, opts.getEffectiveScheme());
+}
+
+test "ConvertOptions default scheme is nvfp4" {
+    const opts: ConvertOptions = .{};
+    try std.testing.expectEqual(Scheme.nvfp4, opts.getEffectiveScheme());
 }
 
 test "ConvertOptions.getEffectiveScheme - platform/quant resolution" {

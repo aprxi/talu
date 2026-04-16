@@ -180,6 +180,7 @@ struct mlx_ctx {
     int embed_tokens_q_bits = 0; // detected quantization bits for embeddings
     bool embed_tokens_has_q = false;
     array lm_head_rhs = array(0.0f);  // [hidden, vocab]
+    array lm_head_lhs = array(0.0f);  // [vocab, hidden] mmap-backed dense fallback
     array lm_head_q_w = array(0.0f);  // [vocab, hidden * bits / 32] packed
     array lm_head_q_scales = array(0.0f); // [vocab, hidden / group_size]
     array lm_head_q_biases = array(0.0f); // [vocab, hidden / group_size] affine-only

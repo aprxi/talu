@@ -160,7 +160,7 @@
 
       <p>Models from HuggingFace are typically in full-precision (F16) safetensors format. Quantization compresses the weights to a smaller representation, reducing memory usage and increasing inference speed with minimal quality loss.</p>
 
-      <p><code>talu convert</code> quantizes a model using Talu Quantized (TQ) schemes. The model is positional (<code>talu convert &lt;model&gt;</code>). When <code>--scheme</code> is not specified, the default scheme is <code>tq4</code>.</p>
+      <p><code>talu convert</code> quantizes a model using Talu quantization schemes. The model is positional (<code>talu convert &lt;model&gt;</code>). When <code>--scheme</code> is not specified, the default scheme is <code>nvfp4</code>.</p>
 
       <div class="code-block">
         <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu convert LiquidAI/LFM2-350M</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
@@ -310,7 +310,7 @@
         <tr><td>talu ls</td><td>List models</td><td>Both</td></tr>
         <tr><td>talu ls &lt;model&gt;</td><td>List files in a model</td><td>Both</td></tr>
         <tr><td>talu rm &lt;model&gt;</td><td>Remove model from cache</td><td>Both</td></tr>
-        <tr><td>talu convert &lt;model&gt;</td><td>Quantize model (default: tq4)</td><td>Both</td></tr>
+        <tr><td>talu convert &lt;model&gt;</td><td>Quantize model (default: nvfp4)</td><td>Both</td></tr>
         <tr><td>talu convert &lt;model&gt; --scheme &lt;s&gt;</td><td>Quantize with specific scheme</td><td>Both</td></tr>
         <tr><td>talu convert --model-uri &lt;model&gt;</td><td>Quantize and print URI only</td><td>Script</td></tr>
         <tr><td>talu set</td><td>Set default model (interactive picker)</td><td>Interactive</td></tr>

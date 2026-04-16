@@ -214,12 +214,18 @@ float fp8_e4m3_byte_to_f32(uint8_t value) {
     return out;
 }
 
+std::string nvfp4_base_key_for_weight(const std::string& weight_key) {
+    if (ends_with(weight_key, ".weight")) {
+        return weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    }
+    return weight_key;
+}
+
 bool has_nvfp4_metadata_for_key(
     const std::unordered_map<std::string, array>& tensors,
     const std::string& weight_key
 ) {
-    if (!ends_with(weight_key, ".weight")) return false;
-    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const std::string base = nvfp4_base_key_for_weight(weight_key);
     const bool has_scale = tensors.find(base + ".weight_scale") != tensors.end();
     if (!has_scale) return false;
     // compressed-tensors: .weight_packed + .weight_scale
@@ -256,7 +262,7 @@ array dequantize_nvfp4_weight(
     const std::unordered_map<std::string, array>& tensors,
     const std::string& weight_key
 ) {
-    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const std::string base = nvfp4_base_key_for_weight(weight_key);
     // compressed-tensors: packed data in .weight_packed; modelopt: in .weight
     const bool use_packed_key = has_tensor(tensors, base + ".weight_packed");
     const std::string packed_key = use_packed_key ? (base + ".weight_packed") : weight_key;
@@ -431,9 +437,8 @@ bool capture_native_nvfp4_quant(
 ) {
     if (!out_q_w || !out_q_scales || !out_q_biases) return false;
     if (!has_nvfp4_metadata_for_key(tensors, weight_key)) return false;
-    if (!ends_with(weight_key, ".weight")) return false;
 
-    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const std::string base = nvfp4_base_key_for_weight(weight_key);
     // compressed-tensors: packed data in .weight_packed; modelopt: in .weight
     const bool use_packed_key = has_tensor(tensors, base + ".weight_packed");
     const std::string packed_key = use_packed_key ? (base + ".weight_packed") : weight_key;
@@ -471,13 +476,20 @@ bool capture_native_nvfp4_quant(
         }
     }
 
-    if (packed_src.ndim() != 2 || scale_src.ndim() != 2) return false;
-    const int rows = packed_src.shape(0);
-    const int packed_byte_cols = packed_src.shape(1);
+    if (packed_src.ndim() != scale_src.ndim()) return false;
+    if (!(packed_src.ndim() == 2 || packed_src.ndim() == 3)) return false;
+    const int packed_byte_cols = packed_src.shape(packed_src.ndim() - 1);
     const int cols = packed_byte_cols * 2;
     if (packed_byte_cols <= 0 || (packed_byte_cols % 4) != 0) return false;
     if ((cols % 16) != 0) return false;
-    if (scale_src.shape(0) != rows || scale_src.shape(1) != (cols / 16)) return false;
+    if (packed_src.ndim() == 2) {
+        const int rows = packed_src.shape(0);
+        if (scale_src.shape(0) != rows || scale_src.shape(1) != (cols / 16)) return false;
+    } else {
+        const int experts = packed_src.shape(0);
+        const int rows = packed_src.shape(1);
+        if (scale_src.shape(0) != experts || scale_src.shape(1) != rows || scale_src.shape(2) != (cols / 16)) return false;
+    }
 
     // Resolve global_scale: compressed-tensors stores 1/scale in weight_global_scale;
     // modelopt stores scale in weight_scale_2 (we invert to get the divisor).
@@ -499,6 +511,8 @@ bool capture_native_nvfp4_quant(
         if (s2 != 0.0f && std::isfinite(s2)) inv_gs = s2;
     }
 
+    const Shape packed_shape = packed_src.shape();
+    const size_t packed_total = static_cast<size_t>(packed_src.size());
     array packed_for_q = packed_src;
     if (g_nvfp4_mmap_required &&
         (env_truthy("TALU_METAL_NVFP4_SWAP_NIBBLES", false) ||
@@ -510,30 +524,40 @@ bool capture_native_nvfp4_quant(
     }
     if (env_truthy("TALU_METAL_NVFP4_SWAP_NIBBLES", false)) {
         const uint8_t* src_ptr = packed_src.data<uint8_t>();
-        std::vector<uint8_t> swapped(static_cast<size_t>(rows) * static_cast<size_t>(packed_byte_cols));
+        std::vector<uint8_t> swapped(packed_total);
         for (size_t i = 0; i < swapped.size(); ++i) {
             const uint8_t byte = src_ptr[i];
             swapped[i] = static_cast<uint8_t>((byte << 4) | (byte >> 4));
         }
-        packed_for_q = stop_gradient(copy(array(swapped.begin(), Shape{rows, packed_byte_cols}, uint8)));
+        packed_for_q = stop_gradient(copy(array(swapped.begin(), packed_shape, uint8)));
     }
     if (env_truthy("TALU_METAL_NVFP4_SWAP_WORD_BYTES", false)) {
         const uint8_t* src_ptr = packed_for_q.data<uint8_t>();
-        std::vector<uint8_t> swapped(static_cast<size_t>(rows) * static_cast<size_t>(packed_byte_cols));
+        std::vector<uint8_t> swapped(packed_total);
         for (size_t i = 0; i < swapped.size(); i += 4) {
             swapped[i + 0] = src_ptr[i + 3];
             swapped[i + 1] = src_ptr[i + 2];
             swapped[i + 2] = src_ptr[i + 1];
             swapped[i + 3] = src_ptr[i + 0];
         }
-        packed_for_q = stop_gradient(copy(array(swapped.begin(), Shape{rows, packed_byte_cols}, uint8)));
+        packed_for_q = stop_gradient(copy(array(swapped.begin(), packed_shape, uint8)));
+    }
+
+    array packed_view_u32 = array(0.0f);
+    if (packed_src.ndim() == 2) {
+        const int rows = packed_src.shape(0);
+        packed_view_u32 = reshape(view(packed_for_q, uint32), {rows, packed_byte_cols / 4});
+    } else {
+        const int experts = packed_src.shape(0);
+        const int rows = packed_src.shape(1);
+        packed_view_u32 = reshape(view(packed_for_q, uint32), {experts, rows, packed_byte_cols / 4});
     }
 
     if (g_nvfp4_mmap_required) {
-        *out_q_w = stop_gradient(reshape(view(packed_for_q, uint32), {rows, packed_byte_cols / 4}));
+        *out_q_w = stop_gradient(packed_view_u32);
         *out_q_scales = stop_gradient(scale_src);
     } else {
-        *out_q_w = stop_gradient(copy(reshape(view(packed_for_q, uint32), {rows, packed_byte_cols / 4})));
+        *out_q_w = stop_gradient(copy(packed_view_u32));
         *out_q_scales = stop_gradient(copy(scale_src));
     }
     // Store inv_gs (1/global_scale) as scalar — decode can route this through

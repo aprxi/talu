@@ -161,6 +161,7 @@ const char* mlx_last_error(void);
 const char* mlx_runtime_binary_dir(void);
 
 int32_t mlx_test_grouped_affine_moe_gpu_path(void);
+int32_t mlx_test_nvfp4_moe_gather_path(void);
 int32_t mlx_test_depthwise_conv_decode_step(void);
 int32_t mlx_test_single_query_attention_matches_sdpa(void);
 int32_t mlx_test_kv_cache_reserve_preserves_prefix(void);
@@ -175,6 +176,7 @@ int32_t mlx_test_linear_attention_fused_quant_inproj_reuse(void);
 int32_t mlx_test_nvfp4_rowwise_post_scale_linear_decode(void);
 int32_t mlx_test_talu_meta_nvfp4_detection(void);
 int32_t mlx_test_nvfp4_mmap_strict_policy(void);
+int32_t mlx_test_dense_lm_head_lhs_fallback(void);
 int32_t mlx_test_grouped_affine_embedding_lookup_matches_reference(void);
 int32_t mlx_test_linear_attention_fused_mixer_matches_reference(void);
 int32_t mlx_test_topk_candidate_extraction_multi(void);

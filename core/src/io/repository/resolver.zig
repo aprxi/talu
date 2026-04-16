@@ -7,6 +7,7 @@
 const std = @import("std");
 const Bundle = @import("bundle.zig").Bundle;
 const cache = @import("cache.zig");
+const json = @import("../json/root.zig");
 
 
 pub const ResolveOptions = struct {
@@ -251,6 +252,12 @@ pub fn findWeightsFile(allocator: std.mem.Allocator, dir_path: []const u8) Resol
     for (preferred_names) |name| {
         const candidate_path = std.fs.path.join(allocator, &.{ dir_path, name }) catch return error.OutOfMemory;
         if (std.fs.cwd().access(candidate_path, .{})) |_| {
+            if (std.mem.endsWith(u8, candidate_path, ".index.json")) {
+                if (!try hasCompleteShardedIndex(allocator, candidate_path)) {
+                    allocator.free(candidate_path);
+                    continue;
+                }
+            }
             return candidate_path;
         } else |err| {
             allocator.free(candidate_path);
@@ -283,6 +290,61 @@ pub fn findWeightsFile(allocator: std.mem.Allocator, dir_path: []const u8) Resol
     }
 
     return null;
+}
+
+const ShardedIndex = struct {
+    weight_map: ?std.json.ArrayHashMap([]const u8) = null,
+};
+
+/// Return true only when every shard referenced by the index exists on disk.
+fn hasCompleteShardedIndex(allocator: std.mem.Allocator, index_path: []const u8) ResolveError!bool {
+    const index_bytes = std.fs.cwd().readFileAlloc(allocator, index_path, 64 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Unexpected,
+    };
+    defer allocator.free(index_bytes);
+
+    const parsed = json.parseStruct(allocator, ShardedIndex, index_bytes, .{
+        .max_size_bytes = 64 * 1024 * 1024,
+        .max_value_bytes = 64 * 1024 * 1024,
+        .max_string_bytes = 1 * 1024 * 1024,
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        return switch (err) {
+            error.InputTooLarge => false,
+            error.InputTooDeep => false,
+            error.StringTooLong => false,
+            error.InvalidJson => false,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    };
+    defer parsed.deinit();
+
+    const weight_map = parsed.value.weight_map orelse return false;
+    const shard_names = weight_map.map.values();
+    if (shard_names.len == 0) return false;
+
+    const index_dir = std.fs.path.dirname(index_path) orelse ".";
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(allocator);
+
+    for (shard_names) |shard_name| {
+        if (seen.contains(shard_name)) continue;
+        seen.put(allocator, shard_name, {}) catch return error.OutOfMemory;
+
+        const shard_path = std.fs.path.join(allocator, &.{ index_dir, shard_name }) catch return error.OutOfMemory;
+        defer allocator.free(shard_path);
+
+        std.fs.cwd().access(shard_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
+            else => return error.Unexpected,
+        };
+    }
+
+    return true;
 }
 
 // =============================================================================
@@ -337,7 +399,7 @@ test "findWeightsFile finds model.safetensors.index.json" {
     const temp_dir_path = temp_dir.dir.realpathAlloc(allocator, ".") catch return error.OutOfMemory;
     defer allocator.free(temp_dir_path);
 
-    // Create index file
+    // Create a complete sharded index (index + referenced shard)
     const index_filename = "model.safetensors.index.json";
     const index_path = try std.fs.path.join(allocator, &.{ temp_dir_path, index_filename });
     defer allocator.free(index_path);
@@ -345,7 +407,21 @@ test "findWeightsFile finds model.safetensors.index.json" {
     {
         var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
         defer file.close();
-        try file.writeAll("{}");
+        try file.writeAll(
+            \\{
+            \\  "weight_map": {
+            \\    "weight": "model.safetensors-00001-of-00001.safetensors"
+            \\  }
+            \\}
+        );
+    }
+
+    const shard_path = try std.fs.path.join(allocator, &.{ temp_dir_path, "model.safetensors-00001-of-00001.safetensors" });
+    defer allocator.free(shard_path);
+    {
+        var file = try std.fs.cwd().createFile(shard_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("");
     }
 
     const found_path = try findWeightsFile(allocator, temp_dir_path);
@@ -353,6 +429,33 @@ test "findWeightsFile finds model.safetensors.index.json" {
     defer allocator.free(found_path.?);
 
     try std.testing.expect(std.mem.endsWith(u8, found_path.?, index_filename));
+}
+
+test "findWeightsFile ignores incomplete sharded index" {
+    const allocator = std.testing.allocator;
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const temp_dir_path = temp_dir.dir.realpathAlloc(allocator, ".") catch return error.OutOfMemory;
+    defer allocator.free(temp_dir_path);
+
+    const index_path = try std.fs.path.join(allocator, &.{ temp_dir_path, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    {
+        var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(
+            \\{
+            \\  "weight_map": {
+            \\    "weight": "model.safetensors-00001-of-00001.safetensors"
+            \\  }
+            \\}
+        );
+    }
+
+    const found_path = try findWeightsFile(allocator, temp_dir_path);
+    try std.testing.expect(found_path == null);
 }
 
 test "findWeightsFile finds weights.safetensors when model.safetensors missing" {
@@ -770,11 +873,60 @@ test "resolve handles sharded weights with index.json" {
     {
         var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
         defer file.close();
-        try file.writeAll("{}");
+        try file.writeAll(
+            \\{
+            \\  "weight_map": {
+            \\    "weight": "model.safetensors-00001-of-00001.safetensors"
+            \\  }
+            \\}
+        );
+    }
+
+    const shard_path = try std.fs.path.join(allocator, &.{ temp_dir_path, "model.safetensors-00001-of-00001.safetensors" });
+    defer allocator.free(shard_path);
+    {
+        var file = try std.fs.cwd().createFile(shard_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("");
     }
 
     var bundle = try resolve(allocator, temp_dir_path, .{});
     defer bundle.deinit();
 
     try std.testing.expect(bundle.isSharded());
+}
+
+test "resolve returns WeightsNotFound for incomplete sharded index" {
+    const allocator = std.testing.allocator;
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const temp_dir_path = temp_dir.dir.realpathAlloc(allocator, ".") catch return error.OutOfMemory;
+    defer allocator.free(temp_dir_path);
+
+    const config_path = try std.fs.path.join(allocator, &.{ temp_dir_path, "config.json" });
+    defer allocator.free(config_path);
+    {
+        var file = try std.fs.cwd().createFile(config_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("{}");
+    }
+
+    const index_path = try std.fs.path.join(allocator, &.{ temp_dir_path, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    {
+        var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(
+            \\{
+            \\  "weight_map": {
+            \\    "weight": "model.safetensors-00001-of-00001.safetensors"
+            \\  }
+            \\}
+        );
+    }
+
+    const result = resolve(allocator, temp_dir_path, .{});
+    try std.testing.expectError(error.WeightsNotFound, result);
 }

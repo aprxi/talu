@@ -148,6 +148,106 @@ int32_t mlx_test_grouped_affine_moe_gpu_path(void) {
     }
 }
 
+int32_t mlx_test_nvfp4_moe_gather_path(void) {
+    try {
+        mlx_ctx ctx{};
+        ctx.cfg.quant_bits = 4;
+        ctx.cfg.quant_group_size = 16;
+        ctx.cfg.use_gelu = false;
+
+        LayerWeights lw;
+        lw.mlp_is_moe = true;
+        lw.moe_has_nvfp4 = true;
+        lw.moe_num_experts = 4;
+        lw.moe_experts_per_token = 2;
+        lw.moe_expert_group_size = 16;
+
+        constexpr int batch = 1;
+        constexpr int seq = 2;
+        constexpr int hidden = 32;
+        constexpr int d_ff = 32;
+        constexpr int num_experts = 4;
+        constexpr int packed_cols = hidden / 8;
+        constexpr int groups = hidden / 16;
+
+        std::vector<float> input_values(static_cast<size_t>(batch * seq * hidden));
+        for (int i = 0; i < batch * seq * hidden; ++i) {
+            input_values[static_cast<size_t>(i)] = static_cast<float>((i % 13) - 6) * 0.03125f;
+        }
+        const array mlp_in(input_values.data(), Shape{batch, seq, hidden}, float32);
+
+        std::vector<float> router_values(static_cast<size_t>(num_experts * hidden));
+        for (int expert = 0; expert < num_experts; ++expert) {
+            for (int col = 0; col < hidden; ++col) {
+                router_values[static_cast<size_t>(expert * hidden + col)] =
+                    static_cast<float>((expert + 1) * ((col % 5) + 1)) * 0.015f;
+            }
+        }
+        lw.moe_router_w = array(router_values.data(), Shape{num_experts, hidden}, float32);
+
+        float best_diff = std::numeric_limits<float>::infinity();
+        uint8_t scale_one = 0;
+        for (int b = 0; b < 256; ++b) {
+            const float v = fp8_e4m3_byte_to_f32(static_cast<uint8_t>(b));
+            if (!std::isfinite(v) || v <= 0.0f) continue;
+            const float diff = std::abs(v - 1.0f);
+            if (diff < best_diff) {
+                best_diff = diff;
+                scale_one = static_cast<uint8_t>(b);
+            }
+        }
+
+        std::vector<uint32_t> gate_words(static_cast<size_t>(num_experts * d_ff * packed_cols), 0u);
+        std::vector<uint32_t> up_words(static_cast<size_t>(num_experts * d_ff * packed_cols), 0u);
+        std::vector<uint32_t> down_words(static_cast<size_t>(num_experts * hidden * packed_cols), 0u);
+        for (size_t i = 0; i < gate_words.size(); ++i) {
+            gate_words[i] = static_cast<uint32_t>(0x01234567u ^ static_cast<uint32_t>(i * 17u));
+        }
+        for (size_t i = 0; i < up_words.size(); ++i) {
+            up_words[i] = static_cast<uint32_t>(0x89ABCDEFu ^ static_cast<uint32_t>(i * 13u));
+        }
+        for (size_t i = 0; i < down_words.size(); ++i) {
+            down_words[i] = static_cast<uint32_t>(0x76543210u ^ static_cast<uint32_t>(i * 19u));
+        }
+
+        std::vector<uint8_t> gate_scales(static_cast<size_t>(num_experts * d_ff * groups), scale_one);
+        std::vector<uint8_t> up_scales(static_cast<size_t>(num_experts * d_ff * groups), scale_one);
+        std::vector<uint8_t> down_scales(static_cast<size_t>(num_experts * hidden * groups), scale_one);
+
+        lw.moe_gate_w = array(gate_words.data(), Shape{num_experts, d_ff, packed_cols}, uint32);
+        lw.moe_up_w = array(up_words.data(), Shape{num_experts, d_ff, packed_cols}, uint32);
+        lw.moe_down_w = array(down_words.data(), Shape{num_experts, hidden, packed_cols}, uint32);
+        lw.moe_gate_scales = array(gate_scales.data(), Shape{num_experts, d_ff, groups}, uint8);
+        lw.moe_up_scales = array(up_scales.data(), Shape{num_experts, d_ff, groups}, uint8);
+        lw.moe_down_scales = array(down_scales.data(), Shape{num_experts, hidden, groups}, uint8);
+        lw.moe_gate_biases = array(0.90f, float32);
+        lw.moe_up_biases = array(1.10f, float32);
+        lw.moe_down_biases = array(0.85f, float32);
+
+        const array expected = run_grouped_affine_moe_reference(&ctx, lw, mlp_in);
+        const array actual = run_native_nvfp4_moe_gather(&ctx, lw, mlp_in);
+        const array diff_max = max(reshape(abs(astype(expected, float32) - astype(actual, float32)), {static_cast<int>(actual.size())}));
+        eval(diff_max);
+        synchronize();
+        const float* diff_ptr = diff_max.data<float>();
+        if (!diff_ptr) {
+            g_last_error = "mlx_test_nvfp4_moe_gather_path: failed to materialize diff";
+            return 0;
+        }
+        if (diff_ptr[0] > 1e-4f) {
+            g_last_error = "mlx_test_nvfp4_moe_gather_path: NVFP4 gather MoE mismatch";
+            return 0;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_test_nvfp4_moe_gather_path";
+        return 0;
+    }
+}
+
 int32_t mlx_test_depthwise_conv_decode_step(void) {
     try {
         constexpr int batch = 2;
@@ -786,4 +886,3 @@ int32_t mlx_test_full_attention_qkv_fusion(void) {
         return 0;
     }
 }
-

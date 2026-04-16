@@ -322,6 +322,21 @@ array forward_hidden(
     return hidden;
 }
 
+array dense_lm_head_logits(mlx_ctx* ctx, const array& lm_input) {
+    if (ctx->lm_head_rhs.size() > 1) {
+        return (ctx->cfg.hidden_size_per_layer_input > 0 && ctx->lm_head_rhs.dtype() == float32)
+            ? matmul(astype(lm_input, float32), ctx->lm_head_rhs)
+            : matmul(lm_input, ctx->lm_head_rhs);
+    }
+    if (ctx->lm_head_lhs.size() > 1) {
+        const array rhs_view = transpose(ctx->lm_head_lhs, {1, 0});
+        return (ctx->cfg.hidden_size_per_layer_input > 0 && ctx->lm_head_lhs.dtype() == float32)
+            ? matmul(astype(lm_input, float32), rhs_view)
+            : matmul(lm_input, rhs_view);
+    }
+    throw std::runtime_error("dense lm_head path unavailable: missing lm_head_rhs and lm_head_lhs");
+}
+
 array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* trace_frame = nullptr) {
     const array hidden = forward_hidden(ctx, input_ids, true, trace_frame);
     array lm_input = hidden;
@@ -385,9 +400,7 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                     std::nullopt,
                     "mxfp8"
                 )))
-        : ((ctx->cfg.hidden_size_per_layer_input > 0 && ctx->lm_head_rhs.dtype() == float32)
-              ? matmul(astype(lm_input, float32), ctx->lm_head_rhs)
-              : matmul(lm_input, ctx->lm_head_rhs));
+        : dense_lm_head_logits(ctx, lm_input);
     if (ctx->cfg.final_logit_softcapping > 0.0f) {
         const array softcap = array(ctx->cfg.final_logit_softcapping, logits.dtype());
         logits = tanh(logits / softcap) * softcap;
@@ -438,7 +451,7 @@ array forward_logits_from_hidden(mlx_ctx* ctx, const array& normed_hidden) {
         return quantized_matmul(normed_hidden, ctx->lm_head_q_w, ctx->lm_head_q_scales,
             std::nullopt, true, std::nullopt, std::nullopt, "mxfp8");
     }
-    return matmul(normed_hidden, ctx->lm_head_rhs);
+    return dense_lm_head_logits(ctx, normed_hidden);
 }
 
 bool can_use_fused_lm_head_argmax(const mlx_ctx* ctx, const TraceFrame* trace_frame = nullptr) {
