@@ -1057,12 +1057,12 @@ fn writeQuantizedWeights(
         else
             0.0;
         std.debug.print(
-            "Calib done tensors={d} units={d} mode={s} avg_mse={d:.12} avg_base={d:.12} avg_improve={d:.2}%\n",
-            .{ quantized_layers, emitted_unit_count, @tagName(progress_mode), avg_mse, avg_baseline, avg_improvement_pct },
+            "Calib done tensors={d} units={d} mode={s} avg_improve={d:.2}%\n",
+            .{ quantized_layers, emitted_unit_count, @tagName(progress_mode), avg_improvement_pct },
         );
         const normalized_ratio = if (avg_baseline > 0) avg_mse / avg_baseline else 1.0;
         std.debug.print(
-            "Calib a2a: normalized_mse_ratio={d:.6} (avg_mse/avg_base, lower-better), relative_mse_reduction_pct={d:.2}%\n",
+            "Calib a2a: normalized_mse_ratio={d:.6}, relative_mse_reduction_pct={d:.2}%\n",
             .{ normalized_ratio, avg_improvement_pct },
         );
         if (calib_layer_window.enabled()) {
@@ -4066,7 +4066,7 @@ fn emitGroupedLayerCalibrationProgress(
     const model_state_reduction_pct = (1.0 - model_state_ratio) * 100.0;
     switch (mode) {
         .layer => std.debug.print(
-            "layer {d}: quantized {d} tensors | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}% (lower-better)\n",
+            "layer {d}: quantized {d} tensors | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}%\n",
             .{
                 layer,
                 tensor_count,
@@ -4087,7 +4087,7 @@ fn emitGroupedLayerCalibrationProgress(
         .block => {
             if (block_map.variantName(layer)) |variant_name| {
                 std.debug.print(
-                    "block {d} ({s}): quantized {d} tensors | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}% (lower-better)\n",
+                    "block {d} ({s}): quantized {d} tensors | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}%\n",
                     .{
                         layer,
                         variant_name,
@@ -4108,7 +4108,7 @@ fn emitGroupedLayerCalibrationProgress(
                 );
             } else {
                 std.debug.print(
-                    "block {d}: quantized {d} tensors | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}% (lower-better)\n",
+                    "block {d}: quantized {d} tensors | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}%\n",
                     .{
                         layer,
                         tensor_count,
@@ -4179,7 +4179,7 @@ fn emitGroupedNonLayerCalibrationProgress(
     const model_state_ratio = 1.0 - ((coverage_pct / 100.0) * (1.0 - running_normalized_ratio));
     const model_state_reduction_pct = (1.0 - model_state_ratio) * 100.0;
     std.debug.print(
-        "quantized non-layer: {s} | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}% (lower-better), sf={d:.6}, b={d:.6}, v={d:.6}\n",
+        "quantized non-layer: {s} | block_baseline_mse={d:.12} block_mse={d:.12} block_normalized_mse_ratio={d:.6} block_relative_mse_reduction_pct={d:.2}% | running_weighted_baseline_mse={d:.12} running_weighted_mse={d:.12} running_normalized_mse_ratio={d:.6} running_relative_mse_reduction_pct={d:.2}% best_running_normalized_mse_ratio={d:.6} | model_state_coverage_pct={d:.2}% model_state_normalized_mse_ratio={d:.6} model_state_relative_mse_reduction_pct={d:.2}%, sf={d:.6}, b={d:.6}, v={d:.6}\n",
         .{
             tensor_name,
             calib_summary.baseline_mse,

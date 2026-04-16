@@ -81,7 +81,10 @@ array maybe_dequantize_fp8_weight(
         return weight_2d;
     }
     if (weight_2d.ndim() != 2) {
-        throw std::runtime_error("expected rank-2 weight for " + weight_key);
+        // FP8 dequantization is defined for matrix weights only. Some model
+        // assembly paths can surface non-matrix tensors under *.weight keys;
+        // those must bypass this dequant helper unchanged.
+        return weight_2d;
     }
 
     const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
@@ -694,7 +697,9 @@ array maybe_dequantize_grouped_affine_weight(
         return weight_2d;
     }
     if (weight_2d.ndim() != 2) {
-        throw std::runtime_error("expected rank-2 weight for " + weight_key);
+        // Grouped-affine dequantization is matrix-only. Preserve original
+        // tensor for non-matrix weights even if metadata exists globally.
+        return weight_2d;
     }
 
     const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());

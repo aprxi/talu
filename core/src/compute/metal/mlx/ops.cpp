@@ -672,6 +672,155 @@ void* mlx_lazy_dequantize(
     ));
 }
 
+static array nvfp4_candidate_mse(const array& weights_3d, const array& scale_3d) {
+    const array denom = maximum(scale_3d, array(1.0e-20f, float32));
+    const array normalized = weights_3d / denom;
+    const array magnitude = abs(normalized);
+
+    array level = astype(magnitude > array(0.25f, float32), uint32);
+    level = level + astype(magnitude > array(0.75f, float32), uint32);
+    level = level + astype(magnitude > array(1.25f, float32), uint32);
+    level = level + astype(magnitude > array(1.75f, float32), uint32);
+    level = level + astype(magnitude > array(2.5f, float32), uint32);
+    level = level + astype(magnitude > array(3.5f, float32), uint32);
+    level = level + astype(magnitude > array(5.0f, float32), uint32);
+
+    const array nonzero = astype(level > array(static_cast<uint32_t>(0), uint32), uint32);
+    const array neg = astype(normalized < array(0.0f, float32), uint32);
+
+    array quant_mag = astype(level > array(static_cast<uint32_t>(0), uint32), float32) * array(0.5f, float32);
+    quant_mag = quant_mag + astype(level > array(static_cast<uint32_t>(1), uint32), float32) * array(0.5f, float32);
+    quant_mag = quant_mag + astype(level > array(static_cast<uint32_t>(2), uint32), float32) * array(0.5f, float32);
+    quant_mag = quant_mag + astype(level > array(static_cast<uint32_t>(3), uint32), float32) * array(0.5f, float32);
+    quant_mag = quant_mag + astype(level > array(static_cast<uint32_t>(4), uint32), float32) * array(1.0f, float32);
+    quant_mag = quant_mag + astype(level > array(static_cast<uint32_t>(5), uint32), float32) * array(1.0f, float32);
+    quant_mag = quant_mag + astype(level > array(static_cast<uint32_t>(6), uint32), float32) * array(2.0f, float32);
+
+    const array neg_nonzero = astype(neg * nonzero, float32);
+    const array sign = array(1.0f, float32) - (neg_nonzero * array(2.0f, float32));
+    const array decoded = (quant_mag * sign) * scale_3d;
+    const array err = weights_3d - decoded;
+    return sum(err * err, 2, true) * array(1.0f / 16.0f, float32);
+}
+
+void* mlx_lazy_nvfp4_block_scales(const void* dense_weights, float clip_multiplier) {
+    mlx_count_op();
+    const auto& weights = *static_cast<const array*>(dense_weights);
+    if (weights.ndim() != 2) {
+        throw std::invalid_argument("[nvfp4_block_scales] expected rank-2 weights");
+    }
+    const int rows = weights.shape(0);
+    const int cols = weights.shape(1);
+    if (rows <= 0 || cols <= 0) {
+        throw std::invalid_argument("[nvfp4_block_scales] invalid non-positive tensor shape");
+    }
+    static constexpr int kGroupSize = 16;
+    if ((cols % kGroupSize) != 0) {
+        throw std::invalid_argument("[nvfp4_block_scales] cols must be divisible by 16");
+    }
+    const int groups = cols / kGroupSize;
+
+    const float clip = (clip_multiplier > 0.0f) ? clip_multiplier : 1.0f;
+    const array weights_f32 = (weights.dtype() == float32) ? weights : astype(weights, float32);
+    const array weights_3d = reshape(weights_f32, {rows, groups, kGroupSize});
+    const array max_abs = max(abs(weights_3d), 2, true);
+    const array effective_abs = max_abs * array(clip, float32);
+
+    const array s0 = effective_abs * array(1.0f / 6.0f, float32);
+    array best_scale = s0;
+    array best_mse = nvfp4_candidate_mse(weights_3d, s0);
+
+    const array s1 = effective_abs * array(1.0f / 5.0f, float32);
+    const array mse1 = nvfp4_candidate_mse(weights_3d, s1);
+    const array better1 = astype(mse1 < best_mse, float32);
+    const array keep1 = array(1.0f, float32) - better1;
+    best_scale = (better1 * s1) + (keep1 * best_scale);
+    best_mse = (better1 * mse1) + (keep1 * best_mse);
+
+    const array s2 = effective_abs * array(1.0f / 4.5f, float32);
+    const array mse2 = nvfp4_candidate_mse(weights_3d, s2);
+    const array better2 = astype(mse2 < best_mse, float32);
+    const array keep2 = array(1.0f, float32) - better2;
+    best_scale = (better2 * s2) + (keep2 * best_scale);
+    best_mse = (better2 * mse2) + (keep2 * best_mse);
+
+    const array s3 = effective_abs * array(1.0f / 4.0f, float32);
+    const array mse3 = nvfp4_candidate_mse(weights_3d, s3);
+    const array better3 = astype(mse3 < best_mse, float32);
+    const array keep3 = array(1.0f, float32) - better3;
+    best_scale = (better3 * s3) + (keep3 * best_scale);
+    best_mse = (better3 * mse3) + (keep3 * best_mse);
+
+    const array s4 = effective_abs * array(1.0f / 3.5f, float32);
+    const array mse4 = nvfp4_candidate_mse(weights_3d, s4);
+    const array better4 = astype(mse4 < best_mse, float32);
+    const array keep4 = array(1.0f, float32) - better4;
+    best_scale = (better4 * s4) + (keep4 * best_scale);
+
+    return pool_array(contiguous(reshape(best_scale, {rows, groups})));
+}
+
+void* mlx_lazy_nvfp4_pack(const void* dense_weights, const void* dequant_scales) {
+    mlx_count_op();
+    const auto& weights = *static_cast<const array*>(dense_weights);
+    const auto& scales = *static_cast<const array*>(dequant_scales);
+
+    if (weights.ndim() != 2 || scales.ndim() != 2) {
+        throw std::invalid_argument("[nvfp4_pack] expected rank-2 tensors");
+    }
+    const int rows = weights.shape(0);
+    const int cols = weights.shape(1);
+    const int scale_rows = scales.shape(0);
+    const int scale_cols = scales.shape(1);
+    if (rows <= 0 || cols <= 0 || scale_rows <= 0 || scale_cols <= 0) {
+        throw std::invalid_argument("[nvfp4_pack] invalid non-positive tensor shape");
+    }
+    static constexpr int kGroupSize = 16;
+    if ((cols % kGroupSize) != 0 || scale_rows != rows || (scale_cols * kGroupSize) != cols) {
+        throw std::invalid_argument("[nvfp4_pack] shape mismatch for NVFP4 group_size=16");
+    }
+
+    const array weights_f32 = (weights.dtype() == float32) ? weights : astype(weights, float32);
+    const array scales_f32 = (scales.dtype() == float32) ? scales : astype(scales, float32);
+    const array weights_3d = reshape(weights_f32, {rows, scale_cols, kGroupSize});
+    const array scales_3d = reshape(scales_f32, {rows, scale_cols, 1});
+
+    // Clamp denominator to keep division defined for pathological scales.
+    const array denom = maximum(scales_3d, array(1.0e-20f, float32));
+    const array normalized = weights_3d / denom;
+    const array magnitude = abs(normalized);
+
+    // Exact threshold ladder matching nearestFp4E2m1Nibble in Zig:
+    // <=0.25 => 0, <=0.75 => 1, <=1.25 => 2, <=1.75 => 3, <=2.5 => 4,
+    // <=3.5 => 5, <=5.0 => 6, else => 7.
+    array level = astype(magnitude > array(0.25f, float32), uint32);
+    level = level + astype(magnitude > array(0.75f, float32), uint32);
+    level = level + astype(magnitude > array(1.25f, float32), uint32);
+    level = level + astype(magnitude > array(1.75f, float32), uint32);
+    level = level + astype(magnitude > array(2.5f, float32), uint32);
+    level = level + astype(magnitude > array(3.5f, float32), uint32);
+    level = level + astype(magnitude > array(5.0f, float32), uint32);
+
+    const array neg = astype(normalized < array(0.0f, float32), uint32);
+    const array nonzero = astype(level > array(static_cast<uint32_t>(0), uint32), uint32);
+    const array nibble = level + (neg * nonzero * array(static_cast<uint32_t>(8), uint32));
+    const array nibble_u8 = astype(nibble, uint8);
+
+    const array pairs = reshape(nibble_u8, {rows, scale_cols, kGroupSize / 2, 2});
+    const array lo = reshape(
+        slice(pairs, {0, 0, 0, 0}, {rows, scale_cols, kGroupSize / 2, 1}),
+        {rows, scale_cols, kGroupSize / 2}
+    );
+    const array hi = reshape(
+        slice(pairs, {0, 0, 0, 1}, {rows, scale_cols, kGroupSize / 2, 2}),
+        {rows, scale_cols, kGroupSize / 2}
+    );
+    const array packed_u32 = astype(lo, uint32) + (astype(hi, uint32) * array(static_cast<uint32_t>(16), uint32));
+    const array packed_u8 = astype(packed_u32, uint8);
+    const array packed = contiguous(reshape(packed_u8, {rows, cols / 2}));
+    return pool_array(packed);
+}
+
 // ============================================================================
 // Compound Operations (fused for convenience)
 // ============================================================================

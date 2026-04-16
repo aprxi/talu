@@ -11,24 +11,13 @@ use talu::TokenizerHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConvertProfile {
-    Best,
     Good,
     Custom,
 }
 
 impl ConvertProfile {
-    fn parse(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "best" | "quality" => Some(Self::Best),
-            "good" => Some(Self::Good),
-            "custom" => Some(Self::Custom),
-            _ => None,
-        }
-    }
-
     fn as_talu(self) -> talu::ConvertProfile {
         match self {
-            Self::Best => talu::ConvertProfile::Best,
             Self::Good => talu::ConvertProfile::Good,
             Self::Custom => talu::ConvertProfile::Custom,
         }
@@ -43,6 +32,13 @@ struct CustomOverrides {
     batch_size: Option<u32>,
     nblocks: Option<u32>,
     seed: Option<u64>,
+    preserve_blocks: Option<u32>,
+    preserve_format: Option<Nvfp4PreserveFormatOverride>,
+    lm_head_q: Option<bool>,
+    small_model_preserve: Option<bool>,
+    clip_mult: Option<f32>,
+    scale_refine_mult: Option<f32>,
+    replay: Option<Nvfp4ReplayOverride>,
     optimizer: Option<CalibrationOptimizerOverride>,
     clip_min: Option<f32>,
     clip_max: Option<f32>,
@@ -58,11 +54,70 @@ impl CustomOverrides {
             && self.batch_size.is_none()
             && self.nblocks.is_none()
             && self.seed.is_none()
+            && self.preserve_blocks.is_none()
+            && self.preserve_format.is_none()
+            && self.lm_head_q.is_none()
+            && self.small_model_preserve.is_none()
+            && self.clip_mult.is_none()
+            && self.scale_refine_mult.is_none()
+            && self.replay.is_none()
             && self.optimizer.is_none()
             && self.clip_min.is_none()
             && self.clip_max.is_none()
             && self.shift_max.is_none()
             && self.adaptive_clip_floor.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nvfp4ReplayOverride {
+    Weighted,
+    Xray,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nvfp4PreserveFormatOverride {
+    Bf16,
+    Mxfp8,
+}
+
+impl Nvfp4PreserveFormatOverride {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bf16" => Ok(Self::Bf16),
+            "mxfp8" => Ok(Self::Mxfp8),
+            other => bail!(
+                "Invalid preserve_format value '{}'. Allowed: bf16|mxfp8",
+                other
+            ),
+        }
+    }
+
+    fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Mxfp8 => "mxfp8",
+        }
+    }
+}
+
+impl Nvfp4ReplayOverride {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "weighted" | "proxy" | "proxy_only" | "weight_only" => Ok(Self::Weighted),
+            "xray" | "capture" | "capture_required" => Ok(Self::Xray),
+            other => bail!(
+                "Invalid replay value '{}'. Allowed: weighted|xray",
+                other
+            ),
+        }
+    }
+
+    fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Weighted => "weighted",
+            Self::Xray => "xray",
+        }
     }
 }
 
@@ -152,6 +207,22 @@ fn parse_f32_value(key: &str, value: &str) -> Result<f32> {
         .map_err(|_| anyhow::anyhow!("Invalid value for {}: '{}'", key, value))
 }
 
+fn parse_bool_value(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!(
+            "Invalid value for {}: '{}' (expected true|false|1|0|on|off)",
+            key,
+            value
+        ),
+    }
+}
+
+fn is_help_token(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "help" | "list" | "?")
+}
+
 fn parse_custom_overrides(args: &[String]) -> Result<CustomOverrides> {
     let mut out = CustomOverrides::default();
     for arg in args {
@@ -177,6 +248,43 @@ fn parse_custom_overrides(args: &[String]) -> Result<CustomOverrides> {
                     out.nblocks = Some(parse_u32_value(&key, v.trim())?)
                 }
                 "seed" => out.seed = Some(parse_u64_value(&key, v.trim())?),
+                "preserve_blocks" | "mixed_preserve_blocks" | "nvfp4_preserve_blocks" => {
+                    out.preserve_blocks = Some(parse_u32_value(&key, v.trim())?);
+                }
+                "preserve_format" | "mixed_preserve_format" | "nvfp4_preserve_format" => {
+                    out.preserve_format = Some(Nvfp4PreserveFormatOverride::parse(v.trim())?);
+                }
+                "lm_head_q" | "lmhead_q" | "lm_head_quant" => {
+                    out.lm_head_q = Some(parse_bool_value(&key, v.trim())?)
+                }
+                "small_model_preserve" | "smallpreserve" | "boundary_preserve" => {
+                    out.small_model_preserve = Some(parse_bool_value(&key, v.trim())?)
+                }
+                "clip_mult" | "clip_multiplier" => {
+                    let value = parse_f32_value(&key, v.trim())?;
+                    if !(value.is_finite() && value > 0.0) {
+                        bail!(
+                            "Invalid value for {}: '{}' (expected finite > 0)",
+                            key,
+                            v.trim()
+                        );
+                    }
+                    out.clip_mult = Some(value);
+                }
+                "scale_refine_mult" | "scale_mult" | "global_scale_mult" => {
+                    let value = parse_f32_value(&key, v.trim())?;
+                    if !(value.is_finite() && value > 0.0) {
+                        bail!(
+                            "Invalid value for {}: '{}' (expected finite > 0)",
+                            key,
+                            v.trim()
+                        );
+                    }
+                    out.scale_refine_mult = Some(value);
+                }
+                "replay" | "replay_policy" => {
+                    out.replay = Some(Nvfp4ReplayOverride::parse(v.trim())?)
+                }
                 "optimizer" | "optim" => {
                     out.optimizer = Some(CalibrationOptimizerOverride::parse(v.trim())?)
                 }
@@ -189,13 +297,48 @@ fn parse_custom_overrides(args: &[String]) -> Result<CustomOverrides> {
                     out.adaptive_clip_floor = Some(parse_f32_value(&key, v.trim())?)
                 }
                 _ => bail!(
-                    "Unknown override key '{}'. Allowed: iters,samples,seqlen,batch_size,nblocks,seed,optimizer,clip_min,clip_max,shift_max,adaptive_clip_floor",
+                    "Unknown override key '{}'. Allowed: iters,samples,seqlen,batch_size,nblocks,seed,preserve_blocks,preserve_format,lm_head_q,small_model_preserve,clip_mult,scale_refine_mult,replay,optimizer,clip_min,clip_max,shift_max,adaptive_clip_floor",
                     k.trim()
                 ),
             }
         }
     }
     Ok(out)
+}
+
+fn unsupported_nvfp4_custom_overrides(overrides: &CustomOverrides) -> Vec<&'static str> {
+    let mut unsupported = Vec::new();
+    if overrides.iters.is_some() {
+        unsupported.push("iters");
+    }
+    if overrides.samples.is_some() {
+        unsupported.push("samples");
+    }
+    if overrides.seqlen.is_some() {
+        unsupported.push("seqlen");
+    }
+    if overrides.batch_size.is_some() {
+        unsupported.push("batch_size");
+    }
+    if overrides.nblocks.is_some() {
+        unsupported.push("nblocks");
+    }
+    if overrides.optimizer.is_some() {
+        unsupported.push("optimizer");
+    }
+    if overrides.clip_min.is_some() {
+        unsupported.push("clip_min");
+    }
+    if overrides.clip_max.is_some() {
+        unsupported.push("clip_max");
+    }
+    if overrides.shift_max.is_some() {
+        unsupported.push("shift_max");
+    }
+    if overrides.adaptive_clip_floor.is_some() {
+        unsupported.push("adaptive_clip_floor");
+    }
+    unsupported
 }
 
 pub(super) fn cmd_tokenize(args: TokenizeArgs) -> Result<()> {
@@ -224,16 +367,45 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
     let json_output = args.json;
     let model_uri_only = args.model_uri_only;
     let quiet = args.quiet;
-    let profile = ConvertProfile::parse(&args.profile).ok_or_else(|| {
-        anyhow::anyhow!("Unknown profile '{}'. Use: best|good|custom", args.profile)
-    })?;
-    let custom_overrides = parse_custom_overrides(&args.profile_overrides)?;
-
-    if profile != ConvertProfile::Custom && !custom_overrides.is_empty() {
-        bail!("Profile overrides require --profile custom");
+    let scheme_lower = args.scheme.to_lowercase();
+    if is_help_token(&scheme_lower) {
+        print_available_schemes();
+        return Ok(());
     }
+    let scheme_enum = match parse_scheme(&args.scheme) {
+        Some(s) => s,
+        None => {
+            if model_uri_only {
+                bail!("Error: Unknown scheme '{}'.", args.scheme);
+            }
+            if json_output {
+                println!(
+                    r#"{{"success": false, "error": "Unknown scheme '{}'"}}"#,
+                    args.scheme
+                );
+                return Ok(());
+            }
+            println!("Error: Unknown scheme '{}'.\n", args.scheme);
+            print_available_schemes();
+            std::process::exit(1);
+        }
+    };
+    let mut raw_opts: Vec<String> = Vec::new();
+    raw_opts.extend(args.opts.iter().cloned());
+    // Legacy positional overrides (deprecated): keep working for now.
+    raw_opts.extend(args.profile_overrides.iter().cloned());
+    if raw_opts.len() == 1 && is_help_token(&raw_opts[0]) {
+        print_profile_help_for_scheme(scheme_enum);
+        return Ok(());
+    }
+    let custom_overrides = parse_custom_overrides(&raw_opts)?;
+    let effective_profile = if custom_overrides.is_empty() {
+        ConvertProfile::Good
+    } else {
+        ConvertProfile::Custom
+    };
 
-    let _optimizer_override_guard = if profile == ConvertProfile::Custom {
+    let _optimizer_override_guard = if effective_profile == ConvertProfile::Custom {
         custom_overrides.optimizer.map(|override_value| {
             if let Some(env_value) = override_value.as_env_value() {
                 ScopedEnvVar::set("TALU_CONVERT_CALIB_OPTIMIZER", env_value)
@@ -245,7 +417,7 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
         None
     };
     let mut _calibration_override_guards: Vec<ScopedEnvVar> = Vec::new();
-    if profile == ConvertProfile::Custom {
+    if effective_profile == ConvertProfile::Custom {
         if let Some(value) = custom_overrides.clip_min {
             _calibration_override_guards.push(ScopedEnvVar::set(
                 "TALU_CONVERT_CALIB_CLIP_MIN",
@@ -270,17 +442,52 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
                 &value.to_string(),
             ));
         }
+        if let Some(value) = custom_overrides.preserve_blocks {
+            _calibration_override_guards.push(ScopedEnvVar::set(
+                "TALU_NVFP4_MIXED_PRESERVE_BLOCKS",
+                &value.to_string(),
+            ));
+        }
+        if let Some(value) = custom_overrides.preserve_format {
+            _calibration_override_guards.push(ScopedEnvVar::set(
+                "TALU_NVFP4_PRESERVE_FORMAT",
+                value.as_env_value(),
+            ));
+        }
+        if let Some(value) = custom_overrides.lm_head_q {
+            _calibration_override_guards.push(ScopedEnvVar::set(
+                "TALU_NVFP4_LM_HEAD_Q",
+                if value { "1" } else { "0" },
+            ));
+        }
+        if let Some(value) = custom_overrides.small_model_preserve {
+            _calibration_override_guards.push(ScopedEnvVar::set(
+                "TALU_NVFP4_SMALL_MODEL_PRESERVE",
+                if value { "1" } else { "0" },
+            ));
+        }
+        if let Some(value) = custom_overrides.clip_mult {
+            _calibration_override_guards.push(ScopedEnvVar::set(
+                "TALU_NVFP4_CUSTOM_CLIP_MULT",
+                &value.to_string(),
+            ));
+        }
+        if let Some(value) = custom_overrides.scale_refine_mult {
+            _calibration_override_guards.push(ScopedEnvVar::set(
+                "TALU_NVFP4_CUSTOM_SCALE_REFINE_MULT",
+                &value.to_string(),
+            ));
+        }
+        if let Some(value) = custom_overrides.replay {
+            _calibration_override_guards.push(ScopedEnvVar::set(
+                "TALU_NVFP4_REPLAY_POLICY",
+                value.as_env_value(),
+            ));
+        }
     }
 
     if model_uri_only && json_output {
         bail!("Error: --model-uri cannot be combined with --json.");
-    }
-
-    // Handle --scheme help/list to show available schemes (before model check)
-    let scheme_lower = args.scheme.to_lowercase();
-    if scheme_lower == "help" || scheme_lower == "list" || scheme_lower == "?" {
-        print_available_schemes();
-        return Ok(());
     }
 
     let model_arg = if let Some(model) = args.model {
@@ -304,38 +511,32 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
             .unwrap_or_else(|_| "models".into())
     });
 
-    let scheme_enum = match parse_scheme(&args.scheme) {
-        Some(s) => s,
-        None => {
-            if model_uri_only {
-                bail!("Error: Unknown scheme '{}'.", args.scheme);
-            }
-            if json_output {
-                println!(
-                    r#"{{"success": false, "error": "Unknown scheme '{}'"}}"#,
-                    args.scheme
-                );
-                return Ok(());
-            }
-            println!("Error: Unknown scheme '{}'.\n", args.scheme);
-            print_available_schemes();
-            std::process::exit(1);
+    if scheme_enum == talu::Scheme::Nvfp4 && effective_profile == ConvertProfile::Custom {
+        let unsupported = unsupported_nvfp4_custom_overrides(&custom_overrides);
+        if !unsupported.is_empty() {
+            bail!(
+                "NVFP4 custom supports only active overrides: preserve_blocks,preserve_format,lm_head_q,small_model_preserve,clip_mult,scale_refine_mult,replay (quality) and seed (reproducibility). Unsupported overrides: {}",
+                unsupported.join(",")
+            );
         }
-    };
+    }
 
     if !quiet && !json_output && !model_uri_only {
         println!(
-            "Converting model...\n  Source: {}\n  Scheme: {}\n  Profile: {}\n  Output dir: {}",
-            model_arg, args.scheme, args.profile, output_dir
+            "Converting model...\n  Source: {}\n  Scheme: {}\n  Output dir: {}",
+            model_arg, args.scheme, output_dir
         );
+        if effective_profile == ConvertProfile::Custom {
+            println!("  Opts: {}", raw_opts.join(","));
+        }
     }
 
     // Pre-fetch model with progress bar if it's a model ID (not a local path)
     // This reuses the same progress UI as `talu get`
     let model_path = if is_model_id(&model_arg) {
-        // Check if already cached (unless force is set)
+        // Check if already cached
         let cached = repo_get_cached_path(&model_arg);
-        if cached.is_none() || args.force {
+        if cached.is_none() {
             if !quiet && !json_output && !model_uri_only {
                 println!("Downloading model...");
             }
@@ -366,29 +567,29 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
         scheme: Some(scheme_enum),
         force: args.force,
         return_model_id: model_uri_only,
-        calibration_profile: Some(profile.as_talu()),
+        calibration_profile: Some(effective_profile.as_talu()),
         calibration_seed: Some(custom_overrides.seed.unwrap_or(args.seed)),
-        calibration_iters: if profile == ConvertProfile::Custom {
+        calibration_iters: if effective_profile == ConvertProfile::Custom {
             custom_overrides.iters
         } else {
             None
         },
-        calibration_nsamples: if profile == ConvertProfile::Custom {
+        calibration_nsamples: if effective_profile == ConvertProfile::Custom {
             custom_overrides.samples
         } else {
             None
         },
-        calibration_seqlen: if profile == ConvertProfile::Custom {
+        calibration_seqlen: if effective_profile == ConvertProfile::Custom {
             custom_overrides.seqlen
         } else {
             None
         },
-        calibration_batch_size: if profile == ConvertProfile::Custom {
+        calibration_batch_size: if effective_profile == ConvertProfile::Custom {
             custom_overrides.batch_size
         } else {
             None
         },
-        calibration_nblocks: if profile == ConvertProfile::Custom {
+        calibration_nblocks: if effective_profile == ConvertProfile::Custom {
             custom_overrides.nblocks
         } else {
             None
@@ -421,10 +622,13 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
                 let meta = serde_json::json!({
                     "source_model_id": model_arg,
                     "scheme": args.scheme,
-                    "profile": args.profile,
+                    "profile": match effective_profile {
+                        ConvertProfile::Good => "good",
+                        ConvertProfile::Custom => "custom",
+                    },
                     "seed": args.seed,
-                    "profile_overrides": if profile == ConvertProfile::Custom {
-                        args.profile_overrides
+                    "opts": if effective_profile == ConvertProfile::Custom {
+                        raw_opts
                     } else {
                         Vec::<String>::new()
                     },
@@ -479,14 +683,15 @@ Arguments:
 
 Options:
   --scheme NAME     Quantization scheme (default: tq4)
-  --profile NAME    Quality profile: best|good|custom (default: good)
   --seed N          Deterministic calibration seed (default: 42)
   --output DIR      Output directory (default: $TALU_HOME/models)
   -f, --force       Overwrite existing output
   -q, --quiet       Output only the path (for scripting)
   --model-uri       Output only the URI (CI-friendly)
   --json            Output JSON: {"success": true, "output_path": "..."}
-  OVERRIDE          custom profile only: iters=...,samples=...,seqlen=...,batch_size=...,nblocks=...,seed=...,optimizer=...,clip_min=...,clip_max=...,shift_max=...,adaptive_clip_floor=...
+  --opts help       Show scheme-specific tunable options
+  --opts KEY=VALUE  Override conversion knobs (activates custom behavior automatically). Repeat or pass CSV.
+  OVERRIDE          (legacy positional, deprecated): same format as --opts
 
 Talu Quantized (DEFAULT):
   tq4        4-bit quantized (DEFAULT). GROUP_SIZE env var overrides group size (default: 32).
@@ -526,8 +731,8 @@ Examples:
   talu convert Qwen/Qwen3-0.6B --json
   # -> {"success": true, "output_path": "models/Qwen/Qwen3-0.6B-TQ4"}
 
-  # Custom profile override example
-  talu convert Qwen/Qwen3.5-2B --scheme mxfp8 --seed 42 --profile custom iters=400,samples=256,seqlen=2048,batch_size=1,nblocks=1,optimizer=clip+search,clip_min=0.5,clip_max=2.0,shift_max=1.0,adaptive_clip_floor=0.55
+  # Custom override example (auto-switches to custom behavior)
+  talu convert Qwen/Qwen3.5-2B --scheme nvfp4 --opts replay=weighted,preserve_blocks=2,preserve_format=bf16,lm_head_q=1,small_model_preserve=0,clip_mult=1.00,scale_refine_mult=1.00
 
 "#;
     print!("{}", usage);
@@ -546,20 +751,99 @@ fn print_available_schemes() {
     nvfp4      NVFP4 surface (emits runtime-native 4-bit packed layout)
 
 Usage: talu convert -m <model> --scheme <SCHEME>
-Advanced: talu convert <model> --scheme mxfp8 --profile custom iters=...,samples=...
+Advanced: talu convert <model> --scheme mxfp8 --opts iters=...,samples=...
 "#;
     print!("{}", schemes);
 }
 
+fn print_profile_help_for_scheme(scheme: talu::Scheme) {
+    match scheme {
+        talu::Scheme::Nvfp4 => {
+            let text = r#"Options help for scheme: nvfp4
+
+Custom parameters (active):
+  preserve_blocks=INT>=0
+      Keep an exact number of worst-scoring transformer blocks in dense precision.
+      When omitted, converter auto-selects blocks from the default 10% budget.
+  preserve_format=bf16|mxfp8
+      Stored format for preserved dense blocks.
+      bf16 is safest; mxfp8 reduces size for preserved blocks.
+  lm_head_q=0|1
+      Quantize lm_head when 1; keep dense when 0.
+  small_model_preserve=0|1
+      Preserve boundary layers for small models when 1.
+  clip_mult=FLOAT>0
+      Per-block clipping multiplier for block-scale derivation.
+  scale_refine_mult=FLOAT>0
+      Post multiplier on selected global scale.
+  replay=weighted|xray
+      weighted: weight-domain fast path.
+      xray: activation-capture replay path (requires xray bridge).
+  seed=INT
+      Reproducibility only.
+
+Example:
+  talu convert <model> --scheme nvfp4 --opts replay=weighted,preserve_blocks=2,preserve_format=bf16,lm_head_q=1,small_model_preserve=0,clip_mult=1.00,scale_refine_mult=1.00
+"#;
+            print!("{}", text);
+        }
+        talu::Scheme::Mxfp8
+        | talu::Scheme::Tq432
+        | talu::Scheme::Tq464
+        | talu::Scheme::Tq4128
+        | talu::Scheme::Tq832
+        | talu::Scheme::Tq864
+        | talu::Scheme::Tq8128 => {
+            let text = r#"Options help for scheme: grouped calibration path (tq*/mxfp8)
+
+Custom parameters (active):
+  iters=INT
+      Optimization steps per tensor (more is slower).
+  samples=INT
+      Calibration sample count.
+  seqlen=INT
+      Calibration sequence length.
+  batch_size=INT
+      Calibration batch size.
+  nblocks=INT
+      Calibration block multiplier.
+  optimizer=auto|clip|search|clip+search
+      Select calibration optimizer mode.
+  clip_min=FLOAT, clip_max=FLOAT
+      Clip-search range.
+  shift_max=FLOAT
+      Max additive shift during search.
+  adaptive_clip_floor=FLOAT
+      Lower bound for adaptive clipping.
+  seed=INT
+      Reproducibility.
+
+Example:
+  talu convert <model> --scheme tq4 --opts optimizer=clip+search,iters=16,samples=128,seqlen=1024,batch_size=1,nblocks=1
+"#;
+            print!("{}", text);
+        }
+        _ => {
+            let text = r#"Options help for this scheme
+
+Custom parameters:
+  This scheme does not expose scheme-specific profile tuning knobs today.
+  seed=INT may still be accepted for reproducibility where calibration is used.
+"#;
+            print!("{}", text);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_custom_overrides;
+    use super::{parse_custom_overrides, unsupported_nvfp4_custom_overrides};
 
     #[test]
     fn parse_custom_overrides_accepts_aliases_and_csv() {
         let args = vec![
             "iters=400,samples=256,seqlen=2048".to_string(),
-            "batch=2,blocks=3,seed=123,optimizer=clip+search,clip_min=0.6,clip_max=1.8,shift_max=0.75,adaptive_clip_floor=0.5".to_string(),
+            "batch=2,blocks=3,seed=123,preserve_blocks=2,preserve_format=mxfp8,lm_head_q=true,small_model_preserve=off,clip_mult=1.02,scale_refine_mult=0.99,replay=xray,optimizer=clip+search,clip_min=0.6,clip_max=1.8,shift_max=0.75,adaptive_clip_floor=0.5".to_string(),
         ];
         let parsed = parse_custom_overrides(&args).expect("parse");
         assert_eq!(parsed.iters, Some(400));
@@ -568,6 +852,16 @@ mod tests {
         assert_eq!(parsed.batch_size, Some(2));
         assert_eq!(parsed.nblocks, Some(3));
         assert_eq!(parsed.seed, Some(123));
+        assert_eq!(parsed.preserve_blocks, Some(2));
+        assert_eq!(
+            parsed.preserve_format,
+            Some(super::Nvfp4PreserveFormatOverride::Mxfp8)
+        );
+        assert_eq!(parsed.lm_head_q, Some(true));
+        assert_eq!(parsed.small_model_preserve, Some(false));
+        assert!(parsed.clip_mult.is_some_and(|v| (v - 1.02).abs() < 1e-6));
+        assert!(parsed.scale_refine_mult.is_some_and(|v| (v - 0.99).abs() < 1e-6));
+        assert_eq!(parsed.replay, Some(super::Nvfp4ReplayOverride::Xray));
         assert_eq!(
             parsed.optimizer,
             Some(super::CalibrationOptimizerOverride::ClipSearch)
@@ -596,5 +890,22 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(err) => assert!(err.to_string().contains("Invalid value for iters")),
         }
+    }
+
+    #[test]
+    fn parse_custom_overrides_rejects_preserve_pct_key() {
+        let args = vec!["preserve_pct=10".to_string()];
+        match parse_custom_overrides(&args) {
+            Ok(_) => panic!("expected error"),
+            Err(err) => assert!(err.to_string().contains("Unknown override key")),
+        }
+    }
+
+    #[test]
+    fn unsupported_nvfp4_custom_overrides_reports_non_active_knobs() {
+        let args = vec!["iters=64,optimizer=clip+search,preserve_blocks=3,seed=7".to_string()];
+        let parsed = parse_custom_overrides(&args).expect("parse");
+        let unsupported = unsupported_nvfp4_custom_overrides(&parsed);
+        assert_eq!(unsupported, vec!["iters", "optimizer"]);
     }
 }

@@ -34,6 +34,7 @@ const Shape g_slice_start = {0, 0, 0, 0};
 enum class IngestLifetime {
     copy_owned,
     caller_persistent,
+    caller_borrowed_relaxed,
 };
 
 static inline std::deque<std::optional<array>>& array_pool_store() {
@@ -61,8 +62,11 @@ static void* create_ingested_array(
 
     const auto* typed_data = static_cast<const T*>(data);
     const auto ptr_value = reinterpret_cast<std::uintptr_t>(data);
-    const bool can_zero_copy = lifetime == IngestLifetime::caller_persistent and
-        (ptr_value % kIngestZeroCopyAlignment) == 0;
+    const size_t required_alignment = (lifetime == IngestLifetime::caller_borrowed_relaxed)
+        ? alignof(T)
+        : kIngestZeroCopyAlignment;
+    const bool can_zero_copy = lifetime != IngestLifetime::copy_owned and
+        (ptr_value % required_alignment) == 0;
 
     if (can_zero_copy) {
         // Persistent zero-copy is only valid for host buffers whose lifetime is
@@ -259,6 +263,10 @@ void* mlx_array_from_float32_persistent(const void* data, const size_t* shape, s
     return create_ingested_array<float>(data, shape, ndim, float32, IngestLifetime::caller_persistent);
 }
 
+void* mlx_array_from_float32_borrowed(const void* data, const size_t* shape, size_t ndim) {
+    return create_ingested_array<float>(data, shape, ndim, float32, IngestLifetime::caller_borrowed_relaxed);
+}
+
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_uint32(const void* data, const size_t* shape, size_t ndim) {
     return create_ingested_array<uint32_t>(data, shape, ndim, uint32, IngestLifetime::copy_owned);
@@ -271,6 +279,10 @@ void* mlx_array_from_uint32_persistent(const void* data, const size_t* shape, si
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_bfloat16(const void* data, const size_t* shape, size_t ndim) {
     return create_ingested_array<uint16_t>(data, shape, ndim, bfloat16, IngestLifetime::copy_owned);
+}
+
+void* mlx_array_from_bfloat16_borrowed(const void* data, const size_t* shape, size_t ndim) {
+    return create_ingested_array<uint16_t>(data, shape, ndim, bfloat16, IngestLifetime::caller_borrowed_relaxed);
 }
 
 void* mlx_array_from_bfloat16_dense_weight(const void* data, const size_t* shape, size_t ndim) {
@@ -296,6 +308,10 @@ void* mlx_array_from_bfloat16_norm(const void* data, const size_t* shape, size_t
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_float16(const void* data, const size_t* shape, size_t ndim) {
     return create_ingested_array<uint16_t>(data, shape, ndim, float16, IngestLifetime::copy_owned);
+}
+
+void* mlx_array_from_float16_borrowed(const void* data, const size_t* shape, size_t ndim) {
+    return create_ingested_array<uint16_t>(data, shape, ndim, float16, IngestLifetime::caller_borrowed_relaxed);
 }
 
 void* mlx_array_from_uint8(const uint8_t* data, const size_t* shape, size_t ndim) {
@@ -364,6 +380,13 @@ void mlx_array_to_uint32(const void* handle, uint32_t* out, size_t size) {
     auto converted = (array_ref.dtype() != uint32) ? astype(array_ref, uint32) : array_ref;
     eval(converted);
     memcpy(out, converted.data<uint32_t>(), size * sizeof(uint32_t));
+}
+
+void mlx_array_to_uint8(const void* handle, uint8_t* out, size_t size) {
+    const auto& array_ref = *static_cast<const array*>(handle);
+    auto converted = (array_ref.dtype() != uint8) ? astype(array_ref, uint8) : array_ref;
+    eval(converted);
+    memcpy(out, converted.data<uint8_t>(), size * sizeof(uint8_t));
 }
 
 uint32_t mlx_array_item_u32(const void* handle) {

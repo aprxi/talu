@@ -787,11 +787,8 @@ pub fn build(b: *std.Build) void {
     const debug_matmul = b.option(bool, "debug-matmul", "Enable matmul debug instrumentation (slow)") orelse false;
     const cuda_startup_selftests = b.option(bool, "cuda-startup-selftests", "Run CUDA startup smoke/parity checks in backend init (slow)") orelse false;
     const dump_tensors = b.option(bool, "dump-tensors", "Enable full tensor dump (for debugging, produces talu-dump binary)") orelse false;
-    const xray_bridge_default = switch (optimize) {
-        .Debug => true,
-        else => false,
-    };
-    const xray_bridge = b.option(bool, "xray_bridge", "Enable xray bridge instrumentation hooks (default: on in Debug, off in Release)") orelse xray_bridge_default;
+    const xray_bridge_default = true;
+    const xray_bridge = b.option(bool, "xray_bridge", "Enable xray bridge instrumentation hooks (default: on)") orelse xray_bridge_default;
     const version = getVersion(b);
 
     // Enforce inference modular boundary for non-inference modules.

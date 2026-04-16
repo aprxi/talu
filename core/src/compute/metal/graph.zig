@@ -72,6 +72,14 @@ pub extern fn mlx_array_from_float32_persistent(
     ndim: usize,
 ) ArrayHandle;
 
+/// Create MLX array from caller-borrowed float32 storage.
+/// The caller must guarantee the backing store outlives the MLX array handle.
+pub extern fn mlx_array_from_float32_borrowed(
+    data: *const anyopaque,
+    shape: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
 /// Create MLX array from uint32 data (accepts unaligned pointers from mmap)
 /// C++ signature: void* mlx_array_from_uint32(const void* data, ...)
 pub extern fn mlx_array_from_uint32(
@@ -96,6 +104,12 @@ pub extern fn mlx_array_from_bfloat16(
     ndim: usize,
 ) ArrayHandle;
 
+pub extern fn mlx_array_from_bfloat16_borrowed(
+    data: *const anyopaque,
+    shape: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
 /// Create dense-weight MLX array from bfloat16 data using compute-owned policy.
 pub extern fn mlx_array_from_bfloat16_dense_weight(
     data: *const anyopaque,
@@ -113,6 +127,12 @@ pub extern fn mlx_array_from_bfloat16_norm(
 /// Create MLX array from float16 (IEEE) data (stored as u16)
 /// C++ signature: void* mlx_array_from_float16(const void* data, ...)
 pub extern fn mlx_array_from_float16(
+    data: *const anyopaque,
+    shape: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
+pub extern fn mlx_array_from_float16_borrowed(
     data: *const anyopaque,
     shape: [*]const usize,
     ndim: usize,
@@ -271,6 +291,20 @@ pub extern fn mlx_lazy_dequantize(
     biases: ArrayHandle,
     group_size: usize,
     bits: usize,
+) ArrayHandle;
+
+/// NVFP4 block-scale chooser:
+/// dense [rows, cols] -> selected block scales [rows, cols/16]
+pub extern fn mlx_lazy_nvfp4_block_scales(
+    dense_weights: ArrayHandle,
+    clip_multiplier: f32,
+) ArrayHandle;
+
+/// NVFP4 pack helper:
+/// dense [rows, cols] and dequant scales [rows, cols/16] -> packed [rows, cols/2]
+pub extern fn mlx_lazy_nvfp4_pack(
+    dense_weights: ArrayHandle,
+    dequant_scales: ArrayHandle,
 ) ArrayHandle;
 
 /// Fused quantized FFN block:
@@ -592,6 +626,12 @@ pub extern fn mlx_array_to_uint32(
     size: usize,
 ) void;
 
+pub extern fn mlx_array_to_uint8(
+    handle: ArrayHandle,
+    out: [*]u8,
+    size: usize,
+) void;
+
 /// GPU-side argmax - returns array handle with selected index
 /// Use to avoid CPU roundtrip during sampling
 pub extern fn mlx_lazy_argmax(handle: ArrayHandle, axis: c_int) ArrayHandle;
@@ -644,12 +684,26 @@ pub fn createArrayF32(data: []const f32, shape: []const i64) ArrayHandle {
     return mlx_array_from_float32(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
 }
 
+/// Create MLX array from unaligned float32 data (for mmap'd safetensor data)
+pub fn createArrayF32Unaligned(data: [*]align(1) const f32, len: usize, shape: []const i64) ArrayHandle {
+    _ = len;
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_float32(@ptrCast(data), &shape_usize.shape, shape_usize.len);
+}
+
 /// Create MLX array from caller-persistent float32 storage.
 /// Use only for model weights or other buffers whose host lifetime is explicit
 /// and guaranteed to outlive the MLX array handle.
 pub fn createPersistentArrayF32(data: []const f32, shape: []const i64) ArrayHandle {
     const shape_usize = shapeToUsize(shape);
     return mlx_array_from_float32_persistent(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
+}
+
+/// Create MLX array from caller-borrowed unaligned float32 storage.
+pub fn createBorrowedArrayF32Unaligned(data: [*]align(1) const f32, len: usize, shape: []const i64) ArrayHandle {
+    _ = len;
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_float32_borrowed(@ptrCast(data), &shape_usize.shape, shape_usize.len);
 }
 
 /// Create MLX array from Zig slice (uint32)
@@ -689,6 +743,12 @@ pub fn createArrayBF16Unaligned(data: [*]align(1) const u16, len: usize, shape: 
     return mlx_array_from_bfloat16(@ptrCast(data), &shape_usize.shape, shape_usize.len);
 }
 
+pub fn createBorrowedArrayBF16Unaligned(data: [*]align(1) const u16, len: usize, shape: []const i64) ArrayHandle {
+    _ = len;
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_bfloat16_borrowed(@ptrCast(data), &shape_usize.shape, shape_usize.len);
+}
+
 /// Create dense-weight array from unaligned bfloat16 data using compute-owned
 /// dense-weight policy.
 pub fn createArrayBF16DenseWeightUnaligned(data: [*]align(1) const u16, len: usize, shape: []const i64) ArrayHandle {
@@ -719,6 +779,12 @@ pub fn createArrayF16Unaligned(data: [*]align(1) const u16, len: usize, shape: [
     return mlx_array_from_float16(@ptrCast(data), &shape_usize.shape, shape_usize.len);
 }
 
+pub fn createBorrowedArrayF16Unaligned(data: [*]align(1) const u16, len: usize, shape: []const i64) ArrayHandle {
+    _ = len;
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_float16_borrowed(@ptrCast(data), &shape_usize.shape, shape_usize.len);
+}
+
 /// Free MLX array
 pub fn freeArray(handle: ArrayHandle) void {
     mlx_array_free(handle);
@@ -742,6 +808,10 @@ pub fn copyToHost(handle: ArrayHandle, out: []f32) void {
 
 pub fn copyU32ToHost(handle: ArrayHandle, out: []u32) void {
     mlx_array_to_uint32(handle, out.ptr, out.len);
+}
+
+pub fn copyU8ToHost(handle: ArrayHandle, out: []u8) void {
+    mlx_array_to_uint8(handle, out.ptr, out.len);
 }
 
 /// Get array shape and dimensions
@@ -2235,4 +2305,58 @@ test "lazy embedding owns token indices beyond caller mutation" {
     var host: [4]f32 = undefined;
     copyToHost(embedded, &host);
     try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 1.0, 2.0 }, &host);
+}
+
+test "mlx_lazy_nvfp4_pack packs a single block with expected nibbles" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const dense = [_]f32{
+        0.0,  0.5,  1.0,  1.5,
+        2.0,  3.0,  4.0,  6.0,
+        -0.5, -1.0, -1.5, -2.0,
+        -3.0, -4.0, -6.0, 0.0,
+    };
+    const scales = [_]f32{1.0};
+    const dense_shape = [_]i64{ 1, 16 };
+    const scale_shape = [_]i64{ 1, 1 };
+
+    const dense_handle = createArrayF32(&dense, &dense_shape);
+    defer freeArray(dense_handle);
+    const scale_handle = createArrayF32(&scales, &scale_shape);
+    defer freeArray(scale_handle);
+
+    const packed_handle = mlx_lazy_nvfp4_pack(dense_handle, scale_handle);
+    defer freeArray(packed_handle);
+
+    const handles = [_]ArrayHandle{packed_handle};
+    mlx_eval(@ptrCast(@constCast(&handles)), handles.len);
+
+    var packed_out: [8]u8 = undefined;
+    copyU8ToHost(packed_handle, &packed_out);
+    try std.testing.expectEqualSlices(u8, &.{ 0x10, 0x32, 0x54, 0x76, 0xA9, 0xCB, 0xED, 0x0F }, &packed_out);
+}
+
+test "mlx_lazy_nvfp4_block_scales returns expected scale for codebook block" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const dense = [_]f32{
+        0.0,  0.5,  1.0,  1.5,
+        2.0,  3.0,  4.0,  6.0,
+        -0.5, -1.0, -1.5, -2.0,
+        -3.0, -4.0, -6.0, 0.0,
+    };
+    const dense_shape = [_]i64{ 1, 16 };
+    const dense_handle = createArrayF32(&dense, &dense_shape);
+    defer freeArray(dense_handle);
+
+    const scales_handle = mlx_lazy_nvfp4_block_scales(dense_handle, 1.0);
+    defer freeArray(scales_handle);
+    const handles = [_]ArrayHandle{scales_handle};
+    mlx_eval(@ptrCast(@constCast(&handles)), handles.len);
+
+    var scales_out: [1]f32 = undefined;
+    copyToHost(scales_handle, &scales_out);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), scales_out[0], 1e-5);
 }

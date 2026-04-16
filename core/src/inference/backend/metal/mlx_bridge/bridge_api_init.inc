@@ -338,11 +338,24 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         // prefill and decode, so the dense transpose is unnecessary.
         if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled ||
             (!ctx->has_fp8_meta && !ctx->has_grouped_affine_meta && !has_nvfp4_meta)) {
-            // Need dense weight: dequantize now if not already in float form.
+            // Need dense weight for lm_head RHS. Ensure we have loaded a real
+            // matrix tensor before transpose (qmm-disabled paths keep the
+            // placeholder scalar until this point).
+            if (lm_head_weight.size() == 1 || lm_head_weight.ndim() != 2) {
+                lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+            }
+            // Dequantize now if not already in float form.
             const bool weight_is_float = lm_head_weight.dtype() == bfloat16 ||
                 lm_head_weight.dtype() == float16 || lm_head_weight.dtype() == float32;
             if (!weight_is_float) {
                 lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+            }
+            if (lm_head_weight.ndim() != 2) {
+                throw std::runtime_error(
+                    "lm_head dense weight must be rank-2 after load: key=" + lm_head_key +
+                    " ndim=" + std::to_string(lm_head_weight.ndim()) +
+                    " size=" + std::to_string(static_cast<size_t>(lm_head_weight.size()))
+                );
             }
             {
                 array rhs = to_rhs(lm_head_weight, lm_head_key);
