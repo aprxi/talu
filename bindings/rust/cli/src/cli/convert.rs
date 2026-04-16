@@ -770,6 +770,8 @@ Custom parameters (active):
       bf16 is safest; mxfp8 reduces size for preserved blocks.
   lm_head_q=0|1
       Quantize lm_head when 1; keep dense when 0.
+      Untied-embedding models keep mmap-strict compatibility with lm_head_q=0 via
+      an auto-emitted dense RHS companion tensor.
   small_model_preserve=0|1
       Preserve boundary layers for small models when 1.
   clip_mult=FLOAT>0

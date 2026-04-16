@@ -293,9 +293,16 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             // Defer loading the dense weight: for large quantized checkpoints (TQ4, FP8, NVFP4)
             // the QMM path below avoids the full dequantize. Load dense only as a fallback.
         }
+        const std::string lm_head_rhs_key = lm_head_key + "_rhs";
+        const bool has_lm_head_rhs_companion = has_tensor(tensors, lm_head_rhs_key);
+        const bool lm_head_has_native_quant_meta =
+            has_grouped_affine_metadata_for_key(tensors, lm_head_key) ||
+            has_nvfp4_metadata_for_key(tensors, lm_head_key);
 
         const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta);
-        if (enable_lm_head_qmm) {
+        const bool allow_lm_head_qmm = enable_lm_head_qmm &&
+            (ctx->cfg.tie_word_embeddings || lm_head_has_native_quant_meta || !nvfp4_mmap_required);
+        if (allow_lm_head_qmm) {
             if (ctx->cfg.tie_word_embeddings && ctx->embed_tokens_has_q) {
                 // Reuse the captured quantized embedding payload for tied lm_head.
                 ctx->lm_head_q_w = ctx->embed_tokens_q_w;
@@ -307,10 +314,13 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 if (lm_head_weight.size() == 1) {
                     // For grouped-affine: pass raw packed tensor directly — QMM capture reads
                     // scales/biases from the tensors map and only needs the shape from lhs_weight.
-                    // For other formats (FP8 etc.) that need a float input, dequantize now.
-                    if (has_grouped_affine_metadata_for_key(tensors, lm_head_key)) {
+                    // NVFP4 strict mmap also requires staying on packed source tensors.
+                    // For other formats that still require float input, dequantize here.
+                    if (has_grouped_affine_metadata_for_key(tensors, lm_head_key) ||
+                        has_nvfp4_metadata_for_key(tensors, lm_head_key))
+                    {
                         lm_head_weight = require_tensor(tensors, lm_head_key);
-                    } else {
+                    } else if (!nvfp4_mmap_required) {
                         lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
                     }
                 }
@@ -338,6 +348,48 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         // prefill and decode, so the dense transpose is unnecessary.
         if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled ||
             (!ctx->has_fp8_meta && !ctx->has_grouped_affine_meta && !has_nvfp4_meta)) {
+            bool loaded_rhs_companion = false;
+            if (has_lm_head_rhs_companion) {
+                const array rhs = require_tensor(tensors, lm_head_rhs_key);
+                const bool rhs_float = rhs.dtype() == bfloat16 ||
+                    rhs.dtype() == float16 || rhs.dtype() == float32;
+                if (!rhs_float || rhs.ndim() != 2) {
+                    throw std::runtime_error(
+                        "invalid lm_head dense RHS companion: key=" + lm_head_rhs_key
+                    );
+                }
+                const int hidden_size = ctx->cfg.hidden_size;
+                int vocab_size = -1;
+                if (has_tensor(tensors, lm_head_key)) {
+                    const array lhs = require_tensor(tensors, lm_head_key);
+                    if (lhs.ndim() == 2) vocab_size = lhs.shape(0);
+                }
+                const bool shape_ok =
+                    rhs.shape(0) == hidden_size &&
+                    rhs.shape(1) > 0 &&
+                    (vocab_size <= 0 || rhs.shape(1) == vocab_size);
+                if (!shape_ok) {
+                    throw std::runtime_error(
+                        "invalid lm_head dense RHS companion shape: key=" + lm_head_rhs_key +
+                        " shape=[" + std::to_string(rhs.shape(0)) + "," + std::to_string(rhs.shape(1)) + "]" +
+                        " expected=[" + std::to_string(hidden_size) + "," +
+                        (vocab_size > 0 ? std::to_string(vocab_size) : std::string("?")) + "]"
+                    );
+                }
+                ctx->lm_head_rhs = stop_gradient(rhs);
+                loaded_rhs_companion = true;
+            }
+
+            if (nvfp4_mmap_required && !ctx->lm_head_q_decode_enabled && !loaded_rhs_companion) {
+                throw std::runtime_error(
+                    "nvfp4 mmap-strict mode requires quantized lm_head or dense companion tensor: " +
+                    lm_head_rhs_key
+                );
+            }
+            if (loaded_rhs_companion) {
+                // Companion is already [hidden, vocab] and mmap-backed.
+                // Avoid transpose/copy in strict mode.
+            } else {
             // Need dense weight for lm_head RHS. Ensure we have loaded a real
             // matrix tensor before transpose (qmm-disabled paths keep the
             // placeholder scalar until this point).
@@ -363,6 +415,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     rhs = stop_gradient(copy(astype(rhs, float32)));
                 }
                 ctx->lm_head_rhs = rhs;
+            }
             }
         }
 
