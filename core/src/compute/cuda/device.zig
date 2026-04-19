@@ -977,6 +977,16 @@ pub const Buffer = struct {
         if (device.launch_stream) |stream| {
             try device.synchronizeStream(stream);
         }
+        try self.downloadNoSync(device, data);
+    }
+
+    /// Download bytes from device buffer without synchronizing launch stream.
+    /// Caller must ensure producer work is complete before calling.
+    pub fn downloadNoSync(self: *const Buffer, device: *Device, data: []u8) !void {
+        if (data.len > self.size) return error.InvalidArgument;
+        if (data.len == 0) return;
+
+        try device.makeCurrent();
         if (device.api.cu_memcpy_dtoh(@ptrCast(data.ptr), self.pointer, data.len) != cuda_success) {
             return error.CudaCopyFailed;
         }

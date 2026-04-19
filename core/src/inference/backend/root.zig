@@ -64,6 +64,7 @@ pub const metal = if (has_metal) @import("metal/root.zig") else struct {
 pub const cuda = if (has_cuda) @import("cuda/root.zig") else struct {
     pub const BackendType = void;
 };
+const shared_scheduler = @import("cpu/scheduler.zig");
 
 comptime {
     contract.assertBackendModuleLayout(cpu, "cpu");
@@ -170,6 +171,15 @@ pub const CudaTopologyConfig = struct {
     split_layer: ?usize = null,
     split_layer_stage2: ?usize = null,
 };
+
+fn defaultSchedulerSingleDecodeRoute(
+    plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
+) shared_scheduler.SchedulerSingleDecodeRoute {
+    if (plan.greedy_streaming_semantic_eligible and plan.greedy_streaming_backend_supported) return .greedy_streaming;
+    if (plan.top_k_streaming_semantic_eligible and plan.top_k_streaming_backend_supported) return .top_k_streaming;
+    if (plan.top_k_candidate_semantic_eligible and plan.top_k_candidate_backend_supported) return .top_k_candidate;
+    return .queued;
+}
 
 /// Backend initialization options selected at startup/config layer.
 pub const InitOptions = struct {
@@ -1327,6 +1337,23 @@ pub const Backend = union(enum) {
         };
     }
 
+    pub fn planSchedulerSingleDecodeRoute(
+        self: *const Backend,
+        plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
+    ) shared_scheduler.SchedulerSingleDecodeRoute {
+        return switch (self.*) {
+            .cpu => defaultSchedulerSingleDecodeRoute(plan),
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "planSchedulerSingleDecodeRoute"))
+                b.planSchedulerSingleDecodeRoute(plan)
+            else
+                defaultSchedulerSingleDecodeRoute(plan),
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "planSchedulerSingleDecodeRoute"))
+                b.planSchedulerSingleDecodeRoute(plan)
+            else
+                defaultSchedulerSingleDecodeRoute(plan),
+        };
+    }
+
     pub fn supportsSchedulerBackendTopKCandidateSamplingRoute(
         self: *const Backend,
         sampling_config: *const cpu.sampling.SamplingConfig,
@@ -1351,7 +1378,10 @@ pub const Backend = union(enum) {
                 b.supportsSchedulerBackendTopKStreamingRoute(sampling_config)
             else
                 false,
-            .cuda => false,
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendTopKStreamingRoute"))
+                b.supportsSchedulerBackendTopKStreamingRoute(sampling_config)
+            else
+                false,
         };
     }
 
@@ -1402,7 +1432,19 @@ pub const Backend = union(enum) {
                 )
             else
                 error.InvalidArgument,
-            .cuda => error.InvalidArgument,
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "decodeTopKStreaming"))
+                b.decodeTopKStreaming(
+                    first_token,
+                    start_position,
+                    max_tokens,
+                    eos_token_ids,
+                    sampling_config,
+                    output_tokens,
+                    callback,
+                    callback_data,
+                )
+            else
+                error.InvalidArgument,
         };
     }
 
@@ -1442,6 +1484,27 @@ pub const Backend = union(enum) {
                 false,
             .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
                 b.supportsSchedulerBackendBatchedTopKDecodeRoute(sampling_config)
+            else
+                false,
+        };
+    }
+
+    pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
+        self: *const Backend,
+        plan: *const shared_scheduler.SchedulerBatchedTopKRoutePlan,
+    ) bool {
+        return switch (self.*) {
+            .cpu => false,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute"))
+                b.shouldUseSchedulerBatchedTopKDecodeRoute(plan)
+            else if (has_metal)
+                plan.decode_batch_size >= 2 and b.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config)
+            else
+                false,
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute"))
+                b.shouldUseSchedulerBatchedTopKDecodeRoute(plan)
+            else if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
+                plan.decode_batch_size >= 2 and b.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config)
             else
                 false,
         };

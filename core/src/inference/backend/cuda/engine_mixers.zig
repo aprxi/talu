@@ -77,6 +77,30 @@ fn recordAttentionPhase(self: anytype, path: AttentionPath, start_ns: i128, is_c
     }
 }
 
+fn recordDecodeAttentionPhase(self: anytype, path: AttentionPath, start_ns: i128, is_causal: bool) void {
+    const SelfType = @TypeOf(self.*);
+    var elapsed_ns: u64 = 0;
+    if (comptime @hasField(SelfType, "phase_attention_start_event")) {
+        if (phaseEventTimingEnabled(self)) {
+            if (self.phase_attention_start_event) |start_evt| {
+                if (self.phase_attention_stop_event) |stop_evt| {
+                    self.device.recordEvent(stop_evt, self.compute_stream) catch {};
+                    self.device.synchronizeEvent(stop_evt) catch {};
+                    elapsed_ns = self.device.elapsedEventNs(start_evt, stop_evt) catch 0;
+                }
+            }
+        }
+    }
+    if (elapsed_ns == 0) {
+        const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
+        elapsed_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+    }
+    if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
+        self.nvfp4_phase_counters.recordAttention(path, elapsed_ns);
+        self.nvfp4_phase_counters.recordAttentionCausality(is_causal);
+    }
+}
+
 fn applyPrefillRopeRows(
     self: anytype,
     q_stage: *compute.cuda.Buffer,
@@ -988,6 +1012,15 @@ pub fn runBatchedDecodeAttentionMixer(
         .i8 => self.attn_fused_decode_heads_i8_kv_ptrs_function != null,
         .fp8 => self.attn_fused_decode_heads_fp8_kv_ptrs_function != null,
     };
+    const can_lowbit_gemm_decode = cfg.is_causal and switch (self.kv_cache_dtype) {
+        .f16 => false,
+        .i8 => self.dequant_kv_i8_to_f16_function != null and
+            (ctx.cast_f32_to_f16_function != null or self.cast_f32_to_f16_function != null) and
+            (self.causal_attn_softmax_f32_function != null),
+        .fp8 => self.dequant_kv_fp8_to_f16_function != null and
+            (ctx.cast_f32_to_f16_function != null or self.cast_f32_to_f16_function != null) and
+            (self.causal_attn_softmax_f32_function != null),
+    };
     const flash_decode_available = switch (self.kv_cache_dtype) {
         .f16 => self.flash_decode_f16_function != null,
         .i8 => self.flash_decode_i8_function != null,
@@ -998,22 +1031,16 @@ pub fn runBatchedDecodeAttentionMixer(
         max_seq_len_u32 = @max(max_seq_len_u32, len_u32);
     }
     // Flash decode is better when there is enough parallel work from
-    // (n_kv_heads × batch_rows). For low-bit KV, allow single-row flash only
-    // for flash-compatible geometries (head_dim<=256, kv_groups<=4).
-    const lowbit_single_row_flash_compatible =
-        n_rows == 1 and kv_groups > 0 and kv_groups <= 4 and
-        ctx.head_dim_u32 > 0 and ctx.head_dim_u32 <= 256;
-    const allow_lowbit_single_row_flash = lowbit_single_row_flash_compatible and switch (self.kv_cache_dtype) {
-        .i8, .fp8 => true,
-        .f16 => false,
-    };
+    // (n_kv_heads × batch_rows). Do not force low-bit single-row flash:
+    // on Blackwell this has regressed vs pointer-table decode for NVFP4 flows.
+    const allow_lowbit_single_row_flash = false;
     const use_flash_decode = shouldUseFlashDecodePath(
         kv_groups,
         ctx.head_dim_u32,
         ctx.n_kv_heads_u32,
         n_rows,
         flash_decode_available,
-    ) or (allow_lowbit_single_row_flash and flash_decode_available);
+    );
     const use_batched_separate_decode_attention = switch (self.kv_cache_dtype) {
         .f16 => (self.rope_rows_ptrs_function != null) and
             (self.attn_scores_heads_f16_kv_ptrs_function != null) and
@@ -1028,20 +1055,25 @@ pub fn runBatchedDecodeAttentionMixer(
             (self.softmax_rows_dynamic_cols_ptrs_function != null) and
             (self.attn_weighted_sum_heads_fp8_kv_ptrs_function != null),
     };
-    // Quantized decode prefers fused ptrs kernels first to avoid large
-    // score/prob scratch surfaces on long contexts.
+    // On Blackwell SM120, low-bit decode has shown better end-to-end latency
+    // with pointer-table separate decode than fused ptrs at rows==1.
+    // Keep fused ptrs available as fallback, but do not prefer it by default.
     const prefer_batched_fused_decode = switch (self.kv_cache_dtype) {
-        // Low-bit fused decode is preferred for typical head sizes. For very
-        // large heads (e.g. 512), separate ptrs kernels can be more efficient.
-        .i8, .fp8 => ctx.head_dim_u32 <= 256,
+        .i8, .fp8 => false,
         .f16 => false,
     };
     const use_batched_fused_decode_path = use_batched_fused_decode_attention and
         (prefer_batched_fused_decode or !use_batched_separate_decode_attention);
     const use_batched_separate_decode_path = use_batched_separate_decode_attention and
         !use_batched_fused_decode_path;
+    // Low-bit GEMM bridge dequantizes KV to f16 each decode step, so prefer it
+    // only as a strict fallback when native low-bit decode kernels are absent.
+    const use_lowbit_gemm_decode_path = can_lowbit_gemm_decode and n_rows == 1 and
+        !use_flash_decode and !use_batched_separate_decode_path and !use_batched_fused_decode_path;
     if (std.posix.getenv("TALU_CUDA_LOG_DECODE_PATH") != null) {
-        const route = if (use_flash_decode)
+        const route = if (use_lowbit_gemm_decode_path)
+            "lowbit_gemm_bridge"
+        else if (use_flash_decode)
             "flash"
         else if (use_batched_fused_decode_path)
             "fused_ptrs"
@@ -1049,7 +1081,9 @@ pub fn runBatchedDecodeAttentionMixer(
             "separate_ptrs"
         else
             "fallback_row";
-        const route_id: u32 = if (use_flash_decode)
+        const route_id: u32 = if (use_lowbit_gemm_decode_path)
+            5
+        else if (use_flash_decode)
             1
         else if (use_batched_fused_decode_path)
             2
@@ -1068,12 +1102,14 @@ pub fn runBatchedDecodeAttentionMixer(
             .prefer_batched_fused_decode_u32 = @as(u32, @intFromBool(prefer_batched_fused_decode)),
             .allow_lowbit_single_row_flash_u32 = @as(u32, @intFromBool(allow_lowbit_single_row_flash)),
             .n_rows_eq_1_u32 = @as(u32, @intFromBool(n_rows == 1)),
+            .lowbit_gemm_bridge_u32 = @as(u32, @intFromBool(use_lowbit_gemm_decode_path)),
             .flash_u32 = @as(u32, @intFromBool(use_flash_decode)),
             .separate_u32 = @as(u32, @intFromBool(use_batched_separate_decode_path)),
             .fused_u32 = @as(u32, @intFromBool(use_batched_fused_decode_path)),
             .flash_available_u32 = @as(u32, @intFromBool(flash_decode_available)),
             .separate_available_u32 = @as(u32, @intFromBool(use_batched_separate_decode_attention)),
             .fused_available_u32 = @as(u32, @intFromBool(use_batched_fused_decode_attention)),
+            .lowbit_gemm_decode_available_u32 = @as(u32, @intFromBool(can_lowbit_gemm_decode)),
         });
     }
     const sliding_window_u32: u32 = if (cfg.is_causal and cfg.sliding_window > 0)
@@ -1096,41 +1132,61 @@ pub fn runBatchedDecodeAttentionMixer(
     var decode_seq_lens_dev = try bufferSlice(&self.runtime_buffers.decode_seq_lens_dev, 0, idx_bytes);
 
     if (shared_source_slot_kv_index) |read_slot_kv_index| {
-        var read_key_ptrs_host = self.runtime_buffers.decode_key_cache_ptrs_host[0..n];
-        var read_value_ptrs_host = self.runtime_buffers.decode_value_cache_ptrs_host[0..n];
-        for (0..n) |row_i| {
-            const slot_idx = batch.slot_indices[row_i];
-            const read_entry = self.slot_kv_states[slot_idx].kv[read_slot_kv_index];
-            read_key_ptrs_host[row_i] = read_entry.k.pointer;
-            read_value_ptrs_host[row_i] = read_entry.v.pointer;
-        }
-        read_key_cache_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_key_cache_ptrs_dev, 0, ptr_bytes);
-        read_value_cache_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_value_cache_ptrs_dev, 0, ptr_bytes);
-        try read_key_cache_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_key_ptrs_host));
-        try read_value_cache_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_value_ptrs_host));
+        const attn_layers = self.block_runtime.attention_block_count;
+        if (read_slot_kv_index < attn_layers) {
+            // Fast path: source KV is another local attention layer.
+            // Reuse the prebuilt device pointer tables and avoid per-layer
+            // host table rebuild/upload in decode.
+            const read_row_offset = std.math.mul(usize, read_slot_kv_index, batch.attn_ptrs_row_stride) catch return error.InvalidArgument;
+            const read_byte_offset = std.math.mul(usize, read_row_offset, @sizeOf(u64)) catch return error.InvalidArgument;
+            read_key_cache_ptrs_dev = try bufferSlice(batch.attn_key_cache_ptrs_table_dev, read_byte_offset, ptr_bytes);
+            read_value_cache_ptrs_dev = try bufferSlice(batch.attn_value_cache_ptrs_table_dev, read_byte_offset, ptr_bytes);
+            switch (self.kv_cache_dtype) {
+                .f16 => {},
+                .i8, .fp8 => {
+                    read_k_scale_ptrs_dev = try bufferSlice(batch.attn_k_scale_ptrs_table_dev, read_byte_offset, ptr_bytes);
+                    read_v_scale_ptrs_dev = try bufferSlice(batch.attn_v_scale_ptrs_table_dev, read_byte_offset, ptr_bytes);
+                },
+            }
+        } else {
+            // Cross-device mirror source: table storage is not layer-indexed in
+            // decode_attn_*_ptrs_table_dev, so build one compact pointer row.
+            var read_key_ptrs_host = self.runtime_buffers.decode_key_cache_ptrs_host[0..n];
+            var read_value_ptrs_host = self.runtime_buffers.decode_value_cache_ptrs_host[0..n];
+            for (0..n) |row_i| {
+                const slot_idx = batch.slot_indices[row_i];
+                const read_entry = self.slot_kv_states[slot_idx].kv[read_slot_kv_index];
+                read_key_ptrs_host[row_i] = read_entry.k.pointer;
+                read_value_ptrs_host[row_i] = read_entry.v.pointer;
+            }
+            read_key_cache_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_key_cache_ptrs_dev, 0, ptr_bytes);
+            read_value_cache_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_value_cache_ptrs_dev, 0, ptr_bytes);
+            try read_key_cache_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_key_ptrs_host));
+            try read_value_cache_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_value_ptrs_host));
 
-        switch (self.kv_cache_dtype) {
-            .f16 => {},
-            .i8, .fp8 => {
-                var read_k_scale_ptrs_host = self.runtime_buffers.decode_attn_k_scale_ptrs_table_host[0..n];
-                var read_v_scale_ptrs_host = self.runtime_buffers.decode_attn_v_scale_ptrs_table_host[0..n];
-                for (0..n) |row_i| {
-                    const slot_idx = batch.slot_indices[row_i];
-                    const read_entry = self.slot_kv_states[slot_idx].kv[read_slot_kv_index];
-                    read_k_scale_ptrs_host[row_i] = read_entry.k_scale.pointer;
-                    read_v_scale_ptrs_host[row_i] = read_entry.v_scale.pointer;
-                }
-                read_k_scale_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_attn_k_scale_ptrs_table_dev, 0, ptr_bytes);
-                read_v_scale_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_attn_v_scale_ptrs_table_dev, 0, ptr_bytes);
-                try read_k_scale_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_k_scale_ptrs_host));
-                try read_v_scale_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_v_scale_ptrs_host));
-            },
+            switch (self.kv_cache_dtype) {
+                .f16 => {},
+                .i8, .fp8 => {
+                    var read_k_scale_ptrs_host = self.runtime_buffers.decode_attn_k_scale_ptrs_table_host[0..n];
+                    var read_v_scale_ptrs_host = self.runtime_buffers.decode_attn_v_scale_ptrs_table_host[0..n];
+                    for (0..n) |row_i| {
+                        const slot_idx = batch.slot_indices[row_i];
+                        const read_entry = self.slot_kv_states[slot_idx].kv[read_slot_kv_index];
+                        read_k_scale_ptrs_host[row_i] = read_entry.k_scale.pointer;
+                        read_v_scale_ptrs_host[row_i] = read_entry.v_scale.pointer;
+                    }
+                    read_k_scale_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_attn_k_scale_ptrs_table_dev, 0, ptr_bytes);
+                    read_v_scale_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_attn_v_scale_ptrs_table_dev, 0, ptr_bytes);
+                    try read_k_scale_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_k_scale_ptrs_host));
+                    try read_v_scale_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_v_scale_ptrs_host));
+                },
+            }
         }
     }
 
     // Flash decode preferred (GQA-aware, fewest KV reads), then batched
     // separate (graph-compatible), then fused fallback.
-    const use_batched_decode_attention = use_flash_decode or use_batched_separate_decode_path or use_batched_fused_decode_path;
+    const use_batched_decode_attention = use_lowbit_gemm_decode_path or use_flash_decode or use_batched_separate_decode_path or use_batched_fused_decode_path;
     const can_skip_row_decode_prep = shared_source_slot_kv_index == null and use_batched_kv_write and use_batched_decode_attention;
     if (!can_skip_row_decode_prep) {
         for (0..n) |row_i| {
@@ -1358,14 +1414,91 @@ pub fn runBatchedDecodeAttentionMixer(
         }
     }
 
-    if (use_flash_decode) {
+    const record_decode_attention = use_lowbit_gemm_decode_path or use_flash_decode or use_batched_separate_decode_path or use_batched_fused_decode_path;
+    const decode_attention_start_ns: i128 = if (record_decode_attention) std.time.nanoTimestamp() else 0;
+
+    if (use_lowbit_gemm_decode_path) {
+        const causal_softmax_f32_fn = self.causal_attn_softmax_f32_function orelse return error.CudaKernelUnavailable;
+        for (0..n) |row_i| {
+            const slot_idx = batch.slot_indices[row_i];
+            const position_u32: u32 = @intCast(batch.positions[row_i]);
+            const seq_len_u32 = batch.seq_lens[row_i];
+            const kv_entry = self.slot_kv_states[slot_idx].kv[batch.attn_layer_index];
+            const read_entry = if (shared_source_slot_kv_index) |read_slot_kv_index|
+                self.slot_kv_states[slot_idx].kv[read_slot_kv_index]
+            else
+                kv_entry;
+            var q_row = try logicalF32RowSlice(&attn_q_stage, n, row_i, cfg.q_dim);
+            var context_row = try logicalF32RowSlice(&attn_context_stage, n, row_i, o_proj.rows());
+            switch (self.kv_cache_dtype) {
+                .f16 => unreachable,
+                .i8 => try runPrefillAttentionLowBitViaF16Gemm(
+                    self,
+                    .i8,
+                    &q_row,
+                    &context_row,
+                    &read_entry.k,
+                    &read_entry.v,
+                    &read_entry.k_scale,
+                    &read_entry.v_scale,
+                    1,
+                    cfg.q_dim,
+                    o_proj.rows(),
+                    seq_len_u32,
+                    kv_dim_u32,
+                    kv_groups,
+                    ctx.n_heads_u32,
+                    ctx.n_kv_heads_u32,
+                    ctx.head_dim_u32,
+                    ctx.rope_dim_u32,
+                    position_u32,
+                    sliding_window_u32,
+                    layer_rope_theta,
+                    attention_scale,
+                    ctx.rope_function,
+                    ctx.cast_f32_to_f16_function,
+                    causal_softmax_f32_fn,
+                ),
+                .fp8 => try runPrefillAttentionLowBitViaF16Gemm(
+                    self,
+                    .fp8,
+                    &q_row,
+                    &context_row,
+                    &read_entry.k,
+                    &read_entry.v,
+                    &read_entry.k_scale,
+                    &read_entry.v_scale,
+                    1,
+                    cfg.q_dim,
+                    o_proj.rows(),
+                    seq_len_u32,
+                    kv_dim_u32,
+                    kv_groups,
+                    ctx.n_heads_u32,
+                    ctx.n_kv_heads_u32,
+                    ctx.head_dim_u32,
+                    ctx.rope_dim_u32,
+                    position_u32,
+                    sliding_window_u32,
+                    layer_rope_theta,
+                    attention_scale,
+                    ctx.rope_function,
+                    ctx.cast_f32_to_f16_function,
+                    causal_softmax_f32_fn,
+                ),
+            }
+        }
+        recordDecodeAttentionPhase(self, .heads_lowbit_bridge_f16_kv, decode_attention_start_ns, cfg.is_causal);
+    } else if (use_flash_decode) {
         // Flash decode with split-K: partition sequence across blocks for
         // occupancy when n_kv_heads is small. GQA-aware, does RoPE on Q
         // internally, reads KV once per KV head for all grouped Q heads.
         const gate_proj: ?*const compute.cuda.Buffer = if (cfg.query_gate) &q_projection_stage else null;
         const gate_proj_stride: u32 = if (cfg.query_gate) @intCast(cfg.q_projection_dim) else 0;
         const prefer_split_k = switch (self.kv_cache_dtype) {
-            .i8, .fp8 => true,
+            // For single-row decode, split-K often adds more launch/reduce
+            // overhead than it saves; keep low-bit flash in single-chunk mode.
+            .i8, .fp8 => n_rows > 1,
             .f16 => false,
         };
         const n_seq_chunks = compute.cuda.flash_decode.computeSeqChunks(
@@ -1512,6 +1645,12 @@ pub fn runBatchedDecodeAttentionMixer(
                 gate_proj_stride,
             );
         }
+        const decode_path: AttentionPath = switch (self.kv_cache_dtype) {
+            .f16 => .heads_f16_kv,
+            .i8 => .heads_i8_kv,
+            .fp8 => .heads_fp8_kv,
+        };
+        recordDecodeAttentionPhase(self, decode_path, decode_attention_start_ns, cfg.is_causal);
     } else if (use_batched_separate_decode_path) {
         // Batched separate attention: same high-occupancy kernel design as
         // per-row path, but reads position/seq_len from device buffers and
@@ -1679,6 +1818,12 @@ pub fn runBatchedDecodeAttentionMixer(
                 );
             },
         }
+        const decode_path: AttentionPath = switch (self.kv_cache_dtype) {
+            .f16 => .heads_f16_kv,
+            .i8 => .heads_i8_kv,
+            .fp8 => .heads_fp8_kv,
+        };
+        recordDecodeAttentionPhase(self, decode_path, decode_attention_start_ns, cfg.is_causal);
     } else if (use_batched_fused_decode_path) {
         // Fused path fallback: single kernel does RoPE + scores + softmax +
         // weighted_sum + optional gate fusion.
@@ -1765,6 +1910,12 @@ pub fn runBatchedDecodeAttentionMixer(
                 );
             },
         }
+        const decode_path: AttentionPath = switch (self.kv_cache_dtype) {
+            .f16 => .fused_heads_f16_kv,
+            .i8 => .fused_heads_i8_kv,
+            .fp8 => .fused_heads_fp8_kv,
+        };
+        recordDecodeAttentionPhase(self, decode_path, decode_attention_start_ns, cfg.is_causal);
     } else {
         for (0..n) |row_i| {
             const slot_idx = batch.slot_indices[row_i];
@@ -4690,13 +4841,6 @@ pub fn runFfnStep(
         rows,
         d_ff,
     )) or (try engine_ops.tryFusedGaffineU4GateUpSiluForward(
-        self,
-        input,
-        gate_weight,
-        up_weight,
-        rows,
-        d_ff,
-    )) or (try engine_ops.tryFusedI8GateUpSiluForward(
         self,
         input,
         gate_weight,

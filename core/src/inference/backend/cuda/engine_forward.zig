@@ -60,6 +60,16 @@ fn typeHasDecl(comptime T: type, comptime name: []const u8) bool {
     };
 }
 
+fn logDecodeInventoryOnce(self: anytype, mode_label: []const u8, token_count: usize, batch_rows: usize) void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "decode_inventory_logged") and @hasDecl(SelfType, "logDecodeInventorySummaryImpl")) {
+        if (!self.decode_inventory_logged) {
+            self.logDecodeInventorySummaryImpl(mode_label, token_count, batch_rows);
+            self.decode_inventory_logged = true;
+        }
+    }
+}
+
 /// Download and log first N f32 values + L2 norm from a device buffer.
 /// Gated by TALU_DUMP_HIDDEN env var. Uses log.warn so it survives ReleaseFast.
 fn dumpHiddenState(
@@ -1265,6 +1275,7 @@ fn computeBatchedPrefillPipeline2(
                     .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
                     .fp8 => "matmul_lm_head_fp8_host",
                     .mxfp8 => "matmul_lm_head_mxfp8_host",
+                    .nvfp4 => "matmul_lm_head_nvfp4_host",
                 };
                 trace.emitFinalWithWork(
                     .lm_head,
@@ -2800,6 +2811,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
             .fp8 => "matmul_lm_head_fp8_host",
             .mxfp8 => "matmul_lm_head_mxfp8_host",
+            .nvfp4 => "matmul_lm_head_nvfp4_host",
         };
         trace.emitFinalWithWork(
             .lm_head,
@@ -2867,6 +2879,20 @@ fn computeBatchedDecodePipeline2WithMode(
         return error.InvalidTopologyConfig;
     }
     var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+    const decode_summary_enabled = std.posix.getenv("TALU_CUDA_DECODE_SUMMARY") != null;
+    var decode_start_ns: i128 = 0;
+    if (decode_summary_enabled and comptime @hasDecl(SelfType, "beginNvfp4RouteWindow") and
+        @hasDecl(SelfType, "beginPhaseBudgetWindow"))
+    {
+        self.beginNvfp4RouteWindow();
+        self.beginPhaseBudgetWindow();
+        decode_start_ns = std.time.nanoTimestamp();
+    }
+    const ms_divisor = 1_000_000.0;
+    var stage0_compute_ns: u64 = 0;
+    var stage0_to_stage1_transfer_ns: u64 = 0;
+    var stage1_compute_ns: u64 = 0;
+    var host_logits_copy_ns: u64 = 0;
 
     // Stage1 state descriptors mirror stage0 bindings per slot.
     if (stage1.state_descriptor_count > 0 and comptime @hasDecl(@TypeOf(stage1.*), "mirrorSlotStateBlocksFrom")) {
@@ -2875,31 +2901,62 @@ fn computeBatchedDecodePipeline2WithMode(
         }
     }
     // Stage0: run decode layers only (no final norm/LM head).
+    const stage0_start_ns = std.time.nanoTimestamp();
     try computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, .device_only, .{
         .bypass_topology_prototype = true,
         .use_preloaded_input = false,
         .compute_logits = false,
         .emit_decode_summary = false,
     });
+    if (decode_summary_enabled) {
+        // Stage0 decode work is stream-async; force completion so timing reflects
+        // actual stage0 compute instead of deferred wait in later stages.
+        try self.device.synchronize();
+    }
+    {
+        const elapsed_i128 = std.time.nanoTimestamp() - stage0_start_ns;
+        stage0_compute_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+    }
 
     const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
     const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
+    const transfer_start_ns = std.time.nanoTimestamp();
     try transferPipelineActivationMultiRow(self, stage1, transfer_bytes);
+    if (decode_summary_enabled) {
+        // Isolate P2P transfer completion from downstream stage1 compute.
+        try self.device.synchronize();
+        try stage1.device.synchronize();
+    }
+    {
+        const elapsed_i128 = std.time.nanoTimestamp() - transfer_start_ns;
+        stage0_to_stage1_transfer_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+    }
 
     // Stage1: consume transferred activations and complete decode.
+    const stage1_start_ns = std.time.nanoTimestamp();
     try computeBatchedDecodeLogitsWithPlan(stage1, tokens, slot_indices, positions, output_mode, .{
         .bypass_topology_prototype = true,
         .use_preloaded_input = true,
         .compute_logits = true,
-        .emit_decode_summary = true,
+        .emit_decode_summary = false,
         .summary_label_override = switch (output_mode) {
             .host_logits => "decode_pipeline2",
             .device_only => "decode_device_only_pipeline2",
         },
     });
+    if (decode_summary_enabled) {
+        // Stage1 includes the final logits projection and download; synchronize to
+        // prevent any deferred device work from leaking into host copy timing.
+        try stage1.device.synchronize();
+    }
+    {
+        const elapsed_i128 = std.time.nanoTimestamp() - stage1_start_ns;
+        stage1_compute_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+    }
 
     // decodeBatch() reads host logits from the root backend. Mirror stage1 rows.
     if (output_mode == .host_logits) {
+        const host_copy_start_ns = std.time.nanoTimestamp();
         const src_vocab = stage1.runtime_buffers.projected_vocab;
         const dst_vocab = self.runtime_buffers.projected_vocab;
         if (src_vocab == 0 or dst_vocab == 0) return;
@@ -2919,7 +2976,165 @@ fn computeBatchedDecodePipeline2WithMode(
             @memset(dst_row, -1.0e9);
             @memcpy(dst_row[0..@min(src_row.len, dst_row.len)], src_row[0..@min(src_row.len, dst_row.len)]);
         }
+        const elapsed_i128 = std.time.nanoTimestamp() - host_copy_start_ns;
+        host_logits_copy_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
     }
+    if (decode_summary_enabled and comptime @hasDecl(SelfType, "logNvfp4RouteSummaryImpl") and
+        @hasDecl(SelfType, "logPhaseBudgetSummaryImpl"))
+    {
+        const decode_elapsed_i128 = std.time.nanoTimestamp() - decode_start_ns;
+        const decode_elapsed_ns: u64 = if (decode_elapsed_i128 > 0) @intCast(decode_elapsed_i128) else 0;
+        const mode_label = switch (output_mode) {
+            .host_logits => "decode_pipeline2",
+            .device_only => "decode_device_only_pipeline2",
+        };
+        logDecodeInventoryOnce(self, mode_label, tokens.len, tokens.len);
+        self.logNvfp4RouteSummaryImpl(mode_label, tokens.len);
+        self.logPhaseBudgetSummaryImpl(mode_label, tokens.len, decode_elapsed_ns);
+        const accounted_ns_u128: u128 = @as(u128, stage0_compute_ns) +
+            @as(u128, stage0_to_stage1_transfer_ns) +
+            @as(u128, stage1_compute_ns) +
+            @as(u128, host_logits_copy_ns);
+        const accounted_ns = saturatingU64FromU128(accounted_ns_u128);
+        const residual_ns: u64 = if (decode_elapsed_ns >= accounted_ns) decode_elapsed_ns - accounted_ns else 0;
+        log.warn("inference", "CUDA decode overhead summary", .{
+            .mode = mode_label,
+            .tokens = tokens.len,
+            .elapsed_ms = @as(f64, @floatFromInt(decode_elapsed_ns)) / ms_divisor,
+            .stage0_compute_ms = @as(f64, @floatFromInt(stage0_compute_ns)) / ms_divisor,
+            .stage0_to_stage1_transfer_ms = @as(f64, @floatFromInt(stage0_to_stage1_transfer_ns)) / ms_divisor,
+            .stage1_compute_ms = @as(f64, @floatFromInt(stage1_compute_ns)) / ms_divisor,
+            .host_logits_copy_ms = @as(f64, @floatFromInt(host_logits_copy_ns)) / ms_divisor,
+            .residual_ms = @as(f64, @floatFromInt(residual_ns)) / ms_divisor,
+        });
+    }
+}
+
+fn computeBatchedDecodeCpuGpuWithMode(
+    self: anytype,
+    tokens: []const u32,
+    slot_indices: []const usize,
+    positions: []const usize,
+    output_mode: BatchedDecodeOutputMode,
+) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasDecl(SelfType, "pipelineCpuStage0")) {
+        return error.InvalidTopologyConfig;
+    }
+    const stage0 = self.pipelineCpuStage0() orelse return error.InvalidTopologyConfig;
+    const split_layer = self.pipelineSplitLayer();
+    if (split_layer == 0) return error.InvalidTopologyConfig;
+
+    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+    try self.runtime_buffers.ensureRowCapacity(&self.device, tokens.len, self.fixed_alloc_mode);
+
+    // Prepare CPU stage0 activations per request row, then upload packed rows to
+    // GPU input_dev so GPU stage1 can run true batched decode from preloaded input.
+    for (0..tokens.len) |row_i| {
+        const token = tokens[row_i];
+        const slot_index = slot_indices[row_i];
+        const position = positions[row_i];
+        self.activateKvSlot(slot_index);
+        try executeCpuStage0LayerRange(
+            stage0,
+            token,
+            position,
+            slot_index,
+            split_layer,
+            true,
+        );
+        try uploadCpuKvToMirrors(self, stage0, slot_index, position, 1);
+        const src_row = stage0.slotActivationBytes(slot_index);
+        if (src_row.len < row_bytes) return error.InvalidTopologyConfig;
+        var dst_row = try bufferSlice(&self.runtime_buffers.input_dev, row_i * row_bytes, row_bytes);
+        try dst_row.upload(&self.device, src_row[0..row_bytes]);
+    }
+
+    try computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{
+        .bypass_topology_prototype = true,
+        .use_preloaded_input = true,
+        .compute_logits = true,
+        .emit_decode_summary = true,
+        .summary_label_override = switch (output_mode) {
+            .host_logits => "decode_cpu_gpu",
+            .device_only => "decode_device_only_cpu_gpu",
+        },
+    });
+}
+
+fn computeBatchedDecodeCpuGpuGpuWithMode(
+    self: anytype,
+    tokens: []const u32,
+    slot_indices: []const usize,
+    positions: []const usize,
+    output_mode: BatchedDecodeOutputMode,
+) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasDecl(SelfType, "pipelineCpuStage0") or !@hasDecl(SelfType, "pipelineStage1")) {
+        return error.InvalidTopologyConfig;
+    }
+    const stage0 = self.pipelineCpuStage0() orelse return error.InvalidTopologyConfig;
+    var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+    const split_layer = self.pipelineSplitLayer();
+    const split_layer_stage2 = self.pipelineSplitLayerStage2();
+    if (split_layer == 0 or split_layer_stage2 <= split_layer) return error.InvalidTopologyConfig;
+
+    // Stage1 descriptor bindings mirror stage2 bindings per slot.
+    if (stage1.state_descriptor_count > 0 and comptime @hasDecl(@TypeOf(stage1.*), "mirrorSlotStateBlocksFrom")) {
+        for (slot_indices) |slot_idx| {
+            try stage1.mirrorSlotStateBlocksFrom(self, slot_idx);
+        }
+    }
+
+    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+    try stage1.runtime_buffers.ensureRowCapacity(&stage1.device, tokens.len, stage1.fixed_alloc_mode);
+
+    // Prepare CPU stage0 activations per request row and upload rows to stage1
+    // input_dev so stage1 can execute true batched decode from preloaded input.
+    for (0..tokens.len) |row_i| {
+        const token = tokens[row_i];
+        const slot_index = slot_indices[row_i];
+        const position = positions[row_i];
+        stage1.activateKvSlot(slot_index);
+        self.activateKvSlot(slot_index);
+        try executeCpuStage0LayerRange(
+            stage0,
+            token,
+            position,
+            slot_index,
+            split_layer,
+            true,
+        );
+        try uploadCpuKvToMirrors(stage1, stage0, slot_index, position, 1);
+        const src_row = stage0.slotActivationBytes(slot_index);
+        if (src_row.len < row_bytes) return error.InvalidTopologyConfig;
+        var stage1_row = try bufferSlice(&stage1.runtime_buffers.input_dev, row_i * row_bytes, row_bytes);
+        try stage1_row.upload(&stage1.device, src_row[0..row_bytes]);
+    }
+
+    // Stage1: decode layers only from preloaded rows.
+    try computeBatchedDecodeLogitsWithPlan(stage1, tokens, slot_indices, positions, .device_only, .{
+        .bypass_topology_prototype = true,
+        .use_preloaded_input = true,
+        .compute_logits = false,
+        .emit_decode_summary = false,
+    });
+
+    // Transfer stage1 output activations to stage2 (self).
+    const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
+    try transferPipelineActivationStage12MultiRow(self, stage1, transfer_bytes);
+
+    // Stage2: final decode from preloaded rows.
+    try computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{
+        .bypass_topology_prototype = true,
+        .use_preloaded_input = true,
+        .compute_logits = true,
+        .emit_decode_summary = true,
+        .summary_label_override = switch (output_mode) {
+            .host_logits => "decode_cpu_gpu_gpu",
+            .device_only => "decode_device_only_cpu_gpu_gpu",
+        },
+    });
 }
 
 fn computeBatchedDecodeLogitsWithMode(
@@ -2938,6 +3153,21 @@ fn computeBatchedDecodeLogitsWithMode(
             @hasDecl(SelfType, "transferPipelineActivation"))
     {
         return computeBatchedDecodePipeline2WithMode(self, tokens, slot_indices, positions, output_mode);
+    }
+    if (!force_prototype and
+        topologyModeIs(self, "cpu_gpu") and
+        comptime @hasField(SelfType, "device") and
+            @hasDecl(SelfType, "pipelineCpuStage0"))
+    {
+        return computeBatchedDecodeCpuGpuWithMode(self, tokens, slot_indices, positions, output_mode);
+    }
+    if (!force_prototype and
+        topologyModeIs(self, "cpu_gpu_gpu") and
+        comptime @hasField(SelfType, "device") and
+            @hasDecl(SelfType, "pipelineCpuStage0") and
+            @hasDecl(SelfType, "pipelineStage1"))
+    {
+        return computeBatchedDecodeCpuGpuGpuWithMode(self, tokens, slot_indices, positions, output_mode);
     }
     return computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{});
 }
@@ -2974,6 +3204,13 @@ fn computeBatchedDecodeLogitsWithPlan(
     if (!plan.bypass_topology_prototype and
         (force_prototype or topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")))
     {
+        if (enable_dispatch_observability) {
+            log.warn("inference", "CUDA decode using sequential fallback route", .{
+                .mode = topologyModeTag(self) orelse "unknown",
+                .forced = @as(u8, @intFromBool(force_prototype)),
+                .batch_rows = n_usize,
+            });
+        }
         const emit_host_logits = output_mode == .host_logits;
         for (0..n_usize) |i| {
             self.activateKvSlot(slot_indices[i]);
@@ -3024,9 +3261,10 @@ fn computeBatchedDecodeLogitsWithPlan(
         {
             const decode_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - decode_start_ns);
             const mode_label = plan.summary_label_override orelse switch (output_mode) {
-                .host_logits => "decode_prototype",
-                .device_only => "decode_device_only_prototype",
+                .host_logits => "decode_fallback_sequential",
+                .device_only => "decode_device_only_fallback_sequential",
             };
+            logDecodeInventoryOnce(self, mode_label, n_usize, n_usize);
             self.logNvfp4RouteSummaryImpl(mode_label, n_usize);
             self.logPhaseBudgetSummaryImpl(mode_label, n_usize, decode_elapsed_ns);
         }
@@ -3133,31 +3371,34 @@ fn computeBatchedDecodeLogitsWithPlan(
             switch (lookup.kind) {
                 .f16, .bf16 => {
                     if (self.embedding_lookup_u16_rows_function) |kernel| {
-                        const token_bytes = std.math.mul(usize, n_usize, @sizeOf(u32)) catch return error.InvalidArgument;
-                        var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
-                        self.prefill_rope_positions_cached_dirty = true;
-                        try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(tokens));
-                        var input_rows = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
-                        try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            kernel,
-                            &input_rows,
-                            &lookup.buffer,
-                            &token_ids_dev,
-                            @intCast(n_usize),
-                            lookup.dim0,
-                            lookup.dim1,
-                            lookup.hidden_dim,
-                            lookup.layout_tag,
-                            switch (lookup.kind) {
-                                .f16 => compute.cuda.embedding_lookup_u16_rows.dtype_f16,
-                                .bf16 => compute.cuda.embedding_lookup_u16_rows.dtype_bf16,
-                                else => unreachable,
-                            },
-                            lookup.multiplier,
-                        );
-                        used_rows_device_lookup = true;
+                        const prefer_scalar_single_row = n_usize == 1 and embedding_lookup_u16_function != null;
+                        if (!prefer_scalar_single_row) {
+                            const token_bytes = std.math.mul(usize, n_usize, @sizeOf(u32)) catch return error.InvalidArgument;
+                            var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
+                            self.prefill_rope_positions_cached_dirty = true;
+                            try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(tokens));
+                            var input_rows = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+                            try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                kernel,
+                                &input_rows,
+                                &lookup.buffer,
+                                &token_ids_dev,
+                                @intCast(n_usize),
+                                lookup.dim0,
+                                lookup.dim1,
+                                lookup.hidden_dim,
+                                lookup.layout_tag,
+                                switch (lookup.kind) {
+                                    .f16 => compute.cuda.embedding_lookup_u16_rows.dtype_f16,
+                                    .bf16 => compute.cuda.embedding_lookup_u16_rows.dtype_bf16,
+                                    else => unreachable,
+                                },
+                                lookup.multiplier,
+                            );
+                            used_rows_device_lookup = true;
+                        }
                     }
                 },
                 else => {},
@@ -3429,6 +3670,8 @@ fn computeBatchedDecodeLogitsWithPlan(
         self.runtime_buffers.batched_attn_max_seq_len = self.batched_decode_graph_seq_tier;
     }
 
+    const no_graph = std.posix.getenv("TALU_NO_GRAPH") != null;
+
     // CUDA graph: capture-once-replay-many. Three states:
     // 1. refresh_pointer_tables=true → run normally, no capture (batch changed).
     // 2. First steady-state step (no graph exec) → capture + instantiate + launch.
@@ -3436,7 +3679,7 @@ fn computeBatchedDecodeLogitsWithPlan(
     compute: {
         // State 3: steady-state replay — cached graph exec + stable batch.
         if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
-            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and
+            if (self.compute_stream != null and !no_graph and !trace.isEnabled() and !refresh_pointer_tables and
                 !gemma4_branch_active and plan.compute_logits)
             {
                 if (self.batched_decode_graph_exec) |exec| {
@@ -3467,7 +3710,7 @@ fn computeBatchedDecodeLogitsWithPlan(
                 self.phase_event_timing_enabled
             else
                 false;
-            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and
+            if (self.compute_stream != null and !no_graph and !trace.isEnabled() and !refresh_pointer_tables and
                 !gemma4_branch_active and !event_timing_enabled and plan.compute_logits)
             {
                 try self.device.streamBeginCapture(self.compute_stream.?);
@@ -3617,6 +3860,7 @@ fn computeBatchedDecodeLogitsWithPlan(
             .host_logits => "decode",
             .device_only => if (plan.compute_logits) "decode_device_only" else "decode_layers_only",
         };
+        logDecodeInventoryOnce(self, mode_label, n_usize, n_usize);
         self.logNvfp4RouteSummaryImpl(mode_label, n_usize);
         self.logPhaseBudgetSummaryImpl(mode_label, n_usize, decode_elapsed_ns);
     }
@@ -4057,6 +4301,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                     .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
                     .fp8 => "matmul_lm_head_fp8_host",
                     .mxfp8 => "matmul_lm_head_mxfp8_host",
+                    .nvfp4 => "matmul_lm_head_nvfp4_host",
                 };
                 trace.emitFinalWithWork(
                     .lm_head,

@@ -69,6 +69,7 @@ const expectedAttentionQProjectionDim = engine_types.expectedAttentionQProjectio
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 const GaffineU4LinearWeight = engine_types.GaffineU4LinearWeight;
 const GaffineU8LinearWeight = engine_types.GaffineU8LinearWeight;
+const Nvfp4LinearWeight = engine_types.Nvfp4LinearWeight;
 const AttentionPath = engine_types.AttentionPath;
 const gqa_prefill_f16_dynamic_smem_bytes: u32 = 65536;
 
@@ -1878,18 +1879,19 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     if (self.kernel_registry.resolveFunction("i8_matvec_f32", "talu_i8_matvec_f32")) |resolved| {
         self.i8_matvec_function = resolved.function;
     } else |_| {}
-    if (self.kernel_registry.resolveFunction("i8_matvec_qkv_f32", "talu_i8_matvec_qkv_f32")) |resolved| {
-        self.i8_matvec_qkv_function = resolved.function;
-    } else |_| {}
-    if (self.kernel_registry.resolveFunction("i8_matvec_gate_up_silu_f32", "talu_i8_matvec_gate_up_silu_f32")) |resolved| {
-        self.i8_matvec_gate_up_silu_function = resolved.function;
-    } else |_| {}
     if (self.kernel_registry.resolveFunction("gaffine_u8_to_i8", "talu_gaffine_u8_to_i8")) |resolved| {
         self.gaffine_u8_to_i8_function = resolved.function;
     } else |_| {}
     if (self.kernel_registry.resolveFunction("gaffine_u4_to_i8", "talu_gaffine_u4_to_i8")) |resolved| {
         self.gaffine_u4_to_i8_function = resolved.function;
     } else |_| {}
+    if (self.kernel_registry.resolveFunction("nvfp4_to_i8", "talu_nvfp4_to_i8")) |resolved| {
+        self.nvfp4_to_i8_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4->I8 kernel resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
     if (self.kernel_registry.resolveFunction("quantize_f16_to_i8", "talu_quantize_f16_to_i8")) |resolved| {
         self.quantize_f16_to_i8_function = resolved.function;
     } else |_| {}
@@ -2027,51 +2029,64 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     const has_u4_dequant = self.gaffine_u4_dequant_f16_function != null;
     const has_u4_to_i8 = self.gaffine_u4_to_i8_function != null;
     const has_u8_to_i8 = self.gaffine_u8_to_i8_function != null;
-    if (!has_u8_dequant and !has_u4_dequant and !has_u4_to_i8 and !has_u8_to_i8) {
+    const has_nvfp4_to_i8 = self.nvfp4_to_i8_function != null;
+    // NVFP4->I8 cache can improve some decode kernels but substantially
+    // increases VRAM footprint; keep disabled by default until budgets and
+    // route quality are validated across long-context prefill.
+    const enable_nvfp4_i8_cache = has_nvfp4_to_i8 and (std.posix.getenv("TALU_NVFP4_I8_CACHE") != null);
+    if (!has_u8_dequant and !has_u4_dequant and !has_u4_to_i8 and !has_u8_to_i8 and !enable_nvfp4_i8_cache) {
         return;
     }
 
     // Estimate total dequant cache bytes and skip if insufficient VRAM remains.
-    // The I8 cache accelerates prefill (INT8 tensor core GEMM) but is optional —
-    // decode uses the native U4 GEMV kernel directly.
+    // The I8 cache accelerates prefill and can unlock fused/smaller-kernel decode
+    // routes for low-bit weights. It is optional and skipped when memory headroom
+    // is insufficient.
     {
         var estimated_cache_bytes: usize = 0;
-        const countGaffineBytes = struct {
-            fn run(weight: *const LinearWeight) usize {
+        const countLowBitI8CacheBytes = struct {
+            fn run(weight: *const LinearWeight, nvfp4_i8_enabled: bool) usize {
                 return switch (weight.*) {
                     // I8: rows*cols + cols*4 (scale). Use rows*cols as lower bound.
                     .gaffine_u4, .gaffine_u8 => |w| std.math.mul(usize, w.rows, w.cols) catch 0,
+                    .nvfp4 => |w| if (nvfp4_i8_enabled) std.math.mul(usize, w.rows, w.cols) catch 0 else 0,
                     else => 0,
                 };
             }
         }.run;
         for (self.block_runtime.blocks) |*layer| {
             if (layer.attention_runtime) |*attn| {
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.q_proj));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.k_proj));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.v_proj));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.o_proj));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.w1));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.w2));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.w3));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&attn.q_proj, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&attn.k_proj, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&attn.v_proj, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&attn.o_proj, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&attn.w1, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&attn.w2, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&attn.w3, enable_nvfp4_i8_cache));
             }
             if (layer.shortconv_runtime) |*sc| {
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&sc.in_proj));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&sc.out_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&sc.in_proj, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&sc.out_proj, enable_nvfp4_i8_cache));
             }
             if (layer.gated_delta_runtime) |*gd| {
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&gd.in_proj));
-                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&gd.out_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&gd.in_proj, enable_nvfp4_i8_cache));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&gd.out_proj, enable_nvfp4_i8_cache));
             }
         }
-        estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&self.runtime_buffers.projection_weight));
+        estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countLowBitI8CacheBytes(&self.runtime_buffers.projection_weight, enable_nvfp4_i8_cache));
         // Add overhead for per-col scale buffers and concatenated QKV caches.
         estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, estimated_cache_bytes / 4);
 
         if (self.device.memoryInfo()) |mem_info| {
-            // Only create I8 caches if they fit within half of free VRAM.
-            // The remaining half is needed for KV cache, activations, and runtime buffers.
-            if (estimated_cache_bytes > mem_info.free / 2) {
+            // Keep a fixed safety headroom for runtime allocations and KV growth.
+            // The previous free/2 cap was too conservative for medium NVFP4 models
+            // (e.g. 4B) and prevented decode caches from being created at all.
+            const safety_bytes: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+            const cache_budget = if (mem_info.free > safety_bytes)
+                mem_info.free - safety_bytes
+            else
+                0;
+            if (estimated_cache_bytes > cache_budget) {
                 return;
             }
         } else |_| {}
@@ -2201,12 +2216,84 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
         }
     }.run;
 
-    // Helper to process a LinearWeight if it is gaffine_u8 or gaffine_u4.
-    // Both get I8 caches for INT8 tensor core prefill (2x vs F16 GEMM).
+    // Helper to create I8 cache for a single NVFP4 weight.
+    // This is used by decode fused I8 paths and prefill tensor-core I8 paths.
+    const dequantNvfp4Weight = struct {
+        fn run(
+            backend: *CudaBackend,
+            w: *Nvfp4LinearWeight,
+            bytes_out: *usize,
+        ) void {
+            const dequant_i8_fn = backend.nvfp4_to_i8_function orelse return;
+            const weight_elems = std.math.mul(usize, w.rows, w.cols) catch return;
+            if (weight_elems == 0) return;
+            const i8_bytes = weight_elems;
+            const scale_bytes = std.math.mul(usize, w.cols, @sizeOf(f32)) catch return;
+
+            var i8_buf = backend.device.allocBuffer(i8_bytes) catch return;
+            var scale_buf = backend.device.allocBuffer(scale_bytes) catch {
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+
+            backend.kernel_arg_pack.reset();
+            backend.kernel_arg_pack.appendBufferPtr(&w.buffer) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+            backend.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+            backend.kernel_arg_pack.appendBufferPtr(&i8_buf) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+            backend.kernel_arg_pack.appendBufferPtr(&scale_buf) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+            backend.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+            backend.kernel_arg_pack.appendScalar(u32, @intCast(w.scale_cols)) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+            backend.kernel_arg_pack.appendScalar(f32, w.weight_global_scale) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+
+            compute.cuda.launch.launchWithFamily(&backend.device, dequant_i8_fn, .{
+                .grid_x = @intCast(w.cols),
+                .block_x = 256,
+            }, &backend.kernel_arg_pack, .other) catch {
+                scale_buf.deinit(&backend.device);
+                i8_buf.deinit(&backend.device);
+                return;
+            };
+
+            w.dequant_i8_cache = i8_buf;
+            w.mean_scale_cache = scale_buf;
+            bytes_out.* += i8_bytes + scale_bytes;
+        }
+    }.run;
+
+    // Helper to process a low-bit LinearWeight and materialize I8 caches.
     const maybeProcess = struct {
         fn run(
             backend: *CudaBackend,
             weight: *LinearWeight,
+            nvfp4_i8_enabled: bool,
             bytes_out: *usize,
             count_out: *usize,
         ) void {
@@ -2221,6 +2308,12 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
                         count_out.* += 1;
                     }
                 },
+                .nvfp4 => |*w| {
+                    if (nvfp4_i8_enabled) {
+                        dequantNvfp4Weight(backend, w, bytes_out);
+                        count_out.* += 1;
+                    }
+                },
                 else => {},
             }
         }
@@ -2231,43 +2324,44 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
         fn run(
             backend: *CudaBackend,
             weight_opt: *?LinearWeight,
+            nvfp4_i8_enabled: bool,
             bytes_out: *usize,
             count_out: *usize,
         ) void {
             if (weight_opt.*) |*w| {
-                maybeProcess(backend, w, bytes_out, count_out);
+                maybeProcess(backend, w, nvfp4_i8_enabled, bytes_out, count_out);
             }
         }
     }.run;
 
     for (self.block_runtime.blocks) |*layer| {
         if (layer.attention_runtime) |*attn| {
-            maybeProcess(self, &attn.q_proj, &total_bytes, &weight_count);
-            maybeProcess(self, &attn.k_proj, &total_bytes, &weight_count);
-            maybeProcess(self, &attn.v_proj, &total_bytes, &weight_count);
-            maybeProcess(self, &attn.o_proj, &total_bytes, &weight_count);
-            maybeProcess(self, &attn.w1, &total_bytes, &weight_count);
-            maybeProcess(self, &attn.w2, &total_bytes, &weight_count);
-            maybeProcess(self, &attn.w3, &total_bytes, &weight_count);
+            maybeProcess(self, &attn.q_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &attn.k_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &attn.v_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &attn.o_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &attn.w1, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &attn.w2, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &attn.w3, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
         }
         if (layer.shortconv_runtime) |*sc| {
-            maybeProcess(self, &sc.in_proj, &total_bytes, &weight_count);
-            maybeProcess(self, &sc.out_proj, &total_bytes, &weight_count);
-            maybeProcessOpt(self, &sc.ffn_w1, &total_bytes, &weight_count);
-            maybeProcessOpt(self, &sc.ffn_w2, &total_bytes, &weight_count);
-            maybeProcessOpt(self, &sc.ffn_w3, &total_bytes, &weight_count);
+            maybeProcess(self, &sc.in_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &sc.out_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcessOpt(self, &sc.ffn_w1, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcessOpt(self, &sc.ffn_w2, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcessOpt(self, &sc.ffn_w3, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
         }
         if (layer.gated_delta_runtime) |*gd| {
-            maybeProcess(self, &gd.in_proj, &total_bytes, &weight_count);
-            maybeProcess(self, &gd.out_proj, &total_bytes, &weight_count);
-            maybeProcessOpt(self, &gd.ffn_w1, &total_bytes, &weight_count);
-            maybeProcessOpt(self, &gd.ffn_w2, &total_bytes, &weight_count);
-            maybeProcessOpt(self, &gd.ffn_w3, &total_bytes, &weight_count);
+            maybeProcess(self, &gd.in_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcess(self, &gd.out_proj, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcessOpt(self, &gd.ffn_w1, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcessOpt(self, &gd.ffn_w2, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
+            maybeProcessOpt(self, &gd.ffn_w3, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
         }
     }
 
     // Projection weight (lm_head).
-    maybeProcess(self, &self.runtime_buffers.projection_weight, &total_bytes, &weight_count);
+    maybeProcess(self, &self.runtime_buffers.projection_weight, enable_nvfp4_i8_cache, &total_bytes, &weight_count);
 
     // Build concatenated I8 QKV caches for fused prefill GEMM.
     // This merges Q+K+V I8 weights into one contiguous buffer so prefill
@@ -2281,6 +2375,10 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
                 else
                     null,
                 .gaffine_u8 => |w| if (w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0)
+                    .{ .i8_buf = w.dequant_i8_cache, .scales_buf = w.mean_scale_cache }
+                else
+                    null,
+                .nvfp4 => |w| if (w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0)
                     .{ .i8_buf = w.dequant_i8_cache, .scales_buf = w.mean_scale_cache }
                 else
                     null,
@@ -2352,7 +2450,7 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     self.dequant_cache_bytes = total_bytes;
     if (weight_count > 0) {
         try self.device.synchronize();
-        log.info("inference", "CUDA gaffine dequant cache ready", .{
+        log.info("inference", "CUDA low-bit i8 cache ready", .{
             .weights = weight_count,
             .cache_mib = total_bytes / (1024 * 1024),
         });

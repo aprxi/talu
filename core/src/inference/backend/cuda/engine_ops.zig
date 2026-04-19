@@ -268,16 +268,12 @@ pub fn linearForwardRows(
             // - f16: keep native batched GEMV for small row counts.
             // - bf16: switch to tensor-core GEMM at n>=8 to avoid leaving
             //   throughput on the table for batched decode.
-            var prefer_matvec = switch (w.dtype) {
+            const prefer_matvec = switch (w.dtype) {
                 .f16 => rows <= 32,
                 .bf16 => rows < 8,
             };
-            // Large single-row BF16 projections (notably lm_head) are
-            // throughput-bound on custom GEMV. Prefer cuBLAS BF16 tensor-core
-            // GEMM for very wide outputs to improve decode throughput.
-            if (rows == 1 and w.dtype == .bf16 and output_row_width >= 65536) {
-                prefer_matvec = false;
-            }
+            // Keep single-row decode on the custom matvec path. cuBLAS GEMV
+            // launch/dispatch overhead can dominate for per-token projections.
             if (prefer_matvec) {
                 try compute.cuda.matvec_u16.runWithFunction(
                     &self.kernel_arg_pack,
@@ -1324,7 +1320,8 @@ pub fn linearForwardRows(
             // Native FP4 tensor core prefill (Blackwell SM_100+):
             // Quantize F32 input → FP4, then cuBLASLt FP4×FP4 → F32 GEMM.
             // Native cuBLASLt FP4×FP4 → BF16 GEMM + BF16→F32 cast (Blackwell SM_100+).
-            if (rows > 4 and w.scales_lt_buffer.size > 0) nvfp4_native_blas: {
+            const prefer_native_single_row = rows == 1 and w.cols >= 65536;
+            if ((rows > 4 or prefer_native_single_row) and w.scales_lt_buffer.size > 0) nvfp4_native_blas: {
                 const quant_fn = self.quantize_f32_to_nvfp4_function orelse break :nvfp4_native_blas;
                 var blas_lt = self.blas_lt orelse break :nvfp4_native_blas;
 
@@ -1404,6 +1401,33 @@ pub fn linearForwardRows(
             };
             const out_cols: u32 = @intCast(w.cols);
 
+            // Decode / small-batch fast path: reuse persistent NVFP4->I8 cache
+            // and run i8_matvec_f32 directly. This avoids FP4 nibble decode in
+            // token-time projection kernels.
+            if (rows <= 4 and
+                w.dequant_i8_cache.pointer != 0 and
+                w.mean_scale_cache.pointer != 0)
+            i8_decode: {
+                const i8_fn = self.i8_matvec_function orelse break :i8_decode;
+                const batch_rows: u32 = @intCast(rows);
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :i8_decode;
+                self.kernel_arg_pack.appendBufferPtr(&w.dequant_i8_cache) catch break :i8_decode;
+                self.kernel_arg_pack.appendBufferPtr(&w.mean_scale_cache) catch break :i8_decode;
+                self.kernel_arg_pack.appendBufferPtr(&packed_out) catch break :i8_decode;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch break :i8_decode;
+                self.kernel_arg_pack.appendScalar(u32, out_cols) catch break :i8_decode;
+                self.kernel_arg_pack.appendScalar(u32, batch_rows) catch break :i8_decode;
+                self.kernel_arg_pack.appendDevicePtr(0) catch break :i8_decode;
+                try compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
+                    .grid_x = (out_cols + 3) / 4,
+                    .grid_y = batch_rows,
+                    .block_x = 128,
+                }, &self.kernel_arg_pack, .matvec);
+                recordNvfp4Route(self, .small_rows_matvec);
+                return;
+            }
+
             // Fail closed when the startup parity probe found multi-row mismatches:
             // execute one row at a time on the known-good single-row kernel.
             if (rows > 1 and !self.nvfp4_sequence_rows_supported) {
@@ -1434,7 +1458,10 @@ pub fn linearForwardRows(
 
             var nvfp4_fn = base_nvfp4_fn;
             var nvfp4_batch_tile: u32 = 4;
-            if (rows > 4) {
+            // Decode is overwhelmingly single-row on NVFP4; prefer the wider
+            // tile8 kernel for practical decode projection widths.
+            const prefer_tile8 = rows > 4 or (rows == 1 and w.cols >= 2048);
+            if (prefer_tile8) {
                 if (self.nvfp4_matvec_tile8_function) |tile8_fn| {
                     nvfp4_fn = tile8_fn;
                     nvfp4_batch_tile = 8;
@@ -2129,7 +2156,6 @@ pub fn tryFusedQkvForward(
 ) !bool {
     if (try tryFusedDenseU16QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
     if (try tryFusedGaffineU4QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
-    if (try tryFusedI8QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
     if (try tryFusedNvfp4QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
     return tryFusedGaffineU8QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest);
 }
@@ -2231,67 +2257,6 @@ pub fn tryFusedGaffineU4QkvForward(
     return true;
 }
 
-pub fn tryFusedI8QkvForward(
-    self: anytype,
-    input: *const compute.cuda.Buffer,
-    q_proj: *const LinearWeight,
-    k_proj: *const LinearWeight,
-    v_proj: *const LinearWeight,
-    rows: usize,
-    q_out_dest: *compute.cuda.Buffer,
-) !bool {
-    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
-    const i8_fn = self.i8_matvec_qkv_function orelse return false;
-    const q = switch (q_proj.*) {
-        .gaffine_u8 => |w| w,
-        else => return false,
-    };
-    const k = switch (k_proj.*) {
-        .gaffine_u8 => |w| w,
-        else => return false,
-    };
-    const v = switch (v_proj.*) {
-        .gaffine_u8 => |w| w,
-        else => return false,
-    };
-    // All three projections must have I8 caches populated.
-    if (q.dequant_i8_cache.pointer == 0 or q.mean_scale_cache.pointer == 0) return false;
-    if (k.dequant_i8_cache.pointer == 0 or k.mean_scale_cache.pointer == 0) return false;
-    if (v.dequant_i8_cache.pointer == 0 or v.mean_scale_cache.pointer == 0) return false;
-    if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
-    const batch_rows: u32 = @intCast(rows);
-
-    const q_out_dim: u32 = @intCast(q.cols);
-    const k_out_dim: u32 = @intCast(k.cols);
-    const v_out_dim: u32 = @intCast(v.cols);
-    const in_dim: u32 = @intCast(q.rows);
-    const total_out = std.math.add(u32, q_out_dim, std.math.add(u32, k_out_dim, v_out_dim) catch return error.InvalidArgument) catch return error.InvalidArgument;
-
-    self.kernel_arg_pack.reset();
-    try self.kernel_arg_pack.appendBufferPtr(input);
-    try self.kernel_arg_pack.appendBufferPtr(&q.dequant_i8_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&q.mean_scale_cache);
-    try self.kernel_arg_pack.appendBufferPtr(q_out_dest);
-    try self.kernel_arg_pack.appendScalar(u32, q_out_dim);
-    try self.kernel_arg_pack.appendBufferPtr(&k.dequant_i8_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&k.mean_scale_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.attn_k_dev);
-    try self.kernel_arg_pack.appendScalar(u32, k_out_dim);
-    try self.kernel_arg_pack.appendBufferPtr(&v.dequant_i8_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&v.mean_scale_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.attn_v_dev);
-    try self.kernel_arg_pack.appendScalar(u32, v_out_dim);
-    try self.kernel_arg_pack.appendScalar(u32, in_dim);
-    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
-
-    try compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
-        .grid_x = (total_out + 3) / 4,
-        .grid_y = batch_rows,
-        .block_x = 128,
-    }, &self.kernel_arg_pack, .matvec_qkv);
-    return true;
-}
-
 pub fn tryFusedGaffineU8QkvForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
@@ -2377,15 +2342,6 @@ pub fn tryFusedNvfp4QkvForward(
     if (q.rows != self.d_model) return false;
     if (q.weight_global_scale == 0.0 or k.weight_global_scale == 0.0 or v.weight_global_scale == 0.0) return false;
 
-    var fused_fn = self.nvfp4_matvec_qkv_function orelse return false;
-    var nvfp4_batch_tile: u32 = 4;
-    if (rows > 4) {
-        if (self.nvfp4_matvec_qkv_tile8_function) |tile8_fn| {
-            fused_fn = tile8_fn;
-            nvfp4_batch_tile = 8;
-        }
-    }
-
     const q_out_dim: u32 = @intCast(q.cols);
     const k_out_dim: u32 = @intCast(k.cols);
     const v_out_dim: u32 = @intCast(v.cols);
@@ -2393,6 +2349,16 @@ pub fn tryFusedNvfp4QkvForward(
     const batch_rows: u32 = @intCast(rows);
     const qk_dim = std.math.add(u32, q_out_dim, k_out_dim) catch return false;
     const total_out = std.math.add(u32, qk_dim, v_out_dim) catch return false;
+
+    var fused_fn = self.nvfp4_matvec_qkv_function orelse return false;
+    var nvfp4_batch_tile: u32 = 4;
+    const prefer_tile8 = rows > 4 or (rows == 1 and total_out >= 3072);
+    if (prefer_tile8) {
+        if (self.nvfp4_matvec_qkv_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            nvfp4_batch_tile = 8;
+        }
+    }
 
     self.kernel_arg_pack.reset();
     try self.kernel_arg_pack.appendBufferPtr(input);
@@ -2607,60 +2573,9 @@ pub fn linearWeightHasI8Cache(weight: *const LinearWeight) bool {
     return switch (weight.*) {
         .gaffine_u4 => |w| w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0,
         .gaffine_u8 => |w| w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0,
+        .nvfp4 => |w| w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0,
         else => false,
     };
-}
-
-pub fn tryFusedI8GateUpSiluForward(
-    self: anytype,
-    input: *const compute.cuda.Buffer,
-    gate_weight: *const LinearWeight,
-    up_weight: *const LinearWeight,
-    rows: usize,
-    expected_out_dim: u32,
-) !bool {
-    if (self.loaded.config.use_gelu) return false;
-    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
-    const i8_fn = self.i8_matvec_gate_up_silu_function orelse return false;
-
-    const gate = switch (gate_weight.*) {
-        .gaffine_u8 => |w| w,
-        else => return false,
-    };
-    const up = switch (up_weight.*) {
-        .gaffine_u8 => |w| w,
-        else => return false,
-    };
-    // Both must have I8 caches populated.
-    if (gate.dequant_i8_cache.pointer == 0 or gate.mean_scale_cache.pointer == 0) return false;
-    if (up.dequant_i8_cache.pointer == 0 or up.mean_scale_cache.pointer == 0) return false;
-    if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
-    if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
-
-    const row_count = bufferF32RowCount(input, gate.rows) catch return false;
-    if (row_count != rows) return false;
-    const batch_rows: u32 = @intCast(rows);
-
-    const out_dim: u32 = @intCast(gate.cols);
-    const in_dim: u32 = @intCast(gate.rows);
-
-    self.kernel_arg_pack.reset();
-    try self.kernel_arg_pack.appendBufferPtr(input);
-    try self.kernel_arg_pack.appendBufferPtr(&gate.dequant_i8_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&gate.mean_scale_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&up.dequant_i8_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&up.mean_scale_cache);
-    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_mul_dev);
-    try self.kernel_arg_pack.appendScalar(u32, out_dim);
-    try self.kernel_arg_pack.appendScalar(u32, in_dim);
-    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
-
-    try compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
-        .grid_x = (out_dim + 3) / 4,
-        .grid_y = batch_rows,
-        .block_x = 128,
-    }, &self.kernel_arg_pack, .matvec_gate_up_silu);
-    return true;
 }
 
 pub fn tryFusedGaffineU8GateUpSiluForward(
@@ -2999,7 +2914,8 @@ pub fn tryFusedNvfp4GateUpSiluForward(
 
     var fused_fn = self.nvfp4_matvec_gate_up_silu_function orelse return false;
     var batch_tile: u32 = 4;
-    if (rows > 4) {
+    const prefer_tile8 = rows > 4 or (rows == 1 and gate.cols >= 8192);
+    if (prefer_tile8) {
         if (self.nvfp4_matvec_gate_up_silu_tile8_function) |tile8_fn| {
             fused_fn = tile8_fn;
             batch_tile = 8;
@@ -3066,7 +2982,8 @@ pub fn tryFusedNvfp4GateUpGeluForward(
 
     var fused_fn = self.nvfp4_matvec_gate_up_gelu_function orelse return false;
     var batch_tile: u32 = 4;
-    if (rows > 4) {
+    const prefer_tile8 = rows > 4 or (rows == 1 and gate.cols >= 8192);
+    if (prefer_tile8) {
         if (self.nvfp4_matvec_gate_up_gelu_tile8_function) |tile8_fn| {
             fused_fn = tile8_fn;
             batch_tile = 8;
@@ -3184,10 +3101,10 @@ pub fn tryFusedNvfp4GateUpForward(
     if (gate.rows != up.rows) return false;
     if (gate.rows != self.d_model) return false;
     if (gate.weight_global_scale == 0.0 or up.weight_global_scale == 0.0) return false;
-
     var fused_fn = self.nvfp4_matvec_gate_up_function orelse return false;
     var nvfp4_batch_tile: u32 = 4;
-    if (rows > 4) {
+    const prefer_tile8 = rows > 4 or (rows == 1 and (gate.cols + up.cols) >= 8192);
+    if (prefer_tile8) {
         if (self.nvfp4_matvec_gate_up_tile8_function) |tile8_fn| {
             fused_fn = tile8_fn;
             nvfp4_batch_tile = 8;
@@ -3298,6 +3215,8 @@ pub fn tryFusedGateUpForward(
     if (try tryFusedDenseU16GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     if (try tryFusedMxfp8GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     if (try tryFusedFp8GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
+    // For decode/small batches, keep NVFP4 gate/up on the canonical gate+up
+    // buffer path first.
     if (try tryFusedNvfp4GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     // The U4 fused gate/up+silu path is currently unstable for quality-sensitive
     // generation; keep the established U8 path as the default correctness path.

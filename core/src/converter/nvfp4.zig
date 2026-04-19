@@ -3018,6 +3018,7 @@ fn collectSampledBlockScalesMetal(
     all_block_scales: []f32,
     block_progress: ?*Nvfp4BlockProgress,
 ) !void {
+    if (comptime !has_metal_gpu_eval) return error.InvalidConfig;
     const total_blocks = std.math.mul(usize, rows, groups) catch return error.InvalidShape;
     if (all_block_scales.len != total_blocks) return error.InvalidShape;
 
@@ -3291,6 +3292,7 @@ fn packNvfp4RowsWithMetal(
     packed_bytes: []u8,
     convert_pool: *parallel.ThreadPool,
 ) !void {
+    if (comptime !has_metal_gpu_eval) return error.InvalidConfig;
     if (!(global_scale > 0.0) or !std.math.isFinite(global_scale)) return error.InvalidConfig;
     const scale_len = std.math.mul(usize, rows, groups) catch return error.InvalidShape;
     const packed_len = std.math.mul(usize, rows, cols / 2) catch return error.InvalidShape;

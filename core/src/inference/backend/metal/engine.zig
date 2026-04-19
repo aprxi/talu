@@ -8,6 +8,7 @@ const progress_mod = @import("progress_pkg");
 const metal_vision = @import("vision/root.zig");
 const cpu_engine = @import("../cpu/engine.zig");
 const sampling = @import("../cpu/sampling.zig");
+const shared_scheduler = @import("../cpu/scheduler.zig");
 const compute = @import("compute_pkg");
 const trace = @import("xray_pkg").trace;
 const cpu_sampling_ops = compute.cpu.sampling_ops;
@@ -1314,6 +1315,22 @@ pub const MetalBackend = struct {
         return true;
     }
 
+    pub fn planSchedulerSingleDecodeRoute(
+        self: *const MetalBackend,
+        plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
+    ) shared_scheduler.SchedulerSingleDecodeRoute {
+        if (plan.greedy_streaming_semantic_eligible and self.supportsSchedulerBackendDecodeStreamingRoute()) {
+            return .greedy_streaming;
+        }
+        if (plan.top_k_streaming_semantic_eligible and self.supportsSchedulerBackendTopKStreamingRoute(plan.sampling_config)) {
+            return .top_k_streaming;
+        }
+        if (plan.top_k_candidate_semantic_eligible and self.supportsSchedulerBackendTopKDecodeRoute(plan.sampling_config)) {
+            return .top_k_candidate;
+        }
+        return .queued;
+    }
+
     fn hasTopKStreamingRegression(self: *const MetalBackend) bool {
         // Models with per-layer-input branches require non-streaming TopK.
         if (self.model_config.hidden_size_per_layer_input > 0) return true;
@@ -1371,6 +1388,15 @@ pub const MetalBackend = struct {
                 sampling_config.logit_bias == null,
             else => false,
         };
+    }
+
+    pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
+        self: *const MetalBackend,
+        plan: *const shared_scheduler.SchedulerBatchedTopKRoutePlan,
+    ) bool {
+        _ = plan.route_top_k;
+        // Keep this policy backend-owned and deterministic (no env toggle).
+        return self.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config);
     }
 
     pub fn supportsSchedulerBackendInPlaceSamplingMutation(self: *const MetalBackend) bool {

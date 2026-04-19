@@ -71,9 +71,9 @@ pub const VisionRuntime = struct {
 
     merger_norm_weight: []f32, // [vision_hidden]
     merger_norm_bias: []f32, // [vision_hidden]
-    merger_fc1_weight: Tensor, // [vision_intermediate, vision_hidden * merge^2]
-    merger_fc1_bias: []f32, // [vision_intermediate]
-    merger_fc2_weight: Tensor, // [language_hidden, vision_intermediate]
+    merger_fc1_weight: Tensor, // [merger_intermediate, vision_hidden * merge^2]
+    merger_fc1_bias: []f32, // [merger_intermediate]
+    merger_fc2_weight: Tensor, // [language_hidden, merger_intermediate]
     merger_fc2_bias: []f32, // [language_hidden]
     deepstack_mergers: []DeepstackMergerWeights = &.{},
     deepstack_visual_layers: [8]usize = [_]usize{0} ** 8,
@@ -166,7 +166,6 @@ pub const VisionRuntime = struct {
         const vision_depth: usize = @intCast(cfg.vision_depth);
         const vision_num_heads: usize = @intCast(if (cfg.vision_num_heads > 0) cfg.vision_num_heads else 16);
         const vision_intermediate_size: usize = @intCast(if (cfg.vision_intermediate_size > 0) cfg.vision_intermediate_size else 4 * cfg.vision_hidden_size);
-        const merger_intermediate_size: usize = @intCast(if (cfg.projector_hidden_size > 0) cfg.projector_hidden_size else if (cfg.vision_intermediate_size > 0) cfg.vision_intermediate_size else 4 * cfg.vision_hidden_size);
         const language_hidden_size: usize = @intCast(cfg.d_model);
         const patch_size: usize = @intCast(if (cfg.vision_patch_size > 0) cfg.vision_patch_size else 16);
         var spatial_merge_size: usize = @intCast(if (cfg.vision_spatial_merge_size > 0) cfg.vision_spatial_merge_size else 1);
@@ -239,6 +238,7 @@ pub const VisionRuntime = struct {
         const merger_fc1_weight = try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc1_candidates);
         const merger_fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc1_bias_candidates));
         errdefer allocator.free(merger_fc1_bias);
+        const merger_intermediate_size = try resolveMergerIntermediateSize(merger_fc1_bias);
 
         const merger_fc2_weight = try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc2_candidates);
         const merger_fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc2_bias_candidates));
@@ -981,6 +981,11 @@ fn flattenPatchProjWeight(
     );
 }
 
+fn resolveMergerIntermediateSize(merger_fc1_bias: []const f32) !usize {
+    if (merger_fc1_bias.len == 0) return error.InvalidShape;
+    return merger_fc1_bias.len;
+}
+
 fn loadDeepstackMergers(
     allocator: std.mem.Allocator,
     name_resolver: *vision_load.TensorNameResolver,
@@ -1133,6 +1138,12 @@ test "initVisionScratch initializes attention cache for every vision layer" {
         const slot_state = scratch.getSlotState(layer_idx) orelse return error.TestUnexpectedResult;
         try std.testing.expect(slot_state.attn_cache != null);
     }
+}
+
+test "resolveMergerIntermediateSize uses merger fc1 bias width" {
+    const bias = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    try std.testing.expectEqual(@as(usize, 4), try resolveMergerIntermediateSize(bias[0..]));
+    try std.testing.expectError(error.InvalidShape, resolveMergerIntermediateSize(&.{}));
 }
 
 test "vision_block_program attention is stateless for vision encode path" {

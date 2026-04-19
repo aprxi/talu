@@ -26,6 +26,7 @@ const CublasCreateFn = *const fn (*?*anyopaque) callconv(.c) c_int;
 const CublasDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CublasSetMathModeFn = *const fn (?*anyopaque, c_int) callconv(.c) c_int;
 const CublasSetStreamFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
+const CublasSetWorkspaceFn = *const fn (?*anyopaque, ?*anyopaque, usize) callconv(.c) c_int;
 const CublasSgemmFn = *const fn (
     ?*anyopaque,
     c_int,
@@ -94,6 +95,7 @@ const CublasApi = struct {
     cublas_destroy: CublasDestroyFn,
     cublas_set_math_mode: CublasSetMathModeFn,
     cublas_set_stream: CublasSetStreamFn,
+    cublas_set_workspace: ?CublasSetWorkspaceFn,
     cublas_sgemm: CublasSgemmFn,
     cublas_gemm_ex: CublasGemmExFn,
     cublas_gemm_strided_batched_ex: CublasGemmStridedBatchedExFn,
@@ -108,7 +110,11 @@ pub const Blas = struct {
     lib: std.DynLib,
     api: CublasApi,
     handle: ?*anyopaque,
+    workspace: ?device_mod.Buffer = null,
+    workspace_size: usize = 0,
     cached_stream: ?*anyopaque = null,
+
+    const default_workspace_mb: usize = 16;
 
     pub fn init(device: *device_mod.Device) !Blas {
         try device.makeCurrent();
@@ -127,10 +133,30 @@ pub const Blas = struct {
             return error.CublasMathModeFailed;
         }
 
+        // Provide a persistent workspace so cuBLAS does not need to perform
+        // internal alloc/free churn on hot decode GEMM calls.
+        const ws_mb = if (std.posix.getenv("TALU_CUBLAS_WORKSPACE_MB")) |s|
+            std.fmt.parseInt(usize, s, 10) catch default_workspace_mb
+        else
+            default_workspace_mb;
+        const ws_bytes = ws_mb * 1024 * 1024;
+        var workspace: ?device_mod.Buffer = null;
+        errdefer if (workspace) |*ws| ws.deinit(device);
+        if (ws_bytes > 0 and api.cublas_set_workspace != null) {
+            workspace = try device.allocBuffer(ws_bytes);
+            const set_workspace_status = api.cublas_set_workspace.?(handle, @ptrFromInt(workspace.?.pointer), workspace.?.size);
+            if (set_workspace_status != cublas_status_success) {
+                workspace.?.deinit(device);
+                workspace = null;
+            }
+        }
+
         return .{
             .lib = lib,
             .api = api,
             .handle = handle,
+            .workspace = workspace,
+            .workspace_size = if (workspace) |ws| ws.size else 0,
             .cached_stream = null,
         };
     }
@@ -140,6 +166,11 @@ pub const Blas = struct {
         if (self.handle) |handle| {
             _ = self.api.cublas_destroy(handle);
             self.handle = null;
+        }
+        if (self.workspace) |*ws| {
+            ws.deinit(device);
+            self.workspace = null;
+            self.workspace_size = 0;
         }
         self.cached_stream = null;
         self.lib.close();
@@ -1033,6 +1064,7 @@ fn loadCublasApi(lib: *std.DynLib) !CublasApi {
         .cublas_destroy = try lookupRequired(CublasDestroyFn, lib, "cublasDestroy_v2"),
         .cublas_set_math_mode = try lookupRequiredAny(CublasSetMathModeFn, lib, &.{ "cublasSetMathMode_v2", "cublasSetMathMode" }),
         .cublas_set_stream = try lookupRequiredAny(CublasSetStreamFn, lib, &.{ "cublasSetStream_v2", "cublasSetStream" }),
+        .cublas_set_workspace = lib.lookup(CublasSetWorkspaceFn, "cublasSetWorkspace_v2") orelse lib.lookup(CublasSetWorkspaceFn, "cublasSetWorkspace"),
         .cublas_sgemm = try lookupRequired(CublasSgemmFn, lib, "cublasSgemm_v2"),
         .cublas_gemm_ex = try lookupRequired(CublasGemmExFn, lib, "cublasGemmEx"),
         .cublas_gemm_strided_batched_ex = try lookupRequired(CublasGemmStridedBatchedExFn, lib, "cublasGemmStridedBatchedEx"),

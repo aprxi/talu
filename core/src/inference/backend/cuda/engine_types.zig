@@ -83,7 +83,7 @@ pub const KvCacheDtype = enum(u8) {
 pub fn resolveKvCacheDtype() KvCacheDtype {
     const raw = std.posix.getenv("TALU_KV_QUANT") orelse return .i8;
     if (std.ascii.eqlIgnoreCase(raw, "f16") or std.ascii.eqlIgnoreCase(raw, "fp16")) return .f16;
-    if (std.ascii.eqlIgnoreCase(raw, "fp8") or std.ascii.eqlIgnoreCase(raw, "e4m3")) return .fp8;
+    if (std.ascii.eqlIgnoreCase(raw, "f8") or std.ascii.eqlIgnoreCase(raw, "fp8") or std.ascii.eqlIgnoreCase(raw, "e4m3")) return .fp8;
     return .i8;
 }
 pub const enable_fused_attention_f16_kv: bool = false;
@@ -1064,15 +1064,26 @@ pub const Nvfp4LinearWeight = struct {
     scale_cols: u32,
     group_size: u32,
     weight_global_scale: f32,
+    /// Optional persistent INT8 cache for fast decode kernels.
+    /// Built once at model init via NVFP4->I8 conversion.
+    dequant_i8_cache: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    /// Per-output-row scales for dequant_i8_cache.
+    mean_scale_cache: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
 
     pub fn deinit(self: *Nvfp4LinearWeight, device: *compute.cuda.Device) void {
+        if (self.mean_scale_cache.pointer != 0) self.mean_scale_cache.deinit(device);
+        if (self.dequant_i8_cache.pointer != 0) self.dequant_i8_cache.deinit(device);
         if (self.scales_lt_buffer.size > 0) self.scales_lt_buffer.deinit(device);
         if (self.scales_buffer.size > 0) self.scales_buffer.deinit(device);
         self.buffer.deinit(device);
     }
 
     pub fn byteSize(self: *const Nvfp4LinearWeight) usize {
-        return self.buffer.size + self.scales_buffer.size + self.scales_lt_buffer.size;
+        return self.buffer.size +
+            self.scales_buffer.size +
+            self.scales_lt_buffer.size +
+            self.dequant_i8_cache.size +
+            self.mean_scale_cache.size;
     }
 
     /// Compute cuBLASLt-required scale tensor size for VEC16_UE4M3 block scaling.

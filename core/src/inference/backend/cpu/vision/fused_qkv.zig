@@ -120,6 +120,7 @@ pub const VisionRuntime = struct {
     vision_depth: usize,
     vision_num_heads: usize,
     vision_intermediate_size: usize,
+    merger_intermediate_size: usize,
     language_hidden_size: usize,
     patch_size: usize,
     spatial_merge_size: usize,
@@ -134,9 +135,9 @@ pub const VisionRuntime = struct {
 
     merger_norm_weight: []f32, // [vision_hidden]
     merger_norm_bias: []f32, // [vision_hidden]
-    merger_fc1_weight: Tensor, // [vision_intermediate, vision_hidden * merge^2]
-    merger_fc1_bias: []f32, // [vision_intermediate]
-    merger_fc2_weight: Tensor, // [language_hidden, vision_intermediate]
+    merger_fc1_weight: Tensor, // [merger_intermediate, vision_hidden * merge^2]
+    merger_fc1_bias: []f32, // [merger_intermediate]
+    merger_fc2_weight: Tensor, // [language_hidden, merger_intermediate]
     merger_fc2_bias: []f32, // [language_hidden]
     deepstack_mergers: []DeepstackMergerWeights = &.{},
     deepstack_visual_layers: [8]usize = [_]usize{0} ** 8,
@@ -299,6 +300,7 @@ pub const VisionRuntime = struct {
         );
         const merger_fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc1_bias_candidates));
         errdefer allocator.free(merger_fc1_bias);
+        const merger_intermediate_size = try resolveMergerIntermediateSize(merger_fc1_bias);
 
         const merger_fc2_weight = try loadOrientedWeightByCandidates(
             tensor_allocator,
@@ -306,7 +308,7 @@ pub const VisionRuntime = struct {
             st,
             loaded.config,
             vision_metadata.merger_fc2_candidates,
-            vision_intermediate_size,
+            merger_intermediate_size,
         );
         const merger_fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc2_bias_candidates));
         errdefer allocator.free(merger_fc2_bias);
@@ -505,6 +507,7 @@ pub const VisionRuntime = struct {
             .vision_depth = vision_depth,
             .vision_num_heads = vision_num_heads,
             .vision_intermediate_size = vision_intermediate_size,
+            .merger_intermediate_size = merger_intermediate_size,
             .language_hidden_size = language_hidden_size,
             .patch_size = patch_size,
             .spatial_merge_size = spatial_merge_size,
@@ -876,7 +879,7 @@ pub const VisionRuntime = struct {
             .patch_count = patch_count,
             .merged_tokens = merged_tokens_log,
             .merged_width = self.vision_hidden_size * merge_units_log,
-            .fc1_out_dim = self.vision_intermediate_size,
+            .fc1_out_dim = self.merger_intermediate_size,
             .fc2_out_dim = self.language_hidden_size,
         }, @src());
 
@@ -913,19 +916,19 @@ pub const VisionRuntime = struct {
             merged,
         );
 
-        const fc1_out = try self.allocator.alloc(f32, merged_tokens * self.vision_intermediate_size);
+        const fc1_out = try self.allocator.alloc(f32, merged_tokens * self.merger_intermediate_size);
         defer self.allocator.free(fc1_out);
 
         var merged_view = Tensor.view2DSlice(merged, merged_tokens, merged_width);
-        var fc1_view = Tensor.view2DSlice(fc1_out, merged_tokens, self.vision_intermediate_size);
+        var fc1_view = Tensor.view2DSlice(fc1_out, merged_tokens, self.merger_intermediate_size);
         try cpu_linalg.matmulAuto(&merged_view, &self.merger_fc1_weight, &fc1_view, &self.scratch.matmul_scratch);
 
-        cpu_common.addBiasRows(fc1_out, self.merger_fc1_bias, merged_tokens, self.vision_intermediate_size);
+        cpu_common.addBiasRows(fc1_out, self.merger_fc1_bias, merged_tokens, self.merger_intermediate_size);
 
         // In-place GELU
         const tv = compute.cpu.tensor_view;
         const activation = compute.cpu.activation_view;
-        var fc1_tensor = Tensor.view2DSlice(fc1_out, merged_tokens, self.vision_intermediate_size);
+        var fc1_tensor = Tensor.view2DSlice(fc1_out, merged_tokens, self.merger_intermediate_size);
         const fc1_tv = tv.fromSimpleTensor(&fc1_tensor) orelse return error.InvalidShape;
         activation.gelu(fc1_tv, fc1_tv);
 
@@ -1004,6 +1007,11 @@ fn flattenPatchProjWeight(
         weight_5d.dtype,
         weight_5d.data_size,
     );
+}
+
+fn resolveMergerIntermediateSize(merger_fc1_bias: []const f32) !usize {
+    if (merger_fc1_bias.len == 0) return error.InvalidShape;
+    return merger_fc1_bias.len;
 }
 
 fn loadDeepstackMergers(
@@ -1170,6 +1178,12 @@ test "initVisionScratch initializes attention cache for every vision layer" {
         const slot_state = scratch.getSlotState(layer_idx) orelse return error.TestUnexpectedResult;
         try std.testing.expect(slot_state.attn_cache != null);
     }
+}
+
+test "resolveMergerIntermediateSize uses merger fc1 bias width" {
+    const bias = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    try std.testing.expectEqual(@as(usize, 4), try resolveMergerIntermediateSize(bias[0..]));
+    try std.testing.expectError(error.InvalidShape, resolveMergerIntermediateSize(&.{}));
 }
 
 test "vision_block_program attention is stateless for vision encode path" {
