@@ -123,7 +123,7 @@ fn responses_rejects_invalid_object_tool_choice_shapes() {
         missing_name_resp.body
     );
 
-    let invalid_allowed_tool_entry = serde_json::json!({
+    let unsupported_tool_choice_type = serde_json::json!({
         "input": "hello",
         "tool_choice": {
             "type": "allowed_tools",
@@ -132,7 +132,7 @@ fn responses_rejects_invalid_object_tool_choice_shapes() {
         }
     });
     let invalid_allowed_tool_entry_resp =
-        post_json(ctx.addr(), "/v1/responses", &invalid_allowed_tool_entry);
+        post_json(ctx.addr(), "/v1/responses", &unsupported_tool_choice_type);
     assert_eq!(
         invalid_allowed_tool_entry_resp.status, 400,
         "body: {}",

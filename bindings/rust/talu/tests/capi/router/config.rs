@@ -1,81 +1,23 @@
-//! Config validation and canonicalization tests.
+//! Config canonicalization tests.
 //!
-//! Exercises `talu_config_validate`, `talu_config_canonicalize`,
-//! `talu_config_get_view`, and `talu_config_free` with both valid and
-//! invalid inputs. No model file required.
+//! Exercises `talu_config_canonicalize`, `talu_config_get_view`, and
+//! `talu_config_free` with both valid and invalid inputs.
 
 use crate::capi::router::common;
 use std::ffi::{c_void, CString};
 use std::ptr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-// ---------------------------------------------------------------------------
-// talu_config_validate
-// ---------------------------------------------------------------------------
-
-#[test]
-fn validate_null_spec_returns_error() {
-    let rc = unsafe { talu_sys::talu_config_validate(ptr::null_mut()) };
-    assert_ne!(rc, 0, "validate with null spec should fail");
+fn create_temp_model_file() -> String {
+    let mut path = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("talu-test-model-{nanos}.gguf"));
+    std::fs::write(&path, b"ok").unwrap();
+    path.to_string_lossy().to_string()
 }
-
-#[test]
-fn validate_bad_abi_version_returns_error() {
-    let c_ref = CString::new("some-model").unwrap();
-    let mut spec = talu_sys::TaluModelSpec {
-        abi_version: 99,
-        struct_size: std::mem::size_of::<talu_sys::TaluModelSpec>() as u32,
-        ref_: c_ref.as_ptr(),
-        backend_type_raw: 0,
-        backend_config: unsafe { std::mem::zeroed() },
-    };
-    let rc = unsafe { talu_sys::talu_config_validate(&mut spec) };
-    assert_ne!(rc, 0, "abi_version=99 should be rejected");
-}
-
-#[test]
-fn validate_null_ref_returns_error() {
-    let mut spec = talu_sys::TaluModelSpec {
-        abi_version: 1,
-        struct_size: std::mem::size_of::<talu_sys::TaluModelSpec>() as u32,
-        ref_: ptr::null(),
-        backend_type_raw: 0,
-        backend_config: unsafe { std::mem::zeroed() },
-    };
-    let rc = unsafe { talu_sys::talu_config_validate(&mut spec) };
-    assert_ne!(rc, 0, "null ref should be rejected");
-}
-
-#[test]
-fn validate_empty_ref_returns_error() {
-    let c_ref = CString::new("").unwrap();
-    let mut spec = talu_sys::TaluModelSpec {
-        abi_version: 1,
-        struct_size: std::mem::size_of::<talu_sys::TaluModelSpec>() as u32,
-        ref_: c_ref.as_ptr(),
-        backend_type_raw: 0,
-        backend_config: unsafe { std::mem::zeroed() },
-    };
-    let rc = unsafe { talu_sys::talu_config_validate(&mut spec) };
-    assert_ne!(rc, 0, "empty ref should be rejected");
-}
-
-#[test]
-fn validate_bad_struct_size_returns_error() {
-    let c_ref = CString::new("some-model").unwrap();
-    let mut spec = talu_sys::TaluModelSpec {
-        abi_version: 1,
-        struct_size: 0,
-        ref_: c_ref.as_ptr(),
-        backend_type_raw: 0,
-        backend_config: unsafe { std::mem::zeroed() },
-    };
-    let rc = unsafe { talu_sys::talu_config_validate(&mut spec) };
-    assert_ne!(rc, 0, "struct_size=0 should be rejected");
-}
-
-// ---------------------------------------------------------------------------
-// talu_config_canonicalize
-// ---------------------------------------------------------------------------
 
 #[test]
 fn canonicalize_null_spec_returns_error() {
@@ -94,7 +36,7 @@ fn canonicalize_null_output_returns_error() {
         abi_version: 1,
         struct_size: std::mem::size_of::<talu_sys::TaluModelSpec>() as u32,
         ref_: c_ref.as_ptr(),
-        backend_type_raw: 1, // OpenAI (avoids file check)
+        backend_type_raw: 0,
         backend_config: unsafe { std::mem::zeroed() },
     };
     let rc = unsafe { talu_sys::talu_config_canonicalize(&mut spec, ptr::null_mut()) };
@@ -116,16 +58,17 @@ fn canonicalize_nonexistent_local_model_returns_error() {
 }
 
 #[test]
-fn canonicalize_valid_openai_spec_succeeds() {
-    let c_model = CString::new("gpt-4").unwrap();
-    let c_url = CString::new("https://api.openai.com/v1").unwrap();
-    let mut spec = common::make_openai_spec(&c_model, &c_url);
+fn canonicalize_valid_local_spec_succeeds() {
+    let model_path = create_temp_model_file();
+    let c_model = CString::new(model_path.clone()).unwrap();
+    let mut spec = common::make_local_spec(&c_model);
     let mut out: *mut c_void = ptr::null_mut();
     let rc =
         unsafe { talu_sys::talu_config_canonicalize(&mut spec, &mut out as *mut _ as *mut c_void) };
-    assert_eq!(rc, 0, "valid OpenAI spec should canonicalize successfully");
+    assert_eq!(rc, 0, "valid local spec should canonicalize successfully");
     assert!(!out.is_null(), "canonical handle should be non-null");
     unsafe { talu_sys::talu_config_free(out) };
+    let _ = std::fs::remove_file(model_path);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,9 +86,9 @@ fn config_free_null_is_noop() {
 
 #[test]
 fn config_get_view_roundtrips() {
-    let c_model = CString::new("gpt-4o").unwrap();
-    let c_url = CString::new("https://custom.api.example.com/v1").unwrap();
-    let mut spec = common::make_openai_spec(&c_model, &c_url);
+    let model_path = create_temp_model_file();
+    let c_model = CString::new(model_path.clone()).unwrap();
+    let mut spec = common::make_local_spec(&c_model);
 
     let canon = common::canonicalize(&mut spec);
 
@@ -158,10 +101,11 @@ fn config_get_view_roundtrips() {
     let ref_str = unsafe { std::ffi::CStr::from_ptr(view.ref_) }
         .to_string_lossy()
         .to_string();
-    assert_eq!(ref_str, "gpt-4o", "model ref should roundtrip");
+    assert_eq!(ref_str, model_path, "model ref should roundtrip");
 
-    // Backend type should be OpenAI (1)
-    assert_eq!(view.backend_type_raw, 1, "backend type should be OpenAI");
+    // Backend type should be Local (0)
+    assert_eq!(view.backend_type_raw, 0, "backend type should be Local");
 
     unsafe { talu_sys::talu_config_free(canon) };
+    let _ = std::fs::remove_file(model_path);
 }

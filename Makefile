@@ -1,4 +1,4 @@
-.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings-python ui
+.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build gen-bindings-python ui
 
 # Detect platform-specific settings
 UNAME_S := $(shell uname -s)
@@ -65,38 +65,10 @@ deps:
 		cp /tmp/sqlite-dl/sqlite-amalgamation-*/sqlite3.c \
 		   /tmp/sqlite-dl/sqlite-amalgamation-*/sqlite3.h deps/sqlite/ && \
 		rm -rf /tmp/sqlite-dl)
-	@test -d deps/file || git clone --branch FILE5_46 --depth 1 https://github.com/file/file.git deps/file
-	@test -d deps/jpeg-turbo || git clone --branch 3.1.3 --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo.git deps/jpeg-turbo
-	@test -d deps/spng || git clone --branch v0.7.4 --depth 1 https://github.com/randy408/libspng.git deps/spng
-	@test -d deps/webp || git clone --branch v1.6.0 --depth 1 https://github.com/webmproject/libwebp.git deps/webp
-	@test -f deps/file/src/magic.h || sed 's/X\.YY/5.46/' deps/file/src/magic.h.in > deps/file/src/magic.h
-	@test -f deps/file/magic.mgc || cp /usr/share/file/magic.mgc deps/file/magic.mgc
 	@test -f deps/cacert.pem || curl -sL https://curl.se/ca/cacert.pem -o deps/cacert.pem
 	@printf '%s\n%s\n' '//! Mozilla CA certificates - auto-generated, do not edit' 'pub const data = @embedFile("cacert.pem");' > deps/cacert.zig
-	@printf '%s\n%s\n' '//! Compiled magic database - auto-generated, do not edit' 'pub const data = @embedFile("file/magic.mgc");' > deps/magic_db.zig
-	@test -d deps/freetype || git clone --branch VER-2-13-3 --depth 1 https://github.com/freetype/freetype.git deps/freetype
-	@test -d deps/pdfium || (git init deps/pdfium && \
-		git -C deps/pdfium fetch --depth 1 https://pdfium.googlesource.com/pdfium 65f4269f6accf48306adb7fff10c07d72d56b1ea && \
-		git -C deps/pdfium checkout FETCH_HEAD)
-	@test -d deps/pdfium/third_party/fast_float/src || \
-		git clone --branch v8.2.3 --depth 1 https://github.com/fastfloat/fast_float.git deps/pdfium/third_party/fast_float/src
-	@# Tree-sitter core runtime + language grammars
-	@test -d deps/tree-sitter || git clone --branch v0.26.5 --depth 1 https://github.com/tree-sitter/tree-sitter.git deps/tree-sitter
-	@test -d deps/tree-sitter-python || git clone --branch v0.23.6 --depth 1 https://github.com/tree-sitter/tree-sitter-python.git deps/tree-sitter-python
-	@test -d deps/tree-sitter-javascript || git clone --branch v0.23.1 --depth 1 https://github.com/tree-sitter/tree-sitter-javascript.git deps/tree-sitter-javascript
-	@test -d deps/tree-sitter-typescript || git clone --branch v0.23.2 --depth 1 https://github.com/tree-sitter/tree-sitter-typescript.git deps/tree-sitter-typescript
-	@test -d deps/tree-sitter-rust || git clone --branch v0.23.2 --depth 1 https://github.com/tree-sitter/tree-sitter-rust.git deps/tree-sitter-rust
-	@test -d deps/tree-sitter-go || git clone --branch v0.23.4 --depth 1 https://github.com/tree-sitter/tree-sitter-go.git deps/tree-sitter-go
-	@test -d deps/tree-sitter-c || git clone --branch v0.23.5 --depth 1 https://github.com/tree-sitter/tree-sitter-c.git deps/tree-sitter-c
-	@test -d deps/tree-sitter-zig || git clone --branch v1.1.2 --depth 1 https://github.com/tree-sitter-grammars/tree-sitter-zig.git deps/tree-sitter-zig
-	@test -d deps/tree-sitter-json || git clone --branch v0.24.8 --depth 1 https://github.com/tree-sitter/tree-sitter-json.git deps/tree-sitter-json
-	@test -d deps/tree-sitter-html || git clone --branch v0.23.2 --depth 1 https://github.com/tree-sitter/tree-sitter-html.git deps/tree-sitter-html
-	@test -d deps/tree-sitter-css || git clone --branch v0.23.1 --depth 1 https://github.com/tree-sitter/tree-sitter-css.git deps/tree-sitter-css
-	@test -d deps/tree-sitter-bash || git clone --branch v0.23.3 --depth 1 https://github.com/tree-sitter/tree-sitter-bash.git deps/tree-sitter-bash
 	@test -f deps/mbedtls/build/library/libmbedtls.a || $(MAKE) mbedtls-build
 	@test -f deps/curl/build/lib/libcurl.a || $(MAKE) curl-build
-	@test -f deps/freetype/build/libfreetype.a || $(MAKE) freetype-build
-	@test -f deps/pdfium/cmake-build/libpdfium.a || $(MAKE) pdfium-build
 ifeq ($(UNAME_S),Darwin)
 	@{ test -f deps/mlx/lib/libmlx.a && test -f deps/mlx/lib/mlx.metallib; } || $(MAKE) mlx-build
 endif
@@ -249,80 +221,6 @@ else
 endif
 	@cd deps/curl/build && cmake --build . --config Release -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-freetype-build:
-	@echo "Building FreeType static library..."
-	@rm -rf deps/freetype/build
-	@mkdir -p deps/freetype/build
-ifeq ($(UNAME_S),Darwin)
-	@cd deps/freetype/build && cmake .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DFT_DISABLE_BZIP2=ON \
-		-DFT_DISABLE_BROTLI=ON \
-		-DFT_DISABLE_HARFBUZZ=ON \
-		-DFT_DISABLE_PNG=ON \
-		-DFT_DISABLE_ZLIB=ON
-else
-	@cd deps/freetype/build && \
-	CC="zig cc $(ZIG_CC_FLAGS)" cmake .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DFT_DISABLE_BZIP2=ON \
-		-DFT_DISABLE_BROTLI=ON \
-		-DFT_DISABLE_HARFBUZZ=ON \
-		-DFT_DISABLE_PNG=ON \
-		-DFT_DISABLE_ZLIB=ON
-endif
-	@cd deps/freetype/build && cmake --build . --config Release -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
-	@echo "FreeType installed to deps/freetype/build/"
-
-pdfium-build: freetype-build
-	@echo "Building PDFium static library..."
-	# Copy our CMake build and shim headers into PDFium source tree
-	@cp ports/pdfium/CMakeLists.txt deps/pdfium/
-	@mkdir -p deps/pdfium/build
-	@cp ports/pdfium/buildflag.h deps/pdfium/build/
-	@cp ports/pdfium/build_config.h deps/pdfium/build/
-	# Patch out abseil dependency (2 files)
-	@cd deps/pdfium && $(SED_INPLACE) \
-		-e 's|#include "third_party/abseil-cpp/absl/container/inlined_vector.h"|#include <vector>|' \
-		-e 's|absl::InlinedVector<float, 16, FxAllocAllocator<float>>|std::vector<float, FxAllocAllocator<float>>|' \
-		-e 's|absl::InlinedVector<uint32_t, 16, FxAllocAllocator<uint32_t>>|std::vector<uint32_t, FxAllocAllocator<uint32_t>>|' \
-		core/fpdfapi/page/cpdf_sampledfunc.cpp
-	@cd deps/pdfium && $(SED_INPLACE) \
-		-e 's|#include "third_party/abseil-cpp/absl/container/flat_hash_set.h"|#include <unordered_set>|' \
-		-e 's|absl::flat_hash_set|std::unordered_set|g' \
-		core/fpdfdoc/cpdf_nametree.cpp
-	# Build with zig cc/c++ for glibc 2.28 compatibility
-	@rm -rf deps/pdfium/cmake-build
-	@mkdir -p deps/pdfium/cmake-build
-ifeq ($(UNAME_S),Darwin)
-	@cd deps/pdfium/cmake-build && cmake .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DFREETYPE_INCLUDE_DIR=$(CURDIR)/deps/freetype/include \
-		-DFREETYPE_LIBRARY=$(CURDIR)/deps/freetype/build/libfreetype.a \
-		-DJPEG_INCLUDE_DIR="$(CURDIR)/deps/jpeg-turbo/src;$(CURDIR)/ports/pdfium/jpeg_compat" \
-		-DICU_INCLUDE_DIR=$(CURDIR)/ports/pdfium/icu_stubs \
-		-DZLIB_INCLUDE_DIR=$(CURDIR)/ports/pdfium/zlib_compat
-else
-	@cd deps/pdfium/cmake-build && \
-	CC="zig cc $(ZIG_CC_FLAGS)" CXX="zig c++ $(ZIG_CC_FLAGS)" cmake .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DFREETYPE_INCLUDE_DIR=$(CURDIR)/deps/freetype/include \
-		-DFREETYPE_LIBRARY=$(CURDIR)/deps/freetype/build/libfreetype.a \
-		-DJPEG_INCLUDE_DIR="$(CURDIR)/deps/jpeg-turbo/src;$(CURDIR)/ports/pdfium/jpeg_compat" \
-		-DICU_INCLUDE_DIR=$(CURDIR)/ports/pdfium/icu_stubs \
-		-DZLIB_INCLUDE_DIR=$(CURDIR)/ports/pdfium/zlib_compat
-endif
-	@cd deps/pdfium/cmake-build && cmake --build . --config Release -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
-	@echo "PDFium installed to deps/pdfium/cmake-build/"
-
 build: deps sync-version ui
 	zig build release $(ZIG_BUILD_FLAGS)
 
@@ -360,15 +258,6 @@ test: deps
 
 docs:
 	cd docs && uv run python scripts/build.py
-
-ui:
-	@if [ -f ui/dist/index.html ]; then \
-		echo "Using pre-built UI assets"; \
-	elif command -v bun >/dev/null 2>&1; then \
-		cd ui && bun install && bun run build; \
-	else \
-		echo "Error: bun is required to build UI. Install from https://bun.sh" >&2; exit 1; \
-	fi
 
 clean:
 	rm -rf zig-out .zig-cache .zig-cache-global

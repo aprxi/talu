@@ -2,7 +2,6 @@
 
 pub const ast = @import("ast.zig");
 pub const schema = @import("schema.zig");
-pub const gbnf = @import("gbnf.zig");
 pub const engine = @import("engine.zig");
 pub const mask = @import("mask.zig");
 pub const sampler = @import("sampler.zig");

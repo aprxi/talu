@@ -1876,7 +1876,7 @@ fn record_reference_bundle(
             max_tokens,
         )?;
         let verify_cap = VerifyCaptureHandle::new_recording(&recorder)?;
-        let backend = create_backend_for_model(&resolved_model, None)?;
+        let backend = create_backend_for_model(&resolved_model)?;
         let mut cfg = cfg;
         let chat = if overrides.is_some_and(|o| o.contract.use_raw_prompt) {
             cfg.template_override = Some("{{ messages[-1].content }}".to_string());
@@ -2036,7 +2036,7 @@ fn run_verify_pass(
     // state between logically independent inferences and can create false
     // phase-2 divergences or crashes.
     let resolved_model = resolve_xray_model(model)?;
-    let backend = create_backend_for_model(&resolved_model, None)?;
+    let backend = create_backend_for_model(&resolved_model)?;
     let pass_outcome = run_verify_pass_with_backend(
         &resolved_model,
         &backend,
@@ -2462,7 +2462,7 @@ fn run_phase2_only_in_current_process(
     );
 
     let resolved_model = resolve_xray_model(model)?;
-    let backend = create_backend_for_model(&resolved_model, None)?;
+    let backend = create_backend_for_model(&resolved_model)?;
     let (diverged, msg, _) = match run_verify_pass_with_backend(
         &resolved_model,
         &backend,
@@ -6044,14 +6044,74 @@ mod tests {
         )
         .expect("write target");
 
-        let result = compare_full_token_transcripts("Qwen/Qwen3.5-0.8B-TQ4", &source, &target, 2)
-            .expect("compare should succeed");
+        // Keep this test fully offline/non-interactive: provide pre-rendered
+        // visible transcripts so compare_full_token_transcripts never touches
+        // model resolution/tokenizer decode paths.
+        std::fs::write(reference_visible_text_path(&source), "cpu-output")
+            .expect("write source visible transcript");
+        std::fs::write(reference_visible_text_path(&target), "metal-output")
+            .expect("write target visible transcript");
+
+        let result =
+            compare_full_token_transcripts("unused-model", &source, &target, 2)
+                .expect("compare should succeed");
         assert!(!result.passed);
         assert!(result.report.contains("----- BEGIN cpu -----"));
         assert!(result.report.contains("----- END cpu -----"));
         assert!(result.report.contains("----- BEGIN metal -----"));
         assert!(result.report.contains("----- END metal -----"));
         assert!(result.report.contains("token=2 -> FAILED"));
+        assert!(result.report.contains("cpu-output"));
+        assert!(result.report.contains("metal-output"));
+    }
+
+    #[test]
+    fn compare_full_token_transcripts_without_visible_sidecars_uses_decode_fallback_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("source.json");
+        let target = dir.path().join("target.json");
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": { "model_name": "test", "seed": 42, "temperature": 0.0, "max_tokens": 3 },
+                "tokens": [20740, 466],
+                "stats": []
+            }))
+            .expect("json"),
+        )
+        .expect("write source");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": { "model_name": "test", "seed": 42, "temperature": 0.0, "max_tokens": 3 },
+                "tokens": [20740, 1576],
+                "stats": []
+            }))
+            .expect("json"),
+        )
+        .expect("write target");
+
+        // No *.visible.txt sidecars are written, so this exercises the decode
+        // fallback path. Under cfg(test) this must remain non-interactive.
+        let result =
+            compare_full_token_transcripts("unused-model", &source, &target, 2)
+                .expect("compare should succeed");
+        assert!(!result.passed);
+        assert!(result.report.contains("token=2 -> FAILED"));
+        assert!(
+            result
+                .report
+                .contains("<failed to decode cpu transcript>"),
+            "{}",
+            result.report
+        );
+        assert!(
+            result
+                .report
+                .contains("<failed to decode metal transcript>"),
+            "{}",
+            result.report
+        );
     }
 
     #[test]
@@ -6373,7 +6433,7 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
     } else {
         XrayCaptureHandle::new_timing()?
     };
-    let backend = create_backend_for_model(&resolved_model, None)?;
+    let backend = create_backend_for_model(&resolved_model)?;
     capture.enable();
     // Drop backend init / warmup emissions so xray reflects route execution only.
     capture.clear();

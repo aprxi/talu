@@ -158,12 +158,6 @@ pub const DType = enum(u8) {
     }
 };
 
-/// Convert compute DType (from dtype.zig) to trace DType.
-/// Since both enums have matching u8 values, we can cast directly.
-pub fn convertDType(compute_dtype: @import("dtype_pkg").DType) DType {
-    return @enumFromInt(@intFromEnum(compute_dtype));
-}
-
 /// Compute backend type.
 pub const Backend = enum(u8) {
     cpu = 0,
@@ -341,11 +335,6 @@ pub fn setBackendContext(backend: Backend) Backend {
     const prev = backend_context;
     backend_context = backend;
     return prev;
-}
-
-/// Get backend context for this thread.
-pub fn getBackendContext() Backend {
-    return backend_context;
 }
 
 /// Check if tracing is enabled (for conditional expensive operations).

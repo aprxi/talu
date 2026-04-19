@@ -1346,10 +1346,6 @@ fn bpe_decode_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids
     return bpe_decode_with_options_impl(model, tok, ids, ids_len, out, out_len, .{});
 }
 
-fn bpe_decode(tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-    return bpe_decode_with_options(tok, ids, ids_len, out, out_len, .{});
-}
-
 fn bpe_destroy_impl(model: *BpeModel, tok: *ct.Tokenizer) void {
     tok.model = null;
 
@@ -1374,13 +1370,6 @@ fn bpe_destroy_impl(model: *BpeModel, tok: *ct.Tokenizer) void {
         model.allocator.free(@constCast(model.json_buffer));
     }
     model.allocator.destroy(model);
-}
-
-/// C API vtable adapter: extracts model from tokenizer and calls impl
-fn bpe_destroy(tok: *ct.Tokenizer) void {
-    if (tok.model == null) return;
-    const model = @as(*BpeModel, @ptrCast(@alignCast(tok.model.?)));
-    bpe_destroy_impl(model, tok);
 }
 
 /// Create a BPE tokenizer from a JSON buffer.

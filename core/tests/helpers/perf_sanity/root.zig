@@ -11,8 +11,6 @@
 //!   TALU_PERF_CPU_MIN_TOKENS_PER_SEC=<float>   optional minimum threshold
 //!   TALU_PERF_CPU_ITERS=<usize>                optional iteration count (default: 2048)
 //!   TALU_LIFECYCLE_CYCLES=<usize>              optional cycle count (default: 128)
-//!   TALU_PERF_VECTOR_MIN_RECALL=<float>        optional minimum IVF recall@k threshold
-//!   TALU_PERF_VECTOR_MAX_SLOWDOWN=<float>      optional max IVF/Flat elapsed ratio
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,7 +20,6 @@ const rowwise = root_main.compute.cpu.rowwise;
 const softmax = root_main.compute.cpu.softmax;
 const metal = root_main.compute.metal;
 const runtime = root_main.inference.backend.cpu.executor.runtime;
-const vector_bench = root_main.db.vector.bench;
 
 fn envUsize(allocator: std.mem.Allocator, name: []const u8, default_value: usize) usize {
     const raw = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
@@ -185,68 +182,6 @@ fn runLifecycle(writer: anytype, allocator: std.mem.Allocator) !void {
     try writer.print("LIFECYCLE_CHECK name=cpu_scratch status=pass cycles={}\n", .{cycles});
 }
 
-fn runDbVectorBench(writer: anytype, allocator: std.mem.Allocator) !void {
-    const rows = envUsize(allocator, "TALU_PERF_VECTOR_ROWS", 4096);
-    const dims = envUsize(allocator, "TALU_PERF_VECTOR_DIMS", 128);
-    const queries = envUsize(allocator, "TALU_PERF_VECTOR_QUERIES", 8);
-    const k = envUsize(allocator, "TALU_PERF_VECTOR_TOPK", 10);
-    const min_recall = envF64(allocator, "TALU_PERF_VECTOR_MIN_RECALL");
-    const max_slowdown = envF64(allocator, "TALU_PERF_VECTOR_MAX_SLOWDOWN");
-
-    const recall = try vector_bench.benchmarkIvfRecall(
-        allocator,
-        rows,
-        @intCast(dims),
-        @intCast(queries),
-        @intCast(k),
-    );
-
-    try writer.print(
-        "PERF_CHECK name=db_vector_flat elapsed_ns={} rows={} queries={} status=pass\n",
-        .{ recall.flat_elapsed_ns, recall.rows_scanned, recall.queries },
-    );
-    try writer.print(
-        "PERF_CHECK name=db_vector_ivf elapsed_ns={} rows={} queries={} status=pass\n",
-        .{ recall.ivf_elapsed_ns, recall.rows_scanned, recall.queries },
-    );
-
-    const recall_status: []const u8 = if (min_recall) |threshold|
-        if (@as(f64, recall.recall_at_k) >= threshold) "pass" else "fail"
-    else
-        "pass";
-    var recall_threshold_buf: [64]u8 = undefined;
-    const recall_threshold_str: []const u8 = if (min_recall) |threshold|
-        try std.fmt.bufPrint(&recall_threshold_buf, "{d:.3}", .{threshold})
-    else
-        "none";
-    try writer.print(
-        "PERF_CHECK name=db_vector_ivf_recall recall_at_k={d:.6} threshold={s} status={s}\n",
-        .{ recall.recall_at_k, recall_threshold_str, recall_status },
-    );
-
-    const slowdown = if (recall.flat_elapsed_ns == 0)
-        0.0
-    else
-        @as(f64, @floatFromInt(recall.ivf_elapsed_ns)) / @as(f64, @floatFromInt(recall.flat_elapsed_ns));
-    const slowdown_status: []const u8 = if (max_slowdown) |threshold|
-        if (slowdown <= threshold) "pass" else "fail"
-    else
-        "pass";
-    var slowdown_threshold_buf: [64]u8 = undefined;
-    const slowdown_threshold_str: []const u8 = if (max_slowdown) |threshold|
-        try std.fmt.bufPrint(&slowdown_threshold_buf, "{d:.3}", .{threshold})
-    else
-        "none";
-    try writer.print(
-        "PERF_CHECK name=db_vector_ivf_slowdown ratio={d:.6} threshold={s} status={s}\n",
-        .{ slowdown, slowdown_threshold_str, slowdown_status },
-    );
-
-    if (std.mem.eql(u8, recall_status, "fail") or std.mem.eql(u8, slowdown_status, "fail")) {
-        return error.PerfRegression;
-    }
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -264,7 +199,6 @@ pub fn main() !void {
         try runCpu(stdout, allocator);
         try runMetal(stdout, allocator);
         try runLifecycle(stdout, allocator);
-        try runDbVectorBench(stdout, allocator);
         return;
     }
 
@@ -280,11 +214,6 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, args[1], "metal")) {
         try runMetal(stdout, allocator);
-        return;
-    }
-
-    if (std.mem.eql(u8, args[1], "db-vector")) {
-        try runDbVectorBench(stdout, allocator);
         return;
     }
 
@@ -305,12 +234,4 @@ test "benchmarkMetalDecodeProxy returns optional throughput" {
 
 test "checkCpuScratchLifecycle does not leak" {
     try checkCpuScratchLifecycle(8);
-}
-
-test "runDbVectorBench emits benchmark rows" {
-    var list = std.ArrayList(u8).empty;
-    defer list.deinit(std.testing.allocator);
-    try runDbVectorBench(list.writer(std.testing.allocator), std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, list.items, "db_vector_flat") != null);
-    try std.testing.expect(std.mem.indexOf(u8, list.items, "db_vector_ivf") != null);
 }

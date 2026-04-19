@@ -56,32 +56,3 @@ pub const Opcode = enum(u8) {
     // Reserved 128..255 for backend-local/experimental opcodes
     _,
 };
-
-pub fn isVision(opcode: Opcode) bool {
-    return switch (opcode) {
-        .vision_patch_embed, .vision_spatial_merge, .vision_deepstack_extract, .vision_scatter => true,
-        else => false,
-    };
-}
-
-pub fn isMacro(opcode: Opcode) bool {
-    return switch (opcode) {
-        .rmsnorm,
-        .multihead_attention,
-        .swiglu,
-        .moe,
-        .mamba_mixer,
-        .gated_delta_net,
-        .per_layer_branch,
-        .shortconv,
-        .mla_attention,
-        .embedding,
-        .residual_add,
-        => true,
-        else => false,
-    };
-}
-
-pub fn isPrimitive(opcode: Opcode) bool {
-    return !isMacro(opcode) and !isVision(opcode);
-}

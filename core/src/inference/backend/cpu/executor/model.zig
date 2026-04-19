@@ -305,17 +305,6 @@ fn tensorScalarToF32(tensor_value: *const Tensor) !f32 {
     };
 }
 
-fn loadTensorAny(
-    safetensors: *st_loader.UnifiedSafeTensors,
-    names: []const []const u8,
-) !Tensor {
-    for (names) |name| {
-        const maybe = safetensors.getTensor(name, null) catch null;
-        if (maybe) |tensor_value| return tensor_value;
-    }
-    return error.MissingWeight;
-}
-
 fn loadOrientedWeightAny(
     tensor_allocator: std.mem.Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,

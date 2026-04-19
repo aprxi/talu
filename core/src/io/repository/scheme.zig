@@ -2,7 +2,7 @@
 //!
 //! Parses URIs to determine WHERE a repository-based model is stored.
 //! This is called by resolveModelPath() after the Router has determined
-//! the model is repository-based (not an external API).
+//! the model is repository-based (not an unsupported namespace target).
 //!
 //! ## Scope
 //!
@@ -10,8 +10,8 @@
 //!   - Local filesystem paths
 //!   - Bare model IDs (e.g., `org/model-name`) - default to HuggingFace Hub
 //!
-//! External API prefixes (`openai:`, `anthropic:`, `bedrock:`) are handled
-//! by the C API layer (capi/router.zig) BEFORE reaching this module.
+//! Unsupported namespace targets (`foo::model`) are rejected by router parsing
+//! before reaching this module.
 //!
 //! ## Supported Schemes
 //!
@@ -108,11 +108,6 @@ fn isDirectory(path: []const u8) bool {
     return stat.kind == .directory;
 }
 
-/// Check if a URI refers to a remote source (may require network).
-pub fn isRemote(uri: Uri) bool {
-    return uri.scheme == .hub;
-}
-
 /// Check if a URI refers to a local source (no network needed).
 pub fn isLocal(uri: Uri) bool {
     return uri.scheme == .local;
@@ -170,11 +165,6 @@ test "parse unknown scheme returns error" {
     try std.testing.expectError(ParseError.UnknownScheme, parse("s3://bucket/path"));
     try std.testing.expectError(ParseError.UnknownScheme, parse("xyz://something"));
     try std.testing.expectError(ParseError.UnknownScheme, parse("http://example.com"));
-}
-
-test "isRemote" {
-    try std.testing.expect(isRemote(.{ .scheme = .hub, .path = "x" }));
-    try std.testing.expect(!isRemote(.{ .scheme = .local, .path = "x" }));
 }
 
 test "isLocal" {

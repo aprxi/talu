@@ -2155,23 +2155,6 @@ fn shouldPreserveWeightByLayerList(weight_name: []const u8, preserved_layers: []
     return false;
 }
 
-fn subtractLayerLists(allocator: std.mem.Allocator, lhs: []const u32, rhs: []const u32) ![]u32 {
-    if (lhs.len == 0) return allocator.alloc(u32, 0);
-    var out = std.ArrayListUnmanaged(u32){};
-    errdefer out.deinit(allocator);
-    for (lhs) |layer| {
-        var found = false;
-        for (rhs) |excluded| {
-            if (layer == excluded) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) try out.append(allocator, layer);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
 fn shouldUseAdvancedSearchForTensor(
     profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
     update_round: u32,
@@ -2934,10 +2917,6 @@ fn packedShapeForWeight(weight: tensor.Tensor) !Nvfp4PackedShape {
         };
     }
     return error.InvalidShape;
-}
-
-fn shouldExcludeWeightByProfile(weight_name: []const u8, profile: @TypeOf((grouped_affine.ConvertOptions{}).profile)) bool {
-    return shouldExcludeWeightByLmHead(weight_name, resolveNvfp4LmHeadQuantized(profile, false));
 }
 
 fn shouldExcludeWeightByLmHead(weight_name: []const u8, lm_head_quantized: bool) bool {
@@ -4637,50 +4616,6 @@ fn formatNvfp4WeightProgressMessage(
         ),
     } catch std.fmt.bufPrintZ(out_buf, "{s}", .{tensor_name[0..name_len]}) catch unreachable;
     return rendered.ptr;
-}
-
-fn printNvfp4QualitySummary(summary: Nvfp4QualitySummary) void {
-    if (summary.tensors == 0) return;
-    const global_pct = summary.globalImprovementPct();
-    const mean_pct = summary.meanImprovementPct();
-    const mean_kl = summary.meanKlDivergence();
-    const min_pct = if (std.math.isFinite(summary.min_improvement_pct)) summary.min_improvement_pct else 0.0;
-    const max_pct = if (std.math.isFinite(summary.max_improvement_pct)) summary.max_improvement_pct else 0.0;
-    const min_kl = if (std.math.isFinite(summary.min_kl_divergence)) summary.min_kl_divergence else 0.0;
-    const max_kl = if (std.math.isFinite(summary.max_kl_divergence)) summary.max_kl_divergence else 0.0;
-    const global_sign = if (global_pct >= 0.0) "+" else "";
-    const mean_sign = if (mean_pct >= 0.0) "+" else "";
-    const min_sign = if (min_pct >= 0.0) "+" else "";
-    const max_sign = if (max_pct >= 0.0) "+" else "";
-    std.debug.print(
-        "NVFP4 quality summary: mode={s} tensors={d} global={s}{d:.2}% mean={s}{d:.2}% min={s}{d:.2}% max={s}{d:.2}% kl_mean={e} kl_min={e} kl_max={e} regressions={d} act={d}/{d} metrics(scale={d},proxy={d},forward={d},hybrid={d})\n",
-        .{
-            nvfp4ProfileName(summary.profile),
-            summary.tensors,
-            global_sign,
-            global_pct,
-            mean_sign,
-            mean_pct,
-            min_sign,
-            min_pct,
-            max_sign,
-            max_pct,
-            mean_kl,
-            min_kl,
-            max_kl,
-            summary.regressions,
-            summary.activation_tensors,
-            summary.tensors,
-            summary.metric_scale,
-            summary.metric_proxy,
-            summary.metric_forward,
-            summary.metric_hybrid,
-        },
-    );
-    std.debug.print(
-        "NVFP4 quality note: percentages are internal reconstruction improvement (lower metric is better), and KL is sampled scaled-domain histogram KL(P||Q) with Laplace smoothing; neither is benchmark eval score.\n",
-        .{},
-    );
 }
 
 fn computeNvfp4ProgressTotalQualityWeight(

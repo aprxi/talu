@@ -1,22 +1,11 @@
 //! Source Abstraction for Model Repositories
 //!
-//! Provides a unified interface for checking model existence and listing files
-//! from HuggingFace Hub.
+//! Provides a unified interface for listing files from HuggingFace Hub.
 //!
 //! ## Design
 //!
 //! The Source abstraction separates "where to fetch from" from "how to cache".
 //! All sources share the same local HF-style cache (~/.cache/huggingface/hub/).
-//!
-//! ```
-//! User: repo.exists("org/model-name")
-//!          ↓
-//!       1. Check local cache (cache.isCached)
-//!          ↓ (miss)
-//!       2. Check source (Source.exists)
-//!          ↓
-//!       HuggingFace API
-//! ```
 //!
 //! ## S3-Compatible Endpoints
 //!
@@ -25,7 +14,6 @@
 //!
 
 const std = @import("std");
-const http = @import("../transport/http.zig");
 const hf = @import("../transport/hf.zig");
 
 /// Errors that can occur during source operations.
@@ -58,43 +46,6 @@ pub const SourceConfig = struct {
 ///
 /// Checks model existence and lists files via the HuggingFace API.
 pub const HuggingFaceSource = struct {
-    const DEFAULT_HF_ENDPOINT = "https://huggingface.co";
-
-    /// Get effective endpoint URL (config > env > default)
-    fn getEffectiveEndpoint(config_endpoint: ?[]const u8) []const u8 {
-        if (config_endpoint) |endpoint| return endpoint;
-        if (std.posix.getenv("HF_ENDPOINT")) |env_endpoint| {
-            return std.mem.sliceTo(env_endpoint, 0);
-        }
-        return DEFAULT_HF_ENDPOINT;
-    }
-
-    /// Check if a model exists on HuggingFace Hub.
-    ///
-    /// Makes an HTTP request to the HF API. Returns true if the model
-    /// exists and is accessible (considering auth token if provided).
-    pub fn exists(allocator: std.mem.Allocator, model_id: []const u8, config: SourceConfig) SourceError!bool {
-        const base_url = getEffectiveEndpoint(config.endpoint_url);
-        const api_url = std.fmt.allocPrint(allocator, "{s}/api/models/{s}", .{ base_url, model_id }) catch {
-            return SourceError.OutOfMemory;
-        };
-        defer allocator.free(api_url);
-
-        // Attempt to fetch model info - if successful, model exists
-        const response = http.fetch(allocator, api_url, .{ .token = config.token }) catch |err| {
-            return switch (err) {
-                error.NotFound => false,
-                error.Unauthorized => SourceError.Unauthorized,
-                error.RateLimited => SourceError.RateLimited,
-                error.ResponseTooLarge => SourceError.NetworkError,
-                error.OutOfMemory => SourceError.OutOfMemory,
-                else => SourceError.NetworkError,
-            };
-        };
-        allocator.free(response);
-        return true;
-    }
-
     /// List files in a model repository on HuggingFace Hub.
     ///
     /// Returns an owned slice of owned strings. Caller must free both
@@ -126,7 +77,7 @@ pub const HuggingFaceSource = struct {
 /// Example:
 /// ```zig
 /// const src = ModelSource.default;  // HuggingFace Hub
-/// const exists = try src.exists(allocator, "org/model-name", .{});
+/// const files = try src.listFiles(allocator, "org/model-name", .{});
 /// ```
 pub const ModelSource = union(enum) {
     /// HuggingFace Hub (default)
@@ -134,16 +85,6 @@ pub const ModelSource = union(enum) {
 
     /// Default source: HuggingFace Hub
     pub const default: ModelSource = .{ .huggingface = {} };
-
-    /// Check if a model exists on this source.
-    ///
-    /// This is a network operation - it queries the remote source.
-    /// For cache-only checks, use cache.isCached() directly.
-    pub fn exists(self: ModelSource, allocator: std.mem.Allocator, model_id: []const u8, config: SourceConfig) SourceError!bool {
-        return switch (self) {
-            .huggingface => HuggingFaceSource.exists(allocator, model_id, config),
-        };
-    }
 
     /// List files in a model on this source.
     ///

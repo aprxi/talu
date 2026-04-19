@@ -232,25 +232,6 @@ inline fn mix64(v: u64) u64 {
     return z ^ (z >> 31);
 }
 
-pub fn sampleLayerActivations(
-    allocator: std.mem.Allocator,
-    cache: *const LayerActivationCache,
-    layer: u32,
-    cols: usize,
-    sample_count: usize,
-    seed: u64,
-) !?SampledActivations {
-    return sampleLayerActivationsForRole(
-        allocator,
-        cache,
-        layer,
-        cols,
-        sample_count,
-        seed,
-        .generic,
-    );
-}
-
 // noinline: called from buildNvfp4InputSecondMoments (noinline); inlining a for loop
 // over sampleLayerActivationsForPoint (which itself inlines 37 lines) into that function
 // would create excessive phi node complexity triggering the AArch64 RegisterCoalescer crash.

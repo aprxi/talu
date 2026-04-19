@@ -332,42 +332,27 @@ fn responses_rejects_invalid_tool_choice_object_shapes() {
         missing_type_resp.body
     );
 
-    let allowed_tools_empty = serde_json::json!({
+    let unsupported_choice_type = serde_json::json!({
         "input": "hello",
         "tool_choice": {
-            "type": "allowed_tools",
-            "tools": [],
-            "mode": "auto"
+            "type": "allowed_tools"
         }
     });
-    let allowed_tools_empty_resp = post_json(ctx.addr(), "/v1/responses", &allowed_tools_empty);
+    let unsupported_choice_type_resp =
+        post_json(ctx.addr(), "/v1/responses", &unsupported_choice_type);
     assert_eq!(
-        allowed_tools_empty_resp.status, 400,
+        unsupported_choice_type_resp.status, 400,
         "body: {}",
-        allowed_tools_empty_resp.body
-    );
-
-    let allowed_tools_bad_mode = serde_json::json!({
-        "input": "hello",
-        "tool_choice": {
-            "type": "allowed_tools",
-            "tools": [{ "type": "function", "name": "lookup" }],
-            "mode": "sometimes"
-        }
-    });
-    let allowed_tools_bad_mode_resp =
-        post_json(ctx.addr(), "/v1/responses", &allowed_tools_bad_mode);
-    assert_eq!(
-        allowed_tools_bad_mode_resp.status, 400,
-        "body: {}",
-        allowed_tools_bad_mode_resp.body
+        unsupported_choice_type_resp.body
     );
 }
 
 #[test]
-fn responses_accepts_valid_allowed_tools_tool_choice_shape() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
+fn responses_rejects_allowed_tools_tool_choice_shape() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
+        "model": &model,
         "input": "hello",
         "tool_choice": {
             "type": "allowed_tools",
@@ -378,13 +363,15 @@ fn responses_accepts_valid_allowed_tools_tool_choice_shape() {
         }
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_shape_is_accepted(&resp);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
 }
 
 #[test]
-fn responses_accepts_engine_spec_fields_shape() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
+fn responses_rejects_provider_orchestration_request_fields() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
+        "model": &model,
         "input": "hello",
         "parallel_tool_calls": true,
         "background": true,
@@ -392,7 +379,7 @@ fn responses_accepts_engine_spec_fields_shape() {
         "prompt_cache_key": "cache-key-1"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_shape_is_accepted(&resp);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
 }
 
 #[test]
@@ -487,7 +474,7 @@ fn responses_rejects_invalid_itemparam_in_input_array() {
 }
 
 #[test]
-fn responses_store_false_still_allows_previous_response_id_chaining_in_process() {
+fn responses_allows_previous_response_id_chaining_in_process() {
     let model = require_model!();
     let mut cfg = model_config();
     cfg.model = Some(model.clone());
@@ -497,7 +484,6 @@ fn responses_store_false_still_allows_previous_response_id_chaining_in_process()
         "model": model,
         "input": "hello",
         "max_output_tokens": 16,
-        "store": false,
         "tools": [{
             "type": "function",
             "name": "lookup",
@@ -514,7 +500,6 @@ fn responses_store_false_still_allows_previous_response_id_chaining_in_process()
         "model": model,
         "input": "follow-up",
         "max_output_tokens": 16,
-        "store": false,
         "previous_response_id": prev_id
     });
     let second_resp = post_json(ctx.addr(), "/v1/responses", &second);
@@ -523,12 +508,12 @@ fn responses_store_false_still_allows_previous_response_id_chaining_in_process()
     assert_eq!(
         second_json["tools"].as_array().map(|v| v.len()),
         Some(1),
-        "same-process chaining should resolve previous_response_id even when store=false"
+        "same-process chaining should resolve previous_response_id"
     );
 }
 
 #[test]
-fn responses_store_flag_round_trips_when_model_is_available() {
+fn responses_store_field_is_output_only_when_model_is_available() {
     let model = require_model!();
     let mut cfg = model_config();
     cfg.model = Some(model.clone());
@@ -536,13 +521,12 @@ fn responses_store_flag_round_trips_when_model_is_available() {
     let body = serde_json::json!({
         "model": model,
         "input": "hello",
-        "max_output_tokens": 16,
-        "store": true
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(json["store"].as_bool(), Some(true));
+    assert_eq!(json["store"].as_bool(), Some(false));
 }
 
 #[test]
@@ -570,13 +554,9 @@ fn responses_instructions_round_trip_when_model_is_available() {
 #[test]
 fn responses_cross_tenant_previous_response_id_does_not_inherit_tools() {
     let model = require_model!();
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let bucket = temp.path().join("bucket");
-    std::fs::create_dir_all(&bucket).expect("create bucket");
 
     let mut config = ServerConfig::new();
     config.model = Some(model.clone());
-    config.bucket = Some(bucket);
     config.gateway_secret = Some("secret".to_string());
     config.tenants = vec![
         TenantSpec {

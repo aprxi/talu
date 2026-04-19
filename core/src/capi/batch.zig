@@ -15,7 +15,6 @@ const local_mod = @import("../router/local.zig");
 const capi_bridge = @import("../router/capi_bridge.zig");
 const router_capi = @import("router.zig");
 const capi_error = @import("error.zig");
-const error_codes = @import("error_codes.zig");
 const responses_capi = @import("responses.zig");
 const responses_mod = @import("../responses/root.zig");
 

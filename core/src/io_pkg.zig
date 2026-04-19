@@ -1,7 +1,6 @@
 //! Package root for named `io_pkg` imports.
 
 pub const transport = @import("io/transport/root.zig");
-pub const plugins = @import("io/plugins/root.zig");
 pub const safetensors = struct {
     pub const root = @import("io/safetensors/root.zig");
     pub const reader = @import("io/safetensors/reader.zig");
@@ -16,4 +15,3 @@ pub const repository = struct {
 };
 pub const json_helpers = @import("io/json_helpers.zig");
 pub const json = @import("io/json/root.zig");
-pub const kvbuf = @import("io/kvbuf/root.zig");

@@ -23,7 +23,7 @@
             <ul>
               <li><a href="#quickstart">Quickstart</a></li>
               <li><a href="#working-with-models">Working with models</a></li>
-              <li><a href="#profiles">Profiles</a></li>
+              <li><a href="#profiles">Default Model</a></li>
               <li><a href="#conversations">Conversations</a></li>
               <li><a href="#quantization">Quantization</a></li>
               <li><a href="#tokenization">Tokenization</a></li>
@@ -96,11 +96,9 @@
       </div>
 
       <!-- ─────────────────────────────────────────────── -->
-      <h3 id="profiles">Profiles</h3>
+      <h3 id="profiles">Default Model</h3>
 
-      <p>A profile stores a default model, conversation history, and other settings in <code>~/.talu/</code>, persisted across terminal sessions. By default, talu uses a profile named <code>default</code>. The active profile can be changed with the <code>TALU_PROFILE</code> environment variable, which makes it straightforward to maintain separate configurations for different projects or use cases.</p>
-
-      <p><code>talu set</code> assigns a default model to the current profile, which means <code>-m</code> no longer needs to be passed on every command.</p>
+      <p><code>talu set</code> assigns a default model so <code>-m</code> no longer needs to be passed on every command.</p>
 
       <div class="code-block">
         <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu set LiquidAI/LFM2-350M</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
@@ -118,17 +116,17 @@
         <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">echo "Summarize this" | talu</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
       </div>
 
-      <p>The <code>-m</code> flag overrides the default for a single command without changing the profile. <code>talu set show</code> displays the current profile configuration, and <code>talu set</code> without arguments opens an interactive picker that lists all cached models.</p>
+      <p>The <code>-m</code> flag overrides the default for a single command without changing it. <code>talu set show</code> displays the current default configuration, and <code>talu set</code> without arguments opens an interactive picker that lists cached models.</p>
 
       <!-- ─────────────────────────────────────────────── -->
       <h3 id="conversations">Conversations</h3>
 
-      <p>By default, each call to <code>talu ask</code> creates a new conversation. Conversations are persisted automatically — the full transcript is stored, so it can be reviewed, continued with follow-up prompts, or resumed at a later time.</p>
+      <p>Conversation persistence is handled through <code>TALU_DB_HOST</code> (Talupi chat API). Without <code>TALU_DB_HOST</code>, <code>talu ask</code> runs inference without external chat persistence.</p>
 
-      <p><code>talu ask</code> without a prompt lists all stored conversations, showing their session IDs and first messages.</p>
+      <p>Create an empty persisted session.</p>
 
       <div class="code-block">
-        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">TALU_DB_HOST=localhost:7258 talu ask --new</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
       </div>
 
       <p>Passing a session ID with <code>--session</code> displays the full transcript of that conversation.</p>
@@ -147,12 +145,6 @@
 
       <div class="code-block">
         <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --session &lt;session_id&gt; --delete</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
-      </div>
-
-      <p><code>--no-bucket</code> creates an ephemeral conversation that is not persisted. This is useful for one-off questions where saving the transcript is unnecessary.</p>
-
-      <div class="code-block">
-        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --no-bucket "Quick check — what year was Python released?"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
       </div>
 
       <!-- ─────────────────────────────────────────────── -->
@@ -224,7 +216,7 @@
         <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">CONVERTED_URI=$(talu convert --model-uri "$MODEL_URI")</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
       </div>
 
-      <p>And with <code>talu set</code>, it confirms the URI that was actually assigned to the profile.</p>
+      <p>And with <code>talu set</code>, it confirms the URI that was actually assigned as the default model.</p>
 
       <div class="code-block">
         <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">SET_URI=$(talu set --model-uri "$CONVERTED_URI")</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
@@ -284,8 +276,7 @@
         <tr><td>TOP_K</td><td>Top-k sampling limit</td><td><code>40</code></td></tr>
         <tr><td>TOP_P</td><td>Nucleus sampling cutoff (0.0 to 1.0)</td><td><code>0.95</code></td></tr>
         <tr><td>SEED</td><td>Deterministic seed</td><td><code>42</code></td></tr>
-        <tr><td>TALU_PROFILE</td><td>Active profile name</td><td><code>default</code></td></tr>
-        <tr><td>TALU_BUCKET</td><td>Storage bucket path override</td><td><code>/path/to/db</code></td></tr>
+        <tr><td>TALU_DB_HOST</td><td>Talupi chat persistence host</td><td><code>localhost:7258</code></td></tr>
         <tr><td>HF_TOKEN</td><td>Auth token for private HuggingFace models</td><td><code>hf_xxx...</code></td></tr>
         <tr><td>HF_ENDPOINT</td><td>HuggingFace endpoint override</td><td><code>https://huggingface.co</code></td></tr>
       </table>
@@ -315,9 +306,9 @@
         <tr><td>talu convert --model-uri &lt;model&gt;</td><td>Quantize and print URI only</td><td>Script</td></tr>
         <tr><td>talu set</td><td>Set default model (interactive picker)</td><td>Interactive</td></tr>
         <tr><td>talu set &lt;model&gt;</td><td>Set default model</td><td>Both</td></tr>
-        <tr><td>talu set show</td><td>Show profile configuration</td><td>Both</td></tr>
+        <tr><td>talu set show</td><td>Show default model configuration</td><td>Both</td></tr>
         <tr><td>talu ask "prompt"</td><td>Ask model (creates new conversation)</td><td>Both</td></tr>
-        <tr><td>talu ask</td><td>List conversations</td><td>Both</td></tr>
+        <tr><td>TALU_DB_HOST=localhost:7258 talu ask --new</td><td>Create persisted session ID</td><td>Script</td></tr>
         <tr><td>talu ask --session &lt;id&gt;</td><td>View conversation transcript</td><td>Both</td></tr>
         <tr><td>talu ask --session &lt;id&gt; "prompt"</td><td>Continue conversation</td><td>Both</td></tr>
         <tr><td>talu ask --session &lt;id&gt; --delete</td><td>Delete conversation</td><td>Both</td></tr>
@@ -326,10 +317,8 @@
         <tr><td>talu ask -s "prompt"</td><td>Silent (exit code only)</td><td>Script</td></tr>
         <tr><td>talu ask --format json "prompt"</td><td>OpenResponses JSON output</td><td>Script</td></tr>
         <tr><td>talu ask --output &lt;path&gt; "prompt"</td><td>Write response to file</td><td>Script</td></tr>
-        <tr><td>talu ask --no-bucket "prompt"</td><td>Ephemeral query (not persisted)</td><td>Both</td></tr>
         <tr><td>talu tokenize &lt;model&gt; "text"</td><td>Show token breakdown</td><td>Both</td></tr>
         <tr><td>talu describe &lt;model&gt;</td><td>Inspect model architecture/plan</td><td>Both</td></tr>
-        <tr><td>talu shell</td><td>Interactive tool-calling shell</td><td>Interactive</td></tr>
         <tr><td>talu xray &lt;model&gt;</td><td>Kernel profiling for debugging</td><td>Both</td></tr>
         <tr><td>talu serve</td><td>Start HTTP server</td><td>Both</td></tr>
       </table>

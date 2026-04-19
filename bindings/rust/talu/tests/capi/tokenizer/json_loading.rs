@@ -1548,7 +1548,11 @@ fn bpe_ignore_merges_changes_tokenization_when_vocab_contains_full_token() {
 }"#;
     let ctx_false = TokenizerTestContext::from_json(json_ignore_false);
     let ids_false = ctx_false.encode_with("abc", &no_bos());
-    assert_eq!(ids_false, vec![4, 3], "ignore_merges=false must use merge path");
+    assert_eq!(
+        ids_false,
+        vec![4, 3],
+        "ignore_merges=false must use merge path"
+    );
 
     let json_ignore_true = r#"{
   "version": "1.0",

@@ -14,8 +14,30 @@ pub fn extractGridBlocksRowMajor(
     temporal_patch_size: usize,
     out: []f32,
 ) !void {
-    const total_frames = pixels.len / (3 * height * width);
-    const patch_dim = 3 * temporal_patch_size * patch_size * patch_size;
+    if (height == 0 or width == 0) return error.InvalidImageDimensions;
+    if (grid_h == 0 or grid_w == 0 or grid_t == 0) return error.InvalidImageDimensions;
+    if (patch_size == 0 or temporal_patch_size == 0) return error.InvalidImageDimensions;
+
+    const expected_height = std.math.mul(usize, grid_h, patch_size) catch return error.InvalidImageDimensions;
+    const expected_width = std.math.mul(usize, grid_w, patch_size) catch return error.InvalidImageDimensions;
+    if (expected_height != height or expected_width != width) return error.InvalidImageDimensions;
+
+    const frame_pixels_1ch = std.math.mul(usize, height, width) catch return error.InvalidImageDimensions;
+    const frame_pixels = std.math.mul(usize, frame_pixels_1ch, 3) catch return error.InvalidImageDimensions;
+    if (frame_pixels == 0 or (pixels.len % frame_pixels) != 0) return error.InvalidImageDimensions;
+    const total_frames = pixels.len / frame_pixels;
+
+    const required_frames = std.math.mul(usize, grid_t, temporal_patch_size) catch return error.InvalidImageDimensions;
+    if (total_frames != required_frames) return error.InvalidImageDimensions;
+
+    const patch_side = std.math.mul(usize, patch_size, patch_size) catch return error.InvalidShape;
+    const patch_span = std.math.mul(usize, temporal_patch_size, patch_side) catch return error.InvalidShape;
+    const patch_dim = std.math.mul(usize, 3, patch_span) catch return error.InvalidShape;
+    const grid_hw = std.math.mul(usize, grid_h, grid_w) catch return error.InvalidShape;
+    const patch_count = std.math.mul(usize, grid_t, grid_hw) catch return error.InvalidShape;
+    const expected_out = std.math.mul(usize, patch_count, patch_dim) catch return error.InvalidShape;
+    if (out.len != expected_out) return error.InvalidShape;
+
     var patch_idx: usize = 0;
 
     for (0..grid_t) |t_block| {
@@ -60,10 +82,34 @@ pub fn extractGridBlocksMerged(
     spatial_merge_size: usize,
     out: []f32,
 ) !void {
+    if (height == 0 or width == 0) return error.InvalidImageDimensions;
+    if (grid_h == 0 or grid_w == 0 or grid_t == 0) return error.InvalidImageDimensions;
+    if (patch_size == 0 or temporal_patch_size == 0) return error.InvalidImageDimensions;
+    if (spatial_merge_size == 0) return error.InvalidShape;
+    if ((grid_h % spatial_merge_size) != 0 or (grid_w % spatial_merge_size) != 0) return error.InvalidShape;
+
+    const expected_height = std.math.mul(usize, grid_h, patch_size) catch return error.InvalidImageDimensions;
+    const expected_width = std.math.mul(usize, grid_w, patch_size) catch return error.InvalidImageDimensions;
+    if (expected_height != height or expected_width != width) return error.InvalidImageDimensions;
+
+    const frame_pixels_1ch = std.math.mul(usize, height, width) catch return error.InvalidImageDimensions;
+    const frame_pixels = std.math.mul(usize, frame_pixels_1ch, 3) catch return error.InvalidImageDimensions;
+    if (frame_pixels == 0 or (pixels.len % frame_pixels) != 0) return error.InvalidImageDimensions;
+    const total_frames = pixels.len / frame_pixels;
+
+    const required_frames = std.math.mul(usize, grid_t, temporal_patch_size) catch return error.InvalidImageDimensions;
+    if (total_frames != required_frames) return error.InvalidImageDimensions;
+
+    const patch_side = std.math.mul(usize, patch_size, patch_size) catch return error.InvalidShape;
+    const patch_span = std.math.mul(usize, temporal_patch_size, patch_side) catch return error.InvalidShape;
+    const patch_dim = std.math.mul(usize, 3, patch_span) catch return error.InvalidShape;
+    const grid_hw = std.math.mul(usize, grid_h, grid_w) catch return error.InvalidShape;
+    const patch_count = std.math.mul(usize, grid_t, grid_hw) catch return error.InvalidShape;
+    const expected_out = std.math.mul(usize, patch_count, patch_dim) catch return error.InvalidShape;
+    if (out.len != expected_out) return error.InvalidShape;
+
     const merged_h = grid_h / spatial_merge_size;
     const merged_w = grid_w / spatial_merge_size;
-    const total_frames = pixels.len / (3 * height * width);
-    const patch_dim = 3 * temporal_patch_size * patch_size * patch_size;
     var patch_idx: usize = 0;
 
     for (0..grid_t) |t_block| {
@@ -330,6 +376,32 @@ test "extractGridBlocksMerged extracts merged traversal patches" {
         3, 7, 11,
         4, 8, 12,
     }, &out);
+}
+
+test "extractGridBlocksMerged rejects grid and patch-size mismatch" {
+    const pixels = [_]f32{
+        1, 2, 3, 4, // C0
+        5, 6, 7, 8, // C1
+        9, 10, 11, 12, // C2
+    };
+    var out = [_]f32{0} ** 12;
+    try std.testing.expectError(
+        error.InvalidImageDimensions,
+        extractGridBlocksMerged(&pixels, 2, 2, 1, 2, 1, 2, 1, 1, &out),
+    );
+}
+
+test "extractGridBlocksRowMajor rejects invalid pixel frame length" {
+    const pixels = [_]f32{
+        1, 2, 3, 4, // C0
+        5, 6, 7, 8, // C1
+        9, 10, 11, // C2 (truncated)
+    };
+    var out = [_]f32{0} ** 12;
+    try std.testing.expectError(
+        error.InvalidImageDimensions,
+        extractGridBlocksRowMajor(&pixels, 2, 2, 1, 1, 1, 2, 1, &out),
+    );
 }
 
 test "bilinearGridRow returns exact corner value on aligned grid" {

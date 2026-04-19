@@ -25,6 +25,12 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// C-API files that intentionally export compatibility stubs for removed APIs.
+/// These stubs must not be used to generate language bindings.
+fn isRemovedApiStubFile(file_name: []const u8) bool {
+    return std.mem.eql(u8, file_name, "removed_apis_stubs.zig");
+}
+
 fn rustPointerType(is_const: bool, pointee: []const u8) []const u8 {
     return std.fmt.allocPrint(
         std.heap.page_allocator,
@@ -80,9 +86,6 @@ const OPAQUE_HANDLES = [_][]const u8{
     "ResponsesHandle",
     "StringList",
     "CachedModelList",
-    "TreeSitterParserHandle",
-    "TreeSitterTreeHandle",
-    "TreeSitterQueryHandle",
 };
 
 fn isOpaqueHandle(name: []const u8) bool {
@@ -90,6 +93,10 @@ fn isOpaqueHandle(name: []const u8) bool {
         if (eql(name, handle)) return true;
     }
     return false;
+}
+
+fn hasType(name: []const u8, known_structs: *std.StringHashMap(StructInfo), known_enums: *std.StringHashMap(EnumInfo)) bool {
+    return known_structs.contains(name) or known_enums.contains(name);
 }
 
 /// Map Zig C-ABI types to Rust types
@@ -143,24 +150,13 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         if (std.mem.startsWith(u8, inner, "const ")) {
             inner = inner[6..];
         }
-        // Strip module prefix (e.g. "docs.CDocumentList" -> "CDocumentList")
+        // Strip module prefix (e.g. "router.CGenerateResult" -> "CGenerateResult")
         if (std.mem.lastIndexOfScalar(u8, inner, '.')) |dot| {
             inner = inner[dot + 1 ..];
         }
         if (known_structs.contains(inner)) {
             // Return double-pointer for known structs
-            if (eql(inner, "CSessionList")) return "*mut *mut CSessionList";
-            if (eql(inner, "CTagList")) return "*mut *mut CTagList";
-            if (eql(inner, "CDocumentList")) return "*mut *mut CDocumentList";
-            if (eql(inner, "CDocumentFullList")) return "*mut *mut CDocumentFullList";
-            if (eql(inner, "CDocumentRecord")) return "*mut *mut CDocumentRecord";
-            if (eql(inner, "CSearchResultList")) return "*mut *mut CSearchResultList";
-            if (eql(inner, "CChangeList")) return "*mut *mut CChangeList";
-            if (eql(inner, "CStringList")) return "*mut *mut CStringList";
-            if (eql(inner, "CRelationStringList")) return "*mut *mut CRelationStringList";
-            if (eql(inner, "CDeltaChain")) return "*mut *mut CDeltaChain";
             if (eql(inner, "CPluginList")) return "*mut *mut CPluginList";
-            if (eql(inner, "CSessionTagBatch")) return "*mut *mut CSessionTagBatch";
         }
         // Opaque or unknown double-pointer types (e.g., ?*?*anyopaque) -> *mut c_void
         // This preserves the existing behavior for opaque output handles.
@@ -225,12 +221,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "DecodeOptionsC")) return if (is_const) "*const DecodeOptionsC" else "*mut DecodeOptionsC";
             if (eql(pointee, "PaddedTensorOptions")) return if (is_const) "*const PaddedTensorOptions" else "*mut PaddedTensorOptions";
             if (eql(pointee, "ValidateConfigC")) return if (is_const) "*const ValidateConfigC" else "*mut ValidateConfigC";
-            if (eql(pointee, "CSessionList")) return if (is_const) "*const CSessionList" else "*mut CSessionList";
-            if (eql(pointee, "CSessionRecord")) return if (is_const) "*const CSessionRecord" else "*mut CSessionRecord";
             if (eql(pointee, "CapturedTensorInfo")) return if (is_const) "*const CapturedTensorInfo" else "*mut CapturedTensorInfo";
-            if (eql(pointee, "CStringList")) return if (is_const) "*const CStringList" else "*mut CStringList";
-            if (eql(pointee, "CTagList")) return if (is_const) "*const CTagList" else "*mut CTagList";
-            if (eql(pointee, "CTagRecord")) return if (is_const) "*const CTagRecord" else "*mut CTagRecord";
             // File/image C API structs
             if (eql(pointee, "TaluImage")) return if (is_const) "*const TaluImage" else "*mut TaluImage";
             if (eql(pointee, "TaluImageDecodeOptions")) return if (is_const) "*const TaluImageDecodeOptions" else "*mut TaluImageDecodeOptions";
@@ -243,33 +234,9 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "TaluImageInfo")) return if (is_const) "*const TaluImageInfo" else "*mut TaluImageInfo";
             if (eql(pointee, "TaluFileTransformOptions")) return if (is_const) "*const TaluFileTransformOptions" else "*mut TaluFileTransformOptions";
             if (eql(pointee, "TaluFsStat")) return if (is_const) "*const TaluFsStat" else "*mut TaluFsStat";
-            // Document types
-            if (eql(pointee, "CDocumentRecord")) return if (is_const) "*const CDocumentRecord" else "*mut CDocumentRecord";
-            if (eql(pointee, "CDocumentSummary")) return if (is_const) "*const CDocumentSummary" else "*mut CDocumentSummary";
-            if (eql(pointee, "CDocumentList")) return if (is_const) "*const CDocumentList" else "*mut CDocumentList";
-            if (eql(pointee, "CSearchResult")) return if (is_const) "*const CSearchResult" else "*mut CSearchResult";
-            if (eql(pointee, "CSearchResultList")) return if (is_const) "*const CSearchResultList" else "*mut CSearchResultList";
-            if (eql(pointee, "CChangeRecord")) return if (is_const) "*const CChangeRecord" else "*mut CChangeRecord";
-            if (eql(pointee, "CChangeList")) return if (is_const) "*const CChangeList" else "*mut CChangeList";
-            if (eql(pointee, "CDeltaChain")) return if (is_const) "*const CDeltaChain" else "*mut CDeltaChain";
-            if (eql(pointee, "CCompactionStats")) return if (is_const) "*const CCompactionStats" else "*mut CCompactionStats";
             // Plugin types
             if (eql(pointee, "CPluginInfo")) return if (is_const) "*const CPluginInfo" else "*mut CPluginInfo";
             if (eql(pointee, "CPluginList")) return if (is_const) "*const CPluginList" else "*mut CPluginList";
-            // Relation types
-            if (eql(pointee, "CRelationStringList")) return if (is_const) "*const CRelationStringList" else "*mut CRelationStringList";
-            // Blob types
-            if (eql(pointee, "BlobGcStats")) return if (is_const) "*const BlobGcStats" else "*mut BlobGcStats";
-            // Session tag batch
-            if (eql(pointee, "CSessionTagBatch")) return if (is_const) "*const CSessionTagBatch" else "*mut CSessionTagBatch";
-            // Table engine types
-            if (eql(pointee, "CCompactionPolicy")) return if (is_const) "*const CCompactionPolicy" else "*mut CCompactionPolicy";
-            if (eql(pointee, "CScanParams")) return if (is_const) "*const CScanParams" else "*mut CScanParams";
-            if (eql(pointee, "CRowIterator")) return if (is_const) "*const CRowIterator" else "*mut CRowIterator";
-            if (eql(pointee, "CRow")) return if (is_const) "*const CRow" else "*mut CRow";
-            if (eql(pointee, "CColumnData")) return if (is_const) "*const CColumnData" else "*mut CColumnData";
-            if (eql(pointee, "CColumnValue")) return if (is_const) "*const CColumnValue" else "*mut CColumnValue";
-            if (eql(pointee, "CColumnFilter")) return if (is_const) "*const CColumnFilter" else "*mut CColumnFilter";
             return rustPointerType(is_const, pointee);
         }
     }
@@ -349,7 +316,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         if (std.mem.indexOf(u8, zig_type, "u8") != null) return if (is_const) "*const u8" else "*mut u8";
 
         // Check if pointer to known struct
-        // Strip module prefix (e.g. "ops.CColumnValue" -> "CColumnValue")
+        // Strip module prefix (e.g. "router.CGenerateConfig" -> "CGenerateConfig")
         if (std.mem.lastIndexOfScalar(u8, elem_type, '.')) |dot| {
             elem_type = elem_type[dot + 1 ..];
         }
@@ -366,15 +333,6 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             }
             if (eql(elem_type, "OverrideRule")) {
                 return if (is_const) "*const OverrideRule" else "*mut OverrideRule";
-            }
-            if (eql(elem_type, "CStorageRecord")) {
-                return if (is_const) "*const CStorageRecord" else "*mut CStorageRecord";
-            }
-            if (eql(elem_type, "CColumnValue")) {
-                return if (is_const) "*const CColumnValue" else "*mut CColumnValue";
-            }
-            if (eql(elem_type, "CSqlParam")) {
-                return if (is_const) "*const CSqlParam" else "*mut CSqlParam";
             }
             return rustPointerType(is_const, elem_type);
         }
@@ -560,7 +518,9 @@ pub fn main() !void {
             try resolveReExports(allocator, source, full_path, project_root, &structs, &enums);
 
             // Parse exported functions
-            try parseExportedFunctions(allocator, source, full_path, &functions);
+            if (!(std.mem.startsWith(u8, rel_dir, "core/src/capi") and isRemovedApiStubFile(entry.path))) {
+                try parseExportedFunctions(allocator, source, full_path, &functions);
+            }
         }
     }
 
@@ -891,30 +851,6 @@ pub fn main() !void {
         \\    _private: [u8; 0],
         \\}
         \\
-        \\/// Opaque handle for tree-sitter parser.
-        \\/// Thread safety: NOT thread-safe. Create one per thread.
-        \\#[repr(C)]
-        \\#[derive(Copy, Clone)]
-        \\pub struct TreeSitterParserHandle {
-        \\    _private: [u8; 0],
-        \\}
-        \\
-        \\/// Opaque handle for parsed syntax tree.
-        \\/// Thread safety: Immutable after creation. Safe to share read-only.
-        \\#[repr(C)]
-        \\#[derive(Copy, Clone)]
-        \\pub struct TreeSitterTreeHandle {
-        \\    _private: [u8; 0],
-        \\}
-        \\
-        \\/// Opaque handle for compiled query pattern.
-        \\/// Thread safety: Immutable after creation. Safe to share read-only.
-        \\#[repr(C)]
-        \\#[derive(Copy, Clone)]
-        \\pub struct TreeSitterQueryHandle {
-        \\    _private: [u8; 0],
-        \\}
-        \\
         \\
     );
 
@@ -940,11 +876,9 @@ pub fn main() !void {
         \\pub type FileStartCallback =
         \\    Option<unsafe extern "C" fn(*const c_char, *mut c_void)>;
         \\
-        \\pub type StorageCallback =
-        \\    Option<unsafe extern "C" fn(*const CStorageEvent, *mut c_void) -> i32>;
-        \\
-        \\
     );
+
+    try writer.writeAll("\n");
 
     // Write type aliases for backwards compatibility
     try writer.writeAll(
@@ -955,14 +889,151 @@ pub fn main() !void {
         \\// These aliases allow wrapper code to use cleaner names without the C prefix.
         \\// New code should prefer the C-prefixed names to match the Zig C API.
         \\
-        \\pub type MessageRole = CMessageRole;
-        \\pub type ItemType = CItemType;
-        \\pub type StorageEventType = CStorageEventType;
-        \\pub type PoolingStrategy = CPoolingStrategy;
-        \\
-        \\/// Alias for CContentPart (legacy name used in some wrapper code)
-        \\pub type CResponsesContentPart = CContentPart;
-        \\
+    );
+
+    if (hasType("CMessageRole", &structs, &enums)) {
+        try writer.writeAll("pub type MessageRole = CMessageRole;\n");
+    }
+    if (hasType("CItemType", &structs, &enums)) {
+        try writer.writeAll("pub type ItemType = CItemType;\n");
+    }
+    if (hasType("CPoolingStrategy", &structs, &enums)) {
+        try writer.writeAll("pub type PoolingStrategy = CPoolingStrategy;\n");
+    }
+    if (hasType("CContentPart", &structs, &enums)) {
+        try writer.writeAll(
+            \\
+            \\/// Alias for CContentPart (legacy name used in some wrapper code)
+            \\pub type CResponsesContentPart = CContentPart;
+            \\
+        );
+    } else {
+        try writer.writeAll("\n");
+    }
+
+    // Fallback semantic types used by wrappers when C API exports raw u8 fields.
+    if (!hasType("ProgressAction", &structs, &enums)) {
+        try writer.writeAll(
+            \\/// Progress action discriminator.
+            \\#[repr(u8)]
+            \\#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+            \\pub enum ProgressAction {
+            \\    Add = 0,
+            \\    Update = 1,
+            \\    Complete = 2,
+            \\}
+            \\
+            \\impl Default for ProgressAction {
+            \\    fn default() -> Self {
+            \\        Self::Update
+            \\    }
+            \\}
+            \\
+            \\impl From<u8> for ProgressAction {
+            \\    fn from(value: u8) -> Self {
+            \\        match value {
+            \\            0 => ProgressAction::Add,
+            \\            1 => ProgressAction::Update,
+            \\            2 => ProgressAction::Complete,
+            \\            _ => ProgressAction::Update,
+            \\        }
+            \\    }
+            \\}
+            \\
+        );
+    }
+
+    if (!hasType("ProgressUpdate", &structs, &enums)) {
+        try writer.writeAll(
+            \\/// Structured progress update payload.
+            \\#[repr(C)]
+            \\#[derive(Copy, Clone)]
+            \\pub struct ProgressUpdate {
+            \\    pub line_id: u8,
+            \\    pub action: ProgressAction,
+            \\    pub current: u64,
+            \\    pub total: u64,
+            \\    pub label: *const c_char,
+            \\    pub message: *const c_char,
+            \\    pub unit: *const c_char,
+            \\}
+            \\
+            \\impl Default for ProgressUpdate {
+            \\    fn default() -> Self {
+            \\        Self {
+            \\            line_id: 0,
+            \\            action: ProgressAction::Update,
+            \\            current: 0,
+            \\            total: 0,
+            \\            label: std::ptr::null(),
+            \\            message: std::ptr::null(),
+            \\            unit: std::ptr::null(),
+            \\        }
+            \\    }
+            \\}
+            \\
+        );
+    }
+
+    if (!hasType("CMessageRole", &structs, &enums)) {
+        try writer.writeAll(
+            \\/// Message role discriminator.
+            \\#[repr(u8)]
+            \\#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+            \\pub enum MessageRole {
+            \\    System = 0,
+            \\    User = 1,
+            \\    Assistant = 2,
+            \\    Developer = 3,
+            \\    Unknown = 255,
+            \\}
+            \\
+            \\impl From<u8> for MessageRole {
+            \\    fn from(value: u8) -> Self {
+            \\        match value {
+            \\            0 => MessageRole::System,
+            \\            1 => MessageRole::User,
+            \\            2 => MessageRole::Assistant,
+            \\            3 => MessageRole::Developer,
+            \\            _ => MessageRole::Unknown,
+            \\        }
+            \\    }
+            \\}
+            \\
+        );
+    }
+
+    if (!hasType("CItemType", &structs, &enums)) {
+        try writer.writeAll(
+            \\/// Item type discriminator.
+            \\#[repr(u8)]
+            \\#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+            \\pub enum ItemType {
+            \\    Message = 0,
+            \\    FunctionCall = 1,
+            \\    FunctionCallOutput = 2,
+            \\    Reasoning = 3,
+            \\    ItemReference = 4,
+            \\    Unknown = 255,
+            \\}
+            \\
+            \\impl From<u8> for ItemType {
+            \\    fn from(value: u8) -> Self {
+            \\        match value {
+            \\            0 => ItemType::Message,
+            \\            1 => ItemType::FunctionCall,
+            \\            2 => ItemType::FunctionCallOutput,
+            \\            3 => ItemType::Reasoning,
+            \\            4 => ItemType::ItemReference,
+            \\            _ => ItemType::Unknown,
+            \\        }
+            \\    }
+            \\}
+            \\
+        );
+    }
+
+    try writer.writeAll(
         \\// =============================================================================
         \\// Semantic Enums (Not in Zig C API, but documented in field comments)
         \\// =============================================================================

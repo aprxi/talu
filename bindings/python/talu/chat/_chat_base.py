@@ -44,7 +44,6 @@ from .response import AsyncStreamingResponse, Response, StreamingResponse
 if TYPE_CHECKING:
     from talu.client import AsyncClient, Client
     from talu.router import Router
-    from talu.types import ItemRecord
 
 SCHEMA_PLACEHOLDER = "{{ schema }}"
 
@@ -684,26 +683,6 @@ class ChatBase:
         """
         return json.loads(self.to_json())
 
-    def _load_storage_records(self, items: list[ItemRecord]) -> None:
-        """Load items from storage records."""
-        from .session import _build_c_storage_records
-
-        if not items:
-            return
-
-        records, keepalive = _build_c_storage_records(items)
-        result = self._lib.talu_responses_load_storage_records(
-            self._conversation_ptr,
-            records,
-            len(items),
-        )
-        if result != 0:
-            raise StateError(
-                f"Failed to load storage records: {result}",
-                code="STATE_LOAD_FAILED",
-            )
-        _ = keepalive
-
     # =========================================================================
     # Append methods
     # =========================================================================
@@ -1044,8 +1023,8 @@ class ChatBase:
         to resume conversations from a database or file.
 
         Args:
-            data: Dict from to_dict(). If ``items`` is provided, full ItemRecord
-                data is loaded; otherwise only OpenAI-format messages are restored.
+            data: Dict from to_dict(). Only OpenAI-format ``messages`` restore
+                is supported.
             model: Model to load (HuggingFace ID or local path).
 
         Returns
@@ -1070,36 +1049,24 @@ class ChatBase:
 
         chat = cls(model=model, config=config)  # type: ignore[call-arg]
 
-        items = data.get("items")
-        if items is not None:
-            chat._load_storage_records(items)
-        else:
-            messages = data.get("messages", [])
-            if messages:
-                messages_json = json.dumps(messages)
-                result = chat._lib.talu_responses_load_completions_json(
-                    chat._conversation_ptr, messages_json.encode("utf-8")
+        if "items" in data:
+            raise ValidationError(
+                "from_dict(items=...) is no longer supported; use messages instead",
+                code="INVALID_ARGUMENT",
+            )
+
+        messages = data.get("messages", [])
+        if messages:
+            messages_json = json.dumps(messages)
+            result = chat._lib.talu_responses_load_completions_json(
+                chat._conversation_ptr, messages_json.encode("utf-8")
+            )
+            if result != 0:
+                raise StateError(
+                    f"Failed to load messages: {result}",
+                    code="STATE_LOAD_FAILED",
                 )
-                if result != 0:
-                    raise StateError(
-                        f"Failed to load messages: {result}",
-                        code="STATE_LOAD_FAILED",
-                    )
 
-        chat._system = chat.items.system
-        return chat
-
-    @classmethod
-    def _from_items(
-        cls,
-        items: list[ItemRecord],
-        model: str | None = None,
-        *,
-        config: GenerationConfig | None = None,
-    ) -> Self:
-        """Restore from ItemRecord dictionaries (full fidelity)."""
-        chat = cls(model=model, config=config)  # type: ignore[call-arg]
-        chat._load_storage_records(items)
         chat._system = chat.items.system
         return chat
 

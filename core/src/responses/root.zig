@@ -1,70 +1,19 @@
 //! Responses Module - Item-based data model for the Open Responses API.
 //!
-//! This module provides the core data types for the Open Responses architecture:
+//! This module provides the core runtime data types for inference:
 //!   - Item: Atomic unit (message, function_call, reasoning, etc.)
 //!   - Conversation: Container for Items with serialization
 //!   - Chat: Lightweight wrapper with sampling parameters
-//!   - StorageBackend: Persistence interface for conversation history
-//!
-//! Architecture:
-//!   Chat (sampling config, session identity)
-//!       │
-//!       ▼
-//!   Conversation (Item container, serialization)
-//!       │
-//!       │ on item finalized (status → final)
-//!       ▼
-//!   StorageBackend (optional persistence)
-//!       │
-//!       └── MemoryBackend     (:memory: - default, no-op)
-//!
-//! Usage:
-//!   const conv = try Conversation.init(allocator);
-//!   defer conv.deinit();
-//!
-//!   const user_item = try conv.appendUserMessage("Hello!");
-//!   const asst_item = try conv.appendAssistantMessage();
-//!   try conv.appendTextContent(asst_item, "Hi there!");
-//!   conv.finalizeItem(asst_item);
-//!
-//! Design Principles:
-//!   1. Zig Memory is always source of truth during runtime
-//!   2. Storage backends mirror data for persistence (write-through)
-//!   3. Session restore loads from storage into Zig memory
-//!   4. Zero overhead when no backend is configured (null check)
-//!
-//! See also:
-//!   - capi/responses.zig - C API for Item access
 
-const std = @import("std");
-
-pub const backend = @import("backend.zig");
-pub const memory = @import("memory.zig");
 pub const chat = @import("chat.zig");
-pub const storage_serializer = @import("storage_serializer.zig");
-pub const record_serializer = @import("record_serializer.zig");
-pub const record_parser = @import("record_parser.zig");
 pub const reasoning_parser = @import("reasoning_parser.zig");
 pub const session_id = @import("session_id.zig");
-pub const schema = @import("schema.zig");
-
-// Session storage domain modules (moved from db/table/sessions/)
-pub const storage_adapter = @import("storage_adapter.zig");
-pub const session_codec = @import("codec.zig");
-pub const session_query = @import("query.zig");
-pub const session_search = @import("search.zig");
-pub const session_helpers = @import("helpers.zig");
 
 // Open Responses architecture modules
 pub const items = @import("items.zig");
 pub const conversation = @import("conversation.zig");
 
 // Re-export main types
-pub const StorageBackend = backend.StorageBackend;
-pub const StorageEvent = backend.StorageEvent;
-pub const MemoryBackend = memory.MemoryBackend;
-
-// Item-based architecture types
 pub const Conversation = conversation.Conversation;
 pub const Item = items.Item;
 pub const ItemType = items.ItemType;
@@ -92,75 +41,6 @@ pub const generateSessionId = session_id.generateSessionId;
 pub const SerializationDirection = conversation.SerializationDirection;
 pub const ResponsesSerializationOptions = conversation.ResponsesSerializationOptions;
 
-// Item storage types
-pub const ItemRecord = backend.ItemRecord;
-pub const StoredItemEnvelope = backend.StoredItemEnvelope;
-
-// Storage serialization (for Item - live in-memory objects)
-pub const serializeItemToJson = storage_serializer.serializeItemToJson;
-pub const serializeItemToJsonZ = storage_serializer.serializeItemToJsonZ;
-pub const extractRole = storage_serializer.extractRole;
-
-// Record serialization (for ItemRecord - portable snapshots)
-pub const serializeItemRecordToJsonZ = record_serializer.serializeItemRecordToJsonZ;
-pub const serializeItemRecordToKvBuf = record_serializer.serializeItemRecordToKvBuf;
-pub const serializeItemRecordToKvBufWithStorage = record_serializer.serializeItemRecordToKvBufWithStorage;
-pub const extractRoleFromRecord = record_serializer.extractRoleFromRecord;
-
-// Record parsing (JSON → ItemRecord)
-pub const parseItemVariantRecord = record_parser.parseItemVariantRecord;
-pub const freeContentPartRecord = record_parser.freeContentPartRecord;
-pub const itemStatusFromU8 = record_parser.itemStatusFromU8;
-
 // Re-export chat types (canonical location)
 pub const Chat = chat.Chat;
 pub const ResolutionConfig = chat.ResolutionConfig;
-
-/// Storage type enum for C API.
-/// Used by talu_chat_set_storage() to select backend.
-pub const StorageType = enum(u8) {
-    /// In-memory only, no persistence (default).
-    memory = 0,
-
-    _reserved_1 = 1,
-    _reserved_2 = 2,
-    _reserved_3 = 3,
-    _reserved_4 = 4,
-
-    /// Reserved for custom/external backends.
-    custom = 255,
-};
-
-// Session storage adapter re-exports (C API surface)
-pub const TableAdapter = storage_adapter.TableAdapter;
-pub const computeSessionHash = storage_adapter.computeSessionHash;
-pub const computeGroupHash = storage_adapter.computeGroupHash;
-pub const computeOptionalHash = storage_adapter.computeOptionalHash;
-pub const ScannedSessionRecord = storage_adapter.ScannedSessionRecord;
-pub const freeScannedSessionRecord = storage_adapter.freeScannedSessionRecord;
-pub const freeScannedSessionRecords = storage_adapter.freeScannedSessionRecords;
-pub const encodeSessionRecordMsgpack = storage_adapter.encodeSessionRecordMsgpack;
-pub const encodeSessionRecordKvBuf = storage_adapter.encodeSessionRecordKvBuf;
-pub const decodeSessionRecordMsgpack = storage_adapter.decodeSessionRecordMsgpack;
-pub const decodeSessionRecordKvBuf = storage_adapter.decodeSessionRecordKvBuf;
-pub const listSessions = storage_adapter.listSessions;
-pub const getSessionInfo = storage_adapter.getSessionInfo;
-pub const loadConversation = storage_adapter.loadConversation;
-pub const forkSession = storage_adapter.forkSession;
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-test "storage module re-exports types" {
-    // Verify public API types are accessible
-    try std.testing.expect(@TypeOf(backend.StorageBackend) == type);
-    try std.testing.expect(@TypeOf(memory.MemoryBackend) == type);
-    try std.testing.expect(@TypeOf(conversation.Conversation) == type);
-    try std.testing.expect(@TypeOf(chat.Chat) == type);
-}
-
-test "StorageType values" {
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(StorageType.memory));
-    try std.testing.expectEqual(@as(u8, 255), @intFromEnum(StorageType.custom));
-}

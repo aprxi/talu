@@ -6,9 +6,9 @@
 const std = @import("std");
 const main = @import("main");
 
-const CachedModelListC = main.io.repository.CachedModelListC;
-const CachedModelC = main.io.repository.CachedModelC;
-const CachedModel = main.io.repository.CachedModel;
+const CachedModelListC = main.io.repository.root.CachedModelListC;
+const CachedModelC = main.io.repository.root.CachedModelC;
+const CachedModel = main.io.repository.root.CachedModel;
 
 // =============================================================================
 // Type Verification Tests

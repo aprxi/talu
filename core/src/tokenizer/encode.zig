@@ -868,37 +868,6 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
     }
 }
 
-fn encodeBpePretokenizedWithGaps(
-    tokenizer: *ct.Tokenizer,
-    segment: []const u8,
-    base_offset: usize,
-    token_items: []Token,
-    token_ranges: []const Range,
-    accumulator: *EncodeAccum,
-) !void {
-    if (token_items.len == 0) return;
-
-    var cursor: usize = 0;
-    var word_cache = WordCache.init();
-    defer word_cache.deinit();
-
-    for (token_items, token_ranges) |token_item, token_range| {
-        const rel_start = token_range.start - base_offset;
-        const rel_end = token_range.end - base_offset;
-
-        if (rel_start > cursor) {
-            try encodeLiteralBpeBytes(tokenizer, segment[cursor..rel_start], accumulator);
-        }
-
-        try encodeWord(tokenizer, token_item.sliceConst(), false, accumulator, &word_cache);
-        cursor = rel_end;
-    }
-
-    if (cursor < segment.len) {
-        try encodeLiteralBpeBytes(tokenizer, segment[cursor..], accumulator);
-    }
-}
-
 // ============================================================================
 // WORD BPE CACHE
 // ============================================================================
@@ -1448,10 +1417,6 @@ pub fn tokenizer_encode_struct_with_options(
 ) c_int {
     out.* = std.mem.zeroes(ct.TokenizerEncoding);
     return tokenizer_encode_pair_struct_with_options(tokenizer_handle, input, null, out, options);
-}
-
-fn tokenizer_encode_pair_struct(tokenizer_handle: *ct.Tokenizer, text_a: []const u8, text_b: ?[]const u8, out: *ct.TokenizerEncoding) c_int {
-    return tokenizer_encode_pair_struct_with_options(tokenizer_handle, text_a, text_b, out, .{});
 }
 
 fn tokenizer_encode_pair_struct_with_options(

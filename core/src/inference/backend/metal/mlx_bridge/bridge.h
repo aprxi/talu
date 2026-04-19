@@ -25,6 +25,18 @@ typedef struct mlx_result {
     double decode_tps;
 } mlx_result;
 
+typedef struct mlx_vision_grid {
+    uint32_t temporal;
+    uint32_t height;
+    uint32_t width;
+} mlx_vision_grid;
+
+typedef struct mlx_prefill_vision_input {
+    const float* merged_embeddings;
+    uint32_t merged_value_count;
+    uint32_t image_token_id;
+} mlx_prefill_vision_input;
+
 int32_t mlx_is_available(void);
 int32_t mlx_validate_config(const char* model_path);
 
@@ -57,6 +69,15 @@ int32_t mlx_prefill_logits(
     mlx_ctx* ctx,
     const int32_t* prompt_ids,
     int32_t prompt_len,
+    float* out_logits,
+    int32_t logits_len
+);
+
+int32_t mlx_prefill_logits_with_vision(
+    mlx_ctx* ctx,
+    const int32_t* prompt_ids,
+    int32_t prompt_len,
+    const mlx_prefill_vision_input* vision_input,
     float* out_logits,
     int32_t logits_len
 );

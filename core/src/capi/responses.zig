@@ -3,7 +3,7 @@
 //! C-callable functions for the Open Responses API architecture.
 //! This module exposes the Item-based data model to language bindings,
 //! enabling zero-copy access to conversation Items without flattening
-//! to legacy message format.
+//! to lossy intermediate message-only formats.
 //!
 //! Architecture:
 //!   - Items are accessed by index (0-based)
@@ -18,9 +18,7 @@
 const std = @import("std");
 const responses_mod = @import("../responses/root.zig");
 const session_id_mod = responses_mod.session_id;
-const backend_mod = @import("../responses/backend.zig");
 const router_mod = @import("../router/root.zig");
-const db_capi = @import("db/ops.zig");
 const Conversation = responses_mod.Conversation;
 const Item = responses_mod.Item;
 const ItemType = responses_mod.ItemType;
@@ -28,7 +26,6 @@ const ItemStatus = responses_mod.ItemStatus;
 const MessageRole = responses_mod.MessageRole;
 const ContentType = responses_mod.ContentType;
 const ContentPart = responses_mod.ContentPart;
-const ImageDetail = responses_mod.ImageDetail;
 const SerializationDirection = responses_mod.SerializationDirection;
 const completions_protocol = router_mod.protocol.completions;
 const responses_protocol = router_mod.protocol.responses;
@@ -100,11 +97,6 @@ fn isChatValidSafe(chat: *Chat) bool {
     }
     return ctx.result;
 }
-
-const ItemRecord = backend_mod.ItemRecord;
-const ItemVariantRecord = backend_mod.ItemVariantRecord;
-const ItemContentPartRecord = backend_mod.ItemContentPartRecord;
-const CStorageRecord = db_capi.CStorageRecord;
 
 // =============================================================================
 // Opaque Handle
@@ -795,7 +787,7 @@ pub export fn talu_responses_to_responses_json(
     return json_cstr.ptr;
 }
 
-/// Serialize conversation to legacy Completions JSON format (role/content messages).
+/// Serialize conversation to Chat Completions JSON format (role/content messages).
 /// Caller must free the returned string with talu_text_free().
 pub export fn talu_responses_to_completions_json(
     handle: ?*ResponsesHandle,
@@ -903,7 +895,7 @@ pub export fn talu_responses_load_responses_json(
 }
 
 /// Clone conversation items from source into destination.
-/// Preserves item timestamps and metadata; emits storage events in batches.
+/// Preserves item timestamps and metadata.
 pub export fn talu_responses_clone(
     dest_handle: ?*ResponsesHandle,
     source_handle: ?*ResponsesHandle,
@@ -923,16 +915,6 @@ pub export fn talu_responses_clone(
         capi_error.setError(err, "failed to clone conversation", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-
-    // Check for sticky storage error after successful clone.
-    // Items are in memory but storage backend failed - propagate this to caller.
-    if (dest.hasStorageError()) {
-        // Use explicit error code - the captured error may be an arbitrary error from
-        // the Python callback which would map to INTERNAL_ERROR (999) instead of STORAGE_ERROR (700).
-        capi_error.setErrorWithCode(error_codes.ErrorCode.storage_error, "storage backend failed during clone (items in memory only)", .{});
-        dest.clearStorageError();
-        return @intFromEnum(error_codes.ErrorCode.storage_error);
-    }
 
     return 0;
 }
@@ -960,43 +942,6 @@ pub export fn talu_responses_clone_prefix(
         return @intFromEnum(error_codes.errorToCode(err));
     };
 
-    // Check for sticky storage error after successful clone.
-    // Items are in memory but storage backend failed - propagate this to caller.
-    if (dest.hasStorageError()) {
-        // Use explicit error code - the captured error may be an arbitrary error from
-        // the Python callback which would map to INTERNAL_ERROR (999) instead of STORAGE_ERROR (700).
-        capi_error.setErrorWithCode(error_codes.ErrorCode.storage_error, "storage backend failed during clone prefix (items in memory only)", .{});
-        dest.clearStorageError();
-        return @intFromEnum(error_codes.ErrorCode.storage_error);
-    }
-
-    return 0;
-}
-
-/// Begin a fork transaction boundary for storage backends.
-/// Returns a fork_id (0 if no storage backend is configured).
-pub export fn talu_responses_begin_fork(
-    handle: ?*ResponsesHandle,
-) callconv(.c) u64 {
-    capi_error.clearError();
-    const conv: *Conversation = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "conversation handle is null", .{});
-        return 0;
-    }));
-    return conv.beginFork();
-}
-
-/// End a fork transaction boundary for storage backends.
-pub export fn talu_responses_end_fork(
-    handle: ?*ResponsesHandle,
-    fork_id: u64,
-) callconv(.c) i32 {
-    capi_error.clearError();
-    const conv: *Conversation = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "conversation handle is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }));
-    conv.endFork(fork_id);
     return 0;
 }
 
@@ -1012,51 +957,6 @@ pub export fn talu_responses_truncate_after(
     }));
 
     _ = conv.truncateAfterIndex(last_index);
-    return 0;
-}
-
-/// Set parent_item_id for an item by index.
-pub export fn talu_responses_set_item_parent(
-    handle: ?*ResponsesHandle,
-    item_index: usize,
-    parent_item_id: u64,
-    has_parent: bool,
-) callconv(.c) i32 {
-    capi_error.clearError();
-    const conv: *Conversation = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "conversation handle is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }));
-
-    if (item_index >= conv.items_list.items.len) {
-        capi_error.setError(error.InvalidArgument, "item index {d} out of bounds", .{item_index});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    }
-
-    const item = &conv.items_list.items[item_index];
-    item.parent_item_id = if (has_parent) parent_item_id else null;
-    return 0;
-}
-
-/// Set structured validation flags for an item by index.
-pub export fn talu_responses_set_item_validation_flags(
-    handle: ?*ResponsesHandle,
-    item_index: usize,
-    json_valid: bool,
-    schema_valid: bool,
-    repaired: bool,
-) callconv(.c) i32 {
-    capi_error.clearError();
-    const conv: *Conversation = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "conversation handle is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }));
-
-    conv.setItemValidationFlags(item_index, json_valid, schema_valid, repaired) catch |err| {
-        capi_error.setError(err, "failed to set validation flags", .{});
-        return @intFromEnum(error_codes.errorToCode(err));
-    };
-
     return 0;
 }
 
@@ -1086,91 +986,6 @@ pub export fn talu_responses_set_item_status(
         return @intFromEnum(error_codes.errorToCode(err));
     };
 
-    return 0;
-}
-
-/// Duplicates a C string to an owned slice, returns null if input is null.
-fn dupeCString(cstr: ?[*:0]const u8) error{OutOfMemory}!?[]const u8 {
-    const ptr = cstr orelse return null;
-    return try allocator.dupe(u8, std.mem.sliceTo(ptr, 0));
-}
-
-/// Frees all ItemRecords in the list and deinitializes the list.
-fn freeParsedRecords(records: *std.ArrayListUnmanaged(ItemRecord)) void {
-    for (records.items) |*rec| rec.deinit(allocator);
-    records.deinit(allocator);
-}
-
-/// Parses a single CStorageRecord into an ItemRecord.
-/// On success, caller owns the returned ItemRecord. On error, all allocations are freed.
-fn parseStorageRecord(record: CStorageRecord) !ItemRecord {
-    const content_json = record.content_json orelse return error.InvalidArgument;
-    const status = responses_mod.itemStatusFromU8(record.status);
-    const variant = try responses_mod.parseItemVariantRecord(allocator, std.mem.sliceTo(content_json, 0), status);
-    // Build ItemRecord with variant for proper cleanup via deinit on error
-    var item_record = ItemRecord{
-        .item_id = record.item_id,
-        .created_at_ms = record.created_at_ms,
-        .ttl_ts = record.ttl_ts,
-        .status = status,
-        .hidden = record.hidden,
-        .pinned = record.pinned,
-        .json_valid = record.json_valid,
-        .schema_valid = record.schema_valid,
-        .repaired = record.repaired,
-        .parent_item_id = if (record.has_parent) record.parent_item_id else null,
-        .origin_item_id = if (record.has_origin) record.origin_item_id else null,
-        .prefill_ns = record.prefill_ns,
-        .generation_ns = record.generation_ns,
-        .input_tokens = record.input_tokens,
-        .output_tokens = record.output_tokens,
-        .item_type = @enumFromInt(record.item_type),
-        .variant = variant,
-    };
-    errdefer item_record.deinit(allocator);
-
-    item_record.origin_session_id = if (record.has_origin) try dupeCString(record.origin_session_id) else null;
-    item_record.finish_reason = try dupeCString(record.finish_reason);
-    item_record.metadata = try dupeCString(record.metadata_json);
-    return item_record;
-}
-
-/// Load storage records into an empty conversation.
-/// Uses storage JSON content to reconstruct Item variants.
-pub export fn talu_responses_load_storage_records(
-    handle: ?*ResponsesHandle,
-    records_ptr: ?[*]const CStorageRecord,
-    records_len: usize,
-) callconv(.c) i32 {
-    capi_error.clearError();
-    const conv: *Conversation = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "conversation handle is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }));
-    const records = records_ptr orelse {
-        capi_error.setError(error.InvalidArgument, "records pointer is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-    if (records_len == 0) return 0;
-
-    var parsed_records: std.ArrayListUnmanaged(ItemRecord) = .{};
-    defer freeParsedRecords(&parsed_records);
-
-    for (records[0..records_len]) |record| {
-        const item_record = parseStorageRecord(record) catch |err| {
-            capi_error.setError(err, "failed to parse storage record", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        };
-        parsed_records.append(allocator, item_record) catch |err| {
-            capi_error.setError(err, "failed to allocate storage record", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        };
-    }
-
-    conv.loadItemRecords(parsed_records.items) catch |err| {
-        capi_error.setError(err, "failed to load storage records", .{});
-        return @intFromEnum(error_codes.errorToCode(err));
-    };
     return 0;
 }
 
@@ -1687,7 +1502,7 @@ pub export fn talu_chat_create_with_system(
 }
 
 /// Create a new Chat with a session identifier.
-/// session_id is used by storage backends to group messages by session.
+/// session_id is used by clients to group messages by session.
 /// Returns null on allocation failure (check talu_last_error for details).
 pub export fn talu_chat_create_with_session(
     session_id: ?[*:0]const u8,
@@ -1780,56 +1595,6 @@ pub export fn talu_chat_get_conversation(handle: ?*ChatHandle) callconv(.c) ?*Re
     return @ptrCast(conv);
 }
 
-/// Validate a Conversation handle.
-/// Returns 1 if valid, 0 if invalid or corrupted.
-/// Safe to call with any pointer value - will not crash on invalid pointers.
-/// Uses signal guard to safely probe unmapped memory.
-pub export fn talu_responses_validate(handle: ?*ResponsesHandle) callconv(.c) i32 {
-    capi_error.clearError();
-    const conv: *Conversation = @ptrCast(@alignCast(handle orelse return 0));
-
-    // Use signal-safe validation to handle unmapped memory without crashing.
-    if (isConversationValidSafe(conv)) {
-        return 1;
-    }
-    return 0;
-}
-
-/// Validate a Chat handle.
-/// Returns 1 if valid, 0 if invalid or corrupted.
-/// Safe to call with any pointer value - will not crash on invalid pointers.
-/// Uses signal guard to safely probe unmapped memory.
-pub export fn talu_chat_validate(handle: ?*ChatHandle) callconv(.c) i32 {
-    capi_error.clearError();
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 0));
-
-    // Use signal-safe validation to handle unmapped memory without crashing.
-    if (isChatValidSafe(chat_state)) {
-        return 1;
-    }
-    return 0;
-}
-
-/// Get the session identifier for a Chat.
-/// Returns null if no session_id is set.
-/// Caller must free with talu_text_free.
-pub export fn talu_chat_get_session_id(handle: ?*ChatHandle) callconv(.c) ?[*:0]u8 {
-    capi_error.clearError();
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "chat handle is null", .{});
-        return null;
-    }));
-    if (chat_state.session_id) |sid| {
-        const sid_cstr = allocator.allocSentinel(u8, sid.len, 0) catch {
-            capi_error.setError(error.OutOfMemory, "failed to allocate session_id copy", .{});
-            return null;
-        };
-        @memcpy(sid_cstr, sid);
-        return sid_cstr.ptr;
-    }
-    return null; // No session_id set - not an error
-}
-
 /// Generate a new session ID.
 /// Caller must free with talu_text_free.
 pub export fn talu_session_id_new(out_session_id: *?[*:0]u8) callconv(.c) i32 {
@@ -1861,88 +1626,6 @@ pub export fn talu_chat_set_ttl_ts(handle: ?*ChatHandle, ttl_ts: i64) callconv(.
     }));
     chat_state.conv.setTtlTs(ttl_ts);
     return 0;
-}
-
-// =============================================================================
-// Chat Sampling Parameters
-// =============================================================================
-
-/// Gets the sampling temperature.
-/// Returns the default value (0.7) if handle is null.
-pub export fn talu_chat_get_temperature(handle: ?*ChatHandle) callconv(.c) f32 {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 0.7));
-    return chat_state.temperature;
-}
-
-/// Sets the sampling temperature.
-pub export fn talu_chat_set_temperature(handle: ?*ChatHandle, value: f32) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.temperature = value;
-}
-
-/// Gets the maximum tokens to generate.
-/// Returns the default value (256) if handle is null.
-pub export fn talu_chat_get_max_tokens(handle: ?*ChatHandle) callconv(.c) usize {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 256));
-    return chat_state.max_tokens;
-}
-
-/// Sets the maximum tokens to generate.
-pub export fn talu_chat_set_max_tokens(handle: ?*ChatHandle, value: usize) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.max_tokens = value;
-}
-
-/// Gets the top-k sampling parameter.
-/// Returns the default value (50) if handle is null.
-pub export fn talu_chat_get_top_k(handle: ?*ChatHandle) callconv(.c) usize {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 50));
-    return chat_state.top_k;
-}
-
-/// Sets the top-k sampling parameter.
-pub export fn talu_chat_set_top_k(handle: ?*ChatHandle, value: usize) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.top_k = value;
-}
-
-/// Gets the nucleus sampling (top-p) parameter.
-/// Returns the default value (0.9) if handle is null.
-pub export fn talu_chat_get_top_p(handle: ?*ChatHandle) callconv(.c) f32 {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 0.9));
-    return chat_state.top_p;
-}
-
-/// Sets the nucleus sampling (top-p) parameter.
-pub export fn talu_chat_set_top_p(handle: ?*ChatHandle, value: f32) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.top_p = value;
-}
-
-/// Gets the min-p sampling parameter.
-/// Returns the default value (0.0) if handle is null.
-pub export fn talu_chat_get_min_p(handle: ?*ChatHandle) callconv(.c) f32 {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 0.0));
-    return chat_state.min_p;
-}
-
-/// Sets the min-p sampling parameter.
-pub export fn talu_chat_set_min_p(handle: ?*ChatHandle, value: f32) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.min_p = value;
-}
-
-/// Gets the repetition penalty.
-/// Returns the default value (1.0, no penalty) if handle is null.
-pub export fn talu_chat_get_repetition_penalty(handle: ?*ChatHandle) callconv(.c) f32 {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 1.0));
-    return chat_state.repetition_penalty;
-}
-
-/// Sets the repetition penalty.
-pub export fn talu_chat_set_repetition_penalty(handle: ?*ChatHandle, value: f32) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.repetition_penalty = value;
 }
 
 /// Set the system prompt for a Chat.
@@ -2078,25 +1761,6 @@ pub export fn talu_chat_get_tool_choice(handle: ?*ChatHandle) callconv(.c) ?[*:0
     return result;
 }
 
-/// Clear all messages from a Chat (preserves system prompt).
-pub export fn talu_chat_clear(handle: ?*ChatHandle) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.reset(); // reset preserves system, clear clears system
-}
-
-/// Reset a Chat completely (clears all messages including system prompt).
-pub export fn talu_chat_reset(handle: ?*ChatHandle) callconv(.c) void {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return));
-    chat_state.clear();
-    chat_state.clearSystem();
-}
-
-/// Get the number of messages in a Chat.
-pub export fn talu_chat_len(handle: ?*ChatHandle) callconv(.c) usize {
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse return 0));
-    return chat_state.len();
-}
-
 /// Serialize Chat messages to JSON (OpenAI Completions format).
 /// Returns allocated string that must be freed with talu_text_free.
 /// Returns null on error (check talu_last_error for details).
@@ -2177,19 +1841,6 @@ pub export fn talu_chat_load_completions_json(
     return 0;
 }
 
-/// Get the Messages handle from a Chat (legacy API).
-/// Returns the underlying Messages structure pointer for zero-copy access.
-/// The returned handle is owned by the Chat - do NOT free it separately.
-/// Note: This returns the Conversation handle as the legacy Messages type is deprecated.
-pub export fn talu_chat_get_messages(handle: ?*ChatHandle) callconv(.c) ?*anyopaque {
-    capi_error.clearError();
-    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "chat handle is null", .{});
-        return null;
-    }));
-    return @ptrCast(chat_state.getConversation());
-}
-
 /// Count tokens for the current chat history, optionally with an additional message.
 ///
 /// This applies the chat template and tokenizes the result, returning the exact
@@ -2262,72 +1913,6 @@ pub export fn talu_chat_max_context_length(model: ?[*:0]const u8) callconv(.c) u
     };
 
     return engine.maxContextLength() orelse 0;
-}
-
-// =============================================================================
-// Session Update Notification
-// =============================================================================
-
-/// Notify the session that metadata fields have changed.
-///
-/// This is a lightweight notification to the conversation's storage backend.
-/// The session record itself is stored by the table-plane APIs; this call
-/// just pushes a `session_update` storage event so that backends can react.
-///
-/// Args:
-///   chat_handle: Opaque Chat handle
-///   model, title, system_prompt, config_json, marker,
-///   parent_session_id, group_id, metadata_json, source_doc_id,
-///   project_id:
-///     New values (or null to leave unchanged).
-///
-/// Returns: 0 on success, negative error code on failure.
-// lint:ignore capi-callconv - callconv(.c) on closing line
-pub export fn talu_chat_notify_session_update(
-    chat_handle: ?*ChatHandle,
-    model: ?[*:0]const u8,
-    title: ?[*:0]const u8,
-    system_prompt: ?[*:0]const u8,
-    config_json: ?[*:0]const u8,
-    marker: ?[*:0]const u8,
-    parent_session_id: ?[*:0]const u8,
-    group_id: ?[*:0]const u8,
-    metadata_json: ?[*:0]const u8,
-    source_doc_id: ?[*:0]const u8,
-    project_id: ?[*:0]const u8,
-) callconv(.c) i32 {
-    capi_error.clearError();
-
-    const chat: *Chat = @ptrCast(@alignCast(chat_handle orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "chat_handle is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    }));
-
-    const model_slice: ?[]const u8 = if (model) |m| std.mem.span(m) else null;
-    const title_slice: ?[]const u8 = if (title) |t| std.mem.span(t) else null;
-    const system_slice: ?[]const u8 = if (system_prompt) |s| std.mem.span(s) else null;
-    const config_slice: ?[]const u8 = if (config_json) |c| std.mem.span(c) else null;
-    const marker_slice: ?[]const u8 = if (marker) |s| std.mem.span(s) else null;
-    const parent_session_id_slice: ?[]const u8 = if (parent_session_id) |p| std.mem.span(p) else null;
-    const group_id_slice: ?[]const u8 = if (group_id) |g| std.mem.span(g) else null;
-    const metadata_json_slice: ?[]const u8 = if (metadata_json) |m| std.mem.span(m) else null;
-    const source_doc_id_slice: ?[]const u8 = if (source_doc_id) |s| std.mem.span(s) else null;
-    const project_id_slice: ?[]const u8 = if (project_id) |p| std.mem.span(p) else null;
-
-    chat.conv.notifySessionUpdate(
-        model_slice,
-        title_slice,
-        system_slice,
-        config_slice,
-        marker_slice,
-        parent_session_id_slice,
-        group_id_slice,
-        metadata_json_slice,
-        source_doc_id_slice,
-        project_id_slice,
-    );
-
-    return 0;
 }
 
 // =============================================================================
@@ -2494,7 +2079,8 @@ test "talu_chat_load_completions_json valid messages loads into conversation" {
     const json = "[{\"role\":\"user\",\"content\":\"Hello\"}]";
     const rc = talu_chat_load_completions_json(chat_handle, json.ptr, json.len);
     try std.testing.expectEqual(@as(i32, 0), rc);
-    try std.testing.expect(talu_chat_len(chat_handle) > 0);
+    const chat_state: *Chat = @ptrCast(@alignCast(chat_handle));
+    try std.testing.expect(chat_state.len() > 0);
 }
 
 test "talu_chat_load_completions_json invalid json returns error" {

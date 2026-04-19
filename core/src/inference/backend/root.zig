@@ -188,6 +188,9 @@ pub const InitOptions = struct {
         model_path: ?[]const u8 = null,
         /// User model reference (e.g. "Qwen/Qwen3.5-0.8B") for metadata/logging.
         model_id: ?[]const u8 = null,
+        /// Absolute safetensors path used by Metal vision runtime when payload
+        /// data is required beyond metadata-only load.
+        weights_path: ?[]const u8 = null,
     };
 
     selection: Selection = .auto,
@@ -1720,6 +1723,17 @@ pub const Backend = union(enum) {
         }
     }
 
+    pub fn takeLastVisionEncodeNs(self: *Backend) u64 {
+        return switch (self.*) {
+            .cpu => 0,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "takeLastVisionEncodeNs"))
+                b.takeLastVisionEncodeNs()
+            else
+                0,
+            .cuda => 0,
+        };
+    }
+
     pub fn decodeBatch(
         self: *Backend,
         requests: []const DecodeRequest,
@@ -1808,9 +1822,12 @@ fn getMetalUnsupportedReason(
 }
 
 fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool {
-    // Metal decode-model path currently does not support recurrent mamba
-    // layer topologies.
-    return runtime.has_mamba;
+    // Do not hard-reject runtime topologies during backend selection.
+    // Auto mode should attempt Metal and fall back only on concrete backend
+    // initialization failures. This keeps backend choice aligned with actual
+    // backend capabilities as they evolve.
+    _ = runtime;
+    return false;
 }
 
 fn initCpu(
@@ -1862,6 +1879,7 @@ fn initMetal(
     const metal_backend_state = try metal.BackendType.init(allocator, loaded, .{
         .model_path = if (config) |c| c.model_path else null,
         .model_id = if (config) |c| c.model_id else null,
+        .weights_path = if (config) |c| c.weights_path else null,
         .memory_fit_is_error = std.mem.eql(u8, reason, "configured"),
     });
     log.info("inference", "Backend selected: metal", .{ .reason = reason });
@@ -2181,7 +2199,7 @@ test "isMetalSupported rejects models when runtime features are unsupported" {
     try std.testing.expect(!isMetalSupported(&config, &runtime, .grouped_affine_u4, true));
 }
 
-test "runtimeHasMetalUnsupportedFeatures flags unsupported metal topology" {
+test "runtimeHasMetalUnsupportedFeatures does not pre-reject known topologies" {
     var runtime = std.mem.zeroes(tensor.ModelRuntime);
     try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
 
@@ -2190,7 +2208,7 @@ test "runtimeHasMetalUnsupportedFeatures flags unsupported metal topology" {
 
     runtime.has_mla = false;
     runtime.has_mamba = true;
-    try std.testing.expect(runtimeHasMetalUnsupportedFeatures(&runtime));
+    try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
 
     runtime.has_mamba = false;
     runtime.has_gated_delta = true;
@@ -2555,11 +2573,11 @@ test "metal module surface does not expose legacy runtime graph symbols" {
     try std.testing.expect(!@hasDecl(metal, "runtime_graph"));
 }
 
-test "metal module surface maps to current cpu-backed helper modules" {
+test "metal module surface maps to shared helper modules without vision type aliasing" {
     if (!has_metal) return;
     try std.testing.expect(metal.executor.Model == cpu.executor.Model);
     try std.testing.expect(metal.kernels.RMSNorm == cpu.kernels.RMSNorm);
-    try std.testing.expect(metal.vision.VisionRuntime == cpu.vision.VisionRuntime);
+    try std.testing.expect(metal.vision.VisionRuntime != cpu.vision.VisionRuntime);
 }
 
 test "visionMaxPixels dispatches to backend vision module" {

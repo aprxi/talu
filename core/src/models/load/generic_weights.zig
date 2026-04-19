@@ -624,13 +624,6 @@ fn getExpectedIn(spec: WeightSpec, raw_tensor: Tensor, model_config: *const tens
     return d_model;
 }
 
-fn validateExpectedShape(tensor_view: Tensor, expected: []const usize) !void {
-    if (tensor_view.n_dims != expected.len) return error.InvalidShape;
-    for (expected, 0..) |dim, idx| {
-        if (@as(usize, @intCast(tensor_view.shape[idx])) != dim) return error.InvalidShape;
-    }
-}
-
 fn hasTransform(transforms_list: []const WeightTransform, transform: WeightTransform) bool {
     for (transforms_list) |t| {
         if (t == transform) return true;

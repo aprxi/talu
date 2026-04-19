@@ -126,22 +126,19 @@ test "validateSpecDetailed identifies invalid backend type" {
     try std.testing.expectEqual(ValidationIssue.invalid_backend_type, result.issue);
 }
 
-test "validateSpecDetailed accepts valid OpenAI spec" {
-    const ref = "openai://gpt-4";
+test "validateSpecDetailed accepts valid local spec" {
+    const ref = "Qwen/Qwen3-0.6B";
     var c_spec = TaluModelSpec{
         .abi_version = 1,
         .struct_size = @sizeOf(TaluModelSpec),
         .ref = ref,
-        .backend_type_raw = @intFromEnum(BackendType.OpenAICompatible),
+        .backend_type_raw = @intFromEnum(BackendType.Local),
         .backend_config = .{
-            .openai_compat = .{
-                .base_url = null,
-                .api_key = "test-key",
-                .org_id = null,
-                .timeout_ms = 30000,
-                .max_retries = 3,
-                .custom_headers_json = null,
-                ._reserved = [_]u8{0} ** 24,
+            .local = .{
+                .gpu_layers = -1,
+                .use_mmap = 1,
+                .num_threads = 0,
+                ._reserved = [_]u8{0} ** 32,
             },
         },
     };
@@ -155,22 +152,19 @@ test "validateSpecDetailed accepts valid OpenAI spec" {
 // Canonicalization Tests
 // =============================================================================
 
-test "canonicalizeSpec succeeds for valid OpenAI spec" {
-    const ref = "openai://gpt-4";
+test "canonicalizeSpec succeeds for valid local spec" {
+    const ref = "Qwen/Qwen3-0.6B";
     var c_spec = TaluModelSpec{
         .abi_version = 1,
         .struct_size = @sizeOf(TaluModelSpec),
         .ref = ref,
-        .backend_type_raw = @intFromEnum(BackendType.OpenAICompatible),
+        .backend_type_raw = @intFromEnum(BackendType.Local),
         .backend_config = .{
-            .openai_compat = .{
-                .base_url = null,
-                .api_key = "test-key",
-                .org_id = null,
-                .timeout_ms = 30000,
-                .max_retries = 3,
-                .custom_headers_json = null,
-                ._reserved = [_]u8{0} ** 24,
+            .local = .{
+                .gpu_layers = -1,
+                .use_mmap = 1,
+                .num_threads = 0,
+                ._reserved = [_]u8{0} ** 32,
             },
         },
     };
@@ -178,26 +172,23 @@ test "canonicalizeSpec succeeds for valid OpenAI spec" {
     var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
     defer canonical.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(BackendType.OpenAICompatible, canonical.backend_type);
-    try std.testing.expectEqualStrings("openai://gpt-4", canonical.ref);
+    try std.testing.expectEqual(BackendType.Local, canonical.backend_type);
+    try std.testing.expectEqualStrings("Qwen/Qwen3-0.6B", canonical.ref);
 }
 
 test "canonicalizeSpec owns its memory" {
-    const ref = "openai://gpt-4";
+    const ref = "Qwen/Qwen3-0.6B";
     var c_spec = TaluModelSpec{
         .abi_version = 1,
         .struct_size = @sizeOf(TaluModelSpec),
         .ref = ref,
-        .backend_type_raw = @intFromEnum(BackendType.OpenAICompatible),
+        .backend_type_raw = @intFromEnum(BackendType.Local),
         .backend_config = .{
-            .openai_compat = .{
-                .base_url = null,
-                .api_key = "test-key",
-                .org_id = null,
-                .timeout_ms = 30000,
-                .max_retries = 3,
-                .custom_headers_json = null,
-                ._reserved = [_]u8{0} ** 24,
+            .local = .{
+                .gpu_layers = -1,
+                .use_mmap = 1,
+                .num_threads = 0,
+                ._reserved = [_]u8{0} ** 32,
             },
         },
     };
@@ -247,7 +238,7 @@ test "parseBackendType returns null for invalid values" {
 test "parseBackendType returns correct types" {
     try std.testing.expectEqual(BackendType.Unspecified, spec.parseBackendType(-1).?);
     try std.testing.expectEqual(BackendType.Local, spec.parseBackendType(0).?);
-    try std.testing.expectEqual(BackendType.OpenAICompatible, spec.parseBackendType(1).?);
+    try std.testing.expect(spec.parseBackendType(1) == null);
 }
 
 // =============================================================================
@@ -257,5 +248,4 @@ test "parseBackendType returns correct types" {
 test "BackendType enum has expected values" {
     try std.testing.expectEqual(@as(i32, -1), @intFromEnum(BackendType.Unspecified));
     try std.testing.expectEqual(@as(i32, 0), @intFromEnum(BackendType.Local));
-    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(BackendType.OpenAICompatible));
 }

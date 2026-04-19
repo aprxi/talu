@@ -684,13 +684,6 @@ pub fn createArrayF32(data: []const f32, shape: []const i64) ArrayHandle {
     return mlx_array_from_float32(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
 }
 
-/// Create MLX array from unaligned float32 data (for mmap'd safetensor data)
-pub fn createArrayF32Unaligned(data: [*]align(1) const f32, len: usize, shape: []const i64) ArrayHandle {
-    _ = len;
-    const shape_usize = shapeToUsize(shape);
-    return mlx_array_from_float32(@ptrCast(data), &shape_usize.shape, shape_usize.len);
-}
-
 /// Create MLX array from caller-persistent float32 storage.
 /// Use only for model weights or other buffers whose host lifetime is explicit
 /// and guaranteed to outlive the MLX array handle.
@@ -706,33 +699,12 @@ pub fn createBorrowedArrayF32Unaligned(data: [*]align(1) const f32, len: usize, 
     return mlx_array_from_float32_borrowed(@ptrCast(data), &shape_usize.shape, shape_usize.len);
 }
 
-/// Create MLX array from Zig slice (uint32)
-fn createArrayU32(data: []const u32, shape: []const i64) ArrayHandle {
-    const shape_usize = shapeToUsize(shape);
-    return mlx_array_from_uint32(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
-}
-
 /// Create MLX array from unaligned uint32 data (for mmap'd safetensor data)
 pub fn createArrayU32Unaligned(data: [*]align(1) const u32, len: usize, shape: []const i64) ArrayHandle {
     _ = len; // used for bounds checking in caller
     const shape_usize = shapeToUsize(shape);
     // Cast to *const anyopaque to avoid alignment checks - C++ uses memcpy internally
     return mlx_array_from_uint32(@ptrCast(data), &shape_usize.shape, shape_usize.len);
-}
-
-/// Create MLX array from caller-persistent unaligned uint32 storage.
-/// Use only when the source host buffer lifetime is explicitly tied to the
-/// resulting MLX handle (for example persistent model weights).
-pub fn createPersistentArrayU32Unaligned(data: [*]align(1) const u32, len: usize, shape: []const i64) ArrayHandle {
-    _ = len;
-    const shape_usize = shapeToUsize(shape);
-    return mlx_array_from_uint32_persistent(@ptrCast(data), &shape_usize.shape, shape_usize.len);
-}
-
-/// Create MLX array from Zig slice (bfloat16 as u16)
-fn createArrayBF16(data: []const u16, shape: []const i64) ArrayHandle {
-    const shape_usize = shapeToUsize(shape);
-    return mlx_array_from_bfloat16(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
 }
 
 /// Create MLX array from unaligned bfloat16 data (for mmap'd safetensor data)
@@ -763,12 +735,6 @@ pub fn createArrayBF16NormUnaligned(data: [*]align(1) const u16, len: usize, sha
     _ = len; // used for bounds checking in caller
     const shape_usize = shapeToUsize(shape);
     return mlx_array_from_bfloat16_norm(@ptrCast(data), &shape_usize.shape, shape_usize.len);
-}
-
-/// Create MLX array from Zig slice (float16/IEEE as u16)
-fn createArrayF16(data: []const u16, shape: []const i64) ArrayHandle {
-    const shape_usize = shapeToUsize(shape);
-    return mlx_array_from_float16(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
 }
 
 /// Create MLX array from unaligned float16 data (for mmap'd safetensor data)
@@ -804,10 +770,6 @@ pub fn asyncEval(handles: []const ArrayHandle) void {
 /// Copy array data from GPU to CPU
 pub fn copyToHost(handle: ArrayHandle, out: []f32) void {
     mlx_array_to_float32(handle, out.ptr, out.len);
-}
-
-pub fn copyU32ToHost(handle: ArrayHandle, out: []u32) void {
-    mlx_array_to_uint32(handle, out.ptr, out.len);
 }
 
 pub fn copyU8ToHost(handle: ArrayHandle, out: []u8) void {

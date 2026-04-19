@@ -46,6 +46,23 @@ pub enum ContentPart {
 /// Sampling parameters default to `-1.0` (unset), matching the C API sentinel.
 /// The Zig core treats negative values as "use model/chat defaults". Callers
 /// must explicitly set any parameter they want to override.
+#[derive(Debug, Clone)]
+pub struct VisionPrefillImage {
+    pub pixels: Vec<f32>,
+    pub width: u32,
+    pub height: u32,
+    pub grid_temporal: u32,
+    pub grid_height: u32,
+    pub grid_width: u32,
+    pub token_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisionPrefillInput {
+    pub image_token_id: u32,
+    pub images: Vec<VisionPrefillImage>,
+}
+
 pub struct GenerateConfig {
     /// Maximum number of tokens to generate (total: thinking + answer).
     pub max_tokens: usize,
@@ -91,6 +108,9 @@ pub struct GenerateConfig {
     /// Optional prefill progress callback. Called once per transformer layer
     /// during prefill (not decode). Arguments: (completed_layers, total_layers).
     pub prefill_progress: Option<PrefillProgressCallback>,
+    /// Optional externally prepared vision input. When set, local image
+    /// decode/preprocess is skipped and this payload is used directly.
+    pub vision_prefill: Option<VisionPrefillInput>,
 }
 
 impl Default for GenerateConfig {
@@ -116,6 +136,7 @@ impl Default for GenerateConfig {
             raw_output: false,
             completions_mode: false,
             prefill_progress: None,
+            vision_prefill: None,
         }
     }
 }
@@ -328,6 +349,8 @@ struct ConfigHolder {
     _tool_choice: Option<CString>,
     _extra_body: Option<CString>,
     _stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    _vision_images: Vec<talu_sys::CGenerateVisionImage>,
+    _vision_pixels: Vec<Vec<f32>>,
     config: talu_sys::CGenerateConfig,
 }
 
@@ -364,6 +387,9 @@ impl ConfigHolder {
             .transpose()?;
 
         let stop_flag = cfg.stop_flag.clone();
+
+        let mut vision_images = Vec::new();
+        let mut vision_pixels = Vec::new();
 
         let mut c_config = talu_sys::CGenerateConfig::default();
         c_config.max_tokens = cfg.max_tokens;
@@ -418,6 +444,36 @@ impl ConfigHolder {
             c_config.prefill_progress_data = cb as *const PrefillProgressCallback as *mut c_void;
         }
 
+        if let Some(ref vision_prefill) = cfg.vision_prefill {
+            vision_pixels.reserve(vision_prefill.images.len());
+            vision_images.reserve(vision_prefill.images.len());
+            for img in &vision_prefill.images {
+                vision_pixels.push(img.pixels.clone());
+                let pixels = vision_pixels.last().expect("vision pixels just pushed");
+                vision_images.push(talu_sys::CGenerateVisionImage {
+                    pixels_ptr: if pixels.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        pixels.as_ptr()
+                    },
+                    pixel_count: pixels.len(),
+                    width: img.width,
+                    height: img.height,
+                    grid_temporal: img.grid_temporal,
+                    grid_height: img.grid_height,
+                    grid_width: img.grid_width,
+                    token_count: img.token_count,
+                });
+            }
+            c_config.external_vision_images = if vision_images.is_empty() {
+                std::ptr::null()
+            } else {
+                vision_images.as_ptr()
+            };
+            c_config.external_vision_image_count = vision_images.len();
+            c_config.external_vision_image_token_id = vision_prefill.image_token_id;
+        }
+
         Ok(Self {
             _template_override: template_override,
             _extra_context: reasoning_effort,
@@ -425,6 +481,8 @@ impl ConfigHolder {
             _tool_choice: tool_choice,
             _extra_body: extra_body,
             _stop_flag: stop_flag,
+            _vision_images: vision_images,
+            _vision_pixels: vision_pixels,
             config: c_config,
         })
     }

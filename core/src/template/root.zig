@@ -85,10 +85,6 @@ const Evaluator = eval_mod.Evaluator;
 const Parser = parser_mod.Parser;
 const Lexer = lexer_mod.Lexer;
 
-// Re-export behavioral types so check_coverage.sh --integration can verify test coverage
-pub const TemplateEvaluator = eval_mod.Evaluator;
-pub const TemplateParserInternal = parser_mod.Parser;
-pub const TemplateLexer = lexer_mod.Lexer;
 pub const EvalError = eval_mod.EvalError;
 pub const ParseError = parser_mod.ParseError;
 pub const Token = lexer_mod.Token;

@@ -75,15 +75,46 @@ def _get_lib_path() -> Path:
         return ZIG_OUT_LIB / "libtalu.so"
 
 
+def _latest_source_mtime() -> float:
+    """Return newest mtime among core/API files that affect Python FFI ABI."""
+    candidates = [
+        PROJECT_ROOT / "build.zig",
+        PROJECT_ROOT / "core" / "helpers" / "gen_bindings_python.zig",
+        PROJECT_ROOT / "bindings" / "python" / "talu" / "_native.py",
+    ]
+    latest = 0.0
+    for path in candidates:
+        if path.exists():
+            latest = max(latest, path.stat().st_mtime)
+
+    core_src = PROJECT_ROOT / "core" / "src"
+    if core_src.exists():
+        for zig_file in core_src.rglob("*.zig"):
+            latest = max(latest, zig_file.stat().st_mtime)
+
+    return latest
+
+
+def _library_is_stale(lib_path: Path) -> bool:
+    """True when libtalu is older than relevant source/ABI inputs."""
+    if not lib_path.exists():
+        return True
+    lib_mtime = lib_path.stat().st_mtime
+    return _latest_source_mtime() > lib_mtime
+
+
 def _ensure_library_ready() -> str | None:
     """Ensure shared library exists and is loadable, returning skip reason on failure."""
     lib_path = _get_lib_path()
 
-    if not lib_path.exists():
-        print(f"\nLibrary not found at {lib_path}, attempting build...")
+    if _library_is_stale(lib_path):
+        if lib_path.exists():
+            print(f"\nLibrary at {lib_path} is stale, rebuilding...")
+        else:
+            print(f"\nLibrary not found at {lib_path}, attempting build...")
         try:
             result = subprocess.run(
-                ["zig", "build"],
+                ["zig", "build", "release", "-Drelease"],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -317,19 +348,25 @@ def _validate_model_loadable_for_embeddings(model_uri: str) -> str | None:
 
 
 def _arg_targets_path(args: tuple[str, ...], target: str) -> bool:
-    """Return True when pytest invocation args include a given test path target."""
-    normalized_target = target.replace("\\", "/")
+    """Return True when pytest args overlap with target path (parent/child aware)."""
+    normalized_target = target.replace("\\", "/").split("::", 1)[0].rstrip("/")
     for arg in args:
         if arg.startswith("-"):
             continue
-        normalized_arg = arg.replace("\\", "/")
-        if normalized_target in normalized_arg:
+        normalized_arg = arg.replace("\\", "/").split("::", 1)[0].rstrip("/")
+        if not normalized_arg:
+            continue
+        if (
+            normalized_arg == normalized_target
+            or normalized_arg.startswith(normalized_target + "/")
+            or normalized_target.startswith(normalized_arg + "/")
+        ):
             return True
     return False
 
 
 def _preflight_models_for_selected_suites(config) -> None:
-    """Fail fast on main process for suites that require model-backed tokenizer fixtures."""
+    """Fail fast once in main process when required model fixtures are unavailable."""
     if hasattr(config, "workerinput"):
         return
 
@@ -364,24 +401,42 @@ def _preflight_models_for_selected_suites(config) -> None:
             _validate_model_loadable_for_tokenizer,
         ),
     )
-    selected = [
-        (env_var, model_uri, validator)
-        for suite_path, env_var, model_uri, validator in suite_model_targets
-        if _arg_targets_path(args, suite_path)
-    ]
-    if not selected:
+    explicit_paths = tuple(arg for arg in args if not arg.startswith("-"))
+    if explicit_paths:
+        selected = [
+            (env_var, model_uri, validator)
+            for suite_path, env_var, model_uri, validator in suite_model_targets
+            if _arg_targets_path(args, suite_path)
+        ]
+    else:
+        # No explicit paths => full-suite run; preflight all model-backed suites.
+        selected = [(env_var, model_uri, validator) for _, env_var, model_uri, validator in suite_model_targets]
+
+    # De-duplicate repeated model checks across suites.
+    dedup: dict[tuple[str, str], tuple[str, str, object]] = {}
+    for env_var, model_uri, validator in selected:
+        dedup[(env_var, model_uri)] = (env_var, model_uri, validator)
+    selected_unique = list(dedup.values())
+
+    if not selected_unique:
         return
 
     library_reason = _ensure_library_ready()
     if library_reason is not None:
-        return
+        pytest.exit(library_reason, returncode=2)
 
-    for env_var, model_uri, validator in selected:
+    errors: list[str] = []
+    for env_var, model_uri, validator in selected_unique:
         if not _is_model_available(model_uri):
-            pytest.exit(_missing_model_msg(env_var, model_uri), returncode=2)
+            errors.append(_missing_model_msg(env_var, model_uri))
+            continue
         load_error = validator(model_uri)
         if load_error is not None:
-            pytest.exit(_unusable_model_msg(env_var, model_uri, load_error), returncode=2)
+            errors.append(_unusable_model_msg(env_var, model_uri, load_error))
+
+    if errors:
+        joined = "\n\n---\n\n".join(errors)
+        pytest.exit(f"Model preflight failed.\n\n{joined}", returncode=2)
 
 
 @pytest.fixture(scope="session")
@@ -392,13 +447,10 @@ def test_model_path(ensure_library_built):
         load_error = _validate_model_loadable_for_tokenizer(model_uri)
         if load_error is None:
             return model_uri
-        pytest.exit(
-            _unusable_model_msg("TEST_MODEL_URI_TEXT_RANDOM", model_uri, load_error),
-            returncode=2,
-        )
+        pytest.skip(_unusable_model_msg("TEST_MODEL_URI_TEXT_RANDOM", model_uri, load_error))
 
     msg = _missing_model_msg("TEST_MODEL_URI_TEXT_RANDOM", model_uri)
-    pytest.exit(msg, returncode=2)
+    pytest.skip(msg)
 
 
 # Note: The old `session` fixture that created Chat(model_path) is removed.

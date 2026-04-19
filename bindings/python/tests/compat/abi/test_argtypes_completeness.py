@@ -124,7 +124,6 @@ class TestKnownCriticalFunctions:
             "talu_chat_create_with_session",
             "talu_chat_create_with_system_and_session",
             "talu_chat_get_conversation",
-            "talu_chat_get_messages",
             "talu_chat_get_system",
         ]
 

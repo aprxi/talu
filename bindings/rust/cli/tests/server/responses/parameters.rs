@@ -252,21 +252,22 @@ fn responses_accepts_safety_identifier_shape() {
 }
 
 #[test]
-fn responses_accepts_spec_fields_shape() {
+fn responses_rejects_provider_orchestration_fields() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate_with(
-        &ctx,
-        &model,
-        serde_json::json!({
-            "parallel_tool_calls": true,
-            "background": true,
-            "service_tier": "default",
-            "prompt_cache_key": "cache-key-1"
-        }),
+    let body = serde_json::json!({
+        "model": &model,
+        "input": "Hello",
+        "max_output_tokens": 16,
+        "parallel_tool_calls": true
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("parallel_tool_calls"),
+        "body: {}",
+        resp.body
     );
-    assert_eq!(json["parallel_tool_calls"].as_bool(), Some(true));
-    assert_eq!(json["background"].as_bool(), Some(true));
-    assert_eq!(json["service_tier"].as_str(), Some("default"));
-    assert_eq!(json["prompt_cache_key"].as_str(), Some("cache-key-1"));
 }

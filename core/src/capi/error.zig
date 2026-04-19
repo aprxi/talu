@@ -82,70 +82,11 @@ pub fn setErrorWithCode(code: ErrorCode, comptime fmt: []const u8, args: anytype
     }
 }
 
-/// Set error with cause chain (flattened into message).
-/// IMPORTANT: cause_msg must NOT alias the TLS error buffer.
-/// NOTE: Currently unused, but kept for future error chaining support.
-fn setErrorWithCause(
-    err: anyerror,
-    cause_msg: ?[]const u8,
-    comptime fmt: []const u8,
-    args: anytype,
-) void {
-    last_error_code = errorToCode(err);
-    is_truncated = false;
-
-    const max_message_len = ERROR_BUF_SIZE - 1 - TRUNCATED_SUFFIX.len;
-    var buffer_stream = std.io.fixedBufferStream(error_buffer[0..max_message_len]);
-    const writer = buffer_stream.writer();
-
-    writer.print(fmt, args) catch {
-        is_truncated = true;
-    };
-
-    if (!is_truncated) {
-        if (cause_msg) |cause_message| {
-            writer.print("\n  caused by: {s}", .{cause_message}) catch {
-                is_truncated = true;
-            };
-        }
-    }
-
-    if (is_truncated) {
-        @memcpy(error_buffer[buffer_stream.pos..][0..TRUNCATED_SUFFIX.len], TRUNCATED_SUFFIX);
-        error_buffer[buffer_stream.pos + TRUNCATED_SUFFIX.len] = 0;
-        error_length = buffer_stream.pos + TRUNCATED_SUFFIX.len;
-    } else {
-        error_buffer[buffer_stream.pos] = 0;
-        error_length = buffer_stream.pos;
-    }
-}
-
 /// Clear error state.
 pub fn clearError() void {
     last_error_code = .ok;
     error_length = 0;
     is_truncated = false;
-}
-
-/// Set error from a simple string message.
-pub fn set_last_error(msg: []const u8) void {
-    last_error_code = .internal_error;
-    is_truncated = false;
-
-    const copy_len = @min(msg.len, ERROR_BUF_SIZE - 1);
-    @memcpy(error_buffer[0..copy_len], msg[0..copy_len]);
-    error_buffer[copy_len] = 0;
-    error_length = copy_len;
-}
-
-/// Set error from an error value.
-pub fn set_last_error_from_err(err: anyerror) void {
-    setError(err, "{s}", .{@errorName(err)});
-}
-
-/// Get the last error message (for internal use).
-pub fn get_last_error() ?[*:0]const u8 {
-    return talu_last_error();
 }
 
 /// Retrieve last error message.

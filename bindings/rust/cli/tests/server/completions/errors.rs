@@ -83,4 +83,51 @@ fn completions_error_shape_matches_openai() {
         "must have error.message"
     );
     assert!(json["error"]["type"].is_string(), "must have error.type");
+    assert!(
+        json["error"].get("code").is_some(),
+        "must have error.code key"
+    );
+    assert!(
+        json["error"].get("param").is_some(),
+        "must have error.param key"
+    );
+}
+
+#[test]
+fn completions_invalid_json_has_invalid_request_error_type() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/chat/completions",
+        &[("Content-Type", "application/json")],
+        Some("{not json}"),
+    );
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(
+        json["error"]["type"].as_str(),
+        Some("invalid_request_error"),
+        "body: {}",
+        resp.body
+    );
+}
+
+#[test]
+fn completions_backend_missing_is_server_error_type() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "model": "test/model",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let resp = post_json(ctx.addr(), "/v1/chat/completions", &body);
+    // Without a loaded backend this request reaches generation and returns a server error.
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(
+        json["error"]["type"].as_str(),
+        Some("server_error"),
+        "body: {}",
+        resp.body
+    );
 }

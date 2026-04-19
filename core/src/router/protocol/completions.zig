@@ -1,6 +1,6 @@
 //! Completions Protocol Adapter
 //!
-//! Transforms Item-based Conversation data into the legacy Chat Completions
+//! Transforms Item-based Conversation data into the Chat Completions
 //! format used by OpenAI v1, Anthropic, Ollama, vLLM, etc.
 //!
 //! This module is the ONLY place that knows about Completions format conversion.
@@ -41,6 +41,7 @@ const responses_mod = @import("../../responses/root.zig");
 const Conversation = responses_mod.Conversation;
 const Item = responses_mod.Item;
 const ContentPart = responses_mod.ContentPart;
+const ContentType = responses_mod.ContentType;
 const MessageData = responses_mod.MessageData;
 
 // =============================================================================
@@ -68,7 +69,7 @@ pub const Options = struct {
 
 /// Serialize a Conversation to Chat Completions JSON format.
 ///
-/// This performs the "Folding" transform from Item-based format to legacy format.
+/// This performs the "Folding" transform from Item-based format to Chat Completions format.
 /// Caller owns the returned memory.
 ///
 /// Example output:
@@ -765,14 +766,17 @@ pub fn parse(
                         else => return error.InvalidContent,
                     };
 
-                    if (std.mem.eql(u8, type_str, "text")) {
+                    if (std.mem.eql(u8, type_str, "text") or std.mem.eql(u8, type_str, "input_text")) {
                         const text = switch (part_obj.get("text") orelse return error.InvalidContent) {
                             .string => |s| s,
                             else => return error.InvalidContent,
                         };
                         try conv.appendTextContent(msg, text);
+                    } else if (std.mem.eql(u8, type_str, "image_url") or std.mem.eql(u8, type_str, "image") or std.mem.eql(u8, type_str, "input_image")) {
+                        const image_url = parseImageUrl(part_obj) orelse return error.InvalidContent;
+                        const part = try conv.addContentPart(msg, ContentType.input_image);
+                        try part.appendData(conv.allocator, image_url);
                     }
-                    // Other content types (image_url, etc.) could be handled here
                 }
                 conv.finalizeItem(msg);
             },
@@ -839,6 +843,18 @@ pub fn parse(
     }
 }
 
+fn parseImageUrl(part_obj: std.json.ObjectMap) ?[]const u8 {
+    const value = part_obj.get("image_url") orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        .object => |image_obj| switch (image_obj.get("url") orelse return null) {
+            .string => |s| s,
+            else => null,
+        },
+        else => null,
+    };
+}
+
 test "parse simple messages" {
     const allocator = std.testing.allocator;
 
@@ -854,6 +870,52 @@ test "parse simple messages" {
     try parse(conv, json);
 
     try std.testing.expectEqual(@as(usize, 3), conv.len());
+}
+
+test "parse multimodal image_url content parts" {
+    const allocator = std.testing.allocator;
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    const json =
+        \\[
+        \\  {"role":"user","content":[
+        \\    {"type":"text","text":"What is in this image?"},
+        \\    {"type":"image_url","image_url":{"url":"file_123"}}
+        \\  ]}
+        \\]
+    ;
+
+    try parse(conv, json);
+    try std.testing.expectEqual(@as(usize, 1), conv.len());
+    const item = conv.getItem(0).?;
+    const msg = item.asMessage().?;
+    try std.testing.expectEqual(@as(usize, 2), msg.content.items.len);
+    try std.testing.expectEqualStrings("What is in this image?", msg.content.items[0].getData());
+    try std.testing.expectEqualStrings("file_123", msg.content.items[1].getData());
+}
+
+test "parse multimodal input_image content parts" {
+    const allocator = std.testing.allocator;
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    const json =
+        \\[
+        \\  {"role":"user","content":[
+        \\    {"type":"input_text","text":"describe"},
+        \\    {"type":"input_image","image_url":"prepared://input_0"}
+        \\  ]}
+        \\]
+    ;
+
+    try parse(conv, json);
+    try std.testing.expectEqual(@as(usize, 1), conv.len());
+    const item = conv.getItem(0).?;
+    const msg = item.asMessage().?;
+    try std.testing.expectEqual(@as(usize, 2), msg.content.items.len);
+    try std.testing.expectEqualStrings("describe", msg.content.items[0].getData());
+    try std.testing.expectEqualStrings("prepared://input_0", msg.content.items[1].getData());
 }
 
 test "parse and serialize roundtrip" {

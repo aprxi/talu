@@ -24,11 +24,25 @@ from .._native import (
     LocalConfig as CLocalConfig,
 )
 from .._native import (
-    OpenAICompatibleConfig as COpenAICompatibleConfig,
-)
-from .._native import (
     SamplingParams as _CSamplingParams,
 )
+
+try:
+    from .._native import OpenAICompatibleConfig as COpenAICompatibleConfig
+except ImportError:
+    # OpenAI-compatible backend config was removed from core CAPI.
+    # Keep a local struct definition so Python imports remain stable while
+    # remote backend paths are cleaned up.
+    class COpenAICompatibleConfig(ctypes.Structure):
+        _fields_ = [
+            ("base_url", ctypes.c_char_p),
+            ("api_key", ctypes.c_char_p),
+            ("org_id", ctypes.c_char_p),
+            ("timeout_ms", ctypes.c_int),
+            ("max_retries", ctypes.c_int),
+            ("custom_headers_json", ctypes.c_char_p),
+            ("_reserved", ctypes.c_uint8 * 24),
+        ]
 
 # Get the library handle (signatures are set up by _native.py at import time)
 _lib = get_lib()

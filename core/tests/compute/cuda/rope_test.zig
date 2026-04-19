@@ -47,7 +47,6 @@ test "rope.run matches interleaved partial-rope CPU reference on CUDA" {
         n_heads,
         head_dim,
         rope_dim,
-        rope_interleaved,
         position,
         theta,
     );
@@ -103,7 +102,6 @@ test "rope.run matches non-interleaved partial-rope CPU reference on CUDA" {
         n_heads,
         head_dim,
         rope_dim,
-        rope_interleaved,
         position,
         theta,
     );

@@ -33,30 +33,6 @@ pub fn make_local_spec(path: &CString) -> talu_sys::TaluModelSpec {
     }
 }
 
-/// Build a `TaluModelSpec` for an OpenAI-compatible backend (backend_type_raw = 1).
-///
-/// The returned spec borrows from the CStrings — caller must keep them alive.
-pub fn make_openai_spec(model_id: &CString, base_url: &CString) -> talu_sys::TaluModelSpec {
-    let openai_config = talu_sys::OpenAICompatibleConfig {
-        base_url: base_url.as_ptr(),
-        api_key: std::ptr::null(),
-        org_id: std::ptr::null(),
-        timeout_ms: 30_000,
-        max_retries: 1,
-        custom_headers_json: std::ptr::null(),
-        _reserved: [0; 24],
-    };
-    talu_sys::TaluModelSpec {
-        abi_version: 1,
-        struct_size: std::mem::size_of::<talu_sys::TaluModelSpec>() as u32,
-        ref_: model_id.as_ptr(),
-        backend_type_raw: 1, // OpenAICompatible
-        backend_config: talu_sys::BackendUnion {
-            openai_compat: openai_config,
-        },
-    }
-}
-
 /// Canonicalize a spec, panicking on failure. Returns the opaque canonical handle.
 pub fn canonicalize(spec: &mut talu_sys::TaluModelSpec) -> *mut c_void {
     let mut canon_ptr: *mut c_void = std::ptr::null_mut();

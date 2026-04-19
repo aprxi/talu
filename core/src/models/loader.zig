@@ -17,7 +17,6 @@ const validation = @import("load/validation.zig");
 pub const weights = weights_impl;
 pub const LoadedModel = weights_impl.LoadedModel;
 pub const LoadOptions = weights_impl.LoadOptions;
-pub const validateLoadedModel = validation.validate;
 
 // Re-export validation types so check_coverage.sh --integration can verify test coverage
 pub const Reporter = validation.Reporter;

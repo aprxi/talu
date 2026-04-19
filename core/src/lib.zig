@@ -14,8 +14,7 @@ pub const capi = @import("capi/root.zig");
 // error, preventing memory corruption from mismatched struct layouts.
 //
 // IMPORTANT: Bump this version whenever ANY of these change:
-//   - CStorageRecord, CStorageEvent, CSessionRecord (capi/storage.zig)
-//   - CGenerateOptions, CGenerateCallbacks (capi/generate.zig)
+//   - Any extern struct in capi/types.zig or capi/* public C API modules
 //   - Any other extern struct in the C-API
 //
 // This is the ONLY place you need to update - Python checks automatically.
@@ -36,25 +35,6 @@ comptime {
     _ = &talu_get_abi_version;
 
     // Tensor API
-    _ = &capi.talu_hello;
-    _ = &capi.talu_tensor_create;
-    _ = &capi.talu_tensor_zeros;
-    _ = &capi.talu_tensor_test_embeddings;
-    _ = &capi.talu_tensor_free;
-    _ = &capi.talu_tensor_data_ptr;
-    _ = &capi.talu_tensor_ndim;
-    _ = &capi.talu_tensor_shape;
-    _ = &capi.talu_tensor_strides;
-    _ = &capi.talu_tensor_dtype;
-    _ = &capi.talu_tensor_typestr;
-    _ = &capi.talu_tensor_device_type;
-    _ = &capi.talu_tensor_device_id;
-    _ = &capi.talu_tensor_is_cpu;
-    _ = &capi.talu_tensor_numel;
-    _ = &capi.talu_tensor_element_size;
-    _ = &capi.talu_tensor_to_dlpack;
-    _ = &capi.talu_dlpack_capsule_name;
-    _ = &capi.talu_dlpack_used_capsule_name;
 
     // Error API
     _ = &capi.talu_last_error;
@@ -76,7 +56,6 @@ comptime {
     _ = &capi.talu_free_string;
 
     // Config API
-    _ = &capi.talu_config_validate;
     _ = &capi.talu_config_canonicalize;
     _ = &capi.talu_config_get_view;
     _ = &capi.talu_config_free;
@@ -105,11 +84,8 @@ comptime {
     // SharedBuffer API (refcounted buffers for zero-copy interop)
     _ = &capi.talu_buffer_create_from_owned;
     _ = &capi.talu_buffer_create_from_copy;
-    _ = &capi.talu_buffer_retain;
     _ = &capi.talu_buffer_release;
     _ = &capi.talu_buffer_get_data_ptr;
-    _ = &capi.talu_buffer_get_capacity;
-    _ = &capi.talu_buffer_get_refcount;
 
     // Tokenizer-only API (lightweight, no model weights)
     _ = &capi.talu_tokenizer_create;
@@ -143,24 +119,10 @@ comptime {
     _ = &capi.talu_convert_free_string;
     _ = &capi.talu_convert_schemes;
 
-    // Image API
-    _ = &capi.talu_image_decode;
-    _ = &capi.talu_image_convert;
-    _ = &capi.talu_image_to_model_input;
-    _ = &capi.talu_image_encode;
-    _ = &capi.talu_image_free;
-    _ = &capi.talu_model_buffer_free;
-    _ = &capi.talu_image_encode_free;
-    _ = &capi.talu_file_inspect;
-    _ = &capi.talu_file_info_free;
-    _ = &capi.talu_file_transform;
-    _ = &capi.talu_file_bytes_free;
-
     // Repo API
     _ = &capi.talu_repo_is_cached;
     _ = &capi.talu_repo_get_cached_path;
     _ = &capi.talu_repo_get_hf_home;
-    _ = &capi.talu_repo_get_cache_dir;
     _ = &capi.talu_repo_list_models;
     _ = &capi.talu_repo_list_count;
     _ = &capi.talu_repo_list_get_id;
@@ -171,30 +133,13 @@ comptime {
     _ = &capi.talu_repo_total_size;
     _ = &capi.talu_repo_is_model_id;
     _ = &capi.talu_repo_fetch;
-    _ = &capi.talu_repo_exists;
     _ = &capi.talu_repo_list;
     _ = &capi.talu_repo_search;
     _ = &capi.talu_repo_string_list_count;
     _ = &capi.talu_repo_string_list_get;
     _ = &capi.talu_repo_string_list_free;
-    _ = &capi.talu_repo_meta_init;
-    _ = &capi.talu_repo_meta_free;
-    _ = &capi.talu_repo_meta_pin;
-    _ = &capi.talu_repo_meta_unpin;
-    _ = &capi.talu_repo_meta_update_size;
-    _ = &capi.talu_repo_meta_clear_size;
-    _ = &capi.talu_repo_meta_list_pins;
-    _ = &capi.talu_repo_meta_free_list;
-    _ = &capi.talu_sql_query;
-    _ = &capi.talu_sql_query_free;
 
     // Validate API (high-level sampler)
-    _ = &capi.talu_validate_create;
-    _ = &capi.talu_validate_free;
-    _ = &capi.talu_validate_apply;
-    _ = &capi.talu_validate_accept;
-    _ = &capi.talu_validate_is_complete;
-    _ = &capi.talu_validate_reset;
     _ = &capi.talu_set_response_format;
     _ = &capi.talu_clear_response_format;
 
@@ -204,29 +149,12 @@ comptime {
     _ = &capi.talu_validate_engine_reset;
     _ = &capi.talu_validate_engine_is_complete;
     _ = &capi.talu_validate_engine_get_position;
-    _ = &capi.talu_validate_engine_get_state_count;
     _ = &capi.talu_validate_engine_get_valid_bytes;
-    _ = &capi.talu_validate_engine_count_valid_bytes;
     _ = &capi.talu_validate_engine_can_accept;
-    _ = &capi.talu_validate_engine_advance_byte;
     _ = &capi.talu_validate_engine_advance;
     _ = &capi.talu_validate_engine_validate;
-    _ = &capi.talu_validate_engine_get_valid_tokens;
-    _ = &capi.talu_validate_engine_get_valid_tokens_with_tokenizer;
-    _ = &capi.talu_validate_engine_get_deterministic_continuation;
 
     // Token Mask API
-    _ = &capi.talu_token_mask_create;
-    _ = &capi.talu_token_mask_destroy;
-    _ = &capi.talu_token_mask_clear;
-    _ = &capi.talu_token_mask_set_all;
-    _ = &capi.talu_token_mask_is_valid;
-    _ = &capi.talu_token_mask_set;
-    _ = &capi.talu_token_mask_get_size;
-    _ = &capi.talu_token_mask_get_bits;
-    _ = &capi.talu_token_mask_get_word_count;
-    _ = &capi.talu_token_mask_count_valid;
-    _ = &capi.talu_token_mask_apply;
 
     // Chat API (maps to talu/chat/)
     _ = &capi.talu_chat_create;
@@ -235,36 +163,14 @@ comptime {
     _ = &capi.talu_chat_create_with_system_and_session;
     _ = &capi.talu_chat_free;
     _ = &capi.talu_chat_get_conversation;
-    _ = &capi.talu_chat_get_session_id;
     _ = &capi.talu_chat_set_ttl_ts;
     _ = &capi.talu_responses_clone_prefix;
     _ = &capi.talu_responses_truncate_after;
-    _ = &capi.talu_responses_load_storage_records;
-    _ = &capi.talu_responses_begin_fork;
-    _ = &capi.talu_responses_end_fork;
-    _ = &capi.talu_responses_set_item_parent;
-    _ = &capi.talu_responses_set_item_validation_flags;
-    _ = &capi.talu_chat_get_temperature;
-    _ = &capi.talu_chat_set_temperature;
-    _ = &capi.talu_chat_get_max_tokens;
-    _ = &capi.talu_chat_set_max_tokens;
-    _ = &capi.talu_chat_get_top_k;
-    _ = &capi.talu_chat_set_top_k;
-    _ = &capi.talu_chat_get_top_p;
-    _ = &capi.talu_chat_set_top_p;
-    _ = &capi.talu_chat_get_min_p;
-    _ = &capi.talu_chat_set_min_p;
-    _ = &capi.talu_chat_get_repetition_penalty;
-    _ = &capi.talu_chat_set_repetition_penalty;
     _ = &capi.talu_chat_set_system;
     _ = &capi.talu_chat_get_system;
-    _ = &capi.talu_chat_clear;
-    _ = &capi.talu_chat_reset;
-    _ = &capi.talu_chat_len;
     _ = &capi.talu_chat_to_json;
     _ = &capi.talu_chat_set_messages;
     _ = &capi.talu_chat_load_completions_json;
-    _ = &capi.talu_chat_get_messages;
 
     // Template API
     _ = &capi.talu_template_render;
@@ -279,15 +185,7 @@ comptime {
     _ = &capi.talu_router_embedding_free;
 
     // Scheduler API (continuous batching)
-    _ = &capi.talu_scheduler_create;
-    _ = &capi.talu_scheduler_destroy;
-    _ = &capi.talu_scheduler_submit;
-    _ = &capi.talu_scheduler_cancel;
-    _ = &capi.talu_scheduler_step;
-    _ = &capi.talu_scheduler_has_active;
-    _ = &capi.talu_scheduler_active_count;
     _ = &capi.talu_scheduler_score_tokens_nll;
-    _ = &capi.talu_scheduler_score_tokens_kld;
 
     // Batch API (responses-aware continuous batching)
     _ = &capi.talu_batch_create;
@@ -317,203 +215,6 @@ comptime {
     _ = &capi.talu_xray_count_matching;
     _ = &capi.talu_xray_get_samples;
     _ = &capi.talu_xray_point_name;
-
-    // Provider API (remote provider registry)
-    _ = &capi.talu_provider_count;
-    _ = &capi.talu_provider_get;
-    _ = &capi.talu_provider_get_by_name;
-    _ = &capi.talu_provider_parse;
-    _ = &capi.talu_provider_has_prefix;
-
-    // Policy API (tool call firewall)
-    _ = &capi.talu_policy_create;
-    _ = &capi.talu_policy_free;
-    _ = &capi.talu_policy_evaluate;
-    _ = &capi.talu_policy_get_mode;
-    _ = &capi.talu_chat_set_policy;
-
-    // Plugins API (UI plugin discovery)
-    _ = &capi.talu_plugins_scan;
-    _ = &capi.talu_plugins_list_count;
-    _ = &capi.talu_plugins_list_get;
-    _ = &capi.talu_plugins_list_free;
-
-    // Documents API (universal document storage)
-    _ = &capi.talu_db_docs_create;
-    _ = &capi.talu_db_docs_get;
-    _ = &capi.talu_db_docs_update;
-    _ = &capi.talu_db_docs_delete;
-    _ = &capi.talu_db_docs_delete_batch;
-    _ = &capi.talu_db_docs_set_marker_batch;
-    _ = &capi.talu_db_docs_list;
-    _ = &capi.talu_db_docs_free_list;
-    _ = &capi.talu_db_docs_search;
-    _ = &capi.talu_db_docs_free_search_results;
-    _ = &capi.talu_db_docs_search_batch;
-    _ = &capi.talu_db_docs_free_json;
-    _ = &capi.talu_db_docs_get_changes;
-    _ = &capi.talu_db_docs_free_changes;
-    _ = &capi.talu_db_docs_set_ttl;
-    _ = &capi.talu_db_docs_count_expired;
-    _ = &capi.talu_db_docs_create_delta;
-    _ = &capi.talu_db_docs_get_delta_chain;
-    _ = &capi.talu_db_docs_free_delta_chain;
-    _ = &capi.talu_db_docs_is_delta;
-    _ = &capi.talu_db_docs_get_base_id;
-    _ = &capi.talu_db_docs_get_compaction_stats;
-    _ = &capi.talu_db_docs_purge_expired;
-    _ = &capi.talu_db_docs_get_garbage_candidates;
-    _ = &capi.talu_db_docs_add_tag;
-    _ = &capi.talu_db_docs_remove_tag;
-    _ = &capi.talu_db_docs_get_tags;
-    _ = &capi.talu_db_docs_get_by_tag;
-    _ = &capi.talu_db_docs_free_string_list;
-    _ = &capi.talu_db_docs_get_blob_ref;
-
-    // Blob API (raw content-addressable blob storage)
-    _ = &capi.talu_db_blob_put;
-    _ = &capi.talu_db_blob_open_stream;
-    _ = &capi.talu_db_blob_stream_read;
-    _ = &capi.talu_db_blob_stream_total_size;
-    _ = &capi.talu_db_blob_stream_close;
-
-    // KV API (generic key/value namespace primitives)
-    _ = &capi.talu_db_kv_init;
-    _ = &capi.talu_db_kv_free;
-    _ = &capi.talu_db_kv_put;
-    _ = &capi.talu_db_kv_put_ex;
-    _ = &capi.talu_db_kv_get;
-    _ = &capi.talu_db_kv_delete;
-    _ = &capi.talu_db_kv_list;
-    _ = &capi.talu_db_kv_free_value;
-    _ = &capi.talu_db_kv_free_list;
-    _ = &capi.talu_db_kv_flush;
-    _ = &capi.talu_db_kv_flush_batched;
-    _ = &capi.talu_db_kv_compact;
-    _ = &capi.talu_db_kv_stats;
-    _ = &capi.talu_db_kv_watch_drain;
-    _ = &capi.talu_db_kv_free_watch_batch;
-    _ = &capi.talu_collab_init;
-    _ = &capi.talu_collab_free;
-    _ = &capi.talu_collab_open_session;
-    _ = &capi.talu_collab_get_summary;
-    _ = &capi.talu_collab_get_snapshot;
-    _ = &capi.talu_collab_submit_op;
-    _ = &capi.talu_collab_get_history;
-    _ = &capi.talu_collab_clear_snapshot;
-    _ = &capi.talu_collab_put_presence;
-    _ = &capi.talu_collab_get_presence;
-    _ = &capi.talu_collab_watch_drain;
-    _ = &capi.talu_collab_watch_wait;
-    _ = &capi.talu_collab_free_session;
-    _ = &capi.talu_collab_free_summary;
-    _ = &capi.talu_collab_free_value;
-    _ = &capi.talu_collab_free_op_result;
-    _ = &capi.talu_collab_free_history;
-    _ = &capi.talu_collab_free_watch_batch;
-
-    // Vector DB idempotent write API
-    _ = &capi.talu_db_vector_append_idempotent_ex;
-    _ = &capi.talu_db_vector_upsert_idempotent_ex;
-    _ = &capi.talu_db_vector_delete_idempotent;
-    _ = &capi.talu_db_vector_compact_idempotent;
-
-    // Agent API (tool registry + agent loop)
-    _ = &capi.talu_agent_registry_create;
-    _ = &capi.talu_agent_registry_free;
-    _ = &capi.talu_agent_registry_add;
-    _ = &capi.talu_agent_registry_count;
-    _ = &capi.talu_agent_run;
-
-    // Agent runtime policy API
-    _ = &capi.talu_agent_policy_create;
-    _ = &capi.talu_agent_policy_free;
-    _ = &capi.talu_agent_policy_check_action;
-    _ = &capi.talu_agent_policy_check_file;
-    _ = &capi.talu_agent_policy_check_process;
-    _ = &capi.talu_agent_policy_check_process_detailed;
-    _ = &capi.talu_agent_policy_validate_strict_emulation;
-    _ = &capi.talu_agent_policy_strict_emulation_decisions;
-
-    // Agent filesystem API
-    _ = &capi.talu_fs_create;
-    _ = &capi.talu_fs_free;
-    _ = &capi.talu_fs_read;
-    _ = &capi.talu_fs_write;
-    _ = &capi.talu_fs_edit;
-    _ = &capi.talu_fs_stat;
-    _ = &capi.talu_fs_list;
-    _ = &capi.talu_fs_remove;
-    _ = &capi.talu_fs_mkdir;
-    _ = &capi.talu_fs_rename;
-    _ = &capi.talu_fs_free_string;
-
-    // Agent shell API
-    _ = &capi.talu_shell_exec;
-    _ = &capi.talu_shell_exec_streaming;
-    _ = &capi.talu_shell_check_command;
-    _ = &capi.talu_shell_default_policy_json;
-    _ = &capi.talu_shell_normalize_command;
-    _ = &capi.talu_shell_free_string;
-    _ = &capi.talu_shell_open;
-    _ = &capi.talu_shell_close;
-    _ = &capi.talu_shell_write;
-    _ = &capi.talu_shell_read;
-    _ = &capi.talu_shell_resize;
-    _ = &capi.talu_shell_signal;
-    _ = &capi.talu_shell_alive;
-    _ = &capi.talu_shell_scrollback;
-
-    // Stateful Agent API
-    _ = &capi.talu_agent_create;
-    _ = &capi.talu_agent_free;
-    _ = &capi.talu_agent_set_system;
-    _ = &capi.talu_agent_register_tool;
-    _ = &capi.talu_agent_set_bus;
-    _ = &capi.talu_agent_prompt;
-    _ = &capi.talu_agent_continue;
-    _ = &capi.talu_agent_heartbeat;
-    _ = &capi.talu_agent_abort;
-    _ = &capi.talu_agent_get_chat;
-    _ = &capi.talu_agent_get_id;
-
-    // Agent goal API
-    _ = &capi.talu_agent_add_goal;
-    _ = &capi.talu_agent_remove_goal;
-    _ = &capi.talu_agent_clear_goals;
-    _ = &capi.talu_agent_goal_count;
-
-    // Agent context injection API
-    _ = &capi.talu_agent_set_context_inject;
-
-    // Tree-sitter API (code parsing, highlighting, querying)
-    _ = &capi.talu_treesitter_parser_create;
-    _ = &capi.talu_treesitter_parser_free;
-    _ = &capi.talu_treesitter_parse;
-    _ = &capi.talu_treesitter_tree_free;
-    _ = &capi.talu_treesitter_tree_sexp;
-    _ = &capi.talu_treesitter_highlight;
-    _ = &capi.talu_treesitter_query_create;
-    _ = &capi.talu_treesitter_query_free;
-    _ = &capi.talu_treesitter_query_exec;
-    _ = &capi.talu_treesitter_languages;
-    _ = &capi.talu_treesitter_language_from_filename;
-    _ = &capi.talu_treesitter_tree_json;
-    _ = &capi.talu_treesitter_highlight_rich;
-    _ = &capi.talu_treesitter_extract_callables;
-    _ = &capi.talu_treesitter_extract_call_sites;
-
-    // MessageBus API
-    _ = &capi.talu_agent_bus_create;
-    _ = &capi.talu_agent_bus_free;
-    _ = &capi.talu_agent_bus_register;
-    _ = &capi.talu_agent_bus_unregister;
-    _ = &capi.talu_agent_bus_add_peer;
-    _ = &capi.talu_agent_bus_remove_peer;
-    _ = &capi.talu_agent_bus_send;
-    _ = &capi.talu_agent_bus_deliver;
-    _ = &capi.talu_agent_bus_broadcast;
-    _ = &capi.talu_agent_bus_pending;
 
     // Training API (LoRA)
     _ = &capi.talu_train_create;

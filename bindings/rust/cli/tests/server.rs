@@ -4,25 +4,11 @@
 //! Run: `cargo test --test server`
 
 mod server {
-    pub mod agent;
     pub mod auth;
-    pub mod chat;
-    pub mod code;
-    pub mod collab;
     pub mod common;
     pub mod completions;
-    pub mod compliance;
-    pub mod console;
-    pub mod db;
-    pub mod events;
-    pub mod file;
-    pub mod files;
+    pub mod cors;
     pub mod openapi_docs;
-    pub mod plugins;
-    pub mod repo;
     pub mod responses;
-    pub mod search;
-    pub mod settings;
-    pub mod tags;
     pub mod tokenizer;
 }

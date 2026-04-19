@@ -1692,15 +1692,6 @@ pub fn runQkvProjection(
     return .unfused;
 }
 
-pub fn runGateUpProjection(
-    self: anytype,
-    input: *const compute.cuda.Buffer,
-    block: *const LayerAttentionRuntime,
-    rows: usize,
-) !ProjectionPath {
-    return runGateUpProjectionWithWeights(self, input, &block.w1, &block.w3, rows);
-}
-
 pub fn runGateUpProjectionWithWeights(
     self: anytype,
     input: *const compute.cuda.Buffer,

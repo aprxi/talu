@@ -205,7 +205,7 @@ test "CUDA gaffine U4 quantization produces BF16 scales matching CPU truncation"
 
     try cuda.launch.launchWithFamily(
         &device,
-        quant_fn,
+        quant_fn.function,
         .{
             .grid_x = group_count,
             .grid_y = row_count,

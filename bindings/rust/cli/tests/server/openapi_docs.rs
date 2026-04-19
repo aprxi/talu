@@ -1,9 +1,52 @@
-//! Integration tests for scoped OpenAPI and docs entrypoints outside DB.
+//! Integration tests for the trimmed inference-server docs surface.
 
 use crate::server::common::*;
 
 #[test]
-fn docs_hub_lists_non_db_sections() {
+fn health_endpoint_returns_ok() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let resp = get(ctx.addr(), "/health");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.body, "ok");
+}
+
+#[test]
+fn root_openapi_served_and_contains_paths() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let resp = get(ctx.addr(), "/openapi.json");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let content_type = resp.header("content-type").unwrap_or("");
+    assert!(
+        content_type.contains("application/json"),
+        "content-type={content_type}"
+    );
+
+    let json = resp.json();
+    let paths = json["paths"].as_object().expect("paths object");
+    assert!(
+        paths.contains_key("/v1/models"),
+        "missing /v1/models in root spec"
+    );
+    assert!(
+        paths.contains_key("/v1/chat/completions"),
+        "missing /v1/chat/completions in root spec"
+    );
+    assert!(
+        paths.contains_key("/v1/responses"),
+        "missing /v1/responses in root spec"
+    );
+    assert!(
+        paths.keys().any(|k| k.starts_with("/v1/tokenizer")),
+        "missing /v1/tokenizer* endpoints in root spec"
+    );
+    assert!(
+        paths.keys().all(|k| k.starts_with("/v1/")),
+        "root spec should expose only /v1/* endpoints"
+    );
+}
+
+#[test]
+fn docs_hub_lists_inference_sections() {
     let ctx = ServerTestContext::new(ServerConfig::new());
 
     let resp = get(ctx.addr(), "/docs");
@@ -18,28 +61,7 @@ fn docs_hub_lists_non_db_sections() {
         "/docs/chat",
         "/docs/responses",
         "/docs/models",
-        "/docs/files",
-        "/docs/collab",
-        "/docs/collab/resources",
-        "/docs/collab/pubsub",
-        "/docs/agent",
-        "/docs/agent/fs",
-        "/docs/agent/exec",
-        "/docs/agent/shell",
-        "/docs/agent/process",
-        "/docs/repo",
-        "/docs/search",
-        "/docs/tags",
-        "/docs/settings",
-        "/docs/plugins",
-        "/docs/code",
-        "/docs/events",
-        "/docs/db/tables",
-        "/docs/db/vectors",
-        "/docs/db/kv",
-        "/docs/db/blobs",
-        "/docs/db/sql",
-        "/docs/db/ops",
+        "/docs/tokenizer",
     ] {
         assert!(resp.body.contains(link), "missing link: {link}");
     }
@@ -53,22 +75,7 @@ fn scoped_docs_pages_point_to_scoped_specs() {
         ("/docs/chat", "/openapi/chat.json"),
         ("/docs/responses", "/openapi/responses.json"),
         ("/docs/models", "/openapi/models.json"),
-        ("/docs/files", "/openapi/files.json"),
-        ("/docs/collab", "/openapi/collab.json"),
-        ("/docs/collab/resources", "/openapi/collab/resources.json"),
-        ("/docs/collab/pubsub", "/openapi/collab/pubsub.json"),
-        ("/docs/agent", "/openapi/agent.json"),
-        ("/docs/agent/fs", "/openapi/agent/fs.json"),
-        ("/docs/agent/exec", "/openapi/agent/exec.json"),
-        ("/docs/agent/shell", "/openapi/agent/shell.json"),
-        ("/docs/agent/process", "/openapi/agent/process.json"),
-        ("/docs/repo", "/openapi/repo.json"),
-        ("/docs/search", "/openapi/search.json"),
-        ("/docs/tags", "/openapi/tags.json"),
-        ("/docs/settings", "/openapi/settings.json"),
-        ("/docs/plugins", "/openapi/plugins.json"),
-        ("/docs/code", "/openapi/code.json"),
-        ("/docs/events", "/openapi/events.json"),
+        ("/docs/tokenizer", "/openapi/tokenizer.json"),
     ] {
         let resp = get(ctx.addr(), path);
         assert_eq!(resp.status, 200, "path={path} body={}", resp.body);
@@ -96,25 +103,7 @@ fn scoped_openapi_specs_are_prefix_scoped() {
         ("/openapi/chat.json", vec!["/v1/chat/"]),
         ("/openapi/responses.json", vec!["/v1/responses"]),
         ("/openapi/models.json", vec!["/v1/models"]),
-        ("/openapi/files.json", vec!["/v1/files", "/v1/file"]),
-        ("/openapi/collab.json", vec!["/v1/collab/"]),
-        (
-            "/openapi/collab/resources.json",
-            vec!["/v1/collab/resources/"],
-        ),
-        ("/openapi/collab/pubsub.json", vec!["/v1/collab/pubsub"]),
-        ("/openapi/agent.json", vec!["/v1/agent/"]),
-        ("/openapi/agent/fs.json", vec!["/v1/agent/fs/"]),
-        ("/openapi/agent/exec.json", vec!["/v1/agent/exec"]),
-        ("/openapi/agent/shell.json", vec!["/v1/agent/shells"]),
-        ("/openapi/agent/process.json", vec!["/v1/agent/processes"]),
-        ("/openapi/repo.json", vec!["/v1/repo"]),
-        ("/openapi/search.json", vec!["/v1/search"]),
-        ("/openapi/tags.json", vec!["/v1/tags"]),
-        ("/openapi/settings.json", vec!["/v1/settings"]),
-        ("/openapi/plugins.json", vec!["/v1/plugins", "/v1/proxy"]),
-        ("/openapi/code.json", vec!["/v1/code"]),
-        ("/openapi/events.json", vec!["/v1/events"]),
+        ("/openapi/tokenizer.json", vec!["/v1/tokenizer"]),
     ] {
         let resp = get(ctx.addr(), path);
         assert_eq!(resp.status, 200, "path={path} body={}", resp.body);

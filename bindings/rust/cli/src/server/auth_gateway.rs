@@ -19,9 +19,9 @@
 //! This is safe because only the gateway possesses the secret, and the
 //! server is not network-reachable by end users.
 //!
-//! Tenant isolation is enforced at the storage layer: each tenant's data
-//! lives under `<bucket>/<storage_prefix>/`, so a request scoped to one
-//! tenant physically cannot read or write another tenant's data.
+//! Tenant isolation is enforced by request scoping: tenant IDs are validated
+//! against the registry and applied to per-tenant response-chain state, so a
+//! request scoped to one tenant cannot read another tenant's in-memory chain.
 
 use hyper::HeaderMap;
 

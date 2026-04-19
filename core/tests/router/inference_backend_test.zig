@@ -1,7 +1,7 @@
 //! Integration tests for InferenceBackend
 //!
 //! InferenceBackend is the backend that performs inference, created from a CanonicalSpec.
-//! It wraps LocalEngine for native inference or API configuration for remote inference.
+//! talu now routes local inference only.
 //!
 //! These tests verify the type structure, methods, and creation behavior.
 
@@ -12,7 +12,6 @@ const InferenceBackend = spec.InferenceBackend;
 const CanonicalSpec = spec.CanonicalSpec;
 const TaluModelSpec = spec.TaluModelSpec;
 const BackendType = spec.BackendType;
-const LocalEngine = main.router.LocalEngine;
 
 // =============================================================================
 // Type Export Tests
@@ -26,21 +25,18 @@ test "InferenceBackend is exported from router" {
 test "InferenceBackend has expected fields" {
     const fields = @typeInfo(InferenceBackend).@"struct".fields;
 
-    try std.testing.expectEqual(@as(usize, 3), fields.len);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
 
     var has_backend_type = false;
     var has_backend = false;
-    var has_model_ref = false;
 
     inline for (fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "backend_type")) has_backend_type = true;
         if (comptime std.mem.eql(u8, field.name, "backend")) has_backend = true;
-        if (comptime std.mem.eql(u8, field.name, "model_ref")) has_model_ref = true;
     }
 
     try std.testing.expect(has_backend_type);
     try std.testing.expect(has_backend);
-    try std.testing.expect(has_model_ref);
 }
 
 // =============================================================================
@@ -72,64 +68,11 @@ test "createInferenceBackend is exported" {
     try std.testing.expect(@hasDecl(spec, "createInferenceBackend"));
 }
 
-test "createInferenceBackend succeeds for valid OpenAI spec" {
-    const ref = "openai://gpt-4";
-    var c_spec = TaluModelSpec{
-        .abi_version = 1,
-        .struct_size = @sizeOf(TaluModelSpec),
-        .ref = ref,
-        .backend_type_raw = @intFromEnum(BackendType.OpenAICompatible),
-        .backend_config = .{
-            .openai_compat = .{
-                .base_url = null,
-                .api_key = "test-key",
-                .org_id = null,
-                .timeout_ms = 30000,
-                .max_retries = 3,
-                .custom_headers_json = null,
-                ._reserved = [_]u8{0} ** 24,
-            },
-        },
+test "getLocalEngine returns null for Unspecified backend union variant" {
+    var backend = InferenceBackend{
+        .backend_type = .Unspecified,
+        .backend = .{ .Unspecified = {} },
     };
-
-    // First canonicalize
-    var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
-    defer canonical.deinit(std.testing.allocator);
-
-    // Then create backend
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
-    defer backend.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(BackendType.OpenAICompatible, backend.backend_type);
-}
-
-test "createInferenceBackend OpenAI backend has no LocalEngine" {
-    const ref = "openai://gpt-4";
-    var c_spec = TaluModelSpec{
-        .abi_version = 1,
-        .struct_size = @sizeOf(TaluModelSpec),
-        .ref = ref,
-        .backend_type_raw = @intFromEnum(BackendType.OpenAICompatible),
-        .backend_config = .{
-            .openai_compat = .{
-                .base_url = null,
-                .api_key = "test-key",
-                .org_id = null,
-                .timeout_ms = 30000,
-                .max_retries = 3,
-                .custom_headers_json = null,
-                ._reserved = [_]u8{0} ** 24,
-            },
-        },
-    };
-
-    var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
-    defer canonical.deinit(std.testing.allocator);
-
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
-    defer backend.deinit(std.testing.allocator);
-
-    // OpenAI backend should not have a LocalEngine
     try std.testing.expect(backend.getLocalEngine() == null);
 }
 
@@ -146,72 +89,6 @@ test "createInferenceBackend fails for Unspecified backend type" {
 
     const result = spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
     try std.testing.expectError(error.InvalidArgument, result);
-}
-
-// =============================================================================
-// Backend Type Relationship Tests
-// =============================================================================
-
-test "InferenceBackend backend_type matches canonical backend_type" {
-    const ref = "openai://gpt-4";
-    var c_spec = TaluModelSpec{
-        .abi_version = 1,
-        .struct_size = @sizeOf(TaluModelSpec),
-        .ref = ref,
-        .backend_type_raw = @intFromEnum(BackendType.OpenAICompatible),
-        .backend_config = .{
-            .openai_compat = .{
-                .base_url = null,
-                .api_key = "test-key",
-                .org_id = null,
-                .timeout_ms = 30000,
-                .max_retries = 3,
-                .custom_headers_json = null,
-                ._reserved = [_]u8{0} ** 24,
-            },
-        },
-    };
-
-    var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
-    defer canonical.deinit(std.testing.allocator);
-
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
-    defer backend.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(canonical.backend_type, backend.backend_type);
-}
-
-// =============================================================================
-// Memory Safety Tests
-// =============================================================================
-
-test "InferenceBackend deinit is safe to call" {
-    const ref = "openai://gpt-4";
-    var c_spec = TaluModelSpec{
-        .abi_version = 1,
-        .struct_size = @sizeOf(TaluModelSpec),
-        .ref = ref,
-        .backend_type_raw = @intFromEnum(BackendType.OpenAICompatible),
-        .backend_config = .{
-            .openai_compat = .{
-                .base_url = "https://api.example.com/v1",
-                .api_key = "test-key",
-                .org_id = "org-123",
-                .timeout_ms = 30000,
-                .max_retries = 3,
-                .custom_headers_json = null,
-                ._reserved = [_]u8{0} ** 24,
-            },
-        },
-    };
-
-    var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
-    defer canonical.deinit(std.testing.allocator);
-
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
-
-    // deinit should free all owned strings without crash
-    backend.deinit(std.testing.allocator);
 }
 
 // =============================================================================

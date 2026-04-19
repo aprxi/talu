@@ -736,25 +736,8 @@ pub const ModelConfig = struct {
 // Utility Functions
 // =============================================================================
 
-fn allocAlignedBytes(allocator: std.mem.Allocator, len: usize, comptime alignment: u29) ![]align(alignment) u8 {
-    const result = try allocator.alignedAlloc(u8, alignment, len);
-    if (builtin.os.tag == .linux and len >= mem.huge_page_size) {
-        _ = std.os.linux.madvise(@ptrCast(result.ptr), result.len, 14);
-    }
-    return result;
-}
-
-fn freeAlignedBytes(allocator: std.mem.Allocator, buffer: []u8) void {
-    allocator.free(buffer);
-}
-
 pub fn isContiguous(tensor: *const Tensor) bool {
     return tensor.isContiguous();
-}
-
-fn isContiguousOwned(tensor: *const OwnedTensor) bool {
-    _ = tensor;
-    return true;
 }
 
 // =============================================================================

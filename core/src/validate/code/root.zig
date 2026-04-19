@@ -9,7 +9,6 @@
 
 pub const fence = @import("fence.zig");
 pub const block = @import("block.zig");
-pub const treesitter = @import("treesitter/root.zig");
 
 // Re-export commonly used types at module level
 pub const CodeBlock = block.CodeBlock;

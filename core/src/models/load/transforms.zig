@@ -1072,47 +1072,6 @@ fn dequantizeMxfp8WeightToBf16(
     return owned.view();
 }
 
-/// Dequantize an MXFP8 embedding tensor to BF16.
-/// Unlike dequantizeMxfp8WeightToBf16, this skips orientation checks since
-/// embeddings are always [vocab, hidden] and never need transposition.
-fn dequantizeMxfp8EmbeddingToBf16(allocator: std.mem.Allocator, t: Tensor) !Tensor {
-    if (t.n_dims != 2) return error.InvalidShape;
-    const meta = t.mxfp8 orelse return error.MissingScales;
-
-    const rows: usize = @intCast(t.shape[0]);
-    const cols: usize = @intCast(t.shape[1]);
-    if (rows == 0 or cols == 0) return error.InvalidShape;
-
-    const scale_ptr = meta.block_scales_data orelse return error.MissingScales;
-    const scale_cols: usize = @intCast(meta.scale_cols);
-    if (scale_cols == 0) return error.InvalidShape;
-
-    const required_scale_cols = (cols + 31) / 32;
-    if (scale_cols < required_scale_cols) return error.InvalidShape;
-    const required_scale_len = rows * scale_cols;
-    if (meta.block_scales_len < required_scale_len) return error.InvalidShape;
-    const scales = scale_ptr[0..required_scale_len];
-
-    const src = t.data();
-    const required_src_len = rows * cols;
-    if (src.len < required_src_len) return error.InvalidShape;
-    const src_bytes = src[0..required_src_len];
-
-    const owned = try tensor.OwnedTensor.init(allocator, .bf16, &.{ rows, cols });
-    const dst_u16 = owned.asSlice(u16);
-
-    for (0..rows) |r| {
-        const scale_row = scales[r * scale_cols ..][0..scale_cols];
-        for (0..cols) |c| {
-            const idx = r * cols + c;
-            const scale = ue8m0ToScale(scale_row[c / 32]);
-            dst_u16[idx] = dtype.f32ToBf16(dtype.fp8e4m3ToF32(src_bytes[idx]) * scale);
-        }
-    }
-
-    return owned.view();
-}
-
 /// Orient a fused 3D expert weight tensor [n_experts, out, in].
 /// For GAF4/GAF8: infer gaffine params and attach metadata (scales/biases + shape override).
 /// For native dtypes (BF16, F16, etc.): pass through unchanged.
@@ -1591,35 +1550,6 @@ pub fn orientWeightTyped(allocator: std.mem.Allocator, t: Tensor, expected_in: u
 
     // Already in [out, in] format or ambiguous (square matrix)
     return t;
-}
-
-/// Dequantize FP8 E4M3 weight tensor to BF16
-fn dequantizeFp8Weight(allocator: std.mem.Allocator, t: Tensor, scale_inv: f32, expected_in: usize) !Tensor {
-    if (t.n_dims != 2) {
-        log.trace("load", "FP8: expected 2D tensor", .{ .n_dims = t.n_dims }, @src());
-        return error.InvalidShape;
-    }
-
-    const rows = t.shape[0];
-    const cols = t.shape[1];
-
-    // Validate shape (either [out, in] or [in, out])
-    if (cols != expected_in and rows != expected_in) {
-        log.trace("load", "FP8: shape mismatch", .{ .rows = rows, .cols = cols, .expected_in = expected_in }, @src());
-        return error.InvalidShape;
-    }
-
-    // Allocate BF16 output tensor (same shape as input)
-    const owned = try tensor.OwnedTensor.init(allocator, .bf16, &.{ @intCast(rows), @intCast(cols) });
-    const src_bytes = t.data()[0..@as(usize, @intCast(rows * cols))];
-    const dst_u16 = owned.asSlice(u16);
-
-    // Dequantize FP8 to BF16
-    dtype.dequantizeFp8E4M3ToBf16(src_bytes, scale_inv, dst_u16);
-
-    log.trace("load", "FP8 dequantized to BF16", .{ .rows = rows, .cols = cols }, @src());
-
-    return owned.view();
 }
 
 /// Dequantize FP8 E4M3 weight tensor to BF16 with per-block scales.

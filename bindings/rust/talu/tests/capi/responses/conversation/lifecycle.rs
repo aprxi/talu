@@ -32,10 +32,3 @@ fn free_is_idempotent() {
         let _h = ResponsesHandle::new().unwrap();
     }
 }
-
-#[test]
-fn validate_live_handle() {
-    let ctx = ResponsesTestContext::new();
-    let rc = unsafe { talu_sys::talu_responses_validate(ctx.handle().as_ptr()) };
-    assert_eq!(rc, 1, "validate should return 1 for live handle");
-}

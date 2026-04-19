@@ -15,7 +15,6 @@ const session_mod = train_mod.session;
 const TrainingSession = session_mod.TrainingSession;
 const CLoraConfig = capi_bridge.CLoraConfig;
 const CTrainingConfig = capi_bridge.CTrainingConfig;
-const CStepMetrics = capi_bridge.CStepMetrics;
 const CTrainingInfo = capi_bridge.CTrainingInfo;
 const CStepCallback = capi_bridge.CStepCallback;
 

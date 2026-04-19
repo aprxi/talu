@@ -1,14 +1,8 @@
-use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal};
 
-use anyhow::{anyhow, bail, Result};
-
-use talu::InferenceBackend;
-
-use crate::pin_store::PinStore;
-use crate::provider::{get_provider, is_provider_prefix, provider_from_prefix};
 use crate::quant_scheme as quant_scheme_display;
+use anyhow::{bail, Result};
 
 use super::repo::{repo_list_files, repo_list_models, resolve_model_for_inference};
 use super::util::{capitalize_first, format_date, format_size, truncate_str};
@@ -43,58 +37,19 @@ impl LocalSourceFilter {
 
 pub(super) fn cmd_ls(args: LsArgs) -> Result<()> {
     let source_filter = LocalSourceFilter::from_ls_args(&args);
-    let endpoint_url_override = args.endpoint_url;
-
-    // Resolve pinned model set when -P is active.
-    let pinned_set = if args.pinned {
-        let pin_bucket = if let Some(explicit) = args.bucket.clone() {
-            explicit
-        } else {
-            crate::config::resolve_and_ensure_bucket(&args.profile)?
-        };
-        let pin_store = PinStore::open(&pin_bucket)?;
-        Some(pin_store.list_pinned()?.into_iter().collect::<HashSet<_>>())
-    } else {
-        None
-    };
 
     // No target: list local cached models
     if args.target.is_none() {
-        return cmd_ls_local_models(source_filter, pinned_set.as_ref());
+        return cmd_ls_local_models(source_filter);
     }
 
     let target = args.target.as_ref().unwrap();
 
-    if args.pinned {
-        bail!("'-P/--pinned' is only supported for local cache listings");
-    }
-
-    // Check if target is a provider prefix (e.g., "vllm::")
-    if is_provider_prefix(target) {
-        if source_filter != LocalSourceFilter::All {
-            bail!("'-Q/--quantized-only' and '-H/--hub-only' are only supported for local cache listings");
-        }
-        return cmd_ls_provider(target, endpoint_url_override);
-    }
-
-    // Check if target contains "::" - it's a provider::model format
-    // For ls, we treat this as listing the provider's models (ignore the model part)
-    if let Some(pos) = target.find("::") {
-        let provider_prefix = &target[..pos + 2]; // Include the "::"
-        if is_provider_prefix(provider_prefix) {
-            if source_filter != LocalSourceFilter::All {
-                bail!("'-Q/--quantized-only' and '-H/--hub-only' are only supported for local cache listings");
-            }
-            println!(
-                "Note: 'ls {}' lists all models on the provider.",
-                provider_prefix
-            );
-            println!(
-                "To generate with a specific model, use: talu -m {} \"prompt\"\n",
-                target
-            );
-            return cmd_ls_provider(provider_prefix, endpoint_url_override);
-        }
+    if target.contains("::") {
+        bail!(
+            "Unsupported backend namespace '{}'. talu is local-inference-only; use a local path or HuggingFace model ID.",
+            target
+        );
     }
 
     // Check if target contains "/" - it's a specific model, list its files
@@ -127,26 +82,17 @@ fn abbreviate_home(path: &str) -> String {
 }
 
 /// List cached models, grouped by source (managed first, then hub).
-fn cmd_ls_local_models(
-    source_filter: LocalSourceFilter,
-    pinned_set: Option<&HashSet<String>>,
-) -> Result<()> {
+fn cmd_ls_local_models(source_filter: LocalSourceFilter) -> Result<()> {
     let list = repo_list_models(false)?;
-
-    let is_pinned = |id: &str| pinned_set.map_or(true, |s| s.contains(id));
 
     let local_models: Vec<_> = list
         .iter()
-        .filter(|(id, _, s)| {
-            source_filter.allows_managed() && *s == talu::CacheOrigin::Managed && is_pinned(id)
-        })
+        .filter(|(_, _, s)| source_filter.allows_managed() && *s == talu::CacheOrigin::Managed)
         .map(|(id, path, _)| (id.clone(), path.clone()))
         .collect();
     let hub_models: Vec<_> = list
         .iter()
-        .filter(|(id, _, s)| {
-            source_filter.allows_hub() && *s == talu::CacheOrigin::Hub && is_pinned(id)
-        })
+        .filter(|(_, _, s)| source_filter.allows_hub() && *s == talu::CacheOrigin::Hub)
         .map(|(id, path, _)| (id.clone(), path.clone()))
         .collect();
 
@@ -193,11 +139,7 @@ fn cmd_ls_local_models(
 
     let total = local_models.len() + hub_models.len();
     if total == 0 {
-        if pinned_set.is_some() {
-            println!("\nNo pinned models found in cache. Pin one with: talu pin Org/Model");
-        } else {
-            println!("\nNo models found. Download one with: talu get Org/Model");
-        }
+        println!("\nNo models found. Download one with: talu get Org/Model");
     }
 
     Ok(())
@@ -312,56 +254,6 @@ fn cmd_ls_display_models(list: &[(String, String)], use_color: bool) -> Result<(
     Ok(())
 }
 
-/// List model IDs from a remote provider
-pub(super) fn list_provider_models(
-    _provider_name: &str,
-    base_url: &str,
-    api_key: Option<&str>,
-) -> Result<Vec<String>> {
-    let backend = InferenceBackend::new_openai_compatible(
-        "unused", // Model ID not needed for listing
-        base_url, api_key, 10_000, // 10 second timeout for listing
-    )?;
-
-    let models = backend.list_models()?;
-    Ok(models.into_iter().map(|m| m.id).collect())
-}
-
-/// List models on a remote provider (e.g., "talu ls vllm::") via C API
-fn cmd_ls_provider(target: &str, endpoint_url_override: Option<String>) -> Result<()> {
-    let provider_name =
-        provider_from_prefix(target).ok_or_else(|| anyhow!("Unknown provider: {}", target))?;
-
-    let provider = get_provider(&provider_name)
-        .ok_or_else(|| anyhow!("Unknown provider: {}", provider_name))?;
-
-    // Determine endpoint URL
-    let base_url = endpoint_url_override
-        .or_else(|| env::var(format!("{}_ENDPOINT", provider_name.to_uppercase())).ok())
-        .unwrap_or_else(|| provider.default_endpoint.to_string());
-
-    // Get API key if needed
-    let api_key = provider
-        .api_key_env
-        .as_ref()
-        .and_then(|env_var| env::var(env_var).ok());
-
-    let models = list_provider_models(&provider_name, &base_url, api_key.as_deref())?;
-
-    if models.is_empty() {
-        println!("No models found on {} ({})", provider_name, base_url);
-        return Ok(());
-    }
-
-    println!("Models on {} ({}):", provider_name, base_url);
-    for model in &models {
-        println!("  {}", model);
-    }
-    println!("\n{} model(s) available", models.len());
-
-    Ok(())
-}
-
 /// Filter cached models by prefix (e.g., "talu ls Qwen")
 fn cmd_ls_prefix_filter(prefix: &str, source_filter: LocalSourceFilter) -> Result<()> {
     // Check local cache for matching models
@@ -388,18 +280,9 @@ fn cmd_ls_prefix_filter(prefix: &str, source_filter: LocalSourceFilter) -> Resul
             println!("No cached models matching '{}'", prefix);
         }
 
-        // Check if it might be a provider name
-        if let Some(provider) = get_provider(prefix) {
-            println!(
-                "\nDid you mean 'talu ls {}::' to list models on the {} server?",
-                provider.name, provider.name
-            );
-            return Ok(());
-        }
-
         println!("\nHints:");
         println!("  talu ls              List all cached models");
-        println!("  talu ls vllm::       List models on vLLM server");
+        println!("  talu ls Qwen         Filter cache entries by prefix");
         return Ok(());
     }
 

@@ -9,9 +9,7 @@ const xray = @import("xray_pkg");
 const trace = xray.trace;
 const capture = xray.capture;
 const query = xray.query;
-const stats_mod = xray.stats;
 const capi_error = @import("error.zig");
-const error_codes = @import("error_codes.zig");
 
 const allocator = std.heap.c_allocator;
 

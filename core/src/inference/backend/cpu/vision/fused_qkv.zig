@@ -18,7 +18,6 @@ const compute = @import("compute_pkg");
 const runtime_contract = @import("runtime_contract_pkg");
 const cpu_blocks = @import("../executor/weights.zig");
 const exec_block = @import("../executor/block.zig");
-const image_mod = @import("image_pkg");
 const common_vision = @import("types.zig");
 const vision_tensor_convert = @import("tensor_convert.zig");
 const vision_program_mod = @import("../../../vision_program.zig");
@@ -794,7 +793,7 @@ pub const VisionRuntime = struct {
 
     fn runDeepstackMerger(
         self: *VisionRuntime,
-        grid: image_mod.VisionGrid,
+        grid: common_vision.VisionGrid,
         hidden: []const f32,
         merger: *const DeepstackMergerWeights,
     ) ![]f32 {
@@ -865,7 +864,7 @@ pub const VisionRuntime = struct {
         return out;
     }
 
-    pub fn runMerger(self: *VisionRuntime, grid: image_mod.VisionGrid, hidden: []const f32) ![]f32 {
+    pub fn runMerger(self: *VisionRuntime, grid: common_vision.VisionGrid, hidden: []const f32) ![]f32 {
         const patch_count: usize = @as(usize, @intCast(grid.temporal)) *
             @as(usize, @intCast(grid.height)) *
             @as(usize, @intCast(grid.width));
@@ -949,7 +948,7 @@ pub const VisionRuntime = struct {
 
     fn fillVisionRotaryTables(
         self: *const VisionRuntime,
-        grid: image_mod.VisionGrid,
+        grid: common_vision.VisionGrid,
         cos_out: []f32,
         sin_out: []f32,
     ) !void {
@@ -1125,7 +1124,7 @@ fn extractPatchInputReordered(
 
 fn interpolatePosEmbeddings(
     self: *const VisionRuntime,
-    grid: image_mod.VisionGrid,
+    grid: common_vision.VisionGrid,
     out: []f32,
 ) !void {
     return cpu_image_ops.interpolateGridEmbeddings(

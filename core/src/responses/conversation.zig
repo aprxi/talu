@@ -29,7 +29,6 @@
 const std = @import("std");
 const json_mod = @import("io_pkg").json;
 const items = @import("items.zig");
-const backend_mod = @import("backend.zig");
 const code_mod = @import("validate_pkg").code;
 
 pub const Item = items.Item;
@@ -113,7 +112,7 @@ pub const Conversation = struct {
     allocator: std.mem.Allocator,
 
     /// Session identifier for this conversation.
-    /// Used for persistence (hashed to SESSION_HASH in StoreFS).
+    /// Used by callers to correlate turns across requests.
     session_id: ?[]const u8 = null,
 
     /// Retention expiry (Unix ms). 0 = no expiry.
@@ -125,15 +124,6 @@ pub const Conversation = struct {
     /// Monotonic counter for generating unique item IDs.
     _next_item_id: u64 = 0,
 
-    /// Monotonic counter for fork transaction boundaries.
-    _fork_sequence: u64 = 0,
-
-    /// Optional storage backend for persistence.
-    storage_backend: ?backend_mod.StorageBackend = null,
-
-    /// Last storage error (sticky).
-    last_storage_error: ?anyerror = null,
-
     /// Double-pointer for stable Python access.
     items_ptr: *[*]Item,
     _items_ptr_storage: [*]Item,
@@ -144,20 +134,12 @@ pub const Conversation = struct {
 
     /// Create a new empty Conversation.
     pub fn init(allocator: std.mem.Allocator) !*Conversation {
-        return initWithStorage(allocator, null, null);
+        return initWithSession(allocator, null);
     }
 
     /// Create a new Conversation with optional session ID.
     pub fn initWithSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !*Conversation {
-        return initWithStorage(allocator, session_id, null);
-    }
-
-    /// Create a new Conversation with storage backend.
-    pub fn initWithStorage(
-        allocator: std.mem.Allocator,
-        session_id_arg: ?[]const u8,
-        storage_backend_arg: ?backend_mod.StorageBackend,
-    ) !*Conversation {
+        const session_id_arg = session_id;
         const self = try allocator.create(Conversation);
         errdefer allocator.destroy(self);
 
@@ -173,8 +155,6 @@ pub const Conversation = struct {
             .session_id = owned_session_id,
             .items_list = .{},
             ._next_item_id = 0,
-            .storage_backend = storage_backend_arg,
-            .last_storage_error = null,
             ._items_ptr_storage = undefined,
             .items_ptr = undefined,
             ._count_storage = 0,
@@ -192,10 +172,6 @@ pub const Conversation = struct {
     pub fn deinit(self: *Conversation) void {
         // Validate magic number to detect double-free
         std.debug.assert(self._magic == MAGIC_VALID);
-
-        if (self.storage_backend) |sb| {
-            sb.deinit();
-        }
 
         if (self.session_id) |sid| {
             self.allocator.free(sid);
@@ -346,15 +322,7 @@ pub const Conversation = struct {
         try self.items_list.append(self.allocator, item);
         self.updatePointers();
 
-        const result = &self.items_list.items[self.items_list.items.len - 1];
-
-        // For user/system/developer messages that are already complete,
-        // notify storage immediately (assistant messages are finalized later during streaming).
-        if (role != .assistant) {
-            self.notifyStorage(result);
-        }
-
-        return result;
+        return &self.items_list.items[self.items_list.items.len - 1];
     }
 
     /// Internal: append a message with initial text content and hidden flag.
@@ -408,85 +376,7 @@ pub const Conversation = struct {
         try self.items_list.append(self.allocator, item);
         self.updatePointers();
 
-        const result = &self.items_list.items[self.items_list.items.len - 1];
-
-        if (role != .assistant) {
-            self.notifyStorage(result);
-        }
-
-        return result;
-    }
-
-    /// Notify storage backend of a finalized item (internal helper).
-    fn notifyStorage(self: *Conversation, item: *const Item) void {
-        if (self.storage_backend) |sb| {
-            // Create a deep copy ItemRecord for storage
-            var record = backend_mod.ItemRecord.fromItem(self.allocator, item) catch |err| {
-                self.last_storage_error = err;
-                return;
-            };
-            defer record.deinit(self.allocator);
-
-            const event = backend_mod.StorageEvent{ .PutItem = record };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-        }
-    }
-
-    /// Notify storage backend of session metadata update.
-    ///
-    /// Call this when session metadata changes (config, title, system_prompt, marker).
-    /// The storage backend will receive a PutSession event with the current
-    /// session state, enabling external persistence of session data.
-    ///
-    /// This ensures Zig is the single source of truth for all session data.
-    pub fn notifySessionUpdate(
-        self: *Conversation,
-        model: ?[]const u8,
-        title: ?[]const u8,
-        system_prompt: ?[]const u8,
-        config_json: ?[]const u8,
-        marker: ?[]const u8,
-        parent_session_id: ?[]const u8,
-        group_id: ?[]const u8,
-        metadata_json: ?[]const u8,
-        source_doc_id: ?[]const u8,
-        project_id: ?[]const u8,
-    ) void {
-        if (self.storage_backend) |sb| {
-            // session_id is required for PutSession
-            const session_id = self.session_id orelse return;
-
-            const now_ms = currentTimeMs();
-            const head_item_id: u64 = if (self.items_list.items.len > 0)
-                self.items_list.items[self.items_list.items.len - 1].id
-            else
-                0;
-            const record = backend_mod.SessionRecord{
-                .session_id = session_id,
-                .model = model,
-                .title = title,
-                .system_prompt = system_prompt,
-                .config_json = config_json,
-                .marker = marker,
-                .parent_session_id = parent_session_id,
-                .group_id = group_id,
-                .head_item_id = head_item_id,
-                .ttl_ts = self.ttl_ts,
-                .metadata_json = metadata_json,
-                .source_doc_id = source_doc_id,
-                .project_id = project_id,
-                // New session events use now for both timestamps; storage can preserve prior created_at_ms.
-                .created_at_ms = now_ms,
-                .updated_at_ms = now_ms,
-            };
-
-            const event = backend_mod.StorageEvent{ .PutSession = record };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-        }
+        return &self.items_list.items[self.items_list.items.len - 1];
     }
 
     /// Insert a message with text content at the specified index.
@@ -657,12 +547,7 @@ pub const Conversation = struct {
         try self.items_list.append(self.allocator, item);
         self.updatePointers();
 
-        const result = &self.items_list.items[self.items_list.items.len - 1];
-
-        // Function call outputs with text are immediately complete - notify storage
-        self.notifyStorage(result);
-
-        return result;
+        return &self.items_list.items[self.items_list.items.len - 1];
     }
 
     /// Append a function call output with multimodal content parts.
@@ -787,7 +672,6 @@ pub const Conversation = struct {
     // =========================================================================
 
     /// Finalize an item (mark as completed, set timestamp).
-    /// Emits PutItem event to storage backend if configured.
     pub fn finalizeItem(self: *Conversation, item: *Item) void {
         if (item.created_at_ms == 0) {
             item.created_at_ms = currentTimeMs();
@@ -803,22 +687,6 @@ pub const Conversation = struct {
 
         // Extract code blocks for output_text content (assistant messages)
         self.extractCodeBlocksForItem(item);
-
-        // Notify storage backend if configured
-        if (self.storage_backend) |sb| {
-            // Create a deep copy ItemRecord for storage
-            // Must use deep copy because ItemContentPartRecord is a different type than ContentPart
-            var record = backend_mod.ItemRecord.fromItem(self.allocator, item) catch |err| {
-                self.last_storage_error = err;
-                return;
-            };
-            defer record.deinit(self.allocator); // Free after event consumed
-
-            const event = backend_mod.StorageEvent{ .PutItem = record };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-        }
     }
 
     /// Extract code blocks from output_text content parts and store as JSON.
@@ -862,23 +730,10 @@ pub const Conversation = struct {
     }
 
     /// Delete an item by index.
-    /// Emits DeleteItem event to storage backend if configured.
     pub fn deleteItem(self: *Conversation, index: usize) bool {
         if (index >= self.items_list.items.len) return false;
 
         var item = self.items_list.items[index];
-        const item_id = item.id; // Capture ID before destruction
-
-        // Notify storage backend before destroying item
-        if (self.storage_backend) |sb| {
-            const event = backend_mod.StorageEvent{ .DeleteItem = .{
-                .item_id = item_id,
-                .deleted_at_ms = currentTimeMs(),
-            } };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-        }
 
         item.deinit(self.allocator);
 
@@ -889,42 +744,9 @@ pub const Conversation = struct {
     }
 
     /// Clone items from another conversation into this one.
-    /// Preserves item timestamps and metadata and emits PutItems in batches.
+    /// Preserves item timestamps and metadata.
     pub fn cloneFrom(self: *Conversation, source: *const Conversation, batch_size: usize) !void {
         try self.cloneFromRange(source, 0, source.items_list.items.len, batch_size);
-    }
-
-    /// Emit a fork begin event for storage backends.
-    pub fn beginFork(self: *Conversation) u64 {
-        if (self.storage_backend) |sb| {
-            const session_id = self.session_id orelse return 0;
-            self._fork_sequence += 1;
-            const fork_id = self._fork_sequence;
-            const event = backend_mod.StorageEvent{ .BeginFork = .{
-                .fork_id = fork_id,
-                .session_id = session_id,
-            } };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-            return fork_id;
-        }
-        return 0;
-    }
-
-    /// Emit a fork end event for storage backends.
-    pub fn endFork(self: *Conversation, fork_id: u64) void {
-        if (fork_id == 0) return;
-        if (self.storage_backend) |sb| {
-            const session_id = self.session_id orelse return;
-            const event = backend_mod.StorageEvent{ .EndFork = .{
-                .fork_id = fork_id,
-                .session_id = session_id,
-            } };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-        }
     }
 
     /// Clone items from another conversation into this one, keeping only a prefix.
@@ -952,24 +774,6 @@ pub const Conversation = struct {
     /// This performs a deep copy of all items including content (text, images, etc.).
     /// Cost is O(n) where n is the total content size. For conversations with large
     /// multimodal content (e.g., base64 images), this can be significant.
-    ///
-    /// Storage serialization adds overhead only when a persistence backend is configured.
-    /// The default MemoryBackend is a no-op. Batching (default 1000 items) amortizes
-    /// the per-event overhead for persistence backends.
-    ///
-    /// # Storage Consistency (Important)
-    ///
-    /// Items are cloned to memory BEFORE storage events are emitted. If storage
-    /// fails mid-fork (e.g., database full, network error), items remain in memory
-    /// but are not persisted. This is intentional:
-    ///
-    ///   - In-memory chat continues to work (fail-open for UX)
-    ///   - Storage error is captured in `last_storage_error`
-    ///   - Caller SHOULD check `hasStorageError()` after fork if persistence is critical
-    ///   - On restart, unpersisted items are lost (storage is source of truth for restore)
-    ///
-    /// This design prioritizes availability over strict consistency. For strict
-    /// consistency, wrap fork in BeginFork/EndFork and check errors.
     pub fn cloneFromRange(
         self: *Conversation,
         source: *const Conversation,
@@ -977,10 +781,10 @@ pub const Conversation = struct {
         end_index: usize,
         batch_size: usize,
     ) !void {
+        _ = batch_size;
         if (self.items_list.items.len != 0) return error.InvalidState;
         if (start_index > end_index) return error.InvalidArgument;
 
-        const effective_batch_size: usize = if (batch_size == 0) 1000 else batch_size;
         var next_item_id: u64 = 0;
         const source_session_id = source.session_id;
         const clamped_end = @min(end_index, source.items_list.items.len);
@@ -994,46 +798,6 @@ pub const Conversation = struct {
 
             if (cloned.id >= next_item_id) {
                 next_item_id = cloned.id + 1;
-            }
-        }
-
-        // Phase 2: Emit storage events (errors are captured, not propagated)
-        // Note: If storage fails here, items are in memory but not persisted.
-        // Caller should check hasStorageError() if persistence is required.
-        if (self.storage_backend) |sb| {
-            var batch: std.ArrayListUnmanaged(backend_mod.ItemRecord) = .{};
-            defer {
-                for (batch.items) |*record| {
-                    record.deinit(self.allocator);
-                }
-                batch.deinit(self.allocator);
-            }
-
-            for (self.items_list.items) |*item| {
-                const record = try backend_mod.ItemRecord.fromItem(self.allocator, item);
-                try batch.append(self.allocator, record);
-
-                if (batch.items.len >= effective_batch_size) {
-                    const event = backend_mod.StorageEvent{ .PutItems = batch.items };
-                    sb.onEvent(&event) catch |err| {
-                        self.last_storage_error = err;
-                    };
-                    for (batch.items) |*item_record| {
-                        item_record.deinit(self.allocator);
-                    }
-                    batch.clearRetainingCapacity();
-                }
-            }
-
-            if (batch.items.len > 0) {
-                const event = backend_mod.StorageEvent{ .PutItems = batch.items };
-                sb.onEvent(&event) catch |err| {
-                    self.last_storage_error = err;
-                };
-                for (batch.items) |*item_record| {
-                    item_record.deinit(self.allocator);
-                }
-                batch.clearRetainingCapacity();
             }
         }
 
@@ -1057,33 +821,6 @@ pub const Conversation = struct {
         return true;
     }
 
-    /// Append a storage record directly without emitting storage events.
-    pub fn appendItemRecord(self: *Conversation, record: *const backend_mod.ItemRecord) !void {
-        const item = try backend_mod.itemFromRecord(self.allocator, record);
-        try self.items_list.append(self.allocator, item);
-        if (item.id >= self._next_item_id) {
-            self._next_item_id = item.id + 1;
-        }
-        self.updatePointers();
-    }
-
-    /// Update structured validation flags for an item and emit storage update.
-    pub fn setItemValidationFlags(
-        self: *Conversation,
-        item_index: usize,
-        json_valid: bool,
-        schema_valid: bool,
-        repaired: bool,
-    ) !void {
-        if (item_index >= self.items_list.items.len) return error.InvalidArgument;
-
-        const item = &self.items_list.items[item_index];
-        item.json_valid = json_valid;
-        item.schema_valid = schema_valid;
-        item.repaired = repaired;
-        self.notifyStorage(item);
-    }
-
     /// Set the status of an item at the given index.
     /// Useful for marking items as incomplete (truncated) or failed (content filter).
     pub fn setItemStatus(self: *Conversation, item_index: usize, status: items.ItemStatus) !void {
@@ -1091,43 +828,10 @@ pub const Conversation = struct {
 
         const item = &self.items_list.items[item_index];
         item.data.setStatus(status);
-        self.notifyStorage(item);
-    }
-
-    /// Load storage records into an empty conversation without emitting storage events.
-    pub fn loadItemRecords(self: *Conversation, records: []const backend_mod.ItemRecord) !void {
-        if (self.items_list.items.len != 0) return error.InvalidState;
-
-        for (records) |*record| {
-            try self.appendItemRecord(record);
-        }
-    }
-
-    /// Load items from the configured storage backend into an empty conversation.
-    /// No-op if no storage backend is configured or it returns no records.
-    pub fn loadFromStorageBackend(self: *Conversation) !void {
-        const storage_backend = self.storage_backend orelse return;
-        const records = try storage_backend.loadAll(self.allocator);
-        defer backend_mod.freeItemRecords(self.allocator, records);
-
-        if (records.len == 0) return;
-        try self.loadItemRecords(records);
     }
 
     /// Clear all items.
-    /// Emits ClearItems event to storage backend if configured.
     pub fn clear(self: *Conversation) void {
-        // Notify storage backend before clearing
-        if (self.storage_backend) |sb| {
-            const event = backend_mod.StorageEvent{ .ClearItems = .{
-                .cleared_at_ms = currentTimeMs(),
-                .keep_context = false,
-            } };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-        }
-
         for (self.items_list.items) |*item| {
             item.deinit(self.allocator);
         }
@@ -1136,7 +840,6 @@ pub const Conversation = struct {
     }
 
     /// Clear all items except the first system message (if present).
-    /// Emits ClearItems event to storage backend if configured.
     pub fn clearKeepingSystem(self: *Conversation) void {
         if (self.items_list.items.len == 0) return;
 
@@ -1147,19 +850,6 @@ pub const Conversation = struct {
             else => false,
         };
 
-        // Notify storage backend before clearing
-        if (self.storage_backend) |sb| {
-            const event = backend_mod.StorageEvent{
-                .ClearItems = .{
-                    .cleared_at_ms = currentTimeMs(),
-                    .keep_context = true, // clearKeepingSystem preserves system/developer if present
-                },
-            };
-            sb.onEvent(&event) catch |err| {
-                self.last_storage_error = err;
-            };
-        }
-
         if (has_system) {
             // Free all items except first
             for (self.items_list.items[1..]) |*item| {
@@ -1167,7 +857,6 @@ pub const Conversation = struct {
             }
             self.items_list.shrinkRetainingCapacity(1);
         } else {
-            // No storage notification needed - already sent above
             for (self.items_list.items) |*item| {
                 item.deinit(self.allocator);
             }
@@ -1475,21 +1164,6 @@ pub const Conversation = struct {
         return &self.items_list.items[self.items_list.items.len - 1];
     }
 
-    /// Check if a storage error occurred.
-    pub fn hasStorageError(self: *const Conversation) bool {
-        return self.last_storage_error != null;
-    }
-
-    /// Get the last storage error.
-    pub fn getStorageError(self: *const Conversation) ?anyerror {
-        return self.last_storage_error;
-    }
-
-    /// Clear the stored storage error.
-    pub fn clearStorageError(self: *Conversation) void {
-        self.last_storage_error = null;
-    }
-
     /// Set retention expiry for all items in this conversation.
     /// 0 means no expiry.
     pub fn setTtlTs(self: *Conversation, ttl_ts: i64) void {
@@ -1507,66 +1181,6 @@ test "Conversation.init" {
     defer conv.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), conv.len());
-}
-
-test "Conversation.loadFromStorageBackend loads records" {
-    const allocator = std.testing.allocator;
-
-    const source = try Conversation.init(allocator);
-    defer source.deinit();
-
-    const item = try source.appendUserMessage("Hello!");
-    const record = try backend_mod.ItemRecord.fromItem(allocator, item);
-
-    var mock = struct {
-        allocator: std.mem.Allocator,
-        record: ?backend_mod.ItemRecord,
-
-        const Self = @This();
-
-        fn onEvent(ctx: *anyopaque, event: *const backend_mod.StorageEvent) anyerror!void {
-            _ = ctx;
-            _ = event;
-        }
-
-        fn loadAll(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror![]backend_mod.ItemRecord {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if (self.record == null) return alloc.alloc(backend_mod.ItemRecord, 0);
-
-            var records = try alloc.alloc(backend_mod.ItemRecord, 1);
-            records[0] = self.record.?;
-            self.record = null;
-            return records;
-        }
-
-        fn deinit(ctx: *anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if (self.record) |*owned| {
-                owned.deinit(self.allocator);
-                self.record = null;
-            }
-        }
-
-        const vtable = backend_mod.StorageBackend.VTable{
-            .onEvent = onEvent,
-            .loadAll = loadAll,
-            .deinit = deinit,
-        };
-    }{
-        .allocator = allocator,
-        .record = record,
-    };
-
-    const backend = backend_mod.StorageBackend.init(&mock, &@TypeOf(mock).vtable);
-    const conv = try Conversation.initWithStorage(allocator, null, backend);
-    defer conv.deinit();
-
-    try conv.loadFromStorageBackend();
-
-    try std.testing.expectEqual(@as(usize, 1), conv.len());
-    const loaded = conv.getItem(0).?;
-    const msg = loaded.asMessage().?;
-    try std.testing.expectEqualStrings("Hello!", msg.getFirstText());
 }
 
 test "Conversation.appendUserMessage" {

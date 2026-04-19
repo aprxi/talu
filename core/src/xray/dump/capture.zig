@@ -311,11 +311,6 @@ pub fn recordGlobal(
     }
 }
 
-/// Check if dump capture is enabled (compile-time check).
-pub fn isDumpEnabled() bool {
-    return DumpEnabled;
-}
-
 /// Check if we should stop execution (called by executor after each layer).
 /// Returns true if stop-after-layer has been reached.
 pub fn shouldStopGlobal() bool {

@@ -87,27 +87,6 @@ pub const SharedBuffer = struct {
         return self;
     }
 
-    /// Create a new SharedBuffer with uninitialized data.
-    /// Caller should fill the data after creation.
-    /// Returns null on allocation failure.
-    pub fn createUninitialized(capacity: usize) ?*Self {
-        if (capacity == 0) return null;
-
-        const data = allocator.alloc(u32, capacity) catch return null;
-
-        const self = allocator.create(Self) catch {
-            allocator.free(data);
-            return null;
-        };
-
-        self.* = .{
-            .data = data.ptr,
-            .capacity = capacity,
-            .refcount = Atomic(usize).init(1),
-        };
-        return self;
-    }
-
     /// Increment reference count.
     /// Safe to call from any thread.
     pub fn retain(self: *Self) void {
@@ -133,12 +112,6 @@ pub const SharedBuffer = struct {
             return true;
         }
         return false;
-    }
-
-    /// Get current reference count (for debugging/testing only).
-    /// The value may be stale by the time it's used.
-    pub fn getRefcount(self: *const Self) usize {
-        return self.refcount.load(.monotonic);
     }
 
     /// Get a slice of the buffer data.
@@ -207,33 +180,6 @@ pub export fn talu_buffer_create_from_copy(
     return @ptrCast(buffer);
 }
 
-/// Create an uninitialized SharedBuffer of given capacity.
-/// Caller should fill via talu_buffer_get_data_ptr.
-/// Returns null on failure (check talu_error_message for details).
-pub export fn talu_buffer_create_uninitialized(
-    capacity: usize,
-) callconv(.c) ?*BufferHandle {
-    capi_error.clearError();
-    if (capacity == 0) {
-        capi_error.setError(error.InvalidArgument, "capacity is 0", .{});
-        return null;
-    }
-
-    const buffer = SharedBuffer.createUninitialized(capacity) orelse {
-        capi_error.setError(error.OutOfMemory, "failed to allocate SharedBuffer", .{});
-        return null;
-    };
-    return @ptrCast(buffer);
-}
-
-/// Increment buffer reference count.
-/// Safe to call from any thread. Silently ignores null handle.
-pub export fn talu_buffer_retain(handle: ?*BufferHandle) callconv(.c) void {
-    // Note: Lightweight accessor - no error context for performance
-    const buffer: *SharedBuffer = @ptrCast(@alignCast(handle orelse return));
-    buffer.retain();
-}
-
 /// Decrement buffer reference count. Frees buffer if count reaches zero.
 /// Safe to call from any thread (including DLPack deleter threads).
 /// Returns 1 if the buffer was freed, 0 otherwise (or null handle).
@@ -251,22 +197,6 @@ pub export fn talu_buffer_get_data_ptr(handle: ?*BufferHandle) callconv(.c) ?[*]
     return buffer.data;
 }
 
-/// Get the capacity (number of elements) of a buffer.
-/// Returns 0 if handle is null.
-pub export fn talu_buffer_get_capacity(handle: ?*BufferHandle) callconv(.c) usize {
-    // Note: Lightweight accessor - no error context for performance
-    const buffer: *SharedBuffer = @ptrCast(@alignCast(handle orelse return 0));
-    return buffer.capacity;
-}
-
-/// Get the current reference count (for debugging/testing).
-/// Returns 0 if handle is null.
-pub export fn talu_buffer_get_refcount(handle: ?*BufferHandle) callconv(.c) usize {
-    // Note: Lightweight accessor - no error context for performance
-    const buffer: *SharedBuffer = @ptrCast(@alignCast(handle orelse return 0));
-    return buffer.getRefcount();
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -282,7 +212,7 @@ test "SharedBuffer basic lifecycle" {
     const buffer = SharedBuffer.createFromOwned(data.ptr, 4) orelse return error.CreateFailed;
 
     // Initial refcount is 1
-    try std.testing.expectEqual(@as(usize, 1), buffer.getRefcount());
+    try std.testing.expectEqual(@as(usize, 1), buffer.refcount.load(.monotonic));
 
     // Data is accessible
     try std.testing.expectEqual(@as(u32, 100), buffer.data[0]);
@@ -290,11 +220,11 @@ test "SharedBuffer basic lifecycle" {
 
     // Retain increases refcount
     buffer.retain();
-    try std.testing.expectEqual(@as(usize, 2), buffer.getRefcount());
+    try std.testing.expectEqual(@as(usize, 2), buffer.refcount.load(.monotonic));
 
     // First release doesn't free
     try std.testing.expect(!buffer.release());
-    try std.testing.expectEqual(@as(usize, 1), buffer.getRefcount());
+    try std.testing.expectEqual(@as(usize, 1), buffer.refcount.load(.monotonic));
 
     // Second release frees
     try std.testing.expect(buffer.release());
@@ -326,7 +256,7 @@ test "SharedBuffer multiple retains and releases" {
     buffer.retain(); // Export 1
     buffer.retain(); // Export 2
     buffer.retain(); // Export 3
-    try std.testing.expectEqual(@as(usize, 4), buffer.getRefcount());
+    try std.testing.expectEqual(@as(usize, 4), buffer.refcount.load(.monotonic));
 
     // Release in various orders (simulating torch tensors being GC'd)
     try std.testing.expect(!buffer.release()); // refcount: 3
@@ -352,16 +282,17 @@ test "C API basic operations" {
     const src = [_]u32{ 1, 2, 3 };
     const handle = talu_buffer_create_from_copy(&src, 3);
     try std.testing.expect(handle != null);
+    const buffer: *SharedBuffer = @ptrCast(@alignCast(handle.?));
 
     // Check capacity
-    try std.testing.expectEqual(@as(usize, 3), talu_buffer_get_capacity(handle));
+    try std.testing.expectEqual(@as(usize, 3), buffer.capacity);
 
     // Check refcount
-    try std.testing.expectEqual(@as(usize, 1), talu_buffer_get_refcount(handle));
+    try std.testing.expectEqual(@as(usize, 1), buffer.refcount.load(.monotonic));
 
     // Retain
-    talu_buffer_retain(handle);
-    try std.testing.expectEqual(@as(usize, 2), talu_buffer_get_refcount(handle));
+    buffer.retain();
+    try std.testing.expectEqual(@as(usize, 2), buffer.refcount.load(.monotonic));
 
     // Get data
     const data_ptr = talu_buffer_get_data_ptr(handle);

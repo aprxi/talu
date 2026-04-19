@@ -91,12 +91,8 @@ pub const SchedulerConfig = scheduler.SchedulerConfig;
 pub const RequestState = scheduler.RequestState;
 pub const TokenEvent = scheduler.TokenEvent;
 pub const Request = scheduler.Request;
-pub const SchedulerFinishReason = scheduler.FinishReason;
 pub const GenerateSyncResult = scheduler.Scheduler.GenerateSyncResult;
 pub const SchedulerSubmitOptions = scheduler.Scheduler.SubmitOptions;
-
-// Re-export sampling behavioral types so check_coverage.sh --integration can verify test coverage
-pub const SamplingWorkspace = sampling.Workspace;
 
 // =============================================================================
 // Internal API (for core/src/ only)

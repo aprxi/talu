@@ -498,13 +498,12 @@ class TestCorruptedSafeTensors:
         monkeypatch.setenv("HF_HOME", str(hf_home))
         assert is_cached("test/empty-weights") is True
 
-    def test_sharded_model_missing_one_shard_still_cached(self, tmp_path, monkeypatch):
-        """Model with missing shard is still considered cached.
+    def test_sharded_model_missing_one_shard_not_cached(self, tmp_path, monkeypatch):
+        """Model with missing shard is not considered cached.
 
-        CONTRACT: findWeightsFile checks for model.safetensors.index.json
-        by file presence (first in priority order). It does NOT parse the
-        index to verify all shards exist. Shard completeness validation
-        happens at model load time when the sharded reader opens each file.
+        CONTRACT: repository resolver validates sharded index completeness.
+        If index.json references a missing shard file, cache detection
+        rejects it at repository layer.
         """
         hf_home = tmp_path / "huggingface"
         cache_dir = hf_home / "hub"
@@ -534,4 +533,4 @@ class TestCorruptedSafeTensors:
         (refs_dir / "main").write_text("abc123")
 
         monkeypatch.setenv("HF_HOME", str(hf_home))
-        assert is_cached("test/missing-shard") is True
+        assert is_cached("test/missing-shard") is False

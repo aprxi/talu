@@ -3,11 +3,6 @@
 const std = @import("std");
 const attention_policy = @import("attention_policy.zig");
 
-pub fn effectiveSeqLen(config: attention_policy.Config, seq_len_u32: u32, sliding_window: usize, is_causal: bool) u32 {
-    _ = config;
-    return attention_policy.effectiveAttentionSeqLen(seq_len_u32, sliding_window, is_causal);
-}
-
 pub fn useFusedHeadsF16Kv(
     config: attention_policy.Config,
     seq_len_u32: u32,

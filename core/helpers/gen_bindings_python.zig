@@ -24,6 +24,12 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// C-API files that intentionally export compatibility stubs for removed APIs.
+/// These stubs must not be used to generate language bindings.
+fn isRemovedApiStubFile(file_name: []const u8) bool {
+    return std.mem.eql(u8, file_name, "removed_apis_stubs.zig");
+}
+
 fn isManyPointerType(zig_type: []const u8) bool {
     return std.mem.startsWith(u8, zig_type, "[*]") or
         std.mem.startsWith(u8, zig_type, "?[*]") or
@@ -341,6 +347,9 @@ pub fn main() !void {
             try extractCallbacks(allocator, source, full_path, &callbacks);
 
             if (std.mem.startsWith(u8, rel_dir, "core/src/capi")) {
+                if (isRemovedApiStubFile(entry.path)) {
+                    continue;
+                }
                 try extractFunctions(allocator, source, entry.path, &functions);
             }
         }

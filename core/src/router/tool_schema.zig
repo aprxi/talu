@@ -33,12 +33,6 @@ pub const ToolSchemaError = error{
     OutOfMemory,
 };
 
-/// Parsed tool definition.
-pub const ToolDef = struct {
-    name: []const u8,
-    parameters_schema: []const u8,
-};
-
 /// Convert OpenAI tools JSON to a grammar schema for tool calls.
 ///
 /// The generated schema matches a single tool call object:

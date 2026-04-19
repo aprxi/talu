@@ -34,13 +34,6 @@ fn with_base_request(extra: &serde_json::Value) -> serde_json::Value {
 
 fn nested_cases() -> Vec<NestedCase> {
     let long_name_65 = "a".repeat(65);
-    let mut allowed_tools_129 = Vec::new();
-    for i in 0..129 {
-        allowed_tools_129.push(serde_json::json!({
-            "type": "function",
-            "name": format!("tool_{i}")
-        }));
-    }
 
     vec![
         NestedCase {
@@ -147,52 +140,6 @@ fn nested_cases() -> Vec<NestedCase> {
             }),
             schema_valid: true,
             expect: Expectation::MustNotBe400,
-        },
-        NestedCase {
-            name: "tool_choice_allowed_tools_valid_mode_required",
-            extra: serde_json::json!({
-                "tool_choice": {
-                    "type": "allowed_tools",
-                    "tools": [{ "type": "function", "name": "lookup" }],
-                    "mode": "required"
-                }
-            }),
-            schema_valid: true,
-            expect: Expectation::MustNotBe400,
-        },
-        NestedCase {
-            name: "tool_choice_allowed_tools_invalid_empty_tools",
-            extra: serde_json::json!({
-                "tool_choice": {
-                    "type": "allowed_tools",
-                    "tools": []
-                }
-            }),
-            schema_valid: false,
-            expect: Expectation::MustBe400,
-        },
-        NestedCase {
-            name: "tool_choice_allowed_tools_invalid_too_many_tools",
-            extra: serde_json::json!({
-                "tool_choice": {
-                    "type": "allowed_tools",
-                    "tools": allowed_tools_129
-                }
-            }),
-            schema_valid: false,
-            expect: Expectation::MustBe400,
-        },
-        NestedCase {
-            name: "tool_choice_allowed_tools_invalid_mode",
-            extra: serde_json::json!({
-                "tool_choice": {
-                    "type": "allowed_tools",
-                    "tools": [{ "type": "function", "name": "lookup" }],
-                    "mode": "sometimes"
-                }
-            }),
-            schema_valid: false,
-            expect: Expectation::MustBe400,
         },
         NestedCase {
             name: "input_function_call_output_with_video_valid",

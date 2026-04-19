@@ -7,4 +7,4 @@ const shared = @import("../../../vision_types.zig");
 pub const PrefillVisionImage = shared.PrefillVisionImage;
 pub const PrefillVisionInput = shared.PrefillVisionInput;
 pub const EncodedVisionOutput = shared.EncodedVisionOutput;
-
+pub const VisionGrid = shared.VisionGrid;

@@ -189,6 +189,44 @@ fn responses_stream_emits_queued_and_omits_progress() {
 }
 
 #[test]
+fn responses_stream_rejects_raw_image_without_file_host() {
+    let model = require_model!();
+    let mut cfg = model_config();
+    cfg.model = Some(model.clone());
+    cfg.env_vars
+        .push(("TALU_FILE_HOST".to_string(), "".to_string()));
+    cfg.env_vars
+        .push(("TALUPI_HOST".to_string(), "".to_string()));
+    let ctx = ServerTestContext::new(cfg);
+    let body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "max_output_tokens": 8,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": "describe the image in one sentence" },
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jx9QAAAAASUVORK5CYII="
+                }
+            ]
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["error"]["code"].as_str(), Some("invalid_vision_input"));
+    assert_eq!(
+        json["error"]["message"].as_str(),
+        Some(
+            "input_image requires external vision preprocessing; set TALU_FILE_HOST/TALUPI_HOST or provide input_image.prepared"
+        )
+    );
+}
+
+#[test]
 fn responses_stream_does_not_inject_session_metadata() {
     let model = require_model!();
     let mut cfg = model_config();

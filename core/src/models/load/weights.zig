@@ -157,19 +157,89 @@ pub fn loadModelMetadataOnly(
 
         const layer_meta = if (variant) |v| v.meta orelse arch.kernel_meta else arch.kernel_meta;
 
+        const variant_is_full_attention = if (variant) |v|
+            std.mem.eql(u8, v.name, "full_attention")
+        else
+            false;
+        const has_explicit_layer_types = model_config.layer_types != null;
+        const layer_has_global_attn = if (variant_is_full_attention)
+            true
+        else if (has_explicit_layer_types and model_config.sliding_window > 0)
+            false
+        else if (model_config.sliding_window <= 0)
+            true
+        else if (model_config.sliding_window_pattern > 0)
+            (@mod(@as(i32, @intCast(layer_idx)), model_config.sliding_window_pattern) == 0)
+        else
+            false;
+        const layer_window_size: usize = if (model_config.sliding_window > 0 and !layer_has_global_attn)
+            @intCast(model_config.sliding_window)
+        else
+            0;
+
+        var map_context = runtime_blocks.BlockMapContext{
+            .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
+            .kernel_meta = layer_meta,
+            .mamba_config = null,
+            .gated_delta_config = null,
+            .shortconv_config = null,
+            .num_experts = if (model_config.num_experts > 0) @intCast(model_config.num_experts) else 0,
+            .experts_per_token = if (model_config.experts_per_token > 0) @intCast(model_config.experts_per_token) else 0,
+            .allocator = null,
+        };
+
+        if (block_type == .mamba) {
+            const meta_cfg = layer_meta.mamba_config;
+            map_context.mamba_config = .{
+                .d_model = @intCast(model_config.d_model),
+                .d_state = if (meta_cfg) |cfg| cfg.d_state else @intCast(model_config.mamba_d_state),
+                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.mamba_d_conv),
+                .n_heads = if (meta_cfg) |cfg| cfg.n_heads else @intCast(model_config.mamba_n_heads),
+                .d_head = if (meta_cfg) |cfg| cfg.d_head else @intCast(model_config.mamba_d_head),
+                .n_groups = if (meta_cfg) |cfg| cfg.n_groups else @intCast(model_config.mamba_n_groups),
+            };
+        }
+
+        if (block_type == .gated_delta) {
+            const meta_cfg = layer_meta.gated_delta_config orelse return error.MissingGatedDeltaConfig;
+            const cfg_num_value_heads: u32 = if (model_config.linear_num_value_heads > 0)
+                @intCast(model_config.linear_num_value_heads)
+            else
+                meta_cfg.n_heads;
+            const cfg_value_head_dim: u32 = if (model_config.linear_value_head_dim > 0)
+                @intCast(model_config.linear_value_head_dim)
+            else
+                meta_cfg.d_head;
+            if (cfg_num_value_heads == 0 or cfg_value_head_dim == 0) return error.InvalidShape;
+            _ = std.math.mul(u32, cfg_num_value_heads, cfg_value_head_dim) catch return error.InvalidShape;
+            const cfg_num_key_heads: u32 = if (model_config.linear_num_key_heads > 0)
+                @intCast(model_config.linear_num_key_heads)
+            else
+                cfg_num_value_heads;
+            map_context.gated_delta_config = .{
+                .d_model = @intCast(model_config.d_model),
+                .d_conv = meta_cfg.d_conv,
+                .n_heads = cfg_num_value_heads,
+                .d_head = cfg_value_head_dim,
+                .n_key_heads = cfg_num_key_heads,
+            };
+        }
+
+        if (block_type == .shortconv) {
+            const meta_cfg = layer_meta.shortconv_config;
+            map_context.shortconv_config = .{
+                .d_model = @intCast(model_config.d_model),
+                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.shortconv_d_conv),
+                .conv_dim = if (meta_cfg) |cfg| cfg.conv_dim else @intCast(model_config.shortconv_conv_dim),
+                .conv_dim_out = if (meta_cfg) |cfg| cfg.conv_dim_out else @intCast(model_config.shortconv_conv_dim_out),
+                .has_bias = if (meta_cfg) |cfg| cfg.has_bias else model_config.shortconv_has_bias,
+            };
+        }
+
         block_weights[layer_idx] = .{
             .block_type = block_type,
             .weight_map = .{},
-            .map_context = .{
-                .sliding_window = 0,
-                .kernel_meta = layer_meta,
-                .mamba_config = null,
-                .gated_delta_config = null,
-                .shortconv_config = null,
-                .num_experts = 0,
-                .experts_per_token = 0,
-                .allocator = null,
-            },
+            .map_context = map_context,
         };
     }
 

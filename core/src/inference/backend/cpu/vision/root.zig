@@ -27,8 +27,6 @@ pub fn maxPixels() u64 {
     return MAX_PIXELS;
 }
 
-const VisionAttentionLayout = models.vision.AttentionLayout;
-
 pub const VisionRuntime = struct {
     allocator: std.mem.Allocator,
     impl: union(enum) {

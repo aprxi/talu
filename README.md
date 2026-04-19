@@ -1,17 +1,14 @@
 # Talu
 
-**Full-Stack Inference for Local AI.**
+**Inference Runtime for Local and Remote Models.**
 
-Talu is a local-first inference engine built from scratch in Zig — no PyTorch, Transformers, or other heavyweight runtime dependencies. Download a model from HuggingFace, optionally quantize it, and run it from the command line, Python, or the built-in web interface.
+Talu is an inference-first runtime built in Zig. Download models from HuggingFace, optionally quantize them, and run inference from the CLI, Rust/Python bindings, or the HTTP server.
 
-It provides structured outputs, multi-turn sessions with persistent profiles, embeddings with vector search, and tool calling. While optimized for local models, talu can also route requests to remote OpenAI-compatible endpoints using the same API contracts.
-
-Distributed as a single binary, talu exposes thin bindings over a shared core runtime. The Web UI runs on the same server APIs and is designed for plugin-based extension.
+It supports local inference and routing to remote OpenAI-compatible providers through the same core runtime and protocol surfaces.
 
 - **CLI** — download, quantize, chat, serve, and inspect models
 - **Python API** — sync and async, multi-turn chat, streaming, embeddings, tool calling, hooks
-- **HTTP server** — built-in chat UI, OpenResponses-compatible API, document storage, full-text search
-- **Web UI** — extensible via plugins (document upload, analysis, and more planned)
+- **HTTP server** — OpenResponses-compatible API + Chat Completions + model/tokenizer endpoints
 - **Structured output** — precompiled grammars with streaming validation
 - **Quantization** — built-in 4-bit and 8-bit grouped affine schemes
 - **Backends** — CPU and Metal (CUDA planned); local models and remote OpenAI-compatible endpoints
@@ -148,16 +145,15 @@ print(bob("Explain recursion."))
 client.close()
 ```
 
-Persistent profile-backed sessions:
+Persistent sessions via external `TALU_DB_HOST`:
 
 ```python
+import os
 import talu
 
-profile = talu.Profile("work")
-chat = talu.Chat("LiquidAI/LFM2-350M", profile=profile)
+os.environ["TALU_DB_HOST"] = "localhost:7258"
+chat = talu.Chat("LiquidAI/LFM2-350M")
 chat("Draft release notes.", stream=False)
-
-print(talu.list_sessions(profile="work", limit=1))
 ```
 
 Python docs: `bindings/python/README.md`
@@ -169,19 +165,19 @@ Python docs: `bindings/python/README.md`
 | `talu get <model>` | Download/cache a model |
 | `talu ls` | List cached models |
 | `talu ls <model>` | List files for one cached model |
-| `talu set <model>` | Set default model for active profile |
-| `talu set show` | Show active profile configuration |
-| `talu ask ...` | Ask a model and manage sessions |
+| `talu set <model>` | Set default model |
+| `talu set show` | Show default model configuration |
+| `talu ask ...` | Ask a model |
 | `talu convert <model> ...` | Quantize a model |
 | `talu rm <model>` | Remove a cached model |
 | `talu tokenize <model> "text"` | Inspect tokenization |
 | `talu serve` | Start chat HTTP server + OpenResponses API (default: `127.0.0.1:8258`) |
 
-## Profiles and Persistence
+## Persistence
 
-- Profiles are selected with `TALU_PROFILE` (default: `default`)
-- Profile config stores defaults such as selected model
-- Conversation sessions are persisted and can be resumed across CLI, Python, and server workflows when using the same profile/storage
+- Local runtime is inference-first and stateless.
+- Chat/session persistence is externalized through `TALU_DB_HOST` (`v1/chat` API).
+- Use the same `TALU_DB_HOST` for both `talu ask` and Talupi UI to share transcripts.
 
 ## Architecture
 
@@ -191,13 +187,12 @@ Talu is organized as one inference/runtime core with thin interface layers:
 - `bindings/python/`: Python package (`import talu`)
 - `bindings/rust/talu-sys/`: generated low-level Rust FFI bindings
 - `bindings/rust/talu/`: safe Rust API over FFI
-- `bindings/rust/cli/`: CLI and chat HTTP server (OpenResponses-compatible API)
-- `ui/`: browser client served by `talu serve` (or `--html-dir`)
+- `bindings/rust/cli/`: CLI and HTTP server (OpenResponses-compatible API)
 
 Request flow:
 
 ```text
-CLI / Python / UI
+CLI / Python / HTTP clients
        |
        v
 Surface layer (CLI, Python binding, or HTTP server)
@@ -206,10 +201,10 @@ Surface layer (CLI, Python binding, or HTTP server)
 Rust safe wrapper / C API boundary
        |
        v
-Core Zig runtime (model + inference + sessions)
+Core Zig runtime (model + inference)
        |
        v
-Local model cache + profile/session storage
+Local model cache + external optional persistence (`TALU_DB_HOST`)
 ```
 
 ## Repository Layout
@@ -218,7 +213,6 @@ Local model cache + profile/session storage
 core/               Zig inference engine + C API
 bindings/python/    Python package
 bindings/rust/      Rust FFI, safe wrapper, CLI/server
-ui/                 Web UI source and build output
 docs/               Documentation site source
 examples/           Runnable CLI/Python/server examples
 ```
@@ -307,24 +301,17 @@ The roadmap below highlights the primary areas of focus for upcoming releases. I
 
 **Core**
 - Expand model coverage across supported HuggingFace architectures
-- Add support for vision and speech models
-- Maintain CPU and Metal as primary backends; introduce initial CUDA support
-- Implement structured output validation for popular programming languages (syntax-aware validation engine)
-- Add a policy firewall to enforce safety constraints for both local and remote models
-- Integrate a VectorDB-backed chat memory layer (long-term memory / full RAG workflows)
-- Add optional S3-compatible storage backend
+- Continue backend work across CPU, Metal, and CUDA
+- Improve tokenizer/template correctness and structured output validation
+- Keep inference and training/runtime contracts deterministic and testable
 
 **Bindings**
-- Maintain Python as the primary, fully supported binding
-- Complete Rust bindings beyond the current minimal FFI layer
-- Introduce initial TypeScript bindings
+- Maintain Python and Rust surfaces aligned with core contracts
+- Improve API ergonomics without adding legacy compatibility paths
 
 **Server**
-- Extend OpenResponses-compatible API with a Completions interface (to support alternative UIs and tooling)
-
-**Web**
-- Add agentic execution module
-- Add plugin system (e.g. document upload and analysis)
+- Continue OpenResponses and Chat Completions compatibility hardening
+- Improve request validation, observability, and throughput
 
 
 ## Contributing

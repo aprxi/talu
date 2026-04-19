@@ -203,7 +203,10 @@ fn multi_turn_conversation() {
 fn load_clears_prior_state() {
     let chat = ChatHandle::new(Some("old system")).unwrap();
     chat.append_user_message("old message").unwrap();
-    assert_eq!(unsafe { talu_sys::talu_chat_len(chat.as_ptr()) }, 2);
+    assert!(
+        !read_items(&chat).is_empty(),
+        "chat should contain preexisting conversation state before load"
+    );
 
     chat.load_completions_json(r#"[{"role":"user","content":"new"}]"#)
         .unwrap();
@@ -241,7 +244,7 @@ fn empty_array_clears() {
     chat.append_user_message("something").unwrap();
     chat.load_completions_json("[]").unwrap();
 
-    assert_eq!(unsafe { talu_sys::talu_chat_len(chat.as_ptr()) }, 0);
+    assert_eq!(read_items(&chat).len(), 0);
 }
 
 // =============================================================================
@@ -285,7 +288,10 @@ fn invalid_role_returns_error() {
 fn failed_load_clears_original_leaves_partial() {
     let chat = ChatHandle::new(None).unwrap();
     chat.append_user_message("original").unwrap();
-    assert_eq!(unsafe { talu_sys::talu_chat_len(chat.as_ptr()) }, 1);
+    assert!(
+        !read_items(&chat).is_empty(),
+        "chat should contain the original message before failed load"
+    );
 
     // First message parses OK, second has no role → error
     let bad_json = r#"[{"role":"user","content":"ok"},{"content":"no role"}]"#;

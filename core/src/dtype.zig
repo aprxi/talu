@@ -134,9 +134,6 @@ pub const DType = enum(u8) {
     }
 };
 
-/// GGML FP16 storage type
-pub const GGMLFp16 = u16;
-
 /// Grouped affine quantization metadata (u4/u8 packed weights + per-group scale/bias)
 pub const GroupedAffineMeta = struct {
     scales: []u8,
@@ -183,13 +180,6 @@ pub const Nvfp4Meta = struct {
     group_size: u32 = 0,
     /// Dequant factor denominator from compressed-tensors weight_global_scale.
     weight_global_scale: f32 = 1.0,
-};
-
-/// MXFP4 quantization metadata (Microsoft Microscaling)
-/// Format: 4-bit values with E8M0 scales (32 values per scale)
-pub const MXFP4Meta = struct {
-    scales: []u8, // E8M0 scales (one per 32 values)
-    block_size: usize, // Usually 32
 };
 
 // =============================================================================
@@ -420,19 +410,6 @@ pub inline fn fp8e4m3ToF32(value: u8) f32 {
         const exp_f32: u32 = (exp + 120) << 23;
         const mant_f32: u32 = mant << 20;
         return @bitCast(sign | exp_f32 | mant_f32);
-    }
-}
-
-/// Dequantize FP8 E4M3 tensor to f32 with scale factor
-/// scale_inv is the inverse scale (weight_scale_inv from safetensors)
-/// Dequantization: output[i] = fp8_to_f32(input[i]) * scale_inv
-fn dequantizeFp8E4M3(
-    input: []const u8,
-    scale_inv: f32,
-    output: []f32,
-) void {
-    for (input, 0..) |value, idx| {
-        output[idx] = fp8e4m3ToF32(value) * scale_inv;
     }
 }
 

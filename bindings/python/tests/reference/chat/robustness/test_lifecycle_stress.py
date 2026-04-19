@@ -31,9 +31,8 @@ class TestConversationPointerValidity:
         # Pointer should not be None
         assert chat._conversation_ptr is not None
 
-        # Chat handle should be valid (len should work)
-        chat_len = lib.talu_chat_len(chat._chat_ptr)
-        assert chat_len == 0
+        # Public API view should match an empty fresh chat
+        assert len(chat.items) == 0
 
         # Conversation pointer should match what Chat reports
         fresh_ptr = lib.talu_chat_get_conversation(chat._chat_ptr)
@@ -114,53 +113,6 @@ class TestConversationPointerValidity:
         # Pointer should still be valid
         fresh_ptr = lib.talu_chat_get_conversation(chat._chat_ptr)
         assert fresh_ptr == chat._conversation_ptr
-
-        chat.close()
-
-
-class TestMagicNumberValidation:
-    """Test magic number validation for detecting memory corruption."""
-
-    def test_valid_conversation_passes_validation(self):
-        """A valid conversation should pass magic number validation."""
-        chat = Chat()
-        lib = get_chat_lib()
-
-        # Setup validation function
-        import ctypes
-
-        lib.talu_responses_validate.argtypes = [ctypes.c_void_p]
-        lib.talu_responses_validate.restype = ctypes.c_int32
-
-        is_valid = lib.talu_responses_validate(chat._conversation_ptr)
-        assert is_valid == 1, "Fresh conversation should be valid"
-
-        chat.close()
-
-    def test_validation_after_operations(self):
-        """Validation should pass after various operations."""
-        chat = Chat(system="Test system")
-        lib = get_chat_lib()
-
-        import ctypes
-
-        lib.talu_responses_validate.argtypes = [ctypes.c_void_p]
-        lib.talu_responses_validate.restype = ctypes.c_int32
-
-        # After creation with system
-        assert lib.talu_responses_validate(chat._conversation_ptr) == 1
-
-        # After append
-        chat.append("user", "Hello")
-        assert lib.talu_responses_validate(chat._conversation_ptr) == 1
-
-        # After hidden append
-        chat.append("user", "Hidden", hidden=True)
-        assert lib.talu_responses_validate(chat._conversation_ptr) == 1
-
-        # After clear
-        chat.clear()
-        assert lib.talu_responses_validate(chat._conversation_ptr) == 1
 
         chat.close()
 

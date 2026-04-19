@@ -78,9 +78,3 @@ pub fn runTwoPhase(
         .block_x = block_x,
     }, arg_pack, .pointwise);
 }
-
-/// Scratch buffer size in bytes for phase 1 intermediate results.
-pub fn scratchBytes(max_rows: u32, k: u32) usize {
-    const entries = @as(usize, max_rows) * @as(usize, CHUNKS) * @as(usize, k);
-    return entries * @sizeOf(f32); // same count for ids (u32 = same size)
-}

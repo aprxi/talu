@@ -4,7 +4,6 @@
 //!
 //! ## Unified Operations (scheme-agnostic)
 //! - talu_repo_list() - List files in model (local, model ID)
-//! - talu_repo_exists() - Check if model is available (cache OR source)
 //! - talu_repo_resolve_path() - Resolve model URI to local path
 //!
 //! ## Cache Operations
@@ -101,24 +100,6 @@ pub export fn talu_repo_cache_dir_exists(model_id: [*:0]const u8) callconv(.c) c
     capi_error.clearError();
     const exists = repository.modelCacheDirExists(allocator, std.mem.span(model_id)) catch |e| {
         setErr("cache_dir_exists", e);
-        return 0;
-    };
-    return if (exists) 1 else 0;
-}
-
-/// Checks if a model exists (either in cache or at the remote source).
-///
-/// For HuggingFace models, this may make a network request if not cached.
-/// Returns 1 if exists, 0 if not found or on error.
-///
-/// Parameters:
-///   model_id: Model identifier (e.g., "org/model-name" or local path)
-///   token: Optional HuggingFace API token for private models
-pub export fn talu_repo_exists(model_id: [*:0]const u8, token: ?[*:0]const u8) callconv(.c) c_int {
-    capi_error.clearError();
-    const tok: ?[]const u8 = if (token) |t| std.mem.span(t) else null;
-    const exists = repository.exists(allocator, std.mem.span(model_id), .{ .token = tok }, null) catch |e| {
-        setErr("exists", e);
         return 0;
     };
     return if (exists) 1 else 0;
@@ -224,28 +205,6 @@ pub export fn talu_repo_get_talu_home(out: *?[*:0]u8) callconv(.c) i32 {
     out.* = null;
     const path = repository.talu_cache.getTaluHome(allocator) catch |e| {
         setErr("get_talu_home", e);
-        return @intFromEnum(error_codes.errorToCode(e));
-    };
-    defer allocator.free(path);
-    out.* = (allocZSlice(path) orelse return @intFromEnum(error_codes.ErrorCode.out_of_memory)).ptr;
-    return 0;
-}
-
-/// Gets the cache directory for a specific model.
-///
-/// Returns the model-specific cache directory (e.g., ~/.cache/huggingface/hub/models--org--model-name).
-/// This is the parent directory containing snapshots and refs.
-///
-/// Parameters:
-///   model_id: Model identifier (e.g., "org/model-name")
-///   out: Output pointer for path (caller must free with talu_free_string)
-///
-/// Returns 0 on success, error code on failure.
-pub export fn talu_repo_get_cache_dir(model_id: [*:0]const u8, out: *?[*:0]u8) callconv(.c) i32 {
-    capi_error.clearError();
-    out.* = null;
-    const path = repository.cache.getModelCacheDir(allocator, std.mem.span(model_id)) catch |e| {
-        setErr("get_cache_dir", e);
         return @intFromEnum(error_codes.errorToCode(e));
     };
     defer allocator.free(path);

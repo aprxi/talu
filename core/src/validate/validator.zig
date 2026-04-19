@@ -65,47 +65,15 @@ pub const Validator = struct {
         return self.bytes_consumed;
     }
 
-    /// Get number of active states (complexity indicator).
-    pub fn getStateCount(self: *const Validator) usize {
-        return self.engine.states.stacks.items.len;
-    }
-
     /// Get valid next bytes from current state.
     pub fn getValidFirstBytes(self: *const Validator, valid: *[256]bool) void {
         for (valid) |*v| v.* = false;
         self.engine.getValidFirstBytes(valid);
     }
 
-    /// Count valid next bytes from current state.
-    pub fn countValidBytes(self: *const Validator) usize {
-        var valid: [256]bool = [_]bool{false} ** 256;
-        self.engine.getValidFirstBytes(&valid);
-
-        var count: usize = 0;
-        for (valid) |v| {
-            if (v) count += 1;
-        }
-        return count;
-    }
-
     /// Check if byte sequence can be accepted from current state (read-only).
     pub fn canAccept(self: *Validator, data: []const u8) !bool {
         return self.engine.canAccept(data);
-    }
-
-    /// Advance state by one byte.
-    /// Returns true if valid and advanced, false if invalid.
-    pub fn advanceByte(self: *Validator, byte: u8) !bool {
-        var valid: [256]bool = [_]bool{false} ** 256;
-        self.engine.getValidFirstBytes(&valid);
-
-        if (!valid[byte]) {
-            return false;
-        }
-
-        try self.engine.advance(&[_]u8{byte});
-        self.bytes_consumed += 1;
-        return true;
     }
 
     /// Advance state by byte sequence.
@@ -149,11 +117,6 @@ pub const Validator = struct {
         self.bytes_consumed = data.len;
 
         return self.engine.isComplete();
-    }
-
-    /// Get deterministic continuation if grammar requires specific bytes next.
-    pub fn getDeterministicContinuation(self: *const Validator) ?[]const u8 {
-        return self.engine.getDeterministicContinuation();
     }
 };
 
@@ -214,31 +177,6 @@ test "Validator.getPosition returns bytes_consumed" {
     try std.testing.expectEqual(@as(usize, 42), validator.getPosition());
 }
 
-test "Validator.getStateCount returns engine state count" {
-    const allocator = std.testing.allocator;
-
-    var validator = try Validator.init(allocator,
-        \\{"type": "object", "properties": {"x": {"type": "integer"}}}
-    );
-    defer validator.deinit();
-
-    // After init, should have at least one state
-    try std.testing.expect(validator.getStateCount() > 0);
-}
-
-test "Validator.countValidBytes returns count from engine" {
-    const allocator = std.testing.allocator;
-
-    var validator = try Validator.init(allocator,
-        \\{"type": "object", "properties": {"x": {"type": "integer"}}}
-    );
-    defer validator.deinit();
-
-    // Should have at least '{' as valid first byte for object
-    const count = validator.countValidBytes();
-    try std.testing.expect(count > 0);
-}
-
 test "Validator.getValidFirstBytes populates array" {
     const allocator = std.testing.allocator;
 
@@ -252,34 +190,6 @@ test "Validator.getValidFirstBytes populates array" {
 
     // '{' should be valid for object start
     try std.testing.expectEqual(true, valid['{']);
-}
-
-test "Validator.advanceByte rejects invalid byte" {
-    const allocator = std.testing.allocator;
-
-    var validator = try Validator.init(allocator,
-        \\{"type": "object", "properties": {"x": {"type": "integer"}}}
-    );
-    defer validator.deinit();
-
-    // 'x' is not a valid first byte (expecting '{')
-    const advanced = try validator.advanceByte('x');
-    try std.testing.expectEqual(false, advanced);
-    try std.testing.expectEqual(@as(usize, 0), validator.getPosition());
-}
-
-test "Validator.advanceByte accepts valid byte and updates position" {
-    const allocator = std.testing.allocator;
-
-    var validator = try Validator.init(allocator,
-        \\{"type": "object", "properties": {"x": {"type": "integer"}}}
-    );
-    defer validator.deinit();
-
-    // '{' should be valid for object start
-    const advanced = try validator.advanceByte('{');
-    try std.testing.expectEqual(true, advanced);
-    try std.testing.expectEqual(@as(usize, 1), validator.getPosition());
 }
 
 test "Validator.canAccept does not modify state" {

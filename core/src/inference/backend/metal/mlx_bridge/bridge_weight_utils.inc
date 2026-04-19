@@ -151,12 +151,6 @@ void sanitize_model_tensors(
             has_mtp_weights = true;
             continue;
         }
-        if (k.rfind("vision_tower", 0) == 0 ||
-            k.rfind("model.visual", 0) == 0 ||
-            k.rfind("model.vision_tower", 0) == 0 ||
-            k.rfind("model.multi_modal_projector", 0) == 0) {
-            continue;
-        }
         if ((k.find("conv1d.weight") != std::string::npos || k.find("conv.conv.weight") != std::string::npos) &&
             kv.second.ndim() == 3 && kv.second.shape(2) != 1) {
             has_unsanitized_conv1d = true;

@@ -35,9 +35,9 @@ fn upload_fake_image(ctx: &ServerTestContext, filename: &str) -> String {
     id
 }
 
-fn model_config_with_bucket(bucket: &std::path::Path) -> ServerConfig {
+fn model_config_with_temp_workdir(workdir: &std::path::Path) -> ServerConfig {
     let mut cfg = model_config();
-    cfg.bucket = Some(bucket.to_path_buf());
+    cfg.workdir = Some(workdir.to_path_buf());
     cfg
 }
 
@@ -45,7 +45,7 @@ fn model_config_with_bucket(bucket: &std::path::Path) -> ServerConfig {
 fn responses_file_reference_resolved_in_generation() {
     let model = require_model!();
     let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(model_config_with_bucket(temp.path()));
+    let ctx = ServerTestContext::new(model_config_with_temp_workdir(temp.path()));
     let file_id = upload_text_file(&ctx, "notes.txt", "The secret word is pineapple.");
 
     let body = serde_json::json!({
@@ -73,7 +73,7 @@ fn responses_file_reference_resolved_in_generation() {
 fn responses_image_reference_resolved_in_generation() {
     let model = require_model!();
     let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(model_config_with_bucket(temp.path()));
+    let ctx = ServerTestContext::new(model_config_with_temp_workdir(temp.path()));
     let file_id = upload_fake_image(&ctx, "photo.jpg");
 
     let body = serde_json::json!({
@@ -101,7 +101,7 @@ fn responses_image_reference_resolved_in_generation() {
 fn responses_dangling_file_reference_does_not_crash_server() {
     let model = require_model!();
     let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(model_config_with_bucket(temp.path()));
+    let ctx = ServerTestContext::new(model_config_with_temp_workdir(temp.path()));
 
     let body = serde_json::json!({
         "model": &model,

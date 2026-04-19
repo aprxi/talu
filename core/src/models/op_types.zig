@@ -337,24 +337,6 @@ pub const BlockKind = enum {
 /// Loader/backend contract: maximum grouped-affine groups supported by runtime kernels.
 pub const MAX_SUPPORTED_GAFFINE_GROUPS: usize = 1024;
 
-/// Fused-model layer kind identifiers for Metal compute bindings.
-pub const FusedLayerKindId = enum(u8) {
-    attention_mlp = 0,
-    shortconv = 1,
-    mamba = 2,
-};
-
-/// Returns the fused-model layer id for kinds supported by fused Metal decode.
-/// `null` means the kind is not supported by fused Metal execution.
-pub fn fusedLayerKindId(kind: BlockKind) ?FusedLayerKindId {
-    return switch (kind) {
-        .attention_mlp => .attention_mlp,
-        .shortconv => .shortconv,
-        .mamba => .mamba,
-        .gated_delta => null,
-    };
-}
-
 /// A registered architecture definition.
 /// Contains static operation metadata and weight contracts.
 pub const Architecture = struct {

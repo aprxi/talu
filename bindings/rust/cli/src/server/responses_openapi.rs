@@ -120,44 +120,11 @@ fn install_request_schemas(schemas: &mut Map<String, Value>) {
     );
 
     schemas.insert(
-        "AllowedToolRef".to_string(),
-        json!({
-            "type": "object",
-            "required": ["type", "name"],
-            "additionalProperties": false,
-            "properties": {
-                "type": { "type": "string", "enum": ["function"] },
-                "name": { "type": "string", "minLength": 1 }
-            }
-        }),
-    );
-
-    schemas.insert(
-        "ToolChoiceAllowedTools".to_string(),
-        json!({
-            "type": "object",
-            "required": ["type", "tools"],
-            "additionalProperties": false,
-            "properties": {
-                "type": { "type": "string", "enum": ["allowed_tools"] },
-                "tools": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 128,
-                    "items": { "$ref": "#/components/schemas/AllowedToolRef" }
-                },
-                "mode": { "type": "string", "enum": ["none", "auto", "required"] }
-            }
-        }),
-    );
-
-    schemas.insert(
         "ToolChoice".to_string(),
         json!({
             "oneOf": [
                 { "type": "string", "enum": ["none", "auto", "required"] },
-                { "$ref": "#/components/schemas/ToolChoiceFunction" },
-                { "$ref": "#/components/schemas/ToolChoiceAllowedTools" }
+                { "$ref": "#/components/schemas/ToolChoiceFunction" }
             ]
         }),
     );
@@ -266,8 +233,16 @@ fn install_request_schemas(schemas: &mut Map<String, Value>) {
         "InputImageContentPart".to_string(),
         json!({
             "type": "object",
-            "required": ["type", "image_url"],
+            "required": ["type"],
             "additionalProperties": false,
+            "allOf": [
+                {
+                    "oneOf": [
+                        { "required": ["image_url"] },
+                        { "required": ["prepared"] }
+                    ]
+                }
+            ],
             "properties": {
                 "type": { "type": "string", "enum": ["input_image"] },
                 "image_url": {
@@ -276,7 +251,137 @@ fn install_request_schemas(schemas: &mut Map<String, Value>) {
                         { "type": "null" }
                     ]
                 },
+                "prepared": { "$ref": "#/components/schemas/VisionPreparedInput" },
                 "detail": { "type": "string", "enum": ["auto", "low", "high"] }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "VisionPreprocessProfile".to_string(),
+        json!({
+            "type": "object",
+            "required": [
+                "version",
+                "normalize",
+                "temporal_frames",
+                "patch_size",
+                "temporal_patch_size",
+                "spatial_merge_size"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "version": { "type": "string" },
+                "normalize": { "type": "string" },
+                "temporal_frames": { "type": "integer", "minimum": 1 },
+                "patch_size": { "type": "integer", "minimum": 1 },
+                "temporal_patch_size": { "type": "integer", "minimum": 1 },
+                "spatial_merge_size": { "type": "integer", "minimum": 1 },
+                "smart_resize": {
+                    "anyOf": [
+                        { "$ref": "#/components/schemas/VisionSmartResize" },
+                        { "type": "null" }
+                    ]
+                },
+                "alpha_mode": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "null" }
+                    ]
+                },
+                "alpha_background": {
+                    "anyOf": [
+                        { "$ref": "#/components/schemas/VisionRgb" },
+                        { "type": "null" }
+                    ]
+                }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "VisionSmartResize".to_string(),
+        json!({
+            "type": "object",
+            "required": ["factor", "min_pixels", "max_pixels"],
+            "additionalProperties": false,
+            "properties": {
+                "factor": { "type": "integer", "minimum": 1 },
+                "min_pixels": { "type": "integer", "minimum": 1 },
+                "max_pixels": { "type": "integer", "minimum": 1 }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "VisionRgb".to_string(),
+        json!({
+            "type": "object",
+            "required": ["r", "g", "b"],
+            "additionalProperties": false,
+            "properties": {
+                "r": { "type": "integer", "minimum": 0, "maximum": 255 },
+                "g": { "type": "integer", "minimum": 0, "maximum": 255 },
+                "b": { "type": "integer", "minimum": 0, "maximum": 255 }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "VisionPreparedGrid".to_string(),
+        json!({
+            "type": "object",
+            "required": ["temporal", "height", "width"],
+            "additionalProperties": false,
+            "properties": {
+                "temporal": { "type": "integer", "minimum": 1 },
+                "height": { "type": "integer", "minimum": 1 },
+                "width": { "type": "integer", "minimum": 1 }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "VisionPreparedItem".to_string(),
+        json!({
+            "type": "object",
+            "required": [
+                "dtype",
+                "layout",
+                "channels",
+                "temporal_frames",
+                "width",
+                "height",
+                "grid",
+                "token_count",
+                "normalize",
+                "tensor_b64"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "dtype": { "type": "string" },
+                "layout": { "type": "string" },
+                "channels": { "type": "integer", "minimum": 1 },
+                "temporal_frames": { "type": "integer", "minimum": 1 },
+                "width": { "type": "integer", "minimum": 1 },
+                "height": { "type": "integer", "minimum": 1 },
+                "grid": { "$ref": "#/components/schemas/VisionPreparedGrid" },
+                "token_count": { "type": "integer", "minimum": 1 },
+                "normalize": { "type": "string" },
+                "tensor_b64": { "type": "string" }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "VisionPreparedInput".to_string(),
+        json!({
+            "type": "object",
+            "required": ["model_profile", "item"],
+            "additionalProperties": false,
+            "properties": {
+                "model_profile": { "$ref": "#/components/schemas/VisionPreprocessProfile" },
+                "item": { "$ref": "#/components/schemas/VisionPreparedItem" }
             }
         }),
     );
@@ -606,21 +711,18 @@ fn install_request_schemas(schemas: &mut Map<String, Value>) {
                 })),
                 "instructions": nullable(json!({ "type": "string" })),
                 "max_output_tokens": nullable(json!({ "type": "integer", "minimum": 1 })),
-                "max_tool_calls": nullable(json!({ "type": "integer", "minimum": 1 })),
                 "metadata": nullable(json!({
                     "type": "object",
                     "maxProperties": 16,
                     "additionalProperties": { "type": "string", "maxLength": 512 }
                 })),
                 "model": nullable(json!({ "type": "string" })),
-                "parallel_tool_calls": nullable(json!({ "type": "boolean" })),
                 "presence_penalty": nullable(json!({ "type": "number" })),
                 "previous_response_id": nullable(json!({ "type": "string" })),
                 "prompt_cache_key": nullable(json!({ "type": "string", "maxLength": 64 })),
                 "reasoning": nullable(json!({ "$ref": "#/components/schemas/ReasoningConfig" })),
                 "safety_identifier": nullable(json!({ "type": "string", "maxLength": 64 })),
                 "service_tier": nullable(json!({ "type": "string", "enum": ["auto", "default", "flex", "priority"] })),
-                "store": nullable(json!({ "type": "boolean" })),
                 "stream": nullable(json!({ "type": "boolean" })),
                 "stream_options": nullable(json!({
                     "type": "object",

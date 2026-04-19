@@ -43,190 +43,6 @@ impl ChatHandle {
         unsafe { ResponsesRef::from_raw(ptr) }
     }
 
-    /// Sets TaluDB storage backend for this chat session.
-    ///
-    /// This enables persistence of the conversation to TaluDB storage.
-    /// All subsequent messages will be persisted to the specified database
-    /// and session. If the session already exists, items are loaded from storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `db_path` - Path to TaluDB storage directory
-    /// * `session_id` - Unique session identifier
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be opened or the lock cannot be acquired.
-    pub fn set_storage_db(&self, db_path: &str, session_id: &str) -> Result<()> {
-        let c_db_path = CString::new(db_path)?;
-        let c_session_id = CString::new(session_id)?;
-
-        // SAFETY: self.ptr is a valid chat handle; CStrings are valid.
-        let rc = unsafe {
-            talu_sys::talu_db_ops_set_storage_db(
-                self.ptr,
-                c_db_path.as_ptr(),
-                c_session_id.as_ptr(),
-            )
-        };
-
-        if rc != 0 {
-            return Err(error_from_last_or("Failed to set TaluDB storage backend"));
-        }
-
-        Ok(())
-    }
-
-    /// Sets the maximum segment size for TaluDB storage.
-    ///
-    /// When the active segment (`current.talu`) would exceed this size after
-    /// a flush, the writer seals it as `seg-<uuid>.talu`, updates
-    /// `manifest.json`, and creates a fresh `current.talu`.
-    ///
-    /// Must be called after [`set_storage_db`]. Pass 0 to restore the
-    /// default (64 MB).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no TaluDB storage backend is set.
-    pub fn set_max_segment_size(&self, max_bytes: u64) -> Result<()> {
-        // SAFETY: self.ptr is a valid chat handle.
-        let rc = unsafe { talu_sys::talu_db_ops_set_max_segment_size(self.ptr, max_bytes) };
-
-        if rc != 0 {
-            return Err(error_from_last_or("Failed to set max segment size"));
-        }
-
-        Ok(())
-    }
-
-    /// Sets the write durability mode for the TaluDB storage backend.
-    ///
-    /// Must be called after [`set_storage_db`]. Controls whether writes
-    /// are fsynced to disk on every append (full durability) or buffered
-    /// in the OS page cache (async durability).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no TaluDB storage backend is set or the mode is invalid.
-    pub fn set_durability(&self, mode: crate::Durability) -> Result<()> {
-        // SAFETY: self.ptr is a valid chat handle.
-        let rc = unsafe { talu_sys::talu_db_ops_set_durability(self.ptr, mode as u8) };
-        if rc != 0 {
-            return Err(error_from_last_or("Failed to set durability"));
-        }
-        Ok(())
-    }
-
-    /// Simulates a process crash for testing.
-    ///
-    /// Closes all file descriptors (releasing flocks) WITHOUT flushing
-    /// pending data or deleting the WAL file. This accurately simulates
-    /// what the OS does when a process dies: all locks are released, but
-    /// files remain on disk. The orphaned WAL will be replayed by the
-    /// next `Writer::open`.
-    ///
-    /// After calling this, the storage backend is detached. The
-    /// `ChatHandle` should still be dropped normally to free memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no TaluDB storage backend is set.
-    pub fn simulate_crash(&self) -> Result<()> {
-        // SAFETY: self.ptr is a valid chat handle.
-        let rc = unsafe { talu_sys::talu_db_ops_simulate_crash(self.ptr) };
-        if rc != 0 {
-            return Err(error_from_last_or("Failed to simulate crash"));
-        }
-        Ok(())
-    }
-
-    /// Notifies the storage backend of a session metadata update.
-    ///
-    /// Call this after generation completes to persist session metadata
-    /// (model, title, marker) to TaluDB. This writes a Schema 4 session
-    /// record that enables `talu db list` to show the session.
-    ///
-    /// # Arguments
-    ///
-    /// * `model` - Model identifier (e.g., "Qwen/Qwen3-0.6B")
-    /// * `title` - Optional session title (derived from first message if None)
-    /// * `marker` - Session marker (e.g., "pinned", "archived", "deleted")
-    pub fn notify_session_update(
-        &self,
-        model: Option<&str>,
-        title: Option<&str>,
-        marker: Option<&str>,
-    ) -> Result<()> {
-        self.notify_session_update_ex(model, title, marker, None, None)
-    }
-
-    /// Extended session update with source document ID and project ID.
-    ///
-    /// Call this after generation completes to persist session metadata
-    /// to TaluDB. This writes a Schema 5 session record that enables
-    /// `talu db list` to show the session.
-    ///
-    /// # Arguments
-    ///
-    /// * `model` - Model identifier (e.g., "Qwen/Qwen3-0.6B")
-    /// * `title` - Optional session title (derived from first message if None)
-    /// * `marker` - Session marker (e.g., "pinned", "archived", "deleted")
-    /// * `source_doc_id` - Source document ID for lineage tracking (prompt_id)
-    /// * `project_id` - Project identifier for multi-project session organization
-    pub fn notify_session_update_ex(
-        &self,
-        model: Option<&str>,
-        title: Option<&str>,
-        marker: Option<&str>,
-        source_doc_id: Option<&str>,
-        project_id: Option<&str>,
-    ) -> Result<()> {
-        let c_model = model.map(|s| CString::new(s)).transpose()?;
-        let c_title = title.map(|s| CString::new(s)).transpose()?;
-        let c_marker = marker.map(|s| CString::new(s)).transpose()?;
-        let c_source_doc_id = source_doc_id.map(|s| CString::new(s)).transpose()?;
-        let c_project_id = project_id.map(|s| CString::new(s)).transpose()?;
-
-        // SAFETY: self.ptr is a valid chat handle; CStrings/nulls are valid.
-        let rc = unsafe {
-            talu_sys::talu_chat_notify_session_update(
-                self.ptr,
-                c_model
-                    .as_ref()
-                    .map(|s| s.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-                c_title
-                    .as_ref()
-                    .map(|s| s.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-                std::ptr::null(), // system_prompt
-                std::ptr::null(), // config_json
-                c_marker
-                    .as_ref()
-                    .map(|s| s.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-                std::ptr::null(), // parent_session_id
-                std::ptr::null(), // group_id
-                std::ptr::null(), // metadata_json
-                c_source_doc_id
-                    .as_ref()
-                    .map(|s| s.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-                c_project_id
-                    .as_ref()
-                    .map(|s| s.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-            )
-        };
-
-        if rc != 0 {
-            return Err(error_from_last_or("Failed to notify session update"));
-        }
-
-        Ok(())
-    }
-
     /// Loads items from Open Responses JSON into the chat's conversation.
     ///
     /// Accepts a JSON string (or array of ItemParam objects). Appends to the
@@ -368,28 +184,6 @@ impl ChatHandle {
         // SAFETY: self.ptr is a valid chat handle. Returns null if no tool_choice set.
         let ptr = unsafe { talu_sys::talu_chat_get_tool_choice(self.ptr) };
         TextPtr::new(ptr as *mut c_char).map(|t| t.to_string_lossy())
-    }
-
-    /// Attaches an IAM-style policy to this chat for tool call filtering.
-    ///
-    /// When a policy is set, tool calls generated during inference are
-    /// evaluated against it before being committed. Denied tool calls
-    /// are committed with `status: failed`.
-    ///
-    /// # Safety contract
-    ///
-    /// The `Policy` must outlive this `ChatHandle`. The core stores a raw
-    /// pointer — dropping the policy while the chat is alive is undefined
-    /// behavior. Pass `None` to detach.
-    pub fn set_policy(&self, policy: Option<&crate::policy::Policy>) -> Result<()> {
-        let policy_ptr = policy.map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
-        // SAFETY: policy_ptr is either null (detach) or valid and will
-        // outlive the chat per the caller's contract.
-        let rc = unsafe { talu_sys::talu_chat_set_policy(self.ptr, policy_ptr) };
-        if rc != 0 {
-            return Err(error_from_last_or("Failed to set policy"));
-        }
-        Ok(())
     }
 }
 
@@ -634,9 +428,6 @@ unsafe extern "C" fn load_progress_callback_wrapper(
 pub struct InferenceBackend {
     ptr: *mut c_void,
     _canonical: CanonicalSpec, // Keep canonical spec alive
-    // Keep CStrings alive for the duration of the backend
-    _base_url: Option<CString>,
-    _api_key: Option<CString>,
 }
 
 // SAFETY: The backend handle is synchronized by callers (e.g., a Mutex) and the
@@ -691,8 +482,6 @@ impl InferenceBackend {
         Ok(Self {
             ptr: backend_ptr,
             _canonical: canonical,
-            _base_url: None,
-            _api_key: None,
         })
     }
 
@@ -754,83 +543,6 @@ impl InferenceBackend {
         Ok(Self {
             ptr: backend_ptr,
             _canonical: canonical,
-            _base_url: None,
-            _api_key: None,
-        })
-    }
-
-    /// Creates a new inference backend for a remote OpenAI-compatible server.
-    pub fn new_openai_compatible(
-        model_id: &str,
-        base_url: &str,
-        api_key: Option<&str>,
-        timeout_ms: i32,
-    ) -> Result<Self> {
-        let c_model = CString::new(model_id)?;
-        let c_base_url = CString::new(base_url)?;
-        let c_api_key = api_key.map(|k| CString::new(k)).transpose()?;
-
-        let openai_config = talu_sys::OpenAICompatibleConfig {
-            base_url: c_base_url.as_ptr(),
-            api_key: c_api_key
-                .as_ref()
-                .map(|k| k.as_ptr())
-                .unwrap_or(std::ptr::null()),
-            org_id: std::ptr::null(),
-            timeout_ms,
-            max_retries: 2,
-            custom_headers_json: std::ptr::null(),
-            _reserved: [0; 24],
-        };
-
-        let spec = talu_sys::TaluModelSpec {
-            abi_version: 1,
-            struct_size: std::mem::size_of::<talu_sys::TaluModelSpec>() as u32,
-            ref_: c_model.as_ptr(),
-            backend_type_raw: 1, // 1 = OpenAICompatible
-            backend_config: talu_sys::BackendUnion {
-                openai_compat: openai_config,
-            },
-        };
-
-        // Canonicalize the spec
-        let mut canon_ptr: *mut c_void = std::ptr::null_mut();
-        let mut spec_mut = spec;
-        // SAFETY: spec_mut is a valid TaluModelSpec; canon_ptr is a valid out-param.
-        let rc = unsafe {
-            talu_sys::talu_config_canonicalize(
-                &mut spec_mut,
-                &mut canon_ptr as *mut _ as *mut c_void,
-            )
-        };
-        if rc != 0 || canon_ptr.is_null() {
-            return Err(error_from_last_or(
-                "Failed to canonicalize remote model spec",
-            ));
-        }
-        let canonical = CanonicalSpec { ptr: canon_ptr };
-
-        // Create backend from canonical spec (no progress for remote)
-        let mut backend_ptr: *mut c_void = std::ptr::null_mut();
-        // SAFETY: canonical.as_ptr() is a valid canonical spec; backend_ptr is a valid out-param.
-        let rc = unsafe {
-            talu_sys::talu_backend_create_from_canonical(
-                canonical.as_ptr() as *mut c_void,
-                talu_sys::BackendCreateOptions::default(),
-                &mut backend_ptr as *mut _ as *mut c_void,
-            )
-        };
-        if rc != 0 || backend_ptr.is_null() {
-            return Err(error_from_last_or(
-                "Failed to create remote inference backend",
-            ));
-        }
-
-        Ok(Self {
-            ptr: backend_ptr,
-            _canonical: canonical,
-            _base_url: Some(c_base_url),
-            _api_key: c_api_key,
         })
     }
 
@@ -840,72 +552,10 @@ impl InferenceBackend {
     }
 
     /// Return static model metadata from a local backend.
-    /// Returns a zero struct for remote backends.
+    /// Returns a zero struct for non-local backends.
     pub fn model_info(&self) -> talu_sys::CModelInfo {
         unsafe { talu_sys::talu_backend_model_info(self.ptr) }
     }
-
-    /// List models available on a remote backend.
-    /// Only works for OpenAI-compatible backends.
-    pub fn list_models(&self) -> Result<Vec<RemoteModelInfo>> {
-        // SAFETY: self.ptr is a valid backend handle.
-        let result = unsafe { talu_sys::talu_backend_list_models(self.ptr) };
-
-        if result.error_code != 0 {
-            return Err(error_from_last_or("Failed to list models"));
-        }
-
-        let mut models = Vec::new();
-        if !result.models.is_null() && result.count > 0 {
-            // SAFETY: Non-null models ptr with valid count from C API.
-            let slice = unsafe { std::slice::from_raw_parts(result.models, result.count) };
-            for info in slice {
-                models.push(RemoteModelInfo {
-                    id: if info.id.is_null() {
-                        String::new()
-                    } else {
-                        // SAFETY: Non-null C string from C API.
-                        unsafe { CStr::from_ptr(info.id) }
-                            .to_string_lossy()
-                            .to_string()
-                    },
-                    object: if info.object.is_null() {
-                        String::new()
-                    } else {
-                        // SAFETY: Non-null C string from C API.
-                        unsafe { CStr::from_ptr(info.object) }
-                            .to_string_lossy()
-                            .to_string()
-                    },
-                    created: info.created,
-                    owned_by: if info.owned_by.is_null() {
-                        String::new()
-                    } else {
-                        // SAFETY: Non-null C string from C API.
-                        unsafe { CStr::from_ptr(info.owned_by) }
-                            .to_string_lossy()
-                            .to_string()
-                    },
-                });
-            }
-        }
-
-        // Free the C result
-        let mut result = result;
-        // SAFETY: result was returned by talu_backend_list_models and must be freed.
-        unsafe { talu_sys::talu_backend_list_models_free(&mut result as *mut _ as *mut c_void) };
-
-        Ok(models)
-    }
-}
-
-/// Model info from a remote backend
-#[derive(Debug, Clone)]
-pub struct RemoteModelInfo {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub owned_by: String,
 }
 
 impl Drop for InferenceBackend {

@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const main = @import("main");
-const Bundle = main.io.repository.Bundle;
+const Bundle = main.io.repository.root.Bundle;
 
 // =============================================================================
 // Type Verification Tests

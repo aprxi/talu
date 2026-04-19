@@ -1,5 +1,8 @@
+mod contract;
 mod errors;
+mod openapi_contract;
 mod parameters;
+mod request_matrix;
 mod routing;
 mod schema;
 mod streaming;

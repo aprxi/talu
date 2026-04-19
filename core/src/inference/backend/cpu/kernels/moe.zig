@@ -38,11 +38,6 @@ fn matmulWeightTransposed(a: *const Tensor, b: *const Tensor, out: *Tensor, scra
     }
 }
 
-pub const MoEError = error{
-    MissingMoEWeights,
-    OutOfMemory,
-};
-
 /// Scratch buffers for MoE computation
 pub const MoEScratch = struct {
     router_logits: []f32 = &.{},

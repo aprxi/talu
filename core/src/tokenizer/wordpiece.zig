@@ -479,30 +479,6 @@ fn buildFromSpec(model: *WordPieceModel, spec: *const ct.WordPieceModelSpec) !vo
     }
 }
 
-fn buildFromVocabFile(model: *WordPieceModel, path_z: [*:0]const u8) !void {
-    const path = std.mem.sliceTo(path_z, 0);
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const data = try file.readToEndAlloc(model.allocator, std.math.maxInt(usize));
-    defer model.allocator.free(data);
-
-    var it = std.mem.splitScalar(u8, data, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, line, "\r");
-        if (trimmed.len == 0) continue;
-        const dup = try model.allocator.dupeZ(u8, trimmed);
-        model.vocab_strings.append(model.allocator, dup) catch |err| {
-            model.allocator.free(dup);
-            return err;
-        };
-    }
-    try allocIdToToken(model, model.vocab_strings.items.len);
-    for (model.vocab_strings.items, 0..) |token_z, idx| {
-        try model.vocab.put(model.allocator, token_z[0..token_z.len], @intCast(idx));
-        model.id_to_token[idx] = token_z.ptr;
-    }
-}
-
 pub fn tokenizer_wordpiece_create_from_spec(spec: ?*const ct.WordPieceModelSpec) ?*ct.Tokenizer {
     if (spec == null or spec.?.vocab == null or spec.?.vocab_len == 0) return null;
     const allocator = std.heap.c_allocator;
