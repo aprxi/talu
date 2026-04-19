@@ -16,9 +16,6 @@ pub const tensor = @import("tensor_pkg");
 pub const dtype = @import("dtype_pkg");
 pub const compute = @import("compute_pkg");
 pub const validate = @import("validate_pkg");
-pub const db = @import("db/root.zig");
-pub const image = @import("image_pkg");
-pub const collab = @import("collab/root.zig");
 
 // =============================================================================
 // Behavioral Type Exports
@@ -31,5 +28,3 @@ pub const OwnedTensor = tensor.OwnedTensor;
 pub const DType = dtype.DType;
 pub const Device = compute.Device;
 pub const DeviceType = compute.DeviceType;
-pub const Image = image.Image;
-pub const ModelBuffer = image.ModelBuffer;

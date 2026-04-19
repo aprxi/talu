@@ -41,7 +41,6 @@ pub const PoolingStrategy = backend_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const io = @import("io_pkg");
 const repository = @import("io_pkg").repository.root;
-const image_mod = @import("image_pkg");
 const io_json = @import("io_pkg").json;
 const gen_config_mod = inference_bridge.generation_config;
 const preproc_mod = inference_bridge.preprocessor_config;
@@ -79,6 +78,26 @@ fn finishReasonToString(reason: FinishReason) [:0]const u8 {
         .tool_calls => "tool_calls",
         .content_filter => "content_filter",
         .cancelled => "cancelled",
+    };
+}
+
+fn isRecoverableMetalInitError(err: anyerror) bool {
+    return err == error.MoENotSupported or
+        err == error.MLXNotAvailable or
+        err == error.UnsupportedDType or
+        err == error.ShortConvNotSupportedOnMetal or
+        err == error.MLANotSupportedOnMetal or
+        err == error.InvalidTensorType or
+        err == error.OutOfMemory or
+        err == error.UnsupportedModel or
+        err == error.NotImplemented or
+        err == error.DecodeModelUnavailable;
+}
+
+fn shouldUseMetadataOnlyLoad(backend_init_options: BackendInitOptions) bool {
+    return switch (backend_root.effectiveLoadSelection(backend_init_options.selection)) {
+        .auto, .metal => true,
+        .cpu, .cuda => false,
     };
 }
 
@@ -235,6 +254,11 @@ pub const GenerateOptions = struct {
     /// without waiting for the next callback invocation.
     stop_flag: ?*const std.atomic.Value(bool) = null,
 
+    /// Optional preprocessed vision payload provided by the caller.
+    /// Required for any `input_image` content. Local image preprocessing
+    /// fallbacks are disabled in this repo.
+    external_vision_input: ?*const vision_types.PrefillVisionInput = null,
+
     /// Reasoning tag name for post-generation parsing.
     /// When non-null, the parser looks for `<tag>...</tag>` markers and
     /// separates reasoning from response content into distinct items.
@@ -371,6 +395,8 @@ pub const LocalEngine = struct {
     cached_chat_template: ?CachedChatTemplate,
     /// Plan-derived descriptor contract for scheduler state allocation.
     scheduler_state_descriptors: []runtime_contract.StateDescriptor,
+    /// Backend init options used to (re)build the backend when required.
+    backend_init_options: BackendInitOptions,
 
     const CachedChatTemplate = struct {
         template_source: []const u8,
@@ -619,19 +645,11 @@ pub const LocalEngine = struct {
         const preproc_config = preproc_mod.loadPreprocessorConfig(allocator, resolved_model_path);
 
         const model_load_options = backend_root.defaultModelLoadOptions(backend_init_options);
+        const cpu_load_options = backend_root.defaultModelLoadOptions(.{ .selection = .cpu });
 
-        // On macOS with Metal, load only config/metadata (no weight tensors).
-        // MLX C++ will load weights independently via mlx_create. This avoids
-        // a memory spike from two copies of weights coexisting during init.
-        // Only use metadata-only when Metal might be selected. When the user
-        // explicitly picks CPU or CUDA (via config or BACKEND env), load full
-        // weights immediately.
-        const metal_metadata_only = if (comptime !backend_root.has_metal)
-            false
-        else blk: {
-            const effective = backend_root.effectiveLoadSelection(backend_init_options.selection);
-            break :blk (effective == .auto or effective == .metal);
-        };
+        // Keep Metal startup fast and mmap-first for text workloads:
+        // load metadata only during engine construction.
+        const metal_metadata_only = shouldUseMetadataOnlyLoad(backend_init_options);
 
         // Start model loading in background thread
         const ModelLoaderThread = struct {
@@ -720,6 +738,7 @@ pub const LocalEngine = struct {
 
         const loaded_model = try allocator.create(models.LoadedModel);
         loaded_model.* = loader_thread_state.loaded_model.?;
+        var loaded_metadata_only_model = metal_metadata_only;
         var retained_loaded_model: ?*models.LoadedModel = loaded_model;
         errdefer if (retained_loaded_model) |lm| {
             lm.deinit();
@@ -760,15 +779,38 @@ pub const LocalEngine = struct {
         backend_options.metal = .{
             .model_path = resolved_model_path,
             .model_id = model_path,
+            .weights_path = wp,
         };
-        var compute_backend = try Backend.init(allocator, loaded_model, backend_options, progress);
+        const effective_backend_selection = backend_root.effectiveLoadSelection(backend_init_options.selection);
+        var compute_backend = blk: {
+            if (loaded_metadata_only_model and effective_backend_selection == .auto) {
+                var metal_options = backend_options;
+                metal_options.selection = .metal;
+                break :blk Backend.init(allocator, loaded_model, metal_options, progress) catch |err| {
+                    if (!isRecoverableMetalInitError(err)) return err;
+                    log.warn("inference", "Auto Metal init failed; retrying with full model load", .{
+                        .reason = @errorName(err),
+                    });
+                    loaded_model.deinit();
+                    loaded_model.* = try models.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
+                    loaded_metadata_only_model = false;
+                    break :blk try Backend.init(allocator, loaded_model, backend_options, progress);
+                };
+            }
+            break :blk try Backend.init(allocator, loaded_model, backend_options, progress);
+        };
         errdefer compute_backend.deinit();
 
+        // Keep metadata-only behavior to preserve fast Metal startup.
+        // Native vision prefill is routed in the backend without lazy CPU
+        // delegate re-hydration.
+
         // If we loaded metadata-only but backend fell back to CPU, re-load full weights.
-        if (metal_metadata_only and compute_backend != .metal) {
+        if (loaded_metadata_only_model and compute_backend != .metal) {
             log.info("inference", "CPU fallback with metadata-only load; re-loading full weights", .{});
             loaded_model.deinit();
-            loaded_model.* = try models.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
+            loaded_model.* = try models.loadModel(allocator, model_bundle.config_path(), wp, cpu_load_options, progress);
+            loaded_metadata_only_model = false;
         }
 
         progress.updateLine(1, 1, "Backend initialized, preparing runtime...");
@@ -852,6 +894,7 @@ pub const LocalEngine = struct {
             .model_path = resolved_model_path,
             .cached_chat_template = cached_chat_template,
             .scheduler_state_descriptors = scheduler_state_descriptors,
+            .backend_init_options = backend_options,
         };
     }
 
@@ -881,7 +924,7 @@ pub const LocalEngine = struct {
         return self.gen_config.eos_token_ids;
     }
 
-    /// Build generation parameters JSON for storage.
+    /// Build generation parameters JSON for response metadata.
     ///
     /// Creates a JSON object with the model and sampling parameters used for generation.
     /// Caller owns returned memory.
@@ -1110,7 +1153,19 @@ pub const LocalEngine = struct {
             opts,
             effective_grammar,
             use_tools,
-        );
+        ) catch |err| {
+            const err_ctx = error_context.consumeContext();
+            log.warn("inference", "LocalEngine generateWithScheduler failed", .{
+                .err = @errorName(err),
+                .context = if (err_ctx) |ctx| ctx else "",
+                .backend = switch (self.backend) {
+                    .cpu => "cpu",
+                    .metal => "metal",
+                    .cuda => "cuda",
+                },
+            });
+            return err;
+        };
     }
 
     /// Generate using Scheduler (continuous batching path).
@@ -1137,26 +1192,42 @@ pub const LocalEngine = struct {
 
         const SchedulerType = inference.scheduler.GenericScheduler(Backend);
 
-        log.debug("router", "Collecting vision input", .{}, @src());
-        var vision_prompt = try self.collectVisionPromptInput(chat);
-        defer if (vision_prompt) |*vp| vp.deinit(self.allocator);
+        const image_count = countInputImageParts(chat);
+        if (image_count > 0 and opts.external_vision_input == null) {
+            log.warn("router", "input_image requires externally prepared vision payload", .{
+                .images = image_count,
+            });
+            return error.UnsupportedContentType;
+        }
+
+        var external_token_counts: []usize = &.{};
+        defer if (external_token_counts.len > 0) self.allocator.free(external_token_counts);
+
+        const resolved_vision_prefill: ?*const vision_types.PrefillVisionInput = opts.external_vision_input;
+
+        const resolved_token_counts: []const usize = if (opts.external_vision_input) |external| blk: {
+            if (external.images.len == 0) break :blk &.{};
+            external_token_counts = try self.allocator.alloc(usize, external.images.len);
+            for (external.images, 0..) |img, i| external_token_counts[i] = img.token_count;
+            break :blk external_token_counts;
+        } else &.{};
 
         // Tokenize prompt
         log.debug("router", "Tokenizing prompt", .{ .prompt_bytes = prompt.len }, @src());
         const encoded_tokens = try self.tok.encode(prompt);
         defer self.allocator.free(encoded_tokens);
 
-        const vision_boundaries = if (vision_prompt != null) self.resolveVisionBoundaryTokens() else VisionBoundaryTokens{};
+        const vision_boundaries = if (resolved_vision_prefill != null) self.resolveVisionBoundaryTokens() else VisionBoundaryTokens{};
         log.debug("router", "Expanding image pad tokens", .{
             .encoded_len = encoded_tokens.len,
-            .has_vision = @as(u8, @intFromBool(vision_prompt != null)),
+            .has_vision = @as(u8, @intFromBool(resolved_vision_prefill != null)),
         }, @src());
-        const prompt_tokens_no_bos = if (vision_prompt) |*vp|
+        const prompt_tokens_no_bos = if (resolved_vision_prefill) |vp|
             try expandImagePadTokens(
                 self.allocator,
                 encoded_tokens,
-                vp.prefill.image_token_id,
-                vp.token_counts,
+                vp.image_token_id,
+                resolved_token_counts,
                 vision_boundaries,
             )
         else
@@ -1211,13 +1282,13 @@ pub const LocalEngine = struct {
             .original_data = opts.callback_data,
         };
 
-        const vision_input_ptr: ?*const anyopaque = if (vision_prompt) |*vp|
-            @ptrCast(&vp.prefill)
+        const vision_input_ptr: ?*const anyopaque = if (resolved_vision_prefill) |vp|
+            @ptrCast(vp)
         else
             null;
         log.debug("inference", "Scheduler request assembled", .{
             .has_vision_input = @as(u8, @intFromBool(vision_input_ptr != null)),
-            .image_count = if (vision_prompt) |*vp| vp.prefill.images.len else 0,
+            .image_count = if (resolved_vision_prefill) |vp| vp.images.len else 0,
         }, @src());
 
         // Thinking budget: carved from max_tokens, never exceeds it.
@@ -1275,6 +1346,14 @@ pub const LocalEngine = struct {
             return err;
         };
         defer result.deinit(self.allocator);
+
+        var adjusted_prefill_ns = result.prefill_ns;
+        if (resolved_vision_prefill != null) {
+            const vision_encode_ns = self.backend.takeLastVisionEncodeNs();
+            if (vision_encode_ns > 0 and adjusted_prefill_ns > vision_encode_ns) {
+                adjusted_prefill_ns -= vision_encode_ns;
+            }
+        }
 
         log.debug("router", "Scheduler token sample", .{
             .count = result.tokens.len,
@@ -1339,7 +1418,7 @@ pub const LocalEngine = struct {
                 .tool_calls = tc_inputs,
                 .prompt_tokens = prompt_len,
                 .completion_tokens = result.tokens.len,
-                .prefill_ns = result.prefill_ns,
+                .prefill_ns = adjusted_prefill_ns,
                 .generation_ns = result.decode_ns,
                 .finish_reason = finish_reason_str,
             });
@@ -1363,7 +1442,7 @@ pub const LocalEngine = struct {
                 .tokens = owned_tokens,
                 .prompt_tokens = prompt_len,
                 .generated_tokens = result.tokens.len,
-                .prefill_ns = result.prefill_ns,
+                .prefill_ns = adjusted_prefill_ns,
                 .decode_ns = result.decode_ns,
                 .finish_reason = .tool_calls,
                 .tool_calls = tool_calls,
@@ -1399,7 +1478,7 @@ pub const LocalEngine = struct {
                 .text = generated_text,
                 .prompt_tokens = prompt_len,
                 .completion_tokens = result.tokens.len,
-                .prefill_ns = result.prefill_ns,
+                .prefill_ns = adjusted_prefill_ns,
                 .generation_ns = result.decode_ns,
                 .finish_reason = finish_reason_str,
                 .reasoning_tag = opts.reasoning_tag,
@@ -1423,7 +1502,7 @@ pub const LocalEngine = struct {
         log.debug("router", "Generation complete", .{
             .prompt_tokens = prompt_len,
             .generated_tokens = result.tokens.len,
-            .prefill_ns = result.prefill_ns,
+            .prefill_ns = adjusted_prefill_ns,
             .decode_ns = result.decode_ns,
         }, @src());
 
@@ -1432,98 +1511,16 @@ pub const LocalEngine = struct {
             .tokens = owned_tokens,
             .prompt_tokens = prompt_len,
             .generated_tokens = result.tokens.len,
-            .prefill_ns = result.prefill_ns,
+            .prefill_ns = adjusted_prefill_ns,
             .decode_ns = result.decode_ns,
             .finish_reason = finish_reason,
         };
     }
 
-    const VisionPromptInput = struct {
-        prefill: vision_types.PrefillVisionInput,
-        token_counts: []usize,
-
-        fn deinit(self: *VisionPromptInput, allocator: std.mem.Allocator) void {
-            self.prefill.deinit(allocator);
-            if (self.token_counts.len > 0) allocator.free(self.token_counts);
-            self.* = undefined;
-        }
-    };
-
     const VisionBoundaryTokens = struct {
         start_token_id: ?u32 = null,
         end_token_id: ?u32 = null,
     };
-
-    fn collectVisionPromptInput(self: *LocalEngine, chat: *Chat) !?VisionPromptInput {
-        const image_count = countInputImageParts(chat);
-        if (image_count == 0) return null;
-        log.debug("router", "Vision input detected", .{ .images = image_count }, @src());
-        if (self.model_config.image_token_id <= 0) return error.UnsupportedContentType;
-
-        const preprocess_opts = try self.buildVisionPreprocessOptions();
-
-        var written: usize = 0;
-        const images = try self.allocator.alloc(vision_types.PrefillVisionImage, image_count);
-        errdefer {
-            for (images[0..written]) |*img| img.deinit(self.allocator);
-            self.allocator.free(images);
-        }
-        const token_counts = try self.allocator.alloc(usize, image_count);
-        errdefer self.allocator.free(token_counts);
-
-        for (0..chat.conv.len()) |item_index| {
-            const item = chat.conv.getItem(item_index) orelse continue;
-            const msg = item.asMessage() orelse continue;
-
-            for (0..msg.partCount()) |part_index| {
-                const part = msg.getPart(part_index) orelse continue;
-                if (part.getContentType() != .input_image) continue;
-
-                log.trace("router", "Loading image", .{
-                    .index = written,
-                    .data_len = part.getData().len,
-                }, @src());
-                const image_bytes = try loadImageBytes(self.allocator, part.getData());
-                defer self.allocator.free(image_bytes);
-
-                var decoded = try image_mod.decode(self.allocator, image_bytes, .{
-                    .prefer_format = .rgb8,
-                    .apply_orientation = true,
-                });
-                defer decoded.deinit(self.allocator);
-
-                log.trace("router", "Preprocessing image", .{
-                    .index = written,
-                    .bytes = image_bytes.len,
-                }, @src());
-                var prep = try image_mod.preprocessImage(self.allocator, decoded, preprocess_opts);
-                errdefer prep.deinit(self.allocator);
-
-                images[written] = .{
-                    .pixels = prep.pixels,
-                    .width = prep.width,
-                    .height = prep.height,
-                    .grid = prep.grid,
-                    .token_count = @intCast(prep.token_count),
-                };
-                token_counts[written] = @intCast(prep.token_count);
-                written += 1;
-
-                prep.pixels = &.{};
-                prep.deinit(self.allocator);
-            }
-        }
-
-        if (written != image_count) return error.InvalidState;
-
-        return VisionPromptInput{
-            .prefill = .{
-                .images = images,
-                .image_token_id = @intCast(self.model_config.image_token_id),
-            },
-            .token_counts = token_counts,
-        };
-    }
 
     fn countInputImageParts(chat: *Chat) usize {
         var count: usize = 0;
@@ -1536,115 +1533,6 @@ pub const LocalEngine = struct {
             }
         }
         return count;
-    }
-
-    fn buildVisionPreprocessOptions(self: *const LocalEngine) !image_mod.VisionPreprocessOptions {
-        const patch_size = try requirePositiveConfigU32(self.model_config.vision_patch_size);
-        const temporal_patch_size = try requirePositiveConfigU32(self.model_config.vision_temporal_patch_size);
-        const spatial_merge_size = try requirePositiveConfigU32(self.model_config.vision_spatial_merge_size);
-        const resize_factor = try std.math.mul(u32, patch_size, spatial_merge_size);
-
-        // Cross-check patch_size if preprocessor_config provided one.
-        if (self.preproc_config.patch_size > 0 and
-            self.preproc_config.patch_size != patch_size)
-        {
-            log.warn("load", "preprocessor_config.json patch_size differs from config.json vision_patch_size; using config.json", .{
-                .preprocessor = self.preproc_config.patch_size,
-                .config = patch_size,
-            });
-        }
-
-        const encoder_max = self.backend.visionMaxPixels();
-
-        // Determine pixel limits for smart resize.
-        //
-        // Priority: preprocessor_config.json values (clamped to encoder limit),
-        // then config.json-based defaults.
-        var min_pixels: u64 = 0;
-        var max_pixels: u64 = 0;
-        if (self.preproc_config.max_pixels > 0) {
-            // Honour preprocessor_config.json, clamped to backend's vision encoder limit.
-            max_pixels = self.preproc_config.max_pixels;
-            min_pixels = self.preproc_config.min_pixels;
-            if (max_pixels > encoder_max) {
-                log.warn("load", "preprocessor_config.json max_pixels exceeds vision encoder limit; clamping", .{
-                    .requested = max_pixels,
-                    .limit = encoder_max,
-                });
-                max_pixels = encoder_max;
-            }
-            // Ensure min does not exceed clamped max.
-            if (min_pixels > max_pixels) min_pixels = 0;
-        } else if (self.model_config.vision_num_position_embeddings > 0) {
-            // Fallback when preprocessor_config.json absent or has no pixel limits.
-            const n_pos: u64 = std.math.cast(u64, self.model_config.vision_num_position_embeddings) orelse 0;
-            if (n_pos > 0) {
-                const base_pixels = n_pos * @as(u64, patch_size) * @as(u64, patch_size);
-                if (temporal_patch_size == 1 and spatial_merge_size == 1) {
-                    min_pixels = base_pixels;
-                    max_pixels = base_pixels;
-                } else {
-                    // Dynamic-resolution without preprocessor_config: conservative default.
-                    max_pixels = encoder_max;
-                }
-            }
-        }
-
-        return .{
-            .normalize = .minus_one_to_one,
-            .temporal_frames = temporal_patch_size,
-            .patch_size = patch_size,
-            .temporal_patch_size = temporal_patch_size,
-            .spatial_merge_size = spatial_merge_size,
-            .smart_resize = .{
-                .factor = resize_factor,
-                .min_pixels = min_pixels,
-                .max_pixels = max_pixels,
-            },
-        };
-    }
-
-    fn requirePositiveConfigU32(value: i32) !u32 {
-        if (value <= 0) return error.UnsupportedContentType;
-        return std.math.cast(u32, value) orelse error.UnsupportedContentType;
-    }
-
-    /// Load raw image bytes from a URL (file:// or data: scheme).
-    fn loadImageBytes(allocator: std.mem.Allocator, image_url: []const u8) ![]u8 {
-        if (std.mem.startsWith(u8, image_url, "file://")) {
-            return loadImageFromFile(allocator, image_url["file://".len..]);
-        }
-        return decodeImageDataUrl(allocator, image_url);
-    }
-
-    /// Read image bytes directly from a local file path.
-    fn loadImageFromFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-        if (path.len == 0) return error.UnsupportedContentType;
-        const file = std.fs.openFileAbsolute(path, .{}) catch return error.UnsupportedContentType;
-        defer file.close();
-        return file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch return error.UnsupportedContentType;
-    }
-
-    fn decodeImageDataUrl(allocator: std.mem.Allocator, image_url: []const u8) ![]u8 {
-        if (!std.mem.startsWith(u8, image_url, "data:")) return error.UnsupportedContentType;
-
-        const comma_index = std.mem.indexOfScalar(u8, image_url, ',') orelse return error.UnsupportedContentType;
-        if (comma_index <= "data:".len or comma_index + 1 >= image_url.len) return error.UnsupportedContentType;
-
-        const metadata = image_url["data:".len..comma_index];
-        if (!std.mem.endsWith(u8, metadata, ";base64")) return error.UnsupportedContentType;
-
-        const mime_end = std.mem.indexOfScalar(u8, metadata, ';') orelse metadata.len;
-        const mime = metadata[0..mime_end];
-        if (!std.mem.startsWith(u8, mime, "image/")) return error.UnsupportedContentType;
-
-        const payload = image_url[comma_index + 1 ..];
-        const decoded_capacity = std.base64.standard.Decoder.calcSizeForSlice(payload) catch return error.InvalidArgument;
-        const decoded = try allocator.alloc(u8, decoded_capacity);
-        errdefer allocator.free(decoded);
-
-        std.base64.standard.Decoder.decode(decoded, payload) catch return error.InvalidArgument;
-        return decoded;
     }
 
     fn expandImagePadTokens(
@@ -2335,24 +2223,6 @@ test "allocateTemporaryStateBindingsForDescriptors rejects zero-sized descriptor
     );
 }
 
-test "decodeImageDataUrl decodes base64 image payload" {
-    const allocator = std.testing.allocator;
-    const url = "data:image/png;base64,AQID";
-
-    const decoded = try LocalEngine.decodeImageDataUrl(allocator, url);
-    defer allocator.free(decoded);
-
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, decoded);
-}
-
-test "decodeImageDataUrl rejects unsupported scheme" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(
-        error.UnsupportedContentType,
-        LocalEngine.decodeImageDataUrl(allocator, "https://example.com/image.png"),
-    );
-}
-
 test "expandImagePadTokens repeats placeholders per token count" {
     const allocator = std.testing.allocator;
     const tokens = [_]u32{ 10, 99, 11, 99, 12 };
@@ -2555,6 +2425,16 @@ test "loadCachedChatTemplate reads inline template and special tokens" {
     try std.testing.expectEqualStrings("{{ messages[0].content }}", cached.template_source);
     try std.testing.expectEqualStrings("<s>", cached.bos_token);
     try std.testing.expectEqualStrings("</s>", cached.eos_token);
+}
+
+test "shouldUseMetadataOnlyLoad keeps metadata-only startup for auto and metal" {
+    try std.testing.expect(shouldUseMetadataOnlyLoad(.{ .selection = .auto }));
+    try std.testing.expect(shouldUseMetadataOnlyLoad(.{ .selection = .metal }));
+}
+
+test "shouldUseMetadataOnlyLoad disables metadata-only startup for cpu and cuda" {
+    try std.testing.expect(!shouldUseMetadataOnlyLoad(.{ .selection = .cpu }));
+    try std.testing.expect(!shouldUseMetadataOnlyLoad(.{ .selection = .cuda }));
 }
 
 test "loadCachedChatTemplate falls back to chat_template.jinja" {

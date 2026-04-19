@@ -22,7 +22,7 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
 }
 
 #[test]
-fn responses_chaining_unknown_id_succeeds() {
+fn responses_chaining_unknown_id_is_rejected() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
@@ -32,8 +32,14 @@ fn responses_chaining_unknown_id_succeeds() {
         "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
-    assert_eq!(resp.json()["object"].as_str(), Some("response"));
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let body = resp.json();
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("previous_response_id"),
+        "expected previous_response_id guidance, body: {}",
+        resp.body
+    );
 }
 
 #[test]
@@ -77,7 +83,6 @@ fn responses_streaming_continue_no_input_emits_lifecycle() {
         "model": &model,
         "input": "Tell me about the weather.",
         "stream": true,
-        "store": true,
         "max_output_tokens": 16
     });
     let initial_resp = post_json(ctx.addr(), "/v1/responses", &initial);
@@ -95,7 +100,6 @@ fn responses_streaming_continue_no_input_emits_lifecycle() {
         "model": &model,
         "previous_response_id": response_id,
         "stream": true,
-        "store": true,
         "max_output_tokens": 16
     });
     let continue_resp = post_json(ctx.addr(), "/v1/responses", &continue_body);
@@ -128,13 +132,9 @@ fn responses_streaming_continue_no_input_emits_lifecycle() {
 #[test]
 fn responses_cross_tenant_chaining_does_not_share_response_state() {
     let model = require_model!();
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let bucket = temp.path().join("bucket");
-    std::fs::create_dir_all(&bucket).expect("create bucket");
 
     let mut config = ServerConfig::new();
     config.model = Some(model.clone());
-    config.bucket = Some(bucket);
     config.gateway_secret = Some("secret".to_string());
     config.tenants = vec![
         TenantSpec {
@@ -194,11 +194,12 @@ fn responses_cross_tenant_chaining_does_not_share_response_state() {
         ],
         Some(&serde_json::to_string(&beta_body).expect("serialize beta body")),
     );
-    assert_eq!(beta_resp.status, 200, "beta failed: {}", beta_resp.body);
+    assert_eq!(beta_resp.status, 400, "beta failed: {}", beta_resp.body);
     let beta_json = beta_resp.json();
-    assert_eq!(
-        beta_json["tools"].as_array().map(|v| v.len()),
-        Some(0),
-        "cross-tenant previous_response_id must not inherit alpha tools"
+    let message = beta_json["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("previous_response_id"),
+        "cross-tenant chaining should fail with previous_response_id guidance, body: {}",
+        beta_resp.body
     );
 }

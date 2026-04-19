@@ -23,18 +23,8 @@ pub struct ServerConfig {
     pub model: Option<String>,
     pub gateway_secret: Option<String>,
     pub tenants: Vec<TenantSpec>,
-    pub bucket: Option<PathBuf>,
-    pub no_bucket: bool,
-    /// Serve console UI from this directory instead of bundled assets.
-    pub html_dir: Option<PathBuf>,
     /// Workdir root passed via `talu serve --workdir`.
     pub workdir: Option<PathBuf>,
-    /// Policy file passed via `talu serve --policy-file`.
-    pub policy_file: Option<PathBuf>,
-    /// Runtime mode passed via `talu serve --agent-runtime-mode`.
-    pub agent_runtime_mode: Option<String>,
-    /// Sandbox backend passed via `talu serve --sandbox-backend`.
-    pub sandbox_backend: Option<String>,
     /// Extra environment variables to set on the server process.
     pub env_vars: Vec<(String, String)>,
 }
@@ -45,13 +35,7 @@ impl ServerConfig {
             model: None,
             gateway_secret: None,
             tenants: Vec::new(),
-            bucket: None,
-            no_bucket: false,
-            html_dir: None,
             workdir: None,
-            policy_file: None,
-            agent_runtime_mode: None,
-            sandbox_backend: None,
             env_vars: Vec::new(),
         }
     }
@@ -123,9 +107,6 @@ impl ServerTestContext {
 
         if let Some(model) = config.model.as_ref() {
             command.arg("--model").arg(model);
-            if model.starts_with("openai::") {
-                command.env("OPENAI_ENDPOINT", "http://127.0.0.1:1");
-            }
         }
 
         if let Some(secret) = config.gateway_secret.as_ref() {
@@ -137,26 +118,8 @@ impl ServerTestContext {
                 .arg(&tenant_path);
         }
 
-        if config.no_bucket {
-            command.arg("--no-bucket");
-        } else if let Some(ref bucket) = config.bucket {
-            command.arg("--bucket").arg(bucket);
-        }
-
-        if let Some(ref html_dir) = config.html_dir {
-            command.arg("--html-dir").arg(html_dir);
-        }
         if let Some(ref workdir) = config.workdir {
             command.arg("--workdir").arg(workdir);
-        }
-        if let Some(ref policy_file) = config.policy_file {
-            command.arg("--policy-file").arg(policy_file);
-        }
-        if let Some(ref mode) = config.agent_runtime_mode {
-            command.arg("--agent-runtime-mode").arg(mode);
-        }
-        if let Some(ref backend) = config.sandbox_backend {
-            command.arg("--sandbox-backend").arg(backend);
         }
 
         for (key, value) in &config.env_vars {
@@ -281,19 +244,8 @@ pub fn delete(addr: SocketAddr, path: &str) -> HttpResponse {
     send_request(addr, "DELETE", path, &[], None)
 }
 
-/// PATCH JSON to a path on the server.
-pub fn patch_json(addr: SocketAddr, path: &str, body: &serde_json::Value) -> HttpResponse {
-    let json = serde_json::to_string(body).expect("serialize json");
-    send_request(
-        addr,
-        "PATCH",
-        path,
-        &[("Content-Type", "application/json")],
-        Some(&json),
-    )
-}
-
 /// PUT JSON to a path on the server.
+#[allow(dead_code)]
 pub fn put_json(addr: SocketAddr, path: &str, body: &serde_json::Value) -> HttpResponse {
     let json = serde_json::to_string(body).expect("serialize json");
     send_request(
@@ -306,6 +258,7 @@ pub fn put_json(addr: SocketAddr, path: &str, body: &serde_json::Value) -> HttpR
 }
 
 /// DELETE with JSON body to a path on the server.
+#[allow(dead_code)]
 pub fn delete_json(addr: SocketAddr, path: &str, body: &serde_json::Value) -> HttpResponse {
     let json = serde_json::to_string(body).expect("serialize json");
     send_request(

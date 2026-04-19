@@ -29,16 +29,10 @@ root_conftest.TEST_MODEL_URI_TEXT_RANDOM = TEST_MODEL_URI_TEXT
 def test_model_path(ensure_library_built):
     """Use a generation-capable model for reference chat tests."""
     if not _is_model_available(TEST_MODEL_URI_TEXT):
-        pytest.exit(
-            _missing_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT),
-            returncode=2,
-        )
+        pytest.skip(_missing_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT))
     load_error = _validate_model_loadable_for_generation(TEST_MODEL_URI_TEXT)
     if load_error is not None:
-        pytest.exit(
-            _unusable_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT, load_error),
-            returncode=2,
-        )
+        pytest.skip(_unusable_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT, load_error))
     return TEST_MODEL_URI_TEXT
 
 

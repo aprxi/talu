@@ -17,11 +17,11 @@ fn completions_route_is_mounted() {
 fn completions_get_not_allowed() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let resp = send_request(ctx.addr(), "GET", "/v1/chat/completions", &[], None);
-    assert!(
-        resp.status == 404 || resp.status == 405,
-        "GET should be rejected, got {}: {}",
-        resp.status,
-        resp.body
+    assert_eq!(resp.status, 405, "GET should be 405, body: {}", resp.body);
+    assert_eq!(
+        resp.header("allow"),
+        Some("POST"),
+        "GET /v1/chat/completions must advertise Allow: POST"
     );
 }
 
@@ -29,11 +29,11 @@ fn completions_get_not_allowed() {
 fn completions_put_not_allowed() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let resp = send_request(ctx.addr(), "PUT", "/v1/chat/completions", &[], None);
-    assert!(
-        resp.status == 404 || resp.status == 405,
-        "PUT should be rejected, got {}: {}",
-        resp.status,
-        resp.body
+    assert_eq!(resp.status, 405, "PUT should be 405, body: {}", resp.body);
+    assert_eq!(
+        resp.header("allow"),
+        Some("POST"),
+        "PUT /v1/chat/completions must advertise Allow: POST"
     );
 }
 
@@ -41,10 +41,14 @@ fn completions_put_not_allowed() {
 fn completions_delete_not_allowed() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let resp = send_request(ctx.addr(), "DELETE", "/v1/chat/completions", &[], None);
-    assert!(
-        resp.status == 404 || resp.status == 405,
-        "DELETE should be rejected, got {}: {}",
-        resp.status,
+    assert_eq!(
+        resp.status, 405,
+        "DELETE should be 405, body: {}",
         resp.body
+    );
+    assert_eq!(
+        resp.header("allow"),
+        Some("POST"),
+        "DELETE /v1/chat/completions must advertise Allow: POST"
     );
 }

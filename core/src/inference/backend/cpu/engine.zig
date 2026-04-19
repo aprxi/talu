@@ -55,7 +55,6 @@ const kv_cache_mod = @import("kernels/kv_cache.zig");
 const BatchedKVCache = kernels.BatchedKVCache;
 const LayeredBatchedKVCache = kernels.LayeredBatchedKVCache;
 const BatchedAttnTemp = kernels.BatchedAttnTemp;
-const attn_mod = @import("kernels/attention.zig");
 const vision_runtime_mod = @import("vision/root.zig");
 const state_bindings = @import("state_bindings.zig");
 

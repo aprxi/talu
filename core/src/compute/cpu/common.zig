@@ -14,9 +14,6 @@ pub const page_size: usize = if (builtin.os.tag == .macos and builtin.cpu.arch =
 else
     std.heap.page_size_min;
 
-/// Alignment in f32 elements for page-aligned buffers.
-const page_align_f32s = page_size / @sizeOf(f32);
-
 /// Heap overflow diagnostic: when true, ensureF32Slice and ensureAligned64F32Slice
 /// append a guard zone of GUARD_PATTERN after each buffer. Use verifyF32Guard() to
 /// detect overflows. Set to false for zero overhead in production.
@@ -101,7 +98,7 @@ pub fn ensurePageAlignedF32Slice(storage: *[]f32, needed: usize) !void {
     const byte_count = total * @sizeOf(f32);
     const aligned_bytes = std.mem.alignForward(usize, byte_count, page_size);
     const bytes = try std.heap.page_allocator.alloc(u8, aligned_bytes);
-    storage.* = @as([*]f32, @alignCast(@ptrCast(bytes.ptr)))[0..total];
+    storage.* = @as([*]f32, @ptrCast(@alignCast(bytes.ptr)))[0..total];
     if (heap_debug) fillGuard(storage.*, needed);
 }
 

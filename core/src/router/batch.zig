@@ -59,9 +59,6 @@ const MAX_TOKEN_LEN = 512;
 /// Maximum tag length for reasoning filter.
 const MAX_TAG_LEN = 64;
 
-/// Maximum text accumulation per request (64 KiB delta buffer).
-const MAX_DELTA_BUF = 65536;
-
 /// Maximum number of typed text segments emitted from one decoded chunk after
 /// reasoning-tag filtering.
 const MAX_FILTER_SEGMENTS = 64;
@@ -1204,58 +1201,6 @@ pub const BatchWrapper = struct {
 // =============================================================================
 // Helpers (private)
 // =============================================================================
-
-/// Decode a token to raw bytes using context-aware pair decoding.
-/// Same algorithm as capi_bridge.zig decodeRawWithContext.
-fn decodeTokenWithContext(engine: *LocalEngine, state: *const RequestState, token_id: u32) ![]u8 {
-    if (state.decode_context_token) |ctx_token| {
-        const ctx_raw = engine.tok.decodeRawBytes(
-            &[_]u32{ctx_token},
-            .{ .skip_special_tokens = true },
-        ) catch return engine.tok.decodeRawBytes(
-            &[_]u32{token_id},
-            .{ .skip_special_tokens = true },
-        );
-        defer engine.allocator.free(ctx_raw);
-
-        const pair_raw = engine.tok.decodeRawBytes(
-            &[_]u32{ ctx_token, token_id },
-            .{ .skip_special_tokens = true },
-        ) catch return engine.tok.decodeRawBytes(
-            &[_]u32{token_id},
-            .{ .skip_special_tokens = true },
-        );
-        errdefer engine.allocator.free(pair_raw);
-
-        const prefix = longestCommonPrefixLen(ctx_raw, pair_raw);
-        if (prefix < ctx_raw.len) {
-            engine.allocator.free(pair_raw);
-            return engine.tok.decodeRawBytes(
-                &[_]u32{token_id},
-                .{ .skip_special_tokens = true },
-            );
-        }
-
-        const delta = pair_raw[prefix..];
-        if (delta.len == pair_raw.len) {
-            engine.allocator.free(pair_raw);
-            return engine.tok.decodeRawBytes(
-                &[_]u32{token_id},
-                .{ .skip_special_tokens = true },
-            );
-        }
-
-        const out = try engine.allocator.alloc(u8, delta.len);
-        @memcpy(out, delta);
-        engine.allocator.free(pair_raw);
-        return out;
-    }
-
-    return engine.tok.decodeRawBytes(
-        &[_]u32{token_id},
-        .{ .skip_special_tokens = true },
-    );
-}
 
 /// Typed text segment emitted by reasoning-tag filtering.
 const FilteredSegment = struct {

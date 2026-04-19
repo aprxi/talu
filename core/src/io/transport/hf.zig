@@ -535,17 +535,6 @@ pub fn fetchModel(
     return snapshot_dir_path;
 }
 
-/// Fetch a model and return a Bundle (convenience wrapper)
-fn fetchModelBundle(
-    allocator: std.mem.Allocator,
-    model_id: []const u8,
-    download_config: DownloadConfig,
-) !Bundle {
-    const snapshot_path = try fetchModel(allocator, model_id, download_config);
-    defer allocator.free(snapshot_path);
-    return resolver.resolve(allocator, snapshot_path);
-}
-
 // =============================================================================
 // Single File Download
 // =============================================================================

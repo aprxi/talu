@@ -555,9 +555,6 @@ pub const ContentPart = struct {
         return self.variant.getType();
     }
 
-    // Legacy compatibility alias
-    pub const content_type = getContentType;
-
     /// Get data as slice (legacy compatibility).
     /// Returns the primary text/data field from the variant.
     pub fn getData(self: *const ContentPart) []const u8 {
@@ -571,9 +568,6 @@ pub const ContentPart = struct {
             else => .auto,
         };
     }
-
-    // Legacy compatibility - image_detail field accessor
-    pub const image_detail = getImageDetail;
 
     /// Append data to this part (for streaming).
     /// Only works for text-based content types.
@@ -1303,10 +1297,10 @@ pub const Item = struct {
     ///
     ///   - Ephemeral chats have no persistent identity to reference
     ///   - Creating a fake origin would be semantically incorrect
-    ///   - The fork becomes the "original" from the storage perspective
+    ///   - The fork becomes the new lineage root
     ///
     /// If lineage tracking is important for your use case, provide a session_id
-    /// when creating the source Chat, even if it won't be persisted.
+    /// when creating the source Chat.
     pub fn cloneWithOrigin(
         self: *const Item,
         allocator: std.mem.Allocator,

@@ -20,4 +20,3 @@ pub const RecurrentRuntimeState = extern struct {
     scratch: *runtime.ScratchBuffer,
     slot_index: usize,
 };
-pub const ScratchRuntimeState = RuntimeState;

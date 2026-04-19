@@ -708,6 +708,9 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
     array conv_out = array(0.0f);
     bool conv_silu_fused = false;
     if (S == 1 && lw.lin_conv1d_decode_w.size() > 1) {
+        const bool use_fused_silu =
+            cache.conv_state.has_value() &&
+            can_use_fused_conv1d_decode_silu(qkv, *cache.conv_state, B, lw.lin_conv_kernel);
         auto [step_out, next_state] = depthwise_conv1d_decode_step(
             cache.conv_state,
             qkv,
@@ -717,9 +720,8 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
             "linear_attn.conv1d"
         );
         conv_out = step_out;
-        // The fused Metal kernel already applied SiLU when B==1 and
-        // kernel_size > 1. Only the fallback path needs a separate silu.
-        conv_silu_fused = (B == 1 && lw.lin_conv_kernel > 1);
+        // The fused Metal kernel already applied SiLU. The fallback path did not.
+        conv_silu_fused = use_fused_silu;
         if (next_state.has_value()) {
             cache.conv_state = *next_state;
         } else {

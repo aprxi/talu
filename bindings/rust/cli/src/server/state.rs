@@ -3,16 +3,13 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use talu::collab::CollabHandle;
-use talu::kv::KvHandle;
-use talu::policy::Policy;
 use talu::InferenceBackend;
 
 use crate::server::tenant::TenantRegistry;
 use crate::server::tokenizer::TokenizerInstance;
-use crate::server::{AgentRuntimeMode, SandboxBackend};
 
 /// Result of an in-flight model load, broadcast to waiters via `watch` channel.
 #[derive(Clone, Debug)]
@@ -31,6 +28,7 @@ pub struct BackendState {
 }
 
 /// Stored conversation state for `previous_response_id` lookups.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredResponse {
     /// Serialized conversation JSON (Open Responses format).
     pub responses_json: String,
@@ -38,81 +36,16 @@ pub struct StoredResponse {
     pub tools_json: Option<serde_json::Value>,
     /// Tool choice (if any).
     pub tool_choice_json: Option<serde_json::Value>,
-    /// Session ID in TaluDB storage (for persistence across chained requests).
+    /// Session ID associated with this in-memory conversation chain.
     pub session_id: Option<String>,
     /// Tenant scope for secure `previous_response_id` chaining.
     /// `None` means gateway auth is disabled (single-tenant server mode).
     pub tenant_id: Option<String>,
 }
 
-/// Per-plugin capability token entry.
-/// Maps a bearer token to the plugin that owns it and its permissions.
-#[derive(Clone)]
-pub struct PluginTokenEntry {
-    pub plugin_id: String,
-    /// Network domain permissions extracted from manifest (e.g., "api.example.com", "*.google.com").
-    pub network_permissions: Vec<String>,
-    /// Whether this token may access `/v1/agent/fs/*`.
-    pub allow_filesystem: bool,
-    /// Whether this token may access `/v1/agent/exec`, `/v1/agent/shells/*`, and `/v1/agent/processes/*`.
-    pub allow_exec: bool,
-}
-
-/// In-memory store for plugin capability tokens.
-/// Cleared and regenerated on each `GET /v1/plugins` call.
-pub type PluginTokenStore = HashMap<String, PluginTokenEntry>;
-
-/// A code analysis session holding a parser and tree for incremental re-parsing.
-///
-/// Sessions enable sub-millisecond re-highlighting on edits by reusing the
-/// tree-sitter parser and feeding the previous tree for incremental parsing.
-pub struct CodeSession {
-    pub parser: talu::treesitter::ParserHandle,
-    pub tree: talu::treesitter::TreeHandle,
-    pub language: String,
-    /// Pre-allocated CString for the language identifier.
-    /// Avoids per-keystroke CString allocation in highlight/query FFI calls.
-    pub c_language: std::ffi::CString,
-    /// Source code that produced the current tree. Kept for highlight-without-reparse.
-    pub source: Vec<u8>,
-    pub last_access: std::time::Instant,
-}
-
-/// An interactive shell session backed by core `talu_shell_*` APIs.
-pub struct ShellSession {
-    pub shell: Arc<Mutex<talu::shell::ShellSession>>,
-    pub owner_key: String,
-    pub cwd: Option<String>,
-    pub cols: u16,
-    pub rows: u16,
-    pub created_at: std::time::Instant,
-    pub last_access: std::time::Instant,
-    /// Number of currently attached WebSocket clients.
-    pub attached_clients: usize,
-}
-
-/// A long-lived non-PTY process session backed by core `talu_process_*` APIs.
-pub struct ProcessSession {
-    pub process: Arc<Mutex<talu::process::ProcessSession>>,
-    pub owner_key: String,
-    pub command: String,
-    pub cwd: Option<String>,
-    pub created_at: std::time::Instant,
-    pub last_access: std::time::Instant,
-    /// Number of currently attached SSE stream clients.
-    pub attached_streams: usize,
-}
-
-pub struct CollabHandleEntry {
-    pub handle: Arc<CollabHandle>,
-    pub last_access: std::time::Instant,
-    /// Number of currently attached live stream clients (SSE or WebSocket).
-    pub active_streams: usize,
-}
-
 pub struct AppState {
     pub backend: Arc<Mutex<BackendState>>,
-    /// Batch scheduler for concurrent local GPU decode (None for remote-only).
+    /// Batch scheduler for concurrent local GPU decode.
     /// Behind a Mutex so it can be replaced when the backend changes (model switch).
     pub batch_scheduler:
         std::sync::Mutex<Option<Arc<crate::server::batch_scheduler::SchedulerState>>>,
@@ -121,48 +54,12 @@ pub struct AppState {
     pub response_store: Mutex<HashMap<String, StoredResponse>>,
     pub gateway_secret: Option<String>,
     pub tenant_registry: Option<TenantRegistry>,
-    /// TaluDB storage bucket for `/v1/chat/sessions` endpoints.
-    pub bucket_path: Option<PathBuf>,
-    /// Canonical workdir root for `/v1/agent/fs/*` endpoints.
+    /// Canonical workdir root for request-scoped integrations.
     pub workdir: Option<PathBuf>,
-    /// Optional JSON policy applied to `/v1/agent/*` runtime operations.
-    pub agent_policy_json: Option<String>,
-    /// Parsed policy handle for `/v1/agent/*` endpoints (loaded at startup).
-    pub agent_policy: Option<Arc<Policy>>,
-    /// Serve console UI from this directory instead of bundled assets.
-    pub html_dir: Option<PathBuf>,
-    /// Plugin capability tokens — maps bearer token → plugin_id + permissions.
-    pub plugin_tokens: Mutex<PluginTokenStore>,
-    /// Max allowed size (bytes) for `/v1/files` uploads.
-    pub max_file_upload_bytes: u64,
-    /// Max allowed size (bytes) for `/v1/file/inspect` and `/v1/file/transform` in-memory operations.
-    pub max_file_inspect_bytes: u64,
-    /// In-memory code session store for incremental parsing.
-    pub code_sessions: Mutex<HashMap<String, CodeSession>>,
-    /// Max idle time before a code session is evicted by the reaper.
-    pub code_session_ttl: std::time::Duration,
-    /// In-memory shell session store for `/v1/agent/shells/*`.
-    pub shell_sessions: Mutex<HashMap<String, ShellSession>>,
-    /// Max idle time before a detached shell session is evicted by the reaper.
-    pub shell_session_ttl: std::time::Duration,
-    /// In-memory process session store for `/v1/agent/processes/*`.
-    pub process_sessions: Mutex<HashMap<String, ProcessSession>>,
-    /// Max idle time before a detached process session is evicted by the reaper.
-    pub process_session_ttl: std::time::Duration,
-    /// Shared long-lived KV namespace handles keyed by `<root>\0<namespace>`.
-    pub kv_handles: Mutex<HashMap<String, Arc<Mutex<KvHandle>>>>,
-    /// Shared long-lived collab resource handles keyed by `<root>\0<kind>\0<id>`.
-    pub collab_handles: Mutex<HashMap<String, CollabHandleEntry>>,
     /// Stateful tokenizer handles keyed by `tokenizer_id` for `/v1/tokenizer/*`.
     /// Map access is protected separately from per-instance operations to avoid
     /// global serialization across independent tokenizer instances.
     pub tokenizer_instances: Mutex<HashMap<String, Arc<Mutex<TokenizerInstance>>>>,
-    /// Agent terminal runtime mode (`host` vs `strict`).
-    pub agent_runtime_mode: AgentRuntimeMode,
-    /// Selected sandbox backend.
-    pub sandbox_backend: SandboxBackend,
-    /// PubSub relay state for cross-client topic messaging.
-    pub pubsub: Mutex<crate::server::pubsub::PubSubState>,
     /// Active generation stop flags. Set all on shutdown for immediate cancellation.
     pub active_stop_flags: std::sync::Mutex<Vec<Weak<AtomicBool>>>,
     /// Previous scheduler drain thread. Joined before spawning a new one

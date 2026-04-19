@@ -21,14 +21,6 @@ pub const BoundaryLayout = enum(u8) {
     row_major,
 };
 
-pub const BoundaryDescriptor = struct {
-    dtype: BoundaryDType,
-    layout: BoundaryLayout = .row_major,
-    row_count: usize,
-    row_width: usize,
-    byte_count: usize,
-};
-
 pub const BoundaryNegotiationRequest = struct {
     stage0_native_dtype: BoundaryDType,
     stage1_native_dtype: BoundaryDType,

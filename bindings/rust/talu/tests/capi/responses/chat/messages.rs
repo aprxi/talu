@@ -4,54 +4,6 @@ use std::ffi::CString;
 use talu::ChatHandle;
 
 #[test]
-fn chat_len_reflects_messages() {
-    let chat = ChatHandle::new(Some("system")).unwrap();
-    let len = unsafe { talu_sys::talu_chat_len(chat.as_ptr()) };
-    // System prompt may or may not count as a "message" in chat_len
-    // depending on implementation. Verify it's accessible.
-    assert!(len <= 1, "new chat with system should have len <= 1");
-}
-
-#[test]
-fn chat_clear_resets_conversation() {
-    let chat = ChatHandle::new(Some("System msg")).unwrap();
-
-    // Add a user message via the conversation
-    {
-        let conv_ptr = unsafe { talu_sys::talu_chat_get_conversation(chat.as_ptr()) };
-        let content = b"user msg";
-        unsafe {
-            talu_sys::talu_responses_append_message(
-                conv_ptr,
-                talu_sys::CMessageRole::User as u8,
-                content.as_ptr(),
-                content.len(),
-            )
-        };
-    }
-
-    unsafe { talu_sys::talu_chat_clear(chat.as_ptr()) };
-
-    // talu_chat_clear resets the conversation (clears items, resets sampling params).
-    // The system prompt is stored as a conversation item, so it is also cleared.
-    let len = unsafe { talu_sys::talu_chat_len(chat.as_ptr()) };
-    assert_eq!(len, 0, "clear should remove all messages");
-}
-
-#[test]
-fn chat_reset_removes_everything() {
-    let chat = ChatHandle::new(Some("Goes away")).unwrap();
-    unsafe { talu_sys::talu_chat_reset(chat.as_ptr()) };
-
-    let system = unsafe { talu_sys::talu_chat_get_system(chat.as_ptr()) };
-    // After reset, system should be null (removed)
-    assert!(system.is_null(), "system prompt should be gone after reset");
-
-    let len = unsafe { talu_sys::talu_chat_len(chat.as_ptr()) };
-    assert_eq!(len, 0, "should have zero messages after reset");
-}
-
-#[test]
 fn chat_to_json_roundtrip() {
     let chat = ChatHandle::new(Some("system msg")).unwrap();
 
@@ -62,7 +14,7 @@ fn chat_to_json_roundtrip() {
         unsafe {
             talu_sys::talu_responses_append_message(
                 conv_ptr,
-                talu_sys::CMessageRole::User as u8,
+                talu_sys::MessageRole::User as u8,
                 content.as_ptr(),
                 content.len(),
             )

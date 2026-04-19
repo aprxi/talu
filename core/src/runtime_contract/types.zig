@@ -143,8 +143,6 @@ pub const kv_cache_state_id: u8 = @intFromEnum(StateBlockId.kv_cache);
 pub const shortconv_state_id: u8 = @intFromEnum(StateBlockId.shortconv);
 pub const mamba_state_id: u8 = @intFromEnum(StateBlockId.mamba);
 pub const gated_delta_state_id: u8 = @intFromEnum(StateBlockId.gated_delta);
-pub const per_layer_source_embeddings_state_id: u8 = @intFromEnum(StateBlockId.per_layer_source_embeddings);
-pub const per_layer_token_ids_state_id: u8 = @intFromEnum(StateBlockId.per_layer_token_ids);
 
 pub const state_runtime_kind_none: u8 = 0;
 pub const state_runtime_kind_kv_cache: u8 = 1;

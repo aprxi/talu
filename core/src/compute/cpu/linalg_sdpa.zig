@@ -526,10 +526,22 @@ fn sdpaHistory(
     if (history_len > MAX_STACK_SEQ) {
         // Fall back to original sequential path for very long sequences
         return sdpaHistorySequential(
-            out_data, out_strides, q_data, q_strides,
-            key_history, value_history, query_group_count, source_group_count,
-            query_steps, history_len, feature_width, causal_mask_shift,
-            scale, sinks, sliding_window, allocator,
+            out_data,
+            out_strides,
+            q_data,
+            q_strides,
+            key_history,
+            value_history,
+            query_group_count,
+            source_group_count,
+            query_steps,
+            history_len,
+            feature_width,
+            causal_mask_shift,
+            scale,
+            sinks,
+            sliding_window,
+            allocator,
         );
     }
 
@@ -791,32 +803,6 @@ fn sdpaHistorySequential(
         }
     }
 }
-
-/// Parameters for history buffer attention, pre-validated.
-/// Use validateHistoryParams() to construct.
-const HistoryAttentionParams = struct {
-    query_group_count: usize,
-    source_group_count: usize,
-    seq_len: usize,
-    feature_width: usize,
-    layer_offset: usize,
-    kv_size: usize,
-    scale: f32,
-    q_strides: [4]usize,
-    k_strides: [4]usize,
-    out_strides: [4]usize,
-};
-
-/// Validation error for history buffer parameters.
-const HistoryValidationError = error{
-    LayerIndexOutOfBounds,
-    InvalidTensorDims,
-    CacheShapeMismatch,
-    BatchMismatch,
-    SeqLenMismatch,
-    GroupShapeMismatch,
-    UnsupportedDType,
-};
 
 /// Convert i64 strides to usize array (4D).
 fn stridesToUsize4D(strides: *const [8]i64) [4]usize {

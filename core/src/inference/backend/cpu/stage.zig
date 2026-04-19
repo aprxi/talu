@@ -80,9 +80,6 @@ pub const CpuStage = struct {
     pub fn deinit(_: *CpuStage, _: std.mem.Allocator) void {}
 };
 
-/// Host-staged CPU pipeline alias for symmetric CPU stage testing.
-pub const CpuPipeline = pipeline.PipelineRuntime(CpuStage, CpuStage, null);
-
 test "CpuStage.executeLayers rejects payload with incorrect byte length" {
     var stage = CpuStage{
         .backend = @ptrFromInt(64),

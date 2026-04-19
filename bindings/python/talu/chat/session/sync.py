@@ -125,10 +125,10 @@ Custom Templates & Advanced Logic (Pre-Render Pattern):
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 from talu.router.config import GenerationConfig, Grammar
-from talu.types import ItemRecord, ItemStatus, ItemType, MessageItem, MessageRole
+from talu.types import MessageItem, MessageRole
 
 from ...exceptions import (
     SchemaValidationError,
@@ -143,36 +143,6 @@ from ..response import Response, ResponseMetadata, StreamingResponse
 if TYPE_CHECKING:
     from talu.client import AsyncClient, Client
     from talu.router import Router
-
-
-def _build_c_storage_records(items: list[ItemRecord]) -> tuple[Any, list[bytes]]:
-    from .._bindings import build_c_storage_records
-
-    type_map = {
-        "message": int(ItemType.MESSAGE),
-        "function_call": int(ItemType.FUNCTION_CALL),
-        "function_call_output": int(ItemType.FUNCTION_CALL_OUTPUT),
-        "reasoning": int(ItemType.REASONING),
-        "item_reference": int(ItemType.ITEM_REFERENCE),
-        "unknown": int(ItemType.UNKNOWN),
-    }
-    role_map = {
-        "system": int(MessageRole.SYSTEM),
-        "user": int(MessageRole.USER),
-        "assistant": int(MessageRole.ASSISTANT),
-        "developer": int(MessageRole.DEVELOPER),
-        "unknown": int(MessageRole.UNKNOWN),
-    }
-    status_map = {
-        "in_progress": int(ItemStatus.IN_PROGRESS),
-        "waiting": int(ItemStatus.WAITING),
-        "completed": int(ItemStatus.COMPLETED),
-        "incomplete": int(ItemStatus.INCOMPLETE),
-        "failed": int(ItemStatus.FAILED),
-    }
-
-    return build_c_storage_records(items, type_map, role_map, status_map)
-
 
 class Chat(ChatBase):
     """

@@ -212,20 +212,10 @@ fn validateInferenceBoundaryImports(b: *std.Build) void {
 
 const pcre2_port = @import("ports/pcre2/build.zig");
 const miniz_port = @import("ports/miniz/build.zig");
-const jpeg_turbo_port = @import("ports/jpeg-turbo/build.zig");
-const spng_port = @import("ports/spng/build.zig");
-const webp_port = @import("ports/webp/build.zig");
-const libmagic_port = @import("ports/libmagic/build.zig");
-const tree_sitter_port = @import("ports/tree-sitter/build.zig");
 const sqlite_port = @import("ports/sqlite/build.zig");
 
 const Pcre2 = pcre2_port.Pcre2;
 const Miniz = miniz_port.Miniz;
-const JpegTurbo = jpeg_turbo_port.JpegTurbo;
-const Spng = spng_port.Spng;
-const Webp = webp_port.Webp;
-const LibMagic = libmagic_port.LibMagic;
-const TreeSitter = tree_sitter_port.TreeSitter;
 const Sqlite3 = sqlite_port.Sqlite3;
 
 const CorePackages = struct {
@@ -239,7 +229,6 @@ const CorePackages = struct {
     runtime_contract_pkg: *std.Build.Module,
     progress_pkg: *std.Build.Module,
     validate_pkg: *std.Build.Module,
-    image_pkg: *std.Build.Module,
     error_context_pkg: *std.Build.Module,
 
     fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) CorePackages {
@@ -304,12 +293,6 @@ const CorePackages = struct {
                 .optimize = optimize,
                 .link_libc = true,
             }),
-            .image_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/image/root.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
             .error_context_pkg = b.createModule(.{
                 .root_source_file = b.path("core/src/error_context.zig"),
                 .target = target,
@@ -331,7 +314,6 @@ fn addCorePackageImports(mod: *std.Build.Module, pkgs: *const CorePackages) void
     if (mod != pkgs.runtime_contract_pkg) mod.addImport("runtime_contract_pkg", pkgs.runtime_contract_pkg);
     if (mod != pkgs.progress_pkg) mod.addImport("progress_pkg", pkgs.progress_pkg);
     if (mod != pkgs.validate_pkg) mod.addImport("validate_pkg", pkgs.validate_pkg);
-    if (mod != pkgs.image_pkg) mod.addImport("image_pkg", pkgs.image_pkg);
     if (mod != pkgs.error_context_pkg) mod.addImport("error_context_pkg", pkgs.error_context_pkg);
 }
 
@@ -346,7 +328,6 @@ fn wireCorePackageImports(pkgs: *const CorePackages) void {
     addCorePackageImports(pkgs.runtime_contract_pkg, pkgs);
     addCorePackageImports(pkgs.progress_pkg, pkgs);
     addCorePackageImports(pkgs.validate_pkg, pkgs);
-    addCorePackageImports(pkgs.image_pkg, pkgs);
     addCorePackageImports(pkgs.error_context_pkg, pkgs);
 }
 
@@ -355,15 +336,9 @@ fn addCorePackageBuildImportsAndDeps(
     pkgs: *const CorePackages,
     build_options_mod: *std.Build.Module,
     cacert_mod: *std.Build.Module,
-    magic_db_mod: *std.Build.Module,
     pcre2: Pcre2,
     miniz: Miniz,
-    libmagic: LibMagic,
-    jpeg_turbo: JpegTurbo,
-    spng: Spng,
-    webp: Webp,
     sqlite3: Sqlite3,
-    tree_sitter: TreeSitter,
 ) void {
     const modules = [_]*std.Build.Module{
         pkgs.models_pkg,
@@ -376,12 +351,11 @@ fn addCorePackageBuildImportsAndDeps(
         pkgs.runtime_contract_pkg,
         pkgs.progress_pkg,
         pkgs.validate_pkg,
-        pkgs.image_pkg,
         pkgs.error_context_pkg,
     };
     inline for (modules) |mod| {
         mod.addImport("build_options", build_options_mod);
-        addCDependencies(b, mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+        addCDependencies(b, mod, cacert_mod, pcre2, miniz, sqlite3);
     }
 }
 
@@ -393,15 +367,9 @@ fn addCDependencies(
     b: *std.Build,
     mod: *std.Build.Module,
     cacert_mod: *std.Build.Module,
-    magic_db_mod: *std.Build.Module,
     pcre2: Pcre2,
     miniz: Miniz,
-    libmagic: LibMagic,
-    jpeg_turbo: JpegTurbo,
-    spng: Spng,
-    webp: Webp,
     sqlite3: Sqlite3,
-    tree_sitter: TreeSitter,
 ) void {
     mod.addIncludePath(b.path("src/text"));
     mod.addIncludePath(b.path("include"));
@@ -409,21 +377,11 @@ fn addCDependencies(
     mod.addIncludePath(pcre2.include_dir);
     mod.addIncludePath(b.path("deps/pcre2/src"));
     mod.addIncludePath(b.path("deps/curl/include"));
-    mod.addIncludePath(b.path("deps/pdfium/public"));
     mod.addIncludePath(miniz.include_dir);
-    mod.addIncludePath(libmagic.include_dir);
-    mod.addIncludePath(jpeg_turbo.generated_include_dir);
-    mod.addIncludePath(jpeg_turbo.include_dir);
-    mod.addIncludePath(spng.include_dir);
-    mod.addIncludePath(webp.include_dir);
     mod.addIncludePath(sqlite3.include_dir);
-    mod.addIncludePath(tree_sitter.include_dir);
 
     // Mozilla CA certificates bundle for HTTPS - generated during `make deps`
     mod.addImport("cacert", cacert_mod);
-
-    // Compiled magic database for file type detection - generated during `make deps`
-    mod.addImport("magic_db", magic_db_mod);
 }
 
 fn linkCDependencies(
@@ -431,27 +389,13 @@ fn linkCDependencies(
     artifact: *std.Build.Step.Compile,
     pcre2: Pcre2,
     miniz: Miniz,
-    libmagic: LibMagic,
-    jpeg_turbo: JpegTurbo,
-    spng: Spng,
-    webp: Webp,
     sqlite3: Sqlite3,
-    tree_sitter: TreeSitter,
     comptime skip_external_archives: bool,
 ) void {
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
     artifact.linkLibrary(miniz.lib);
-    artifact.linkLibrary(libmagic.lib);
-    artifact.linkLibrary(jpeg_turbo.lib);
-    artifact.linkLibrary(jpeg_turbo.jpeg12_lib);
-    artifact.linkLibrary(jpeg_turbo.jpeg16_lib);
-    artifact.linkLibrary(jpeg_turbo.turbojpeg12_lib);
-    artifact.linkLibrary(jpeg_turbo.turbojpeg16_lib);
-    artifact.linkLibrary(spng.lib);
-    artifact.linkLibrary(webp.lib);
     artifact.linkLibrary(sqlite3.lib);
-    artifact.linkLibrary(tree_sitter.lib);
 
     // For static libraries, skip external .a archives to avoid nested archive warnings.
     // The final executable/shared lib will link them directly.
@@ -464,14 +408,6 @@ fn linkCDependencies(
         artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedx509.a"));
         artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedcrypto.a"));
 
-        // Link PDFium for PDF rendering
-        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libpdfium.a"));
-        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libagg.a"));
-        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/liblcms.a"));
-        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libopenjpeg.a"));
-        artifact.addObjectFile(b.path("deps/freetype/build/libfreetype.a"));
-        artifact.linkLibCpp();
-
         const target_os = artifact.rootModuleTarget().os.tag;
         if (target_os == .macos) {
             artifact.linkFramework("CoreFoundation");
@@ -479,20 +415,6 @@ fn linkCDependencies(
             artifact.linkFramework("Security");
         }
         artifact.linkSystemLibrary("pthread");
-
-        // PDFium ICU shim: u_tolower, u_isalpha, etc. backed by utf8proc.
-        artifact.addCSourceFiles(.{
-            .files = &.{"ports/pdfium/icu_shim.c"},
-            .flags = &.{ "-std=gnu11", "-Ideps/utf8proc" },
-        });
-        // PDFium zlib shim: inflate, compress, etc. forwarded to miniz.
-        // Must define MINIZ_NO_ZLIB_COMPATIBLE_NAMES to avoid conflicting
-        // inline definitions from miniz.h.
-        artifact.addCSourceFiles(.{
-            .files = &.{"ports/pdfium/zlib_shim.c"},
-            .flags = &.{ "-std=gnu11", "-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES" },
-        });
-        artifact.addIncludePath(miniz.include_dir);
 
         artifact.addCSourceFiles(.{
             .files = &.{"deps/utf8proc/utf8proc.c"},
@@ -517,26 +439,12 @@ fn linkExternalArchives(
     artifact: *std.Build.Step.Compile,
     pcre2: Pcre2,
     miniz: Miniz,
-    libmagic: LibMagic,
-    jpeg_turbo: JpegTurbo,
-    spng: Spng,
-    webp: Webp,
     sqlite3: Sqlite3,
-    tree_sitter: TreeSitter,
 ) void {
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
     artifact.linkLibrary(miniz.lib);
-    artifact.linkLibrary(libmagic.lib);
-    artifact.linkLibrary(jpeg_turbo.lib);
-    artifact.linkLibrary(jpeg_turbo.jpeg12_lib);
-    artifact.linkLibrary(jpeg_turbo.jpeg16_lib);
-    artifact.linkLibrary(jpeg_turbo.turbojpeg12_lib);
-    artifact.linkLibrary(jpeg_turbo.turbojpeg16_lib);
-    artifact.linkLibrary(spng.lib);
-    artifact.linkLibrary(webp.lib);
     artifact.linkLibrary(sqlite3.lib);
-    artifact.linkLibrary(tree_sitter.lib);
 
     // Link pre-built libcurl static library
     artifact.addObjectFile(b.path("deps/curl/build/lib/libcurl.a"));
@@ -545,14 +453,6 @@ fn linkExternalArchives(
     artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedtls.a"));
     artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedx509.a"));
     artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedcrypto.a"));
-
-    // Link PDFium for PDF rendering
-    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libpdfium.a"));
-    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libagg.a"));
-    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/liblcms.a"));
-    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libopenjpeg.a"));
-    artifact.addObjectFile(b.path("deps/freetype/build/libfreetype.a"));
-    artifact.linkLibCpp();
 
     const target_os = artifact.rootModuleTarget().os.tag;
     if (target_os == .macos) {
@@ -575,16 +475,10 @@ const UnitTestCfg = struct {
     cuda_assets_mod: *std.Build.Module,
     inference_pkg_mod: *std.Build.Module,
     cacert_mod: *std.Build.Module,
-    magic_db_mod: *std.Build.Module,
     core_pkgs: *const CorePackages,
     pcre2: Pcre2,
     miniz: Miniz,
-    libmagic: LibMagic,
-    jpeg_turbo: JpegTurbo,
-    spng: Spng,
-    webp: Webp,
     sqlite3: Sqlite3,
-    tree_sitter: TreeSitter,
 
     fn addLazy(
         self: UnitTestCfg,
@@ -602,13 +496,13 @@ const UnitTestCfg = struct {
         mod.addImport("inference_pkg", self.inference_pkg_mod);
         addCorePackageImports(mod, self.core_pkgs);
         mod.addOptions("build_options", self.build_options);
-        addCDependencies(self.b, mod, self.cacert_mod, self.magic_db_mod, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter);
+        addCDependencies(self.b, mod, self.cacert_mod, self.pcre2, self.miniz, self.sqlite3);
 
         const test_artifact = self.b.addTest(.{
             .root_module = mod,
             .filters = filters,
         });
-        linkCDependencies(self.b, test_artifact, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter, false);
+        linkCDependencies(self.b, test_artifact, self.pcre2, self.miniz, self.sqlite3, false);
         const run = self.b.addRunArtifact(test_artifact);
         const step = self.b.step("test-" ++ name, "Run " ++ name ++ " unit tests");
         step.dependOn(&run.step);
@@ -826,9 +720,6 @@ pub fn build(b: *std.Build) void {
     const cacert_mod = b.createModule(.{
         .root_source_file = b.path("deps/cacert.zig"),
     });
-    const magic_db_mod = b.createModule(.{
-        .root_source_file = b.path("deps/magic_db.zig"),
-    });
     const inference_pkg_mod = b.createModule(.{
         .root_source_file = b.path("core/src/inference/abi.zig"),
         .target = target,
@@ -845,13 +736,7 @@ pub fn build(b: *std.Build) void {
     // Build dependencies
     const pcre2 = pcre2_port.add(b, target, optimize);
     const miniz = miniz_port.add(b, target, optimize);
-    const libmagic = libmagic_port.add(b, target, optimize);
-    const jpeg_turbo = jpeg_turbo_port.add(b, target, optimize);
-    const spng = spng_port.add(b, target, optimize, miniz);
-    const webp = webp_port.add(b, target, optimize);
     const sqlite3 = sqlite_port.add(b, target, optimize);
-    const tree_sitter = tree_sitter_port.add(b, target, optimize);
-
     var core_pkgs = CorePackages.init(b, target, optimize);
     wireCorePackageImports(&core_pkgs);
     core_pkgs.compute_pkg.addImport("cuda_assets", cuda_assets_mod);
@@ -860,19 +745,13 @@ pub fn build(b: *std.Build) void {
         &core_pkgs,
         build_options_mod,
         cacert_mod,
-        magic_db_mod,
         pcre2,
         miniz,
-        libmagic,
-        jpeg_turbo,
-        spng,
-        webp,
         sqlite3,
-        tree_sitter,
     );
     addCorePackageImports(inference_pkg_mod, &core_pkgs);
     inference_pkg_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, inference_pkg_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    addCDependencies(b, inference_pkg_mod, cacert_mod, pcre2, miniz, sqlite3);
 
     // ==========================================================================
     // Internal inference library (inference + models + compute)
@@ -887,7 +766,7 @@ pub fn build(b: *std.Build) void {
     inference_mod.addImport("inference_pkg", inference_pkg_mod);
     addCorePackageImports(inference_mod, &core_pkgs);
     inference_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, inference_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    addCDependencies(b, inference_mod, cacert_mod, pcre2, miniz, sqlite3);
 
     const inference_lib = b.addLibrary(.{
         .linkage = .static,
@@ -896,7 +775,7 @@ pub fn build(b: *std.Build) void {
     });
     // Keep this archive self-contained for internal linking; external archives
     // are linked by final binaries/shared libs.
-    linkCDependencies(b, inference_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, true);
+    linkCDependencies(b, inference_lib, pcre2, miniz, sqlite3, true);
     addMetalSupport(b, inference_mod, inference_lib, enable_metal);
 
     const inference_step = b.step("inference", "Build internal inference library (inference + models + compute)");
@@ -915,14 +794,14 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("inference_pkg", inference_pkg_mod);
     addCorePackageImports(lib_mod, &core_pkgs);
     lib_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, lib_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    addCDependencies(b, lib_mod, cacert_mod, pcre2, miniz, sqlite3);
 
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "talu",
         .root_module = lib_mod,
     });
-    linkCDependencies(b, lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+    linkCDependencies(b, lib, pcre2, miniz, sqlite3, false);
     addMetalSupport(b, lib_mod, lib, enable_metal);
 
     const install_lib = b.addInstallArtifact(lib, .{});
@@ -981,7 +860,7 @@ pub fn build(b: *std.Build) void {
     addCorePackageImports(static_lib_mod, &core_pkgs);
 
     static_lib_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, static_lib_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    addCDependencies(b, static_lib_mod, cacert_mod, pcre2, miniz, sqlite3);
 
     const static_lib = b.addLibrary(.{
         .linkage = .static,
@@ -989,7 +868,7 @@ pub fn build(b: *std.Build) void {
         .root_module = static_lib_mod,
     });
     // Skip external .a archives for static lib - they'll be linked by the final executable
-    linkCDependencies(b, static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, true);
+    linkCDependencies(b, static_lib, pcre2, miniz, sqlite3, true);
     addMetalSupport(b, static_lib_mod, static_lib, enable_metal);
 
     const static_step = b.step("static", "Build static library");
@@ -1021,7 +900,7 @@ pub fn build(b: *std.Build) void {
         // (shared + static) in the release path.
         exe.linkLibrary(lib);
         // Link all deps including external .a archives (curl, mbedtls)
-        linkCDependencies(b, exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, exe, pcre2, miniz, sqlite3, false);
         exe.addObjectFile(b.path("bindings/rust/target/release/libtalu_cli.a"));
 
         // Link platform-specific runtime libraries for Rust CLI
@@ -1153,7 +1032,7 @@ pub fn build(b: *std.Build) void {
         dump_lib_mod.addImport("inference_pkg", inference_pkg_mod);
         addCorePackageImports(dump_lib_mod, &core_pkgs);
         dump_lib_mod.addOptions("build_options", dump_build_options);
-        addCDependencies(b, dump_lib_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+        addCDependencies(b, dump_lib_mod, cacert_mod, pcre2, miniz, sqlite3);
 
         const dump_static_lib = b.addLibrary(.{
             .linkage = .static,
@@ -1161,7 +1040,7 @@ pub fn build(b: *std.Build) void {
             .root_module = dump_lib_mod,
         });
         // Add C sources to static lib with skip_external_archives=true (matches main build pattern)
-        linkCDependencies(b, dump_static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, true);
+        linkCDependencies(b, dump_static_lib, pcre2, miniz, sqlite3, true);
         addMetalSupport(b, dump_lib_mod, dump_static_lib, enable_metal);
 
         // Dump CLI executable - only links static lib and external archives (no C sources)
@@ -1179,7 +1058,7 @@ pub fn build(b: *std.Build) void {
         });
         dump_exe.linkLibrary(dump_static_lib);
         // Only link external archives - C sources are in the static lib
-        linkExternalArchives(b, dump_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+        linkExternalArchives(b, dump_exe, pcre2, miniz, sqlite3);
         addMetalSupport(b, dump_cli_mod, dump_exe, enable_metal);
 
         dump_step.dependOn(&b.addInstallArtifact(dump_exe, .{}).step);
@@ -1211,23 +1090,19 @@ pub fn build(b: *std.Build) void {
         \\  tokenizer
         \\  validate
         \\  io
-        \\  db
-        \\  collab
         \\  template
         \\  policy
         \\  models
         \\  responses
         \\  converter
         \\  xray
-        \\  image
         \\  compute
         \\  inference
         \\  inference-cpu
         \\  inference-metal
         \\  inference-cuda
-        \\  agent
         \\
-        \\Example: zig build test-db -Drelease
+        \\Example: zig build test-io -Drelease
         \\
     ).step);
 
@@ -1246,16 +1121,10 @@ pub fn build(b: *std.Build) void {
         .cuda_assets_mod = cuda_assets_mod,
         .inference_pkg_mod = inference_pkg_mod,
         .cacert_mod = cacert_mod,
-        .magic_db_mod = magic_db_mod,
         .core_pkgs = &core_pkgs,
         .pcre2 = pcre2,
         .miniz = miniz,
-        .libmagic = libmagic,
-        .jpeg_turbo = jpeg_turbo,
-        .spng = spng,
-        .webp = webp,
         .sqlite3 = sqlite3,
-        .tree_sitter = tree_sitter,
     };
     ut.addLazy("tokenizer", b.path("core/src/lib_dev.zig"), &.{
         "wordpiece",
@@ -1271,20 +1140,6 @@ pub fn build(b: *std.Build) void {
         "Http",
         "fetch ",
         "download",
-    });
-    ut.addLazy("db", b.path("core/src/lib_dev.zig"), &.{
-        "index build",
-        "vector",
-        "bench",
-    });
-    ut.addLazy("collab", b.path("core/src/lib_dev.zig"), &.{
-        "ResourceStore",
-        "SessionStore",
-        "OperationEnvelope",
-        "StorageLane",
-        "TextCrdt",
-        "LamportClock",
-        "collab",
     });
     ut.addLazy("template", b.path("core/src/lib_dev.zig"), &.{
         "TemplateInput",
@@ -1321,11 +1176,6 @@ pub fn build(b: *std.Build) void {
         "LayerGeometry",
         "xray",
     });
-    ut.addLazy("image", b.path("core/src/lib_dev.zig"), &.{
-        "stripAlpha",
-        "compositeRgbaToRgb",
-        "image",
-    });
     ut.addLazy("compute", b.path("core/src/lib_dev.zig"), &.{
         "validateArgs",
         "mmap",
@@ -1349,21 +1199,6 @@ pub fn build(b: *std.Build) void {
     });
     ut.addLazy("inference-cuda", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.cuda",
-    });
-    ut.addLazy("agent", b.path("core/src/lib_dev.zig"), &.{
-        "ToolRegistry",
-        "MessageBus",
-        "buildSystemPrompt",
-        "ProcessSession",
-        "ShellSession",
-        "checkCommand",
-        "compactTurns",
-        "CapabilityReport",
-        "parseKernelVersion",
-        "CgroupConfig",
-        "ProbeReport",
-        "TaluCapabilityReport",
-        "validate_strict_ext",
     });
     ut.addLazy("train", b.path("core/src/lib_dev.zig"), &.{
         "GradTensor",
@@ -1420,7 +1255,7 @@ pub fn build(b: *std.Build) void {
     integration_main_mod.addImport("inference_pkg", inference_pkg_mod);
     addCorePackageImports(integration_main_mod, &core_pkgs);
     integration_main_mod.addOptions("build_options", integration_build_options);
-    addCDependencies(b, integration_main_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+    addCDependencies(b, integration_main_mod, cacert_mod, pcre2, miniz, sqlite3);
 
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("core/tests/root.zig"),
@@ -1434,7 +1269,7 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{
         .root_module = integration_test_mod,
     });
-    linkCDependencies(b, integration_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+    linkCDependencies(b, integration_tests, pcre2, miniz, sqlite3, false);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run integration tests");
@@ -1465,7 +1300,7 @@ pub fn build(b: *std.Build) void {
         integration_metal_main_mod.addImport("inference_pkg", inference_pkg_mod);
         addCorePackageImports(integration_metal_main_mod, &core_pkgs);
         integration_metal_main_mod.addOptions("build_options", integration_metal_build_options);
-        addCDependencies(b, integration_metal_main_mod, cacert_mod, magic_db_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+        addCDependencies(b, integration_metal_main_mod, cacert_mod, pcre2, miniz, sqlite3);
 
         const integration_metal_test_mod = b.createModule(.{
             .root_source_file = b.path("core/tests/inference/backend/metal/root.zig"),
@@ -1480,7 +1315,7 @@ pub fn build(b: *std.Build) void {
             .name = "test-integration-inference-metal",
             .root_module = integration_metal_test_mod,
         });
-        linkCDependencies(b, integration_metal_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, integration_metal_tests, pcre2, miniz, sqlite3, false);
         addMetalSupport(b, integration_metal_main_mod, integration_metal_tests, true);
         const install_integration_metal_tests = b.addInstallArtifact(integration_metal_tests, .{});
 
@@ -1521,7 +1356,7 @@ pub fn build(b: *std.Build) void {
             .name = "models_report",
             .root_module = models_report_mod,
         });
-        linkCDependencies(b, models_report_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, models_report_exe, pcre2, miniz, sqlite3, false);
         const run_models_report = b.addRunArtifact(models_report_exe);
         if (b.args) |args| {
             for (args) |arg| run_models_report.addArg(arg);
@@ -1668,7 +1503,7 @@ pub fn build(b: *std.Build) void {
             .name = "perf_sanity",
             .root_module = perf_exe_mod,
         });
-        linkCDependencies(b, perf_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, perf_exe, pcre2, miniz, sqlite3, false);
         addMetalCoreSupport(b, perf_exe_mod, perf_exe, enable_metal);
         b.installArtifact(perf_exe);
 
@@ -1700,7 +1535,7 @@ pub fn build(b: *std.Build) void {
         const perf_tests = b.addTest(.{
             .root_module = perf_test_mod,
         });
-        linkCDependencies(b, perf_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, perf_tests, pcre2, miniz, sqlite3, false);
         const run_perf_tests = b.addRunArtifact(perf_tests);
         const perf_test_step = b.step("test-perf-sanity", "Run perf/lifecycle sanity tests");
         perf_test_step.dependOn(&run_perf_tests.step);
@@ -1729,7 +1564,7 @@ pub fn build(b: *std.Build) void {
             .name = "bench-cpu-compute",
             .root_module = bench_cpu_compute_mod,
         });
-        linkCDependencies(b, bench_cpu_compute_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, bench_cpu_compute_exe, pcre2, miniz, sqlite3, false);
         addMetalSupport(b, bench_cpu_compute_mod, bench_cpu_compute_exe, enable_metal);
         b.installArtifact(bench_cpu_compute_exe);
 
@@ -1806,7 +1641,7 @@ pub fn build(b: *std.Build) void {
             .name = "bench-tokenizer",
             .root_module = bench_tokenizer_mod,
         });
-        linkCDependencies(b, bench_tokenizer_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, bench_tokenizer_exe, pcre2, miniz, sqlite3, false);
         b.installArtifact(bench_tokenizer_exe);
 
         const run_bench_tokenizer = b.addRunArtifact(bench_tokenizer_exe);
@@ -1840,7 +1675,7 @@ pub fn build(b: *std.Build) void {
             .name = "bench-train",
             .root_module = bench_train_mod,
         });
-        linkCDependencies(b, bench_train_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        linkCDependencies(b, bench_train_exe, pcre2, miniz, sqlite3, false);
         b.installArtifact(bench_train_exe);
 
         const run_bench_train = b.addRunArtifact(bench_train_exe);

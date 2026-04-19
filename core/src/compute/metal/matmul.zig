@@ -101,42 +101,6 @@ pub fn matmulF32TransBScaled(
     if (!success) return error.MetalMatmulFailed;
 }
 
-/// F32 Q × I8 K matrix multiplication with dequant: C = alpha * A @ dequant(B)^T.
-/// A: [m x k] f32 (queries)
-/// B: [n x k] i8 (keys, will be dequantized and transposed)
-/// B_scales: [n] f32 (per-row scales for K)
-/// C: [m x n] f32 (output scores)
-pub fn matmulF32I8TransBScaled(
-    device: *device_mod.Device,
-    a: []const f32,
-    m: usize,
-    k: usize,
-    b: []const i8,
-    n: usize,
-    b_scales: []const f32,
-    c: []f32,
-    alpha: f32,
-) !void {
-    std.debug.assert(a.len >= m * k);
-    std.debug.assert(b.len >= n * k);
-    std.debug.assert(b_scales.len >= n);
-    std.debug.assert(c.len >= m * n);
-
-    const success = metal_matmul_f32_i8_transB_scaled(
-        device.handle,
-        a.ptr,
-        m,
-        k,
-        b.ptr,
-        n,
-        b_scales.ptr,
-        c.ptr,
-        alpha,
-    );
-
-    if (!success) return error.MetalMatmulFailed;
-}
-
 /// Grouped-affine u4 quantized matrix multiplication.
 pub fn matmulGaffineU4(
     device: *device_mod.Device,

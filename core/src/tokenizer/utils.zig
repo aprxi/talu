@@ -258,18 +258,6 @@ pub fn unkSlice(unk_token: *const [16]u8) []const u8 {
     return std.mem.sliceTo(c_string_ptr, 0);
 }
 
-/// Helper to get a typed model pointer from a tokenizer
-fn getModel(comptime T: type, tok: anytype) ?*T {
-    const model_pointer = tok.model orelse return null;
-    return @ptrCast(@alignCast(model_pointer));
-}
-
-/// Helper to get a const typed model pointer from a tokenizer
-fn getModelConst(comptime T: type, tok: anytype) ?*const T {
-    const model_pointer = tok.model orelse return null;
-    return @ptrCast(@alignCast(model_pointer));
-}
-
 // =============================================================================
 // Tests
 // =============================================================================

@@ -598,7 +598,7 @@ pub trait ResponsesView {
         Ok(json)
     }
 
-    /// Serializes the conversation to legacy Completions JSON format.
+    /// Serializes the conversation to Chat Completions JSON format.
     fn to_completions_json(&self) -> Result<String> {
         // SAFETY: self.as_ptr() is a valid handle (module invariant).
         let ptr = unsafe { talu_sys::talu_responses_to_completions_json(self.as_ptr()) };

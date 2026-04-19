@@ -63,16 +63,10 @@ def numpy():
 def test_model_path(ensure_library_built):
     """Override test_model_path for reference tests to use the reasoning model."""
     if not _is_model_available(TEST_MODEL_URI_TEXT):
-        pytest.exit(
-            _missing_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT),
-            returncode=2,
-        )
+        pytest.skip(_missing_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT))
     load_error = _validate_model_loadable_for_tokenizer(TEST_MODEL_URI_TEXT)
     if load_error is not None:
-        pytest.exit(
-            _unusable_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT, load_error),
-            returncode=2,
-        )
+        pytest.skip(_unusable_model_msg("TEST_MODEL_URI_TEXT", TEST_MODEL_URI_TEXT, load_error))
     return TEST_MODEL_URI_TEXT
 
 

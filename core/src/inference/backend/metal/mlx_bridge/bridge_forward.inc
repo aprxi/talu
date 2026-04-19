@@ -259,20 +259,15 @@ array embedding_lookup(mlx_ctx* ctx, const array& ids) {
     return reshape(dequant, out_shape);
 }
 
-array forward_hidden(
+array forward_hidden_from_embeddings(
     mlx_ctx* ctx,
     const array& input_ids,
+    const array& hidden_in,
     bool apply_final_norm,
     const TraceFrame* trace_frame = nullptr
 ) {
-    if (embedding_vocab_size(ctx) <= 0) {
-        throw std::runtime_error("forward_hidden: embedding table is not initialized");
-    }
-    array hidden = embedding_lookup(ctx, input_ids); // [B,S,H]
-    if (std::fabs(ctx->cfg.embedding_multiplier - 1.0f) > 1.0e-6f) {
-        hidden = hidden * array(ctx->cfg.embedding_multiplier, hidden.dtype());
-    }
-    const array source_embeddings = hidden;
+    array hidden = hidden_in;
+    const array source_embeddings = hidden_in;
     if (trace_frame && trace_frame->emit_embed) {
         xray_emit_array_f32(
             XRAY_POINT_EMBED,
@@ -320,6 +315,22 @@ array forward_hidden(
         }
     }
     return hidden;
+}
+
+array forward_hidden(
+    mlx_ctx* ctx,
+    const array& input_ids,
+    bool apply_final_norm,
+    const TraceFrame* trace_frame = nullptr
+) {
+    if (embedding_vocab_size(ctx) <= 0) {
+        throw std::runtime_error("forward_hidden: embedding table is not initialized");
+    }
+    array hidden = embedding_lookup(ctx, input_ids); // [B,S,H]
+    if (std::fabs(ctx->cfg.embedding_multiplier - 1.0f) > 1.0e-6f) {
+        hidden = hidden * array(ctx->cfg.embedding_multiplier, hidden.dtype());
+    }
+    return forward_hidden_from_embeddings(ctx, input_ids, hidden, apply_final_norm, trace_frame);
 }
 
 array dense_lm_head_logits(mlx_ctx* ctx, const array& lm_input) {

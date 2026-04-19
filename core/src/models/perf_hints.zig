@@ -71,44 +71,9 @@ pub const PerfHints = struct {
 /// These are not intended to mirror one exact checkpoint; they provide a
 /// stable architecture-level proxy so bench remains usable even when a family
 /// spans multiple concrete sizes.
-pub const default_text_role_dims = [_]RoleDims{
-    .{ .bench_row = "prefill.attn_q", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "prefill.attn_k", .tokens = 14, .hidden = 1024, .out = 256 },
-    .{ .bench_row = "prefill.attn_v", .tokens = 14, .hidden = 1024, .out = 256 },
-    .{ .bench_row = "prefill.attn_out", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "prefill.ffn_gate", .tokens = 14, .hidden = 1024, .out = 4096 },
-    .{ .bench_row = "prefill.ffn_down", .tokens = 14, .hidden = 4096, .out = 1024 },
-    .{ .bench_row = "prefill.layer_attn_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "prefill.layer_ffn_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "prefill.final_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "decode.attn_q", .tokens = 1, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "decode.attn_k", .tokens = 1, .hidden = 1024, .out = 256 },
-    .{ .bench_row = "decode.attn_v", .tokens = 1, .hidden = 1024, .out = 256 },
-    .{ .bench_row = "decode.attn_out", .tokens = 1, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "decode.ffn_gate", .tokens = 1, .hidden = 1024, .out = 4096 },
-    .{ .bench_row = "decode.ffn_down", .tokens = 1, .hidden = 4096, .out = 1024 },
-    .{ .bench_row = "decode.layer_attn_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "decode.layer_ffn_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "decode.final_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
-};
-
 pub fn pointMappingFor(mappings: []const PointBenchMap, point: []const u8) ?[]const u8 {
     for (mappings) |mapping| {
         if (std.mem.eql(u8, mapping.point, point)) return mapping.bench_row;
-    }
-    return null;
-}
-
-pub fn roleDimsFor(hints: *const PerfHints, bench_row: []const u8) ?RoleDims {
-    for (hints.role_dims) |dims| {
-        if (std.mem.eql(u8, dims.bench_row, bench_row)) return dims;
-    }
-    return null;
-}
-
-pub fn defaultRoleDimsFor(bench_row: []const u8) ?RoleDims {
-    for (default_text_role_dims) |dims| {
-        if (std.mem.eql(u8, dims.bench_row, bench_row)) return dims;
     }
     return null;
 }
@@ -217,22 +182,6 @@ pub const attention_norm_decode_point_mappings = [_]PointBenchMap{
     .{ .point = "final_norm", .bench_row = "decode.final_norm" },
 };
 
-pub const ffn_norm_prefill_point_mappings = [_]PointBenchMap{
-    .{ .point = "ffn.gate", .bench_row = "prefill.ffn_gate" },
-    .{ .point = "ffn.down", .bench_row = "prefill.ffn_down" },
-    .{ .point = "layer_attn_norm", .bench_row = "prefill.layer_attn_norm" },
-    .{ .point = "layer_ffn_norm", .bench_row = "prefill.layer_ffn_norm" },
-    .{ .point = "final_norm", .bench_row = "prefill.final_norm" },
-};
-
-pub const ffn_norm_decode_point_mappings = [_]PointBenchMap{
-    .{ .point = "ffn.gate", .bench_row = "decode.ffn_gate" },
-    .{ .point = "ffn.down", .bench_row = "decode.ffn_down" },
-    .{ .point = "layer_attn_norm", .bench_row = "decode.layer_attn_norm" },
-    .{ .point = "layer_ffn_norm", .bench_row = "decode.layer_ffn_norm" },
-    .{ .point = "final_norm", .bench_row = "decode.final_norm" },
-};
-
 pub const qwen3_5_hidden_rows = [_][]const u8{
     "gdelta_conv_f32",
     "gdelta_qk_norm_f32",
@@ -330,14 +279,6 @@ pub fn attentionOnlyMambaHints(comptime bench_model: []const u8) PerfHints {
         .decode_point_mappings = attention_norm_decode_point_mappings[0..],
         .prefill_hidden_rows = mamba_hidden_rows[0..],
         .decode_hidden_rows = mamba_hidden_rows[0..],
-    };
-}
-
-pub fn ffnNormHints(comptime bench_model: []const u8) PerfHints {
-    return .{
-        .bench_model = bench_model,
-        .prefill_point_mappings = ffn_norm_prefill_point_mappings[0..],
-        .decode_point_mappings = ffn_norm_decode_point_mappings[0..],
     };
 }
 

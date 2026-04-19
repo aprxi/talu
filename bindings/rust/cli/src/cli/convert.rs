@@ -106,10 +106,7 @@ impl Nvfp4ReplayOverride {
         match value.trim().to_ascii_lowercase().as_str() {
             "weighted" | "proxy" | "proxy_only" | "weight_only" => Ok(Self::Weighted),
             "xray" | "capture" | "capture_required" => Ok(Self::Xray),
-            other => bail!(
-                "Invalid replay value '{}'. Allowed: weighted|xray",
-                other
-            ),
+            other => bail!("Invalid replay value '{}'. Allowed: weighted|xray", other),
         }
     }
 
@@ -220,7 +217,10 @@ fn parse_bool_value(key: &str, value: &str) -> Result<bool> {
 }
 
 fn is_help_token(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "help" | "list" | "?")
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "help" | "list" | "?"
+    )
 }
 
 fn parse_custom_overrides(args: &[String]) -> Result<CustomOverrides> {
@@ -392,8 +392,6 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
     };
     let mut raw_opts: Vec<String> = Vec::new();
     raw_opts.extend(args.opts.iter().cloned());
-    // Legacy positional overrides (deprecated): keep working for now.
-    raw_opts.extend(args.profile_overrides.iter().cloned());
     if raw_opts.len() == 1 && is_help_token(&raw_opts[0]) {
         print_profile_help_for_scheme(scheme_enum);
         return Ok(());
@@ -691,7 +689,6 @@ Options:
   --json            Output JSON: {"success": true, "output_path": "..."}
   --opts help       Show scheme-specific tunable options
   --opts KEY=VALUE  Override conversion knobs (activates custom behavior automatically). Repeat or pass CSV.
-  OVERRIDE          (legacy positional, deprecated): same format as --opts
 
   Talu Quantized:
   tq4        4-bit quantized. GROUP_SIZE env var overrides group size (default: 32).
@@ -862,7 +859,9 @@ mod tests {
         assert_eq!(parsed.lm_head_q, Some(true));
         assert_eq!(parsed.small_model_preserve, Some(false));
         assert!(parsed.clip_mult.is_some_and(|v| (v - 1.02).abs() < 1e-6));
-        assert!(parsed.scale_refine_mult.is_some_and(|v| (v - 0.99).abs() < 1e-6));
+        assert!(parsed
+            .scale_refine_mult
+            .is_some_and(|v| (v - 0.99).abs() < 1e-6));
         assert_eq!(parsed.replay, Some(super::Nvfp4ReplayOverride::Xray));
         assert_eq!(
             parsed.optimizer,

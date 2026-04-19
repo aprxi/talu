@@ -38,24 +38,17 @@ class TaluServer:
         binary: str | Path = _DEFAULT_BINARY,
         host: str = "127.0.0.1",
         port: int = 8258,
-        no_bucket: bool = True,
-        bucket: str | Path | None = None,
         extra_args: list[str] | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
         self.binary = Path(binary)
         self.host = host
         self.port = port
-        self.no_bucket = no_bucket
-        self.bucket = Path(bucket) if bucket is not None else None
         self.extra_args = extra_args or []
         self.env = env or {}
         self._proc: subprocess.Popen | None = None  # type: ignore[type-arg]
         self._socket_path: Path | None = None
         self._owns_socket_path: bool = False
-
-        if self.no_bucket and self.bucket is not None:
-            raise ValueError("no_bucket=True cannot be combined with bucket=...")
 
     # -- Public API ----------------------------------------------------------
 
@@ -81,11 +74,6 @@ class TaluServer:
             "--port", str(self.port),
             "--socket", str(socket_path),
         ]
-        if self.no_bucket:
-            cmd.append("--no-bucket")
-        elif self.bucket is not None:
-            self.bucket.mkdir(parents=True, exist_ok=True)
-            cmd.extend(["--bucket", str(self.bucket)])
         cmd.extend(self.extra_args)
 
         # Inherit current env, overlay config env vars.

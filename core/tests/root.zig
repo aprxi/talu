@@ -16,25 +16,12 @@ const std = @import("std");
 // Struct Integration Tests
 // =============================================================================
 
-// messages (TODO: several test files are outdated)
-// pub const messages_storage_backend = @import("messages/storage_backend_test.zig");
-// pub const messages_memory_backend = @import("messages/memory_backend_test.zig");
-// pub const messages_message_record = @import("messages/message_record_test.zig");
-// pub const messages_chat = @import("messages/chat_test.zig");
-// pub const messages_message = @import("messages/message_test.zig");
-// pub const messages_messages = @import("messages/messages_test.zig");
-// pub const messages_role = @import("messages/role_test.zig");
-// pub const messages_content_type = @import("messages/content_type_test.zig");
-
 // router
 pub const router_local_engine = @import("router/local_engine_test.zig");
 pub const router_generation_result = @import("router/generation_result_test.zig");
 pub const router_canonical_spec = @import("router/canonical_spec_test.zig");
 pub const router_inference_backend = @import("router/inference_backend_test.zig");
 pub const router_parsed_tool_call = @import("router/parsed_tool_call_test.zig");
-pub const router_token_iterator = @import("router/token_iterator_test.zig");
-// pub const router_scheduler = @import("router/scheduler_test.zig");
-// pub const router_scheduler_request = @import("router/scheduler_request_test.zig");
 
 // tokenizer
 pub const tokenizer = @import("tokenizer/root.zig");
@@ -45,17 +32,7 @@ pub const validate = @import("validate/root.zig");
 // template
 pub const template = @import("template/root.zig");
 
-// inference (TODO: outdated tests)
-// pub const inference = @import("inference/root.zig");
-
-// xray (tensor inspection and tracing) (TODO: outdated - xray.TracePoint enum changed)
-// pub const xray_trace_point = @import("xray/trace_point_test.zig");
-// pub const xray_traced_tensor = @import("xray/traced_tensor_test.zig");
-// pub const xray_tensor_stats = @import("xray/tensor_stats_test.zig");
-// pub const xray_trace_capture = @import("xray/trace_capture_test.zig");
-// pub const xray_trace_point_set = @import("xray/trace_point_set_test.zig");
-// pub const xray_capture_query = @import("xray/capture_query_test.zig");
-// Remaining xray tests still work:
+// xray (tensor inspection and tracing)
 pub const xray_kernel_info = @import("xray/kernel_info_test.zig");
 pub const xray_kernel_op = @import("xray/kernel_op_test.zig");
 pub const xray_shape_dim = @import("xray/shape_dim_test.zig");
@@ -95,33 +72,8 @@ pub const models_loaded_model = @import("models/loaded_model_test.zig");
 pub const models_loader = @import("models/loader/root.zig");
 pub const models_config_model_description = @import("models/config/model_description_test.zig");
 
-// db (TaluDB append-only columnar storage)
-pub const db = @import("db/root.zig");
-pub const collab = @import("collab/root.zig");
-
 // responses (conversation / item / reasoning types)
 pub const responses = @import("responses/root.zig");
-
-// agent policy (IAM-style tool call firewall)
-pub const policy = @import("agent/policy/root.zig");
-
-// agent (tool registry + agent loop orchestration)
-pub const agent = @import("agent/root.zig");
-
-// agent filesystem (workspace sandbox + fs operations)
-pub const fs = @import("agent/fs/root.zig");
-
-// agent shell (command execution + PTY sessions)
-pub const shell = @import("agent/shell/root.zig");
-
-// agent process (non-PTY long-lived process sessions)
-pub const process = @import("agent/process/root.zig");
-
-// agent sandbox (runtime mode/profile enforcement)
-pub const sandbox = @import("agent/sandbox/root.zig");
-
-// image (decode/convert/model_input/encode/capi)
-pub const image = @import("image/root.zig");
 
 // train (training, fine-tuning, LoRA adapters)
 pub const train = @import("train/root.zig");

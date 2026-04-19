@@ -11,7 +11,6 @@ const ItemType = main.responses.ItemType;
 const ItemStatus = main.responses.ItemStatus;
 const MessageRole = main.responses.MessageRole;
 const ContentType = main.responses.ContentType;
-const MemoryBackend = main.responses.MemoryBackend;
 
 // =============================================================================
 // Lifecycle Tests
@@ -225,22 +224,6 @@ test "Conversation.clearKeepingContext preserves system message" {
     try std.testing.expectEqual(@as(usize, 1), conv.len());
     const remaining = conv.getItem(0).?;
     try std.testing.expectEqual(MessageRole.system, remaining.asMessage().?.role);
-}
-
-// =============================================================================
-// Storage Backend Integration Tests
-// =============================================================================
-
-test "Conversation.initWithStorage accepts backend" {
-    var mem = MemoryBackend{ .debug_stats = true };
-    const conv = try Conversation.initWithStorage(std.testing.allocator, null, mem.backend());
-    defer conv.deinit();
-
-    const item = try conv.appendUserMessage("Hello");
-    conv.finalizeItem(item);
-
-    // Backend should have been notified
-    try std.testing.expectEqual(@as(usize, 1), mem._debug_persist_count);
 }
 
 // =============================================================================

@@ -3,13 +3,18 @@
 //! This module defines backend-agnostic image/prefill data structures.
 
 const std = @import("std");
-const image_mod = @import("image_pkg");
+
+pub const VisionGrid = struct {
+    temporal: u32,
+    height: u32,
+    width: u32,
+};
 
 pub const PrefillVisionImage = struct {
     pixels: []f32,
     width: u32,
     height: u32,
-    grid: image_mod.VisionGrid,
+    grid: VisionGrid,
     token_count: usize,
 
     pub fn deinit(self: *PrefillVisionImage, allocator: std.mem.Allocator) void {
@@ -53,4 +58,3 @@ pub const EncodedVisionOutput = struct {
         };
     }
 };
-

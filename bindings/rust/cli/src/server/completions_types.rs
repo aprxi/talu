@@ -1,9 +1,10 @@
 //! Serde types for the OpenAI-compatible `/v1/chat/completions` endpoint.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Request body for `POST /v1/chat/completions`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateChatCompletionBody {
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
@@ -21,7 +22,7 @@ pub struct CreateChatCompletionBody {
 }
 
 /// A single message in the chat completions request.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<serde_json::Value>,
@@ -35,7 +36,7 @@ pub struct ChatMessage {
 // ---------------------------------------------------------------------------
 
 /// Non-streaming response for `POST /v1/chat/completions`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletion {
     pub id: String,
     pub object: String,
@@ -46,7 +47,7 @@ pub struct ChatCompletion {
 }
 
 /// A single choice in a chat completion response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct Choice {
     pub index: u32,
     pub message: ResponseMessage,
@@ -54,7 +55,7 @@ pub struct Choice {
 }
 
 /// The assistant message returned in a choice.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ResponseMessage {
     pub role: String,
     pub content: Option<String>,
@@ -63,7 +64,7 @@ pub struct ResponseMessage {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, ToSchema)]
 pub struct CompletionUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -75,7 +76,7 @@ pub struct CompletionUsage {
 // ---------------------------------------------------------------------------
 
 /// A single streaming chunk for `POST /v1/chat/completions` with `stream=true`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionChunk {
     pub id: String,
     pub object: String,
@@ -87,7 +88,7 @@ pub struct ChatCompletionChunk {
 }
 
 /// A single choice within a streaming chunk.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
@@ -95,7 +96,7 @@ pub struct ChunkChoice {
 }
 
 /// The delta content in a streaming chunk.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,

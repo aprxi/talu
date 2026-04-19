@@ -1,7 +1,7 @@
 //! Router C API - Generation, Streaming, Embeddings, and Backend Management
 //!
 //! C-callable functions for the Router subsystem. Routes generation requests
-//! to inference backends (local engines or remote APIs).
+//! to local inference backends.
 //!
 //! Architecture:
 //!   - Generation: sync and callback-based streaming via InferenceBackend
@@ -70,12 +70,6 @@ pub const TaluCanonicalSpec = opaque {};
 
 /// Opaque handle for inference backend (wraps spec_mod.InferenceBackend).
 pub const TaluInferenceBackend = opaque {};
-
-/// Model information from a remote endpoint.
-pub const RemoteModelInfo = capi_bridge.CRemoteModelInfo;
-
-/// Result from listing remote models.
-pub const RemoteModelListResult = capi_bridge.CRemoteModelListResult;
 
 /// Options for backend creation.
 pub const BackendCreateOptions = extern struct {
@@ -161,7 +155,6 @@ pub const StreamCallback = capi_bridge.StreamCallback;
 /// reasoning-tag filtering). Blocks until generation completes or callback
 /// returns 0. Returns the same result struct as talu_router_generate_with_backend.
 ///
-/// Only supported for local backends. Returns error for remote/HTTP backends.
 pub export fn talu_router_generate_streaming(
     chat_handle: ?*ChatHandle,
     parts: ?[*]const GenerateContentPart,
@@ -271,22 +264,6 @@ pub export fn talu_router_embedding_free(embedding: ?[*]f32, dim: usize) callcon
 // =============================================================================
 // Model Specification API
 // =============================================================================
-
-pub export fn talu_config_validate(spec: ?*const TaluModelSpec) callconv(.c) c_int {
-    capi_error.clearError();
-    const spec_ptr = spec orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "spec is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-    const result = spec_mod.validateSpecDetailed(spec_ptr);
-    if (!result.valid) {
-        const msg = spec_mod.validationIssueMessage(result.issue);
-        const code = validationIssueToErrorCode(result.issue);
-        capi_error.setErrorWithCode(code, "validation failed: {s}", .{msg});
-        return @intFromEnum(code);
-    }
-    return 0;
-}
 
 pub export fn talu_config_canonicalize(
     in_spec: ?*const TaluModelSpec,
@@ -430,42 +407,11 @@ pub export fn talu_backend_synchronize(backend: ?*TaluInferenceBackend) callconv
 }
 
 // =============================================================================
-// Remote Model Listing
-// =============================================================================
-
-/// List models from a remote OpenAI-compatible backend.
-pub export fn talu_backend_list_models(backend: ?*TaluInferenceBackend) callconv(.c) RemoteModelListResult {
-    capi_error.clearError();
-
-    const backend_ptr = backend orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "backend is null", .{});
-        return .{ .models = null, .count = 0, .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) };
-    };
-
-    const boxed: *spec_mod.InferenceBackend = @ptrCast(@alignCast(backend_ptr));
-    const result = capi_bridge.listModels(allocator, boxed);
-
-    if (result.error_code != 0) {
-        capi_error.setErrorWithCode(@enumFromInt(result.error_code), "failed to list models", .{});
-    }
-
-    return result;
-}
-
-/// Free result from talu_backend_list_models.
-///
-/// Passing null is a safe no-op.
-pub export fn talu_backend_list_models_free(result: ?*RemoteModelListResult) callconv(.c) void {
-    const ptr = result orelse return;
-    capi_bridge.freeModelListResult(allocator, ptr);
-}
-
-// =============================================================================
 // Model Info
 // =============================================================================
 
 /// Static model metadata returned by talu_backend_model_info.
-/// All fields are zero when the backend is null or remote (no local engine).
+/// All fields are zero when the backend is null or non-local.
 pub const CModelInfo = extern struct {
     file_size: u64,
     tensor_count: u64,
@@ -482,7 +428,7 @@ pub const CModelInfo = extern struct {
 };
 
 /// Return static model metadata from a local backend.
-/// Returns a zero struct if the backend is null or remote.
+/// Returns a zero struct if the backend is null or non-local.
 pub export fn talu_backend_model_info(
     backend: ?*TaluInferenceBackend,
 ) callconv(.c) CModelInfo {
@@ -503,17 +449,5 @@ pub export fn talu_backend_model_info(
         .gaffine_group_size = cfg.gaffine_group_size,
         .weight_dtype = engine.model_weight_dtype_tag,
         ._pad = .{0} ** 7,
-    };
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-fn validationIssueToErrorCode(issue: spec_mod.ValidationIssue) error_codes.ErrorCode {
-    return switch (issue) {
-        .bad_abi => .unsupported_abi_version,
-        .model_not_found => .model_not_found,
-        else => .invalid_argument,
     };
 }

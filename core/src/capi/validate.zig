@@ -2,13 +2,13 @@
 //!
 //! This module provides three APIs:
 //!
-//! 1. High-level sampler API (talu_validate_*):
-//!    - Works with ConstrainedSampler for LLM generation
-//!    - Includes thinking mode, stop tokens, etc.
+//! 1. Chat response-format API (talu_set_response_format*):
+//!    - Attaches JSON-schema-constrained generation to chat sessions
+//!    - Includes thinking mode, stop tokens, and reusable grammar handles
 //!
 //! 2. Low-level engine API (talu_validate_engine_*):
 //!    - Direct access to validation state machine
-//!    - Byte-level and token-level operations
+//!    - Byte-level operations
 //!    - Useful for benchmarking, validation, and standalone use cases
 //!
 //! 3. Grammar handle API (talu_grammar_*):
@@ -19,84 +19,18 @@
 const std = @import("std");
 const validate_mod = @import("validate_pkg");
 const sampler_mod = validate_mod.sampler;
-const mask_mod = validate_mod.mask;
 const cache_mod = validate_mod.cache;
-const schema_mod = validate_mod.schema;
-const ffi = @import("../helpers/ffi.zig");
-const tokenizer_capi = @import("tokenizer.zig");
 const responses_capi = @import("responses.zig");
 const responses_mod = @import("../responses/root.zig");
-const log = @import("log_pkg");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 
 const ConstrainedSampler = sampler_mod.ConstrainedSampler;
 const GrammarConfig = sampler_mod.GrammarConfig;
-const TokenizerHandle = tokenizer_capi.TokenizerHandle;
 const ChatHandle = responses_capi.ChatHandle;
 const Chat = responses_mod.Chat;
 const Validator = validate_mod.Validator;
-const TokenMask = validate_mod.TokenMask;
 const Grammar = validate_mod.ast.Grammar;
-
-/// Opaque handle for constrained sampler (high-level validation API).
-/// Thread safety: NOT thread-safe. Create one per thread.
-pub const ValidateHandle = opaque {
-    fn fromPtr(ptr: *ConstrainedSampler) *ValidateHandle {
-        return @ptrCast(ptr);
-    }
-
-    fn toPtr(self: *ValidateHandle) *ConstrainedSampler {
-        return @ptrCast(@alignCast(self));
-    }
-};
-
-/// Creates a constrained sampler for structured output validation.
-///
-/// The sampler enforces JSON schema constraints during LLM generation.
-/// Optionally supports "thinking" mode where the model can reason before output.
-///
-/// Parameters:
-///   schema_json: JSON Schema string defining the output structure
-///   allow_thinking: If true, allow free-form text before structured output
-///   start_marker: Token sequence that starts structured output (for thinking mode)
-///   stop_tokens: EOS token IDs that signal generation complete
-///   stop_tokens_len: Number of stop tokens
-///
-/// Returns handle on success, null on schema parse error or OOM.
-/// Caller must call talu_validate_free() when done.
-pub export fn talu_validate_create(
-    schema_json: [*:0]const u8,
-    allow_thinking: bool,
-    start_marker: ?[*:0]const u8,
-    stop_tokens: ?[*]const u32,
-    stop_tokens_len: usize,
-) callconv(.c) ?*ValidateHandle {
-    capi_error.clearError();
-    const allocator = std.heap.c_allocator;
-
-    const config = GrammarConfig{
-        .allow_thinking = allow_thinking,
-        .start_marker = if (start_marker) |m| std.mem.span(m) else null,
-    };
-
-    const tokens = if (stop_tokens) |ptr| ptr[0..stop_tokens_len] else &[_]u32{};
-
-    const handle = createValidateHandle(
-        allocator,
-        schema_json,
-        config,
-        tokens,
-    ) catch |err| {
-        if (err == error.AllocFailed) {
-            capi_error.setError(error.OutOfMemory, "Failed to allocate sampler", .{});
-            return null;
-        }
-        capi_error.setError(err, "Failed to create constrained sampler", .{});
-        return null;
-    };
-    return handle;
-}
 
 /// Configuration for structured output validation.
 pub const ValidateConfigC = extern struct {
@@ -247,97 +181,6 @@ pub export fn talu_validate_response_format(
         copyViolationStrings(result, violation);
     }
     return 0;
-}
-
-/// Frees a constrained sampler created by talu_validate_create().
-///
-/// Safe to call with null (no-op).
-pub export fn talu_validate_free(handle: ?*ValidateHandle) callconv(.c) void {
-    if (handle) |h| {
-        const sampler = h.toPtr();
-        sampler.deinit();
-        std.heap.c_allocator.destroy(sampler);
-    }
-}
-
-/// Applies grammar constraints to logits array.
-///
-/// Sets logits of invalid tokens to -infinity, forcing valid token selection.
-///
-/// Parameters:
-///   handle: Constrained sampler handle
-///   tokenizer: Tokenizer handle for token lookup
-///   logits: Logits array to modify in-place
-///   logits_len: Length of logits array (should match vocab size)
-///
-/// Returns 0 on success, negative error code on failure.
-pub export fn talu_validate_apply(
-    handle: ?*ValidateHandle,
-    tokenizer: ?*TokenizerHandle,
-    logits: [*]f32,
-    logits_len: usize,
-) callconv(.c) i32 {
-    capi_error.clearError();
-
-    const sampler = (handle orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid validate handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }).toPtr();
-
-    const tok_handle: *TokenizerHandle = @ptrCast(@alignCast(tokenizer orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid tokenizer handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }));
-
-    sampler.applyConstraints(logits[0..logits_len], &tok_handle.tok) catch |e| {
-        capi_error.setError(e, "Failed to apply constraints", .{});
-        return @intFromEnum(error_codes.errorToCode(e));
-    };
-    return 0;
-}
-
-/// Accepts a generated token and advances grammar state.
-///
-/// Must be called after each token is sampled to track grammar progress.
-///
-/// Parameters:
-///   handle: Constrained sampler handle
-///   token_id: The sampled token ID
-///   token_text: Text representation of the token
-///
-/// Returns 0 on success, negative error code on failure.
-pub export fn talu_validate_accept(
-    handle: ?*ValidateHandle,
-    token_id: u32,
-    token_text: [*:0]const u8,
-) callconv(.c) i32 {
-    capi_error.clearError();
-
-    const sampler = (handle orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid validate handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }).toPtr();
-
-    sampler.acceptToken(token_id, std.mem.span(token_text)) catch |e| {
-        capi_error.setError(e, "Failed to accept token", .{});
-        return @intFromEnum(error_codes.errorToCode(e));
-    };
-    return 0;
-}
-
-/// Checks if the grammar has reached a complete/accepting state.
-///
-/// Returns true if generation has produced valid complete output.
-pub export fn talu_validate_is_complete(handle: ?*ValidateHandle) callconv(.c) bool {
-    const sampler = (handle orelse return false).toPtr();
-    return sampler.state == .complete;
-}
-
-/// Resets the sampler to initial state for new generation.
-pub export fn talu_validate_reset(handle: ?*ValidateHandle) callconv(.c) void {
-    if (handle) |h| {
-        h.toPtr().reset();
-    }
 }
 
 // ============================================================================
@@ -590,14 +433,6 @@ pub export fn talu_validate_engine_get_position(handle: ?*ValidateEngineHandle) 
     return validator.getPosition();
 }
 
-/// Gets the number of active states in the state set.
-///
-/// A higher count indicates more complex parsing state (ambiguity).
-pub export fn talu_validate_engine_get_state_count(handle: ?*ValidateEngineHandle) callconv(.c) usize {
-    const validator = (handle orelse return 0).toPtr();
-    return validator.getStateCount();
-}
-
 // ============================================================================
 // Byte-Level Operations (No Tokenizer Required)
 // ============================================================================
@@ -625,18 +460,6 @@ pub export fn talu_validate_engine_get_valid_bytes(
     return 0;
 }
 
-/// Gets the count of valid next bytes from current state.
-///
-/// Returns count on success, error code (negative) on invalid handle.
-pub export fn talu_validate_engine_count_valid_bytes(handle: ?*ValidateEngineHandle) callconv(.c) i32 {
-    capi_error.clearError();
-    const validator = (handle orelse {
-        capi_error.setError(error.InvalidHandle, "validate engine handle is null", .{});
-        return @intFromEnum(error_codes.errorToCode(error.InvalidHandle));
-    }).toPtr();
-    return @intCast(validator.countValidBytes());
-}
-
 /// Checks if a byte sequence can be accepted from current state.
 ///
 /// This is a read-only check - does NOT advance the engine state.
@@ -649,25 +472,6 @@ pub export fn talu_validate_engine_can_accept(
     const validator = (handle orelse return false).toPtr();
     const data = (bytes orelse return false)[0..len];
     return validator.canAccept(data) catch false;
-}
-
-/// Advances engine state by one byte.
-///
-/// Returns 1 if byte was valid and state advanced, 0 if invalid, -1 on error.
-pub export fn talu_validate_engine_advance_byte(
-    handle: ?*ValidateEngineHandle,
-    byte: u8,
-) callconv(.c) i32 {
-    capi_error.clearError();
-    const validator = (handle orelse {
-        capi_error.setError(error.InvalidHandle, "validate engine handle is null", .{});
-        return @intFromEnum(error_codes.errorToCode(error.InvalidHandle));
-    }).toPtr();
-    const advanced = validator.advanceByte(byte) catch |err| {
-        capi_error.setError(err, "advance byte failed", .{});
-        return @intFromEnum(error_codes.errorToCode(err));
-    };
-    return if (advanced) 1 else 0;
 }
 
 /// Advances engine state by a byte sequence.
@@ -713,43 +517,6 @@ pub export fn talu_validate_engine_validate(
 // Token-Level Operations (For LLM Integration)
 // ============================================================================
 
-/// Opaque handle for token mask (wraps TokenMask directly).
-/// Thread safety: NOT thread-safe. Create one per thread.
-pub const TokenMaskHandle = opaque {
-    fn fromPtr(ptr: *TokenMask) *TokenMaskHandle {
-        return @ptrCast(ptr);
-    }
-
-    fn toPtr(self: *TokenMaskHandle) *TokenMask {
-        return @ptrCast(@alignCast(self));
-    }
-};
-
-fn createValidateHandle(
-    allocator: std.mem.Allocator,
-    schema_json: [*:0]const u8,
-    config: GrammarConfig,
-    tokens: []const u32,
-) !*ValidateHandle {
-    var sampler = try ConstrainedSampler.init(
-        allocator,
-        std.mem.span(schema_json),
-        config,
-        tokens,
-        null,
-        null,
-    );
-    errdefer sampler.deinit();
-
-    const ptr = allocator.create(ConstrainedSampler) catch {
-        return error.AllocFailed;
-    };
-    errdefer allocator.destroy(ptr);
-
-    ptr.* = sampler;
-    return ValidateHandle.fromPtr(ptr);
-}
-
 fn setResponseFormat(
     chat_state: *Chat,
     schema_json: [*:0]const u8,
@@ -792,259 +559,6 @@ fn setResponseFormatSlice(
     chat_state.setGrammar(sampler_ptr);
 }
 
-/// Creates a token mask for vocab_size tokens.
-///
-/// All tokens start as invalid (bits cleared).
-/// Caller must call talu_token_mask_destroy() when done.
-///
-/// Returns handle on success, null on OOM.
-pub export fn talu_token_mask_create(vocab_size: usize) callconv(.c) ?*TokenMaskHandle {
-    const allocator = std.heap.c_allocator;
-    const mask = allocator.create(TokenMask) catch {
-        capi_error.setError(error.OutOfMemory, "Failed to allocate mask", .{});
-        return null;
-    };
-    mask.* = TokenMask.init(allocator, vocab_size) catch {
-        capi_error.setError(error.OutOfMemory, "Failed to allocate mask bits", .{});
-        allocator.destroy(mask);
-        return null;
-    };
-    return TokenMaskHandle.fromPtr(mask);
-}
-
-/// Destroys a token mask and frees all resources.
-///
-/// Safe to call with null (no-op).
-pub export fn talu_token_mask_destroy(mask_handle: ?*TokenMaskHandle) callconv(.c) void {
-    const mask = (mask_handle orelse return).toPtr();
-    mask.deinit();
-    std.heap.c_allocator.destroy(mask);
-}
-
-/// Clears all bits in mask (all tokens become invalid).
-pub export fn talu_token_mask_clear(mask_handle: ?*TokenMaskHandle) callconv(.c) void {
-    const mask = (mask_handle orelse return).toPtr();
-    mask.clearAll();
-}
-
-/// Sets all bits in mask (all tokens become valid).
-pub export fn talu_token_mask_set_all(mask_handle: ?*TokenMaskHandle) callconv(.c) void {
-    const mask = (mask_handle orelse return).toPtr();
-    mask.setAll();
-}
-
-/// Checks if the token at the given index is valid.
-pub export fn talu_token_mask_is_valid(mask_handle: ?*TokenMaskHandle, index: usize) callconv(.c) bool {
-    const mask = (mask_handle orelse return false).toPtr();
-    return mask.isSet(index);
-}
-
-/// Sets the token at the given index as valid.
-pub export fn talu_token_mask_set(mask_handle: ?*TokenMaskHandle, index: usize) callconv(.c) void {
-    const mask = (mask_handle orelse return).toPtr();
-    mask.set(index);
-}
-
-/// Gets the vocab size of the mask.
-pub export fn talu_token_mask_get_size(mask_handle: ?*TokenMaskHandle) callconv(.c) usize {
-    const mask = (mask_handle orelse return 0).toPtr();
-    return mask.len;
-}
-
-/// Gets the raw bits pointer for direct access.
-///
-/// Returns pointer to u64 array where bit N corresponds to token N.
-/// Useful for SIMD operations on the mask.
-pub export fn talu_token_mask_get_bits(mask_handle: ?*TokenMaskHandle) callconv(.c) ?[*]u64 {
-    const mask = (mask_handle orelse return null).toPtr();
-    return mask.bits.ptr;
-}
-
-/// Gets the word count (number of u64 values in the bits array).
-pub export fn talu_token_mask_get_word_count(mask_handle: ?*TokenMaskHandle) callconv(.c) usize {
-    const mask = (mask_handle orelse return 0).toPtr();
-    return mask.bits.len;
-}
-
-/// Counts the number of valid tokens in the mask.
-pub export fn talu_token_mask_count_valid(mask_handle: ?*TokenMaskHandle) callconv(.c) usize {
-    const mask = (mask_handle orelse return 0).toPtr();
-    var count: usize = 0;
-    for (0..mask.len) |i| {
-        if (mask.isSet(i)) count += 1;
-    }
-    return count;
-}
-
-/// Token info callback type for get_valid_tokens.
-///
-/// Called for each token ID to get its byte representation.
-/// Re-export callback type from helpers.
-/// Should return pointer to token bytes and write length to out_len.
-/// Return null for invalid/unknown tokens.
-pub const TokenInfoCallback = ffi.TokenInfoCallback;
-
-// Use generic callback adapter from helpers
-const CallbackTokenizer = ffi.CallbackTokenizer;
-
-/// Computes valid token mask given current grammar state.
-///
-/// Uses callback to get token bytes by ID. For each token, checks if it
-/// can be accepted by the current grammar state.
-///
-/// Parameters:
-///   handle: Grammar engine handle
-///   vocab_size: Total vocabulary size
-///   mask_out: Token mask to populate
-///   token_fn: Callback to get token bytes by ID
-///   ctx: User context passed to callback
-///
-/// Returns 0 on success, negative error code on failure.
-pub export fn talu_validate_engine_get_valid_tokens(
-    handle: ?*ValidateEngineHandle,
-    vocab_size: usize,
-    mask_out: ?*TokenMaskHandle,
-    token_fn: ?TokenInfoCallback,
-    ctx: ?*anyopaque,
-) callconv(.c) i32 {
-    capi_error.clearError();
-
-    const validator = (handle orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid engine handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }).toPtr();
-    const mask = (mask_out orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid mask handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }).toPtr();
-    const callback = token_fn orelse {
-        capi_error.setError(error.InvalidArgument, "Token callback is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-
-    // Create adapter that wraps the C callback as a Zig tokenizer interface
-    const tokenizer = CallbackTokenizer{
-        .callback = callback,
-        .ctx = ctx,
-        .vocab_size = vocab_size,
-    };
-
-    // Compute mask using engine
-    var computed_mask = validator.engine.getValidTokens(tokenizer) catch |e| {
-        capi_error.setError(e, "Failed to compute valid tokens", .{});
-        return @intFromEnum(error_codes.errorToCode(e));
-    };
-    defer computed_mask.deinit();
-
-    // Copy to output mask
-    mask.clearAll();
-    const copy_len = @min(computed_mask.bits.len, mask.bits.len);
-    @memcpy(mask.bits[0..copy_len], computed_mask.bits[0..copy_len]);
-
-    return 0;
-}
-
-/// Computes valid token mask using a tokenizer handle.
-///
-/// More efficient than callback version as it can use prefix index optimization.
-///
-/// Parameters:
-///   handle: Grammar engine handle
-///   tokenizer: Tokenizer handle
-///   mask_out: Token mask to populate
-///
-/// Returns 0 on success, negative error code on failure.
-pub export fn talu_validate_engine_get_valid_tokens_with_tokenizer(
-    handle: ?*ValidateEngineHandle,
-    tokenizer: ?*TokenizerHandle,
-    mask_out: ?*TokenMaskHandle,
-) callconv(.c) i32 {
-    capi_error.clearError();
-
-    const validator = (handle orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid engine handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }).toPtr();
-    const tok_handle: *TokenizerHandle = @ptrCast(@alignCast(tokenizer orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid tokenizer handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }));
-    const mask = (mask_out orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid mask handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }).toPtr();
-
-    // Compute mask using engine - pass tok_handle to enable prefix index optimization
-    var computed_mask = validator.engine.getValidTokens(tok_handle) catch |e| {
-        capi_error.setError(e, "Failed to compute valid tokens", .{});
-        return @intFromEnum(error_codes.errorToCode(e));
-    };
-    defer computed_mask.deinit();
-
-    // Copy to output mask
-    mask.clearAll();
-    const copy_len = @min(computed_mask.bits.len, mask.bits.len);
-    @memcpy(mask.bits[0..copy_len], computed_mask.bits[0..copy_len]);
-
-    return 0;
-}
-
-/// Applies mask to logits array - sets invalid tokens to -infinity.
-///
-/// After calling this, sampling will only select valid tokens.
-///
-/// Returns 0 on success, negative error code on failure.
-pub export fn talu_token_mask_apply(
-    mask_handle: ?*TokenMaskHandle,
-    logits: ?[*]f32,
-    logits_len: usize,
-) callconv(.c) i32 {
-    capi_error.clearError();
-
-    const mask = (mask_handle orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid mask handle", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
-    }).toPtr();
-    const logits_slice = (logits orelse {
-        capi_error.setError(error.InvalidArgument, "Logits buffer is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    })[0..logits_len];
-
-    mask_mod.applyMask(logits_slice, mask);
-    return 0;
-}
-
-// ============================================================================
-// State Inspection (For Debugging/Profiling)
-// ============================================================================
-
-/// Gets the deterministic continuation if the grammar requires specific bytes next.
-///
-/// Some grammar states have only one valid continuation (e.g., after seeing `"tru`
-/// in JSON, only `e"` is valid). This function returns that required continuation.
-///
-/// Parameters:
-///   handle: Grammar engine handle
-///   out_len: Output for continuation length
-///
-/// Returns pointer to the required bytes, or null if multiple options are valid.
-/// The returned pointer is owned by the engine and valid until next state change.
-pub export fn talu_validate_engine_get_deterministic_continuation(
-    handle: ?*ValidateEngineHandle,
-    out_len: ?*usize,
-) callconv(.c) ?[*]const u8 {
-    const validator = (handle orelse return null).toPtr();
-    const len_ptr = out_len orelse return null;
-
-    if (validator.getDeterministicContinuation()) |continuation| {
-        len_ptr.* = continuation.len;
-        return continuation.ptr;
-    }
-
-    len_ptr.* = 0;
-    return null;
-}
-
 // ============================================================================
 // Semantic Validation API - Post-Parse Constraint Checking
 // ============================================================================
@@ -1061,7 +575,6 @@ pub export fn talu_validate_engine_get_deterministic_continuation(
 // 3. If semantic validation fails, use error message for retry/correction
 
 const SemanticValidator = validate_mod.SemanticValidator;
-const SemanticViolation = validate_mod.SemanticViolation;
 
 /// Opaque handle for semantic validator.
 /// Thread safety: NOT thread-safe. Create one per thread.

@@ -1,4 +1,3 @@
-//! Structured output and validation flag tests.
+//! Structured output tests.
 
 mod json_roundtrip;
-mod validation_flags;

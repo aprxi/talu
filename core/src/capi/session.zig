@@ -8,35 +8,13 @@ const std = @import("std");
 const gen_config_mod = @import("../config/generation.zig");
 const cfg_root = @import("models_pkg").config;
 const repository = @import("io_pkg").repository.root;
-const transport = @import("io_pkg").transport;
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
-const log = @import("log_pkg");
 const models_registry = @import("models_pkg").registry;
 
 // Import tokenizer types and functions
 const tokenizer_mod = @import("tokenizer.zig");
-pub const TokenizerHandle = tokenizer_mod.TokenizerHandle;
-pub const TokenizerWrapper = tokenizer_mod.TokenizerWrapper;
-pub const EncodeResult = tokenizer_mod.EncodeResult;
-pub const DecodeResult = tokenizer_mod.DecodeResult;
-pub const EncodeOptions = tokenizer_mod.EncodeOptions;
-pub const TokenizeResult = tokenizer_mod.TokenizeResult;
-pub const TokenizeBytesResult = tokenizer_mod.TokenizeBytesResult;
-pub const TokenOffset = tokenizer_mod.TokenOffset;
-pub const OffsetsResult = tokenizer_mod.OffsetsResult;
 pub const EosTokenResult = tokenizer_mod.EosTokenResult;
-pub const BatchEncodeResult = tokenizer_mod.BatchEncodeResult;
-pub const SpecialTokensResult = tokenizer_mod.SpecialTokensResult;
-pub const DecodeOptionsC = tokenizer_mod.DecodeOptionsC;
-pub const VocabResult = tokenizer_mod.VocabResult;
-pub const PaddedTensorOptions = tokenizer_mod.PaddedTensorOptions;
-pub const PaddedTensorResult = tokenizer_mod.PaddedTensorResult;
-pub const addEosFromTokenizer = tokenizer_mod.addEosFromTokenizer;
-
-// Import model description types
-const converter_mod = @import("converter.zig");
-pub const ModelInfo = converter_mod.ModelInfo;
 
 // Native build uses C allocator
 const allocator = std.heap.c_allocator;

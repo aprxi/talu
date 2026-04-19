@@ -32,19 +32,15 @@ from tests.conftest import (
 def test_model_path(ensure_library_built):
     """Return the model URI (TEST_MODEL_URI_TEXT env var or default)."""
     if not _is_model_available(TEST_MODEL_URI_TEXT_RANDOM):
-        pytest.exit(
-            _missing_model_msg("TEST_MODEL_URI_TEXT_RANDOM", TEST_MODEL_URI_TEXT_RANDOM),
-            returncode=2,
-        )
+        pytest.skip(_missing_model_msg("TEST_MODEL_URI_TEXT_RANDOM", TEST_MODEL_URI_TEXT_RANDOM))
     load_error = _validate_model_loadable_for_tokenizer(TEST_MODEL_URI_TEXT_RANDOM)
     if load_error is not None:
-        pytest.exit(
+        pytest.skip(
             _unusable_model_msg(
                 "TEST_MODEL_URI_TEXT_RANDOM",
                 TEST_MODEL_URI_TEXT_RANDOM,
                 load_error,
-            ),
-            returncode=2,
+            )
         )
     return TEST_MODEL_URI_TEXT_RANDOM
 

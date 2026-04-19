@@ -10,11 +10,10 @@ const std = @import("std");
 const local = @import("local.zig");
 const root = @import("root.zig");
 const spec = @import("spec.zig");
-const http_engine_mod = @import("http_engine.zig");
-const commit_mod = @import("commit.zig");
 const responses_mod = @import("../responses/root.zig");
 const inference_bridge = @import("inference_bridge.zig");
 const inference_types = inference_bridge.types;
+const vision_types = inference_bridge.vision_types;
 const sampler = inference_bridge.sampling;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const error_codes = @import("../capi/error_codes.zig");
@@ -22,7 +21,6 @@ const capi_error = @import("../capi/error.zig");
 const log = @import("log_pkg");
 
 const LocalEngine = local.LocalEngine;
-const HttpEngine = http_engine_mod.HttpEngine;
 const InferenceBackend = spec.InferenceBackend;
 const GenerateOptions = local.GenerateOptions;
 const Chat = responses_mod.Chat;
@@ -71,6 +69,21 @@ pub const CLogitBiasEntry = extern struct {
     bias: f32,
 };
 
+/// Preprocessed vision image payload from C API callers.
+///
+/// `pixels_ptr` points to a contiguous array of `pixel_count` f32 values
+/// (row-major CHW layout expected by inference backends).
+pub const CGenerateVisionImage = extern struct {
+    pixels_ptr: ?[*]const f32 = null,
+    pixel_count: usize = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    grid_temporal: u32 = 0,
+    grid_height: u32 = 0,
+    grid_width: u32 = 0,
+    token_count: usize = 0,
+};
+
 /// Generation configuration from C API.
 pub const CGenerateConfig = extern struct {
     max_tokens: usize = 0,
@@ -104,10 +117,7 @@ pub const CGenerateConfig = extern struct {
     /// without waiting for the next callback invocation.
     /// The pointer must remain valid for the duration of generation.
     stop_flag: ?*const std.atomic.Value(bool) = null,
-    /// Extra body fields for remote API requests as a JSON object string.
-    /// These are merged into the request body for OpenAI-compatible APIs.
-    /// Useful for provider-specific parameters not covered by standard config.
-    /// Example: "{\"repetition_penalty\": 1.1, \"top_a\": 0.5}"
+    /// Reserved for compatibility; ignored by local inference.
     extra_body_json: ?[*:0]const u8 = null,
 
     /// When non-zero, preserve raw model output bytes without reasoning-tag filtering.
@@ -123,6 +133,13 @@ pub const CGenerateConfig = extern struct {
     /// during prefill (not decode). Signature: fn(completed_layers, total_layers, userdata).
     prefill_progress_fn: ?*const fn (usize, usize, ?*anyopaque) callconv(.c) void = null,
     prefill_progress_data: ?*anyopaque = null,
+
+    /// Optional externally preprocessed vision payload.
+    /// When present, local image decode/preprocess is skipped.
+    external_vision_images: ?[*]const CGenerateVisionImage = null,
+    external_vision_image_count: usize = 0,
+    external_vision_image_token_id: u32 = 0,
+    _external_vision_padding: u32 = 0,
 };
 
 // =============================================================================
@@ -156,27 +173,6 @@ pub const CFinishReason = enum(u8) {
     /// Request was cancelled (e.g., client disconnect, stop flag set).
     cancelled = 5,
 };
-
-fn finishReasonToString(reason: CFinishReason) [:0]const u8 {
-    return switch (reason) {
-        .eos_token => "stop",
-        .length => "length",
-        .stop_sequence => "stop_sequence",
-        .tool_calls => "tool_calls",
-        .content_filter => "content_filter",
-        .cancelled => "cancelled",
-    };
-}
-
-fn httpFinishReasonToC(reason: http_engine_mod.FinishReason) CFinishReason {
-    return switch (reason) {
-        .stop => .eos_token,
-        .length => .length,
-        .tool_calls => .tool_calls,
-        .content_filter => .content_filter,
-        .unknown => .eos_token,
-    };
-}
 
 /// Generation result (internal, Zig slice).
 pub const GenerateResult = struct {
@@ -317,31 +313,6 @@ pub fn freeResult(allocator: std.mem.Allocator, result: *CGenerateResult) void {
     }
 }
 
-/// Free internal ToolCallRef slice (used for ownership transfer error paths).
-fn freeToolCallRefs(allocator: std.mem.Allocator, tool_calls: ?[]const local.ToolCallRef) void {
-    const calls = tool_calls orelse return;
-    for (calls) |call| {
-        allocator.free(call.call_id);
-        allocator.free(call.name);
-        allocator.free(call.arguments);
-    }
-    allocator.free(calls);
-}
-
-fn freeToolCallRefsPartial(
-    allocator: std.mem.Allocator,
-    tool_calls: []const local.ToolCallRef,
-    count: usize,
-) void {
-    const bounded = tool_calls[0..count];
-    for (bounded) |call| {
-        allocator.free(call.call_id);
-        allocator.free(call.name);
-        allocator.free(call.arguments);
-    }
-    allocator.free(tool_calls);
-}
-
 // =============================================================================
 // Generation API
 // =============================================================================
@@ -367,7 +338,11 @@ pub fn generate(
     if (parts.len == 0) return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_empty_prompt) };
 
     // Resolve model for routing
-    const resolved_id = root.resolveForRouting(model_id) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.internal_error) };
+    const resolved_id = root.resolveForRouting(model_id) catch |err| return .{
+        .error_code = @intFromEnum(switch (err) {
+            error.UnsupportedNamespace => error_codes.ErrorCode.ambiguous_backend,
+        }),
+    };
 
     // Get or create engine
     const engine = root.getOrCreateEngineWithConfig(allocator, resolved_id, resolution) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.model_not_found) };
@@ -387,9 +362,7 @@ pub fn generate(
 /// instead of a model ID string. This is the new spec-based API that will replace
 /// the string-based API.
 ///
-/// Dispatches to either:
-///   - LocalEngine for native inference
-///   - HttpEngine for OpenAI-compatible remote inference
+/// Dispatches to the local backend.
 pub fn generateWithBackend(
     allocator: std.mem.Allocator,
     chat: *Chat,
@@ -402,8 +375,7 @@ pub fn generateWithBackend(
         .conv_items = chat.conv.len(),
         .backend = @as(u8, switch (backend.backend) {
             .Local => 0,
-            .OpenAICompatible => 1,
-            .Unspecified => 2,
+            .Unspecified => 1,
         }),
     }, @src());
 
@@ -424,9 +396,6 @@ pub fn generateWithBackend(
         .Local => |local_engine| {
             return generateWithLocalEngine(allocator, chat, local_engine, config);
         },
-        .OpenAICompatible => |http_engine| {
-            return generateWithHttpEngine(allocator, chat, http_engine, config);
-        },
         .Unspecified => {
             return .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) };
         },
@@ -440,7 +409,10 @@ fn generateWithLocalEngine(
     local_engine: *LocalEngine,
     config: ?*const CGenerateConfig,
 ) GenerateResult {
-    var built = buildOptions(allocator_, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+    var built = buildOptions(allocator_, config, local_engine) catch |err| {
+        capi_error.setError(err, "Invalid generation options", .{});
+        return .{ .error_code = @intFromEnum(buildOptionsErrorCode(err)) };
+    };
     defer built.deinit(allocator_);
 
     log.debug("router", "LocalEngine generate (direct route)", .{
@@ -689,7 +661,10 @@ fn generateStreamingWithLocalEngine(
     stream_cb: StreamCallback,
     stream_cb_data: ?*anyopaque,
 ) GenerateResult {
-    var built = buildOptions(allocator_, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+    var built = buildOptions(allocator_, config, local_engine) catch |err| {
+        capi_error.setError(err, "Invalid generation options", .{});
+        return .{ .error_code = @intFromEnum(buildOptionsErrorCode(err)) };
+    };
     defer built.deinit(allocator_);
 
     // Determine tool generation mode.
@@ -769,7 +744,7 @@ fn generateStreamingWithLocalEngine(
     };
 }
 
-/// Generate with streaming callback. Dispatches to local or HTTP backend.
+/// Generate with streaming callback using local backend.
 pub fn generateStreamingWithBackend(
     allocator_: std.mem.Allocator,
     chat: *Chat,
@@ -792,256 +767,10 @@ pub fn generateStreamingWithBackend(
         .Local => |local_engine| {
             return generateStreamingWithLocalEngine(allocator_, chat, local_engine, config, stream_cb, stream_cb_data);
         },
-        .OpenAICompatible => {
-            // HTTP streaming not supported through callback API.
-            capi_error.setErrorWithCode(.invalid_argument, "Streaming callback not supported for remote backends", .{});
-            return .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) };
-        },
         .Unspecified => {
             return .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) };
         },
     }
-}
-
-/// Generate using HttpEngine (remote OpenAI-compatible inference).
-fn generateWithHttpEngine(
-    allocator: std.mem.Allocator,
-    chat: *Chat,
-    http_engine: *HttpEngine,
-    config: ?*const CGenerateConfig,
-) GenerateResult {
-    log.debug("capi_bridge", "Dispatching to HttpEngine", .{}, @src());
-
-    // Build HTTP generation options from C config
-    var http_opts = http_engine_mod.GenerateOptions{};
-
-    if (config) |cfg| {
-        if (cfg.max_tokens > 0) http_opts.max_tokens = cfg.max_tokens;
-        if (cfg.temperature >= 0) http_opts.temperature = cfg.temperature;
-        if (cfg.top_p > 0) http_opts.top_p = cfg.top_p;
-
-        // Pass through tool definitions and choice
-        if (cfg.tools_json) |t| http_opts.tools_json = std.mem.sliceTo(t, 0);
-        if (cfg.tool_choice) |c| http_opts.tool_choice = std.mem.sliceTo(c, 0);
-
-        // Pass through extra body JSON for provider-specific parameters
-        if (cfg.extra_body_json) |extra| {
-            http_opts.extra_body_json = std.mem.sliceTo(extra, 0);
-        }
-    }
-
-    // Call HttpEngine (non-streaming mode)
-    const start_time = std.time.nanoTimestamp();
-
-    const result = http_engine.generate(chat, http_opts) catch |err| {
-        log.warn("capi_bridge", "HttpEngine generate failed", .{ .err = @errorName(err) });
-        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
-    };
-    defer result.deinit(allocator);
-
-    const end_time = std.time.nanoTimestamp();
-    const generation_ns: u64 = @intCast(end_time - start_time);
-
-    const finish_reason = httpFinishReasonToC(result.finish_reason);
-
-    // Build tool call inputs for commit (if any)
-    var tc_inputs_buf: [32]commit_mod.ToolCallInput = undefined; // filled element-by-element in loop below
-    const tc_inputs: []const commit_mod.ToolCallInput = if (result.tool_calls.len > 0) blk: {
-        // Allocate if more than static buffer
-        if (result.tool_calls.len > tc_inputs_buf.len) {
-            return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-        }
-        for (result.tool_calls, 0..) |tc, i| {
-            tc_inputs_buf[i] = .{
-                .id = tc.id,
-                .name = tc.name,
-                .arguments = tc.arguments,
-            };
-        }
-        break :blk tc_inputs_buf[0..result.tool_calls.len];
-    } else &.{};
-
-    // Commit to conversation via shared path (handles firewall, reasoning, chat items)
-    commit_mod.commitGenerationResult(allocator, chat, .{
-        .text = result.text,
-        .tool_calls = tc_inputs,
-        .prompt_tokens = result.prompt_tokens,
-        .completion_tokens = result.completion_tokens,
-        .generation_ns = generation_ns,
-        .finish_reason = finishReasonToString(finish_reason),
-    }) catch {
-        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-    };
-
-    // Copy text for the returned GenerateResult
-    const text = allocator.dupe(u8, result.text) catch {
-        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-    };
-
-    // Build tool call refs for the caller (if any)
-    var tool_refs: ?[]const local.ToolCallRef = null;
-    if (result.tool_calls.len > 0) {
-        var refs = allocator.alloc(local.ToolCallRef, result.tool_calls.len) catch {
-            allocator.free(text);
-            return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-        };
-        var built_count: usize = 0;
-
-        for (result.tool_calls, 0..) |tc, i| {
-            const call_id = allocator.dupe(u8, tc.id) catch {
-                freeToolCallRefsPartial(allocator, refs, built_count);
-                allocator.free(text);
-                return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-            };
-            const name = allocator.dupe(u8, tc.name) catch {
-                allocator.free(call_id);
-                freeToolCallRefsPartial(allocator, refs, built_count);
-                allocator.free(text);
-                return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-            };
-            const arguments = allocator.dupe(u8, tc.arguments) catch {
-                allocator.free(call_id);
-                allocator.free(name);
-                freeToolCallRefsPartial(allocator, refs, built_count);
-                allocator.free(text);
-                return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-            };
-
-            refs[i] = .{
-                .item_index = chat.conv.len() - (result.tool_calls.len - i),
-                .call_id = call_id,
-                .name = name,
-                .arguments = arguments,
-            };
-            built_count += 1;
-        }
-        tool_refs = refs;
-    }
-
-    return .{
-        .text = text,
-        .token_count = result.completion_tokens,
-        .prompt_tokens = result.prompt_tokens,
-        .completion_tokens = result.completion_tokens,
-        .prefill_ns = 0, // Remote API doesn't report prefill time
-        .generation_ns = generation_ns,
-        .ttft_ns = 0, // Remote API doesn't report TTFT
-        .finish_reason = finish_reason,
-        .tool_calls = tool_refs,
-        .error_code = 0,
-    };
-}
-
-// =============================================================================
-// Remote Model Listing API
-// =============================================================================
-
-/// C-compatible model info for remote endpoints.
-pub const CRemoteModelInfo = extern struct {
-    /// Model ID (null-terminated, owned)
-    id: ?[*:0]u8,
-    /// Object type (usually "model")
-    object: ?[*:0]u8,
-    /// Creation timestamp (0 if not available)
-    created: i64,
-    /// Owner/organization
-    owned_by: ?[*:0]u8,
-};
-
-/// C-compatible result from listing remote models.
-pub const CRemoteModelListResult = extern struct {
-    /// Array of model info (owned)
-    models: ?[*]CRemoteModelInfo,
-    /// Number of models
-    count: usize,
-    /// Error code (0 = success)
-    error_code: i32,
-};
-
-/// List models from a remote OpenAI-compatible backend.
-///
-/// Caller owns the returned result and must call freeModelListResult() to free it.
-pub fn listModels(allocator: std.mem.Allocator, backend: *InferenceBackend) CRemoteModelListResult {
-    // Get HTTP engine from backend
-    const http_engine = backend.getHttpEngine() orelse {
-        var ret = std.mem.zeroes(CRemoteModelListResult);
-        ret.error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument);
-        return ret;
-    };
-
-    // List models via HTTP engine
-    var result = http_engine.listModels() catch |err| {
-        log.warn("capi_bridge", "listModels failed", .{ .err = @errorName(err) });
-        var ret = std.mem.zeroes(CRemoteModelListResult);
-        ret.error_code = @intFromEnum(error_codes.errorToCode(err));
-        return ret;
-    };
-    defer result.deinit(allocator);
-
-    // Convert to C format
-    return convertModelListResult(allocator, result);
-}
-
-/// Convert HttpEngine.ListModelsResult to C-compatible CRemoteModelListResult.
-///
-/// This is extracted from listModels for testability. The HTTP call is separate
-/// from the response conversion logic. All parsing logic tested via mock tests below.
-pub fn convertModelListResult(allocator: std.mem.Allocator, result: http_engine_mod.ListModelsResult) CRemoteModelListResult {
-    const count = result.models.len;
-    if (count == 0) {
-        return std.mem.zeroes(CRemoteModelListResult);
-    }
-
-    const models = allocator.alloc(CRemoteModelInfo, count) catch {
-        var ret = std.mem.zeroes(CRemoteModelListResult);
-        ret.error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory);
-        return ret;
-    };
-
-    for (result.models, 0..) |model, i| {
-        var info = std.mem.zeroes(CRemoteModelInfo);
-        info.id = dupeToSentinelOrNull(allocator, model.id);
-        info.object = dupeToSentinelOrNull(allocator, model.object);
-        info.created = model.created orelse 0;
-        info.owned_by = dupeToSentinelOrNull(allocator, model.owned_by);
-        models[i] = info;
-    }
-
-    var ret = std.mem.zeroes(CRemoteModelListResult);
-    ret.models = models.ptr;
-    ret.count = count;
-    return ret;
-}
-
-/// Free result from listModels().
-pub fn freeModelListResult(allocator: std.mem.Allocator, result: *CRemoteModelListResult) void {
-    if (result.models) |models| {
-        const slice = models[0..result.count];
-
-        for (slice) |*model| {
-            if (model.id) |id| freeSentinelString(allocator, id);
-            if (model.object) |obj| freeSentinelString(allocator, obj);
-            if (model.owned_by) |owner| freeSentinelString(allocator, owner);
-        }
-
-        allocator.free(slice);
-        result.models = null;
-        result.count = 0;
-    }
-}
-
-/// Duplicate a slice to a null-terminated C string, or return null if empty.
-fn dupeToSentinelOrNull(allocator: std.mem.Allocator, src: []const u8) ?[*:0]u8 {
-    if (src.len == 0) return null;
-    const buf = allocator.allocSentinel(u8, src.len, 0) catch return null;
-    @memcpy(buf, src);
-    return buf.ptr;
-}
-
-/// Free a null-terminated string allocated with allocSentinel.
-fn freeSentinelString(allocator: std.mem.Allocator, ptr: [*:0]u8) void {
-    const span = std.mem.span(ptr);
-    allocator.free(span.ptr[0 .. span.len + 1]);
 }
 
 // =============================================================================
@@ -1088,27 +817,6 @@ pub fn configToGenerateOptions(config: ?*const CGenerateConfig) GenerateOptions 
     return opts;
 }
 
-/// Convert C config to HTTP GenerateOptions (for remote backends).
-///
-/// Like `configToGenerateOptions` but produces `http_engine_mod.GenerateOptions`.
-/// Copies scalar fields and string slice pointers (which reference C-owned memory).
-pub fn configToHttpGenerateOptions(config: ?*const CGenerateConfig) http_engine_mod.GenerateOptions {
-    var opts = http_engine_mod.GenerateOptions{};
-
-    const cfg = config orelse return opts;
-
-    if (cfg.max_tokens > 0) opts.max_tokens = cfg.max_tokens;
-    if (cfg.temperature >= 0) opts.temperature = cfg.temperature;
-    if (cfg.top_p > 0) opts.top_p = cfg.top_p;
-
-    if (cfg.tools_json) |t| opts.tools_json = std.mem.sliceTo(t, 0);
-    if (cfg.tool_choice) |c| opts.tool_choice = std.mem.sliceTo(c, 0);
-    if (cfg.extra_body_json) |extra| opts.extra_body_json = std.mem.sliceTo(extra, 0);
-    opts.raw_output = cfg.raw_output != 0;
-
-    return opts;
-}
-
 // =============================================================================
 // Internal Implementation
 // =============================================================================
@@ -1118,13 +826,62 @@ const BuiltOptions = struct {
     options: GenerateOptions,
     stop_sequences: [][]u32,
     logit_bias: []sampler.LogitBiasEntry,
+    external_vision_input: ?vision_types.PrefillVisionInput,
 
     fn deinit(self: *BuiltOptions, allocator: std.mem.Allocator) void {
         for (self.stop_sequences) |seq| allocator.free(seq);
         if (self.stop_sequences.len > 0) allocator.free(self.stop_sequences);
         if (self.logit_bias.len > 0) allocator.free(self.logit_bias);
+        if (self.external_vision_input) |*vision_input| vision_input.deinit(allocator);
     }
 };
+
+fn copyExternalVisionInput(
+    allocator: std.mem.Allocator,
+    cfg: *const CGenerateConfig,
+) !?vision_types.PrefillVisionInput {
+    if (cfg.external_vision_images == null or cfg.external_vision_image_count == 0) return null;
+    if (cfg.external_vision_image_token_id == 0) return error.InvalidArgument;
+
+    const src_images = cfg.external_vision_images.?[0..cfg.external_vision_image_count];
+    const images = try allocator.alloc(vision_types.PrefillVisionImage, src_images.len);
+
+    var written: usize = 0;
+    errdefer {
+        for (images[0..written]) |*img| img.deinit(allocator);
+        allocator.free(images);
+    }
+
+    for (src_images, 0..) |src_img, i| {
+        if (src_img.width == 0 or src_img.height == 0) return error.InvalidArgument;
+        if (src_img.token_count == 0) return error.InvalidArgument;
+        if (src_img.pixel_count > 0 and src_img.pixels_ptr == null) return error.InvalidArgument;
+
+        const src_pixels: []const f32 = if (src_img.pixel_count > 0)
+            src_img.pixels_ptr.?[0..src_img.pixel_count]
+        else
+            &.{};
+
+        const copied_pixels = try allocator.dupe(f32, src_pixels);
+        images[i] = .{
+            .pixels = copied_pixels,
+            .width = src_img.width,
+            .height = src_img.height,
+            .grid = .{
+                .temporal = src_img.grid_temporal,
+                .height = src_img.grid_height,
+                .width = src_img.grid_width,
+            },
+            .token_count = src_img.token_count,
+        };
+        written += 1;
+    }
+
+    return vision_types.PrefillVisionInput{
+        .images = images,
+        .image_token_id = cfg.external_vision_image_token_id,
+    };
+}
 
 /// Build GenerateOptions from C config.
 fn buildOptions(
@@ -1136,6 +893,7 @@ fn buildOptions(
         .options = .{},
         .stop_sequences = &.{},
         .logit_bias = &.{},
+        .external_vision_input = null,
     };
 
     const cfg = config orelse return result;
@@ -1166,6 +924,11 @@ fn buildOptions(
     result.options.prefill_progress_fn = cfg.prefill_progress_fn;
     result.options.prefill_progress_data = cfg.prefill_progress_data;
 
+    if (try copyExternalVisionInput(allocator, cfg)) |external_vision_input| {
+        result.external_vision_input = external_vision_input;
+        result.options.external_vision_input = &result.external_vision_input.?;
+    }
+
     // Tokenize stop sequences
     if (cfg.stop_sequences != null and cfg.stop_sequence_count > 0) {
         const seqs = cfg.stop_sequences.?[0..cfg.stop_sequence_count];
@@ -1187,6 +950,13 @@ fn buildOptions(
     }
 
     return result;
+}
+
+fn buildOptionsErrorCode(err: anyerror) error_codes.ErrorCode {
+    return switch (err) {
+        error.InvalidArgument, error.UnsupportedContentType => .invalid_argument,
+        else => .out_of_memory,
+    };
 }
 
 // =============================================================================
@@ -1262,6 +1032,9 @@ test "CGenerateConfig defaults" {
     try std.testing.expect(cfg.extra_body_json == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.raw_output);
     try std.testing.expectEqual(@as(usize, 0), cfg.completions_mode);
+    try std.testing.expect(cfg.external_vision_images == null);
+    try std.testing.expectEqual(@as(usize, 0), cfg.external_vision_image_count);
+    try std.testing.expectEqual(@as(u32, 0), cfg.external_vision_image_token_id);
 }
 
 test "configToGenerateOptions completions_mode" {
@@ -1282,6 +1055,60 @@ test "configToGenerateOptions completions_mode" {
 test "configToGenerateOptions completions_mode default off" {
     const opts = configToGenerateOptions(null);
     try std.testing.expect(!opts.completions_mode);
+}
+
+test "copyExternalVisionInput copies payload" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]f32{ 0.25, 0.5, 0.75, 1.0 };
+    const c_images = [_]CGenerateVisionImage{
+        .{
+            .pixels_ptr = pixels[0..].ptr,
+            .pixel_count = pixels.len,
+            .width = 2,
+            .height = 2,
+            .grid_temporal = 1,
+            .grid_height = 1,
+            .grid_width = 1,
+            .token_count = 3,
+        },
+    };
+    var cfg: CGenerateConfig = .{};
+    cfg.external_vision_images = c_images[0..].ptr;
+    cfg.external_vision_image_count = c_images.len;
+    cfg.external_vision_image_token_id = 1234;
+
+    var copied = (try copyExternalVisionInput(allocator, &cfg)).?;
+    defer copied.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), copied.images.len);
+    try std.testing.expectEqual(@as(u32, 1234), copied.image_token_id);
+    try std.testing.expectEqual(@as(u32, 2), copied.images[0].width);
+    try std.testing.expectEqual(@as(usize, 3), copied.images[0].token_count);
+    try std.testing.expectEqual(@as(usize, pixels.len), copied.images[0].pixels.len);
+    try std.testing.expectEqual(@as(f32, 0.75), copied.images[0].pixels[2]);
+}
+
+test "copyExternalVisionInput rejects missing image token id" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]f32{1.0};
+    const c_images = [_]CGenerateVisionImage{
+        .{
+            .pixels_ptr = pixels[0..].ptr,
+            .pixel_count = pixels.len,
+            .width = 1,
+            .height = 1,
+            .grid_temporal = 1,
+            .grid_height = 1,
+            .grid_width = 1,
+            .token_count = 1,
+        },
+    };
+    var cfg: CGenerateConfig = .{};
+    cfg.external_vision_images = c_images[0..].ptr;
+    cfg.external_vision_image_count = c_images.len;
+    cfg.external_vision_image_token_id = 0;
+
+    try std.testing.expectError(error.InvalidArgument, copyExternalVisionInput(allocator, &cfg));
 }
 
 test "GenerateContentPart struct layout" {
@@ -1339,12 +1166,9 @@ test "GenerateResult deinit frees text" {
 // -----------------------------------------------------------------------------
 // Network-dependent function coverage (signature verification)
 //
-// The following functions require LocalEngine/HttpEngine and cannot be unit
-// tested without a real model or remote server. Their signatures are verified
-// here; behavior is covered through:
-//
-// - generate, generateWithBackend: integration tests in bindings/python/tests/
-// - listModels: integration tests in bindings/python/tests/model/test_remote_backend.py
+// The following functions require a real LocalEngine and cannot be unit tested
+// without a model. Their signatures are verified here; behavior is covered
+// through integration tests in bindings/python/tests/.
 // -----------------------------------------------------------------------------
 
 test "generate: signature verification" {
@@ -1361,14 +1185,6 @@ test "generateWithBackend: signature verification" {
     const F = @TypeOf(generateWithBackend);
     const info = @typeInfo(F).@"fn";
     try std.testing.expectEqual(@as(usize, 5), info.params.len);
-}
-
-test "listModels: signature verification" {
-    // Verify function signature compiles correctly.
-    // Cannot unit test: requires HttpEngine connected to remote server.
-    const F = @TypeOf(listModels);
-    const info = @typeInfo(F).@"fn";
-    try std.testing.expectEqual(@as(usize, 2), info.params.len);
 }
 
 // -----------------------------------------------------------------------------
@@ -1460,230 +1276,6 @@ test "freeResult: handles null text" {
     freeResult(allocator, &result);
     // Should not crash
     try std.testing.expect(result.text == null);
-}
-
-test "dupeToSentinelOrNull: duplicates non-empty string" {
-    const allocator = std.testing.allocator;
-
-    const result = dupeToSentinelOrNull(allocator, "hello");
-    try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("hello", std.mem.span(result.?));
-
-    freeSentinelString(allocator, result.?);
-}
-
-test "dupeToSentinelOrNull: returns null for empty string" {
-    const allocator = std.testing.allocator;
-
-    const result = dupeToSentinelOrNull(allocator, "");
-    try std.testing.expect(result == null);
-}
-
-test "freeSentinelString: frees correctly" {
-    const allocator = std.testing.allocator;
-
-    const str = try allocator.allocSentinel(u8, 4, 0);
-    @memcpy(str, "test");
-
-    freeSentinelString(allocator, str.ptr);
-    // No leak = success
-}
-
-test "CRemoteModelInfo struct layout" {
-    var info = std.mem.zeroes(CRemoteModelInfo);
-    info.created = 1234567890;
-    try std.testing.expect(info.id == null);
-    try std.testing.expectEqual(@as(i64, 1234567890), info.created);
-}
-
-test "CRemoteModelListResult struct layout" {
-    const result = std.mem.zeroes(CRemoteModelListResult);
-    try std.testing.expect(result.models == null);
-    try std.testing.expectEqual(@as(usize, 0), result.count);
-    try std.testing.expectEqual(@as(i32, 0), result.error_code);
-}
-
-test "freeModelListResult: handles empty result" {
-    const allocator = std.testing.allocator;
-
-    var result = std.mem.zeroes(CRemoteModelListResult);
-
-    freeModelListResult(allocator, &result);
-    try std.testing.expect(result.models == null);
-}
-
-test "freeModelListResult: frees models array" {
-    const allocator = std.testing.allocator;
-
-    // Allocate a models array
-    var models = try allocator.alloc(CRemoteModelInfo, 2);
-    errdefer allocator.free(models);
-
-    const id0 = try allocator.allocSentinel(u8, 5, 0);
-    errdefer allocator.free(id0);
-    @memcpy(id0, "gpt-4");
-
-    const obj0 = try allocator.allocSentinel(u8, 5, 0);
-    errdefer allocator.free(obj0);
-    @memcpy(obj0, "model");
-
-    const owner0 = try allocator.allocSentinel(u8, 6, 0);
-    errdefer allocator.free(owner0);
-    @memcpy(owner0, "openai");
-
-    models[0] = std.mem.zeroes(CRemoteModelInfo);
-    models[0].id = id0.ptr;
-    models[0].object = obj0.ptr;
-    models[0].created = 12345;
-    models[0].owned_by = owner0.ptr;
-
-    const id1 = try allocator.allocSentinel(u8, 8, 0);
-    @memcpy(id1, "gpt-4o-m");
-
-    models[1] = std.mem.zeroes(CRemoteModelInfo);
-    models[1].id = id1.ptr;
-    // Test null handling: object and owned_by remain null from zeroes
-
-    var result = std.mem.zeroes(CRemoteModelListResult);
-    result.models = models.ptr;
-    result.count = 2;
-
-    freeModelListResult(allocator, &result);
-    try std.testing.expect(result.models == null);
-    try std.testing.expectEqual(@as(usize, 0), result.count);
-}
-
-// -----------------------------------------------------------------------------
-// Response conversion tests (mock API responses)
-//
-// These tests verify conversion logic by constructing mock HttpEngine results
-// and passing them to the conversion function. No HTTP calls are made.
-// -----------------------------------------------------------------------------
-
-test "convertModelListResult: mock response with multiple models" {
-    const allocator = std.testing.allocator;
-
-    // Create mock ModelInfo array (simulating what HttpEngine.parseModelsResponse returns)
-    var mock_models = try allocator.alloc(http_engine_mod.ModelInfo, 3);
-    defer allocator.free(mock_models);
-
-    // Note: we don't allocate these strings - they're "borrowed" from the mock response
-    // In real usage, HttpEngine.parseModelsResponse allocates them
-    mock_models[0] = .{
-        .id = "gpt-4o",
-        .object = "model",
-        .created = 1686935002,
-        .owned_by = "openai",
-    };
-    mock_models[1] = .{
-        .id = "gpt-4o-mini",
-        .object = "model",
-        .created = 1721172741,
-        .owned_by = "system",
-    };
-    mock_models[2] = .{
-        .id = "org/model-name",
-        .object = "model",
-        .created = null, // Some providers don't have created timestamp
-        .owned_by = "vllm",
-    };
-
-    const mock_result = http_engine_mod.ListModelsResult{
-        .models = mock_models,
-    };
-
-    // Convert to C format
-    var c_result = convertModelListResult(allocator, mock_result);
-    defer freeModelListResult(allocator, &c_result);
-
-    // Verify conversion
-    try std.testing.expectEqual(@as(i32, 0), c_result.error_code);
-    try std.testing.expectEqual(@as(usize, 3), c_result.count);
-    try std.testing.expect(c_result.models != null);
-
-    const models = c_result.models.?[0..c_result.count];
-
-    // Model 0
-    try std.testing.expectEqualStrings("gpt-4o", std.mem.span(models[0].id.?));
-    try std.testing.expectEqualStrings("model", std.mem.span(models[0].object.?));
-    try std.testing.expectEqual(@as(i64, 1686935002), models[0].created);
-    try std.testing.expectEqualStrings("openai", std.mem.span(models[0].owned_by.?));
-
-    // Model 1
-    try std.testing.expectEqualStrings("gpt-4o-mini", std.mem.span(models[1].id.?));
-    try std.testing.expectEqual(@as(i64, 1721172741), models[1].created);
-
-    // Model 2 - null created should become 0
-    try std.testing.expectEqualStrings("org/model-name", std.mem.span(models[2].id.?));
-    try std.testing.expectEqual(@as(i64, 0), models[2].created);
-}
-
-test "convertModelListResult: mock empty response" {
-    const allocator = std.testing.allocator;
-
-    const mock_result = http_engine_mod.ListModelsResult{
-        .models = &.{},
-    };
-
-    var c_result = convertModelListResult(allocator, mock_result);
-    defer freeModelListResult(allocator, &c_result);
-
-    try std.testing.expectEqual(@as(i32, 0), c_result.error_code);
-    try std.testing.expectEqual(@as(usize, 0), c_result.count);
-    try std.testing.expect(c_result.models == null);
-}
-
-test "convertModelListResult: mock single model (typical vLLM response)" {
-    const allocator = std.testing.allocator;
-
-    var mock_models = try allocator.alloc(http_engine_mod.ModelInfo, 1);
-    defer allocator.free(mock_models);
-
-    mock_models[0] = .{
-        .id = "my-org/model-7b-chat-hf",
-        .object = "model",
-        .created = 1234567890,
-        .owned_by = "vllm",
-    };
-
-    const mock_result = http_engine_mod.ListModelsResult{
-        .models = mock_models,
-    };
-
-    var c_result = convertModelListResult(allocator, mock_result);
-    defer freeModelListResult(allocator, &c_result);
-
-    try std.testing.expectEqual(@as(usize, 1), c_result.count);
-    try std.testing.expectEqualStrings("my-org/model-7b-chat-hf", std.mem.span(c_result.models.?[0].id.?));
-}
-
-test "convertModelListResult: mock response with empty strings" {
-    const allocator = std.testing.allocator;
-
-    var mock_models = try allocator.alloc(http_engine_mod.ModelInfo, 1);
-    defer allocator.free(mock_models);
-
-    // Test that empty strings become null (dupeToSentinelOrNull behavior)
-    mock_models[0] = .{
-        .id = "model-1",
-        .object = "",
-        .created = null,
-        .owned_by = "",
-    };
-
-    const mock_result = http_engine_mod.ListModelsResult{
-        .models = mock_models,
-    };
-
-    var c_result = convertModelListResult(allocator, mock_result);
-    defer freeModelListResult(allocator, &c_result);
-
-    try std.testing.expectEqual(@as(usize, 1), c_result.count);
-    const model = c_result.models.?[0];
-    try std.testing.expectEqualStrings("model-1", std.mem.span(model.id.?));
-    try std.testing.expect(model.object == null); // Empty string -> null
-    try std.testing.expect(model.owned_by == null); // Empty string -> null
-    try std.testing.expectEqual(@as(i64, 0), model.created); // null -> 0
 }
 
 // -----------------------------------------------------------------------------

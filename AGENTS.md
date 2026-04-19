@@ -155,6 +155,3 @@ Match test scope to your changes. Changed `talu/chat/`? Run `tests/chat/`.
 
 See `bindings/python/POLICY.md` for test requirements and conventions.
 
-## UI
-
-make -C ui && ./zig-out/bin/talu serve --html-dir ui/dist

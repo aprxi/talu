@@ -491,6 +491,19 @@ static inline fast::CustomKernelFunction& conv1d_decode_silu_kernel() {
     return kernel;
 }
 
+static inline bool can_use_fused_conv1d_decode_silu(
+    const array& token_input,
+    const array& cache_state,
+    int batch,
+    int kernel_size
+) {
+    if (batch != 1 || kernel_size <= 1) return false;
+    // MLX Metal bfloat path fails to compile this custom kernel on some hosts.
+    // Keep the fused path for float16 and route all other dtypes through the
+    // existing graph fallback.
+    return token_input.dtype() == float16 && cache_state.dtype() == float16;
+}
+
 std::pair<array, std::optional<array>> depthwise_conv1d_decode_step(
     const std::optional<array>& cache_state_opt,
     const array& token_input,
@@ -534,8 +547,8 @@ std::pair<array, std::optional<array>> depthwise_conv1d_decode_step(
         throw std::runtime_error("depthwise conv decode cache shape mismatch: " + name);
     }
 
-    // Use the fused Metal kernel for batch=1 decode with kernel_size > 1.
-    if (batch == 1 && kernel_size > 1) {
+    // Use the fused Metal kernel only for supported dtypes.
+    if (can_use_fused_conv1d_decode_silu(token_input, cache_state, batch, kernel_size)) {
         const array flat_cache = reshape(cache_state, {kernel_size - 1, conv_dim});
         const array flat_input = reshape(token_input, {conv_dim});
         const array flat_weight = reshape(decode_weight, {kernel_size, conv_dim});

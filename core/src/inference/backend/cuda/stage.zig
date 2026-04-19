@@ -170,9 +170,6 @@ pub const CudaP2PTransfer = struct {
     }
 };
 
-/// CUDA pipeline type: PipelineRuntime specialized for CudaStage + CudaP2PTransfer.
-pub const CudaPipeline = pipeline.PipelineRuntime(CudaStage, CudaStage, CudaP2PTransfer);
-
 test "CudaStage.executeLayers rejects payload with incorrect byte length" {
     var stage = CudaStage{
         .backend = @ptrFromInt(64),

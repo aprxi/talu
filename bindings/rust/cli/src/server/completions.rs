@@ -20,6 +20,7 @@ use tokio_stream::StreamExt;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::completions_types::*;
 use crate::server::state::AppState;
+use crate::server::vision;
 use talu::ChatHandle;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -28,6 +29,13 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 // Entry point
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(post, path = "/v1/chat/completions", tag = "Chat",
+    request_body = CreateChatCompletionBody,
+    responses(
+        (status = 200, description = "Chat completion response", body = ChatCompletion),
+        (status = 400, description = "Invalid request"),
+        (status = 500, description = "Generation failed"),
+    ))]
 pub async fn handle_create(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -62,12 +70,33 @@ pub async fn handle_create(
 
 async fn handle_non_streaming(
     state: Arc<AppState>,
-    body: CreateChatCompletionBody,
+    mut body: CreateChatCompletionBody,
 ) -> Response<BoxBody> {
     let model_id = match resolve_model(&state, body.model.as_deref()).await {
         Ok(m) => m,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+
+    let prepared_vision_prefill = match vision::extract_prepared_prefill_from_completions_messages(
+        &mut body.messages,
+        &model_id,
+    ) {
+        Ok(prefill) => prefill,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid prepared image payload: {e}"),
+            )
+        }
+    };
+    if prepared_vision_prefill.is_some() {
+        log::info!(
+            target: "server::vision",
+            "model={} path=prepared profile_version={}",
+            model_id,
+            vision::VISION_PROFILE_VERSION
+        );
+    }
 
     let messages_json = match serde_json::to_string(&body.messages) {
         Ok(j) => j,
@@ -89,6 +118,7 @@ async fn handle_non_streaming(
     let backend = state.backend.clone();
     let batch_scheduler = state.batch_scheduler.lock().unwrap().clone();
     let model_id_for_task = model_id.clone();
+    let model_id_for_task_inner = model_id_for_task.clone();
     let created = now_unix_seconds();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -98,11 +128,24 @@ async fn handle_non_streaming(
 
         let mut cfg = cfg;
         cfg.stop_flag = Some(stop_flag_for_gen);
+        let vision_prefill = if let Some(prefill) = prepared_vision_prefill {
+            Some(prefill)
+        } else {
+            match vision::prepare_vision_prefill(&chat, &model_id_for_task_inner) {
+                Ok(v) => v,
+                Err(e) => return Err(anyhow!("vision prepare failed: {e}")),
+            }
+        };
+        let use_batch = batch_scheduler.is_some() && vision_prefill.is_none();
+        cfg.vision_prefill = vision_prefill;
 
         // Generate. BatchResult.text is the raw model output (with <think>
         // tags intact). BatchResult.tool_calls has parsed tool calls.
         // No further extraction or format conversion needed here.
-        if let Some(ref sched) = batch_scheduler {
+        if use_batch {
+            let sched = batch_scheduler
+                .as_ref()
+                .ok_or_else(|| anyhow!("batch scheduler unavailable"))?;
             let (request_id, event_rx) = sched
                 .submit_final_only(&chat, cfg, stop_flag)
                 .map_err(|e| anyhow!("batch submit failed: {e}"))?;
@@ -235,12 +278,33 @@ async fn handle_non_streaming(
 
 async fn handle_streaming(
     state: Arc<AppState>,
-    body: CreateChatCompletionBody,
+    mut body: CreateChatCompletionBody,
 ) -> Response<BoxBody> {
     let model_id = match resolve_model(&state, body.model.as_deref()).await {
         Ok(m) => m,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+
+    let prepared_vision_prefill = match vision::extract_prepared_prefill_from_completions_messages(
+        &mut body.messages,
+        &model_id,
+    ) {
+        Ok(prefill) => prefill,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid prepared image payload: {e}"),
+            )
+        }
+    };
+    if prepared_vision_prefill.is_some() {
+        log::info!(
+            target: "server::vision",
+            "model={} path=prepared profile_version={}",
+            model_id,
+            vision::VISION_PROFILE_VERSION
+        );
+    }
 
     let messages_json = match serde_json::to_string(&body.messages) {
         Ok(j) => j,
@@ -301,12 +365,32 @@ async fn handle_streaming(
 
         let mut cfg = cfg;
         cfg.stop_flag = Some(stop_flag_for_gen.clone());
+        let vision_prefill = if let Some(prefill) = prepared_vision_prefill {
+            Some(prefill)
+        } else {
+            match vision::prepare_vision_prefill(&chat, &model_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = send_error_chunk(&tx, &format!("vision prepare failed: {e}"));
+                    return;
+                }
+            }
+        };
+        let use_batch = batch_scheduler.is_some() && vision_prefill.is_none();
+        cfg.vision_prefill = vision_prefill;
 
         let finish_reason;
         let prompt_tokens;
         let completion_tokens;
 
-        if let Some(ref sched) = batch_scheduler {
+        if use_batch {
+            let sched = match batch_scheduler.as_ref() {
+                Some(s) => s,
+                None => {
+                    let _ = send_error_chunk(&tx, "batch scheduler unavailable");
+                    return;
+                }
+            };
             let submit_result = sched.submit(&chat, cfg, stop_flag);
             let (request_id, event_rx) = match submit_result {
                 Ok(v) => v,
@@ -377,7 +461,7 @@ async fn handle_streaming(
                 return;
             }
         } else {
-            // Direct generate_stream path (remote/provider backends).
+            // Direct generate_stream path (no batch scheduler attached).
             let stop_flag_for_cb = stop_flag_for_gen.clone();
             let tx_for_cb = tx.clone();
             let id_for_cb = completion_id.clone();

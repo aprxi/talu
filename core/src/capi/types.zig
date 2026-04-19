@@ -7,7 +7,6 @@ const std = @import("std");
 pub const BackendType = enum(c_int) {
     Unspecified = -1,
     Local = 0,
-    OpenAICompatible = 1,
 };
 
 pub const LocalConfig = extern struct {
@@ -17,22 +16,8 @@ pub const LocalConfig = extern struct {
     _reserved: [32]u8,
 };
 
-pub const OpenAICompatibleConfig = extern struct {
-    base_url: ?[*:0]const u8,
-    api_key: ?[*:0]const u8,
-    org_id: ?[*:0]const u8,
-    timeout_ms: c_int,
-    max_retries: c_int,
-    /// Custom HTTP headers as JSON object string.
-    /// Format: {"Header-Name": "value", "Another-Header": "value2"}
-    /// These are added to every request to this backend.
-    custom_headers_json: ?[*:0]const u8,
-    _reserved: [24]u8, // Reduced from 32 to accommodate pointer
-};
-
 pub const BackendUnion = extern union {
     local: LocalConfig,
-    openai_compat: OpenAICompatibleConfig,
 };
 
 pub const TaluModelSpec = extern struct {

@@ -14,7 +14,6 @@
 //! Both use LP64 data model with 8-byte pointers, so sizes are identical.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const capi_bridge = @import("../router/capi_bridge.zig");
 const responses = @import("responses.zig");
 const capi_types = @import("types.zig");
@@ -36,10 +35,11 @@ comptime {
 
 pub const EXPECTED_SIZES = struct {
     // Router/generation structs
-    pub const RouterGenerateConfig = 128;  // Added extra_body_json pointer (8 bytes)
+    pub const RouterGenerateConfig = 152; // Added external vision payload pointers.
     pub const RouterGenerateResult = 80;
     pub const CToolCallRef = 24;
     pub const CLogitBiasEntry = 8;
+    pub const CGenerateVisionImage = 48;
     pub const GenerateContentPart = 32;
 
     // Conversation/Items structs (from responses.zig)
@@ -80,6 +80,7 @@ comptime {
     assertSize("RouterGenerateResult", capi_bridge.CGenerateResult, EXPECTED_SIZES.RouterGenerateResult);
     assertSize("CToolCallRef", capi_bridge.CToolCallRef, EXPECTED_SIZES.CToolCallRef);
     assertSize("CLogitBiasEntry", capi_bridge.CLogitBiasEntry, EXPECTED_SIZES.CLogitBiasEntry);
+    assertSize("CGenerateVisionImage", capi_bridge.CGenerateVisionImage, EXPECTED_SIZES.CGenerateVisionImage);
     assertSize("GenerateContentPart", capi_bridge.GenerateContentPart, EXPECTED_SIZES.GenerateContentPart);
 
     // Conversation/Items structs

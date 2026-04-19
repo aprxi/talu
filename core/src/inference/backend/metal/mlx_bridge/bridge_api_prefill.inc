@@ -164,6 +164,172 @@ int32_t mlx_prefill_logits(
     }
 }
 
+int32_t mlx_prefill_logits_with_vision(
+    mlx_ctx* ctx,
+    const int32_t* prompt_ids,
+    int32_t prompt_len,
+    const mlx_prefill_vision_input* vision_input,
+    float* out_logits,
+    int32_t logits_len
+) {
+    if (!vision_input) {
+        g_last_error = "mlx_prefill_logits_with_vision: vision_input is null";
+        return 0;
+    }
+    if (!ctx || !prompt_ids || prompt_len <= 0 || !out_logits || logits_len <= 0) {
+        g_last_error = "mlx_prefill_logits_with_vision: invalid arguments";
+        return 0;
+    }
+    if (!vision_input->merged_embeddings || vision_input->merged_value_count == 0) {
+        g_last_error = "mlx_prefill_logits_with_vision: merged_embeddings must be non-empty";
+        return 0;
+    }
+    if (vision_input->image_token_id == 0) {
+        g_last_error = "mlx_prefill_logits_with_vision: image_token_id must be non-zero";
+        return 0;
+    }
+
+    try {
+        clear_fused_decode_ctx_cache();
+        std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
+        reset_runtime_state(ctx);
+        ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
+        ctx->kv_reserve_tokens = resolve_kv_reserve_target_tokens(ctx, prompt_len, 0);
+
+        const array prompt_arr(prompt_vec.data(), Shape{1, prompt_len}, int32);
+        array hidden = embedding_lookup(ctx, prompt_arr);
+        if (std::fabs(ctx->cfg.embedding_multiplier - 1.0f) > 1.0e-6f) {
+            hidden = hidden * array(ctx->cfg.embedding_multiplier, hidden.dtype());
+        }
+
+        if (hidden.ndim() != 3 || hidden.shape(0) != 1 || hidden.shape(1) != prompt_len) {
+            g_last_error = "mlx_prefill_logits_with_vision: unexpected hidden embedding shape";
+            return 0;
+        }
+        const int hidden_size = hidden.shape(2);
+        if (hidden_size <= 0) {
+            g_last_error = "mlx_prefill_logits_with_vision: invalid hidden size";
+            return 0;
+        }
+        if (vision_input->merged_value_count % static_cast<uint32_t>(hidden_size) != 0) {
+            g_last_error = "mlx_prefill_logits_with_vision: merged embedding values do not align to hidden size";
+            return 0;
+        }
+
+        const size_t merged_rows = static_cast<size_t>(vision_input->merged_value_count) / static_cast<size_t>(hidden_size);
+        const array merged_embeddings_f32(
+            vision_input->merged_embeddings,
+            Shape{static_cast<int>(merged_rows), hidden_size},
+            float32
+        );
+        const array merged_embeddings = astype(merged_embeddings_f32, hidden.dtype());
+
+        std::vector<int32_t> image_row_positions;
+        image_row_positions.reserve(merged_rows);
+        for (int32_t row = 0; row < prompt_len; ++row) {
+            if (prompt_vec[static_cast<size_t>(row)] == static_cast<int32_t>(vision_input->image_token_id)) {
+                image_row_positions.push_back(row);
+            }
+        }
+        if (image_row_positions.size() != merged_rows) {
+            if (image_row_positions.size() > merged_rows) {
+                g_last_error = "mlx_prefill_logits_with_vision: prompt image placeholders exceed provided merged embeddings";
+            } else {
+                g_last_error = "mlx_prefill_logits_with_vision: unused merged embeddings do not match prompt image placeholder count";
+            }
+            return 0;
+        }
+
+        const array hidden_2d = reshape(hidden, {prompt_len, hidden_size});
+        const array row_indices_base(
+            image_row_positions.data(),
+            Shape{static_cast<int>(merged_rows), 1},
+            int32
+        );
+        const array row_indices = repeat(row_indices_base, hidden_size, 1);
+        const array hidden_scattered_2d = put_along_axis(hidden_2d, row_indices, merged_embeddings, 0);
+        const array hidden_scattered = reshape(hidden_scattered_2d, {1, prompt_len, hidden_size});
+
+        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold(ctx);
+        const bool use_full_prompt =
+            prompt_len <= 1 || should_use_full_prompt_prefill(ctx, prompt_len, full_prompt_threshold);
+
+        array normed_hidden = array(0.0f);
+        if (use_full_prompt) {
+            normed_hidden = forward_hidden_from_embeddings(ctx, prompt_arr, hidden_scattered, true);
+        } else {
+            const int chunk_size = resolve_prefill_chunk_size(ctx);
+            const int tail_chunk_size = std::max(
+                chunk_size,
+                env_positive_int("TALU_METAL_PREFILL_TAIL_CHUNK_SIZE", chunk_size)
+            );
+            const int32_t tail_len = std::min<int32_t>(prompt_len, tail_chunk_size);
+            const int32_t prefix_len = prompt_len - tail_len;
+
+            int32_t offset = 0;
+            while (offset < prefix_len) {
+                const int32_t take_count = std::min<int32_t>(prefix_len - offset, chunk_size);
+                const array chunk_ids(prompt_vec.data() + static_cast<size_t>(offset), Shape{1, take_count}, int32);
+                const array chunk_hidden = slice(
+                    hidden_scattered,
+                    {0, offset, 0},
+                    {1, offset + take_count, hidden_size}
+                );
+                const array pending_hidden = forward_hidden_from_embeddings(ctx, chunk_ids, chunk_hidden, false);
+                eval(pending_hidden);
+                synchronize();
+                offset += take_count;
+            }
+
+            const auto* tail_ids_ptr = prompt_vec.data() + static_cast<size_t>(prefix_len);
+            const array tail_ids(tail_ids_ptr, Shape{1, tail_len}, int32);
+            const array tail_hidden = slice(
+                hidden_scattered,
+                {0, prefix_len, 0},
+                {1, prefix_len + tail_len, hidden_size}
+            );
+            normed_hidden = forward_hidden_from_embeddings(ctx, tail_ids, tail_hidden, true);
+        }
+
+        if (ctx->lm_head_q_decode_enabled &&
+            normed_hidden.ndim() == 3 &&
+            normed_hidden.shape(0) == 1 &&
+            normed_hidden.shape(1) > 1 &&
+            ctx->cfg.hidden_size_per_layer_input <= 0)
+        {
+            const int b = normed_hidden.shape(0);
+            const int t = normed_hidden.shape(1);
+            const int h = normed_hidden.shape(2);
+            normed_hidden = slice(normed_hidden, {0, t - 1, 0}, {b, t, h});
+        }
+
+        array logits = forward_logits_from_hidden(ctx, normed_hidden);
+        if (ctx->cfg.final_logit_softcapping > 0.0f) {
+            const array softcap = array(ctx->cfg.final_logit_softcapping, logits.dtype());
+            logits = tanh(logits / softcap) * softcap;
+        }
+        const array first_logits = last_token_logits(logits);
+        const int flat_size = static_cast<int>(first_logits.size());
+        const array first_logits_flat = reshape(astype(first_logits, float32), {flat_size});
+        if (static_cast<int32_t>(first_logits_flat.size()) != logits_len) {
+            g_last_error = "mlx_prefill_logits_with_vision: logits length mismatch";
+            return 0;
+        }
+
+        eval(first_logits_flat);
+        synchronize();
+        std::memcpy(out_logits, first_logits_flat.data<float>(), static_cast<size_t>(logits_len) * sizeof(float));
+        ctx->stream_ready = true;
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_prefill_logits_with_vision";
+        return 0;
+    }
+}
+
 int32_t mlx_prefill_logits_batch(
     mlx_ctx* const* ctxs,
     const int32_t* const* prompt_ids_ptrs,

@@ -102,6 +102,11 @@ class TestChatMessages:
         assert chat.items[0].role.name.lower() == "user"
         assert chat.items[1].role.name.lower() == "assistant"
 
+    def test_from_dict_rejects_items_restore(self):
+        """Chat.from_dict() only supports messages restore."""
+        with pytest.raises(talu.ValidationError, match="no longer supported"):
+            Chat.from_dict({"items": [{"item_id": 1}]})
+
     def test_messages_is_read_only(self):
         """messages property is read-only (no setter)."""
         chat = Chat()

@@ -14,10 +14,6 @@ const ct = @import("c_types.zig");
 const tok_fns = @import("pipeline.zig");
 const log = @import("log_pkg");
 
-const PATTERN_GPT2: [:0]const u8 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
-const PATTERN_BERT: [:0]const u8 = "[A-Za-z0-9]+|[^A-Za-z0-9\\s]+";
-const PATTERN_WS: [:0]const u8 = "[^\\s]+";
-
 const ManagedArrayList = std.array_list.Managed;
 
 // -------------------- Streaming Loader (hot path) --------------------
@@ -567,63 +563,6 @@ fn parseMergesFastSection(arena_allocator: std.mem.Allocator, json_bytes: []cons
     }
 }
 
-fn parseModel(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner) !schema.Model {
-    if ((try json_scanner.next()) != .object_begin) return error.InvalidModel;
-    var model_type_name: []const u8 = "";
-    var vocab_entries = ManagedArrayList(schema.TokenId).init(arena_allocator);
-    var merge_entries = ManagedArrayList([]const u8).init(arena_allocator);
-    var unk_token_bytes: ?[]const u8 = null;
-    var bos_token_bytes: ?[]const u8 = null;
-    var eos_token_bytes: ?[]const u8 = null;
-    var is_unigram_vocab = false;
-    var max_input_chars: i32 = 200;
-
-    while (true) {
-        const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-        switch (json_token) {
-            .object_end => break,
-            .allocated_string => |key| {
-                if (std.mem.eql(u8, key, "type")) {
-                    const type_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    if (type_value == .allocated_string) model_type_name = type_value.allocated_string;
-                } else if (std.mem.eql(u8, key, "vocab")) {
-                    try parseVocab(arena_allocator, json_scanner, &vocab_entries, &is_unigram_vocab);
-                } else if (std.mem.eql(u8, key, "merges")) {
-                    try parseMerges(arena_allocator, json_scanner, &merge_entries);
-                } else if (std.mem.eql(u8, key, "unk_token")) {
-                    const token_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    if (token_value == .allocated_string) unk_token_bytes = token_value.allocated_string;
-                } else if (std.mem.eql(u8, key, "bos_token")) {
-                    const token_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    if (token_value == .allocated_string) bos_token_bytes = token_value.allocated_string;
-                } else if (std.mem.eql(u8, key, "eos_token")) {
-                    const token_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    if (token_value == .allocated_string) eos_token_bytes = token_value.allocated_string;
-                } else if (std.mem.eql(u8, key, "max_input_chars_per_word")) {
-                    const val = try json_scanner.next();
-                    if (val == .number) {
-                        max_input_chars = std.fmt.parseInt(i32, val.number, 10) catch 200;
-                    }
-                } else {
-                    // Skip unknown model fields (dropout, fuse_unk, byte_fallback, etc.)
-                    try json_scanner.skipValue();
-                }
-            },
-            else => return error.InvalidModel,
-        }
-    }
-
-    return schema.Model{
-        .type = model_type_name,
-        .vocab = try vocab_entries.toOwnedSlice(),
-        .merges = if (merge_entries.items.len > 0) try merge_entries.toOwnedSlice() else null,
-        .unk_token = unk_token_bytes,
-        .bos_token = bos_token_bytes,
-        .eos_token = eos_token_bytes,
-        .max_input_chars_per_word = max_input_chars,
-    };
-}
-
 /// Fast direct vocab parser - bypasses std.json for speed
 /// Scans for "key": number patterns directly in the JSON buffer
 fn parseVocabFastSection(
@@ -699,108 +638,6 @@ fn unescapeJsonStringFast(arena_allocator: std.mem.Allocator, input_bytes: []con
         return try arena_allocator.dupe(u8, input_bytes);
     }
     return unescaped;
-}
-
-fn parseVocab(
-    arena_allocator: std.mem.Allocator,
-    json_scanner: *std.json.Scanner,
-    vocab_entries: *ManagedArrayList(schema.TokenId),
-    is_unigram: *bool,
-) !void {
-    const next_token = try json_scanner.next();
-    switch (next_token) {
-        .object_begin => {
-            is_unigram.* = false;
-            while (true) {
-                const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_if_needed);
-                switch (json_token) {
-                    .object_end => break,
-                    .string => |key| {
-                        // Zero-copy: string has no escapes, points directly into JSON buffer
-                        const value_token = try json_scanner.next();
-                        const id_num: i32 = switch (value_token) {
-                            .number => |bytes| std.fmt.parseInt(i32, bytes, 10) catch return error.InvalidVocab,
-                            else => return error.InvalidVocab,
-                        };
-                        try vocab_entries.append(.{ .token = key, .id = id_num, .score = -1.0 });
-                    },
-                    .allocated_string => |key| {
-                        // String had escapes, was allocated
-                        const value_token = try json_scanner.next();
-                        const id_num: i32 = switch (value_token) {
-                            .number => |bytes| std.fmt.parseInt(i32, bytes, 10) catch return error.InvalidVocab,
-                            else => return error.InvalidVocab,
-                        };
-                        try vocab_entries.append(.{ .token = key, .id = id_num, .score = -1.0 });
-                    },
-                    else => return error.InvalidVocab,
-                }
-            }
-        },
-        .array_begin => {
-            is_unigram.* = true;
-            var token_index: i32 = 0;
-            while (true) {
-                const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                switch (json_token) {
-                    .array_end => break,
-                    .array_begin => {
-                        const token_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                        const token_slice = switch (token_value) {
-                            .allocated_string => |s| s,
-                            else => return error.InvalidVocab,
-                        };
-                        const score_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                        const score_val: f32 = switch (score_value) {
-                            .allocated_number => |bytes| std.fmt.parseFloat(f32, bytes) catch return error.InvalidVocab,
-                            .number => |bytes| std.fmt.parseFloat(f32, bytes) catch return error.InvalidVocab,
-                            else => return error.InvalidVocab,
-                        };
-                        try vocab_entries.append(.{ .token = token_slice, .id = token_index, .score = score_val });
-                        token_index += 1;
-                        const closer = try json_scanner.next();
-                        if (closer != .array_end) return error.InvalidVocab;
-                    },
-                    else => return error.InvalidVocab,
-                }
-            }
-        },
-        else => return error.InvalidVocab,
-    }
-}
-
-fn parseMerges(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, merge_entries: *ManagedArrayList([]const u8)) !void {
-    if ((try json_scanner.next()) != .array_begin) return error.InvalidMerges;
-    while (true) {
-        const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_if_needed);
-        switch (json_token) {
-            .array_end => break,
-            // String format: "a b" - zero-copy if no escapes
-            .string => |s| try merge_entries.append(s),
-            .allocated_string => |s| try merge_entries.append(s),
-            // Array format: ["a", "b"] - join with space
-            .array_begin => {
-                const first_value = try json_scanner.nextAlloc(arena_allocator, .alloc_if_needed);
-                const lhs = switch (first_value) {
-                    .string => |s| s,
-                    .allocated_string => |s| s,
-                    else => return error.InvalidMerges,
-                };
-                const second_value = try json_scanner.nextAlloc(arena_allocator, .alloc_if_needed);
-                const rhs = switch (second_value) {
-                    .string => |s| s,
-                    .allocated_string => |s| s,
-                    else => return error.InvalidMerges,
-                };
-                // Expect array_end
-                if ((try json_scanner.next()) != .array_end) return error.InvalidMerges;
-                // Join "a" + " " + "b"
-                const merged = try std.fmt.allocPrint(arena_allocator, "{s} {s}", .{ lhs, rhs });
-                try merge_entries.append(merged);
-            },
-            else => return error.InvalidMerges,
-        }
-    }
 }
 
 fn parseAddedTokens(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, added_entries: *ManagedArrayList(schema.AddedToken)) !void {
@@ -2060,170 +1897,6 @@ fn detectModelType(json_bytes: []const u8) []const u8 {
     return "BPE";
 }
 
-/// Apply config from JSON (added_tokens, normalizer, pre_tokenizer, post_processor)
-/// This is fast - these sections are small
-fn applyConfigFromJson(tokenizer_any: anytype, json_bytes: []const u8) !void {
-    const tokenizer: *ct.Tokenizer = @ptrCast(tokenizer_any);
-    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    // Parse added_tokens
-    if (findSection(json_bytes, "\"added_tokens\"")) |section| {
-        if (section.len > 0 and section[0] == '[') {
-            const end = findMatchingBrace(section, '[', ']') orelse section.len;
-            try parseAndApplyAddedTokens(tokenizer, section[0..end], arena_allocator);
-        }
-    }
-
-    // Parse normalizer
-    if (findSection(json_bytes, "\"normalizer\"")) |section| {
-        if (section.len > 0 and section[0] == '{') {
-            const end = findMatchingBrace(section, '{', '}') orelse section.len;
-            var scanner = std.json.Scanner.initCompleteInput(arena_allocator, section[0..end]);
-            const normalizer = try parseNormalizer(arena_allocator, &scanner);
-            const normalizer_spec = ct.NormalizerSpec{
-                .type = if (normalizer.type.len > 0) (std.heap.c_allocator.dupeZ(u8, normalizer.type) catch return error.OutOfMemory).ptr else null,
-                .lowercase = if (normalizer.lowercase) 1 else 0,
-                .strip_accents = if (normalizer.strip_accents) 1 else 0,
-                .nfc = if (normalizer.nfc) 1 else 0,
-                .nfd = if (normalizer.nfd) 1 else 0,
-                .nfkc = if (normalizer.nfkc) 1 else 0,
-                .nfkd = if (normalizer.nfkd) 1 else 0,
-                .clean_text = if (normalizer.clean_text) 1 else 0,
-                .handle_chinese_chars = if (normalizer.handle_chinese_chars) 1 else 0,
-                .prepend = if (normalizer.prepend) |p| (std.heap.c_allocator.dupeZ(u8, p) catch return error.OutOfMemory).ptr else null,
-                .replace_pattern = if (normalizer.replace_pattern) |p| (std.heap.c_allocator.dupeZ(u8, p) catch return error.OutOfMemory).ptr else null,
-                .replace_content = if (normalizer.replace_content) |c_val| (std.heap.c_allocator.dupeZ(u8, c_val) catch return error.OutOfMemory).ptr else null,
-            };
-            tok_fns.tokenizer_apply_normalizer_spec(tokenizer, &normalizer_spec);
-        }
-    }
-
-    // Parse pre_tokenizer
-    if (findSection(json_bytes, "\"pre_tokenizer\"")) |section| {
-        if (section.len > 0 and section[0] == '{') {
-            const end = findMatchingBrace(section, '{', '}') orelse section.len;
-            var scanner = std.json.Scanner.initCompleteInput(arena_allocator, section[0..end]);
-            const pretokenizer = try parsePreTokenizer(arena_allocator, &scanner);
-            const pretokenizer_spec = ct.PreTokenizerSpec{
-                .type = if (pretokenizer.type.len > 0) (std.heap.c_allocator.dupeZ(u8, pretokenizer.type) catch return error.OutOfMemory).ptr else null,
-                .add_prefix_space = if (pretokenizer.add_prefix_space) 1 else 0,
-                .trim_offsets = if (pretokenizer.trim_offsets) 1 else 0,
-                .use_regex = if (pretokenizer.use_regex) 1 else 0,
-                .byte_level = if (pretokenizer.byte_level) 1 else 0,
-                .whitespace = if (pretokenizer.whitespace) 1 else 0,
-                .punctuation = if (pretokenizer.punctuation) 1 else 0,
-                .pattern = if (pretokenizer.pattern) |p| (std.heap.c_allocator.dupeZ(u8, p) catch return error.OutOfMemory).ptr else null,
-                .regex_split = if (pretokenizer.regex_split) 1 else 0,
-                .regex_invert = if (pretokenizer.regex_invert) 1 else 0,
-                .metaspace = if (pretokenizer.metaspace) 1 else 0,
-            };
-            tok_fns.tokenizer_apply_pretokenizer_spec(tokenizer, &pretokenizer_spec);
-        }
-    }
-
-    // Parse post_processor
-    if (findSection(json_bytes, "\"post_processor\"")) |section| {
-        if (section.len > 0 and section[0] == '{') {
-            const end = findMatchingBrace(section, '{', '}') orelse section.len;
-            try applyPostProcessorFromJson(tokenizer, section[0..end]);
-        }
-    }
-
-    // Parse decoder
-    if (findSection(json_bytes, "\"decoder\"")) |section| {
-        if (section.len > 0 and section[0] == '{') {
-            const end = findMatchingBrace(section, '{', '}') orelse section.len;
-            applyDecoderFromJson(tokenizer, section[0..end], arena_allocator);
-        }
-    }
-}
-
-/// Parse added_tokens and apply directly
-fn parseAndApplyAddedTokens(tokenizer: *ct.Tokenizer, json_bytes: []const u8, _: std.mem.Allocator) !void {
-    var cursor: usize = 0;
-    while (cursor < json_bytes.len) {
-        // Find start of token object
-        while (cursor < json_bytes.len and json_bytes[cursor] != '{') : (cursor += 1) {}
-        if (cursor >= json_bytes.len) break;
-
-        const obj_start = cursor;
-        const obj_end = if (findMatchingBrace(json_bytes[cursor..], '{', '}')) |len| cursor + len else break;
-
-        const obj = json_bytes[obj_start..obj_end];
-
-        // Extract id
-        var token_id: i32 = 0;
-        if (findJsonFieldValue(obj, "\"id\"")) |id_str| {
-            token_id = std.fmt.parseInt(i32, id_str, 10) catch 0;
-        }
-
-        // Extract content
-        var token_content: []const u8 = "";
-        if (findJsonFieldString(obj, "\"content\"")) |content_str| {
-            token_content = content_str;
-        }
-
-        // Extract special flag
-        var special_flag: c_int = 0;
-        if (findJsonFieldValue(obj, "\"special\"")) |special_str| {
-            special_flag = if (std.mem.eql(u8, special_str, "true")) 1 else 0;
-        }
-
-        if (std.mem.indexOfScalar(u8, token_content, 0) != null) return error.InvalidAdded;
-
-        // Add token
-        // Use c_allocator for persistent allocations (arena is freed on function return)
-        if (token_content.len > 0) {
-            // Unescape JSON escape sequences (\t, \n, \\, etc.) and null-terminate.
-            // Unescaping can only shorten the string, so token_content.len is the max size.
-            const content_dup = std.heap.c_allocator.allocSentinel(u8, token_content.len, 0) catch return error.OutOfMemory;
-            var out_i: usize = 0;
-            var in_i: usize = 0;
-            while (in_i < token_content.len) {
-                if (token_content[in_i] == '\\' and in_i + 1 < token_content.len) {
-                    content_dup[out_i] = switch (token_content[in_i + 1]) {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        'b' => 0x08,
-                        'f' => 0x0C,
-                        '\\' => '\\',
-                        '"' => '"',
-                        '/' => '/',
-                        else => token_content[in_i + 1],
-                    };
-                    in_i += 2;
-                } else {
-                    content_dup[out_i] = token_content[in_i];
-                    in_i += 1;
-                }
-                out_i += 1;
-            }
-            content_dup[out_i] = 0;
-            const added_node = tok_fns.tokenizer_added_token_add(tokenizer, content_dup.ptr, token_id, special_flag);
-            if (added_node != null) {
-                // Parse additional flags
-                if (findJsonFieldValue(obj, "\"single_word\"")) |v| {
-                    added_node.?.single_word = if (std.mem.eql(u8, v, "true")) 1 else 0;
-                }
-                if (findJsonFieldValue(obj, "\"lstrip\"")) |v| {
-                    added_node.?.lstrip = if (std.mem.eql(u8, v, "true")) 1 else 0;
-                }
-                if (findJsonFieldValue(obj, "\"rstrip\"")) |v| {
-                    added_node.?.rstrip = if (std.mem.eql(u8, v, "true")) 1 else 0;
-                }
-                if (findJsonFieldValue(obj, "\"normalized\"")) |v| {
-                    added_node.?.normalized = if (std.mem.eql(u8, v, "true")) 1 else 0;
-                }
-            }
-        }
-
-        cursor = obj_end;
-    }
-}
-
 /// Find a field value (number/bool) in JSON object
 fn findJsonFieldValue(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
     const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
@@ -2293,11 +1966,6 @@ fn findJsonKeyPos(json_bytes: []const u8, field_bytes: []const u8) ?usize {
         }
     }
     return null;
-}
-
-fn applyNormalizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator) !void {
-    try ensureJsonDepthWithinLimit(json_bytes, error.InvalidNormalizer);
-    return applyNormalizerFromJsonDepth(tokenizer, json_bytes, arena_allocator, 0);
 }
 
 fn applyNormalizerFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator, depth: usize) !void {
@@ -2396,11 +2064,6 @@ fn applyNormalizerFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const u8
     if (findJsonFieldValue(json_bytes, "\"handle_chinese_chars\"")) |v| {
         tokenizer.*.normalizer.handle_chinese_chars = if (std.mem.eql(u8, v, "true")) 1 else 0;
     }
-}
-
-fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator) !void {
-    try ensureJsonDepthWithinLimit(json_bytes, error.InvalidPreTokenizer);
-    return applyPreTokenizerFromJsonDepth(tokenizer, json_bytes, arena_allocator, 0);
 }
 
 fn applyPreTokenizerFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator, depth: usize) !void {
@@ -2660,17 +2323,6 @@ fn applyPostProcessorFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const
             tokenizer.postproc.sep_id = added.id;
         }
     }
-}
-
-fn applyDecoderFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator) void {
-    var scanner = std.json.Scanner.initCompleteInput(arena_allocator, json_bytes);
-    const decoder = parseDecoder(arena_allocator, &scanner) catch return;
-    tokenizer.decoder.strip_start = @intCast(decoder.strip_start);
-    tokenizer.decoder.strip_stop = @intCast(decoder.strip_stop);
-    tokenizer.decoder.wordpiece = if (std.mem.eql(u8, decoder.type, "WordPiece")) 1 else 0;
-    tokenizer.decoder.cleanup = if (decoder.cleanup) 1 else 0;
-    tokenizer.decoder.add_prefix_space = if (decoder.add_prefix_space) 1 else 0;
-    tokenizer.decoder.metaspace = if (decoder.metaspace) 1 else 0;
 }
 
 fn apply_root_metadata_without_postprocessor(arena: *std.heap.ArenaAllocator, tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) !void {

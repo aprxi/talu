@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const main = @import("main");
-const GenerationConfig = main.inference.config.GenerationConfig;
+const GenerationConfig = main.generation_config.GenerationConfig;
 
 // =============================================================================
 // Type Verification Tests

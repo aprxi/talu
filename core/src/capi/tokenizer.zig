@@ -82,8 +82,10 @@ pub const DecodeResult = extern struct {
 };
 
 pub const EncodeOptions = extern struct {
-    add_bos: u8 = 1,
-    add_eos: u8 = 1,
+    // Explicit options structs default to "no special tokens". A null options
+    // pointer remains the convenience path that uses the C API defaults.
+    add_bos: u8 = 0,
+    add_eos: u8 = 0,
     truncation: u8 = 0,
     truncation_side: u8 = 0,
     _padding: [4]u8 = .{ 0, 0, 0, 0 },
@@ -129,7 +131,9 @@ pub const SpecialTokensResult = extern struct {
 };
 
 pub const DecodeOptionsC = extern struct {
-    skip_special_tokens: c_int = 1,
+    // Explicit options structs default to preserving special tokens. A null
+    // options pointer remains the convenience path that skips specials.
+    skip_special_tokens: c_int = 0,
 };
 
 pub const VocabResult = extern struct {

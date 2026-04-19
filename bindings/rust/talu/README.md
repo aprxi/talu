@@ -11,11 +11,11 @@ the raw FFI layer in [`talu-sys`](https://crates.io/crates/talu-sys).
 - **Chat** — multi-turn conversation with streaming generation
 - **Inference backends** — load and run local models (CPU, Metal)
 - **Tokenizer** — encode and decode text
-- **Embeddings & vector search** — embed text and search over vectors
-- **Document storage** — store, search, and manage documents
 - **Structured output** — constrained generation with grammar validation
 - **Model management** — download, list, and inspect cached models
 - **Responses API** — item-based conversation inspection (Open Responses compatible)
+- **Batch execution** — run batched generation workflows
+- **Tree-sitter utilities** — parse/highlight/query source code
 
 ## Example
 

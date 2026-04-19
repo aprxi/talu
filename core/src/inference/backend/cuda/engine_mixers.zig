@@ -1878,38 +1878,6 @@ pub fn downloadRowsF32StrideAware(
     }
 }
 
-pub fn uploadRowsF32StrideAware(
-    self: anytype,
-    src: []const f32,
-    rows: usize,
-    row_width: usize,
-    dst: *compute.cuda.Buffer,
-) !void {
-    if (rows == 0 or row_width == 0) return error.InvalidArgument;
-    const logical_elements = std.math.mul(usize, rows, row_width) catch return error.InvalidArgument;
-    if (src.len < logical_elements) return error.InvalidArgument;
-    const row_bytes = std.math.mul(usize, row_width, @sizeOf(f32)) catch return error.InvalidArgument;
-    const packed_bytes = std.math.mul(usize, logical_elements, @sizeOf(f32)) catch return error.InvalidArgument;
-    if (dst.size < packed_bytes) return error.InvalidInstructionBinding;
-
-    if (rows == 1 or dst.size == packed_bytes) {
-        return dst.upload(&self.device, std.mem.sliceAsBytes(src[0..logical_elements]));
-    }
-
-    if (dst.size % rows != 0) return error.InvalidInstructionBinding;
-    const dst_row_stride = dst.size / rows;
-    if (dst_row_stride < row_bytes) return error.InvalidInstructionBinding;
-
-    var row_idx: usize = 0;
-    while (row_idx < rows) : (row_idx += 1) {
-        const dst_offset = std.math.mul(usize, row_idx, dst_row_stride) catch return error.InvalidArgument;
-        var dst_row = try bufferSlice(dst, dst_offset, row_bytes);
-        const src_start = std.math.mul(usize, row_idx, row_width) catch return error.InvalidArgument;
-        const src_row = src[src_start .. src_start + row_width];
-        try dst_row.upload(&self.device, std.mem.sliceAsBytes(src_row));
-    }
-}
-
 pub fn runGatedDeltaMixerStep(
     self: anytype,
     block: *GatedDeltaBlockRuntime,
@@ -2506,43 +2474,6 @@ pub fn runBatchedDecodeGatedDeltaMixer(
 
     // Step 3: out_proj GEMM for all N rows.
     try engine_ops.linearForwardRows(self, &norm_stage_dev, n, &block.out_proj, output);
-}
-
-pub fn runAttentionMixerStepCpu(
-    self: anytype,
-    block: *LayerAttentionRuntime,
-    input: *const compute.cuda.Buffer,
-    output: *compute.cuda.Buffer,
-    seq_len: usize,
-) !void {
-    const kernel = &(block.cpu_kernel orelse return error.InvalidInstructionBinding);
-    const cache = &(block.cpu_cache orelse return error.InvalidInstructionBinding);
-    const scratch = &(block.cpu_scratch orelse return error.InvalidInstructionBinding);
-    const matmul_scratch = &(block.cpu_matmul_scratch orelse return error.InvalidInstructionBinding);
-    const element_count = std.math.mul(usize, seq_len, self.d_model) catch return error.InvalidArgument;
-    try engine_forward.ensureGatedDeltaHostStageCapacity(self, element_count);
-    const input_host = self.gated_delta_stage_input_host[0..element_count];
-    const output_host = self.gated_delta_stage_output_host[0..element_count];
-    try self.device.synchronize();
-    try downloadRowsF32StrideAware(self, input, seq_len, self.d_model, input_host);
-    kernel.position_delta = self.slot_rope_position_deltas[self.active_kv_slot];
-    var input_view = Tensor.view3DSlice(input_host, seq_len, self.d_model);
-    var output_view = Tensor.view3DSlice(output_host, seq_len, self.d_model);
-    const use_cache = attentionFallbackUsesCache(seq_len);
-    // Attention fallback executes on CPU tensors; preserve host-readable
-    // trace semantics even when wrapped by the CUDA execution route.
-    const prev_backend = trace.setBackendContext(.cpu);
-    defer _ = trace.setBackendContext(prev_backend);
-    try kernel.forward(
-        &input_view,
-        &output_view,
-        cache,
-        scratch,
-        matmul_scratch,
-        use_cache,
-    );
-    try uploadRowsF32StrideAware(self, output_host, seq_len, self.d_model, output);
-    try self.device.synchronize();
 }
 
 pub fn runAttentionMixerPrefillBatchedNoQueryGate(

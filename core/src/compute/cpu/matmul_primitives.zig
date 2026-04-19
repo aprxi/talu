@@ -77,15 +77,9 @@ pub const MatmulScratch = struct {
 // These control tiling and parallelization strategies. Values are tuned for
 // modern x86-64 CPUs with AVX2/AVX-512.
 
-/// Number of output columns per tile in the single-row (`m=1`) path.
-/// Smaller tiles mean better load balancing but more overhead.
-const TILE_COLS: usize = 4;
-
 /// Column tile size for small-batch multi-row path (quantized kernels).
 /// Larger tiles improve cache locality at the cost of load balancing.
 /// Quantized kernels benefit from larger tiles to amortize unpacking overhead.
-const COL_TILE_SIZE: usize = 128;
-
 /// Column tile size for BF16/F16 multi-row path.
 /// BF16/F16 are memory-bandwidth bound (not compute bound like quantized).
 /// Small hidden widths benefit from 16-column tiles because the active BF16
@@ -1368,51 +1362,6 @@ pub inline fn gaffineU4DotProductOpt(
     }
 
     return @reduce(.Add, acc0 + acc1);
-}
-
-/// Simple reference implementation for debugging - scalar, no SIMD.
-/// Only compiled when debug_matmul build option is enabled.
-const gaffineU4DotProductRef = if (debug_matmul) gaffineU4DotProductRefImpl else void;
-
-fn gaffineU4DotProductRefImpl(
-    a_ptr: [*]const f32,
-    w_ptr: [*]align(1) const u32,
-    scales: [*]align(1) const u16,
-    biases: [*]align(1) const u16,
-    scales_dtype: DType,
-    k: usize,
-    group: usize,
-) f32 {
-    var result: f32 = 0;
-    const k_div_group = k / group;
-    const group_u32 = group / 8;
-
-    var group_idx: usize = 0;
-    while (group_idx < k_div_group) : (group_idx += 1) {
-        const scale = gaffineScaleBiasToF32(scales_dtype, scales[group_idx]);
-        const bias = gaffineScaleBiasToF32(scales_dtype, biases[group_idx]);
-
-        var wx_sum: f32 = 0;
-        var x_sum: f32 = 0;
-
-        var pack_idx: usize = 0;
-        while (pack_idx < group_u32) : (pack_idx += 1) {
-            const packed_w = w_ptr[group_idx * group_u32 + pack_idx];
-            // Extract nibbles in shift order (packed nibble order)
-            var nib: usize = 0;
-            while (nib < 8) : (nib += 1) {
-                const nibble: f32 = @floatFromInt((packed_w >> @intCast(nib * 4)) & 0xF);
-                const x_idx = group_idx * group + pack_idx * 8 + nib;
-                const input_value = a_ptr[x_idx];
-                wx_sum += nibble * input_value;
-                x_sum += input_value;
-            }
-        }
-
-        result += scale * wx_sum + bias * x_sum;
-    }
-
-    return result;
 }
 
 /// Grouped-affine u4 matmul: C = A × B^T where B is [n, k] packed 4-bit weights.

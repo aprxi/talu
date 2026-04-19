@@ -14,7 +14,6 @@ Examples:
     python bench/run.py responses/perf/hello --config cuda --env BACKEND=cpu
     python bench/run.py responses/evals/mmlu --samples 100
     python bench/run.py responses/evals/gpqa --samples 50
-    python bench/run.py db/perf/sql_select1 --set requests=200 --set concurrency=8
 
 Multi-GPU:
     python bench/run.py responses/perf/pp512 --config cuda --env TALU_CUDA_TOPOLOGY=pipeline2 --env TALU_CUDA_STAGE_DEVICES=0,1
@@ -30,7 +29,6 @@ import platform
 import re
 import subprocess
 import sys
-import tempfile
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -44,7 +42,6 @@ from server import TaluServer
 
 # Import scenarios — triggers registration via __init_subclass__.
 import responses  # noqa: F401
-import db  # noqa: F401
 
 from scenario import (
     list_scenarios,
@@ -216,7 +213,6 @@ def cmd_list() -> None:
         (n for n in names if n.startswith("responses/perf/")),
         names[0] if names else "responses/perf/pp512",
     )
-    first_db = next((n for n in names if n.startswith("db/perf/")), None)
     print()
     print("Usage:")
     argv0 = sys.argv[0]
@@ -226,8 +222,6 @@ def cmd_list() -> None:
     print(f"  python {argv0} {first} --set precision=original,TQ4")
     print(f"  python {argv0} {first} --set preset=coding")
     print(f"  python {argv0} {first} --set preset=coding --set temperature=0.3")
-    if first_db:
-        print(f"  python {argv0} {first_db} --config local --set requests=200 --set concurrency=8")
     print()
     print("Multi-GPU topologies (via --env):")
     print(f"  python {argv0} {first} --config cuda --env TALU_CUDA_TOPOLOGY=pipeline2 --env TALU_CUDA_STAGE_DEVICES=0,1")
@@ -290,16 +284,6 @@ def _is_eval_scenario(scenario_name: str, results: list[dict]) -> bool:
     if "evals/" in scenario_name:
         return True
     return bool(results) and "accuracy" in results[0]
-
-
-def _is_db_scenario(scenario_name: str, results: list[dict]) -> bool:
-    """Detect DB perf scenarios by name prefix or result shape."""
-    if scenario_name.startswith("db/"):
-        return True
-    if not results:
-        return False
-    first = results[0]
-    return "rps" in first and "p95_ms" in first
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -405,26 +389,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     scenario = cls()
     scenario.prepare_config(config)
-    if not scenario.uses_model_matrix:
-        # DB scenarios benchmark endpoint behavior, not model variants.
-        config["model_uri"] = ["n/a"]
-        config["precision"] = ["original"]
-
     # Show the fully-expanded CLI command so users can reproduce/modify.
     _print_expanded_cmd(args, config)
 
     env_vars = config.get("env", {})
-    temp_bucket: tempfile.TemporaryDirectory[str] | None = None
-    bucket_path: Path | None = None
-    if scenario.requires_storage:
-        cfg_bucket = config.get("bucket_path")
-        if isinstance(cfg_bucket, str) and cfg_bucket.strip():
-            bucket_path = Path(cfg_bucket).expanduser()
-            bucket_path.mkdir(parents=True, exist_ok=True)
-        else:
-            temp_bucket = tempfile.TemporaryDirectory(prefix="talu-bench-db-")
-            bucket_path = Path(temp_bucket.name)
-        print(f"[auto] DB benchmark bucket={bucket_path}", flush=True)
 
     # Version and hardware detection (no server needed).
     _probe = TaluServer(port=args.port)
@@ -460,8 +428,6 @@ def cmd_run(args: argparse.Namespace) -> None:
                 else:
                     srv = TaluServer(
                         port=args.port,
-                        no_bucket=not scenario.requires_storage,
-                        bucket=bucket_path,
                         extra_args=scenario.server_args(combo_config),
                         env=env_vars,
                     )
@@ -479,17 +445,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
-        if temp_bucket is not None:
-            temp_bucket.cleanup()
+        pass
 
     if results:
         print()
         if _is_eval_scenario(args.scenario, results):
             print_eval_report(args.scenario, args.config, config, results,
                               version, hardware)
-        elif scenario.report_type == "db" or _is_db_scenario(args.scenario, results):
-            print_db_report(args.scenario, args.config, config, args.rounds, results,
-                            version, hardware)
         else:
             print_report(args.scenario, args.config, config, args.rounds, results,
                          version, hardware)
@@ -540,77 +502,6 @@ def print_report(
 
     for model, scheme_groups in by_model.items():
         _print_model_table(console, model, scheme_groups)
-
-
-def print_db_report(
-    scenario_name: str,
-    config_name: str | None,
-    config: dict,
-    rounds: int,
-    results: list[dict],
-    version: str,
-    hardware: str,
-) -> None:
-    """Print DB performance summary tables."""
-    env_vars = config.get("env", {})
-    date = datetime.date.today().isoformat()
-
-    console.print()
-    console.rule(f"[bold]talu bench · {scenario_name}[/bold]", style="bright_blue")
-    console.print()
-
-    info_parts = [version, hardware, date]
-    if config_name:
-        info_parts.append(f"config={config_name}")
-    console.print(f"  [dim]{' · '.join(info_parts)}[/]")
-
-    param_parts = [f"rounds={rounds}"]
-    for key in ("requests", "concurrency", "batch_size", "seed_rows"):
-        if key in config:
-            param_parts.append(f"{key}={config[key]}")
-    for k, v in sorted(env_vars.items()):
-        param_parts.append(f"{k}={v}")
-    console.print(f"  [dim]{' · '.join(param_parts)}[/]")
-    console.print()
-
-    by_op: dict[str, list[dict]] = defaultdict(list)
-    for row in results:
-        by_op[row.get("op", "unknown")].append(row)
-
-    table = Table(title="DB Performance", box=box.SIMPLE, header_style="bold cyan")
-    table.add_column("Operation", style="cyan")
-    table.add_column("Concurrency", justify="right")
-    table.add_column("Requests", justify="right")
-    table.add_column("Success %", justify="right")
-    table.add_column("RPS avg", justify="right")
-    table.add_column("p50 ms", justify="right")
-    table.add_column("p95 ms", justify="right")
-    table.add_column("p99 ms", justify="right")
-
-    def _avg(rows: list[dict], key: str) -> float:
-        vals = [float(r.get(key, 0.0)) for r in rows]
-        return (sum(vals) / len(vals)) if vals else 0.0
-
-    for op in sorted(by_op):
-        rows = by_op[op]
-        total_requests = int(sum(int(r.get("requests", 0)) for r in rows))
-        total_ok = int(sum(int(r.get("ok", 0)) for r in rows))
-        success_pct = (100.0 * total_ok / total_requests) if total_requests > 0 else 0.0
-        conc_values = sorted({int(r.get("concurrency", 1)) for r in rows})
-        conc_label = ",".join(str(v) for v in conc_values)
-        table.add_row(
-            op,
-            conc_label,
-            str(total_requests),
-            f"{success_pct:.1f}",
-            f"{_avg(rows, 'rps'):.1f}",
-            f"{_avg(rows, 'p50_ms'):.2f}",
-            f"{_avg(rows, 'p95_ms'):.2f}",
-            f"{_avg(rows, 'p99_ms'):.2f}",
-        )
-
-    console.print(table)
-    console.print()
 
 
 def _print_model_table(

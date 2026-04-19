@@ -102,24 +102,3 @@ pub fn matmul(
     metal.matmul.matmulF32(dev, a, m, k, b, n, c) catch return false;
     return true;
 }
-
-/// Perform Q @ K^T with K as INT8 and on-the-fly dequant using Metal.
-/// Q: [m, k] f32, K: [n, k] i8, K_scales: [n] f32, C: [m, n] f32.
-/// Returns true if Metal was used, false if caller should use CPU fallback.
-pub fn matmulI8TransBScaled(
-    a: []const f32, // [m, k] - Q
-    b: []const i8, // [n, k] - K (INT8)
-    b_scales: []const f32, // [n] - K scales
-    c: []f32, // [m, n] - scores
-    m: usize,
-    n: usize,
-    k: usize,
-    alpha: f32,
-) bool {
-    if (comptime builtin.os.tag != .macos) return false;
-
-    const dev = getDevice() orelse return false;
-
-    metal.matmul.matmulF32I8TransBScaled(dev, a, m, k, b, n, b_scales, c, alpha) catch return false;
-    return true;
-}

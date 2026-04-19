@@ -6,7 +6,6 @@
 
 use crate::capi::router::common;
 use crate::capi::router::common::skip_without_model;
-use std::ffi::CString;
 use std::ptr;
 
 // =============================================================================
@@ -79,24 +78,6 @@ fn take_result_null_handle_returns_null() {
 #[test]
 fn result_free_null_is_noop() {
     unsafe { talu_sys::talu_batch_result_free(ptr::null_mut()) };
-}
-
-#[test]
-fn create_non_local_backend_returns_null() {
-    let c_model = CString::new("gpt-4").unwrap();
-    let c_url = CString::new("https://api.openai.com/v1").unwrap();
-    let mut spec = common::make_openai_spec(&c_model, &c_url);
-    let canon = common::canonicalize(&mut spec);
-    let backend = common::create_backend(canon);
-
-    let handle = unsafe { talu_sys::talu_batch_create(backend, ptr::null()) };
-    assert!(
-        handle.is_null(),
-        "create with non-local backend should return null"
-    );
-
-    unsafe { talu_sys::talu_backend_free(backend) };
-    unsafe { talu_sys::talu_config_free(canon) };
 }
 
 // =============================================================================

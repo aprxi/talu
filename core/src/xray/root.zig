@@ -87,7 +87,6 @@ pub const FfnConfig = perf_estimate.FfnConfig;
 pub const MatmulKernel = execution_plan.MatmulKernel;
 pub const AttentionType = execution_plan.AttentionType;
 pub const FfnType = execution_plan.FfnType;
-pub const ExecutionPlanConfig = execution_plan.ModelConfig;
 
 // ============================================================================
 // Convenience API
@@ -101,11 +100,6 @@ pub fn enableCapture(cap: *TraceCapture) void {
 /// Disable tensor capture.
 pub fn disableCapture() void {
     capture.disable();
-}
-
-/// Check if tensor capture is enabled.
-pub fn isCaptureEnabled() bool {
-    return capture.isEnabled();
 }
 
 /// Check if tracing is active (handler installed).

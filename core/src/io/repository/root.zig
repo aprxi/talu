@@ -9,7 +9,7 @@
 //!     ↓
 //! router/root.zig (classifyModel)
 //!     │
-//!     ├─ External API (openai::, vllm::, etc.) → error (not yet implemented)
+//!     ├─ Unsupported backend namespace (`foo::model`) → error
 //!     │
 //!     └─ Native (repository-based) → router/local.zig (LocalEngine.init)
 //!                                        ↓
@@ -75,7 +75,6 @@ pub const source = @import("source.zig");
 pub const Scheme = scheme.Scheme;
 pub const Uri = scheme.Uri;
 pub const ParseError = scheme.ParseError;
-pub const parseUri = scheme.parse;
 
 // Re-export source types
 pub const ModelSource = source.ModelSource;
@@ -272,7 +271,6 @@ pub fn modelCacheDirExists(allocator: std.mem.Allocator, model_id: []const u8) !
     return hf_exists or talu_exists;
 }
 
-
 /// Delete a specific cached snapshot revision for a model ID.
 /// Returns true if anything was deleted.
 pub fn deleteCachedSnapshot(allocator: std.mem.Allocator, model_id: []const u8, revision: []const u8) !bool {
@@ -289,55 +287,9 @@ pub const globalCleanup = http.globalCleanup;
 // Unified Repository Operations
 // =============================================================================
 
-/// Check if a model exists (local cache OR remote source).
-///
-/// This is the user-facing "can I get this model?" check. It:
-/// 1. Checks the local HF cache first (fast, no network)
-/// 2. If not cached, queries the remote source (network request)
-///
-/// Use `isCached()` if you only want to check local cache without network.
-///
-/// Parameters:
-/// - allocator: Memory allocator for temporary allocations
-/// - model_id: Model identifier (e.g., "org/model-name")
-/// - config: Source configuration (token for auth)
-/// - src: Source to check (default: HuggingFace Hub)
-///
-/// Returns true if the model is available (cached or on source).
-pub fn exists(
-    allocator: std.mem.Allocator,
-    model_id: []const u8,
-    config: SourceConfig,
-    src: ?ModelSource,
-) !bool {
-    // 1. Check local cache first (no network)
-    if (try cache.isCached(allocator, model_id)) {
-        return true;
-    }
-
-    // 2. Check remote source
-    const actual_source = src orelse ModelSource.default;
-
-    // Initialize HTTP for network request
-    transport.globalInit();
-    defer transport.globalCleanup();
-
-    return actual_source.exists(allocator, model_id, config) catch |err| {
-        // Convert source errors to appropriate return values
-        return switch (err) {
-            SourceError.Unauthorized => error.Unauthorized,
-            SourceError.RateLimited => error.RateLimited,
-            SourceError.NotSupported => error.NotSupported,
-            SourceError.OutOfMemory => error.OutOfMemory,
-            else => false, // Network errors → model not accessible
-        };
-    };
-}
-
 /// Check if a model is in the local cache.
 ///
 /// This is an explicit cache-only check. No network requests are made.
-/// Use `exists()` if you want to check both cache and remote source.
 ///
 /// Parameters:
 /// - allocator: Memory allocator for temporary allocations

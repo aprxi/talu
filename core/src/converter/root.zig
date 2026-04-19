@@ -28,10 +28,6 @@ pub const model_card = @import("model_card.zig");
 pub const Role = mapping.Role;
 pub const TensorInfo = mapping.TensorInfo;
 
-// Re-export for backwards compatibility
-pub const MLXConfig = gaf_paths.GAFConfig; // Alias for backwards compatibility
-pub const MLXModelDir = gaf_paths.GAFModelDir; // Alias for backwards compatibility
-
 // =============================================================================
 // Tie Embeddings Logic
 // =============================================================================
@@ -76,28 +72,6 @@ fn isQuantizedDtype(dtype: dtype_mod.DType) bool {
         .grouped_affine_u4, .grouped_affine_u8 => true,
         else => false,
     };
-}
-
-/// DEPRECATED: Use shouldQuantizeTensorByLayout for architecture-driven quantization.
-/// Check if a tensor should be quantized based on name-derived role.
-/// Only used as fallback when architecture metadata is not available.
-pub fn shouldQuantizeTensor(info: mapping.TensorInfo, src_tensor: tensor_mod.Tensor) bool {
-    // Role-based check first
-    if (!mapping.shouldQuantize(info.role)) return false;
-
-    // Only quantize 2D weight matrices
-    if (src_tensor.n_dims != 2) return false;
-
-    // Only quantize float tensors (including FP8 source models)
-    switch (src_tensor.dtype) {
-        .f32, .f16, .bf16, .f8_e4m3 => {},
-        else => return false,
-    }
-
-    // Skip small tensors (< 1024 elements)
-    if (src_tensor.numel < 1024) return false;
-
-    return true;
 }
 
 // =============================================================================
@@ -350,11 +324,6 @@ fn addConversionFusionsForPrefix(
     }
 }
 
-/// Get the weight specs for a given layer (handles heterogeneous models).
-fn getWeightsForLayer(arch: *const op_types.Architecture, layer_idx: usize) []const op_types.WeightSpec {
-    return getWeightsForLayerWithOverride(arch, layer_idx, null);
-}
-
 fn getWeightsForLayerWithOverride(arch: *const op_types.Architecture, layer_idx: usize, layer_types_override: ?[]const u8) []const op_types.WeightSpec {
     if (arch.block_variants) |variants| {
         // Heterogeneous model - use override (from config.json) when available
@@ -483,35 +452,6 @@ pub fn tensorToF32(allocator: std.mem.Allocator, t: tensor_mod.Tensor) !F32Resul
     }
 }
 
-/// Convert tensor data to F32 as owned allocation (always allocates).
-fn tensorToF32Alloc(allocator: std.mem.Allocator, t: tensor_mod.Tensor) ![]f32 {
-    const element_count: usize = t.numel;
-    const f32_values = try allocator.alloc(f32, element_count);
-    errdefer allocator.free(f32_values);
-
-    switch (t.dtype) {
-        .f32 => {
-            const src_f32 = @as([*]align(1) const f32, @ptrCast(t.data().ptr))[0..element_count];
-            @memcpy(f32_values, src_f32);
-        },
-        .f16 => {
-            const src_u16 = @as([*]align(1) const u16, @ptrCast(t.data().ptr))[0..element_count];
-            for (src_u16, f32_values) |src_val, *dst| dst.* = dtype_mod.fp16ToF32(src_val);
-        },
-        .bf16 => {
-            const src_u16 = @as([*]align(1) const u16, @ptrCast(t.data().ptr))[0..element_count];
-            for (src_u16, f32_values) |src_val, *dst| dst.* = dtype_mod.bf16ToF32(src_val);
-        },
-        .f8_e4m3 => {
-            const src_u8 = @as([*]align(1) const u8, @ptrCast(t.data().ptr))[0..element_count];
-            for (src_u8, f32_values) |src_val, *dst| dst.* = dtype_mod.fp8e4m3ToF32(src_val);
-        },
-        else => return error.UnsupportedDType,
-    }
-
-    return f32_values;
-}
-
 // =============================================================================
 // Float Conversion Utilities
 // =============================================================================
@@ -554,11 +494,6 @@ pub fn f32ToF16(value: f32) u16 {
     // Normal number
     const f16_exp: u32 = @intCast(exp + 15);
     return @intCast((sign << 15) | (f16_exp << 10) | (mantissa >> 13));
-}
-
-/// Convert F16 bits to F32.
-fn f16ToF32(bits: u16) f32 {
-    return @floatCast(@as(f16, @bitCast(bits)));
 }
 
 // =============================================================================
@@ -872,16 +807,6 @@ test "sortTensorNames orders lm_head last" {
 // File Copy Utilities (shared by both converters)
 // =============================================================================
 
-/// Copy config.json from source to output directory.
-pub fn copyConfigFile(allocator: std.mem.Allocator, source_config_path: []const u8, output_path: []const u8) !void {
-    const dst_config_path = try std.fs.path.join(allocator, &.{ output_path, "config.json" });
-    defer allocator.free(dst_config_path);
-
-    std.fs.cwd().copyFile(source_config_path, std.fs.cwd(), dst_config_path, .{}) catch |err| {
-        if (err != error.FileNotFound) return err;
-    };
-}
-
 /// Quantization config to inject into config.json
 pub const QuantizationConfig = struct {
     quant_method: []const u8,
@@ -1067,7 +992,8 @@ pub fn copyConfigWithGAFQuantization(
 /// Copy tokenizer files from source directory to output directory.
 /// Copies tokenizer.json and tokenizer_config.json if they exist.
 ///
-/// Note: This copies fewer files than MLX conversion (gaf_paths.MLXModelDir.copyTokenizerFiles),
+/// Note: This copies fewer files than grouped-affine conversion
+/// (`gaf_paths.GAFModelDir.copyTokenizerFiles`),
 /// which also copies special_tokens_map.json, generation_config.json, merges.txt, vocab.json.
 /// Native conversion intentionally copies only the minimal required files.
 ///

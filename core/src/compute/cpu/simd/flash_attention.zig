@@ -6,20 +6,6 @@
 const std = @import("std");
 const simd = @import("arch/root.zig");
 
-/// Configuration for Flash Attention kernel.
-pub const FlashAttentionConfig = struct {
-    /// Tile size for keys/values (affects cache efficiency).
-    kv_tile_size: usize = 256,
-    /// Feature width (must be known for SIMD vectorization).
-    head_dim: usize,
-    /// Attention scale (typically 1/sqrt(feature_width)).
-    scale: f32,
-    /// Enable causal masking.
-    causal: bool = true,
-    /// Sliding window size (0 = disabled).
-    sliding_window: usize = 0,
-};
-
 pub const FlashAttentionFn = *const fn (
     // Output: [n_heads, seq_q, head_dim]
     out: [*]f32,

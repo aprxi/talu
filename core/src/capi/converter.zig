@@ -19,12 +19,6 @@ const error_codes = @import("error_codes.zig");
 const xray = @import("xray_pkg");
 const execution_plan = xray.execution_plan;
 
-// Import session for path resolution and tokenizer for memory utils
-const session_mod = @import("session.zig");
-const tokenizer_mod = @import("tokenizer.zig");
-const talu_resolve_model_path = session_mod.talu_resolve_model_path;
-const talu_text_free = tokenizer_mod.talu_text_free;
-
 // =============================================================================
 // Re-exported Types (from scheme module)
 // =============================================================================
@@ -208,15 +202,12 @@ pub export fn talu_convert_parse_scheme(name: [*:0]const u8) callconv(.c) c_int 
 /// Get model information from a model directory.
 /// Caller must free model_type and architecture strings with talu_model_info_free.
 pub export fn talu_describe(model_path: [*:0]const u8) callconv(.c) ModelInfo {
-    var resolved_path_ptr: ?[*:0]u8 = null;
-    if (talu_resolve_model_path(model_path, &resolved_path_ptr) != 0) {
-        return describeErrorResult("Failed to resolve model path");
-    }
-    if (resolved_path_ptr == null) {
-        return describeErrorResult("Failed to resolve model path");
-    }
-    const resolved_path = std.mem.span(resolved_path_ptr.?);
-    defer talu_text_free(resolved_path_ptr);
+    const resolved_path = repository.resolveModelPath(
+        allocator,
+        std.mem.span(model_path),
+        .{ .require_weights = false },
+    ) catch return describeErrorResult("Failed to resolve model path");
+    defer allocator.free(resolved_path);
 
     const info = describeFromResolvedPath(resolved_path) catch |err| {
         return switch (err) {

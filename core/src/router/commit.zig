@@ -1,11 +1,10 @@
 //! Post-generation commit logic.
 //!
-//! After any engine (local or HTTP) produces a generation result, this
+//! After the local engine produces a generation result, this
 //! module commits the result to the chat's Conversation:
 //!   - Parses reasoning tags (<think>...</think>) into ReasoningItems
-//!   - Checks tool calls against the firewall policy
 //!   - Creates AssistantMessage or FunctionCallItem(s)
-//!   - Calls finalizeItem (which triggers storage persistence)
+//!   - Calls finalizeItem to mark the item complete in conversation state
 //!
 //! This is the SINGLE path for all post-generation state changes.
 //! Engines produce raw results; this module interprets them.
@@ -14,7 +13,6 @@ const std = @import("std");
 const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const reasoning_parser_mod = responses_mod.reasoning_parser;
-const firewall = @import("firewall.zig");
 const log = @import("log_pkg");
 
 /// Backend-agnostic tool call input for commit.
@@ -26,15 +24,13 @@ pub const ToolCallInput = struct {
 
 /// Backend-agnostic generation result for commit.
 ///
-/// Both `local.GenerationResult` and `http_engine.GenerationResult` can be
-/// projected into this without conversion — callers fill in the fields they have.
+/// Local generation results can be projected into this without conversion.
 pub const CommitParams = struct {
     /// The raw generated text (may contain <think> tags).
     text: []const u8,
 
     /// Tool calls from the model (empty slice if none).
     /// For local: populated from grammar-constrained JSON parsing.
-    /// For HTTP: populated from API response.
     tool_calls: []const ToolCallInput = &.{},
 
     /// Prompt token count.
@@ -70,15 +66,15 @@ pub const CommitParams = struct {
 
 /// Commit a generation result to chat history.
 ///
-/// This is the SINGLE function that both backends (local and HTTP) and
-/// all API surfaces (non-streaming generate, streaming iterator) call
+/// This is the SINGLE function local API surfaces (non-streaming generate,
+/// streaming iterator) call
 /// after generation completes.
 ///
 /// It handles:
-///   1. Tool calls: firewall check + FunctionCallItem creation
+///   1. Tool calls: FunctionCallItem creation
 ///   2. Reasoning: <think> tag parsing + ReasoningItem creation
 ///   3. Normal text: AssistantMessage creation
-///   4. finalizeItem (triggers storage persistence)
+///   4. finalizeItem (marks item complete in conversation state)
 pub fn commitGenerationResult(
     allocator: std.mem.Allocator,
     chat: *Chat,
@@ -92,16 +88,9 @@ pub fn commitGenerationResult(
             .completion_tokens = params.completion_tokens,
         }, @src());
         for (params.tool_calls) |tc| {
-            const policy_denied = try firewall.checkFirewall(
-                allocator,
-                chat,
-                tc.name,
-                tc.arguments,
-            );
             log.trace("router", "Tool call committed", .{
                 .name_len = tc.name.len,
                 .args_len = tc.arguments.len,
-                .denied = @as(u8, @intFromBool(policy_denied)),
             }, @src());
 
             const item = try chat.conv.appendFunctionCall(tc.id, tc.name);
@@ -114,12 +103,6 @@ pub fn commitGenerationResult(
             item.finish_reason = params.finish_reason;
 
             chat.conv.finalizeItem(item);
-
-            // Override status after finalize: finalizeItem sets .completed,
-            // but policy denial requires .failed for the caller.
-            if (policy_denied) {
-                item.data.function_call.status = .failed;
-            }
         }
         return;
     }
@@ -304,46 +287,6 @@ test "commitGenerationResult: tool calls create FunctionCallItems" {
     try std.testing.expectEqualStrings("{\"location\":\"Paris\"}", fc.arguments.items);
     try std.testing.expectEqual(@as(u32, 10), item.input_tokens);
     try std.testing.expectEqual(@as(u32, 15), item.output_tokens);
-}
-
-test "commitGenerationResult: tool calls with policy denial set status=failed" {
-    const allocator = std.testing.allocator;
-
-    const policy_mod = @import("../agent/policy/evaluate.zig");
-
-    var chat = try Chat.init(allocator);
-    defer chat.deinit();
-
-    // Set up a deny-all policy
-    var policy = policy_mod.Policy{
-        .default_effect = .deny,
-        .mode = .enforce,
-        .statements = &.{},
-        ._pattern_buf = &.{},
-        .allocator = allocator,
-    };
-    chat.policy = &policy;
-
-    const tool_calls = [_]ToolCallInput{
-        .{
-            .id = "call_denied",
-            .name = "dangerous_tool",
-            .arguments = "{\"cmd\":\"rm -rf /\"}",
-        },
-    };
-
-    try commitGenerationResult(allocator, &chat, .{
-        .text = "",
-        .tool_calls = &tool_calls,
-        .prompt_tokens = 5,
-        .completion_tokens = 8,
-        .finish_reason = "tool_calls",
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), chat.conv.len());
-    const item = chat.conv.getItem(0).?;
-    const fc = item.asFunctionCall().?;
-    try std.testing.expectEqual(responses_mod.ItemStatus.failed, fc.status);
 }
 
 test "commitGenerationResult: multiple tool calls creates multiple items" {

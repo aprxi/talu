@@ -413,10 +413,6 @@ fn missingOptionalWeightPtrInternal() *anyopaque {
     return @ptrCast(&missing_optional_array_handle);
 }
 
-pub fn missingOptionalWeightPtr() *anyopaque {
-    return missingOptionalWeightPtrInternal();
-}
-
 fn layerProgramStaticWeightPtr(
     layer: *WeightHandles.LayerWeights,
     key: WeightHandles.LayerProgramWeightBindingKey,

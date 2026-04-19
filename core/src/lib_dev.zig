@@ -22,17 +22,9 @@ pub const compute = @import("compute_pkg");
 pub const tensor = @import("tensor_pkg");
 pub const xray = @import("xray_pkg");
 pub const validate = @import("validate_pkg");
-pub const db = @import("db/root.zig");
-pub const collab = @import("collab/root.zig");
-pub const policy = @import("agent/policy/root.zig");
 pub const dump = @import("xray_pkg").dump.root;
-pub const agent = @import("agent/root.zig");
 pub const train = @import("train/root.zig");
 
 pub const models = struct {
     pub const dispatcher = @import("models_pkg");
-};
-
-pub const nn = struct {
-    pub const sampling = inference.sampling;
 };

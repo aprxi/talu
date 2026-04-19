@@ -25,7 +25,6 @@ const LoraAdapter = adapter_mod.LoraAdapter;
 const LoraConfig = adapter_mod.LoraConfig;
 const LoraLayer = adapter_mod.LoraLayer;
 const AdamW = optimizer_mod.AdamW;
-const OptimizerParamState = optimizer_mod.ParamState;
 const Scheduler = scheduler_mod.Scheduler;
 const TrainableParams = param_state_mod.TrainableParams;
 const TrainableParam = param_state_mod.TrainableParam;

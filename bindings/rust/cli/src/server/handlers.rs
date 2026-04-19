@@ -14,13 +14,12 @@ use serde_json::json;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::bucket_settings;
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::events;
 use crate::server::responses_types;
 use crate::server::state::{AppState, ModelLoadResult, StoredResponse};
-use talu::documents::{DocumentError, DocumentsHandle};
+use crate::server::vision;
 use talu::responses::{ContentType, ItemType};
 use talu::{ChatHandle, FinishReason};
 
@@ -101,13 +100,6 @@ pub enum ResponseError {
 impl ResponseError {
     fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         Self::BadRequest {
-            code,
-            message: message.into(),
-        }
-    }
-
-    fn internal(code: &'static str, message: impl Into<String>) -> Self {
-        Self::Internal {
             code,
             message: message.into(),
         }
@@ -273,30 +265,15 @@ async fn handle_generate(
     let tool_choice_json = parsed.tool_choice.clone();
     let previous_response_id = parsed.previous_response_id.clone();
     let input_value = parsed.input.clone();
-    let store = parsed.store.unwrap_or(false);
-    // Extract session_id from metadata (allows clients to resume a conversation
-    // without previous_response_id, e.g. after a page refresh).
-    let request_session_id: Option<String> = parsed
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("session_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let request_session_id: Option<String> = None;
     let prompt_id = None;
-
-    // Internal project scoping hint (if present in metadata).
-    let project_id: Option<String> = parsed
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("project_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let project_id: Option<String> = None;
 
     log::debug!(
         target: "server::gen",
-        "model={} stream={} store={} session_id={:?} prompt_id={:?} prev_response_id={:?}",
+        "model={} stream={} session_id={:?} prompt_id={:?} prev_response_id={:?}",
         request.model.as_deref().unwrap_or("(default)"),
-        stream, store, request_session_id, prompt_id, previous_response_id
+        stream, request_session_id, prompt_id, previous_response_id
     );
 
     // Validate that input is present (string, array, or null with previous_response_id).
@@ -317,7 +294,6 @@ async fn handle_generate(
             tools_json,
             tool_choice_json,
             previous_response_id,
-            store,
             request_session_id,
             prompt_id,
             project_id,
@@ -334,7 +310,6 @@ async fn handle_generate(
         tools_json,
         tool_choice_json,
         previous_response_id,
-        store,
         request_session_id,
         prompt_id,
         project_id,
@@ -394,54 +369,49 @@ pub async fn handle_models(
         })
         .unwrap_or_default();
 
-    let mut models = match list_backend_models(state.clone()).await {
-        Ok(items) if !items.is_empty() => items,
-        _ => {
-            let fallback = state
-                .backend
-                .lock()
-                .await
-                .current_model
-                .clone()
-                .or_else(|| state.configured_model.clone());
-            if let Some(model_id) = fallback {
-                vec![talu::RemoteModelInfo {
-                    id: model_id,
-                    object: "model".to_string(),
-                    created: 0,
-                    owned_by: "talu".to_string(),
-                }]
-            } else {
-                Vec::new()
-            }
-        }
-    };
+    let mut model_ids = tokio::task::spawn_blocking(|| {
+        talu::repo::repo_list_models(false)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
 
-    // Merge models from enabled remote providers (prefixed with "provider::").
-    if let Some(ref bucket) = state.bucket_path {
-        let db_root = bucket.join("kv").to_string_lossy().into_owned();
-        if let Ok(Ok(remote)) =
-            tokio::task::spawn_blocking(move || talu::provider_config_list_remote_models(&db_root))
-                .await
-        {
-            models.extend(remote);
+    if model_ids.is_empty() {
+        let fallback = state
+            .backend
+            .lock()
+            .await
+            .current_model
+            .clone()
+            .or_else(|| state.configured_model.clone());
+        if let Some(model_id) = fallback {
+            model_ids.push(model_id);
         }
     }
 
     if !allowed_models.is_empty() {
         let allowed: HashSet<String> = allowed_models.into_iter().collect();
-        models.retain(|model| allowed.contains(&model.id));
+        model_ids.retain(|model_id| allowed.contains(model_id));
     }
 
-    let models = models
+    let models = model_ids
         .into_iter()
-        .map(|model| {
-            json!({
-                "id": model.id,
-                "object": model.object,
-                "created": model.created,
-                "owned_by": model.owned_by
-            })
+        .map(|model_id| {
+            let mut obj = json!({
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "talu"
+            });
+            if let Some(profile) = vision::model_vision_preprocess_profile(
+                obj.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+            ) {
+                obj["vision_preprocess_profile"] = profile;
+            }
+            obj
         })
         .collect::<Vec<_>>();
 
@@ -458,163 +428,60 @@ pub async fn handle_models(
         .unwrap()
 }
 
-/// Compute the absolute blob file path for a sha256 blob ref.
+/// Resolve file references for structured input.
 ///
-/// Returns `Some(path)` for `sha256:<64hex>` refs, `None` for multipart or invalid refs.
-fn blob_ref_to_file_url(storage_path: &std::path::Path, blob_ref: &str) -> Option<String> {
-    let hex = blob_ref.strip_prefix("sha256:")?;
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut path = storage_path.to_path_buf();
-    path.push("blobs");
-    path.push(&hex[..2]);
-    path.push(hex);
-    Some(format!("file://{}", path.display()))
-}
-
-/// File document metadata (matches the JSON stored by the upload handler).
-#[derive(serde::Deserialize)]
-struct FileDocContent {
-    blob_ref: Option<String>,
-    mime_type: Option<String>,
-    kind: Option<String>,
-}
-
-/// Resolve file references in a structured input JSON array.
-///
-/// Scans the input for `input_image` or `input_file` items whose URLs look like
-/// file IDs (e.g. `file_abc123`). For each, rewrites the URL to a `file://` path
-/// pointing directly to the blob on disk, so the engine can read it zero-copy.
-///
-/// Returns the (possibly modified) JSON string ready for `load_responses_json`.
+/// In the inference-only build, local DB/file-id indirection is disabled and
+/// request payloads are passed through unchanged.
 fn resolve_file_references(input_json: &str, storage_path: &std::path::Path) -> Result<String> {
-    let mut items: serde_json::Value =
-        serde_json::from_str(input_json).context("failed to parse input JSON")?;
+    let _ = storage_path;
+    Ok(input_json.to_string())
+}
 
-    let arr = match items.as_array_mut() {
-        Some(a) => a,
-        None => return Ok(input_json.to_string()),
+type PreviousState = (
+    String,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+    Option<String>,
+);
+
+/// Resolve `previous_response_id` from the in-memory response store only.
+///
+/// This server is inference-only and intentionally does not perform durable
+/// conversation lookups. Durable continuation must be handled by the caller
+/// (for example `talupi`) by replaying prior items in `input`.
+async fn load_in_memory_prev_state(
+    state: Arc<AppState>,
+    previous_response_id: Option<&str>,
+    auth_ctx: Option<&AuthContext>,
+) -> Result<Option<PreviousState>, ResponseError> {
+    let Some(previous_response_id) = previous_response_id else {
+        return Ok(None);
     };
 
-    let mut needs_storage = false;
-    // Pre-scan: check if any content parts reference file IDs.
-    for item in arr.iter() {
-        if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-            for part in content {
-                let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match part_type {
-                    "input_image" => {
-                        if let Some(url) = part.get("image_url").and_then(|u| u.as_str()) {
-                            if url.starts_with("file_") {
-                                needs_storage = true;
-                            }
-                        }
-                    }
-                    "input_file" => {
-                        if let Some(url) = part.get("file_url").and_then(|u| u.as_str()) {
-                            if url.starts_with("file_") {
-                                needs_storage = true;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    let requester_tenant = auth_ctx.map(|ctx| ctx.tenant_id.as_str());
+    let store = state.response_store.lock().await;
+    let prev_state = store.get(previous_response_id).and_then(|stored| {
+        if stored.tenant_id.as_deref() == requester_tenant {
+            Some((
+                stored.responses_json.clone(),
+                stored.tools_json.clone(),
+                stored.tool_choice_json.clone(),
+                stored.session_id.clone(),
+            ))
+        } else {
+            None
         }
-    }
-
-    if !needs_storage {
-        return Ok(input_json.to_string());
-    }
-
-    let docs = DocumentsHandle::open(&storage_path.join("tables").join("documents"))
-        .map_err(|e| anyhow!("failed to open documents for file resolution: {}", e))?;
-
-    for item in arr.iter_mut() {
-        let content = match item.get_mut("content").and_then(|c| c.as_array_mut()) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let mut replacements: Vec<(usize, serde_json::Value)> = Vec::new();
-
-        for (idx, part) in content.iter().enumerate() {
-            let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-            let file_id = match part_type {
-                "input_image" => part.get("image_url").and_then(|u| u.as_str()),
-                "input_file" => part.get("file_url").and_then(|u| u.as_str()),
-                _ => None,
-            };
-
-            let file_id = match file_id {
-                Some(id) if id.starts_with("file_") => id,
-                _ => continue,
-            };
-
-            // Look up document metadata.
-            let doc = match docs.get(file_id) {
-                Ok(Some(d)) if d.doc_type == "file" => d,
-                Ok(_) | Err(_) => continue,
-            };
-
-            let meta: FileDocContent =
-                serde_json::from_str(&doc.doc_json).unwrap_or(FileDocContent {
-                    blob_ref: None,
-                    mime_type: None,
-                    kind: None,
-                });
-
-            let blob_ref = match meta.blob_ref {
-                Some(ref r) if !r.is_empty() => r.as_str(),
-                _ => continue,
-            };
-
-            let mime = meta
-                .mime_type
-                .as_deref()
-                .unwrap_or("application/octet-stream");
-            let is_image = meta.kind.as_deref() == Some("image") || mime.starts_with("image/");
-
-            if is_image {
-                // Zero-copy: pass file:// URL so the engine reads directly from disk.
-                if let Some(file_url) = blob_ref_to_file_url(storage_path, blob_ref) {
-                    replacements.push((
-                        idx,
-                        json!({
-                            "type": "input_image",
-                            "image_url": file_url
-                        }),
-                    ));
-                }
-                // Multipart blobs are unsupported for zero-copy; skip silently.
-            } else {
-                // Non-image files: pass file:// URL with metadata.
-                if let Some(file_url) = blob_ref_to_file_url(storage_path, blob_ref) {
-                    let filename = part
-                        .get("filename")
-                        .and_then(|f| f.as_str())
-                        .unwrap_or(&doc.title);
-                    replacements.push((
-                        idx,
-                        json!({
-                            "type": "input_file",
-                            "file_data": file_url,
-                            "filename": filename
-                        }),
-                    ));
-                }
-            }
-        }
-
-        // Apply replacements in reverse to preserve indices.
-        for (idx, new_part) in replacements.into_iter().rev() {
-            content[idx] = new_part;
-        }
-    }
-
-    serde_json::to_string(&items).context("failed to serialize resolved input")
+    });
+    let Some(prev_state) = prev_state else {
+        return Err(ResponseError::bad_request(
+            "invalid_request",
+            format!(
+                "previous_response_id '{}' is unavailable in this inference-only server; replay prior items from client persistence",
+                previous_response_id
+            ),
+        ));
+    };
+    Ok(Some(prev_state))
 }
 
 async fn generate_response(
@@ -624,10 +491,9 @@ async fn generate_response(
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
     previous_response_id: Option<String>,
-    store: bool,
     request_session_id: Option<String>,
     prompt_id: Option<String>,
-    project_id: Option<String>,
+    _project_id: Option<String>,
     strict_responses: bool,
     auth_ctx: Option<&AuthContext>,
 ) -> Result<serde_json::Value, ResponseError> {
@@ -647,25 +513,9 @@ async fn generate_response(
 
     let model_id = select_model_id(state.clone(), request.model.clone()).await?;
 
-    // Load previous conversation state if chaining.
-    let requester_tenant = auth_ctx.map(|ctx| ctx.tenant_id.as_str());
-    let prev_state = if let Some(ref prev_id) = previous_response_id {
-        let store = state.response_store.lock().await;
-        store.get(prev_id).and_then(|s| {
-            if s.tenant_id.as_deref() == requester_tenant {
-                Some((
-                    s.responses_json.clone(),
-                    s.tools_json.clone(),
-                    s.tool_choice_json.clone(),
-                    s.session_id.clone(),
-                ))
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
+    // In this inference-only server, previous-response chaining is process-local.
+    let prev_state =
+        load_in_memory_prev_state(state.clone(), previous_response_id.as_deref(), auth_ctx).await?;
 
     // Merge: previous conversation's tools/tool_choice are used as defaults
     // if the new request doesn't specify them.
@@ -678,57 +528,14 @@ async fn generate_response(
         .or_else(|| prev_state.as_ref().and_then(|s| s.3.clone()))
         .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
 
-    // Resolve bucket path for persistence (only when store=true).
-    let bucket_path = if store {
-        state.bucket_path.as_ref().map(|base| match auth_ctx {
-            Some(ctx) => base.join(&ctx.storage_prefix),
-            None => base.to_path_buf(),
-        })
-    } else {
-        None
-    };
-
-    // Load auto_title setting from bucket config.
-    let auto_title = bucket_path.as_ref().map_or(false, |bp| {
-        bucket_settings::load_bucket_settings(bp)
-            .map(|s| s.auto_title)
-            .unwrap_or(true)
-    });
+    let auto_title = false;
     let is_new_conversation = previous_response_id.is_none();
 
-    // Ensure storage directory exists.
-    if let Some(ref bp) = bucket_path {
-        std::fs::create_dir_all(bp)
-            .map_err(|e| anyhow!("failed to create storage directory: {}", e))?;
-    }
-
-    // Load bucket settings for fallback values (max_output_tokens + per-model overrides).
-    // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
-    let fallback_settings = state
-        .bucket_path
-        .as_ref()
-        .map(|base| match auth_ctx {
-            Some(ctx) => base.join(&ctx.storage_prefix),
-            None => base.to_path_buf(),
-        })
-        .and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
-
-    let max_output_tokens = request_max_output_tokens.or_else(|| {
-        fallback_settings
-            .as_ref()
-            .and_then(|s| s.max_output_tokens.map(|v| v as i64))
-    });
-
-    // Apply per-model sampling overrides as fallbacks when the request doesn't specify them.
-    let model_overrides = fallback_settings
-        .as_ref()
-        .and_then(|s| s.models.get(&model_id).cloned());
-    let temperature = temperature.or_else(|| model_overrides.as_ref().and_then(|o| o.temperature));
-    let top_p = top_p.or_else(|| model_overrides.as_ref().and_then(|o| o.top_p));
+    let max_output_tokens = request_max_output_tokens;
 
     // Resolve effective generation config using model sampling presets.
     // Applies 3-layer precedence: model presets → generation_config.json → API request.
-    // For remote/provider models this may fail — fall back to raw request params.
+    // For unknown/unresolved model IDs this may fail; fall back to raw request params.
     let effective_gen = talu::model::resolve_effective_generation_config(
         &model_id,
         &talu::EffectiveGenConfigRequest {
@@ -746,62 +553,15 @@ async fn generate_response(
         log::warn!(target: "server::gen", "resolve_effective_generation_config: {e} (using raw request params)");
     }
 
-    // If prompt_id is provided, fetch the document and extract system prompt.
+    // Prompt documents are no longer resolved from local storage in this build.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
-        if let Some(ref bp) = bucket_path {
-            match DocumentsHandle::open(&bp.join("tables").join("documents")) {
-                Ok(docs) => match docs.get(pid) {
-                    Ok(Some(doc)) => {
-                        // Parse doc_json to extract system prompt
-                        // Try direct fields first (current UI format), then nested under "data" (legacy)
-                        if let Ok(envelope) =
-                            serde_json::from_str::<serde_json::Value>(&doc.doc_json)
-                        {
-                            envelope
-                                .get("system")
-                                .or_else(|| envelope.get("system_prompt"))
-                                .or_else(|| envelope.get("data").and_then(|d| d.get("system")))
-                                .or_else(|| {
-                                    envelope.get("data").and_then(|d| d.get("system_prompt"))
-                                })
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    }
-                    Ok(None) => {
-                        return Err(ResponseError::bad_request(
-                            "invalid_request",
-                            format!("prompt_id '{}' not found", pid),
-                        ));
-                    }
-                    Err(DocumentError::DocumentNotFound(_)) => {
-                        return Err(ResponseError::bad_request(
-                            "invalid_request",
-                            format!("prompt_id '{}' not found", pid),
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(ResponseError::internal(
-                            "storage_error",
-                            format!("failed to fetch prompt document: {}", e),
-                        ));
-                    }
-                },
-                Err(e) => {
-                    return Err(ResponseError::internal(
-                        "storage_error",
-                        format!("failed to open documents store: {}", e),
-                    ));
-                }
-            }
-        } else {
-            return Err(ResponseError::bad_request(
-                "invalid_request",
-                "prompt_id requires storage to be configured",
-            ));
-        }
+        return Err(ResponseError::bad_request(
+            "invalid_request",
+            format!(
+                "prompt_id '{}' is not supported in this inference-only build",
+                pid
+            ),
+        ));
     } else {
         None
     };
@@ -815,14 +575,22 @@ async fn generate_response(
     let created_at = now_unix_seconds();
 
     let backend = state.backend.clone();
-    // Only pass prev_json for in-memory chaining when storage is NOT active.
-    // When storage is active, set_storage_db auto-loads existing items.
-    let prev_json = if bucket_path.is_none() {
-        prev_state.map(|s| s.0)
+    let prev_json = prev_state.map(|s| s.0);
+    let mut input_value = input_value;
+    let prepared_vision_prefill = if let Some(input) = input_value.as_mut() {
+        vision::extract_prepared_prefill_from_responses_input(input, &model_id)
+            .map_err(|e| ResponseError::bad_request("invalid_vision_input", format!("{e}")))?
     } else {
-        let _ = prev_state; // consumed
         None
     };
+    if prepared_vision_prefill.is_some() {
+        log::info!(
+            target: "server::vision",
+            "model={} path=prepared profile_version={}",
+            model_id,
+            vision::VISION_PROFILE_VERSION
+        );
+    }
 
     // Build serialized input for the blocking task.
     let input_json = input_value
@@ -834,11 +602,7 @@ async fn generate_response(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // File storage path for resolving file references (always available if bucket exists).
-    let file_storage_path = state.bucket_path.as_ref().map(|base| match auth_ctx {
-        Some(ctx) => base.join(&ctx.storage_prefix),
-        None => base.to_path_buf(),
-    });
+    let file_storage_path: Option<std::path::PathBuf> = None;
 
     // Create a stop flag so the generation can be cancelled when the client
     // disconnects (hyper drops the handler future).  The guard sets the flag
@@ -853,13 +617,21 @@ async fn generate_response(
 
     let effective_config = effective_gen.ok();
     let effective_config_for_task = effective_config.clone();
+    let contains_images_hint =
+        vision::payload_may_include_images(input_json.as_deref(), prev_json.as_deref());
+    let has_prepared_vision_prefill = prepared_vision_prefill.is_some();
+    if contains_images_hint
+        && !has_prepared_vision_prefill
+        && vision::file_host_from_env().is_none()
+    {
+        return Err(ResponseError::bad_request(
+            "invalid_vision_input",
+            vision::RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE.to_string(),
+        ));
+    }
 
-    let session_id_for_task = session_id.clone();
-    let bucket_for_task = bucket_path.clone();
     let model_id_for_task = model_id.clone();
     let system_prompt_for_task = effective_system_prompt.clone();
-    let prompt_id_for_task = prompt_id.clone();
-    let project_id_for_task = project_id.clone();
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
     let reasoning_effort_for_generation = reasoning.effort.clone();
@@ -870,29 +642,10 @@ async fn generate_response(
             log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt_for_task.is_some());
             let chat = ChatHandle::new(system_prompt_for_task.as_deref())?;
 
-            // Enable storage persistence if store=true and bucket is configured.
-            // set_storage_db auto-loads any existing items for this session.
-            let has_storage = if let Some(ref bp) = bucket_for_task {
-                if let Some(bp_str) = bp.to_str() {
-                    log::trace!(target: "server::gen", "set_storage_db({:?}, {})", bp_str, session_id_for_task);
-                    chat.set_storage_db(bp_str, &session_id_for_task)
-                        .map_err(|e| anyhow!("failed to set storage: {}", e))?;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            // Restore previous conversation from in-memory JSON only when
-            // storage is not active — set_storage_db already loaded persisted items.
-            if !has_storage {
-                if let Some(ref prev) = prev_json {
-                    log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
-                    chat.load_responses_json(prev)
-                        .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
-                }
+            if let Some(ref prev) = prev_json {
+                log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
+                chat.load_responses_json(prev)
+                    .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
             }
 
             // Load input items into the conversation, resolving file references.
@@ -915,20 +668,6 @@ async fn generate_response(
             // Record item count before generation to extract only new output items.
             let pre_gen_count = chat.item_count();
 
-            // Persist session metadata BEFORE generation so the conversation
-            // appears in list_sessions immediately.
-            if bucket_for_task.is_some() && pre_gen_count <= 2 {
-                let t = input_string.as_deref().unwrap_or("Untitled");
-                let title: String = t.chars().take(47).collect();
-                let _ = chat.notify_session_update_ex(
-                    Some(&model_id_for_task),
-                    Some(&title),
-                    Some("active"),
-                    prompt_id_for_task.as_deref(),
-                    project_id_for_task.as_deref(),
-                );
-            }
-
             let mut cfg = talu::router::GenerateConfig::default();
             if let Some(ref eff) = effective_config_for_task {
                 cfg.max_tokens = eff.max_tokens;
@@ -941,7 +680,7 @@ async fn generate_response(
                 cfg.frequency_penalty = eff.frequency_penalty;
                 cfg.seed = eff.seed;
             } else {
-                // Fallback for remote/provider models where presets are unavailable.
+                // Fallback when preset lookup is unavailable.
                 if let Some(max_tokens) = max_output_tokens {
                     cfg.max_tokens = max_tokens as usize;
                 }
@@ -975,12 +714,26 @@ async fn generate_response(
             }
             cfg.stop_flag = Some(stop_flag_for_gen.clone());
 
+            let vision_prefill = if has_prepared_vision_prefill {
+                prepared_vision_prefill
+            } else if contains_images_hint {
+                vision::prepare_vision_prefill(&chat, &model_id_for_task)
+                    .map_err(|e| anyhow!("vision prepare failed: {e}"))?
+            } else {
+                None
+            };
+            let use_batch = batch_scheduler_for_task.is_some() && vision_prefill.is_none();
+            cfg.vision_prefill = vision_prefill;
+
             log::debug!(target: "server::gen", "generating: model={} max_tokens={} temp={} top_p={} seed={}",
                 model_id_for_task, cfg.max_tokens, cfg.temperature, cfg.top_p, cfg.seed);
             log::trace!(target: "server::gen", "generate(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
                 pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
 
-            if let Some(ref sched) = batch_scheduler_for_task {
+            if use_batch {
+                let sched = batch_scheduler_for_task
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("batch scheduler unavailable"))?;
                 // --- Batch scheduler path (concurrent GPU decode) ---
                 let (request_id, event_rx) = sched
                     .submit_final_only(&chat, cfg, stop_flag_for_gen)
@@ -1064,7 +817,7 @@ async fn generate_response(
                     batch_status, batch_incomplete_reason,
                 ))
             } else {
-                // --- Remote provider path (direct generate with backend mutex) ---
+                // --- Direct generation path (non-batch) ---
                 let mut backend = backend.blocking_lock();
                 let backend = backend
                     .backend
@@ -1099,7 +852,7 @@ async fn generate_response(
                 Ok::<_, anyhow::Error>((
                     output_items, prompt_tokens, completion_tokens,
                     prefill_ns, generation_ns, ttft_ns, responses_json, model_info_json,
-                    "completed", None::<&str>, // remote providers always complete
+                    "completed", None::<&str>,
                 ))
             }
         })
@@ -1111,20 +864,17 @@ async fn generate_response(
     cancel_guard.defuse();
 
     // Store conversation for future `previous_response_id` lookups.
-    let session_id_for_response = session_id.clone();
     let tenant_id_for_store = auth_ctx.map(|ctx| ctx.tenant_id.clone());
+    let stored_response = StoredResponse {
+        responses_json,
+        tools_json: effective_tools.clone(),
+        tool_choice_json: effective_tool_choice.clone(),
+        session_id: Some(session_id.clone()),
+        tenant_id: tenant_id_for_store,
+    };
     {
         let mut store = state.response_store.lock().await;
-        store.insert(
-            response_id.clone(),
-            StoredResponse {
-                responses_json,
-                tools_json: effective_tools.clone(),
-                tool_choice_json: effective_tool_choice.clone(),
-                session_id: Some(session_id),
-                tenant_id: tenant_id_for_store,
-            },
-        );
+        store.insert(response_id.clone(), stored_response.clone());
     }
 
     let usage = UsageStats {
@@ -1171,7 +921,6 @@ async fn generate_response(
         Some(&usage),
         effective_tools.as_ref(),
         effective_tool_choice.as_ref(),
-        store,
         instructions.as_deref(),
         text_format.as_ref(),
     );
@@ -1189,16 +938,6 @@ async fn generate_response(
         });
     }
 
-    if !strict_responses {
-        // Include session_id (and project_id if set) in metadata so the UI
-        // can adopt them for follow-ups.
-        let mut meta = json!({ "session_id": session_id_for_response });
-        if let Some(ref pid) = project_id {
-            meta["project_id"] = json!(pid);
-        }
-        response_value["metadata"] = meta;
-    }
-
     // Auto-generate a descriptive title for new conversations in the background.
     if !strict_responses && is_new_conversation && auto_title {
         let title_input = input_value
@@ -1207,10 +946,9 @@ async fn generate_response(
             .map(|s| s.to_string());
         if let Some(input) = title_input {
             let title_backend = state.backend.clone();
-            let title_bucket = bucket_path.clone();
-            let title_session_id = session_id_for_response.clone();
+            let title_session_id = session_id.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = generate_title(&title_backend, &title_bucket, &title_session_id, &input);
+                let _ = generate_title(&title_backend, &title_session_id, &input);
             });
         }
     }
@@ -1225,7 +963,6 @@ async fn stream_response(
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
     previous_response_id: Option<String>,
-    store: bool,
     request_session_id: Option<String>,
     prompt_id: Option<String>,
     project_id: Option<String>,
@@ -1265,24 +1002,23 @@ async fn stream_response(
         }
     };
 
-    // Load previous conversation state if chaining.
-    let requester_tenant = auth_ctx.as_ref().map(|ctx| ctx.tenant_id.as_str());
-    let prev_state = if let Some(ref prev_id) = previous_response_id {
-        let rstore = state.response_store.lock().await;
-        rstore.get(prev_id).and_then(|s| {
-            if s.tenant_id.as_deref() == requester_tenant {
-                Some((
-                    s.responses_json.clone(),
-                    s.tools_json.clone(),
-                    s.tool_choice_json.clone(),
-                    s.session_id.clone(),
-                ))
-            } else {
-                None
-            }
-        })
-    } else {
-        None
+    // In this inference-only server, previous-response chaining is process-local.
+    let prev_state = match load_in_memory_prev_state(
+        state.clone(),
+        previous_response_id.as_deref(),
+        auth_ctx.as_ref(),
+    )
+    .await
+    {
+        Ok(prev_state) => prev_state,
+        Err(err) => {
+            return api_error(
+                strict_responses,
+                err.status_code(),
+                err.error_code(),
+                err.error_message(),
+            )
+        }
     };
 
     // Merge tools from previous if not specified in this request.
@@ -1295,56 +1031,8 @@ async fn stream_response(
         .or_else(|| prev_state.as_ref().and_then(|s| s.3.clone()))
         .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
 
-    // Resolve bucket path for persistence (only when store=true).
-    let bucket_path = if store {
-        state
-            .bucket_path
-            .as_ref()
-            .map(|base| match auth_ctx.as_ref() {
-                Some(ctx) => base.join(&ctx.storage_prefix),
-                None => base.to_path_buf(),
-            })
-    } else {
-        None
-    };
-
-    // Load auto_title setting from bucket config.
-    let auto_title = bucket_path.as_ref().map_or(false, |bp| {
-        bucket_settings::load_bucket_settings(bp)
-            .map(|s| s.auto_title)
-            .unwrap_or(true)
-    });
-
-    // Ensure storage directory exists.
-    if let Some(ref bp) = bucket_path {
-        if let Err(e) = std::fs::create_dir_all(bp) {
-            log::warn!(target: "server::gen", "failed to create storage directory: {}", e);
-        }
-    }
-
-    // Load bucket settings for fallback values (max_output_tokens + per-model overrides).
-    // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
-    let fallback_settings = state
-        .bucket_path
-        .as_ref()
-        .map(|base| match auth_ctx.as_ref() {
-            Some(ctx) => base.join(&ctx.storage_prefix),
-            None => base.to_path_buf(),
-        })
-        .and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
-
-    let max_output_tokens = request_max_output_tokens.or_else(|| {
-        fallback_settings
-            .as_ref()
-            .and_then(|s| s.max_output_tokens.map(|v| v as i64))
-    });
-
-    // Apply per-model sampling overrides as fallbacks when the request doesn't specify them.
-    let model_overrides = fallback_settings
-        .as_ref()
-        .and_then(|s| s.models.get(&model_id).cloned());
-    let temperature = temperature.or_else(|| model_overrides.as_ref().and_then(|o| o.temperature));
-    let top_p = top_p.or_else(|| model_overrides.as_ref().and_then(|o| o.top_p));
+    let auto_title = false;
+    let max_output_tokens = request_max_output_tokens;
 
     // Resolve effective generation config using model sampling presets.
     let effective_gen = talu::model::resolve_effective_generation_config(
@@ -1365,72 +1053,17 @@ async fn stream_response(
     }
     let effective_config = effective_gen.ok();
 
-    // If prompt_id is provided, fetch the document and extract system prompt.
+    // Prompt documents are no longer resolved from local storage in this build.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
-        if let Some(ref bp) = bucket_path {
-            match DocumentsHandle::open(&bp.join("tables").join("documents")) {
-                Ok(docs) => match docs.get(pid) {
-                    Ok(Some(doc)) => {
-                        // Parse doc_json to extract system prompt
-                        // Try direct fields first (current UI format), then nested under "data" (legacy)
-                        if let Ok(envelope) =
-                            serde_json::from_str::<serde_json::Value>(&doc.doc_json)
-                        {
-                            envelope
-                                .get("system")
-                                .or_else(|| envelope.get("system_prompt"))
-                                .or_else(|| envelope.get("data").and_then(|d| d.get("system")))
-                                .or_else(|| {
-                                    envelope.get("data").and_then(|d| d.get("system_prompt"))
-                                })
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    }
-                    Ok(None) => {
-                        return api_error(
-                            strict_responses,
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request",
-                            &format!("prompt_id '{}' not found", pid),
-                        );
-                    }
-                    Err(DocumentError::DocumentNotFound(_)) => {
-                        return api_error(
-                            strict_responses,
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request",
-                            &format!("prompt_id '{}' not found", pid),
-                        );
-                    }
-                    Err(e) => {
-                        return api_error(
-                            strict_responses,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "storage_error",
-                            &format!("failed to fetch prompt document: {}", e),
-                        );
-                    }
-                },
-                Err(e) => {
-                    return api_error(
-                        strict_responses,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "storage_error",
-                        &format!("failed to open documents store: {}", e),
-                    );
-                }
-            }
-        } else {
-            return api_error(
-                strict_responses,
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                "prompt_id requires storage to be configured",
-            );
-        }
+        return api_error(
+            strict_responses,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!(
+                "prompt_id '{}' is not supported in this inference-only build",
+                pid
+            ),
+        );
     } else {
         None
     };
@@ -1440,14 +1073,31 @@ async fn stream_response(
         system_prompt_from_doc.clone()
     };
 
-    // Only pass prev_json for in-memory chaining when storage is NOT active.
-    // When storage is active, set_storage_db auto-loads existing items.
-    let prev_json = if bucket_path.is_none() {
-        prev_state.map(|s| s.0)
+    let prev_json = prev_state.map(|s| s.0);
+    let mut input_value = input_value;
+    let prepared_vision_prefill = if let Some(input) = input_value.as_mut() {
+        match vision::extract_prepared_prefill_from_responses_input(input, &model_id) {
+            Ok(prefill) => prefill,
+            Err(err) => {
+                return api_error(
+                    strict_responses,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_vision_input",
+                    &format!("{err}"),
+                )
+            }
+        }
     } else {
-        let _ = prev_state; // consumed
         None
     };
+    if prepared_vision_prefill.is_some() {
+        log::info!(
+            target: "server::vision",
+            "model={} path=prepared profile_version={}",
+            model_id,
+            vision::VISION_PROFILE_VERSION
+        );
+    }
 
     // Create a stop flag for cancellation on client disconnect or server shutdown.
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1467,14 +1117,7 @@ async fn stream_response(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // File storage path for resolving file references (always available if bucket exists).
-    let file_storage_path = state
-        .bucket_path
-        .as_ref()
-        .map(|base| match auth_ctx.as_ref() {
-            Some(ctx) => base.join(&ctx.storage_prefix),
-            None => base.to_path_buf(),
-        });
+    let file_storage_path: Option<std::path::PathBuf> = None;
 
     // Clones for the blocking task to store response after completion.
     let state_for_store = state.clone();
@@ -1495,12 +1138,8 @@ async fn stream_response(
     let text_format_for_events = text_format.clone();
     let reasoning_for_events = reasoning.clone();
 
-    // Clone project_id for the streaming blocking task.
-    let project_id_for_stream = project_id.clone();
-
     // Clones for post-generation title generation.
     let title_input = input_string.clone();
-    let title_bucket = bucket_path.clone();
     let title_session_id = session_id.clone();
     let title_backend = state.backend.clone();
     let events_tenant_id = auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone());
@@ -1508,12 +1147,21 @@ async fn stream_response(
     let events_response_id = response_id.clone();
     let events_session_id = session_id.clone();
 
-    let kv_root = state
-        .bucket_path
-        .as_ref()
-        .map(|b| b.join("kv").to_string_lossy().into_owned());
-
     let previous_response_id_for_ctx = previous_response_id.clone();
+    let has_prepared_vision_prefill = prepared_vision_prefill.is_some();
+    let contains_images_hint =
+        vision::payload_may_include_images(input_json.as_deref(), prev_json.as_deref());
+    if contains_images_hint
+        && !has_prepared_vision_prefill
+        && vision::file_host_from_env().is_none()
+    {
+        return api_error(
+            strict_responses,
+            StatusCode::BAD_REQUEST,
+            "invalid_vision_input",
+            vision::RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE,
+        );
+    }
     tokio::task::spawn_blocking(move || {
         let mut seq = 0u64;
         if strict_responses {
@@ -1553,7 +1201,7 @@ async fn stream_response(
                         "usage": null,
                         "max_output_tokens": max_output_tokens,
                         "max_tool_calls": null,
-                        "store": store,
+                        "store": false,
                         "background": false,
                         "service_tier": "default",
                         "metadata": {},
@@ -1587,11 +1235,7 @@ async fn stream_response(
                             p.total,
                         );
                     }));
-                match provider::create_backend_for_model_with_progress(
-                    &model_id,
-                    kv_root.as_deref(),
-                    callback,
-                ) {
+                match provider::create_backend_for_model_with_progress(&model_id, callback) {
                     Ok(new_backend) => {
                         // Recreate batch scheduler for new backend.
                         let new_sched =
@@ -1683,27 +1327,6 @@ async fn stream_response(
             }
         }
 
-        // Persist session metadata for new conversations BEFORE sending
-        // response.created — the client refreshes the sidebar on receipt and
-        // the session must already be in list_sessions at that point.
-        if !strict_responses && is_new_conversation && bucket_path.is_some() {
-            if let Ok(temp_chat) = ChatHandle::new(effective_system_prompt.as_deref()) {
-                if let Some(bp_str) = bucket_path.as_ref().and_then(|p| p.to_str()) {
-                    if temp_chat.set_storage_db(bp_str, &session_id).is_ok() {
-                        let t = input_string.as_deref().unwrap_or("Untitled");
-                        let title: String = t.chars().take(47).collect();
-                        let _ = temp_chat.notify_session_update_ex(
-                            Some(&model_id),
-                            Some(&title),
-                            Some("active"),
-                            prompt_id.as_deref(),
-                            project_id_for_stream.as_deref(),
-                        );
-                    }
-                }
-            }
-        }
-
         let mut created_response = normalize_response_value(build_response_resource_value(
             &response_id,
             &model_id,
@@ -1723,21 +1346,11 @@ async fn stream_response(
             None,
             tools_for_events.as_ref(),
             tool_choice_for_events.as_ref(),
-            store,
             instructions.as_deref(),
             text_format_for_events.as_ref(),
         ));
         if let Some(ref prev_id) = previous_response_id_for_ctx {
             created_response["previous_response_id"] = json!(prev_id);
-        }
-        if !strict_responses {
-            // Include session_id (and project_id if set) in the very first
-            // event so the UI can track the conversation immediately.
-            let mut meta = json!({ "session_id": session_id });
-            if let Some(ref pid) = project_id_for_stream {
-                meta["project_id"] = json!(pid);
-            }
-            created_response["metadata"] = meta;
         }
         let _ = send_event(
             &tx,
@@ -1780,13 +1393,10 @@ async fn stream_response(
             tool_choice_json: tool_choice_for_events,
             tenant_id: auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone()),
             user_id: auth_ctx.and_then(|ctx| ctx.user_id),
-            session_id: session_id.clone(),
             strict_responses,
-            request_store: store,
             previous_response_id: previous_response_id_for_ctx.clone(),
             instructions: instructions.clone(),
             text_format: text_format_for_events.clone(),
-            project_id: project_id.clone(),
             top_logprobs: logprobs.top_logprobs,
             top_k: effective_config
                 .as_ref()
@@ -1812,41 +1422,78 @@ async fn stream_response(
         let ctx_for_complete = ctx.clone();
 
         let batch_sched = state_for_store.batch_scheduler.lock().unwrap().clone();
-        let gen_result = if let Some(ref sched) = batch_sched {
-            run_batch_streaming_generation(
-                sched,
-                backend,
-                input_json,
-                input_string,
-                store_tools.clone(),
-                store_tool_choice.clone(),
-                text_format_for_events.clone(),
-                prev_json,
-                bucket_path,
-                session_id,
-                model_id.clone(),
-                max_output_tokens,
-                request_max_completion_tokens,
-                request_max_reasoning_tokens,
-                temperature,
-                top_p,
-                top_k,
-                seed,
-                presence_penalty,
-                frequency_penalty,
-                effective_system_prompt,
-                prompt_id,
-                project_id_for_stream,
-                file_storage_path,
-                ctx,
-                stop_flag_for_gen,
-                reasoning_for_events.effort.clone(),
-                events_tenant_id.clone(),
-                Some(events_request_id.clone()),
-                Some(events_response_id.clone()),
-                Some(events_session_id.clone()),
-                effective_config,
-            )
+        let contains_images =
+            vision::payload_may_include_images(input_json.as_deref(), prev_json.as_deref());
+        let use_batch_stream = has_prepared_vision_prefill || !contains_images;
+        let gen_result = if use_batch_stream {
+            if let Some(ref sched) = batch_sched {
+                run_batch_streaming_generation(
+                    sched,
+                    backend,
+                    input_json,
+                    input_string,
+                    store_tools.clone(),
+                    store_tool_choice.clone(),
+                    text_format_for_events.clone(),
+                    prev_json,
+                    model_id.clone(),
+                    max_output_tokens,
+                    request_max_completion_tokens,
+                    request_max_reasoning_tokens,
+                    temperature,
+                    top_p,
+                    top_k,
+                    seed,
+                    presence_penalty,
+                    frequency_penalty,
+                    effective_system_prompt,
+                    prompt_id,
+                    project_id.clone(),
+                    file_storage_path,
+                    ctx,
+                    stop_flag_for_gen,
+                    reasoning_for_events.effort.clone(),
+                    events_tenant_id.clone(),
+                    Some(events_request_id.clone()),
+                    Some(events_response_id.clone()),
+                    Some(events_session_id.clone()),
+                    effective_config,
+                    prepared_vision_prefill,
+                )
+            } else {
+                run_streaming_generation(
+                    backend,
+                    input_json,
+                    input_string,
+                    store_tools.clone(),
+                    store_tool_choice.clone(),
+                    text_format_for_events.clone(),
+                    prev_json,
+                    model_id.clone(),
+                    max_output_tokens,
+                    request_max_completion_tokens,
+                    request_max_reasoning_tokens,
+                    temperature,
+                    top_p,
+                    top_k,
+                    seed,
+                    presence_penalty,
+                    frequency_penalty,
+                    effective_system_prompt,
+                    prompt_id,
+                    project_id.clone(),
+                    file_storage_path,
+                    ctx,
+                    stop_flag_for_gen,
+                    reasoning_for_events.effort.clone(),
+                    events_tenant_id.clone(),
+                    Some(events_request_id.clone()),
+                    Some(events_response_id.clone()),
+                    Some(events_session_id.clone()),
+                    effective_config,
+                    prepared_vision_prefill,
+                )
+            }
         } else {
             run_streaming_generation(
                 backend,
@@ -1856,8 +1503,6 @@ async fn stream_response(
                 store_tool_choice.clone(),
                 text_format_for_events.clone(),
                 prev_json,
-                bucket_path,
-                session_id,
                 model_id.clone(),
                 max_output_tokens,
                 request_max_completion_tokens,
@@ -1870,7 +1515,7 @@ async fn stream_response(
                 frequency_penalty,
                 effective_system_prompt,
                 prompt_id,
-                project_id_for_stream,
+                project_id.clone(),
                 file_storage_path,
                 ctx,
                 stop_flag_for_gen,
@@ -1880,23 +1525,28 @@ async fn stream_response(
                 Some(events_response_id.clone()),
                 Some(events_session_id.clone()),
                 effective_config,
+                prepared_vision_prefill,
             )
         };
 
         // Store conversation for chaining after streaming completes.
-        if let Ok(ref r) = gen_result {
-            let mut store = state_for_store.response_store.blocking_lock();
-            store.insert(
-                response_id_for_store.clone(),
-                StoredResponse {
+        let gen_result = match gen_result {
+            Ok(r) => {
+                let stored_response = StoredResponse {
                     responses_json: r.responses_json.clone(),
-                    tools_json: store_tools,
-                    tool_choice_json: store_tool_choice,
-                    session_id: Some(session_id_for_store),
-                    tenant_id: tenant_id_for_store,
-                },
-            );
-        }
+                    tools_json: store_tools.clone(),
+                    tool_choice_json: store_tool_choice.clone(),
+                    session_id: Some(session_id_for_store.clone()),
+                    tenant_id: tenant_id_for_store.clone(),
+                };
+                {
+                    let mut response_store = state_for_store.response_store.blocking_lock();
+                    response_store.insert(response_id_for_store.clone(), stored_response);
+                }
+                Ok(r)
+            }
+            Err(err) => Err(err),
+        };
 
         if let Ok(mut guard) = ctx_for_complete.lock() {
             let _ = guard.flush_completion(
@@ -1912,7 +1562,7 @@ async fn stream_response(
         // Auto-generate a descriptive title for new conversations.
         if !strict_responses && is_new_conversation && auto_title {
             if let Some(ref input) = title_input {
-                let _ = generate_title(&title_backend, &title_bucket, &title_session_id, input);
+                let _ = generate_title(&title_backend, &title_session_id, input);
             }
         }
     });
@@ -1932,7 +1582,7 @@ async fn stream_response(
 
 /// Run streaming generation via `talu::router::generate_stream` (callback API).
 ///
-/// Used for remote/provider backends that do not have a batch scheduler.
+/// Used when no batch scheduler is available.
 /// Local backends use [`run_batch_streaming_generation`] instead.
 fn run_streaming_generation(
     backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
@@ -1942,8 +1592,6 @@ fn run_streaming_generation(
     tool_choice_json: Option<serde_json::Value>,
     _text_format: Option<TextFormatConfig>,
     prev_json: Option<String>,
-    bucket_path: Option<std::path::PathBuf>,
-    session_id: String,
     model_id: String,
     max_output_tokens: Option<i64>,
     max_completion_tokens: Option<i64>,
@@ -1955,8 +1603,8 @@ fn run_streaming_generation(
     presence_penalty: Option<f64>,
     frequency_penalty: Option<f64>,
     system_prompt: Option<String>,
-    prompt_id: Option<String>,
-    project_id: Option<String>,
+    _prompt_id: Option<String>,
+    _project_id: Option<String>,
     file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
@@ -1966,6 +1614,7 @@ fn run_streaming_generation(
     event_response_id: Option<String>,
     event_session_id: Option<String>,
     effective_config: Option<talu::model::EffectiveGenConfig>,
+    prepared_vision_prefill: Option<talu::router::VisionPrefillInput>,
 ) -> Result<StreamGenResult> {
     let mut backend = backend.blocking_lock();
     let backend = backend
@@ -1976,29 +1625,10 @@ fn run_streaming_generation(
     log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt.is_some());
     let chat = ChatHandle::new(system_prompt.as_deref())?;
 
-    // Enable storage persistence if store=true and bucket is configured.
-    // set_storage_db auto-loads any existing items for this session.
-    let has_storage = if let Some(ref bp) = bucket_path {
-        if let Some(bp_str) = bp.to_str() {
-            log::trace!(target: "server::gen", "set_storage_db({:?}, {})", bp_str, session_id);
-            chat.set_storage_db(bp_str, &session_id)
-                .map_err(|e| anyhow!("failed to set storage: {}", e))?;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // Restore previous conversation from in-memory JSON only when storage
-    // is not active — set_storage_db already loaded persisted items.
-    if !has_storage {
-        if let Some(ref prev) = prev_json {
-            log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
-            chat.load_responses_json(prev)
-                .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
-        }
+    if let Some(ref prev) = prev_json {
+        log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
+        chat.load_responses_json(prev)
+            .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
     }
 
     // Load input items into the conversation, resolving file references.
@@ -2030,7 +1660,7 @@ fn run_streaming_generation(
         cfg.frequency_penalty = eff.frequency_penalty;
         cfg.seed = eff.seed;
     } else {
-        // Fallback for remote/provider models where presets are unavailable.
+        // Fallback when preset lookup is unavailable.
         if let Some(max_tokens) = max_output_tokens {
             cfg.max_tokens = max_tokens as usize;
         }
@@ -2062,6 +1692,18 @@ fn run_streaming_generation(
     if let Some(mrt) = max_reasoning_tokens {
         cfg.max_reasoning_tokens = Some(mrt as usize);
     }
+    cfg.vision_prefill = if let Some(prefill) = prepared_vision_prefill {
+        log::info!(
+            target: "server::vision",
+            "model={} path=prepared profile_version={}",
+            model_id,
+            vision::VISION_PROFILE_VERSION
+        );
+        Some(prefill)
+    } else {
+        vision::prepare_vision_prefill(&chat, &model_id)
+            .map_err(|e| anyhow!("vision prepare failed: {e}"))?
+    };
 
     // Pass the stop flag for cooperative cancellation.
     // Clone before moving into cfg so the callback can also check it.
@@ -2097,24 +1739,6 @@ fn run_streaming_generation(
 
     // Record item count before generation to extract only new output items.
     let pre_gen_count = chat.item_count();
-
-    // Persist session metadata BEFORE generation so the conversation appears
-    // in list_sessions immediately — the user can navigate to it while
-    // generation is still in progress.
-    // A brand-new chat has at most 2 items before generation: an optional
-    // system message (from prompt_id) + the user message.  Chained requests
-    // have more items and must skip this to avoid overwriting the title.
-    if bucket_path.is_some() && pre_gen_count <= 2 {
-        let t = input_string.as_deref().unwrap_or("Untitled");
-        let title: String = t.chars().take(47).collect();
-        let _ = chat.notify_session_update_ex(
-            Some(&model_id),
-            Some(&title),
-            Some("active"),
-            prompt_id.as_deref(),
-            project_id.as_deref(),
-        );
-    }
 
     log::trace!(target: "server::gen", "generate_stream(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
         pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
@@ -2165,8 +1789,6 @@ fn run_batch_streaming_generation(
     tool_choice_json: Option<serde_json::Value>,
     _text_format: Option<TextFormatConfig>,
     prev_json: Option<String>,
-    bucket_path: Option<std::path::PathBuf>,
-    session_id: String,
     model_id: String,
     max_output_tokens: Option<i64>,
     max_completion_tokens: Option<i64>,
@@ -2178,8 +1800,8 @@ fn run_batch_streaming_generation(
     presence_penalty: Option<f64>,
     frequency_penalty: Option<f64>,
     system_prompt: Option<String>,
-    prompt_id: Option<String>,
-    project_id: Option<String>,
+    _prompt_id: Option<String>,
+    _project_id: Option<String>,
     file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
@@ -2189,34 +1811,19 @@ fn run_batch_streaming_generation(
     _event_response_id: Option<String>,
     _event_session_id: Option<String>,
     effective_config: Option<talu::model::EffectiveGenConfig>,
+    prepared_vision_prefill: Option<talu::router::VisionPrefillInput>,
 ) -> Result<StreamGenResult> {
     // --- Conversation setup (same as run_streaming_generation) ---
     let chat = ChatHandle::new(system_prompt.as_deref())?;
 
-    let has_storage = if let Some(ref bp) = bucket_path {
-        if let Some(bp_str) = bp.to_str() {
-            chat.set_storage_db(bp_str, &session_id)
-                .map_err(|e| anyhow!("failed to set storage: {}", e))?;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // Restore previous conversation from in-memory JSON only when storage
-    // is not active — set_storage_db already loaded persisted items.
-    if !has_storage {
-        if let Some(ref prev) = prev_json {
-            chat.load_responses_json(prev)
-                .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
-        }
+    if let Some(ref prev) = prev_json {
+        chat.load_responses_json(prev)
+            .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
     }
 
     log::info!(target: "server::gen",
-        "batch_stream setup: has_storage={} items_after_load={} has_prev={}",
-        has_storage, chat.item_count(), prev_json.is_some());
+        "batch_stream setup: items_after_load={} has_prev={}",
+        chat.item_count(), prev_json.is_some());
 
     if let Some(ref json) = input_json {
         let resolved = match file_storage_path.as_deref() {
@@ -2233,18 +1840,6 @@ fn run_batch_streaming_generation(
     let pre_gen_count = chat.item_count();
     log::info!(target: "server::gen",
         "batch_stream pre-gen: items={}", pre_gen_count);
-
-    if bucket_path.is_some() && pre_gen_count <= 2 {
-        let t = input_string.as_deref().unwrap_or("Untitled");
-        let title: String = t.chars().take(47).collect();
-        let _ = chat.notify_session_update_ex(
-            Some(&model_id),
-            Some(&title),
-            Some("active"),
-            prompt_id.as_deref(),
-            project_id.as_deref(),
-        );
-    }
 
     // --- Build GenerateConfig ---
     let mut cfg = talu::router::GenerateConfig::default();
@@ -2291,6 +1886,18 @@ fn run_batch_streaming_generation(
         cfg.max_reasoning_tokens = Some(mrt as usize);
     }
     cfg.stop_flag = Some(stop_flag.clone());
+    cfg.vision_prefill = if let Some(prefill) = prepared_vision_prefill {
+        log::info!(
+            target: "server::vision",
+            "model={} path=prepared profile_version={}",
+            model_id,
+            vision::VISION_PROFILE_VERSION
+        );
+        Some(prefill)
+    } else {
+        vision::prepare_vision_prefill(&chat, &model_id)
+            .map_err(|e| anyhow!("vision prepare failed: {e}"))?
+    };
 
     // Capture generation config before submit moves cfg.
     let gen_temperature = cfg.temperature;
@@ -2395,7 +2002,7 @@ fn run_batch_streaming_generation(
     }
 
     // Flush the last content/item so output_items is fully populated before
-    // we read it for storage persistence and response building.
+    // we read it for response building and in-memory chaining state.
     if let Ok(mut guard) = ctx.lock() {
         let _ = guard.flush_coalesce();
         let _ = guard.emit_content_done();
@@ -2417,7 +2024,7 @@ fn run_batch_streaming_generation(
     };
 
     // For conversation chaining, inject generation metadata into the last
-    // assistant message so it persists to storage and is available on reload.
+    // assistant message so follow-up turns can inherit generation context.
     if let Ok(mut guard) = ctx.lock() {
         let mut gen_data = json!({
             "model": model_id,
@@ -2485,7 +2092,6 @@ fn run_batch_streaming_generation(
 /// title-generation system prompt.
 fn generate_title(
     backend: &Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
-    bucket_path: &Option<std::path::PathBuf>,
     session_id: &str,
     input_text: &str,
 ) -> Result<String> {
@@ -2531,17 +2137,7 @@ fn generate_title(
         return Err(anyhow!("generated title is empty"));
     }
 
-    // Update the session title in storage.
-    if let Some(ref bp) = bucket_path {
-        if let Ok(storage) = talu::storage::StorageHandle::open(bp) {
-            let update = talu::storage::SessionUpdate {
-                title: Some(title.clone()),
-                ..Default::default()
-            };
-            let _ = storage.update_session(session_id, &update);
-            log::info!(target: "server::gen", "auto-title for {session_id}: {title:?}");
-        }
-    }
+    log::info!(target: "server::gen", "auto-title generated for {session_id}: {title:?}");
 
     Ok(title)
 }
@@ -2553,7 +2149,7 @@ struct StreamGenResult {
     finish_reason: FinishReason,
     /// Full conversation JSON for chaining via response_store.
     responses_json: String,
-    /// Static model metadata (null for remote backends).
+    /// Static model metadata (null when unavailable).
     model_info_json: serde_json::Value,
 }
 
@@ -2594,20 +2190,14 @@ struct StreamCtx {
     tenant_id: Option<String>,
     /// Optional user identifier from the gateway.
     user_id: Option<String>,
-    /// TaluDB session ID (returned in metadata so the UI can chain follow-ups).
-    session_id: String,
     /// Whether this stream is serving strict `/v1/responses`.
     strict_responses: bool,
-    /// Request `store` flag.
-    request_store: bool,
     /// Previous response chain id from the request.
     previous_response_id: Option<String>,
     /// Request instructions field for OpenResponses response resources.
     instructions: Option<String>,
     /// Request text format configuration for response resource round-tripping.
     text_format: Option<TextFormatConfig>,
-    /// Project ID from request metadata (returned in response metadata).
-    project_id: Option<String>,
     /// Requested top_logprobs count from the API request.
     top_logprobs: usize,
     /// Request sampling penalties echoed in response resources.
@@ -3186,7 +2776,6 @@ impl StreamCtx {
                     Some(&r.usage),
                     self.tools_json.as_ref(),
                     self.tool_choice_json.as_ref(),
-                    self.request_store,
                     self.instructions.as_deref(),
                     self.text_format.as_ref(),
                 );
@@ -3204,13 +2793,6 @@ impl StreamCtx {
                     response["incomplete_details"] = json!({
                         "reason": reason
                     });
-                }
-                if !self.strict_responses {
-                    let mut meta = json!({ "session_id": self.session_id });
-                    if let Some(ref pid) = self.project_id {
-                        meta["project_id"] = json!(pid);
-                    }
-                    response["metadata"] = meta;
                 }
                 let response = normalize_response_value(response);
                 let payload = json!({
@@ -3256,7 +2838,6 @@ impl StreamCtx {
                     None,
                     self.tools_json.as_ref(),
                     self.tool_choice_json.as_ref(),
-                    self.request_store,
                     self.instructions.as_deref(),
                     self.text_format.as_ref(),
                 );
@@ -3267,13 +2848,6 @@ impl StreamCtx {
                     "code": "server_error",
                     "message": format!("{err}")
                 });
-                if !self.strict_responses {
-                    let mut meta = json!({ "session_id": self.session_id });
-                    if let Some(ref pid) = self.project_id {
-                        meta["project_id"] = json!(pid);
-                    }
-                    response["metadata"] = meta;
-                }
                 let response = normalize_response_value(response);
                 let payload = json!({
                     "type": "response.failed",
@@ -3449,7 +3023,6 @@ fn build_response_resource_value(
     usage: Option<&UsageStats>,
     tools: Option<&serde_json::Value>,
     tool_choice: Option<&serde_json::Value>,
-    store: bool,
     instructions: Option<&str>,
     text_format: Option<&TextFormatConfig>,
 ) -> serde_json::Value {
@@ -3510,7 +3083,7 @@ fn build_response_resource_value(
         "usage": usage_value,
         "max_output_tokens": max_output_tokens,
         "max_tool_calls": null,
-        "store": store,
+        "store": false,
         "background": false,
         "service_tier": "default",
         "metadata": {},
@@ -3548,19 +3121,6 @@ async fn select_model_id_ex(
                 return Ok(configured);
             }
 
-            // Provider-prefixed model (e.g. "vllm::llama3") — accept directly.
-            // Routing to the correct provider backend happens later in
-            // create_backend_for_model_with_progress via parse_model_target.
-            if requested.contains("::") {
-                return Ok(requested);
-            }
-
-            // Check remote backend models (e.g. OpenAI-compatible providers).
-            let models = list_backend_models(state.clone()).await.unwrap_or_default();
-            if models.iter().any(|model| model.id == requested) {
-                return Ok(requested);
-            }
-
             // Check managed local models and hot-swap if found.
             let requested_clone = requested.clone();
             let found = tokio::task::spawn_blocking(move || {
@@ -3581,14 +3141,9 @@ async fn select_model_id_ex(
 
             return Err(anyhow!("model not available: {}", requested));
         }
-
-        let models = list_backend_models(state.clone()).await.unwrap_or_default();
-        if let Some(first) = models.first() {
-            if !first.id.is_empty() {
-                return Ok(first.id.clone());
-            }
+        if load_backend {
+            ensure_backend_for_model(state.clone(), &configured).await?;
         }
-
         return Ok(configured);
     }
 
@@ -3597,17 +3152,6 @@ async fn select_model_id_ex(
         ensure_backend_for_model(state.clone(), &requested).await?;
     }
     Ok(requested)
-}
-
-async fn list_backend_models(state: Arc<AppState>) -> Result<Vec<talu::RemoteModelInfo>> {
-    let mut guard = state.backend.lock().await;
-    let backend = guard
-        .backend
-        .as_mut()
-        .ok_or_else(|| anyhow!("no backend available"))?;
-    backend
-        .list_models()
-        .map_err(|err| anyhow!("model listing failed: {err}"))
 }
 
 async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Result<()> {
@@ -3690,14 +3234,8 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
     log::info!(target: "server::gen", "loading backend for model {}", model_id);
     let model = model_id.to_string();
     let model_key = model_id.to_string();
-    let db_root = state
-        .bucket_path
-        .as_ref()
-        .map(|b| b.join("kv").to_string_lossy().into_owned());
-    let load_result = tokio::task::spawn_blocking(move || {
-        provider::create_backend_for_model(&model, db_root.as_deref())
-    })
-    .await;
+    let load_result =
+        tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model)).await;
 
     let backend = match load_result {
         Ok(Ok(b)) => b,
@@ -3966,16 +3504,102 @@ fn validate_max_output_tokens(max_output_tokens: Option<i64>) -> std::result::Re
     Ok(())
 }
 
+/// `max_tool_calls` is a workflow-orchestration control and is owned by the
+/// provider layer above inference.
 fn validate_max_tool_calls(max_tool_calls: Option<i64>) -> std::result::Result<(), String> {
-    let Some(max_tool_calls) = max_tool_calls else {
-        return Ok(());
-    };
-    if max_tool_calls < 1 {
-        return Err("`max_tool_calls` must be at least 1".to_string());
+    if max_tool_calls.is_some() {
+        return Err(
+            "`max_tool_calls` is not supported in this inference-only build; enforce tool-call limits in talupi"
+                .to_string(),
+        );
     }
     Ok(())
 }
 
+/// `parallel_tool_calls` is a provider scheduling policy and is owned by the
+/// layer executing tools, not by the inference-only server.
+fn validate_parallel_tool_calls(
+    parallel_tool_calls: Option<bool>,
+) -> std::result::Result<(), String> {
+    if parallel_tool_calls.is_some() {
+        return Err(
+            "`parallel_tool_calls` is not supported in this inference-only build; enforce parallel tool execution in talupi".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_responses_request(request: &responses_types::CreateResponseBody) -> Result<(), String> {
+    if let Some(input) = request.input.as_ref() {
+        if !(input.is_string() || input.is_array() || input.is_null()) {
+            return Err("`input` must be a string, an array, or null".to_string());
+        }
+        if let Some(text) = input.as_str() {
+            if text.chars().count() > 10_485_760 {
+                return Err("`input` string must be at most 10485760 characters".to_string());
+            }
+        }
+        if input.is_array() {
+            validate_input_items(input)?;
+        }
+    }
+
+    validate_metadata(request.metadata.as_ref())?;
+
+    if let Some(tools) = request.tools.as_ref() {
+        validate_tools_shape(tools)?;
+    }
+
+    if let Some(tool_choice) = request.tool_choice.as_ref() {
+        validate_tool_choice(tool_choice)?;
+    }
+
+    parse_requested_text_format(request.text.as_ref())?;
+    let _ = parse_logprob_config(request.include.as_ref(), request.top_logprobs)?;
+    let _ = parse_reasoning_config(request.reasoning.as_ref())?;
+    validate_temperature(request.temperature)?;
+    validate_top_p(request.top_p)?;
+    validate_max_output_tokens(request.max_output_tokens)?;
+    validate_max_tool_calls(request.max_tool_calls)?;
+    validate_parallel_tool_calls(request.parallel_tool_calls)?;
+    validate_penalty_bounds("presence_penalty", request.presence_penalty)?;
+    validate_penalty_bounds("frequency_penalty", request.frequency_penalty)?;
+    parse_stream_options_config(request.stream_options.as_ref())?;
+    validate_service_tier(request.service_tier.as_deref())?;
+    validate_safety_identifier(request.safety_identifier.as_deref())?;
+    validate_prompt_cache_key(request.prompt_cache_key.as_deref())?;
+    validate_truncation(request.truncation.as_deref())?;
+    Ok(())
+}
+
+fn validate_tool_choice(tool_choice: &serde_json::Value) -> Result<(), String> {
+    if let Some(choice) = tool_choice.as_str() {
+        if matches!(choice, "none" | "auto" | "required") {
+            return Ok(());
+        }
+        return Err("`tool_choice` string must be one of: none, auto, required".to_string());
+    }
+
+    let obj = tool_choice
+        .as_object()
+        .ok_or_else(|| "`tool_choice` must be a string or object".to_string())?;
+    let choice_type = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "`tool_choice.type` must be a string".to_string())?;
+
+    // Keep the inference contract narrow: single-function forcing is supported,
+    // provider-level filtering extensions are not.
+    match choice_type {
+        "function" => {
+            if obj.get("name").and_then(|v| v.as_str()).is_none() {
+                return Err("`tool_choice` of type `function` requires a string `name`".to_string());
+            }
+            Ok(())
+        }
+        _ => Err("`tool_choice.type` must be `function`".to_string()),
+    }
+}
 fn validate_prompt_cache_key(prompt_cache_key: Option<&str>) -> std::result::Result<(), String> {
     let Some(prompt_cache_key) = prompt_cache_key else {
         return Ok(());
@@ -4315,11 +3939,26 @@ fn validate_image_part(
     part_obj: &serde_json::Map<String, serde_json::Value>,
     context: &str,
 ) -> std::result::Result<(), String> {
-    let image_url = part_obj
-        .get("image_url")
-        .ok_or_else(|| format!("`{context}.image_url` is required"))?;
-    if !(image_url.is_string() || image_url.is_null()) {
-        return Err(format!("`{context}.image_url` must be a string or null"));
+    let image_url = part_obj.get("image_url");
+    let prepared = part_obj.get("prepared");
+    if image_url.is_none() && prepared.is_none() {
+        return Err(format!(
+            "`{context}` must include either `image_url` or `prepared`"
+        ));
+    }
+    if image_url.is_some() && prepared.is_some() {
+        return Err(format!(
+            "`{context}` cannot include both `image_url` and `prepared`"
+        ));
+    }
+    if let Some(image_url) = image_url {
+        if !(image_url.is_string() || image_url.is_null()) {
+            return Err(format!("`{context}.image_url` must be a string or null"));
+        }
+    }
+    if let Some(prepared) = prepared {
+        vision::validate_prepared_image_payload_shape(prepared)
+            .map_err(|e| format!("`{context}.prepared` is invalid: {e}"))?;
     }
     if let Some(detail_value) = part_obj.get("detail") {
         let detail = detail_value
@@ -4444,107 +4083,6 @@ fn validate_truncation(truncation: Option<&str>) -> std::result::Result<(), Stri
     }
 }
 
-fn validate_responses_request(request: &responses_types::CreateResponseBody) -> Result<(), String> {
-    if let Some(input) = request.input.as_ref() {
-        if !(input.is_string() || input.is_array() || input.is_null()) {
-            return Err("`input` must be a string, an array, or null".to_string());
-        }
-        if let Some(text) = input.as_str() {
-            if text.chars().count() > 10_485_760 {
-                return Err("`input` string must be at most 10485760 characters".to_string());
-            }
-        }
-        if input.is_array() {
-            validate_input_items(input)?;
-        }
-    }
-
-    validate_metadata(request.metadata.as_ref())?;
-
-    if let Some(tools) = request.tools.as_ref() {
-        validate_tools_shape(tools)?;
-    }
-
-    if let Some(tool_choice) = request.tool_choice.as_ref() {
-        validate_tool_choice(tool_choice)?;
-    }
-
-    parse_requested_text_format(request.text.as_ref())?;
-    let _ = parse_logprob_config(request.include.as_ref(), request.top_logprobs)?;
-    let _ = parse_reasoning_config(request.reasoning.as_ref())?;
-    validate_temperature(request.temperature)?;
-    validate_top_p(request.top_p)?;
-    validate_max_output_tokens(request.max_output_tokens)?;
-    validate_max_tool_calls(request.max_tool_calls)?;
-    validate_penalty_bounds("presence_penalty", request.presence_penalty)?;
-    validate_penalty_bounds("frequency_penalty", request.frequency_penalty)?;
-    parse_stream_options_config(request.stream_options.as_ref())?;
-    validate_service_tier(request.service_tier.as_deref())?;
-    validate_safety_identifier(request.safety_identifier.as_deref())?;
-    validate_prompt_cache_key(request.prompt_cache_key.as_deref())?;
-    validate_truncation(request.truncation.as_deref())?;
-    Ok(())
-}
-
-fn validate_tool_choice(tool_choice: &serde_json::Value) -> Result<(), String> {
-    if let Some(choice) = tool_choice.as_str() {
-        if matches!(choice, "none" | "auto" | "required") {
-            return Ok(());
-        }
-        return Err("`tool_choice` string must be one of: none, auto, required".to_string());
-    }
-
-    let obj = tool_choice
-        .as_object()
-        .ok_or_else(|| "`tool_choice` must be a string or object".to_string())?;
-    let choice_type = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "`tool_choice.type` must be a string".to_string())?;
-
-    match choice_type {
-        "function" => {
-            if obj.get("name").and_then(|v| v.as_str()).is_none() {
-                return Err("`tool_choice` of type `function` requires a string `name`".to_string());
-            }
-            Ok(())
-        }
-        "allowed_tools" => {
-            let tools = obj.get("tools").and_then(|v| v.as_array()).ok_or_else(|| {
-                "`tool_choice` of type `allowed_tools` requires `tools` array".to_string()
-            })?;
-            if tools.is_empty() {
-                return Err("`tool_choice.tools` must contain at least one tool".to_string());
-            }
-            if tools.len() > 128 {
-                return Err("`tool_choice.tools` must contain at most 128 tools".to_string());
-            }
-            for tool in tools {
-                let tool_obj = tool
-                    .as_object()
-                    .ok_or_else(|| "`tool_choice.tools[*]` must be an object".to_string())?;
-                if tool_obj.get("type").and_then(|v| v.as_str()) != Some("function")
-                    || tool_obj.get("name").and_then(|v| v.as_str()).is_none()
-                {
-                    return Err(
-                        "`tool_choice.tools[*]` must be `{ \"type\": \"function\", \"name\": \"...\" }`"
-                            .to_string(),
-                    );
-                }
-            }
-            if let Some(mode) = obj.get("mode").and_then(|v| v.as_str()) {
-                if !matches!(mode, "none" | "auto" | "required") {
-                    return Err(
-                        "`tool_choice.mode` must be one of: none, auto, required".to_string()
-                    );
-                }
-            }
-            Ok(())
-        }
-        _ => Err("`tool_choice.type` must be `function` or `allowed_tools`".to_string()),
-    }
-}
-
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody> {
     let payload = json!({
         "error": {
@@ -4613,7 +4151,6 @@ mod tests {
             safety_identifier: None,
             service_tier: None,
             seed: None,
-            store: None,
             stream: None,
             stream_options: None,
             temperature: None,
@@ -4664,14 +4201,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_max_tool_calls_rejects_values_below_minimum() {
+    fn validate_max_tool_calls_rejects_inference_only_provider_knob() {
         assert!(validate_max_tool_calls(Some(0)).is_err());
-        assert!(validate_max_tool_calls(Some(1)).is_ok());
+        assert!(validate_max_tool_calls(Some(1)).is_err());
+        assert!(validate_max_tool_calls(None).is_ok());
+    }
+
+    #[test]
+    fn validate_parallel_tool_calls_rejects_inference_only_provider_knob() {
+        assert!(validate_parallel_tool_calls(Some(false)).is_err());
+        assert!(validate_parallel_tool_calls(Some(true)).is_err());
+        assert!(validate_parallel_tool_calls(None).is_ok());
     }
 
     #[test]
     fn validate_tool_choice_rejects_invalid_string() {
         assert!(validate_tool_choice(&json!("sometimes")).is_err());
+    }
+
+    #[test]
+    fn validate_tool_choice_rejects_allowed_tools_extension() {
+        let value = json!({
+            "type": "allowed_tools",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "foo"
+                }
+            ]
+        });
+        assert!(validate_tool_choice(&value).is_err());
     }
 
     #[test]

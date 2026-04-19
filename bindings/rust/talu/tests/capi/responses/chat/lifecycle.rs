@@ -29,14 +29,11 @@ fn create_with_session() {
         talu_sys::talu_chat_create_with_session(session_id.as_ptr(), std::ptr::null_mut())
     };
     assert!(!ptr.is_null(), "create_with_session should return non-null");
-
-    let got_session = unsafe { talu_sys::talu_chat_get_session_id(ptr) };
-    if !got_session.is_null() {
-        let s = unsafe { std::ffi::CStr::from_ptr(got_session) }
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(s, "session-abc");
-    }
+    let conv = unsafe { talu_sys::talu_chat_get_conversation(ptr) };
+    assert!(
+        !conv.is_null(),
+        "session-backed chat must expose a conversation handle"
+    );
     unsafe { talu_sys::talu_chat_free(ptr) };
 }
 
@@ -70,11 +67,4 @@ fn get_conversation_returns_view() {
     // System prompt is stored internally, not as a conversation item in all implementations.
     // Just verify we can access item_count without panicking.
     let _count = conv.item_count();
-}
-
-#[test]
-fn validate_live_chat() {
-    let chat = ChatHandle::new(None).unwrap();
-    let rc = unsafe { talu_sys::talu_chat_validate(chat.as_ptr()) };
-    assert_eq!(rc, 1, "validate should return 1 for live chat");
 }

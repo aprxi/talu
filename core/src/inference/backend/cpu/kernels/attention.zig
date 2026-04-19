@@ -34,7 +34,6 @@ const dump = if (build_options.dump_tensors) @import("xray_pkg").dump.capture el
 
 const Tensor = tensor.Tensor;
 
-
 const MatmulFn = cpu_linalg.MatmulFn;
 const RoPE = rope_kernel.RoPE;
 const FlashAttentionFn = flash_attention.FlashAttentionFn;
@@ -233,64 +232,6 @@ pub const AttnTemp = struct {
         self.* = .{};
     }
 };
-
-/// Dequantize i8 KV cache data to f32 using SIMD.
-/// src: [num_positions * head_dim] i8 values
-/// scales: [num_positions] scale factors (one per position)
-/// dst: [num_positions * head_dim] f32 output
-/// dequantize: f32_val = i8_val * scale[position]
-fn dequantizeKVHead(src: []const i8, scales: []const f32, dst: []f32, num_positions: usize, head_dim: usize) void {
-    std.debug.assert(src.len >= num_positions * head_dim);
-    std.debug.assert(scales.len >= num_positions);
-    std.debug.assert(dst.len >= num_positions * head_dim);
-
-    // SIMD: process 16 i8 values → 16 f32 values per iteration
-    const vec_len = 16;
-
-    for (0..num_positions) |pos| {
-        const scale = scales[pos];
-        const scale_vec: @Vector(4, f32) = @splat(scale);
-        const src_row = src[pos * head_dim ..][0..head_dim];
-        const dst_row = dst[pos * head_dim ..][0..head_dim];
-
-        var i: usize = 0;
-        // Main SIMD loop: process 16 i8 at a time
-        while (i + vec_len <= head_dim) : (i += vec_len) {
-            // Load 16 i8 values
-            const i8_vec: @Vector(vec_len, i8) = src_row[i..][0..vec_len].*;
-
-            // Process in 4 groups of 4 to convert i8 → f32
-            // Group 0: elements 0-3
-            const i8_0: @Vector(4, i8) = .{ i8_vec[0], i8_vec[1], i8_vec[2], i8_vec[3] };
-            const i32_0: @Vector(4, i32) = i8_0;
-            const f32_0: @Vector(4, f32) = @floatFromInt(i32_0);
-            dst_row[i..][0..4].* = f32_0 * scale_vec;
-
-            // Group 1: elements 4-7
-            const i8_1: @Vector(4, i8) = .{ i8_vec[4], i8_vec[5], i8_vec[6], i8_vec[7] };
-            const i32_1: @Vector(4, i32) = i8_1;
-            const f32_1: @Vector(4, f32) = @floatFromInt(i32_1);
-            dst_row[i + 4 ..][0..4].* = f32_1 * scale_vec;
-
-            // Group 2: elements 8-11
-            const i8_2: @Vector(4, i8) = .{ i8_vec[8], i8_vec[9], i8_vec[10], i8_vec[11] };
-            const i32_2: @Vector(4, i32) = i8_2;
-            const f32_2: @Vector(4, f32) = @floatFromInt(i32_2);
-            dst_row[i + 8 ..][0..4].* = f32_2 * scale_vec;
-
-            // Group 3: elements 12-15
-            const i8_3: @Vector(4, i8) = .{ i8_vec[12], i8_vec[13], i8_vec[14], i8_vec[15] };
-            const i32_3: @Vector(4, i32) = i8_3;
-            const f32_3: @Vector(4, f32) = @floatFromInt(i32_3);
-            dst_row[i + 12 ..][0..4].* = f32_3 * scale_vec;
-        }
-
-        // Scalar tail for remaining elements (if head_dim not divisible by 16)
-        while (i < head_dim) : (i += 1) {
-            dst_row[i] = @as(f32, @floatFromInt(src_row[i])) * scale;
-        }
-    }
-}
 
 /// Per-layer KV cache (must persist across calls).
 ///

@@ -47,7 +47,7 @@ test "flash_prefill_f16 matches CPU reference on grouped-head geometry" {
     const theta: f32 = 10000.0;
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(shape.head_dim)));
 
-    var prng = std.Random.DefaultPrng.init(0x83B2_A019_D5C1_477Eu64);
+    var prng = std.Random.DefaultPrng.init(0x83B2_A019_D5C1_477E);
     const random = prng.random();
 
     const query_count = @as(usize, shape.q_rows) * @as(usize, shape.n_heads) * @as(usize, shape.head_dim);
@@ -156,11 +156,11 @@ fn computeFlashPrefillReference(
     const n_kv_heads = shape.n_heads / shape.kv_groups;
     const inv_scale = @as(f32, @floatFromInt(shape.rope_dim));
 
-    var q_rot = std.ArrayList(f32).init(std.testing.allocator);
+    var q_rot = std.array_list.Managed(f32).init(std.testing.allocator);
     defer q_rot.deinit();
     q_rot.resize(head_dim_usize) catch unreachable;
 
-    var scores = std.ArrayList(f32).init(std.testing.allocator);
+    var scores = std.array_list.Managed(f32).init(std.testing.allocator);
     defer scores.deinit();
     scores.resize(shape.seq_len) catch unreachable;
 

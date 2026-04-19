@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const runtime_contract = @import("runtime_contract_pkg");
-const image_mod = @import("image_pkg");
+const vision_types = @import("vision_types.zig");
 
 const missing_register_storage_byte: u8 = 0;
 const invalid_physical_id: u16 = std.math.maxInt(u16);
@@ -177,14 +177,14 @@ pub const EncodedSingleImage = struct {
 /// Type-erased vtable for VisionRuntime methods used by adapters.
 pub const VisionRuntimeVTable = struct {
     deepstackLayerToMergerIndex: *const fn (runtime_ptr: *anyopaque, layer_idx: usize) ?usize,
-    runMerger: *const fn (runtime_ptr: *anyopaque, grid: image_mod.VisionGrid, hidden: []const f32) anyerror![]f32,
+    runMerger: *const fn (runtime_ptr: *anyopaque, grid: vision_types.VisionGrid, hidden: []const f32) anyerror![]f32,
 };
 
 /// Generates a `VisionRuntimeVTable` for a concrete VisionRuntime type.
 ///
 /// `VRT` must expose:
 ///   - method `deepstackLayerToMergerIndex(layer_idx: usize) ?usize`
-///   - method `runMerger(grid: image_mod.VisionGrid, hidden: []const f32) ![]f32`
+///   - method `runMerger(grid: vision_types.VisionGrid, hidden: []const f32) ![]f32`
 pub fn VTableFor(comptime VRT: type) type {
     return struct {
         pub const vtable = VisionRuntimeVTable{
@@ -195,7 +195,7 @@ pub fn VTableFor(comptime VRT: type) type {
                 }
             }.call,
             .runMerger = struct {
-                fn call(runtime_ptr: *anyopaque, grid: image_mod.VisionGrid, hidden: []const f32) anyerror![]f32 {
+                fn call(runtime_ptr: *anyopaque, grid: vision_types.VisionGrid, hidden: []const f32) anyerror![]f32 {
                     const self: *VRT = @ptrCast(@alignCast(runtime_ptr));
                     return self.runMerger(grid, hidden);
                 }
@@ -229,7 +229,7 @@ pub const ExecutionContext = struct {
     vtable: *const VisionRuntimeVTable,
     compiled_plan: *const runtime_contract.CompiledPlan,
     op_index: usize,
-    grid: image_mod.VisionGrid,
+    grid: vision_types.VisionGrid,
     merged_hidden_in: []const f32,
     deepstack_layer_embeddings: []const []const f32,
     state: *AdapterState,
@@ -254,7 +254,7 @@ pub fn runVisionProgram(
     compiled_vision_plan: *const runtime_contract.CompiledPlan,
     dispatch_counters: ?*runtime_contract.DispatchCounters,
     dispatch_table: runtime_contract.AdapterTable,
-    grid: image_mod.VisionGrid,
+    grid: vision_types.VisionGrid,
     merged_hidden_in: []const f32,
     deepstack_layer_embeddings: []const []const f32,
 ) !EncodedSingleImage {

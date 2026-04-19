@@ -1,23 +1,22 @@
 use std::env;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
 use indicatif::{ProgressBar, ProgressStyle};
-use serde_json;
+use serde_json::json;
 use talu::responses::ResponsesView;
 
 use talu::error::last_error_message;
-use talu::{ChatHandle, InferenceBackend, StorageError, StorageHandle};
+use talu::{ChatHandle, InferenceBackend};
 
-use crate::provider::{get_provider, parse_model_target, ModelTarget};
+use crate::provider::ensure_local_model_target;
+use crate::server::vision;
 
 use super::repo::{resolve_model_for_inference, UnifiedProgressCtx};
-use super::sessions::{print_sessions_with_stats, resolve_session_target, show_session_transcript};
-use super::util::{truncate_str, DEFAULT_MAX_TOKENS};
+use super::talupi_sessions::{self, SessionRecord, UpsertSessionRequest};
+use super::util::DEFAULT_MAX_TOKENS;
 use super::{AskArgs, AskOutputFormat};
-
-use super::models::list_provider_models;
 
 pub(super) const DEFAULT_SYSTEM_MESSAGE: &str = "You are a helpful assistant.";
 const DEFAULT_STDIN_IMAGE_PROMPT: &str = "Describe this image.";
@@ -67,7 +66,8 @@ impl StreamCtx {
     fn on_token(&mut self, token: &talu::router::StreamToken) {
         // Complete prefill progress on first token
         if let Some(spinner) = self.prefill_spinner.take() {
-            spinner.finish_with_message("done");
+            // Clear transient progress UI before printing model output.
+            spinner.finish_and_clear();
         }
 
         if self.hide_thinking && token.item_type == talu::responses::ItemType::Reasoning {
@@ -105,7 +105,8 @@ impl StreamCtx {
     fn flush(&mut self) {
         // Complete prefill progress if generation produced no tokens
         if let Some(spinner) = self.prefill_spinner.take() {
-            spinner.finish_with_message("done");
+            // Clear transient progress UI before flushing the final line.
+            spinner.finish_and_clear();
         }
         if !self.raw_output && self.in_reasoning {
             // Reset ANSI if still in reasoning at end
@@ -209,18 +210,7 @@ pub(super) fn latest_visible_text(
 struct ParsedStdin {
     text: Option<String>,
     images: Vec<talu::router::ContentPart>,
-}
-
-fn map_stdin_image_mime(info: &talu::file::FileInfo) -> String {
-    if !info.mime.is_empty() && info.mime.starts_with("image/") {
-        return info.mime.clone();
-    }
-    match info.image.map(|image| image.format) {
-        Some(talu::file::ImageFormat::Jpeg) => "image/jpeg".to_string(),
-        Some(talu::file::ImageFormat::Png) => "image/png".to_string(),
-        Some(talu::file::ImageFormat::Webp) => "image/webp".to_string(),
-        _ => "application/octet-stream".to_string(),
-    }
+    prepared_stdin_json: Option<String>,
 }
 
 fn trim_trailing_stdin_whitespace(bytes: &mut Vec<u8>) {
@@ -229,38 +219,20 @@ fn trim_trailing_stdin_whitespace(bytes: &mut Vec<u8>) {
     }
 }
 
-fn encode_base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-    while i + 3 <= bytes.len() {
-        let b0 = bytes[i];
-        let b1 = bytes[i + 1];
-        let b2 = bytes[i + 2];
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        out.push(TABLE[(b2 & 0x3f) as usize] as char);
-        i += 3;
+fn sniff_stdin_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return "image/png";
     }
-
-    let rem = bytes.len() - i;
-    if rem == 1 {
-        let b0 = bytes[i];
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[((b0 & 0x03) << 4) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let b0 = bytes[i];
-        let b1 = bytes[i + 1];
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(TABLE[((b1 & 0x0f) << 2) as usize] as char);
-        out.push('=');
+    if bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff {
+        return "image/jpeg";
     }
-
-    out
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf";
+    }
+    "application/octet-stream"
 }
 
 fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
@@ -268,53 +240,31 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
         return Ok(ParsedStdin {
             text: None,
             images: vec![],
+            prepared_stdin_json: None,
         });
     }
 
-    if let Ok(info) = talu::file::inspect_bytes(&stdin_buf) {
-        if info.kind == talu::file::FileKind::Image {
-            let mime = map_stdin_image_mime(&info);
-            let data_url = format!("data:{};base64,{}", mime, encode_base64(&stdin_buf));
-            return Ok(ParsedStdin {
-                text: None,
-                images: vec![talu::router::ContentPart::ImageUrl {
-                    url: data_url,
-                    mime: Some(mime),
-                }],
-            });
-        }
-
-        // Auto-convert PDF pages to images for VLM consumption.
-        if info.kind == talu::file::FileKind::Document && info.mime == "application/pdf" {
-            let count = talu::file::pdf_page_count(&stdin_buf)
-                .map_err(|e| anyhow!("Failed to get PDF page count: {e}"))?;
-            let mut images = Vec::with_capacity(count as usize);
-            for i in 0..count {
-                let opts = talu::file::TransformOptions {
-                    output_format: Some(talu::file::OutputFormat::Png),
-                    ..Default::default()
-                };
-                let rendered = talu::file::pdf_transform_page(&stdin_buf, i, 150, opts)
-                    .map_err(|e| anyhow!("Failed to render PDF page {}: {e}", i + 1))?;
-                let data_url = format!("data:image/png;base64,{}", encode_base64(&rendered.bytes));
-                images.push(talu::router::ContentPart::ImageUrl {
-                    url: data_url,
-                    mime: Some("image/png".into()),
-                });
-            }
-            return Ok(ParsedStdin { text: None, images });
-        }
-
-        if !info.mime.starts_with("text/") && stdin_buf.contains(&0) {
+    let is_binary = stdin_buf.contains(&0) || std::str::from_utf8(&stdin_buf).is_err();
+    if is_binary {
+        if vision::file_host_from_env().is_none() {
             bail!(
-                "Error: stdin contains binary data ({}) and cannot be used as text prompt.",
-                if info.mime.is_empty() {
-                    "unknown MIME"
-                } else {
-                    info.mime.as_str()
-                }
+                "Error: binary stdin input is not supported in this build without TALU_FILE_HOST."
             );
         }
+        let mime = sniff_stdin_mime(&stdin_buf);
+        let data_url = format!(
+            "data:{};base64,{}",
+            mime,
+            base64::engine::general_purpose::STANDARD.encode(&stdin_buf)
+        );
+        return Ok(ParsedStdin {
+            text: None,
+            images: vec![talu::router::ContentPart::ImageUrl {
+                url: data_url,
+                mime: Some(mime.to_string()),
+            }],
+            prepared_stdin_json: None,
+        });
     }
 
     trim_trailing_stdin_whitespace(&mut stdin_buf);
@@ -322,86 +272,264 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
         return Ok(ParsedStdin {
             text: None,
             images: vec![],
+            prepared_stdin_json: None,
         });
     }
-    let text = String::from_utf8_lossy(&stdin_buf).to_string();
-    if text.contains('\0') {
-        bail!("Error: stdin contains NUL bytes and cannot be used as text prompt.");
+    let text = String::from_utf8(stdin_buf)
+        .map_err(|_| anyhow!("Error: non-UTF-8 stdin input is not supported in this build."))?;
+    if vision::stdin_json_has_prepared_payload(&text) {
+        return Ok(ParsedStdin {
+            text: None,
+            images: vec![],
+            prepared_stdin_json: Some(text),
+        });
     }
     Ok(ParsedStdin {
         text: Some(text),
         images: vec![],
+        prepared_stdin_json: None,
     })
 }
 
-/// Chat: new session by default; append via --session.
-pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result<()> {
+#[derive(Debug, Clone)]
+struct SessionCtx {
+    db_host: String,
+    session_id: String,
+    existing: Option<SessionRecord>,
+}
+
+fn conversation_title_from_prompt(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(80).collect())
+}
+
+fn default_metadata_object(metadata: &serde_json::Value) -> serde_json::Value {
+    if metadata.is_object() {
+        metadata.clone()
+    } else {
+        json!({})
+    }
+}
+
+fn load_session_history(chat: &ChatHandle, session: Option<&SessionCtx>) -> Result<()> {
+    if let Some(sess) = session {
+        if !sess
+            .existing
+            .as_ref()
+            .map_or(true, |s| s.responses_json.trim().is_empty())
+        {
+            if let Some(existing) = sess.existing.as_ref() {
+                chat.load_responses_json(&existing.responses_json)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn persist_session(
+    chat: &ChatHandle,
+    session: &SessionCtx,
+    model_id: &str,
+    system_msg: &str,
+    prompt: &str,
+) -> Result<()> {
+    let responses_json = chat.to_responses_json(1)?;
+    let existing = session.existing.as_ref();
+    let metadata = existing
+        .map(|s| default_metadata_object(&s.metadata))
+        .unwrap_or_else(|| json!({}));
+    let title = existing
+        .and_then(|s| s.title.clone())
+        .or_else(|| conversation_title_from_prompt(prompt));
+    let req = UpsertSessionRequest {
+        session_id: session.session_id.clone(),
+        responses_json,
+        model: existing
+            .and_then(|s| s.model.clone())
+            .or_else(|| Some(model_id.to_string())),
+        title,
+        system_prompt: existing.and_then(|s| s.system_prompt.clone()).or_else(|| {
+            if system_msg.is_empty() {
+                None
+            } else {
+                Some(system_msg.to_string())
+            }
+        }),
+        metadata,
+        project_id: existing.and_then(|s| s.project_id.clone()),
+        marker: existing
+            .and_then(|s| s.marker.clone())
+            .or_else(|| Some("active".to_string())),
+        parent_session_id: existing.and_then(|s| s.parent_session_id.clone()),
+    };
+    talupi_sessions::upsert_session(&session.db_host, &req)
+}
+
+fn message_role_label(role: talu::responses::MessageRole) -> &'static str {
+    match role {
+        talu::responses::MessageRole::System => "system",
+        talu::responses::MessageRole::User => "user",
+        talu::responses::MessageRole::Assistant => "assistant",
+        talu::responses::MessageRole::Developer => "developer",
+        _ => "unknown",
+    }
+}
+
+fn format_session_transcript(session: &SessionRecord, include_reasoning: bool) -> Result<String> {
+    let chat = ChatHandle::new(None)?;
+    chat.load_responses_json(&session.responses_json)?;
+    let conv = chat.responses();
+    let mut lines = Vec::new();
+    for index in 0..conv.item_count() {
+        let item_type = conv.item_type(index);
+        if item_type == talu::responses::ItemType::Message {
+            let msg = conv.get_message(index)?;
+            let text = conv.message_text(index)?;
+            if !text.trim().is_empty() {
+                lines.push(format!("{}: {}", message_role_label(msg.role), text));
+            }
+        } else if include_reasoning && item_type == talu::responses::ItemType::Reasoning {
+            let text = reasoning_text_for_item(&conv, index)?;
+            if !text.trim().is_empty() {
+                lines.push(format!("assistant_reasoning: {}", text));
+            }
+        }
+    }
+    if lines.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(lines.join("\n"))
+    }
+}
+
+/// Chat: one-shot generation (stateless).
+pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Result<()> {
     let no_chat = args.no_chat;
     let use_json = args.format == Some(AskOutputFormat::Json);
-    let session_id_only = args.session_id_only;
-    let quiet = (args.quiet && !use_json) || session_id_only;
-    let silent = args.silent;
+    let quiet = args.quiet && !use_json;
+    let mut silent = args.silent;
     let raw_output = args.raw;
     let hide_thinking = args.hide_thinking;
     let mut system_msg = args.system.clone();
     let mut prompt_parts = args.prompt.clone();
+    let mut stdin_text_part: Option<String> = None;
     let mut stdin_image_parts: Vec<talu::router::ContentPart> = Vec::new();
-    let endpoint_url_override = args.endpoint_url.clone();
+    let mut stdin_prepared_payload_json: Option<String> = None;
     let seed = args.seed.unwrap_or(0);
-    let db_path =
-        crate::config::resolve_bucket(args.no_bucket, args.bucket.clone(), &args.profile)?;
     let session_env = env::var("SESSION_ID").ok().filter(|s| !s.is_empty());
+    let session_target = args.session.clone().or(session_env);
+    let db_host = talupi_sessions::db_host_from_env();
+    let mut preloaded_stdin: Option<Vec<u8>> = None;
+    let output_path = args.output.clone();
 
     if silent && args.quiet {
         bail!("Error: cannot specify both --quiet and --silent.");
     }
-
+    if args.session_id_only && session_target.is_some() {
+        bail!("Error: --session-id cannot be combined with --session or SESSION_ID.");
+    }
     if args.new {
-        if args.no_bucket {
-            bail!("Error: --new cannot be used with --no-bucket.");
+        if !args.prompt.is_empty() {
+            bail!("Error: --new does not accept a prompt.");
         }
-        if args.delete {
-            bail!("Error: --new cannot be used with --delete.");
+        let db_host = db_host.ok_or_else(|| {
+            anyhow!("Error: --new requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258).")
+        })?;
+        let session_id = format!("sess_{}", uuid::Uuid::new_v4().hyphenated());
+        let req = UpsertSessionRequest {
+            session_id: session_id.clone(),
+            responses_json: "[]".to_string(),
+            model: args.model.clone().or_else(crate::config::get_default_model),
+            title: None,
+            system_prompt: if no_chat {
+                None
+            } else {
+                Some(system_msg.clone())
+            },
+            metadata: json!({}),
+            project_id: None,
+            marker: Some("active".to_string()),
+            parent_session_id: None,
+        };
+        talupi_sessions::upsert_session(&db_host, &req)?;
+        if let Some(path) = &output_path {
+            std::fs::write(path, format!("{session_id}\n"))?;
+        } else if !silent {
+            println!("{session_id}");
         }
-        if session_id_only {
-            bail!("Error: --new cannot be used with --session-id.");
-        }
-        if args.session.is_some() || session_env.is_some() {
-            bail!("Error: --new cannot be used with --session or SESSION_ID.");
+        return Ok(());
+    }
+    if args.delete {
+        let target = session_target
+            .as_deref()
+            .ok_or_else(|| anyhow!("Error: --delete requires --session or SESSION_ID."))?;
+        let db_host = db_host.ok_or_else(|| {
+            anyhow!("Error: --delete requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258).")
+        })?;
+        let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
+        talupi_sessions::delete_session(&db_host, &session_id)?;
+        return Ok(());
+    }
+    if let Some(target) = session_target.as_deref() {
+        if args.prompt.is_empty() && !args.session_id_only {
+            if stdin_is_pipe {
+                let mut probe = Vec::new();
+                io::stdin()
+                    .read_to_end(&mut probe)
+                    .context("read stdin for session dispatch")?;
+                if !probe.is_empty() {
+                    preloaded_stdin = Some(probe);
+                } else {
+                    let db_host = db_host.ok_or_else(|| {
+                        anyhow!(
+                            "Error: --session requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258)."
+                        )
+                    })?;
+                    let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
+                    let session = talupi_sessions::get_session(&db_host, &session_id)?;
+                    let output = if use_json {
+                        session.responses_json
+                    } else {
+                        format_session_transcript(&session, !hide_thinking)?
+                    };
+                    if let Some(path) = &output_path {
+                        std::fs::write(path, format!("{output}\n"))?;
+                    } else if !silent {
+                        println!("{output}");
+                    }
+                    return Ok(());
+                }
+            } else {
+                let db_host = db_host.ok_or_else(|| {
+                    anyhow!(
+                        "Error: --session requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258)."
+                    )
+                })?;
+                let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
+                let session = talupi_sessions::get_session(&db_host, &session_id)?;
+                let output = if use_json {
+                    session.responses_json
+                } else {
+                    format_session_transcript(&session, !hide_thinking)?
+                };
+                if let Some(path) = &output_path {
+                    std::fs::write(path, format!("{output}\n"))?;
+                } else if !silent {
+                    println!("{output}");
+                }
+                return Ok(());
+            }
         }
     }
-    if session_id_only {
-        if args.no_bucket {
-            bail!("Error: --session-id cannot be used with --no-bucket.");
-        }
-        if args.delete {
-            bail!("Error: --session-id cannot be used with --delete.");
-        }
-        if args.new {
-            bail!("Error: --session-id cannot be used with --new.");
-        }
-        if args.output.is_some() {
-            bail!("Error: --session-id cannot be used with --output.");
-        }
-        if use_json {
-            bail!("Error: --session-id cannot be used with --format json.");
-        }
-        if args.silent {
-            bail!("Error: --session-id cannot be used with --silent.");
-        }
-        if args.session.is_some() {
-            bail!("Error: --session-id cannot be used with --session.");
-        }
-        // --session-id takes precedence over SESSION_ID.
+    if args.session_id_only {
+        silent = true;
     }
 
-    let output_path = args.output.clone();
-    let no_stream =
-        args.no_stream || use_json || silent || output_path.is_some() || session_id_only;
+    let no_stream = args.no_stream || use_json || silent || output_path.is_some();
     let emit_output = |text: &str| -> Result<()> {
-        if session_id_only {
-            return Ok(());
-        }
         if let Some(path) = &output_path {
             std::fs::write(path, format!("{text}\n"))?;
             return Ok(());
@@ -412,13 +540,30 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         println!("{text}");
         Ok(())
     };
+    let emit_session_id = |session_id: &str| -> Result<()> {
+        if let Some(path) = &output_path {
+            std::fs::write(path, format!("{session_id}\n"))?;
+        } else {
+            println!("{session_id}");
+        }
+        Ok(())
+    };
 
     // --each-line: collect stdin lines as separate prompts for batched decode.
     let mut each_line_prompts: Vec<String> = Vec::new();
 
     if stdin_is_pipe {
-        let mut stdin_buf = Vec::new();
-        if io::stdin().read_to_end(&mut stdin_buf).is_ok() && !stdin_buf.is_empty() {
+        let stdin_buf = if let Some(buf) = preloaded_stdin.take() {
+            buf
+        } else {
+            let mut buf = Vec::new();
+            if io::stdin().read_to_end(&mut buf).is_err() {
+                Vec::new()
+            } else {
+                buf
+            }
+        };
+        if !stdin_buf.is_empty() {
             if args.each_line {
                 // Each non-empty line becomes a separate prompt.
                 let text = String::from_utf8_lossy(&stdin_buf);
@@ -436,9 +581,10 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             } else {
                 let parsed = parse_stdin_content(stdin_buf)?;
                 if let Some(text) = parsed.text {
-                    prompt_parts.push(text);
+                    stdin_text_part = Some(text);
                 }
                 stdin_image_parts = parsed.images;
+                stdin_prepared_payload_json = parsed.prepared_stdin_json;
             }
         }
     }
@@ -446,127 +592,16 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     if !stdin_image_parts.is_empty() && prompt_parts.is_empty() {
         prompt_parts.push(DEFAULT_STDIN_IMAGE_PROMPT.to_string());
     }
+    if stdin_prepared_payload_json.is_some() && prompt_parts.is_empty() {
+        prompt_parts.push(DEFAULT_STDIN_IMAGE_PROMPT.to_string());
+    }
+    if let Some(text) = stdin_text_part.take() {
+        prompt_parts.push(text);
+    }
 
     let prompt = prompt_parts.join(" ");
-
-    if args.new {
-        if !prompt.is_empty() {
-            bail!("Error: --new does not accept a prompt.");
-        }
-        let db = match db_path {
-            Some(ref p) => p,
-            None => bail!("Error: Storage is disabled. Nothing to create."),
-        };
-        let session_id = talu::responses::new_session_id()?;
-        let chat = ChatHandle::new(None)?;
-        let db_str = db.to_string_lossy();
-        chat.set_storage_db(&db_str, &session_id)?;
-
-        let model_opt = args.model.clone().or_else(crate::config::get_default_model);
-        let _ = chat.notify_session_update(model_opt.as_deref(), None, Some("active"));
-
-        emit_output(&session_id)?;
-        return Ok(());
-    }
-
-    let session_target = if session_id_only {
-        None
-    } else {
-        args.session.as_deref().or(session_env.as_deref())
-    };
-
-    if session_id_only && prompt.is_empty() {
-        let db = match db_path {
-            Some(ref p) => p,
-            None => bail!("Error: Storage is disabled. Nothing to create."),
-        };
-        let session_id = talu::responses::new_session_id()?;
-        let chat = ChatHandle::new(None)?;
-        let db_str = db.to_string_lossy();
-        chat.set_storage_db(&db_str, &session_id)?;
-
-        let model_opt = args.model.clone().or_else(crate::config::get_default_model);
-        let _ = chat.notify_session_update(model_opt.as_deref(), None, Some("active"));
-
-        println!("{session_id}");
-        return Ok(());
-    }
-
-    // No prompt → list sessions or show/delete by ID
     if prompt.is_empty() {
-        if args.delete && session_target.is_none() {
-            bail!("Error: --delete requires --session <id>.");
-        }
-
-        let db = match db_path {
-            Some(ref p) => p,
-            None => bail!("Error: Storage is disabled. Nothing to show."),
-        };
-        let handle = match StorageHandle::open(db) {
-            Ok(h) => h,
-            Err(StorageError::StorageNotFound(p)) => {
-                bail!("Error: No sessions yet. Use 'talu ask \"prompt\"' to start one.\n  Storage: {}", p.display());
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        if let Some(target) = session_target {
-            let session_id = resolve_session_target(&handle, target)?;
-            if args.delete {
-                let title = handle
-                    .get_session(&session_id)
-                    .ok()
-                    .and_then(|s| s.title.clone())
-                    .unwrap_or_default();
-                handle.delete_session(&session_id)?;
-                let display_title = if title.is_empty() {
-                    "(untitled)".to_string()
-                } else {
-                    title
-                };
-                eprintln!(
-                    "Deleted session {} ({})",
-                    truncate_str(&session_id, 8),
-                    display_title
-                );
-                return Ok(());
-            }
-            if use_json {
-                let conv = handle
-                    .load_session(&session_id)
-                    .map_err(|e| anyhow!("Error: Failed to load session: {}", e))?;
-                let json = conv.to_responses_json(1)?;
-                emit_output(&json)?;
-                return Ok(());
-            }
-            return show_session_transcript(&handle, &session_id, verbose);
-        }
-
-        let sessions = handle.list_sessions(Some(50))?;
-        let total_count = handle.session_count()?;
-        if use_json {
-            let list: Vec<_> = sessions
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "session_id": s.session_id,
-                        "title": s.title,
-                        "model": s.model,
-                        "marker": s.marker,
-                        "created_at": s.created_at,
-                        "updated_at": s.updated_at,
-                    })
-                })
-                .collect();
-            let json = serde_json::to_string(&list)?;
-            emit_output(&json)?;
-        } else {
-            print_sessions_with_stats(&handle, &sessions);
-        }
-        if total_count > 50 {
-            eprintln!("Showing 50 of {} sessions.", total_count);
-        }
-        return Ok(());
+        bail!("Error: ask requires a prompt.");
     }
 
     let model_arg = if let Some(path) = args.model.clone() {
@@ -580,66 +615,45 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         return Ok(());
     };
 
-    if args.delete {
-        bail!("Error: --delete can only be used without a prompt.");
-    }
-
-    // Determine whether to continue an existing session or start a new one.
-    let (is_continue, session_id) = if session_id_only {
-        let sid = if let Some(target) = args.session.as_deref() {
-            target.to_string()
-        } else {
-            talu::responses::new_session_id()?
-        };
-        (false, sid)
-    } else if let Some(target) = session_target {
-        let db = match db_path {
-            Some(ref p) => p,
-            None => {
-                bail!("Error: Storage is disabled. Use --session only with persistent storage.")
-            }
-        };
-        let handle = match StorageHandle::open(db) {
-            Ok(h) => h,
-            Err(StorageError::StorageNotFound(p)) => {
-                bail!("Error: No sessions yet. Use 'talu ask \"prompt\"' to start one.\n  Storage: {}", p.display());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let session_id = resolve_session_target(&handle, target)?;
-        (true, session_id)
-    } else {
-        (false, talu::responses::new_session_id()?)
-    };
-
-    // Parse provider prefix
-    let target = parse_model_target(&model_arg)?;
-
-    // Handle remote providers
-    if let ModelTarget::Remote { provider, model } = target {
-        if !stdin_image_parts.is_empty() {
-            bail!("Error: piped image input is currently supported only for local models.");
+    let mut session_ctx: Option<SessionCtx> = None;
+    if let Some(target) = session_target.as_deref() {
+        let db_host = db_host.ok_or_else(|| {
+            anyhow!(
+                "Error: persistent sessions require TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258)."
+            )
+        })?;
+        let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
+        let existing = talupi_sessions::get_session(&db_host, &session_id)?;
+        if !no_chat
+            && system_msg == DEFAULT_SYSTEM_MESSAGE
+            && existing
+                .system_prompt
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        {
+            system_msg = existing.system_prompt.clone().unwrap_or_default();
         }
-        return cmd_ask_remote(
-            &provider,
-            model,
-            &prompt,
-            &system_msg,
-            no_stream,
-            raw_output,
-            hide_thinking,
-            endpoint_url_override,
-            seed,
-            is_continue,
-            &session_id,
-            &db_path,
-            &output_path,
-            quiet,
-            silent,
-            use_json,
-            session_id_only,
-        );
+        session_ctx = Some(SessionCtx {
+            db_host,
+            session_id,
+            existing: Some(existing),
+        });
+    } else if let Some(db_host) = db_host.clone() {
+        session_ctx = Some(SessionCtx {
+            db_host,
+            session_id: format!("sess_{}", uuid::Uuid::new_v4().hyphenated()),
+            existing: None,
+        });
     }
+    if args.session_id_only && session_ctx.is_none() {
+        bail!("Error: --session-id requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258).");
+    }
+    if session_ctx.is_some() && (args.each_line || args.completions > 1) {
+        bail!("Error: persistent session mode does not support --each-line or --completions > 1.");
+    }
+
+    ensure_local_model_target(&model_arg)?;
 
     // Local inference path
     let resolved_model = resolve_model_for_inference(&model_arg)?;
@@ -692,23 +706,14 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         system_msg.clear();
     }
 
-    // When continuing from DB, create chat WITHOUT system message — the
-    // persisted session already contains the original system message.
-    let chat = if is_continue && db_path.is_some() {
-        ChatHandle::new(None)?
+    let chat = ChatHandle::new(if system_msg.is_empty() {
+        None
     } else {
-        ChatHandle::new(if system_msg.is_empty() {
-            None
-        } else {
-            Some(system_msg.as_str())
-        })?
-    };
+        Some(system_msg.as_str())
+    })?;
+    load_session_history(&chat, session_ctx.as_ref())?;
 
-    if let Some(ref db) = db_path {
-        let db_str = db.to_string_lossy();
-        chat.set_storage_db(&db_str, &session_id)?;
-    }
-
+    let has_stdin_images = !stdin_image_parts.is_empty();
     let mut content = Vec::new();
     for image_part in stdin_image_parts {
         content.push(image_part);
@@ -731,6 +736,33 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         raw_output,
         max_reasoning_tokens: if think { None } else { Some(0) },
         ..Default::default()
+    };
+
+    let stdin_prepared_prefill = if let Some(prepared_json) = stdin_prepared_payload_json.as_deref()
+    {
+        vision::prepare_vision_prefill_from_stdin_prepared_json(prepared_json, &resolved_model)?
+    } else {
+        None
+    };
+    if stdin_prepared_prefill.is_some() && has_stdin_images {
+        bail!("Error: cannot mix piped prepared vision JSON with raw piped image input.");
+    }
+    if let Some(prefill) = stdin_prepared_prefill.as_ref() {
+        for index in (0..prefill.images.len()).rev() {
+            content.insert(
+                0,
+                talu::router::ContentPart::ImageUrl {
+                    url: format!("prepared://input_{index}"),
+                    mime: None,
+                },
+            );
+        }
+    }
+
+    cfg.vision_prefill = if stdin_prepared_prefill.is_some() {
+        stdin_prepared_prefill
+    } else {
+        vision::prepare_vision_prefill_from_content(&content, &resolved_model)?
     };
 
     if no_chat {
@@ -778,6 +810,9 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     // -n N:        N completions of the same prompt (different seeds).
     let n_completions = args.completions;
     let use_batch = n_completions > 1 || !each_line_prompts.is_empty();
+    if use_batch && cfg.vision_prefill.is_some() {
+        bail!("Error: batched completions with image input are not supported.");
+    }
     if use_batch {
         if each_line_prompts.is_empty() && n_completions < 2 {
             bail!("Error: --each-line requires piped stdin with at least one non-empty line.");
@@ -994,7 +1029,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
 
         let result = talu::router::generate(&chat, &content, &backend, &cfg)?;
         if let Some(s) = spinner {
-            s.finish_with_message("done");
+            s.finish_and_clear();
         }
 
         if result.error_code() != 0 {
@@ -1016,8 +1051,15 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             // Fallback to raw generation text if item reconstruction is unavailable.
             emit_output(&text)?;
         }
+        if let Some(ref session) = session_ctx {
+            persist_session(&chat, session, &model_arg, &system_msg, &prompt)?;
+            if args.session_id_only {
+                emit_session_id(&session.session_id)?;
+                return Ok(());
+            }
+        }
 
-        if !quiet && !silent && !use_json && !session_id_only && output_path.is_none() {
+        if !quiet && !silent && !use_json && output_path.is_none() {
             let output_tok_per_sec = if result.generation_ns() > 0 {
                 (result.token_count() as f64) / (result.generation_ns() as f64 / 1_000_000_000.0)
             } else {
@@ -1088,9 +1130,16 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
                 emit_output(&text)?;
             }
         }
+        if let Some(ref session) = session_ctx {
+            persist_session(&chat, session, &model_arg, &system_msg, &prompt)?;
+            if args.session_id_only {
+                emit_session_id(&session.session_id)?;
+                return Ok(());
+            }
+        }
 
         // Print stats (cyan color)
-        if !quiet && !silent && !use_json && !session_id_only && output_path.is_none() {
+        if !quiet && !silent && !use_json && output_path.is_none() {
             let input_tok_per_sec = stream_result.prefill_tokens_per_second();
             let output_tok_per_sec = stream_result.tokens_per_second();
             eprintln!(
@@ -1103,295 +1152,76 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         }
     }
 
-    // Persist session metadata
-    if db_path.is_some() {
-        // Get model name (last path component)
-        let model_name = std::path::Path::new(&resolved_model)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&resolved_model);
-
-        if is_continue {
-            let _ = chat.notify_session_update(
-                Some(model_name),
-                None, // Don't update title on continue
-                Some("active"),
-            );
-        } else {
-            // Derive title from first ~50 chars of prompt
-            let title = if prompt.len() > 50 {
-                format!("{}...", &prompt[..47])
-            } else {
-                prompt.clone()
-            };
-
-            let _ = chat.notify_session_update(Some(model_name), Some(&title), Some("active"));
-        }
-    }
-
-    if session_id_only {
-        println!("{session_id}");
-    }
-
-    Ok(())
-}
-
-/// Generate text using a remote OpenAI-compatible provider via the C API
-#[allow(clippy::too_many_arguments)]
-fn cmd_ask_remote(
-    provider_name: &str,
-    model_id: &str,
-    prompt: &str,
-    system_msg: &str,
-    no_stream: bool,
-    raw_output: bool,
-    hide_thinking: bool,
-    endpoint_url_override: Option<String>,
-    seed: u64,
-    is_continue: bool,
-    session_id: &str,
-    db_path: &Option<PathBuf>,
-    output_path: &Option<PathBuf>,
-    quiet: bool,
-    silent: bool,
-    use_json: bool,
-    session_id_only: bool,
-) -> Result<()> {
-    use std::time::Instant;
-
-    let provider = get_provider(provider_name)
-        .ok_or_else(|| anyhow!("Unknown provider: {}", provider_name))?;
-
-    // Determine endpoint URL
-    let base_url = endpoint_url_override
-        .clone()
-        .or_else(|| env::var(format!("{}_ENDPOINT", provider_name.to_uppercase())).ok())
-        .unwrap_or_else(|| provider.default_endpoint.to_string());
-
-    // If no model specified, list available models and exit
-    if model_id.is_empty() {
-        eprintln!("Error: No model specified for {}.\n", provider_name);
-
-        // Try to list models
-        let api_key = provider
-            .api_key_env
-            .as_ref()
-            .and_then(|env_var| env::var(env_var).ok());
-
-        match list_provider_models(provider_name, &base_url, api_key.as_deref()) {
-            Ok(models) if !models.is_empty() => {
-                eprintln!("Available models on {} ({}):", provider_name, base_url);
-                for model in &models {
-                    eprintln!("  {}", model);
-                }
-            }
-            Ok(_) => {
-                eprintln!("No models found on {} ({})", provider_name, base_url);
-            }
-            Err(e) => {
-                eprintln!("Could not list models on {}: {}", provider_name, e);
-            }
-        }
-
-        eprintln!("\nUsage: talu ask -m {}::<model> \"prompt\"", provider_name);
-        return Ok(());
-    }
-
-    if prompt.is_empty() {
-        bail!("Error: ask requires a prompt.\nUse 'talu ask' to list sessions.");
-    }
-
-    // Get API key if needed
-    let api_key = provider
-        .api_key_env
-        .as_ref()
-        .and_then(|env_var| env::var(env_var).ok());
-
-    // Get generation parameters
-    let max_tokens = env::var("TOKENS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_TOKENS);
-    let temperature = env::var("TEMPERATURE")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(0.7);
-
-    // When continuing from DB, create chat WITHOUT system message — the
-    // persisted session already contains the original system message.
-    let chat = if is_continue && db_path.is_some() {
-        ChatHandle::new(None)?
-    } else {
-        ChatHandle::new(if system_msg.is_empty() {
-            None
-        } else {
-            Some(system_msg)
-        })?
-    };
-
-    if let Some(ref db) = db_path {
-        let db_str = db.to_string_lossy();
-        chat.set_storage_db(&db_str, session_id)?;
-    }
-
-    // Create remote backend via C API
-    let backend = InferenceBackend::new_openai_compatible(
-        model_id,
-        &base_url,
-        api_key.as_deref(),
-        120_000, // 2 minute timeout
-    )?;
-
-    // Build content part for the prompt
-    let content = vec![talu::router::ContentPart::Text(prompt.to_string())];
-
-    // Build generation config
-    let cfg = talu::router::GenerateConfig {
-        max_tokens,
-        temperature,
-        seed,
-        raw_output,
-        ..Default::default()
-    };
-
-    let start_time = Instant::now();
-
-    // Generate via the router safe API
-    let emit_output = |text: &str| -> Result<()> {
-        if session_id_only {
-            return Ok(());
-        }
-        if let Some(path) = output_path {
-            std::fs::write(path, format!("{text}\n"))?;
-            return Ok(());
-        }
-        if silent {
-            return Ok(());
-        }
-        println!("{text}");
-        Ok(())
-    };
-
-    if no_stream {
-        let result = talu::router::generate(&chat, &content, &backend, &cfg)?;
-
-        if result.error_code() != 0 {
-            let code = result.error_code();
-            let message =
-                last_error_message().unwrap_or_else(|| "remote generation failed".to_string());
-            return Err(anyhow!("Error: {} (code {})", message, code));
-        }
-
-        if use_json {
-            let json = chat.to_responses_json(1)?;
-            emit_output(&json)?;
-        } else if raw_output {
-            if let Some(text) = result.text() {
-                emit_output(&text)?;
-            }
-        } else if let Some(text) = latest_visible_text(&chat, !hide_thinking)? {
-            emit_output(&text)?;
-        } else if let Some(text) = result.text() {
-            // Fallback to raw generation text if item reconstruction is unavailable.
-            emit_output(&text)?;
-        }
-
-        if !quiet && !silent && !use_json && !session_id_only && output_path.is_none() {
-            let elapsed = start_time.elapsed();
-            eprintln!(
-                "\n\x1b[36m{}::{} | {:.1}s | {} tokens\x1b[0m",
-                provider_name,
-                model_id,
-                elapsed.as_secs_f64(),
-                result.token_count()
-            );
-        }
-    } else {
-        // Streaming - use a simple callback that prints content
-        let flush_each_token = true;
-        let pending_flush_bytes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-        let pending_flush_bytes_cb = pending_flush_bytes.clone();
-        let callback: talu::router::StreamCallback = Box::new(move |token| {
-            if hide_thinking && token.item_type == talu::responses::ItemType::Reasoning {
-                return true;
-            }
-            let _ = io::stdout().write_all(token.text.as_bytes());
-            if let Ok(mut pending) = pending_flush_bytes_cb.lock() {
-                *pending += token.text.len();
-                if should_flush_stream_output(&token.text, *pending, flush_each_token) {
-                    let _ = io::stdout().flush();
-                    *pending = 0;
-                }
-            }
-            true
-        });
-        talu::router::generate_stream(&chat, &content, &backend, &cfg, callback)?;
-        let _ = io::stdout().flush();
-        println!(); // Newline after streaming
-
-        if !quiet && !silent && !use_json && !session_id_only && output_path.is_none() {
-            let elapsed = start_time.elapsed();
-            eprintln!(
-                "\n\x1b[36m{}::{} | {:.1}s\x1b[0m",
-                provider_name,
-                model_id,
-                elapsed.as_secs_f64()
-            );
-        }
-    }
-
-    // Persist session metadata
-    if db_path.is_some() {
-        if is_continue {
-            let _ = chat.notify_session_update(
-                Some(model_id),
-                None, // Don't update title on continue
-                Some("active"),
-            );
-        } else {
-            let title = if prompt.len() > 50 {
-                format!("{}...", &prompt[..47])
-            } else {
-                prompt.to_string()
-            };
-
-            let _ = chat.notify_session_update(Some(model_id), Some(&title), Some("active"));
-        }
-    }
-
-    if session_id_only {
-        println!("{session_id}");
-    }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
 
-    #[test]
-    fn encode_base64_known_vectors() {
-        assert_eq!(encode_base64(b""), "");
-        assert_eq!(encode_base64(b"f"), "Zg==");
-        assert_eq!(encode_base64(b"fo"), "Zm8=");
-        assert_eq!(encode_base64(b"foo"), "Zm9v");
-        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
-    }
+    const JPEG_MAGIC_AND_BINARY_TAIL: &[u8] = &[0xff, 0xd8, 0xff, 0x00];
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn parse_stdin_content_text_trims_trailing_whitespace() {
         let parsed = parse_stdin_content(b"hello world\n".to_vec()).expect("parse text stdin");
         assert_eq!(parsed.text.as_deref(), Some("hello world"));
         assert!(parsed.images.is_empty());
+        assert!(parsed.prepared_stdin_json.is_none());
     }
 
     #[test]
-    fn parse_stdin_content_image_builds_data_url() {
-        let jpeg = include_bytes!("../../../../../core/tests/image/corpus/1x1_red.jpg");
-        let parsed = parse_stdin_content(jpeg.to_vec()).expect("parse jpeg stdin");
+    fn parse_stdin_content_rejects_binary_image_bytes_without_file_host() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("TALU_FILE_HOST");
+        std::env::remove_var("TALUPI_HOST");
+        let err = parse_stdin_content(JPEG_MAGIC_AND_BINARY_TAIL.to_vec())
+            .expect_err("binary image stdin should fail");
+        assert!(err.to_string().contains("without TALU_FILE_HOST"));
+    }
+
+    #[test]
+    fn parse_stdin_content_rejects_binary_pdf_bytes_without_file_host() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("TALU_FILE_HOST");
+        std::env::remove_var("TALUPI_HOST");
+        // Include a non-UTF8 byte so stdin is treated as binary.
+        let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n\xff";
+        let err = parse_stdin_content(pdf.to_vec()).expect_err("binary pdf stdin should fail");
+        assert!(err.to_string().contains("without TALU_FILE_HOST"));
+    }
+
+    #[test]
+    fn parse_stdin_content_rejects_binary_nul_data_without_file_host() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("TALU_FILE_HOST");
+        std::env::remove_var("TALUPI_HOST");
+        let err = parse_stdin_content(vec![0, 1, 2, 3]).expect_err("binary stdin should fail");
+        assert!(err.to_string().contains("without TALU_FILE_HOST"));
+    }
+
+    #[test]
+    fn parse_stdin_content_rejects_non_utf8_text_data_without_file_host() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("TALU_FILE_HOST");
+        std::env::remove_var("TALUPI_HOST");
+        let err = parse_stdin_content(vec![0xf0, 0x28, 0x8c, 0x28])
+            .expect_err("non-utf8 stdin should fail");
+        assert!(err.to_string().contains("without TALU_FILE_HOST"));
+    }
+
+    #[test]
+    fn parse_stdin_content_binary_image_with_file_host_builds_data_url() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("TALU_FILE_HOST", "http://localhost:7258");
+        std::env::remove_var("TALUPI_HOST");
+        let parsed =
+            parse_stdin_content(JPEG_MAGIC_AND_BINARY_TAIL.to_vec()).expect("parse jpeg stdin");
         assert!(parsed.text.is_none());
         assert_eq!(parsed.images.len(), 1);
+        assert!(parsed.prepared_stdin_json.is_none());
         match &parsed.images[0] {
             talu::router::ContentPart::ImageUrl { url, mime } => {
                 assert_eq!(mime.as_deref(), Some("image/jpeg"));
@@ -1399,28 +1229,40 @@ mod tests {
             }
             _ => panic!("expected image url content part"),
         }
+        std::env::remove_var("TALU_FILE_HOST");
     }
 
     #[test]
-    fn parse_stdin_content_pdf_converts_to_images() {
-        let pdf = include_bytes!("../../../../../deps/pdfium/testing/resources/hello_world.pdf");
-        let parsed = parse_stdin_content(pdf.to_vec()).expect("parse pdf stdin");
-        assert!(parsed.text.is_none());
-        assert_eq!(parsed.images.len(), 1); // hello_world.pdf is a single page
-        match &parsed.images[0] {
-            talu::router::ContentPart::ImageUrl { url, mime } => {
-                assert_eq!(mime.as_deref(), Some("image/png"));
-                assert!(url.starts_with("data:image/png;base64,"));
+    fn parse_stdin_content_detects_prepared_vision_wrapper_json() {
+        let payload = r#"{
+            "talu_prepared_vision": {
+                "model_profile": {
+                    "version": "2026-04-17",
+                    "normalize": "minus_one_to_one",
+                    "temporal_frames": 1,
+                    "patch_size": 16,
+                    "temporal_patch_size": 1,
+                    "spatial_merge_size": 1
+                },
+                "item": {
+                    "dtype": "f32",
+                    "layout": "cthw",
+                    "channels": 3,
+                    "temporal_frames": 1,
+                    "width": 16,
+                    "height": 16,
+                    "grid": { "temporal": 1, "height": 1, "width": 1 },
+                    "token_count": 1,
+                    "normalize": "minus_one_to_one",
+                    "tensor_b64": "AAAAAA=="
+                }
             }
-            _ => panic!("expected image url content part"),
-        }
-    }
-
-    #[test]
-    fn parse_stdin_content_rejects_binary_nul_data() {
-        let err = parse_stdin_content(vec![0, 1, 2, 3]).expect_err("binary stdin should fail");
-        let msg = err.to_string();
-        assert!(msg.contains("binary data"));
+        }"#;
+        let parsed =
+            parse_stdin_content(payload.as_bytes().to_vec()).expect("parse prepared vision JSON");
+        assert!(parsed.text.is_none());
+        assert!(parsed.images.is_empty());
+        assert!(parsed.prepared_stdin_json.is_some());
     }
 
     #[test]

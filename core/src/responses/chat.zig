@@ -42,8 +42,7 @@ pub const ResolutionConfig = repository.ResolutionConfig;
 ///
 /// ## Session Identity
 /// The optional `session_id` identifies which conversation this Chat belongs to.
-/// When persisting to StoreFS, session_id is hashed to `SESSION_HASH` (u64)
-/// for efficient Jump Reads during session restoration.
+/// TALU itself is stateless; session persistence is handled externally.
 ///
 /// Thread safety: NOT thread-safe. All access must be from a single thread.
 pub const Chat = struct {
@@ -61,7 +60,7 @@ pub const Chat = struct {
     conv: *Conversation,
 
     /// Session identifier for this conversation.
-    /// Used by storage backends to group messages by session.
+    /// Used by external clients to correlate turns in a logical conversation.
     /// When null, messages are not associated with a named session.
     session_id: ?[]const u8 = null,
 
@@ -101,15 +100,9 @@ pub const Chat = struct {
     /// Stored for round-tripping in the response resource.
     tool_choice_json: ?[]u8 = null,
 
-    /// Optional policy for tool call filtering (IAM-style firewall).
-    /// When set, tool calls are evaluated against this policy before
-    /// being committed to the conversation. The policy must outlive the Chat.
-    /// Not owned by Chat — caller manages the Policy lifecycle.
-    policy: ?*const @import("../agent/policy/evaluate.zig").Policy = null,
-
     /// Prompt document ID for lineage tracking.
     /// When the system prompt comes from a Document, this records the document ID.
-    /// Used by storage backends to link sessions to their source prompts.
+    /// Used by external clients to link sessions to their source prompts.
     prompt_id: ?[]u8 = null,
 
     /// Create a new empty chat.
@@ -119,9 +112,7 @@ pub const Chat = struct {
 
     /// Create a new chat with a session identifier.
     ///
-    /// The session_id is used by storage backends to group messages.
-    /// When persisting to StoreFS, it's hashed to SESSION_HASH for
-    /// efficient Jump Reads during session restoration.
+    /// The session_id is used by clients to group messages by session.
     pub fn initWithSession(allocator: std.mem.Allocator, session_id_arg: ?[]const u8) !Chat {
         const conv = try Conversation.initWithSession(allocator, session_id_arg);
         errdefer conv.deinit();
@@ -586,7 +577,6 @@ test "Chat.reset" {
     try std.testing.expectEqual(@as(f32, 0.7), chat_session.temperature);
 }
 
-
 test "Chat.startStreaming and streaming workflow" {
     const allocator = std.testing.allocator;
     var chat_session = try Chat.init(allocator);
@@ -738,7 +728,6 @@ test "Chat.clearSystem empty" {
     try std.testing.expectEqual(@as(usize, 0), chat_session.len());
 }
 
-
 test "Chat.get out of bounds" {
     const allocator = std.testing.allocator;
     var chat_session = try Chat.init(allocator);
@@ -810,7 +799,6 @@ test "Chat.reset clears all settings" {
     try std.testing.expectEqual(@as(f32, 0.0), chat_session.min_p);
     try std.testing.expectEqual(@as(f32, 1.0), chat_session.repetition_penalty);
 }
-
 
 test "Chat.deinit frees all resources" {
     const allocator = std.testing.allocator;

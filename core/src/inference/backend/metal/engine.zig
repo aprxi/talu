@@ -3,10 +3,9 @@ const contract = @import("../contract.zig");
 const runtime_contract = @import("runtime_contract_pkg");
 const models = @import("models_pkg");
 const tensor = @import("tensor_pkg");
+const safetensors_root = @import("io_pkg").safetensors.root;
 const log = @import("log_pkg");
-const progress_mod = @import("progress_pkg");
 const metal_vision = @import("vision/root.zig");
-const cpu_engine = @import("../cpu/engine.zig");
 const sampling = @import("../cpu/sampling.zig");
 const compute = @import("compute_pkg");
 const trace = @import("xray_pkg").trace;
@@ -27,6 +26,12 @@ const MlxModelFlags = extern struct {
     _pad: u8 = 0,
     embedding_multiplier: f32 = 1.0,
     attention_multiplier: f32 = 0.0,
+};
+
+const MlxPrefillVisionInput = extern struct {
+    merged_embeddings: [*]const f32,
+    merged_value_count: u32,
+    image_token_id: u32,
 };
 
 extern fn mlx_is_available() c_int;
@@ -50,6 +55,15 @@ extern fn mlx_prefill_logits(
     ctx: ?*mlx_ctx,
     prompt_ids: [*]const i32,
     prompt_len: c_int,
+    out_logits: [*]f32,
+    logits_len: c_int,
+) c_int;
+
+extern fn mlx_prefill_logits_with_vision(
+    ctx: ?*mlx_ctx,
+    prompt_ids: [*]const i32,
+    prompt_len: c_int,
+    vision_input: *const MlxPrefillVisionInput,
     out_logits: [*]f32,
     logits_len: c_int,
 ) c_int;
@@ -246,6 +260,7 @@ pub const MetalBackend = struct {
     pub const InitConfig = struct {
         model_path: ?[]const u8 = null,
         model_id: ?[]const u8 = null,
+        weights_path: ?[]const u8 = null,
         memory_fit_is_error: bool = false,
     };
 
@@ -262,9 +277,14 @@ pub const MetalBackend = struct {
     allocator: std.mem.Allocator,
     model_config: ModelConfig,
     model_runtime: ModelRuntime,
-    loaded_for_delegate: ?*LoadedModel = null,
+    loaded_model: *LoadedModel,
+    vision_runtime: ?metal_vision.VisionRuntime = null,
+    vision_runtime_init_attempted: bool = false,
+    vision_safetensors_reopened: bool = false,
+    last_vision_encode_ns: u64 = 0,
     model_id_z: [:0]u8,
     model_path_z: [:0]u8,
+    weights_path: ?[]u8 = null,
     seed: c_int,
     bridge_flags: MlxModelFlags,
 
@@ -291,10 +311,6 @@ pub const MetalBackend = struct {
     batch_topk_counts_i32: []i32,
     batch_topk_row_indices: []usize,
     slot_state_bindings: []SlotStateBinding,
-    slot_route_modes: []SlotRouteMode,
-    slot_delegate_slots: []?usize,
-    vision_delegate: ?cpu_engine.FusedCpuBackend = null,
-    force_text_delegate_cpu: bool = false,
     state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined,
     state_descriptor_count: u8 = 0,
 
@@ -309,11 +325,6 @@ pub const MetalBackend = struct {
             self.bound = false;
             self.count = 0;
         }
-    };
-
-    const SlotRouteMode = enum(u8) {
-        mlx = 0,
-        vision_delegate = 1,
     };
 
     fn appendProgramStateDescriptors(
@@ -333,12 +344,6 @@ pub const MetalBackend = struct {
                 try models.registry.stateDescriptorForId(entry, state_id),
             );
         }
-    }
-
-    fn shouldRetainLoadedForVisionDelegate(config: *const ModelConfig, runtime: *const ModelRuntime) bool {
-        if (config.image_token_id <= 0) return false;
-        const arch_id = runtime.architecture_id orelse return false;
-        return models.registry.visionProgramByArchitectureId(arch_id) != null;
     }
 
     fn collectPlanStateDescriptors(self: *MetalBackend) !void {
@@ -607,29 +612,38 @@ pub const MetalBackend = struct {
         }
     }
 
-    fn ensureVisionDelegate(self: *MetalBackend) !*cpu_engine.FusedCpuBackend {
-        if (self.vision_delegate) |*delegate| return delegate;
-        const loaded = self.loaded_for_delegate orelse return error.UnsupportedContentType;
-        self.vision_delegate = try cpu_engine.FusedCpuBackend.init(
-            self.allocator,
-            loaded,
-            self.max_batch_size,
-            progress_mod.Context.NONE,
-        );
-        return &self.vision_delegate.?;
+    fn ensureVisionSafeTensorData(self: *MetalBackend) !void {
+        const loaded = self.loaded_model;
+        if (loaded.st == null) return error.UnsupportedContentType;
+        if (loaded.token_embeddings.data_ptr != null) return;
+        if (self.vision_safetensors_reopened) return;
+
+        const weights_path = self.weights_path orelse {
+            log.warn("inference", "metal vision runtime missing weights_path for safetensors reopen", .{});
+            return error.UnsupportedContentType;
+        };
+        const full_st = try safetensors_root.UnifiedSafeTensors.load(self.allocator, weights_path);
+        loaded.st.?.deinit();
+        loaded.st = full_st;
+        self.vision_safetensors_reopened = true;
     }
 
-    fn releaseSlotDelegateRouting(self: *MetalBackend, slot_index: usize) void {
-        if (slot_index >= self.max_batch_size) return;
-        if (self.slot_route_modes[slot_index] != .vision_delegate) return;
-        if (self.vision_delegate) |*delegate| {
-            if (self.slot_delegate_slots[slot_index]) |delegate_slot| {
-                delegate.unbindSlotStateBlocks(delegate_slot);
-                delegate.freeSlot(delegate_slot);
-            }
-        }
-        self.slot_delegate_slots[slot_index] = null;
-        self.slot_route_modes[slot_index] = .mlx;
+    fn ensureVisionRuntime(self: *MetalBackend) !*metal_vision.VisionRuntime {
+        if (self.vision_runtime) |*runtime| return runtime;
+        if (self.vision_runtime_init_attempted) return error.UnsupportedContentType;
+        self.vision_runtime_init_attempted = true;
+
+        const loaded = self.loaded_model;
+        try self.ensureVisionSafeTensorData();
+        const vision_runtime = (try metal_vision.VisionRuntime.init(self.allocator, loaded)) orelse {
+            log.warn("inference", "metal vision runtime unavailable for loaded model", .{
+                .has_image_token = @as(u8, @intFromBool(loaded.config.image_token_id > 0)),
+                .has_weights = @as(u8, @intFromBool(loaded.st != null)),
+            });
+            return error.UnsupportedContentType;
+        };
+        self.vision_runtime = vision_runtime;
+        return &self.vision_runtime.?;
     }
 
     fn prefillFirst(self: *MetalBackend, slot_index: usize, ctx: *mlx_ctx, prompt_tokens: []const u32) !u32 {
@@ -908,6 +922,14 @@ pub const MetalBackend = struct {
         const model_id_z = try allocator.dupeZ(u8, model_id_src);
         errdefer allocator.free(model_id_z);
 
+        const weights_path_owned = blk: {
+            const configured = init_config.weights_path orelse break :blk null;
+            const trimmed = std.mem.trim(u8, configured, " \t\r\n");
+            if (trimmed.len == 0) break :blk null;
+            break :blk try allocator.dupe(u8, trimmed);
+        };
+        errdefer if (weights_path_owned) |buf| allocator.free(buf);
+
         ensureMlxMetallibColocated(allocator);
 
         const seed = readSeedFromEnv(allocator);
@@ -954,8 +976,6 @@ pub const MetalBackend = struct {
 
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
         const d_model = std.math.cast(usize, loaded.config.d_model) orelse return error.InvalidArgument;
-        const retain_loaded_for_vision_delegate =
-            shouldRetainLoadedForVisionDelegate(&loaded.config, &loaded.runtime);
         const slot_ctxs = try allocator.alloc(?*mlx_ctx, max_batch_size);
         errdefer allocator.free(slot_ctxs);
         @memset(slot_ctxs, null);
@@ -1004,23 +1024,14 @@ pub const MetalBackend = struct {
         errdefer allocator.free(slot_state_bindings);
         for (slot_state_bindings) |*binding| binding.* = .{};
 
-        const slot_route_modes = try allocator.alloc(SlotRouteMode, max_batch_size);
-        errdefer allocator.free(slot_route_modes);
-        @memset(slot_route_modes, .mlx);
-
-        const slot_delegate_slots = try allocator.alloc(?usize, max_batch_size);
-        errdefer allocator.free(slot_delegate_slots);
-        @memset(slot_delegate_slots, null);
-
-        const force_text_delegate_cpu = false;
-
         var backend = MetalBackend{
             .allocator = allocator,
             .model_config = loaded.config,
             .model_runtime = loaded.runtime,
-            .loaded_for_delegate = if (retain_loaded_for_vision_delegate) loaded else null,
+            .loaded_model = loaded,
             .model_id_z = model_id_z,
             .model_path_z = model_path_z,
+            .weights_path = weights_path_owned,
             .seed = seed,
             .bridge_flags = model_flags,
             .vocab_size = vocab_size,
@@ -1045,11 +1056,6 @@ pub const MetalBackend = struct {
             .batch_topk_counts_i32 = batch_topk_counts_i32,
             .batch_topk_row_indices = batch_topk_row_indices,
             .slot_state_bindings = slot_state_bindings,
-            .slot_route_modes = slot_route_modes,
-            .slot_delegate_slots = slot_delegate_slots,
-            // Native Metal is the default execution route for text models.
-            // Set TALU_METAL_FORCE_TEXT_DELEGATE_CPU=1 only for targeted debug.
-            .force_text_delegate_cpu = force_text_delegate_cpu,
         };
         errdefer backend.deinit();
         try backend.collectPlanStateDescriptors();
@@ -1057,19 +1063,18 @@ pub const MetalBackend = struct {
     }
 
     pub fn canReleaseLoadedModel(self: *const MetalBackend) bool {
-        return self.loaded_for_delegate == null;
+        _ = self;
+        return false;
     }
 
     pub fn deinit(self: *MetalBackend) void {
-        if (self.vision_delegate) |*delegate| {
-            delegate.deinit();
-            self.vision_delegate = null;
+        if (self.vision_runtime) |*runtime| {
+            runtime.deinit();
+            self.vision_runtime = null;
         }
         for (self.slot_ctxs) |ctx| {
             if (ctx != null) mlx_destroy(ctx);
         }
-        self.allocator.free(self.slot_delegate_slots);
-        self.allocator.free(self.slot_route_modes);
         self.allocator.free(self.slot_state_bindings);
         for (self.slot_token_scratch) |*scratch| {
             scratch.deinit(self.allocator);
@@ -1093,6 +1098,7 @@ pub const MetalBackend = struct {
         self.allocator.free(self.slot_ctxs);
         self.allocator.free(self.model_id_z);
         self.allocator.free(self.model_path_z);
+        if (self.weights_path) |path| self.allocator.free(path);
     }
 
     pub fn synchronize(self: *MetalBackend) void {
@@ -1109,7 +1115,6 @@ pub const MetalBackend = struct {
 
     pub fn prefill(self: *MetalBackend, tokens: []const u32, logits_out: []f32) !void {
         self.slot_in_use[0] = true;
-        self.releaseSlotDelegateRouting(0);
         return self.prefillSlot(0, tokens, logits_out);
     }
 
@@ -1117,23 +1122,6 @@ pub const MetalBackend = struct {
         if (!self.slot_in_use[0]) return error.InvalidArgument;
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(0);
-        if (self.slot_route_modes[0] == .vision_delegate) {
-            const delegate = if (self.vision_delegate) |*d| d else return error.InvalidState;
-            const delegate_slot = self.slot_delegate_slots[0] orelse return error.InvalidState;
-            var delegate_requests = [_]contract.DecodeRequest{.{
-                .slot_index = delegate_slot,
-                .token = token,
-            }};
-            var delegate_results = [_]contract.DecodeResult{undefined};
-            try delegate.decodeBatch(delegate_requests[0..], delegate_results[0..]);
-            const delegate_logits = delegate_results[0].logits;
-            if (delegate_logits.len < self.vocab_size) return error.InvalidState;
-            const slot_logits = self.slotLogitsSlice(0);
-            @memcpy(slot_logits, delegate_logits[0..self.vocab_size]);
-            @memcpy(logits_out[0..self.vocab_size], slot_logits);
-            self.slot_positions[0] = position + 1;
-            return;
-        }
         const ctx = try self.ensureSlotCtx(0);
         const logits_view = logits_out[0..self.vocab_size];
         try self.decodeLogits(ctx, token, logits_view);
@@ -1157,54 +1145,6 @@ pub const MetalBackend = struct {
         if (!self.slot_in_use[0]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(0);
         const budget = @min(max_tokens, output_tokens.len);
-        if (self.slot_route_modes[0] == .vision_delegate) {
-            const delegate = if (self.vision_delegate) |*d| d else return error.InvalidState;
-            const delegate_slot = self.slot_delegate_slots[0] orelse return error.InvalidState;
-            var produced: usize = 0;
-            if (delegate_slot == 0) {
-                produced = try delegate.decodeStreaming(
-                    first_token,
-                    start_position,
-                    budget,
-                    eos_token_ids,
-                    output_tokens,
-                    callback,
-                    callback_data,
-                );
-            } else {
-                var current_token = first_token;
-                while (produced < budget) : (produced += 1) {
-                    var delegate_requests = [_]contract.DecodeRequest{.{
-                        .slot_index = delegate_slot,
-                        .token = current_token,
-                    }};
-                    var delegate_results = [_]contract.DecodeResult{undefined};
-                    try delegate.decodeBatch(delegate_requests[0..], delegate_results[0..]);
-                    const logits = delegate_results[0].logits;
-                    if (logits.len == 0) return error.InvalidState;
-                    var best_idx: usize = 0;
-                    var best_val: f32 = -std.math.inf(f32);
-                    for (logits, 0..) |value, idx| {
-                        if (value > best_val) {
-                            best_val = value;
-                            best_idx = idx;
-                        }
-                    }
-                    current_token = @intCast(best_idx);
-                    output_tokens[produced] = current_token;
-                    if (callback) |cb| cb(current_token, callback_data);
-                    for (eos_token_ids) |eos_id| {
-                        if (current_token == eos_id) {
-                            produced += 1;
-                            self.slot_positions[0] = start_position + produced;
-                            return produced;
-                        }
-                    }
-                }
-            }
-            self.slot_positions[0] = start_position + produced;
-            return produced;
-        }
         const ctx = try self.ensureSlotCtx(0);
 
         if (callback != null) {
@@ -1258,7 +1198,6 @@ pub const MetalBackend = struct {
     ) !usize {
         if (!self.slot_in_use[0]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(0);
-        if (self.slot_route_modes[0] == .vision_delegate) return error.InvalidArgument;
 
         const budget = @min(max_tokens, output_tokens.len);
         const ctx = try self.ensureSlotCtx(0);
@@ -1395,28 +1334,6 @@ pub const MetalBackend = struct {
         if (candidate_ids_out.len < top_k) return error.InvalidArgument;
         if (token > @as(u32, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
         if (top_k > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
-        if (self.slot_route_modes[slot_index] == .vision_delegate) {
-            const delegate = if (self.vision_delegate) |*d| d else return error.InvalidState;
-            const delegate_slot = self.slot_delegate_slots[slot_index] orelse return error.InvalidState;
-            var delegate_requests = [_]contract.DecodeRequest{.{
-                .slot_index = delegate_slot,
-                .token = token,
-            }};
-            var delegate_results = [_]contract.DecodeResult{undefined};
-            try delegate.decodeBatch(delegate_requests[0..], delegate_results[0..]);
-            const delegate_logits = delegate_results[0].logits;
-            if (delegate_logits.len < self.vocab_size) return error.InvalidState;
-            const slot_logits = self.slotLogitsSlice(slot_index);
-            @memcpy(slot_logits, delegate_logits[0..self.vocab_size]);
-            const candidate_count = fillTopKFromLogits(
-                slot_logits[0..self.vocab_size],
-                top_k,
-                candidate_logits_out,
-                candidate_ids_out,
-            );
-            self.slot_positions[slot_index] += 1;
-            return candidate_count;
-        }
 
         const ctx = try self.ensureSlotCtx(slot_index);
         var candidate_ids_owned: ?[]i32 = null;
@@ -1476,30 +1393,6 @@ pub const MetalBackend = struct {
         if (token > @as(u32, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
         if (sampling_config.top_k > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
         if (sampling_config.logit_bias != null) return error.InvalidArgument;
-        if (self.slot_route_modes[slot_index] == .vision_delegate) {
-            const delegate = if (self.vision_delegate) |*d| d else return error.InvalidState;
-            const delegate_slot = self.slot_delegate_slots[slot_index] orelse return error.InvalidState;
-            var delegate_requests = [_]contract.DecodeRequest{.{
-                .slot_index = delegate_slot,
-                .token = token,
-            }};
-            var delegate_results = [_]contract.DecodeResult{undefined};
-            try delegate.decodeBatch(delegate_requests[0..], delegate_results[0..]);
-            const delegate_logits = delegate_results[0].logits;
-            if (delegate_logits.len < self.vocab_size) return error.InvalidState;
-            const slot_logits = self.slotLogitsSlice(slot_index);
-            @memcpy(slot_logits, delegate_logits[0..self.vocab_size]);
-            applySamplingMutationsToLogits(slot_logits, sampling_config);
-
-            const candidate_count = fillTopKFromLogits(
-                slot_logits[0..self.vocab_size],
-                sampling_config.top_k,
-                candidate_logits_out,
-                candidate_ids_out,
-            );
-            self.slot_positions[slot_index] += 1;
-            return candidate_count;
-        }
 
         const ctx = try self.ensureSlotCtx(slot_index);
         const context_tokens = sampling_config.context_tokens orelse &.{};
@@ -1588,17 +1481,6 @@ pub const MetalBackend = struct {
         for (requests, 0..) |request_entry, row_idx| {
             const row_start = row_idx * top_k;
             const row_end = row_start + top_k;
-
-            if (self.slot_route_modes[request_entry.slot_index] == .vision_delegate) {
-                candidate_counts_out[row_idx] = try self.decodeTopKCandidates(
-                    request_entry.slot_index,
-                    request_entry.token,
-                    top_k,
-                    candidate_logits_out[row_start..row_end],
-                    candidate_ids_out[row_start..row_end],
-                );
-                continue;
-            }
 
             const ctx = try self.ensureSlotCtx(request_entry.slot_index);
             self.batch_decode_ctxs[batch_topk_count] = ctx;
@@ -1756,7 +1638,6 @@ pub const MetalBackend = struct {
 
     pub fn freeSlot(self: *MetalBackend, slot_index: usize) void {
         self.ensureSlotIndex(slot_index) catch return;
-        self.releaseSlotDelegateRouting(slot_index);
         self.unbindSlotStateBlocks(slot_index);
         self.slot_in_use[slot_index] = false;
         self.resetCtx(slot_index);
@@ -1765,27 +1646,12 @@ pub const MetalBackend = struct {
 
     pub fn resetSlot(self: *MetalBackend, slot_index: usize) void {
         self.ensureSlotIndex(slot_index) catch return;
-        if (self.slot_route_modes[slot_index] == .vision_delegate) {
-            if (self.vision_delegate) |*delegate| {
-                if (self.slot_delegate_slots[slot_index]) |delegate_slot| {
-                    delegate.resetSlot(delegate_slot);
-                }
-            }
-        } else {
-            self.resetCtx(slot_index);
-        }
+        self.resetCtx(slot_index);
         self.clearSlotState(slot_index);
     }
 
     pub fn getPosition(self: *const MetalBackend, slot_index: usize) usize {
         if (slot_index >= self.max_batch_size) return 0;
-        if (self.slot_route_modes[slot_index] == .vision_delegate) {
-            if (self.vision_delegate) |*delegate| {
-                if (self.slot_delegate_slots[slot_index]) |delegate_slot| {
-                    return delegate.getPosition(delegate_slot);
-                }
-            }
-        }
         return self.slot_positions[slot_index];
     }
 
@@ -1831,60 +1697,20 @@ pub const MetalBackend = struct {
 
         binding.count = @intCast(state_blocks.len);
         binding.bound = true;
-        if (self.slot_route_modes[slot_index] == .vision_delegate) {
-            const delegate = if (self.vision_delegate) |*d| d else return error.InvalidState;
-            const delegate_slot = self.slot_delegate_slots[slot_index] orelse return error.InvalidState;
-            try delegate.bindSlotStateBlocks(delegate_slot, state_blocks);
-        }
     }
 
     pub fn unbindSlotStateBlocks(self: *MetalBackend, slot_index: usize) void {
         if (slot_index >= self.max_batch_size) return;
-        if (self.slot_route_modes[slot_index] == .vision_delegate) {
-            if (self.vision_delegate) |*delegate| {
-                if (self.slot_delegate_slots[slot_index]) |delegate_slot| {
-                    delegate.unbindSlotStateBlocks(delegate_slot);
-                }
-            }
-        }
         self.slot_state_bindings[slot_index].clear();
     }
 
     pub fn prefillSlot(self: *MetalBackend, slot_index: usize, tokens: []const u32, logits_out: []f32) !void {
+        self.last_vision_encode_ns = 0;
         try self.ensureSlotIndex(slot_index);
         if (!self.slot_in_use[slot_index]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(slot_index);
         if (tokens.len == 0) return error.InvalidArgument;
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
-        if (self.force_text_delegate_cpu) {
-            var delegate = try self.ensureVisionDelegate();
-            var delegate_slot = self.slot_delegate_slots[slot_index];
-            var allocated_delegate_slot = false;
-            if (delegate_slot == null) {
-                delegate_slot = delegate.allocSlot() orelse return error.NoSlotsAvailable;
-                self.slot_delegate_slots[slot_index] = delegate_slot;
-                allocated_delegate_slot = true;
-            }
-            errdefer if (allocated_delegate_slot) {
-                if (delegate_slot) |slot| delegate.freeSlot(slot);
-                self.slot_delegate_slots[slot_index] = null;
-            };
-
-            const binding = &self.slot_state_bindings[slot_index];
-            if (binding.bound) {
-                const count: usize = @intCast(binding.count);
-                try delegate.bindSlotStateBlocks(delegate_slot.?, binding.handles[0..count]);
-            }
-            try delegate.prefillSlot(delegate_slot.?, tokens, logits_out[0..self.vocab_size]);
-            self.slot_route_modes[slot_index] = .vision_delegate;
-            const slot_logits = self.slotLogitsSlice(slot_index);
-            if (logits_out.ptr != slot_logits.ptr) {
-                @memcpy(slot_logits, logits_out[0..self.vocab_size]);
-            }
-            self.slot_positions[slot_index] = tokens.len;
-            return;
-        }
-        self.releaseSlotDelegateRouting(slot_index);
         const ctx = try self.ensureSlotCtx(slot_index);
         self.resetCtx(slot_index);
         self.clearSlotState(slot_index);
@@ -1904,12 +1730,6 @@ pub const MetalBackend = struct {
             .max_batch_size = self.max_batch_size,
         }, requests.len);
         if (requests.len == 0) return;
-        if (self.force_text_delegate_cpu) {
-            for (requests) |request_entry| {
-                try self.prefillSlot(request_entry.slot_index, request_entry.prompt_tokens, request_entry.logits_out);
-            }
-            return;
-        }
         if (self.vocab_size > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
 
         var batch_prefill_count: usize = 0;
@@ -1923,11 +1743,6 @@ pub const MetalBackend = struct {
             for (requests[0..idx]) |prev| {
                 if (prev.slot_index == request_entry.slot_index) return error.InvalidBatchSize;
             }
-            if (self.slot_route_modes[request_entry.slot_index] == .vision_delegate) {
-                return error.UnsupportedContentType;
-            }
-
-            self.releaseSlotDelegateRouting(request_entry.slot_index);
             const ctx = try self.ensureSlotCtx(request_entry.slot_index);
             self.resetCtx(request_entry.slot_index);
             self.clearSlotState(request_entry.slot_index);
@@ -1976,21 +1791,6 @@ pub const MetalBackend = struct {
         if (!self.slot_in_use[slot_index]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(slot_index);
         if (tokens.len == 0) return error.InvalidArgument;
-        if (self.force_text_delegate_cpu) {
-            const logits_buf = self.slotLogitsSlice(slot_index);
-            try self.prefillSlot(slot_index, tokens, logits_buf);
-            var best_idx: usize = 0;
-            var best_val: f32 = -std.math.inf(f32);
-            for (logits_buf, 0..) |value, idx| {
-                if (value > best_val) {
-                    best_val = value;
-                    best_idx = idx;
-                }
-            }
-            return @intCast(best_idx);
-        }
-
-        self.releaseSlotDelegateRouting(slot_index);
         const ctx = try self.ensureSlotCtx(slot_index);
         self.resetCtx(slot_index);
         self.clearSlotState(slot_index);
@@ -2008,40 +1808,81 @@ pub const MetalBackend = struct {
     ) !void {
         if (vision_input == null) return self.prefillSlot(slot_index, tokens, logits_out);
 
+        self.last_vision_encode_ns = 0;
         try self.ensureSlotIndex(slot_index);
         if (!self.slot_in_use[slot_index]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(slot_index);
         if (tokens.len == 0) return error.InvalidArgument;
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
+        const vision = vision_input.?;
+        if (vision.images.len == 0) return error.InvalidArgument;
+        if (vision.image_token_id == 0) return error.InvalidArgument;
+        if (vision.images.len > @as(usize, @intCast(std.math.maxInt(u32)))) return error.InvalidArgument;
 
-        var delegate = try self.ensureVisionDelegate();
-        var delegate_slot = self.slot_delegate_slots[slot_index];
-        var allocated_delegate_slot = false;
-        if (delegate_slot == null) {
-            delegate_slot = delegate.allocSlot() orelse return error.NoSlotsAvailable;
-            self.slot_delegate_slots[slot_index] = delegate_slot;
-            allocated_delegate_slot = true;
+        const prompt_i32 = try self.ensureSlotTokenScratch(slot_index, tokens.len);
+        for (tokens, 0..) |tok, i| {
+            if (tok > @as(u32, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+            prompt_i32[i] = @intCast(tok);
         }
-        errdefer if (allocated_delegate_slot) {
-            if (delegate_slot) |slot| delegate.freeSlot(slot);
-            self.slot_delegate_slots[slot_index] = null;
+
+        const encode_start_ns: i128 = std.time.nanoTimestamp();
+        var vision_runtime = try self.ensureVisionRuntime();
+        var encoded_vision_output = try vision_runtime.encodeImages(vision.images);
+        defer encoded_vision_output.deinit(self.allocator);
+        const encode_done_ns: i128 = std.time.nanoTimestamp();
+        const encode_elapsed_ns_i128 = encode_done_ns - encode_start_ns;
+        const encode_elapsed_ns: u64 = if (encode_elapsed_ns_i128 <= 0)
+            0
+        else
+            @intCast(encode_elapsed_ns_i128);
+        self.last_vision_encode_ns = encode_elapsed_ns;
+
+        if (encoded_vision_output.merged_embeddings.len == 0) return error.InvalidArgument;
+        if (encoded_vision_output.merged_embeddings.len > @as(usize, @intCast(std.math.maxInt(u32)))) {
+            return error.InvalidArgument;
+        }
+
+        const bridge_vision_input = MlxPrefillVisionInput{
+            .merged_embeddings = encoded_vision_output.merged_embeddings.ptr,
+            .merged_value_count = @intCast(encoded_vision_output.merged_embeddings.len),
+            .image_token_id = vision.image_token_id,
         };
-        const previous_route_mode = self.slot_route_modes[slot_index];
-        errdefer self.slot_route_modes[slot_index] = previous_route_mode;
 
-        const binding = &self.slot_state_bindings[slot_index];
-        if (binding.bound) {
-            const count: usize = @intCast(binding.count);
-            try delegate.bindSlotStateBlocks(delegate_slot.?, binding.handles[0..count]);
-        }
+        const ctx = try self.ensureSlotCtx(slot_index);
+        self.resetCtx(slot_index);
+        self.clearSlotState(slot_index);
 
-        try delegate.prefillSlotWithVision(
-            delegate_slot.?,
-            tokens,
-            vision_input,
-            logits_out[0..self.vocab_size],
+        const bridge_prefill_start_ns: i128 = std.time.nanoTimestamp();
+        const status = mlx_prefill_logits_with_vision(
+            ctx,
+            @ptrCast(prompt_i32.ptr),
+            @intCast(prompt_i32.len),
+            &bridge_vision_input,
+            @ptrCast(logits_out.ptr),
+            @intCast(self.vocab_size),
         );
-        self.slot_route_modes[slot_index] = .vision_delegate;
+        const bridge_prefill_done_ns: i128 = std.time.nanoTimestamp();
+        if (status == 0) {
+            const err_msg = resolveLastError();
+            log.warn("inference", "metal prefill_logits_with_vision failed", .{
+                .mlx_error = err_msg,
+                .prompt_len = tokens.len,
+                .image_count = vision.images.len,
+                .merged_values = encoded_vision_output.merged_embeddings.len,
+            });
+            if (std.mem.indexOf(u8, err_msg, "not implemented") != null) {
+                return error.UnsupportedContentType;
+            }
+            return error.InvalidArgument;
+        }
+        log.debug("inference", "metal vision prefill timings", .{
+            .prompt_len = tokens.len,
+            .images = vision.images.len,
+            .merged_values = encoded_vision_output.merged_embeddings.len,
+            .encode_ms = @as(f64, @floatFromInt(encode_elapsed_ns)) / 1_000_000.0,
+            .bridge_prefill_ms = @as(f64, @floatFromInt(bridge_prefill_done_ns - bridge_prefill_start_ns)) / 1_000_000.0,
+        }, @src());
+
         const slot_logits = self.slotLogitsSlice(slot_index);
         if (slot_logits.ptr != logits_out.ptr) {
             @memcpy(slot_logits, logits_out[0..self.vocab_size]);
@@ -2069,7 +1910,6 @@ pub const MetalBackend = struct {
         var batch_decode_count: usize = 0;
         for (requests, 0..) |request, idx| {
             _ = idx;
-            if (self.slot_route_modes[request.slot_index] == .vision_delegate) continue;
             const ctx = try self.ensureSlotCtx(request.slot_index);
             self.batch_decode_ctxs[batch_decode_count] = ctx;
             self.batch_decode_tokens_i32[batch_decode_count] = @intCast(request.token);
@@ -2096,25 +1936,18 @@ pub const MetalBackend = struct {
 
         for (requests, 0..) |request, idx| {
             const slot_logits = self.slotLogitsSlice(request.slot_index);
-            if (self.slot_route_modes[request.slot_index] == .vision_delegate) {
-                const delegate = if (self.vision_delegate) |*d| d else return error.InvalidState;
-                const delegate_slot = self.slot_delegate_slots[request.slot_index] orelse return error.InvalidState;
-                var delegate_requests = [_]contract.DecodeRequest{.{
-                    .slot_index = delegate_slot,
-                    .token = request.token,
-                }};
-                var delegate_results = [_]contract.DecodeResult{undefined};
-                try delegate.decodeBatch(delegate_requests[0..], delegate_results[0..]);
-                const delegate_logits = delegate_results[0].logits;
-                if (delegate_logits.len < self.vocab_size) return error.InvalidState;
-                @memcpy(slot_logits, delegate_logits[0..self.vocab_size]);
-            }
             self.slot_positions[request.slot_index] += 1;
             results[idx] = .{
                 .slot_index = request.slot_index,
                 .logits = slot_logits,
             };
         }
+    }
+
+    pub fn takeLastVisionEncodeNs(self: *MetalBackend) u64 {
+        const value = self.last_vision_encode_ns;
+        self.last_vision_encode_ns = 0;
+        return value;
     }
 
     pub fn isAvailable() bool {
@@ -2136,21 +1969,6 @@ test "MetalBackend.applySamplingMutationsToLogits applies repetition penalty" {
     try std.testing.expectApproxEqAbs(@as(f32, -4.0), logits[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), logits[3], 1e-6);
-}
-
-test "MetalBackend.shouldRetainLoadedForVisionDelegate only retains weights for active vision configs" {
-    var cfg = std.mem.zeroes(ModelConfig);
-    var runtime = std.mem.zeroes(ModelRuntime);
-    runtime.architecture_id = "qwen3";
-
-    cfg.image_token_id = 0;
-    try std.testing.expect(!MetalBackend.shouldRetainLoadedForVisionDelegate(&cfg, &runtime));
-
-    cfg.image_token_id = 151652;
-    try std.testing.expect(MetalBackend.shouldRetainLoadedForVisionDelegate(&cfg, &runtime));
-
-    runtime.architecture_id = null;
-    try std.testing.expect(!MetalBackend.shouldRetainLoadedForVisionDelegate(&cfg, &runtime));
 }
 
 test "MetalBackend.applySamplingMutationsToLogits applies additive penalties" {

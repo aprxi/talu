@@ -306,23 +306,6 @@ export fn mlx_matmul_bf16_transw(
     return mlx_matmul_bf16_transw_impl(a_data, m, k, b_data, n, c_data);
 }
 
-/// BF16-weights prefill GEMM: C = A @ W^T.
-/// Returns true on success, false if MLX is unavailable or fails.
-/// Caller falls back to the CPU Accelerate/SIMD path on false.
-pub fn matmulBF16TransW(
-    a: []const f32,
-    m: usize,
-    k: usize,
-    b: []align(1) const u16,
-    n: usize,
-    c: []f32,
-) bool {
-    std.debug.assert(a.len >= m * k);
-    std.debug.assert(b.len >= n * k);
-    std.debug.assert(c.len >= m * n);
-    return mlx_matmul_bf16_transw(a.ptr, m, k, @ptrCast(b.ptr), n, c.ptr);
-}
-
 /// Grouped-affine u4 quantized matrix multiplication using Metal GPU (MLX backend).
 /// A: [m x k] f32
 /// B: [k x n] grouped-affine u4 (w_data + scales + biases)

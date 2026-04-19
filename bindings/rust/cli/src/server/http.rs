@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -9,6 +8,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::header::HeaderValue;
 use hyper::{Method, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -17,38 +17,21 @@ use tower_service::Service;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::server::agent::exec as agent_exec;
-use crate::server::agent::fs as agent_fs;
-use crate::server::agent::process as agent_process;
-use crate::server::agent::shell as agent_shell;
 use crate::server::auth_gateway::AuthContext;
-use crate::server::code;
-use crate::server::code_ws;
-use crate::server::collab;
 use crate::server::completions;
-use crate::server::db;
-use crate::server::events;
-use crate::server::file;
-use crate::server::files;
 use crate::server::handlers;
 use crate::server::openapi;
-use crate::server::plugins;
-use crate::server::projects;
-use crate::server::providers;
-use crate::server::proxy;
-use crate::server::pubsub;
-use crate::server::repo;
 use crate::server::responses;
 use crate::server::responses_openapi;
-use crate::server::search;
-use crate::server::sessions;
-use crate::server::settings;
 use crate::server::state::AppState;
-use crate::server::state::PluginTokenEntry;
-use crate::server::tags;
 use crate::server::tokenizer;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+const CORS_ALLOW_ORIGIN: &str = "*";
+const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+const CORS_ALLOW_HEADERS_DEFAULT: &str =
+    "authorization, content-type, x-talu-gateway-secret, x-talu-tenant-id, x-talu-group-id, x-talu-user-id";
+const CORS_MAX_AGE_SECONDS: &str = "600";
 
 /// Structured error response returned by all endpoints.
 #[derive(Debug, Serialize, ToSchema)]
@@ -63,9 +46,20 @@ pub struct ErrorBody {
     pub message: String,
 }
 
-static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(openapi::build_openapi_json);
+static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
+    let spec = openapi::build_openapi_json();
+    filter_openapi_paths(
+        &spec,
+        &[
+            "/v1/chat/completions",
+            "/v1/models",
+            "/v1/responses",
+            "/v1/tokenizer",
+        ],
+    )
+});
 static OPENAPI_CHAT_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/"]));
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/completions"]));
 static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
     responses_openapi::patch_responses_openapi_spec(&filter_openapi_paths(
         &OPENAPI_SPEC,
@@ -74,63 +68,8 @@ static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
 });
 static OPENAPI_MODELS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models"]));
-static OPENAPI_FILES_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/files", "/v1/file"]));
-static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
-static OPENAPI_SEARCH_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/search"]));
-static OPENAPI_TAGS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tags"]));
-static OPENAPI_SETTINGS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/settings"]));
-static OPENAPI_PLUGINS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/plugins", "/v1/proxy"]));
-static OPENAPI_CODE_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/code"]));
-static OPENAPI_EVENTS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/events"]));
-static OPENAPI_PROJECTS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/projects"]));
-static OPENAPI_DB_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/"]));
-static OPENAPI_DB_TABLES_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/tables/"]));
-static OPENAPI_DB_VECTORS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/vectors/"]));
-static OPENAPI_DB_KV_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/kv/"]));
-static OPENAPI_DB_BLOBS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/blobs"]));
-static OPENAPI_DB_SQL_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/sql/"]));
-static OPENAPI_DB_OPS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/ops/"]));
-static OPENAPI_AGENT_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/"]));
-static OPENAPI_COLLAB_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/"]));
-static OPENAPI_COLLAB_RESOURCES_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/resources/"]));
-static OPENAPI_COLLAB_PUBSUB_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/pubsub"]));
-static OPENAPI_AGENT_FS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/fs/"]));
-static OPENAPI_AGENT_EXEC_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/exec"]));
-static OPENAPI_AGENT_SHELL_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/shells"]));
-static OPENAPI_AGENT_PROCESS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/processes"]));
-
-// Console UI assets — only compiled in when `make ui` has been run.
-// build.rs sets cfg(bundled_ui) when ui/dist/ contains the required files.
-#[cfg(bundled_ui)]
-const CONSOLE_HTML: &[u8] = include_bytes!("../../../../../ui/dist/index.html");
-#[cfg(bundled_ui)]
-const CONSOLE_CSS: &[u8] = include_bytes!("../../../../../ui/dist/style.css");
-#[cfg(bundled_ui)]
-const CONSOLE_JS: &[u8] = include_bytes!("../../../../../ui/dist/main.js");
+static OPENAPI_TOKENIZER_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tokenizer"]));
 
 static KNOWN_PATHS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut paths = HashSet::new();
@@ -170,6 +109,7 @@ impl Service<Request<Incoming>> for Router {
             let method_log = method.clone();
             let path = req.uri().path().to_string();
             let path_log = path.clone();
+            let cors_request_headers = req.headers().clone();
 
             let content_length = req
                 .headers()
@@ -187,6 +127,7 @@ impl Service<Request<Incoming>> for Router {
 
             // Auth-exempt routes.
             let response = match (method.clone(), path.as_str()) {
+                (Method::OPTIONS, _) => cors_preflight_response(&cors_request_headers),
                 (Method::GET, "/health") => {
                     Response::new(Full::new(Bytes::from_static(b"ok")).boxed())
                 }
@@ -210,129 +151,14 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_MODELS_SPEC.clone())).boxed())
                     .unwrap(),
-                (Method::GET, "/openapi/files.json") => Response::builder()
+                (Method::GET, "/openapi/tokenizer.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_FILES_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/repo.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_REPO_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/search.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_SEARCH_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/tags.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_TAGS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/settings.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_SETTINGS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/plugins.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_PLUGINS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/code.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_CODE_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/events.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_EVENTS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/projects.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_PROJECTS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/db.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_DB_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/db/tables.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_DB_TABLES_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/db/vectors.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_DB_VECTORS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/db/kv.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_DB_KV_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/db/blobs.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_DB_BLOBS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/db/sql.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_DB_SQL_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/db/ops.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_DB_OPS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/agent.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_AGENT_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/collab.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_COLLAB_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/collab/resources.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_COLLAB_RESOURCES_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/collab/pubsub.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_COLLAB_PUBSUB_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/agent/fs.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_AGENT_FS_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/agent/exec.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_AGENT_EXEC_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/agent/shell.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_AGENT_SHELL_SPEC.clone())).boxed())
-                    .unwrap(),
-                (Method::GET, "/openapi/agent/process.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_AGENT_PROCESS_SPEC.clone())).boxed())
+                    .body(Full::new(Bytes::from(OPENAPI_TOKENIZER_SPEC.clone())).boxed())
                     .unwrap(),
                 (Method::GET, "/docs") => docs_hub_response(),
                 (Method::GET, "/docs/chat") => {
-                    swagger_ui_response("/openapi/chat.json", "Talu API :: Chat")
+                    swagger_ui_response("/openapi/chat.json", "Talu API :: Chat Completions")
                 }
                 (Method::GET, "/docs/responses") => {
                     swagger_ui_response("/openapi/responses.json", "Talu API :: Responses")
@@ -340,146 +166,15 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/docs/models") => {
                     swagger_ui_response("/openapi/models.json", "Talu API :: Models")
                 }
-                (Method::GET, "/docs/files") => {
-                    swagger_ui_response("/openapi/files.json", "Talu API :: Files")
-                }
-                (Method::GET, "/docs/repo") => {
-                    swagger_ui_response("/openapi/repo.json", "Talu API :: Repository")
-                }
-                (Method::GET, "/docs/search") => {
-                    swagger_ui_response("/openapi/search.json", "Talu API :: Search")
-                }
-                (Method::GET, "/docs/tags") => {
-                    swagger_ui_response("/openapi/tags.json", "Talu API :: Tags")
-                }
-                (Method::GET, "/docs/settings") => {
-                    swagger_ui_response("/openapi/settings.json", "Talu API :: Settings")
-                }
-                (Method::GET, "/docs/plugins") => {
-                    swagger_ui_response("/openapi/plugins.json", "Talu API :: Plugins")
-                }
-                (Method::GET, "/docs/code") => {
-                    swagger_ui_response("/openapi/code.json", "Talu API :: Code")
-                }
-                (Method::GET, "/docs/events") => {
-                    swagger_ui_response("/openapi/events.json", "Talu API :: Events")
-                }
-                (Method::GET, "/docs/projects") => {
-                    swagger_ui_response("/openapi/projects.json", "Talu API :: Projects")
-                }
-                (Method::GET, "/docs/db") => docs_hub_response(),
-                (Method::GET, "/docs/collab") => docs_hub_response(),
-                (Method::GET, "/docs/agent") => docs_hub_response(),
-                (Method::GET, "/docs/db/tables") => {
-                    swagger_ui_response("/openapi/db/tables.json", "Talu API :: DB::Tables")
-                }
-                (Method::GET, "/docs/db/vectors") => {
-                    swagger_ui_response("/openapi/db/vectors.json", "Talu API :: DB::Vectors")
-                }
-                (Method::GET, "/docs/db/kv") => {
-                    swagger_ui_response("/openapi/db/kv.json", "Talu API :: DB::KV")
-                }
-                (Method::GET, "/docs/db/blobs") => {
-                    swagger_ui_response("/openapi/db/blobs.json", "Talu API :: DB::Blobs")
-                }
-                (Method::GET, "/docs/db/sql") => {
-                    swagger_ui_response("/openapi/db/sql.json", "Talu API :: DB::SQL")
-                }
-                (Method::GET, "/docs/db/ops") => {
-                    swagger_ui_response("/openapi/db/ops.json", "Talu API :: DB::Ops")
-                }
-                (Method::GET, "/docs/agent/fs") => {
-                    swagger_ui_response("/openapi/agent/fs.json", "Talu API :: Agent::FS")
-                }
-                (Method::GET, "/docs/collab/pubsub") => {
-                    swagger_ui_response("/openapi/collab/pubsub.json", "Talu API :: Collab::PubSub")
-                }
-                (Method::GET, "/docs/collab/resources") => swagger_ui_response(
-                    "/openapi/collab/resources.json",
-                    "Talu API :: Collab::Resources",
-                ),
-                (Method::GET, "/docs/agent/exec") => {
-                    swagger_ui_response("/openapi/agent/exec.json", "Talu API :: Agent::Exec")
-                }
-                (Method::GET, "/docs/agent/shell") => {
-                    swagger_ui_response("/openapi/agent/shell.json", "Talu API :: Agent::Shell")
-                }
-                (Method::GET, "/docs/agent/process") => {
-                    swagger_ui_response("/openapi/agent/process.json", "Talu API :: Agent::Process")
-                }
-                // Console UI (auth-exempt)
-                (Method::GET, "/") => {
-                    let mut resp = serve_ui_asset(&state, "index.html", "text/html; charset=utf-8");
-                    if resp.status() == StatusCode::OK {
-                        resp.headers_mut().insert(
-                            "content-security-policy",
-                            hyper::header::HeaderValue::from_static(
-                                "default-src 'self'; \
-                                 script-src 'self' 'unsafe-inline'; \
-                                 style-src 'self' 'unsafe-inline'; \
-                                 connect-src 'self'; \
-                                 img-src 'self' data: blob:; \
-                                 font-src 'self'; \
-                                 media-src 'self' blob:; \
-                                 object-src 'none'; \
-                                 frame-src 'self'",
-                            ),
-                        );
-                        resp.headers_mut().insert(
-                            "referrer-policy",
-                            hyper::header::HeaderValue::from_static("no-referrer"),
-                        );
-                    }
-                    resp
-                }
-                (Method::GET, "/assets/style.css") => {
-                    serve_ui_asset(&state, "style.css", "text/css")
-                }
-                (Method::GET, "/assets/main.js") => {
-                    serve_ui_asset(&state, "main.js", "application/javascript")
-                }
-                (Method::GET, p)
-                    if p == "/bench"
-                        || p == "/bench/"
-                        || p == "/bench/index.html"
-                        || p.starts_with("/bench/") =>
-                {
-                    let mut resp =
-                        serve_ui_asset(&state, "bench/index.html", "text/html; charset=utf-8");
-                    if resp.status() == StatusCode::OK {
-                        resp.headers_mut().insert(
-                            "content-security-policy",
-                            hyper::header::HeaderValue::from_static(
-                                "default-src 'self'; \
-                                 script-src 'self' 'unsafe-inline'; \
-                                 style-src 'self' 'unsafe-inline'; \
-                                 connect-src 'self'; \
-                                 img-src 'self' data: blob:; \
-                                 font-src 'self'; \
-                                 media-src 'self' blob:; \
-                                 object-src 'none'; \
-                                 frame-src 'self'",
-                            ),
-                        );
-                        resp.headers_mut().insert(
-                            "referrer-policy",
-                            hyper::header::HeaderValue::from_static("no-referrer"),
-                        );
-                    }
-                    resp
-                }
-                // Plugin assets (auth-exempt — JS loads before auth context exists)
-                (Method::GET, p)
-                    if (p.starts_with("/v1/plugins/") || p.starts_with("/plugins/"))
-                        && p.matches('/').count() >= 3 =>
-                {
-                    plugins::handle_asset(state, req, None).await
+                (Method::GET, "/docs/tokenizer") => {
+                    swagger_ui_response("/openapi/tokenizer.json", "Talu API :: Tokenizer")
                 }
                 _ => {
                     // Authenticate all other routes.
                     let auth = match authenticate(&state, req.headers()) {
                         Ok(ctx) => ctx,
                         Err(resp) => {
+                            let resp = with_cors(resp, &cors_request_headers);
                             let status = resp.status();
                             if status.is_client_error() {
                                 log::warn!(target: "server::http", "{} {} -> {}", method_log, path_log, status);
@@ -488,15 +183,8 @@ impl Service<Request<Incoming>> for Router {
                         }
                     };
 
-                    // Resolve plugin Bearer token for plugin-scoped routes.
-                    let plugin_token_entry =
-                        plugins::resolve_bearer_token_entry(&state, req.headers()).await;
-                    let plugin_owner = plugin_token_entry
-                        .as_ref()
-                        .map(|entry| entry.plugin_id.clone());
-
                     match (method, path.as_str()) {
-                        (Method::GET, "/v1/models") | (Method::GET, "/models") => {
+                        (Method::GET, "/v1/models") => {
                             handlers::handle_models(state, req, auth).await
                         }
                         (Method::POST, "/v1/responses") => {
@@ -505,6 +193,9 @@ impl Service<Request<Incoming>> for Router {
                         (Method::POST, "/v1/chat/completions") => {
                             completions::handle_create(state, req, auth).await
                         }
+                        (_, "/v1/models") => method_not_allowed(&["GET"]),
+                        (_, "/v1/responses") => method_not_allowed(&["POST"]),
+                        (_, "/v1/chat/completions") => method_not_allowed(&["POST"]),
                         (Method::POST, "/v1/tokenizer/instances") => {
                             tokenizer::handle_create_instance(state, req, auth).await
                         }
@@ -571,811 +262,6 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/tokenizer/capabilities") => {
                             tokenizer::handle_capabilities(state, req, auth).await
                         }
-                        (Method::POST, "/v1/agent/fs/read") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_read(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/fs/write") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_write(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/fs/edit") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_edit(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/fs/stat") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_stat(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/fs/ls") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_list(state, req, auth).await
-                            }
-                        }
-                        (Method::DELETE, "/v1/agent/fs/rm") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_remove(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/fs/mkdir") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_mkdir(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/fs/rename") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Filesystem,
-                            ) {
-                                resp
-                            } else {
-                                agent_fs::handle_rename(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/exec") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_exec::handle_exec(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/shells") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_shell::handle_create(state, req, auth).await
-                            }
-                        }
-                        (Method::GET, "/v1/agent/shells") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_shell::handle_list(state, req, auth).await
-                            }
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/agent/shells/")
-                                && p.ends_with("/ws")
-                                && req
-                                    .headers()
-                                    .get("upgrade")
-                                    .and_then(|v| v.to_str().ok())
-                                    .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
-                        {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_shell::handle_ws(state, req, auth).await
-                            }
-                        }
-                        (Method::GET, p) if p.starts_with("/v1/agent/shells/") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_shell::handle_get(state, req, auth).await
-                            }
-                        }
-                        (Method::DELETE, p) if p.starts_with("/v1/agent/shells/") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_shell::handle_delete(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, "/v1/agent/processes/spawn") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_process::handle_spawn(state, req, auth).await
-                            }
-                        }
-                        (Method::GET, "/v1/agent/processes") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_process::handle_list(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, p)
-                            if p.starts_with("/v1/agent/processes/") && p.ends_with("/send") =>
-                        {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_process::handle_send(state, req, auth).await
-                            }
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/agent/processes/")
-                                && p.ends_with("/ws")
-                                && req
-                                    .headers()
-                                    .get("upgrade")
-                                    .and_then(|v| v.to_str().ok())
-                                    .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
-                        {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_process::handle_ws(state, req, auth).await
-                            }
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/agent/processes/") && p.ends_with("/stream") =>
-                        {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_process::handle_stream(state, req, auth).await
-                            }
-                        }
-                        (Method::DELETE, p) if p.starts_with("/v1/agent/processes/") => {
-                            if let Some(resp) = enforce_plugin_agent_capability(
-                                req.headers(),
-                                plugin_token_entry.as_ref(),
-                                AgentCapability::Exec,
-                            ) {
-                                resp
-                            } else {
-                                agent_process::handle_delete(state, req, auth).await
-                            }
-                        }
-                        (Method::POST, p) if collab::is_collab_session_open_path(p) => {
-                            collab::handle_open_session(state, req, auth).await
-                        }
-                        (Method::GET, p) if collab::is_collab_events_stream_path(p) => {
-                            collab::handle_stream_events(state, req, auth).await
-                        }
-                        (Method::GET, p) if collab::is_collab_ws_path(p) => {
-                            collab::handle_ws(state, req, auth).await
-                        }
-                        (Method::GET, p) if collab::is_collab_history_path(p) => {
-                            collab::handle_get_history(state, req, auth).await
-                        }
-                        (Method::GET, p) if collab::is_collab_snapshot_path(p) => {
-                            collab::handle_get_snapshot(state, req, auth).await
-                        }
-                        (Method::POST, p) if collab::is_collab_ops_path(p) => {
-                            collab::handle_submit_op(state, req, auth).await
-                        }
-                        (Method::PUT, p) if collab::is_collab_presence_path(p) => {
-                            collab::handle_put_presence(state, req, auth).await
-                        }
-                        (Method::GET, p) if collab::is_collab_presence_path(p) => {
-                            collab::handle_get_presence(state, req, auth).await
-                        }
-                        (Method::GET, p) if collab::is_collab_resource_root_path(p) => {
-                            collab::handle_get_resource(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/events") => {
-                            events::handle_replay(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/events/stream") => {
-                            events::handle_stream(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/events/topics") => {
-                            events::handle_topics(state, req, auth).await
-                        }
-                        // Settings endpoints
-                        (Method::GET, "/v1/settings") | (Method::GET, "/settings") => {
-                            settings::handle_get(state, req, auth).await
-                        }
-                        (Method::PATCH, "/v1/settings") | (Method::PATCH, "/settings") => {
-                            settings::handle_patch(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/settings/models/")
-                                || p.starts_with("/settings/models/") =>
-                        {
-                            let prefix = if p.starts_with("/v1") {
-                                "/v1/settings/models/"
-                            } else {
-                                "/settings/models/"
-                            };
-                            let model_id = &p[prefix.len()..];
-                            settings::handle_reset_model(state, req, auth, model_id).await
-                        }
-                        // Session management endpoints
-                        (Method::GET, "/v1/chat/sessions") => {
-                            sessions::handle_list(state, req, auth).await
-                        }
-                        // Batch operations (must be before single-session routes)
-                        (Method::POST, "/v1/chat/sessions/batch") => {
-                            sessions::handle_batch(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/chat/sessions/") && !p.ends_with("/fork") =>
-                        {
-                            sessions::handle_get(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/chat/sessions/") && !p.ends_with("/tags") =>
-                        {
-                            sessions::handle_delete(state, req, auth).await
-                        }
-                        (Method::PATCH, p) if p.starts_with("/v1/chat/sessions/") => {
-                            sessions::handle_patch(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/fork") && p.starts_with("/v1/chat/sessions/") =>
-                        {
-                            sessions::handle_fork(state, req, auth).await
-                        }
-                        // Search endpoint
-                        (Method::POST, "/v1/search") | (Method::POST, "/search") => {
-                            search::handle_search(state, req, auth).await
-                        }
-                        // Project management endpoints
-                        (Method::GET, "/v1/projects") | (Method::GET, "/projects") => {
-                            projects::handle_list(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/projects") | (Method::POST, "/projects") => {
-                            projects::handle_create(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/projects/") || p.starts_with("/projects/") =>
-                        {
-                            projects::handle_get(state, req, auth).await
-                        }
-                        (Method::PATCH, p)
-                            if p.starts_with("/v1/projects/") || p.starts_with("/projects/") =>
-                        {
-                            projects::handle_update(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/projects/") || p.starts_with("/projects/") =>
-                        {
-                            projects::handle_delete(state, req, auth).await
-                        }
-                        // Provider config endpoints
-                        (Method::GET, "/v1/providers") => {
-                            providers::handle_list(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/providers/") && p.ends_with("/models") =>
-                        {
-                            let name =
-                                p["/v1/providers/".len()..p.len() - "/models".len()].to_string();
-                            providers::handle_list_models(state, req, auth, name).await
-                        }
-                        (Method::POST, p)
-                            if p.starts_with("/v1/providers/") && p.ends_with("/health") =>
-                        {
-                            let name =
-                                p["/v1/providers/".len()..p.len() - "/health".len()].to_string();
-                            providers::handle_health(state, req, auth, name).await
-                        }
-                        (Method::PATCH, p) if p.starts_with("/v1/providers/") => {
-                            let name = p["/v1/providers/".len()..].to_string();
-                            providers::handle_update(state, req, auth, name).await
-                        }
-                        // DB vector plane endpoints
-                        (Method::POST, "/v1/db/vectors/collections") => {
-                            db::vector::handle_create_collection(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/db/vectors/collections") => {
-                            db::vector::handle_list_collections(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/points/append")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_append_points(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/points/upsert")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_upsert_points(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/points/delete")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_delete_points(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/points/fetch")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_fetch_points(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/points/query")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_query_points(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/indexes/build")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_build_collection_indexes(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.ends_with("/compact")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_compact_collection(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.ends_with("/stats")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_collection_stats(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.ends_with("/changes")
-                                && p.starts_with("/v1/db/vectors/collections/") =>
-                        {
-                            db::vector::handle_collection_changes(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/db/vectors/collections/")
-                                && !is_dynamic_vector_subpath(p) =>
-                        {
-                            db::vector::handle_get_collection(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/db/vectors/collections/")
-                                && !is_dynamic_vector_subpath(p) =>
-                        {
-                            db::vector::handle_delete_collection(state, req, auth).await
-                        }
-                        // Tag management endpoints
-                        (Method::GET, "/v1/tags") | (Method::GET, "/tags") => {
-                            tags::handle_list(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/tags") | (Method::POST, "/tags") => {
-                            tags::handle_create(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/tags/") || p.starts_with("/tags/") =>
-                        {
-                            tags::handle_get(state, req, auth).await
-                        }
-                        (Method::PATCH, p)
-                            if p.starts_with("/v1/tags/") || p.starts_with("/tags/") =>
-                        {
-                            tags::handle_patch(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/tags/") || p.starts_with("/tags/") =>
-                        {
-                            tags::handle_delete(state, req, auth).await
-                        }
-                        // Session tag endpoints
-                        (Method::GET, p)
-                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
-                        {
-                            sessions::handle_get_tags(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
-                        {
-                            sessions::handle_add_tags(state, req, auth).await
-                        }
-                        (Method::PUT, p)
-                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
-                        {
-                            sessions::handle_set_tags(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
-                        {
-                            sessions::handle_remove_tags(state, req, auth).await
-                        }
-                        // Table meta endpoints
-                        (Method::GET, "/v1/db/tables/_meta/namespaces") => {
-                            db::table::handle_list_namespaces(state, req, auth).await
-                        }
-                        (Method::GET, p) if db::table::is_table_meta_policy_path(p) => {
-                            db::table::handle_get_policy(state, req, auth).await
-                        }
-                        // Document/table plane endpoints
-                        (Method::GET, p) if is_db_table_root_path(p) => {
-                            db::docs::handle_list(state, req, auth, plugin_owner).await
-                        }
-                        (Method::POST, p)
-                            if is_db_table_root_path(p) || is_db_table_insert_path(p) =>
-                        {
-                            db::docs::handle_create(state, req, auth, plugin_owner).await
-                        }
-                        (Method::POST, p) if is_db_table_search_path(p) => {
-                            db::docs::handle_search(state, req, auth).await
-                        }
-                        (Method::GET, p) if is_db_table_tags_path(p) => {
-                            db::docs::handle_get_tags(state, req, auth).await
-                        }
-                        (Method::POST, p) if is_db_table_tags_path(p) => {
-                            db::docs::handle_add_tags(state, req, auth).await
-                        }
-                        (Method::DELETE, p) if is_db_table_tags_path(p) => {
-                            db::docs::handle_remove_tags(state, req, auth).await
-                        }
-                        // Table rows endpoints (must come before item-path match)
-                        (Method::POST, p) if db::table::is_table_scan_path(p) => {
-                            db::table::handle_scan_post(state, req, auth).await
-                        }
-                        (Method::POST, p) if db::table::is_table_rows_path(p) => {
-                            db::table::handle_write_row(state, req, auth).await
-                        }
-                        (Method::GET, p) if db::table::is_table_row_path(p) => {
-                            db::table::handle_get_row(state, req, auth).await
-                        }
-                        (Method::GET, p) if db::table::is_table_rows_path(p) => {
-                            db::table::handle_scan(state, req, auth).await
-                        }
-                        (Method::DELETE, p) if db::table::is_table_row_path(p) => {
-                            db::table::handle_delete_row(state, req, auth).await
-                        }
-                        (Method::GET, p) if is_db_table_item_path(p) => {
-                            db::docs::handle_get(state, req, auth).await
-                        }
-                        (Method::PATCH, p) if is_db_table_item_path(p) => {
-                            db::docs::handle_update(state, req, auth).await
-                        }
-                        (Method::DELETE, p) if is_db_table_item_path(p) => {
-                            db::docs::handle_delete(state, req, auth).await
-                        }
-                        // Stateless file inspect/transform (no storage required)
-                        (Method::POST, "/v1/file/inspect") | (Method::POST, "/file/inspect") => {
-                            file::handle_inspect(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/file/transform")
-                        | (Method::POST, "/file/transform") => {
-                            file::handle_transform(state, req, auth).await
-                        }
-                        // Batch must come before single-file routes
-                        (Method::POST, "/v1/files/batch") | (Method::POST, "/files/batch") => {
-                            files::handle_batch(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/files") | (Method::POST, "/files") => {
-                            files::handle_upload(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/files") | (Method::GET, "/files") => {
-                            files::handle_list(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/db/blobs") => {
-                            db::blob::handle_list(state, req, auth).await
-                        }
-                        (Method::GET, p) if p.starts_with("/v1/db/blobs/") => {
-                            db::blob::handle_get(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if (p.starts_with("/v1/files/") || p.starts_with("/files/"))
-                                && p.ends_with("/content") =>
-                        {
-                            files::handle_get_content(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if (p.starts_with("/v1/files/") || p.starts_with("/files/"))
-                                && !p.ends_with("/content") =>
-                        {
-                            files::handle_get(state, req, auth).await
-                        }
-                        (Method::PATCH, p)
-                            if p.starts_with("/v1/files/") || p.starts_with("/files/") =>
-                        {
-                            files::handle_patch(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/files/") || p.starts_with("/files/") =>
-                        {
-                            files::handle_delete(state, req, auth).await
-                        }
-                        // Code analysis endpoints (tree-sitter)
-                        (Method::POST, "/v1/code/highlight")
-                        | (Method::POST, "/code/highlight") => {
-                            code::handle_highlight(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/code/parse") | (Method::POST, "/code/parse") => {
-                            code::handle_parse(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/code/query") | (Method::POST, "/code/query") => {
-                            code::handle_query(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/code/graph") | (Method::POST, "/code/graph") => {
-                            code::handle_graph(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/code/languages") | (Method::GET, "/code/languages") => {
-                            code::handle_languages(state, req, auth).await
-                        }
-                        // Code session endpoints (incremental parsing)
-                        (Method::POST, "/v1/code/session/create")
-                        | (Method::POST, "/code/session/create") => {
-                            code::handle_session_create(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/code/session/update")
-                        | (Method::POST, "/code/session/update") => {
-                            code::handle_session_update(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/code/session/highlight")
-                        | (Method::POST, "/code/session/highlight") => {
-                            code::handle_session_highlight(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/code/session/")
-                                || p.starts_with("/code/session/") =>
-                        {
-                            code::handle_session_delete(state, req, auth).await
-                        }
-                        // Temporary collaboration WebSocket topic relay used by current editor sync.
-                        (Method::GET, "/v1/collab/pubsub/ws")
-                            if req
-                                .headers()
-                                .get("upgrade")
-                                .and_then(|v| v.to_str().ok())
-                                .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
-                        {
-                            pubsub::handle_ws(state, req).await
-                        }
-                        // WebSocket upgrade for real-time code analysis
-                        (Method::GET, "/v1/code/ws") | (Method::GET, "/code/ws")
-                            if req
-                                .headers()
-                                .get("upgrade")
-                                .and_then(|v| v.to_str().ok())
-                                .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
-                        {
-                            let key = match req.headers().get("sec-websocket-key") {
-                                Some(k) => k.as_bytes().to_vec(),
-                                None => {
-                                    return Ok(json_error(
-                                        StatusCode::BAD_REQUEST,
-                                        "invalid_request",
-                                        "Missing Sec-WebSocket-Key header",
-                                    ));
-                                }
-                            };
-                            let accept = code_ws::compute_accept_key(&key);
-
-                            let upgrade = hyper::upgrade::on(req);
-                            tokio::spawn(async move {
-                                match upgrade.await {
-                                    Ok(upgraded) => {
-                                        log::info!(target: "server::code_ws", "WebSocket connection established");
-                                        code_ws::handle_ws_connection(upgraded).await;
-                                    }
-                                    Err(e) => {
-                                        log::error!(target: "server::code_ws", "WebSocket upgrade failed: {e}");
-                                    }
-                                }
-                            });
-
-                            Response::builder()
-                                .status(StatusCode::SWITCHING_PROTOCOLS)
-                                .header("upgrade", "websocket")
-                                .header("connection", "Upgrade")
-                                .header("sec-websocket-accept", accept)
-                                .body(Full::new(Bytes::new()).boxed())
-                                .unwrap()
-                        }
-                        // DB KV plane endpoints
-                        (Method::GET, p)
-                            if p.starts_with("/v1/db/kv/namespaces/")
-                                && p.ends_with("/entries") =>
-                        {
-                            db::kv::handle_list(state, req, auth).await
-                        }
-                        (Method::PUT, p)
-                            if p.starts_with("/v1/db/kv/namespaces/")
-                                && p.contains("/entries/") =>
-                        {
-                            db::kv::handle_put(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/db/kv/namespaces/")
-                                && p.contains("/entries/") =>
-                        {
-                            db::kv::handle_get(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/db/kv/namespaces/")
-                                && p.contains("/entries/") =>
-                        {
-                            db::kv::handle_delete(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/flush") =>
-                        {
-                            db::kv::handle_flush(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/batch") =>
-                        {
-                            db::kv::handle_batch(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if p.starts_with("/v1/db/kv/namespaces/")
-                                && p.ends_with("/compact") =>
-                        {
-                            db::kv::handle_compact(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/stats") =>
-                        {
-                            db::kv::handle_stats(state, req, auth).await
-                        }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/watch") =>
-                        {
-                            db::kv::handle_watch(state, req, auth).await
-                        }
-                        // DB SQL plane endpoints
-                        (Method::POST, "/v1/db/sql/query") => {
-                            db::sql::handle_query(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/db/sql/explain") => {
-                            db::sql::handle_explain(state, req, auth).await
-                        }
-                        // DB ops plane endpoints
-                        (Method::POST, p) if p.starts_with("/v1/db/ops/") => {
-                            db::ops::handle(state, req, auth).await
-                        }
-                        // Plugin discovery
-                        (Method::GET, "/v1/plugins") | (Method::GET, "/plugins") => {
-                            plugins::handle_list(state, req, auth).await
-                        }
-                        // Repository management endpoints
-                        (Method::GET, "/v1/repo/models") | (Method::GET, "/repo/models") => {
-                            repo::handle_list(state, req, auth).await
-                        }
-                        (Method::GET, "/v1/repo/search") | (Method::GET, "/repo/search") => {
-                            repo::handle_search(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/repo/models") | (Method::POST, "/repo/models") => {
-                            repo::handle_fetch(state, req, auth).await
-                        }
-                        // File listing (must come before DELETE /repo/models/{id})
-                        (Method::GET, p)
-                            if (p.starts_with("/v1/repo/models/")
-                                || p.starts_with("/repo/models/"))
-                                && p.ends_with("/files") =>
-                        {
-                            let prefix = if p.starts_with("/v1") {
-                                "/v1/repo/models/"
-                            } else {
-                                "/repo/models/"
-                            };
-                            let raw = &p[prefix.len()..p.len() - "/files".len()];
-                            let model_id =
-                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
-                            repo::handle_list_files(state, req, auth, &model_id).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/repo/models/")
-                                || p.starts_with("/repo/models/") =>
-                        {
-                            let prefix = if p.starts_with("/v1") {
-                                "/v1/repo/models/"
-                            } else {
-                                "/repo/models/"
-                            };
-                            let raw = &p[prefix.len()..];
-                            let model_id =
-                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
-                            repo::handle_delete(state, req, auth, &model_id).await
-                        }
-                        // Pin management endpoints
-                        (Method::GET, "/v1/repo/pins") | (Method::GET, "/repo/pins") => {
-                            repo::handle_list_pins(state, req, auth).await
-                        }
-                        (Method::POST, "/v1/repo/pins") | (Method::POST, "/repo/pins") => {
-                            repo::handle_pin(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/repo/pins/") || p.starts_with("/repo/pins/") =>
-                        {
-                            let prefix = if p.starts_with("/v1") {
-                                "/v1/repo/pins/"
-                            } else {
-                                "/repo/pins/"
-                            };
-                            let raw = &p[prefix.len()..];
-                            let model_id =
-                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
-                            repo::handle_unpin(state, req, auth, &model_id).await
-                        }
-                        (Method::POST, "/v1/repo/sync-pins")
-                        | (Method::POST, "/repo/sync-pins") => {
-                            repo::handle_sync_pins(state, req, auth).await
-                        }
-                        // Proxy endpoint (plugin outbound HTTP)
-                        (Method::POST, "/v1/proxy") | (Method::POST, "/proxy") => {
-                            proxy::handle_proxy(state, req, auth).await
-                        }
                         _ => {
                             if is_known_path(&path) {
                                 log::warn!(target: "server::http", "unimplemented endpoint: {} {}", method_log, path_log);
@@ -1394,6 +280,7 @@ impl Service<Request<Incoming>> for Router {
                     }
                 }
             };
+            let response = with_cors(response, &cors_request_headers);
 
             let status = response.status();
             if status.is_client_error() {
@@ -1405,6 +292,49 @@ impl Service<Request<Incoming>> for Router {
             Ok(response)
         })
     }
+}
+
+fn with_cors(mut response: Response<BoxBody>, req_headers: &hyper::HeaderMap) -> Response<BoxBody> {
+    apply_cors_headers(response.headers_mut(), req_headers);
+    response
+}
+
+fn cors_preflight_response(req_headers: &hyper::HeaderMap) -> Response<BoxBody> {
+    let mut response = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Full::new(Bytes::new()).boxed())
+        .unwrap();
+    apply_cors_headers(response.headers_mut(), req_headers);
+    response
+}
+
+fn apply_cors_headers(headers: &mut hyper::HeaderMap, req_headers: &hyper::HeaderMap) {
+    headers.insert(
+        "access-control-allow-origin",
+        HeaderValue::from_static(CORS_ALLOW_ORIGIN),
+    );
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static(CORS_ALLOW_METHODS),
+    );
+    if let Some(requested_headers) = req_headers.get("access-control-request-headers") {
+        headers.insert("access-control-allow-headers", requested_headers.clone());
+    } else {
+        headers.insert(
+            "access-control-allow-headers",
+            HeaderValue::from_static(CORS_ALLOW_HEADERS_DEFAULT),
+        );
+    }
+    headers.insert(
+        "access-control-max-age",
+        HeaderValue::from_static(CORS_MAX_AGE_SECONDS),
+    );
+    headers.insert(
+        "vary",
+        HeaderValue::from_static(
+            "origin, access-control-request-method, access-control-request-headers",
+        ),
+    );
 }
 
 /// Authenticate the request using gateway auth (if configured).
@@ -1458,63 +388,11 @@ fn authenticate(
     }
 }
 
-fn is_db_table_root_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
-        return false;
-    };
-    !stripped.is_empty() && !stripped.contains('/')
-}
-
-fn is_db_table_insert_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
-        return false;
-    };
-    let mut parts = stripped.split('/');
-    let table = parts.next().unwrap_or("");
-    let action = parts.next().unwrap_or("");
-    table != "" && action == "insert" && parts.next().is_none()
-}
-
-fn is_db_table_search_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
-        return false;
-    };
-    let mut parts = stripped.split('/');
-    let table = parts.next().unwrap_or("");
-    let action = parts.next().unwrap_or("");
-    table != "" && action == "search" && parts.next().is_none()
-}
-
-fn is_db_table_item_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
-        return false;
-    };
-    let mut parts = stripped.split('/');
-    let table = parts.next().unwrap_or("");
-    let id = parts.next().unwrap_or("");
-    table != ""
-        && id != ""
-        && id != "search"
-        && id != "insert"
-        && id != "rows"
-        && id != "_meta"
-        && !(table == "_meta" && (id == "namespaces" || id == "policy"))
-        && parts.next().is_none()
-}
-
-fn is_db_table_tags_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
-        return false;
-    };
-    let mut parts = stripped.split('/');
-    let table = parts.next().unwrap_or("");
-    let id = parts.next().unwrap_or("");
-    let tags = parts.next().unwrap_or("");
-    table != "" && id != "" && tags == "tags" && parts.next().is_none()
-}
-
 fn is_known_path(path: &str) -> bool {
     if KNOWN_PATHS.contains(path) {
+        return true;
+    }
+    if path.starts_with("/v1/tokenizer/instances/") {
         return true;
     }
     if let Some(stripped) = path.strip_prefix("/v1") {
@@ -1522,215 +400,7 @@ fn is_known_path(path: &str) -> bool {
             return true;
         }
     }
-    // Parameterized paths not in KNOWN_PATHS as literals.
-    is_kv_entry_path(path)
-        || is_kv_state_op_path(path)
-        || is_db_table_root_path(path)
-        || is_db_table_item_path(path)
-        || is_db_table_insert_path(path)
-        || is_db_table_search_path(path)
-        || is_db_table_tags_path(path)
-        || db::table::is_table_rows_path(path)
-        || db::table::is_table_row_path(path)
-        || db::table::is_table_scan_path(path)
-        || db::table::is_table_meta_policy_path(path)
-        || is_dynamic_vector_path(path)
-        || collab::is_collab_resource_prefix(path)
-        || is_blob_item_path(path)
-}
-
-fn is_kv_entry_path(path: &str) -> bool {
-    let p = path.strip_prefix("/v1").unwrap_or(path);
-    p.starts_with("/db/kv/namespaces/") && p.contains("/entries")
-}
-
-fn is_kv_state_op_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/kv/namespaces/") else {
-        return false;
-    };
-    stripped.ends_with("/flush")
-        || stripped.ends_with("/compact")
-        || stripped.ends_with("/batch")
-        || stripped.ends_with("/stats")
-        || stripped.ends_with("/watch")
-}
-
-/// True when path is a known vector sub-path (points/*, stats, compact, etc.)
-/// as opposed to a simple collection-name path.  Used to prevent GET/DELETE
-/// catch-alls from absorbing wrong-method requests on known sub-paths.
-fn is_dynamic_vector_subpath(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/vectors/collections/") else {
-        return false;
-    };
-    let parts: Vec<&str> = stripped.split('/').collect();
-    match parts.len() {
-        2 => matches!(parts[1], "stats" | "compact" | "changes"),
-        3 => {
-            (parts[1] == "points"
-                && matches!(parts[2], "append" | "upsert" | "delete" | "fetch" | "query"))
-                || (parts[1] == "indexes" && parts[2] == "build")
-        }
-        _ => false,
-    }
-}
-
-fn is_dynamic_vector_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/vectors/collections/") else {
-        return false;
-    };
-    if stripped.is_empty() {
-        return false;
-    }
-    let parts: Vec<&str> = stripped.split('/').collect();
-    match parts.len() {
-        // /v1/db/vectors/collections/{name}
-        1 => true,
-        // /v1/db/vectors/collections/{name}/{suffix}
-        2 => matches!(parts[1], "stats" | "compact" | "changes"),
-        // /v1/db/vectors/collections/{name}/points/{action} or indexes/build
-        3 => {
-            (parts[1] == "points"
-                && matches!(parts[2], "append" | "upsert" | "delete" | "fetch" | "query"))
-                || (parts[1] == "indexes" && parts[2] == "build")
-        }
-        _ => false,
-    }
-}
-
-fn is_blob_item_path(path: &str) -> bool {
-    let Some(stripped) = path.strip_prefix("/v1/db/blobs/") else {
-        return false;
-    };
-    !stripped.is_empty() && !stripped.contains('/')
-}
-
-/// Serve a console UI asset.
-///
-/// Resolution order:
-/// 1. `--html-dir <dir>` → read `<dir>/<filename>` from disk
-/// 2. Bundled assets (when built with `make ui` / `cfg(bundled_ui)`)
-/// 3. 404 with a helpful message
-fn serve_ui_asset(state: &AppState, filename: &str, content_type: &str) -> Response<BoxBody> {
-    if filename == "index.html" {
-        return serve_index_html(state);
-    }
-
-    // --html-dir takes precedence over bundled assets.
-    if let Some(ref dir) = state.html_dir {
-        return serve_file(dir, filename, content_type);
-    }
-
-    // Fall back to bundled assets (compiled in when ui/dist/ exists).
-    #[cfg(bundled_ui)]
-    {
-        if let Some(data) = bundled_asset(filename) {
-            return static_response(content_type, data);
-        }
-    }
-
-    json_error(
-        StatusCode::NOT_FOUND,
-        "ui_not_available",
-        "No UI bundled. Run 'make ui' or use --html-dir",
-    )
-}
-
-fn serve_index_html(state: &AppState) -> Response<BoxBody> {
-    let html = if let Some(ref dir) = state.html_dir {
-        let path = dir.join("index.html");
-        match std::fs::read_to_string(&path) {
-            Ok(html) => html,
-            Err(_) => {
-                return json_error(
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "Asset not found: index.html",
-                )
-            }
-        }
-    } else {
-        #[cfg(bundled_ui)]
-        {
-            String::from_utf8_lossy(CONSOLE_HTML).into_owned()
-        }
-        #[cfg(not(bundled_ui))]
-        {
-            return json_error(
-                StatusCode::NOT_FOUND,
-                "ui_not_available",
-                "No UI bundled. Run 'make ui' or use --html-dir",
-            );
-        }
-    };
-
-    let body = inject_bootstrap_script(&html, state);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(body)).boxed())
-        .unwrap()
-}
-
-fn inject_bootstrap_script(html: &str, state: &AppState) -> String {
-    let payload = serde_json::json!({
-        "workdir": state
-            .workdir
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
-    });
-    let payload_json = serde_json::to_string(&payload)
-        .unwrap_or_else(|_| "{\"workdir\":null}".to_string())
-        .replace("</", "<\\/");
-    let script = format!(r#"<script>window.__TALU_BOOTSTRAP__={payload_json};</script>"#);
-
-    if let Some(index) = html.find("</head>") {
-        let mut injected = String::with_capacity(html.len() + script.len());
-        injected.push_str(&html[..index]);
-        injected.push_str(&script);
-        injected.push_str(&html[index..]);
-        injected
-    } else {
-        format!("{script}{html}")
-    }
-}
-
-/// Return bundled asset bytes by filename.
-#[cfg(bundled_ui)]
-fn bundled_asset(filename: &str) -> Option<&'static [u8]> {
-    match filename {
-        "index.html" => Some(CONSOLE_HTML),
-        "style.css" => Some(CONSOLE_CSS),
-        "main.js" => Some(CONSOLE_JS),
-        _ => None,
-    }
-}
-
-/// Serve a file from a directory on disk.
-fn serve_file(dir: &Path, filename: &str, content_type: &str) -> Response<BoxBody> {
-    let path = dir.join(filename);
-    match std::fs::read(&path) {
-        Ok(data) => Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", content_type)
-            .header("referrer-policy", "no-referrer")
-            .body(Full::new(Bytes::from(data)).boxed())
-            .unwrap(),
-        Err(_) => json_error(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("Asset not found: {}", filename),
-        ),
-    }
-}
-
-#[cfg(bundled_ui)]
-fn static_response(content_type: &str, body: &'static [u8]) -> Response<BoxBody> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", content_type)
-        .header("referrer-policy", "no-referrer")
-        .body(Full::new(Bytes::from_static(body)).boxed())
-        .unwrap()
+    false
 }
 
 fn swagger_ui_response(spec_url: &str, title: &str) -> Response<BoxBody> {
@@ -1802,7 +472,7 @@ body {
   color: #0f172a;
 }
 .page {
-  max-width: 78rem;
+  max-width: 72rem;
   margin: 0 auto;
   padding: 2rem 1.25rem 2.5rem;
 }
@@ -1819,7 +489,6 @@ h1 {
   border: 1px solid #e2e8f0;
   border-radius: 10px;
   overflow: hidden;
-  margin-bottom: 1rem;
 }
 table {
   width: 100%;
@@ -1835,31 +504,16 @@ th, td {
 th:last-child, td:last-child {
   border-right: none;
 }
-th {
-  background: #f1f5f9;
-  color: #0f172a;
-  font-weight: 700;
-  font-size: 0.92rem;
-}
-th .header-link {
-  font-weight: 600;
-  margin-left: 0;
-}
-tbody tr:last-child td {
+tr:last-child td {
   border-bottom: none;
 }
-td {
-  font-size: 0.95rem;
-}
-td.desc {
-  color: #334155;
+th {
+  background: #f1f5f9;
+  font-weight: 700;
 }
 .json-cell {
   white-space: nowrap;
   width: 8.5rem;
-}
-.mono {
-  white-space: nowrap;
 }
 .json-link {
   display: inline-block;
@@ -1868,7 +522,6 @@ td.desc {
   border-radius: 6px;
   font-size: 0.82rem;
   font-weight: 600;
-  letter-spacing: 0.01em;
 }
 .copy-btn {
   margin-left: 0.35rem;
@@ -1906,7 +559,7 @@ a:hover {
 <body>
 <main class="page">
   <h1>Talu API Docs</h1>
-  <p class="muted">Single index for interactive docs and scoped OpenAPI JSON contracts.</p>
+  <p class="muted">Inference-only server surface.</p>
 
   <div class="table-wrap">
     <table>
@@ -1919,166 +572,24 @@ a:hover {
       </thead>
       <tbody>
         <tr>
-          <td class="mono"><a href="/docs/chat"><code>chat</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/chat.json" title="/openapi/chat.json">json</a><button class="copy-btn" data-url="/openapi/chat.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Chat API plane (`/v1/chat/*`) for conversational session management.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/responses"><code>responses</code></a></td>
+          <td><a href="/docs/responses"><code>responses</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/responses.json" title="/openapi/responses.json">json</a><button class="copy-btn" data-url="/openapi/responses.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">OpenResponses-compatible API surface (`/v1/responses`).</td>
+          <td>OpenResponses-compatible inference API.</td>
         </tr>
         <tr>
-          <td class="mono"><a href="/docs/models"><code>models</code></a></td>
+          <td><a href="/docs/chat"><code>chat</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/chat.json" title="/openapi/chat.json">json</a><button class="copy-btn" data-url="/openapi/chat.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>Chat completions endpoint.</td>
+        </tr>
+        <tr>
+          <td><a href="/docs/models"><code>models</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/models.json" title="/openapi/models.json">json</a><button class="copy-btn" data-url="/openapi/models.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Model discovery and listing endpoints.</td>
+          <td>Model discovery and listing.</td>
         </tr>
         <tr>
-          <td class="mono"><a href="/docs/files"><code>files</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/files.json" title="/openapi/files.json">json</a><button class="copy-btn" data-url="/openapi/files.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">File upload/list/get plus stateless inspect and transform APIs.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/repo"><code>repo</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/repo.json" title="/openapi/repo.json">json</a><button class="copy-btn" data-url="/openapi/repo.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Repository model management, pin lifecycle, and sync endpoints.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/search"><code>search</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/search.json" title="/openapi/search.json">json</a><button class="copy-btn" data-url="/openapi/search.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Cross-domain search with text and filter capabilities.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/tags"><code>tags</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/tags.json" title="/openapi/tags.json">json</a><button class="copy-btn" data-url="/openapi/tags.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Tag CRUD and tag-association endpoints.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/settings"><code>settings</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/settings.json" title="/openapi/settings.json">json</a><button class="copy-btn" data-url="/openapi/settings.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Server and model-default settings APIs.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/plugins"><code>plugins</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/plugins.json" title="/openapi/plugins.json">json</a><button class="copy-btn" data-url="/openapi/plugins.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Plugin discovery, plugin assets, and proxy operations.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/code"><code>code</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/code.json" title="/openapi/code.json">json</a><button class="copy-btn" data-url="/openapi/code.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Tree-sitter parse, highlight, query, graph, and code-session APIs.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/events"><code>events</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/events.json" title="/openapi/events.json">json</a><button class="copy-btn" data-url="/openapi/events.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Unified in-memory observability stream and replay APIs (`/v1/events*`).</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/collab"><code>collab</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/collab.json" title="/openapi/collab.json">json</a><button class="copy-btn" data-url="/openapi/collab.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Collaboration runtime APIs (`/v1/collab/*`).</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th><a class="header-link" href="/docs/agent"><code>/docs/agent</code></a></th>
-          <th class="json-cell"><a class="json-link" href="/openapi/agent.json" title="/openapi/agent.json">json</a><button class="copy-btn" data-url="/openapi/agent.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></th>
-          <th>Description</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td class="mono"><a href="/docs/agent/fs"><code>fs</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Workdir filesystem runtime APIs (`/v1/agent/fs/*`).</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/agent/exec"><code>exec</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/exec.json" title="/openapi/agent/exec.json">json</a><button class="copy-btn" data-url="/openapi/agent/exec.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">One-shot shell command execution streamed as SSE (`/v1/agent/exec`).</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/agent/shell"><code>shell</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/shell.json" title="/openapi/agent/shell.json">json</a><button class="copy-btn" data-url="/openapi/agent/shell.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Interactive PTY shell lifecycle and WebSocket attach endpoints.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/agent/process"><code>process</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/process.json" title="/openapi/agent/process.json">json</a><button class="copy-btn" data-url="/openapi/agent/process.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Long-lived process sessions with stdin send and SSE stream endpoints (`/v1/agent/processes/*`).</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th><a class="header-link" href="/docs/collab"><code>/docs/collab</code></a></th>
-          <th class="json-cell"><a class="json-link" href="/openapi/collab.json" title="/openapi/collab.json">json</a><button class="copy-btn" data-url="/openapi/collab.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></th>
-          <th>Description</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td class="mono"><a href="/docs/collab/resources"><code>resources</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/collab/resources.json" title="/openapi/collab/resources.json">json</a><button class="copy-btn" data-url="/openapi/collab/resources.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Session, ops, presence, snapshot, history, SSE watch, and active WebSocket APIs for collaborative resources (`/v1/collab/resources/*`).</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/collab/pubsub"><code>pubsub</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/collab/pubsub.json" title="/openapi/collab/pubsub.json">json</a><button class="copy-btn" data-url="/openapi/collab/pubsub.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Legacy topic-based WebSocket relay retained for compatibility (`/v1/collab/pubsub/ws`) alongside the resource-backed collab APIs.</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th><a class="header-link" href="/docs/db"><code>/docs/db</code></a></th>
-          <th class="json-cell"><a class="json-link" href="/openapi/db.json" title="/openapi/db.json">json</a><button class="copy-btn" data-url="/openapi/db.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></th>
-          <th>Description</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td class="mono"><a href="/docs/db/tables"><code>tables</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/db/tables.json" title="/openapi/db/tables.json">json</a><button class="copy-btn" data-url="/openapi/db/tables.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Table-plane CRUD/search routes (currently documents-backed).</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/db/vectors"><code>vectors</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/db/vectors.json" title="/openapi/db/vectors.json">json</a><button class="copy-btn" data-url="/openapi/db/vectors.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Vector collection, points mutation/query, and index workflows.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/db/kv"><code>kv</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/db/kv.json" title="/openapi/db/kv.json">json</a><button class="copy-btn" data-url="/openapi/db/kv.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Generic namespaced key/value entry and maintenance operations.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/db/blobs"><code>blobs</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/db/blobs.json" title="/openapi/db/blobs.json">json</a><button class="copy-btn" data-url="/openapi/db/blobs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Blob-plane listing and content retrieval endpoints.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/db/sql"><code>sql</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/db/sql.json" title="/openapi/db/sql.json">json</a><button class="copy-btn" data-url="/openapi/db/sql.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Compute SQL query plane over database-backed resources.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/db/ops"><code>ops</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/db/ops.json" title="/openapi/db/ops.json">json</a><button class="copy-btn" data-url="/openapi/db/ops.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Operational DB actions such as compaction and maintenance.</td>
+          <td><a href="/docs/tokenizer"><code>tokenizer</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/tokenizer.json" title="/openapi/tokenizer.json">json</a><button class="copy-btn" data-url="/openapi/tokenizer.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>Full tokenizer lifecycle, encode/decode, training, and persistence APIs.</td>
         </tr>
       </tbody>
     </table>
@@ -2100,7 +611,6 @@ document.querySelectorAll('.copy-btn').forEach((button) => {
         button.textContent = prev;
       }, 1000);
     } catch {
-      // Best-effort copy; no-op on clipboard errors.
     }
   });
 });
@@ -2156,76 +666,6 @@ fn filter_openapi_paths(spec: &[u8], prefixes: &[&str]) -> Vec<u8> {
     serde_json::to_vec_pretty(&doc).unwrap_or_else(|_| spec.to_vec())
 }
 
-#[derive(Clone, Copy)]
-enum AgentCapability {
-    Filesystem,
-    Exec,
-}
-
-fn enforce_plugin_agent_capability(
-    headers: &hyper::HeaderMap,
-    plugin_token_entry: Option<&PluginTokenEntry>,
-    required: AgentCapability,
-) -> Option<Response<BoxBody>> {
-    let plugin_id_header = headers
-        .get("x-talu-plugin-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let bearer_token_present = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some();
-
-    // Non-plugin callers are allowed through. Plugin requests must present a
-    // valid capability token with the required permission.
-    if plugin_id_header.is_none() && !bearer_token_present {
-        return None;
-    }
-
-    let token_entry = match plugin_token_entry {
-        Some(entry) => entry,
-        None => {
-            return Some(json_error(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "Missing or invalid plugin capability token",
-            ))
-        }
-    };
-
-    if let Some(plugin_id) = plugin_id_header {
-        if plugin_id != token_entry.plugin_id {
-            return Some(json_error(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "Plugin token does not match X-Talu-Plugin-Id",
-            ));
-        }
-    }
-
-    let allowed = match required {
-        AgentCapability::Filesystem => token_entry.allow_filesystem,
-        AgentCapability::Exec => token_entry.allow_exec,
-    };
-    if !allowed {
-        let permission = match required {
-            AgentCapability::Filesystem => "filesystem",
-            AgentCapability::Exec => "exec",
-        };
-        return Some(json_error(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            &format!(
-                "Plugin '{}' lacks '{}' permission for this endpoint",
-                token_entry.plugin_id, permission
-            ),
-        ));
-    }
-
-    None
-}
-
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody> {
     let payload = serde_json::json!({
         "error": {
@@ -2239,4 +679,17 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)).boxed())
         .unwrap()
+}
+
+fn method_not_allowed(allow: &[&str]) -> Response<BoxBody> {
+    let mut response = json_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "Method not allowed",
+    );
+    let allow_value = allow.join(", ");
+    if let Ok(header) = HeaderValue::from_str(&allow_value) {
+        response.headers_mut().insert("allow", header);
+    }
+    response
 }
