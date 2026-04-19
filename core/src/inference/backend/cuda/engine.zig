@@ -30,6 +30,7 @@ const prefill_mod = @import("prefill.zig");
 const cpu_backend = @import("../cpu/root.zig");
 const cuda_stage = @import("stage.zig");
 const cpu_stage = @import("../cpu/stage.zig");
+const shared_scheduler = @import("../cpu/scheduler.zig");
 const progress_mod = @import("progress_pkg");
 const sampling_mod = @import("sampling.zig");
 const vision_runtime_mod = @import("vision/root.zig");
@@ -400,10 +401,9 @@ pub const CudaBackend = struct {
     i8_rowsum_function: ?compute.cuda.Function = null,
     u8_xor_to_i8_function: ?compute.cuda.Function = null,
     i8_matvec_function: ?compute.cuda.Function = null,
-    i8_matvec_qkv_function: ?compute.cuda.Function = null,
-    i8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     gaffine_u8_to_i8_function: ?compute.cuda.Function = null,
     gaffine_u4_to_i8_function: ?compute.cuda.Function = null,
+    nvfp4_to_i8_function: ?compute.cuda.Function = null,
     quantize_f16_to_i8_function: ?compute.cuda.Function = null,
     quantize_f32_to_i8_simple_function: ?compute.cuda.Function = null,
     dequant_i32_scales_function: ?compute.cuda.Function = null,
@@ -538,6 +538,8 @@ pub const CudaBackend = struct {
     nvfp4_route_window_start: Nvfp4RouteCounters = .{},
     nvfp4_phase_counters: Nvfp4PhaseBudgetCounters = .{},
     nvfp4_phase_window_start: Nvfp4PhaseBudgetCounters = .{},
+    decode_inventory_logged: bool = false,
+    decode_topk_summary_logged: bool = false,
     phase_linear_start_event: ?compute.cuda.EventHandle = null,
     phase_linear_stop_event: ?compute.cuda.EventHandle = null,
     phase_attention_start_event: ?compute.cuda.EventHandle = null,
@@ -3150,6 +3152,31 @@ pub const CudaBackend = struct {
         );
     }
 
+    pub fn decodeTopKStreaming(
+        self: *CudaBackend,
+        first_token: u32,
+        start_position: usize,
+        max_tokens: usize,
+        eos_token_ids: []const u32,
+        sampling_config: *const sampling_mod.SamplingConfig,
+        output_tokens: []u32,
+        callback: ?*const fn (u32, ?*anyopaque) void,
+        callback_data: ?*anyopaque,
+    ) !usize {
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
+        return decode_mod.decodeTopKStreaming(
+            self,
+            first_token,
+            start_position,
+            max_tokens,
+            eos_token_ids,
+            sampling_config,
+            output_tokens,
+            callback,
+            callback_data,
+        );
+    }
+
     pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const CudaBackend) bool {
         _ = self;
         // Parity mode: force n=1 and n>1 through queued decodeBatch.
@@ -3157,26 +3184,139 @@ pub const CudaBackend = struct {
         return false;
     }
 
+    fn supportsCudaTopKCandidateRoute(
+        self: *const CudaBackend,
+        sampling_config: *const sampling_mod.SamplingConfig,
+    ) bool {
+        if (self.loaded.config.logits_scaling <= 0.0) return false;
+        return switch (sampling_config.strategy) {
+            .top_k => sampling_config.top_k > 0 and
+                sampling_config.top_k <= 256 and
+                sampling_config.temperature > 0.0,
+            .greedy => sampling_config.repetition_penalty == 1.0 and
+                sampling_config.presence_penalty == 0.0 and
+                sampling_config.frequency_penalty == 0.0 and
+                sampling_config.logit_bias == null and
+                sampling_config.top_p == 1.0 and
+                sampling_config.min_p == 0.0,
+            else => false,
+        };
+    }
+
+    fn supportsCudaTopKStreamingRoute(
+        self: *const CudaBackend,
+        sampling_config: *const sampling_mod.SamplingConfig,
+    ) bool {
+        if (!supportsCudaTopKCandidateRoute(self, sampling_config)) return false;
+        if (sampling_config.strategy != .top_k) return false;
+        if (sampling_config.repetition_penalty != 1.0) return false;
+        if (sampling_config.presence_penalty != 0.0) return false;
+        if (sampling_config.frequency_penalty != 0.0) return false;
+        if (sampling_config.logit_bias != null) return false;
+        if (sampling_config.top_p < 0.0 or sampling_config.top_p > 1.0) return false;
+        if (sampling_config.min_p < 0.0 or sampling_config.min_p > 1.0) return false;
+        return switch (self.kv_cache_dtype) {
+            .i8, .fp8 => self.prefersSingleRowTopKCandidate(sampling_config),
+            .f16 => false,
+        };
+    }
+
+    /// Backend-owned decode policy for `N=1` route crossover.
+    ///
+    /// Candidate decode avoids per-token full-logits host transfer/sampling,
+    /// but smaller models can still run faster on queued full-logits decode.
+    /// Gate by model width + logits row size so large models keep the win while
+    /// small models avoid regression.
+    fn prefersSingleRowTopKCandidateWithContext(
+        self: *const CudaBackend,
+        sampling_config: *const sampling_mod.SamplingConfig,
+        has_callback: bool,
+    ) bool {
+        // Crossover policy: small models can remain faster on queued full-logits
+        // sampling, while larger models benefit from avoiding per-token full
+        // logits transfers/sampling on host.
+        //
+        // Low-bit KV decode is more sensitive to host-side full-logits overhead,
+        // so use a more aggressive threshold there.
+        const is_lowbit_kv = self.kv_cache_dtype != .f16;
+        // Callback-driven single-request decode still pays callback dispatch
+        // overhead each step. For smaller low-bit models this can dominate the
+        // top-k candidate savings, so use a stricter crossover there.
+        const lowbit_d_model_threshold: usize = if (has_callback) 3072 else 1024;
+        const large_model_d_model_threshold: usize = if (is_lowbit_kv) lowbit_d_model_threshold else 2048;
+        if (self.d_model < large_model_d_model_threshold) return false;
+        const host_row_bytes = self.vocab_size * @sizeOf(f32);
+        const lowbit_host_copy_threshold_bytes: usize = if (has_callback) 512 * 1024 else 256 * 1024;
+        const large_vocab_host_copy_threshold_bytes: usize = if (is_lowbit_kv) lowbit_host_copy_threshold_bytes else 800 * 1024;
+        if (host_row_bytes < large_vocab_host_copy_threshold_bytes) return false;
+        return switch (sampling_config.strategy) {
+            .greedy => true,
+            .top_k => if (is_lowbit_kv)
+                if (has_callback) sampling_config.top_k <= 64 else sampling_config.top_k <= 128
+            else
+                sampling_config.top_k <= 64,
+            else => false,
+        };
+    }
+
+    fn prefersSingleRowTopKCandidate(
+        self: *const CudaBackend,
+        sampling_config: *const sampling_mod.SamplingConfig,
+    ) bool {
+        return self.prefersSingleRowTopKCandidateWithContext(sampling_config, false);
+    }
+
+    pub fn planSchedulerSingleDecodeRoute(
+        self: *const CudaBackend,
+        plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
+    ) shared_scheduler.SchedulerSingleDecodeRoute {
+        if (plan.top_k_candidate_semantic_eligible and supportsCudaTopKCandidateRoute(self, plan.sampling_config)) {
+            if (plan.decode_batch_size == 1 and !self.prefersSingleRowTopKCandidateWithContext(plan.sampling_config, plan.has_callback)) return .queued;
+            return .top_k_candidate;
+        }
+        if (plan.top_k_streaming_semantic_eligible and supportsCudaTopKStreamingRoute(self, plan.sampling_config)) {
+            return .top_k_streaming;
+        }
+        return .queued;
+    }
+
+    pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
+        self: *const CudaBackend,
+        plan: *const shared_scheduler.SchedulerBatchedTopKRoutePlan,
+    ) bool {
+        if (!supportsCudaTopKCandidateRoute(self, plan.sampling_config)) return false;
+        // Keep batched top-k route for true batches only. Single-request decode
+        // should use decodeTopKCandidates() directly to avoid batched plumbing.
+        if (plan.decode_batch_size >= 2) return true;
+        return false;
+    }
+
     pub fn supportsSchedulerBackendTopKDecodeRoute(
         self: *const CudaBackend,
         sampling_config: *const sampling_mod.SamplingConfig,
     ) bool {
-        _ = self;
-        _ = sampling_config;
-        // Keep single-request top-k candidate route disabled for CUDA.
-        // Batched top-k routing is exposed via supportsSchedulerBackendBatchedTopKDecodeRoute().
-        return false;
+        if (!supportsCudaTopKCandidateRoute(self, sampling_config)) return false;
+        // Single-row CUDA top-k candidate route currently targets low-bit KV
+        // decode to reduce host-side full-logits overhead without regressing
+        // established f16 single-request behavior.
+        return switch (self.kv_cache_dtype) {
+            .i8, .fp8 => self.prefersSingleRowTopKCandidate(sampling_config),
+            .f16 => false,
+        };
+    }
+
+    pub fn supportsSchedulerBackendTopKStreamingRoute(
+        self: *const CudaBackend,
+        sampling_config: *const sampling_mod.SamplingConfig,
+    ) bool {
+        return supportsCudaTopKStreamingRoute(self, sampling_config);
     }
 
     pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
         self: *const CudaBackend,
         sampling_config: *const sampling_mod.SamplingConfig,
     ) bool {
-        return sampling_config.strategy == .top_k and
-            sampling_config.top_k > 0 and
-            sampling_config.top_k <= 256 and
-            sampling_config.temperature > 0.0 and
-            self.loaded.config.logits_scaling > 0.0;
+        return supportsCudaTopKCandidateRoute(self, sampling_config);
     }
 
     pub fn incrementDecodeMetadataInPlace(
@@ -3274,6 +3414,14 @@ pub const CudaBackend = struct {
         var scratch_vals = self.topk_scratch_vals_dev orelse return error.CudaKernelUnavailable;
         var scratch_ids = self.topk_scratch_ids_dev orelse return error.CudaKernelUnavailable;
 
+        const decode_summary_enabled = std.posix.getenv("TALU_CUDA_DECODE_SUMMARY") != null;
+        var topk_kernel_ns: u64 = 0;
+        var values_download_ns: u64 = 0;
+        var ids_download_ns: u64 = 0;
+        var host_postprocess_ns: u64 = 0;
+        const skip_values_download = top_k == 1;
+
+        const topk_kernel_start_ns: i128 = if (decode_summary_enabled) std.time.nanoTimestamp() else 0;
         try compute.cuda.topk_rows_f32.runTwoPhase(
             &self.kernel_arg_pack,
             &self.device,
@@ -3289,17 +3437,41 @@ pub const CudaBackend = struct {
             row_stride_u32,
             row_stride_u32,
         );
+        if (decode_summary_enabled) {
+            const elapsed_i128 = std.time.nanoTimestamp() - topk_kernel_start_ns;
+            topk_kernel_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+        }
 
         const topk_total = std.math.mul(usize, batch_rows, top_k) catch return error.InvalidArgument;
         const topk_total_logits = candidate_logits_out[0..topk_total];
         const topk_total_ids = candidate_ids_out[0..topk_total];
-        try self.runtime_buffers.topk_values_dev.download(&self.device, std.mem.sliceAsBytes(topk_total_logits));
-        try self.runtime_buffers.topk_ids_dev.download(&self.device, std.mem.sliceAsBytes(topk_total_ids));
+        // Synchronize once before host candidate downloads. This avoids
+        // issuing two stream synchronizations (values + ids) per decode step.
+        if (self.device.launch_stream) |stream| {
+            try self.device.synchronizeStream(stream);
+        }
+        if (!skip_values_download) {
+            const values_download_start_ns: i128 = if (decode_summary_enabled) std.time.nanoTimestamp() else 0;
+            try self.runtime_buffers.topk_values_dev.downloadNoSync(&self.device, std.mem.sliceAsBytes(topk_total_logits));
+            if (decode_summary_enabled) {
+                const elapsed_i128 = std.time.nanoTimestamp() - values_download_start_ns;
+                values_download_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+            }
+        } else {
+            @memset(topk_total_logits, 0.0);
+        }
+        const ids_download_start_ns: i128 = if (decode_summary_enabled) std.time.nanoTimestamp() else 0;
+        try self.runtime_buffers.topk_ids_dev.downloadNoSync(&self.device, std.mem.sliceAsBytes(topk_total_ids));
+        if (decode_summary_enabled) {
+            const elapsed_i128 = std.time.nanoTimestamp() - ids_download_start_ns;
+            ids_download_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+        }
 
+        const host_postprocess_start_ns: i128 = if (decode_summary_enabled) std.time.nanoTimestamp() else 0;
         for (0..batch_rows) |row_index| {
             candidate_counts_out[row_index] = per_row_count;
         }
-        if (logits_scaling != 1.0) {
+        if (!skip_values_download and logits_scaling != 1.0) {
             for (0..batch_rows) |row_index| {
                 const row_base = std.math.mul(usize, row_index, top_k) catch return error.InvalidArgument;
                 for (0..per_row_count) |k_index| {
@@ -3309,13 +3481,31 @@ pub const CudaBackend = struct {
             }
         }
         const final_logit_softcapping = self.loaded.config.final_logit_softcapping;
-        if (final_logit_softcapping > 0.0) {
+        if (!skip_values_download and final_logit_softcapping > 0.0) {
             for (0..batch_rows) |row_index| {
                 const row_base = std.math.mul(usize, row_index, top_k) catch return error.InvalidArgument;
                 for (0..per_row_count) |k_index| {
                     const out_idx = row_base + k_index;
                     candidate_logits_out[out_idx] = std.math.tanh(candidate_logits_out[out_idx] / final_logit_softcapping) * final_logit_softcapping;
                 }
+            }
+        }
+        if (decode_summary_enabled) {
+            const elapsed_i128 = std.time.nanoTimestamp() - host_postprocess_start_ns;
+            host_postprocess_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+            if (!self.decode_topk_summary_logged) {
+                self.decode_topk_summary_logged = true;
+                const ns_to_ms = 1_000_000.0;
+                log.warn("inference", "CUDA decode topk candidate summary", .{
+                    .batch_rows = batch_rows,
+                    .top_k = top_k,
+                    .per_row_count = per_row_count,
+                    .skip_values_download = @as(u8, @intFromBool(skip_values_download)),
+                    .topk_kernel_ms = @as(f64, @floatFromInt(topk_kernel_ns)) / ns_to_ms,
+                    .values_download_ms = @as(f64, @floatFromInt(values_download_ns)) / ns_to_ms,
+                    .ids_download_ms = @as(f64, @floatFromInt(ids_download_ns)) / ns_to_ms,
+                    .host_postprocess_ms = @as(f64, @floatFromInt(host_postprocess_ns)) / ns_to_ms,
+                });
             }
         }
     }
@@ -3332,10 +3522,22 @@ pub const CudaBackend = struct {
         if (top_k == 0) return error.InvalidArgument;
         if (top_k > 256) return error.InvalidArgument;
         if (self.loaded.config.logits_scaling <= 0.0) return error.UnsupportedModel;
+        if (candidate_counts_out.len < requests.len) return error.InvalidArgument;
+        if (requests.len == 1) {
+            if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
+            const count = try self.decodeTopKCandidates(
+                requests[0].slot_index,
+                requests[0].token,
+                top_k,
+                candidate_logits_out[0..top_k],
+                candidate_ids_out[0..top_k],
+            );
+            candidate_counts_out[0] = count;
+            return;
+        }
         const needed_candidates = std.math.mul(usize, requests.len, top_k) catch return error.InvalidArgument;
         if (candidate_logits_out.len < needed_candidates or
-            candidate_ids_out.len < needed_candidates or
-            candidate_counts_out.len < requests.len)
+            candidate_ids_out.len < needed_candidates)
         {
             return error.InvalidArgument;
         }
@@ -3415,15 +3617,52 @@ pub const CudaBackend = struct {
     ) !usize {
         if (top_k == 0) return error.InvalidArgument;
         if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
-        var counts: [1]usize = .{0};
-        const request = [_]contract.DecodeRequest{
-            .{
-                .slot_index = slot_index,
+        if (!self.slotIndexSupported(slot_index) or !self.slot_in_use[slot_index]) {
+            return error.InvalidArgument;
+        }
+        try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
+
+        const raw_position = self.slot_positions[slot_index];
+        const effective_position = try common_mrope.applyPositionDelta(
+            raw_position,
+            self.slot_rope_position_deltas[slot_index],
+        );
+
+        var tokens_buf = [_]u32{token};
+        var slot_indices_buf = [_]usize{slot_index};
+        var positions_buf = [_]usize{effective_position};
+        self.computeBatchedDecodeLogitsDeviceOnly(
+            tokens_buf[0..],
+            slot_indices_buf[0..],
+            positions_buf[0..],
+        ) catch |err| {
+            log.warn("inference", "CUDA decodeTopKCandidates decode failed", .{
+                .slot = slot_index,
+                .raw_pos = raw_position,
+                .effective_pos = effective_position,
                 .token = token,
-            },
+                .max_seq = self.max_seq_len,
+                .kv_dtype = @tagName(self.kv_cache_dtype),
+                .reason = @errorName(err),
+            });
+            return err;
         };
-        try self.decodeBatchTopKCandidates(
-            request[0..],
+        self.slot_positions[slot_index] = raw_position + 1;
+
+        if (top_k == 1) {
+            candidate_ids_out[0] = try self.selectNextTokenFromDeviceLogitsImpl();
+            candidate_logits_out[0] = 0.0;
+            return 1;
+        }
+
+        var topk_source_backend: *CudaBackend = self;
+        if (self.topology_mode == .pipeline2) {
+            topk_source_backend = self.pipeline_backend1 orelse return error.InvalidTopologyConfig;
+        }
+
+        var counts: [1]usize = .{0};
+        try topk_source_backend.extractTopKFromBatchedDeviceLogits(
+            1,
             top_k,
             candidate_logits_out[0..top_k],
             candidate_ids_out[0..top_k],
@@ -4092,6 +4331,36 @@ pub const CudaBackend = struct {
             return mergeNvfp4RouteCounters(primary, stage1.nvfp4RouteWindowDelta());
         }
         return primary;
+    }
+
+    pub fn logDecodeInventorySummaryImpl(self: *const CudaBackend, mode: []const u8, token_count: usize, batch_rows: usize) void {
+        const arch_id = self.loaded.runtime.architecture_id orelse "unknown";
+        const kv_groups = if (self.n_kv_heads > 0) self.n_heads / self.n_kv_heads else 0;
+        log.warn("inference", "CUDA decode inventory summary", .{
+            .mode = mode,
+            .tokens = token_count,
+            .batch_rows = batch_rows,
+            .architecture_id = arch_id,
+            .topology = @tagName(self.topology_mode),
+            .kv_dtype = @tagName(self.kv_cache_dtype),
+            .kv_storage = @tagName(self.kv_storage_mode),
+            .d_model = self.d_model,
+            .n_layers = self.block_runtime.blocks.len,
+            .n_heads = self.n_heads,
+            .n_kv = self.n_kv_heads,
+            .kv_groups = kv_groups,
+            .head_dim = self.head_dim,
+            .vocab = self.vocab_size,
+            .max_batch = self.max_batch_size,
+            .max_seq = self.max_seq_len,
+            .model_max_seq = self.model_max_seq_len,
+            .logits_scaling = self.loaded.config.logits_scaling,
+            .prefill_chunk_rows = self.prefill_chunk_rows_cap,
+            .fixed_alloc = @as(u8, @intFromBool(self.fixed_alloc_mode)),
+            .strict_memory = @as(u8, @intFromBool(self.strict_memory_mode)),
+            .has_pipeline_stage1 = @as(u8, @intFromBool(self.pipeline_backend1 != null)),
+            .gemma_layer_scalar_active = @as(u8, @intFromBool(self.gemma4_per_layer != null)),
+        });
     }
 
     pub fn logNvfp4RouteSummaryImpl(self: *const CudaBackend, mode: []const u8, token_count: usize) void {

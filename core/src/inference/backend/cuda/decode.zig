@@ -3,6 +3,7 @@
 const std = @import("std");
 const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
+const sampling_mod = @import("sampling.zig");
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 
@@ -290,6 +291,103 @@ pub fn decodeStreaming(
             if (next_token == eos_id) {
                 return generated + 1;
             }
+        }
+        current_token = next_token;
+    }
+    return generated;
+}
+
+fn supportsTopKStreamingSamplingConfig(sampling_config: *const sampling_mod.SamplingConfig) bool {
+    // Backend-owned top-k streaming path currently assumes candidate-space
+    // sampling only (no full-logits penalties/bias mutation).
+    return sampling_config.strategy == .top_k and
+        sampling_config.top_k > 0 and
+        sampling_config.top_k <= 256 and
+        sampling_config.temperature > 0.0 and
+        sampling_config.top_p >= 0.0 and
+        sampling_config.top_p <= 1.0 and
+        sampling_config.min_p >= 0.0 and
+        sampling_config.min_p <= 1.0 and
+        sampling_config.repetition_penalty == 1.0 and
+        sampling_config.presence_penalty == 0.0 and
+        sampling_config.frequency_penalty == 0.0 and
+        sampling_config.logit_bias == null;
+}
+
+pub fn decodeTopKStreaming(
+    self: anytype,
+    first_token: u32,
+    start_position: usize,
+    max_tokens: usize,
+    eos_token_ids: []const u32,
+    sampling_config: *const sampling_mod.SamplingConfig,
+    output_tokens: []u32,
+    callback: ?*const fn (u32, ?*anyopaque) void,
+    callback_data: ?*anyopaque,
+) !usize {
+    const prev_backend = trace.setBackendContext(.cuda);
+    defer _ = trace.setBackendContext(prev_backend);
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
+    }
+    if (!supportsTopKStreamingSamplingConfig(sampling_config)) return error.NotEligible;
+    if (max_tokens == 0 or output_tokens.len == 0) return 0;
+
+    if (!self.slot_in_use[0]) {
+        self.slot_in_use[0] = true;
+        self.slot_positions[0] = start_position;
+    }
+
+    const budget = @min(max_tokens, output_tokens.len);
+    if (comptime @hasDecl(SelfType, "ensureKvCapacity")) {
+        if (budget > 0) {
+            const required_capacity = std.math.add(usize, self.slot_positions[0], budget) catch return error.InvalidArgument;
+            try self.ensureKvCapacity(required_capacity);
+        }
+    }
+
+    const candidate_capacity = @min(sampling_config.top_k, self.vocab_size);
+    if (candidate_capacity == 0) return error.InvalidArgument;
+    var candidate_logits = try self.allocator.alloc(f32, candidate_capacity);
+    defer self.allocator.free(candidate_logits);
+    const candidate_ids = try self.allocator.alloc(u32, candidate_capacity);
+    defer self.allocator.free(candidate_ids);
+
+    const seeded_prng = if (sampling_config.seed != 0)
+        sampling_config.seed
+    else
+        std.crypto.random.int(u64);
+    var sampler = try sampling_mod.Sampler.init(self.allocator, seeded_prng, candidate_capacity);
+    defer sampler.deinit();
+
+    var generated: usize = 0;
+    var current_token: u32 = first_token;
+    while (generated < budget) {
+        const candidate_count = try self.decodeTopKCandidates(
+            0,
+            current_token,
+            candidate_capacity,
+            candidate_logits,
+            candidate_ids,
+        );
+        if (candidate_count == 0) return error.InvalidArgument;
+
+        var next_token: u32 = candidate_ids[0];
+        if (candidate_count > 1) {
+            var cfg = sampling_config.*;
+            cfg.top_k = @min(cfg.top_k, candidate_count);
+            cfg.context_tokens = null;
+            const sampled_rank = try sampler.sample(candidate_logits[0..candidate_count], cfg);
+            if (sampled_rank >= candidate_count) return error.InvalidState;
+            next_token = candidate_ids[sampled_rank];
+        }
+
+        output_tokens[generated] = next_token;
+        generated += 1;
+        if (callback) |cb| cb(next_token, callback_data);
+        for (eos_token_ids) |eos_id| {
+            if (next_token == eos_id) return generated;
         }
         current_token = next_token;
     }
