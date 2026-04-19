@@ -65,6 +65,10 @@ struct LayerWeights {
     int moe_router_group_size = 0;
     int moe_expert_group_size = 0;
     array moe_router_w = array(0.0f);
+    array moe_router_q_w = array(0.0f);
+    array moe_router_q_scales = array(0.0f);
+    array moe_router_q_biases = array(0.0f);
+    bool moe_router_has_q = false;
     array moe_gate_up_w = array(0.0f);
     array moe_gate_up_scales = array(0.0f);
     array moe_gate_up_biases = array(0.0f);
@@ -77,6 +81,7 @@ struct LayerWeights {
     array moe_down_w = array(0.0f);
     array moe_down_scales = array(0.0f);
     array moe_down_biases = array(0.0f);
+    bool moe_has_nvfp4 = false;
     array moe_shared_gate_rhs = array(0.0f);
     array moe_shared_gate_q_w = array(0.0f);
     array moe_shared_gate_q_scales = array(0.0f);
@@ -98,6 +103,10 @@ struct LayerWeights {
     bool moe_shared_down_has_q = false;
     bool moe_shared_gate_up_has_q = false;
     array moe_shared_expert_gate_w = array(0.0f);
+    array moe_shared_expert_gate_q_w = array(0.0f);
+    array moe_shared_expert_gate_q_scales = array(0.0f);
+    array moe_shared_expert_gate_q_biases = array(0.0f);
+    bool moe_shared_expert_gate_has_q = false;
 
     // Full-attention branch.
     array attn_q_rhs = array(0.0f);

@@ -758,6 +758,53 @@ int32_t mlx_test_nvfp4_mmap_strict_policy(void) {
     return 1;
 }
 
+int32_t mlx_test_dense_lm_head_lhs_fallback(void) {
+    try {
+        constexpr int hidden = 8;
+        constexpr int vocab = 6;
+        mlx_ctx ctx{};
+        ctx.cfg.hidden_size = hidden;
+
+        std::vector<float> lhs_values(static_cast<size_t>(vocab * hidden), 0.0f);
+        for (int r = 0; r < vocab; ++r) {
+            for (int c = 0; c < hidden; ++c) {
+                lhs_values[static_cast<size_t>(r * hidden + c)] =
+                    static_cast<float>(((r * 3 + c * 5) % 11) - 5) * 0.0625f;
+            }
+        }
+        ctx.lm_head_lhs = array(lhs_values.data(), Shape{vocab, hidden}, float32);
+
+        std::vector<float> hidden_values(static_cast<size_t>(hidden), 0.0f);
+        for (int i = 0; i < hidden; ++i) {
+            hidden_values[static_cast<size_t>(i)] =
+                static_cast<float>(((i * 7) % 9) - 4) * 0.125f;
+        }
+        const array normed_hidden(hidden_values.data(), Shape{1, 1, hidden}, float32);
+        const array actual = forward_logits_from_hidden(&ctx, normed_hidden);
+        const array expected = matmul(normed_hidden, transpose(ctx.lm_head_lhs, {1, 0}));
+
+        const array diff = max(reshape(abs(astype(actual, float32) - astype(expected, float32)), {static_cast<int>(actual.size())}));
+        eval(diff);
+        synchronize();
+        const float* diff_ptr = diff.data<float>();
+        if (!diff_ptr) {
+            g_last_error = "mlx_test_dense_lm_head_lhs_fallback: failed to materialize diff";
+            return 0;
+        }
+        if (diff_ptr[0] > 1e-6f) {
+            g_last_error = "mlx_test_dense_lm_head_lhs_fallback: fallback output mismatch";
+            return 0;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_test_dense_lm_head_lhs_fallback";
+        return 0;
+    }
+}
+
 int32_t mlx_test_grouped_affine_embedding_lookup_matches_reference(void) {
     try {
         constexpr int vocab = 5;

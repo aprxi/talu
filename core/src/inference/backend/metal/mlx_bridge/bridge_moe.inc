@@ -20,10 +20,187 @@ array slice_expert_matrix(const array& value, int expert_index, const std::strin
 std::optional<array> maybe_slice_expert_matrix(
     const array& value,
     int expert_index,
-    const std::string& name
+    const std::string& name,
+    bool allow_scalar = false
 ) {
-    if (value.size() <= 1) return std::nullopt;
+    if (value.size() <= 1) {
+        if (allow_scalar) return value;
+        return std::nullopt;
+    }
     return slice_expert_matrix(value, expert_index, name);
+}
+
+array apply_moe_nvfp4_post_scale(
+    const array& value,
+    const array& post_scale,
+    const array& top_k_indices
+) {
+    if (post_scale.size() <= 0) return value;
+    if (post_scale.size() == 1) return apply_nvfp4_post_scale(value, post_scale);
+    if (value.ndim() <= 0 || top_k_indices.ndim() <= 0) return value;
+
+    const int out_cols = value.shape(value.ndim() - 1);
+    if (out_cols <= 0) return value;
+
+    if (post_scale.ndim() == 1) {
+        if (post_scale.shape(0) == out_cols) {
+            return apply_nvfp4_post_scale(value, post_scale);
+        }
+        if (post_scale.dtype() != float32) return value;
+        const array flat_indices = flatten(astype(top_k_indices, int32), 0, -1);
+        const array selected = take(post_scale, flat_indices, 0);
+        Shape scale_shape(static_cast<size_t>(value.ndim()), 1);
+        for (int axis = 0; axis < top_k_indices.ndim(); ++axis) {
+            scale_shape[static_cast<size_t>(axis)] = top_k_indices.shape(axis);
+        }
+        const array broadcast = reshape(selected, scale_shape);
+        return value * astype(broadcast, value.dtype());
+    }
+
+    array expert_scale = post_scale;
+    if (expert_scale.ndim() == 3 && expert_scale.shape(2) == 1) {
+        expert_scale = reshape(expert_scale, {expert_scale.shape(0), expert_scale.shape(1)});
+    } else if (expert_scale.ndim() == 3 && expert_scale.shape(1) == 1) {
+        expert_scale = reshape(expert_scale, {expert_scale.shape(0), expert_scale.shape(2)});
+    }
+    if (expert_scale.ndim() != 2 || expert_scale.dtype() != float32) {
+        return apply_nvfp4_post_scale(value, post_scale);
+    }
+
+    const int rows = expert_scale.shape(1);
+    if (rows != 1 && rows != out_cols) return value;
+
+    const array flat_indices = flatten(astype(top_k_indices, int32), 0, -1);
+    const array selected = take(expert_scale, flat_indices, 0);
+    Shape scale_shape(static_cast<size_t>(value.ndim()), 1);
+    for (int axis = 0; axis < top_k_indices.ndim(); ++axis) {
+        scale_shape[static_cast<size_t>(axis)] = top_k_indices.shape(axis);
+    }
+    scale_shape.back() = rows;
+    const array broadcast = reshape(selected, scale_shape);
+    return value * astype(broadcast, value.dtype());
+}
+
+array run_native_nvfp4_moe_gather(
+    mlx_ctx* ctx,
+    const LayerWeights& lw,
+    const array& mlp_in
+) {
+    if (!lw.moe_has_nvfp4) {
+        throw std::runtime_error("run_native_nvfp4_moe_gather requires native NVFP4 MoE weights");
+    }
+
+    array router_logits = array(0.0f);
+    if (lw.moe_router_has_q) {
+        router_logits = quantized_matmul(
+            mlp_in,
+            lw.moe_router_q_w,
+            lw.moe_router_q_scales,
+            std::nullopt,
+            true,
+            std::nullopt,
+            std::nullopt,
+            "nvfp4"
+        );
+        router_logits = apply_nvfp4_post_scale(router_logits, lw.moe_router_q_biases);
+    } else {
+        router_logits = matmul(mlp_in, transpose(lw.moe_router_w, {1, 0}));
+    }
+
+    const int k = lw.moe_experts_per_token;
+    auto partitioned_indices = argpartition(router_logits, -k, -1);
+    const int last_dim = router_logits.ndim() - 1;
+    const int total_experts = lw.moe_num_experts;
+    Shape start(router_logits.ndim(), 0);
+    Shape stop = router_logits.shape();
+    start[last_dim] = total_experts - k;
+    auto top_k_indices = slice(partitioned_indices, start, stop);
+    auto top_k_logits = take_along_axis(router_logits, top_k_indices, last_dim);
+    auto expert_weights = softmax(top_k_logits, -1, true);
+
+    const auto x_expanded = expand_dims(mlp_in, {-2, -3});
+    const bool use_fused_gate_up =
+        lw.moe_gate_up_w.size() > 1 &&
+        lw.moe_gate_up_scales.size() > 1;
+    array gate_out = array(0.0f);
+    array up_out = array(0.0f);
+    if (use_fused_gate_up) {
+        auto gate_up_out = gather_qmm(
+            x_expanded,
+            lw.moe_gate_up_w,
+            lw.moe_gate_up_scales,
+            std::nullopt,
+            std::nullopt,
+            top_k_indices,
+            true,
+            16,
+            4,
+            "nvfp4",
+            false
+        );
+        gate_up_out = apply_moe_nvfp4_post_scale(gate_up_out, lw.moe_gate_up_biases, top_k_indices);
+        const int last_dim = gate_up_out.ndim() - 1;
+        const int half_width = gate_up_out.shape(last_dim) / 2;
+        Shape gate_start(gate_up_out.ndim(), 0);
+        Shape gate_stop = gate_up_out.shape();
+        gate_stop[last_dim] = half_width;
+        Shape up_start(gate_up_out.ndim(), 0);
+        up_start[last_dim] = half_width;
+        gate_out = slice(gate_up_out, gate_start, gate_stop);
+        up_out = slice(gate_up_out, up_start, gate_up_out.shape());
+    } else {
+        gate_out = gather_qmm(
+            x_expanded,
+            lw.moe_gate_w,
+            lw.moe_gate_scales,
+            std::nullopt,
+            std::nullopt,
+            top_k_indices,
+            true,
+            16,
+            4,
+            "nvfp4",
+            false
+        );
+        gate_out = apply_moe_nvfp4_post_scale(gate_out, lw.moe_gate_biases, top_k_indices);
+
+        up_out = gather_qmm(
+            x_expanded,
+            lw.moe_up_w,
+            lw.moe_up_scales,
+            std::nullopt,
+            std::nullopt,
+            top_k_indices,
+            true,
+            16,
+            4,
+            "nvfp4",
+            false
+        );
+        up_out = apply_moe_nvfp4_post_scale(up_out, lw.moe_up_biases, top_k_indices);
+    }
+
+    auto mid = ctx->cfg.use_gelu
+        ? (gelu_approx(gate_out) * up_out)
+        : ((gate_out * sigmoid(gate_out)) * up_out);
+    auto down_out = gather_qmm(
+        mid,
+        lw.moe_down_w,
+        lw.moe_down_scales,
+        std::nullopt,
+        std::nullopt,
+        top_k_indices,
+        true,
+        16,
+        4,
+        "nvfp4",
+        false
+    );
+    down_out = apply_moe_nvfp4_post_scale(down_out, lw.moe_down_biases, top_k_indices);
+
+    down_out = squeeze(down_out, -2);
+    auto weights_expanded = expand_dims(expert_weights, -1);
+    return sum(down_out * weights_expanded, -2);
 }
 
 // Reference grouped-affine MoE implementation used for bridge self-tests.
@@ -37,7 +214,23 @@ array run_grouped_affine_moe_reference(mlx_ctx* ctx, const LayerWeights& lw, con
         throw std::runtime_error("invalid MoE routing geometry");
     }
 
-    const array router_logits_f32 = astype(matmul(mlp_in, transpose(lw.moe_router_w, {1, 0})), float32);
+    array router_logits = array(0.0f);
+    if (lw.moe_router_has_q) {
+        router_logits = quantized_matmul(
+            mlp_in,
+            lw.moe_router_q_w,
+            lw.moe_router_q_scales,
+            std::nullopt,
+            true,
+            std::nullopt,
+            std::nullopt,
+            "nvfp4"
+        );
+        router_logits = apply_nvfp4_post_scale(router_logits, lw.moe_router_q_biases);
+    } else {
+        router_logits = matmul(mlp_in, transpose(lw.moe_router_w, {1, 0}));
+    }
+    const array router_logits_f32 = astype(router_logits, float32);
     eval(router_logits_f32);
     synchronize();
     const float* router_ptr = router_logits_f32.data<float>();
@@ -89,26 +282,66 @@ array run_grouped_affine_moe_reference(mlx_ctx* ctx, const LayerWeights& lw, con
                 const float expert_weight = expert_weights[static_cast<size_t>(k)] * inv_weight_sum;
                 if (expert_id < 0 || expert_id >= num_experts) continue;
 
-                const array gate = quantized_matmul(
-                    token_input,
-                    slice_expert_matrix(lw.moe_gate_w, expert_id, "moe_gate_w"),
-                    slice_expert_matrix(lw.moe_gate_scales, expert_id, "moe_gate_scales"),
-                    maybe_slice_expert_matrix(lw.moe_gate_biases, expert_id, "moe_gate_biases"),
-                    true,
-                    lw.moe_expert_group_size,
-                    ctx->cfg.quant_bits,
-                    "affine"
-                );
-                const array up = quantized_matmul(
-                    token_input,
-                    slice_expert_matrix(lw.moe_up_w, expert_id, "moe_up_w"),
-                    slice_expert_matrix(lw.moe_up_scales, expert_id, "moe_up_scales"),
-                    maybe_slice_expert_matrix(lw.moe_up_biases, expert_id, "moe_up_biases"),
-                    true,
-                    lw.moe_expert_group_size,
-                    ctx->cfg.quant_bits,
-                    "affine"
-                );
+                array gate = array(0.0f);
+                array up = array(0.0f);
+                if (lw.moe_has_nvfp4) {
+                    const auto gate_post_scale = maybe_slice_expert_matrix(
+                        lw.moe_gate_biases,
+                        expert_id,
+                        "moe_gate_biases",
+                        true
+                    );
+                    gate = quantized_matmul(
+                        token_input,
+                        slice_expert_matrix(lw.moe_gate_w, expert_id, "moe_gate_w"),
+                        slice_expert_matrix(lw.moe_gate_scales, expert_id, "moe_gate_scales"),
+                        std::nullopt,
+                        true,
+                        std::nullopt,
+                        std::nullopt,
+                        "nvfp4"
+                    );
+                    if (gate_post_scale) gate = apply_nvfp4_post_scale(gate, *gate_post_scale);
+
+                    const auto up_post_scale = maybe_slice_expert_matrix(
+                        lw.moe_up_biases,
+                        expert_id,
+                        "moe_up_biases",
+                        true
+                    );
+                    up = quantized_matmul(
+                        token_input,
+                        slice_expert_matrix(lw.moe_up_w, expert_id, "moe_up_w"),
+                        slice_expert_matrix(lw.moe_up_scales, expert_id, "moe_up_scales"),
+                        std::nullopt,
+                        true,
+                        std::nullopt,
+                        std::nullopt,
+                        "nvfp4"
+                    );
+                    if (up_post_scale) up = apply_nvfp4_post_scale(up, *up_post_scale);
+                } else {
+                    gate = quantized_matmul(
+                        token_input,
+                        slice_expert_matrix(lw.moe_gate_w, expert_id, "moe_gate_w"),
+                        slice_expert_matrix(lw.moe_gate_scales, expert_id, "moe_gate_scales"),
+                        maybe_slice_expert_matrix(lw.moe_gate_biases, expert_id, "moe_gate_biases"),
+                        true,
+                        lw.moe_expert_group_size,
+                        ctx->cfg.quant_bits,
+                        "affine"
+                    );
+                    up = quantized_matmul(
+                        token_input,
+                        slice_expert_matrix(lw.moe_up_w, expert_id, "moe_up_w"),
+                        slice_expert_matrix(lw.moe_up_scales, expert_id, "moe_up_scales"),
+                        maybe_slice_expert_matrix(lw.moe_up_biases, expert_id, "moe_up_biases"),
+                        true,
+                        lw.moe_expert_group_size,
+                        ctx->cfg.quant_bits,
+                        "affine"
+                    );
+                }
                 array ff = array(0.0f);
                 {
                     static const auto compiled_silu_gate_mul = compile(
@@ -127,16 +360,37 @@ array run_grouped_affine_moe_reference(mlx_ctx* ctx, const LayerWeights& lw, con
                         ? compiled_gelu_gate_mul({gate, up}).at(0)
                         : compiled_silu_gate_mul({gate, up}).at(0);
                 }
-                const array down = quantized_matmul(
-                    ff,
-                    slice_expert_matrix(lw.moe_down_w, expert_id, "moe_down_w"),
-                    slice_expert_matrix(lw.moe_down_scales, expert_id, "moe_down_scales"),
-                    maybe_slice_expert_matrix(lw.moe_down_biases, expert_id, "moe_down_biases"),
-                    true,
-                    lw.moe_expert_group_size,
-                    ctx->cfg.quant_bits,
-                    "affine"
-                );
+                array down = array(0.0f);
+                if (lw.moe_has_nvfp4) {
+                    const auto down_post_scale = maybe_slice_expert_matrix(
+                        lw.moe_down_biases,
+                        expert_id,
+                        "moe_down_biases",
+                        true
+                    );
+                    down = quantized_matmul(
+                        ff,
+                        slice_expert_matrix(lw.moe_down_w, expert_id, "moe_down_w"),
+                        slice_expert_matrix(lw.moe_down_scales, expert_id, "moe_down_scales"),
+                        std::nullopt,
+                        true,
+                        std::nullopt,
+                        std::nullopt,
+                        "nvfp4"
+                    );
+                    if (down_post_scale) down = apply_nvfp4_post_scale(down, *down_post_scale);
+                } else {
+                    down = quantized_matmul(
+                        ff,
+                        slice_expert_matrix(lw.moe_down_w, expert_id, "moe_down_w"),
+                        slice_expert_matrix(lw.moe_down_scales, expert_id, "moe_down_scales"),
+                        maybe_slice_expert_matrix(lw.moe_down_biases, expert_id, "moe_down_biases"),
+                        true,
+                        lw.moe_expert_group_size,
+                        ctx->cfg.quant_bits,
+                        "affine"
+                    );
+                }
                 token_output = token_output + down * array(expert_weight, down.dtype());
             }
 
@@ -206,14 +460,19 @@ array run_layer(
     }
     array down = array(0.0f);
     if (lw.mlp_is_moe) {
-        const bool use_mxfp4_moe =
-            lw.moe_gate_scales.dtype() == uint8 &&
-            lw.moe_up_scales.dtype() == uint8 &&
-            lw.moe_down_scales.dtype() == uint8;
-        const bool use_fused_affine_gate_up =
-            !use_mxfp4_moe &&
-            lw.moe_gate_up_w.size() > 1 &&
-            lw.moe_gate_up_scales.size() > 1;
+        if (lw.moe_has_nvfp4) {
+            // Native NVFP4 experts use gather_qmm in NVFP4 mode with expert-aware
+            // post-scale application; keeps execution on GPU and avoids host loops.
+            down = run_native_nvfp4_moe_gather(ctx, lw, mlp_in);
+        } else {
+            const bool use_mxfp4_moe =
+                lw.moe_gate_scales.dtype() == uint8 &&
+                lw.moe_up_scales.dtype() == uint8 &&
+                lw.moe_down_scales.dtype() == uint8;
+            const bool use_fused_affine_gate_up =
+                !use_mxfp4_moe &&
+                lw.moe_gate_up_w.size() > 1 &&
+                lw.moe_gate_up_scales.size() > 1;
 
         // Decode-specialized path: split routing from expert compute.
         // For B=1 S=1 with affine fused_gate_up, use the separate routing
@@ -226,7 +485,7 @@ array run_layer(
             !use_mxfp4_moe &&
             env_truthy("TALU_METAL_MOE_DECODE_GEMV", true);
 
-        if (use_decode_expert_path) {
+            if (use_decode_expert_path) {
             // Routing: same logic as fused kernel but separated for custom expert compute.
             array router_logits = matmul(mlp_in, transpose(lw.moe_router_w, {1, 0}));
             const int k = lw.moe_experts_per_token;
@@ -262,7 +521,7 @@ array run_layer(
                 ctx->cfg.quant_bits,
                 ctx->cfg.use_gelu
             );
-        } else {
+            } else {
 
         down = use_mxfp4_moe
             ? *static_cast<array*>(mlx_lazy_fused_expert_mix_ffn_mxfp4(
@@ -321,7 +580,8 @@ array run_layer(
                 ctx->cfg.quant_bits,
                 ctx->cfg.use_gelu
             )));
-        } // end else (non-decode or non-eligible path)
+            } // end else (non-decode or non-eligible path)
+        } // end non-nvfp4 branch
 
         if (lw.moe_shared_gate_rhs.size() > 1 || lw.moe_shared_gate_has_q) {
             const bool use_fused_shared_gate_up =
@@ -411,7 +671,20 @@ array run_layer(
                 false
             );
 
-            if (lw.moe_shared_expert_gate_w.size() > 1) {
+            if (lw.moe_shared_expert_gate_has_q) {
+                array gate_logits = quantized_matmul(
+                    mlp_in,
+                    lw.moe_shared_expert_gate_q_w,
+                    lw.moe_shared_expert_gate_q_scales,
+                    std::nullopt,
+                    true,
+                    std::nullopt,
+                    std::nullopt,
+                    "nvfp4"
+                );
+                gate_logits = apply_nvfp4_post_scale(gate_logits, lw.moe_shared_expert_gate_q_biases);
+                shared_down = shared_down * sigmoid(gate_logits);
+            } else if (lw.moe_shared_expert_gate_w.size() > 1) {
                 const array shared_gate_weight = lw.moe_shared_expert_gate_w.dtype() == mlp_in.dtype()
                     ? lw.moe_shared_expert_gate_w
                     : astype(lw.moe_shared_expert_gate_w, mlp_in.dtype());

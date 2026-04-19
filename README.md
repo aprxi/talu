@@ -75,7 +75,7 @@ talu set LiquidAI/LFM2-350M-TQ4
 talu ask "Explain quantization in one sentence."
 ```
 
-Converts the model to 4-bit (default scheme: `tq4`). Converted models are saved with a `-TQ4` suffix; the original remains available.
+Converts the model to 4-bit (default scheme: `nvfp4`). Converted models are saved with a `-NVFP4` suffix; the original remains available.
 
 Available schemes (Talu Quantized):
 

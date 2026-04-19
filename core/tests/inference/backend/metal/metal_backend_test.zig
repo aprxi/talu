@@ -15,6 +15,7 @@ const xray = main.xray;
 const sampling = main.inference.backend.metal.sampling;
 
 extern fn mlx_test_grouped_affine_moe_gpu_path() c_int;
+extern fn mlx_test_nvfp4_moe_gather_path() c_int;
 extern fn mlx_test_depthwise_conv_decode_step() c_int;
 extern fn mlx_test_single_query_attention_matches_sdpa() c_int;
 extern fn mlx_test_kv_cache_reserve_preserves_prefix() c_int;
@@ -29,6 +30,7 @@ extern fn mlx_test_linear_attention_fused_quant_inproj_reuse() c_int;
 extern fn mlx_test_nvfp4_rowwise_post_scale_linear_decode() c_int;
 extern fn mlx_test_talu_meta_nvfp4_detection() c_int;
 extern fn mlx_test_nvfp4_mmap_strict_policy() c_int;
+extern fn mlx_test_dense_lm_head_lhs_fallback() c_int;
 extern fn mlx_test_grouped_affine_embedding_lookup_matches_reference() c_int;
 extern fn mlx_test_topk_candidate_extraction_multi() c_int;
 extern fn mlx_last_error() [*:0]const u8;
@@ -249,6 +251,16 @@ test "metal bridge grouped-affine moe gpu path matches reference implementation"
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
+test "metal bridge nvfp4 moe gather path matches reference implementation" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_nvfp4_moe_gather_path();
+    if (status != 1) {
+        std.debug.print("mlx nvfp4 moe gather self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
 test "metal bridge depthwise conv decode step matches conv1d" {
     if (!canRunMetalRuntime()) return;
 
@@ -383,6 +395,16 @@ test "metal bridge enables mmap strict mode for pure nvfp4 checkpoints" {
     const status = mlx_test_nvfp4_mmap_strict_policy();
     if (status != 1) {
         std.debug.print("mlx nvfp4 mmap strict policy self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
+    }
+    try std.testing.expectEqual(@as(c_int, 1), status);
+}
+
+test "metal bridge dense lm_head lhs fallback matches explicit transpose matmul" {
+    if (!canRunMetalRuntime()) return;
+
+    const status = mlx_test_dense_lm_head_lhs_fallback();
+    if (status != 1) {
+        std.debug.print("mlx dense lm_head lhs fallback self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
     }
     try std.testing.expectEqual(@as(c_int, 1), status);
 }

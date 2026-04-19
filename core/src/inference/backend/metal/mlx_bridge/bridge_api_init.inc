@@ -293,9 +293,16 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             // Defer loading the dense weight: for large quantized checkpoints (TQ4, FP8, NVFP4)
             // the QMM path below avoids the full dequantize. Load dense only as a fallback.
         }
+        const std::string lm_head_rhs_key = lm_head_key + "_rhs";
+        const bool has_lm_head_rhs_companion = has_tensor(tensors, lm_head_rhs_key);
+        const bool lm_head_has_native_quant_meta =
+            has_grouped_affine_metadata_for_key(tensors, lm_head_key) ||
+            has_nvfp4_metadata_for_key(tensors, lm_head_key);
 
         const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta);
-        if (enable_lm_head_qmm) {
+        const bool allow_lm_head_qmm = enable_lm_head_qmm &&
+            (ctx->cfg.tie_word_embeddings || lm_head_has_native_quant_meta || !nvfp4_mmap_required);
+        if (allow_lm_head_qmm) {
             if (ctx->cfg.tie_word_embeddings && ctx->embed_tokens_has_q) {
                 // Reuse the captured quantized embedding payload for tied lm_head.
                 ctx->lm_head_q_w = ctx->embed_tokens_q_w;
@@ -307,10 +314,13 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 if (lm_head_weight.size() == 1) {
                     // For grouped-affine: pass raw packed tensor directly — QMM capture reads
                     // scales/biases from the tensors map and only needs the shape from lhs_weight.
-                    // For other formats (FP8 etc.) that need a float input, dequantize now.
-                    if (has_grouped_affine_metadata_for_key(tensors, lm_head_key)) {
+                    // NVFP4 strict mmap also requires staying on packed source tensors.
+                    // For other formats that still require float input, dequantize here.
+                    if (has_grouped_affine_metadata_for_key(tensors, lm_head_key) ||
+                        has_nvfp4_metadata_for_key(tensors, lm_head_key))
+                    {
                         lm_head_weight = require_tensor(tensors, lm_head_key);
-                    } else {
+                    } else if (!nvfp4_mmap_required) {
                         lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
                     }
                 }
@@ -338,6 +348,69 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         // prefill and decode, so the dense transpose is unnecessary.
         if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled ||
             (!ctx->has_fp8_meta && !ctx->has_grouped_affine_meta && !has_nvfp4_meta)) {
+            bool loaded_rhs_companion = false;
+            bool loaded_dense_lhs = false;
+            if (has_lm_head_rhs_companion) {
+                const array rhs = require_tensor(tensors, lm_head_rhs_key);
+                const bool rhs_float = rhs.dtype() == bfloat16 ||
+                    rhs.dtype() == float16 || rhs.dtype() == float32;
+                if (!rhs_float || rhs.ndim() != 2) {
+                    throw std::runtime_error(
+                        "invalid lm_head dense RHS companion: key=" + lm_head_rhs_key
+                    );
+                }
+                const int hidden_size = ctx->cfg.hidden_size;
+                int vocab_size = -1;
+                if (has_tensor(tensors, lm_head_key)) {
+                    const array lhs = require_tensor(tensors, lm_head_key);
+                    if (lhs.ndim() == 2) vocab_size = lhs.shape(0);
+                }
+                const bool shape_ok =
+                    rhs.shape(0) == hidden_size &&
+                    rhs.shape(1) > 0 &&
+                    (vocab_size <= 0 || rhs.shape(1) == vocab_size);
+                if (!shape_ok) {
+                    throw std::runtime_error(
+                        "invalid lm_head dense RHS companion shape: key=" + lm_head_rhs_key +
+                        " shape=[" + std::to_string(rhs.shape(0)) + "," + std::to_string(rhs.shape(1)) + "]" +
+                        " expected=[" + std::to_string(hidden_size) + "," +
+                        (vocab_size > 0 ? std::to_string(vocab_size) : std::string("?")) + "]"
+                    );
+                }
+                ctx->lm_head_rhs = stop_gradient(rhs);
+                loaded_rhs_companion = true;
+            }
+
+            if (nvfp4_mmap_required && !ctx->lm_head_q_decode_enabled && !loaded_rhs_companion) {
+                // Strict mmap fallback: keep dense [vocab,hidden] mmap view and
+                // transpose lazily at matmul time. This avoids any materialized
+                // dense companion copy while supporting lm_head_q=off.
+                if (has_tensor(tensors, lm_head_key)) {
+                    const array lhs = require_tensor(tensors, lm_head_key);
+                    const bool lhs_float = lhs.dtype() == bfloat16 ||
+                        lhs.dtype() == float16 || lhs.dtype() == float32;
+                    const bool lhs_shape_ok = lhs.ndim() == 2 &&
+                        lhs.shape(1) == ctx->cfg.hidden_size &&
+                        lhs.shape(0) > 0;
+                    if (lhs_float && lhs_shape_ok) {
+                        ctx->lm_head_lhs = stop_gradient(lhs);
+                        loaded_dense_lhs = true;
+                    }
+                }
+                if (!loaded_dense_lhs) {
+                    throw std::runtime_error(
+                        "nvfp4 mmap-strict mode requires quantized lm_head, dense companion tensor, or dense lm_head tensor: " +
+                        lm_head_key
+                    );
+                }
+            }
+            if (loaded_rhs_companion) {
+                // Companion is already [hidden, vocab] and mmap-backed.
+                // Avoid transpose/copy in strict mode.
+            } else if (loaded_dense_lhs) {
+                // Dense lhs fallback is mmap-backed and used via lazy transpose
+                // in forward matmul to preserve strict mmap semantics.
+            } else {
             // Need dense weight for lm_head RHS. Ensure we have loaded a real
             // matrix tensor before transpose (qmm-disabled paths keep the
             // placeholder scalar until this point).
@@ -363,6 +436,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     rhs = stop_gradient(copy(astype(rhs, float32)));
                 }
                 ctx->lm_head_rhs = rhs;
+            }
             }
         }
 
@@ -470,61 +544,157 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 if (ctx->cfg.num_experts <= 0 || ctx->cfg.num_experts_per_tok <= 0) {
                     throw std::runtime_error("missing MoE routing config fields for layer: " + std::to_string(i));
                 }
-                if (ctx->cfg.quant_group_size <= 0 || (ctx->cfg.quant_bits != 4 && ctx->cfg.quant_bits != 8)) {
-                    throw std::runtime_error("Metal MLX MoE bridge requires grouped-affine expert quantization metadata");
+                const bool has_fused_gate_up = has_tensor(tensors, p + "mlp.experts.gate_up_proj");
+                const bool has_split_gate_up =
+                    has_tensor(tensors, p + "mlp.experts.gate_proj") &&
+                    has_tensor(tensors, p + "mlp.experts.up_proj");
+                const bool moe_nvfp4_fused =
+                    has_fused_gate_up &&
+                    has_nvfp4_metadata_for_key(tensors, p + "mlp.experts.gate_up_proj") &&
+                    has_nvfp4_metadata_for_key(tensors, p + "mlp.experts.down_proj");
+                const bool moe_nvfp4_split =
+                    has_split_gate_up &&
+                    has_nvfp4_metadata_for_key(tensors, p + "mlp.experts.gate_proj") &&
+                    has_nvfp4_metadata_for_key(tensors, p + "mlp.experts.up_proj") &&
+                    has_nvfp4_metadata_for_key(tensors, p + "mlp.experts.down_proj");
+                const bool moe_has_native_nvfp4 = moe_nvfp4_fused || moe_nvfp4_split;
+                if (!moe_has_native_nvfp4 &&
+                    (ctx->cfg.quant_group_size <= 0 || (ctx->cfg.quant_bits != 4 && ctx->cfg.quant_bits != 8)))
+                {
+                    throw std::runtime_error("Metal MLX MoE bridge requires grouped-affine or native NVFP4 expert quantization metadata");
                 }
 
                 lw.mlp_is_moe = true;
                 ctx->has_moe_layers = true;
                 lw.moe_num_experts = ctx->cfg.num_experts;
                 lw.moe_experts_per_token = ctx->cfg.num_experts_per_tok;
-                lw.moe_router_group_size = ctx->cfg.quant_group_size;
-                lw.moe_expert_group_size = ctx->cfg.quant_group_size;
-                lw.moe_router_w = load_linear_weight(tensors, ctx->cfg, p + "mlp.gate.weight");
-
-                if (has_tensor(tensors, p + "mlp.experts.gate_up_proj")) {
-                    lw.moe_gate_up_w = require_tensor(tensors, p + "mlp.experts.gate_up_proj");
-                    lw.moe_gate_up_scales = require_tensor(tensors, p + "mlp.experts.gate_up_proj.scales");
-                    if (has_tensor(tensors, p + "mlp.experts.gate_up_proj.biases")) {
-                        lw.moe_gate_up_biases = require_tensor(tensors, p + "mlp.experts.gate_up_proj.biases");
+                lw.moe_has_nvfp4 = moe_has_native_nvfp4;
+                lw.moe_router_group_size = ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 16;
+                lw.moe_expert_group_size = ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 16;
+                const std::string moe_router_key = p + "mlp.gate.weight";
+                if (has_nvfp4_metadata_for_key(tensors, moe_router_key)) {
+                    if (!capture_native_nvfp4_quant(
+                            tensors,
+                            moe_router_key,
+                            &lw.moe_router_q_w,
+                            &lw.moe_router_q_scales,
+                            &lw.moe_router_q_biases))
+                    {
+                        throw std::runtime_error("failed to capture native NVFP4 MoE router tensor");
                     }
-                    const auto gate_up_split = split_fused_moe_gate_up_projection(
-                        lw.moe_gate_up_w,
-                        p + "mlp.experts.gate_up_proj"
-                    );
-                    const auto gate_up_scales_split = split_fused_moe_gate_up_projection(
-                        lw.moe_gate_up_scales,
-                        p + "mlp.experts.gate_up_proj.scales"
-                    );
-                    lw.moe_gate_w = gate_up_split.first;
-                    lw.moe_up_w = gate_up_split.second;
-                    lw.moe_gate_scales = gate_up_scales_split.first;
-                    lw.moe_up_scales = gate_up_scales_split.second;
-                    if (lw.moe_gate_up_biases.size() > 1) {
-                        const auto gate_up_biases_split = split_fused_moe_gate_up_projection(
-                            lw.moe_gate_up_biases,
-                            p + "mlp.experts.gate_up_proj.biases"
-                        );
-                        lw.moe_gate_biases = gate_up_biases_split.first;
-                        lw.moe_up_biases = gate_up_biases_split.second;
-                    }
+                    lw.moe_router_has_q = true;
                 } else {
-                    lw.moe_gate_w = require_tensor(tensors, p + "mlp.experts.gate_proj");
-                    lw.moe_up_w = require_tensor(tensors, p + "mlp.experts.up_proj");
-                    lw.moe_gate_scales = require_tensor(tensors, p + "mlp.experts.gate_proj.scales");
-                    lw.moe_up_scales = require_tensor(tensors, p + "mlp.experts.up_proj.scales");
-                    if (has_tensor(tensors, p + "mlp.experts.gate_proj.biases")) {
-                        lw.moe_gate_biases = require_tensor(tensors, p + "mlp.experts.gate_proj.biases");
-                    }
-                    if (has_tensor(tensors, p + "mlp.experts.up_proj.biases")) {
-                        lw.moe_up_biases = require_tensor(tensors, p + "mlp.experts.up_proj.biases");
-                    }
+                    lw.moe_router_w = load_linear_weight(tensors, ctx->cfg, moe_router_key);
                 }
 
-                lw.moe_down_w = require_tensor(tensors, p + "mlp.experts.down_proj");
-                lw.moe_down_scales = require_tensor(tensors, p + "mlp.experts.down_proj.scales");
-                if (has_tensor(tensors, p + "mlp.experts.down_proj.biases")) {
-                    lw.moe_down_biases = require_tensor(tensors, p + "mlp.experts.down_proj.biases");
+                if (moe_has_native_nvfp4) {
+                    if (moe_nvfp4_fused) {
+                        if (!capture_native_nvfp4_quant(
+                                tensors,
+                                p + "mlp.experts.gate_up_proj",
+                                &lw.moe_gate_up_w,
+                                &lw.moe_gate_up_scales,
+                                &lw.moe_gate_up_biases))
+                        {
+                            throw std::runtime_error("failed to capture native NVFP4 MoE fused gate_up tensor");
+                        }
+                        const auto gate_up_split = split_fused_moe_gate_up_projection(
+                            lw.moe_gate_up_w,
+                            p + "mlp.experts.gate_up_proj"
+                        );
+                        const auto gate_up_scales_split = split_fused_moe_gate_up_projection(
+                            lw.moe_gate_up_scales,
+                            p + "mlp.experts.gate_up_proj.weight_scale"
+                        );
+                        lw.moe_gate_w = gate_up_split.first;
+                        lw.moe_up_w = gate_up_split.second;
+                        lw.moe_gate_scales = gate_up_scales_split.first;
+                        lw.moe_up_scales = gate_up_scales_split.second;
+                        if (lw.moe_gate_up_biases.size() > 1) {
+                            const auto gate_up_biases_split = split_fused_moe_gate_up_projection(
+                                lw.moe_gate_up_biases,
+                                p + "mlp.experts.gate_up_proj.biases"
+                            );
+                            lw.moe_gate_biases = gate_up_biases_split.first;
+                            lw.moe_up_biases = gate_up_biases_split.second;
+                        } else {
+                            // NVFP4 carries post-scale as scalar; apply to both gate/up experts.
+                            lw.moe_gate_biases = lw.moe_gate_up_biases;
+                            lw.moe_up_biases = lw.moe_gate_up_biases;
+                        }
+                    } else {
+                        if (!capture_native_nvfp4_quant(
+                                tensors,
+                                p + "mlp.experts.gate_proj",
+                                &lw.moe_gate_w,
+                                &lw.moe_gate_scales,
+                                &lw.moe_gate_biases))
+                        {
+                            throw std::runtime_error("failed to capture native NVFP4 MoE gate expert tensor");
+                        }
+                        if (!capture_native_nvfp4_quant(
+                                tensors,
+                                p + "mlp.experts.up_proj",
+                                &lw.moe_up_w,
+                                &lw.moe_up_scales,
+                                &lw.moe_up_biases))
+                        {
+                            throw std::runtime_error("failed to capture native NVFP4 MoE up expert tensor");
+                        }
+                    }
+                    if (!capture_native_nvfp4_quant(
+                            tensors,
+                            p + "mlp.experts.down_proj",
+                            &lw.moe_down_w,
+                            &lw.moe_down_scales,
+                            &lw.moe_down_biases))
+                    {
+                        throw std::runtime_error("failed to capture native NVFP4 MoE down expert tensor");
+                    }
+                } else {
+                    if (has_tensor(tensors, p + "mlp.experts.gate_up_proj")) {
+                        lw.moe_gate_up_w = require_tensor(tensors, p + "mlp.experts.gate_up_proj");
+                        lw.moe_gate_up_scales = require_tensor(tensors, p + "mlp.experts.gate_up_proj.scales");
+                        if (has_tensor(tensors, p + "mlp.experts.gate_up_proj.biases")) {
+                            lw.moe_gate_up_biases = require_tensor(tensors, p + "mlp.experts.gate_up_proj.biases");
+                        }
+                        const auto gate_up_split = split_fused_moe_gate_up_projection(
+                            lw.moe_gate_up_w,
+                            p + "mlp.experts.gate_up_proj"
+                        );
+                        const auto gate_up_scales_split = split_fused_moe_gate_up_projection(
+                            lw.moe_gate_up_scales,
+                            p + "mlp.experts.gate_up_proj.scales"
+                        );
+                        lw.moe_gate_w = gate_up_split.first;
+                        lw.moe_up_w = gate_up_split.second;
+                        lw.moe_gate_scales = gate_up_scales_split.first;
+                        lw.moe_up_scales = gate_up_scales_split.second;
+                        if (lw.moe_gate_up_biases.size() > 1) {
+                            const auto gate_up_biases_split = split_fused_moe_gate_up_projection(
+                                lw.moe_gate_up_biases,
+                                p + "mlp.experts.gate_up_proj.biases"
+                            );
+                            lw.moe_gate_biases = gate_up_biases_split.first;
+                            lw.moe_up_biases = gate_up_biases_split.second;
+                        }
+                    } else {
+                        lw.moe_gate_w = require_tensor(tensors, p + "mlp.experts.gate_proj");
+                        lw.moe_up_w = require_tensor(tensors, p + "mlp.experts.up_proj");
+                        lw.moe_gate_scales = require_tensor(tensors, p + "mlp.experts.gate_proj.scales");
+                        lw.moe_up_scales = require_tensor(tensors, p + "mlp.experts.up_proj.scales");
+                        if (has_tensor(tensors, p + "mlp.experts.gate_proj.biases")) {
+                            lw.moe_gate_biases = require_tensor(tensors, p + "mlp.experts.gate_proj.biases");
+                        }
+                        if (has_tensor(tensors, p + "mlp.experts.up_proj.biases")) {
+                            lw.moe_up_biases = require_tensor(tensors, p + "mlp.experts.up_proj.biases");
+                        }
+                    }
+                    lw.moe_down_w = require_tensor(tensors, p + "mlp.experts.down_proj");
+                    lw.moe_down_scales = require_tensor(tensors, p + "mlp.experts.down_proj.scales");
+                    if (has_tensor(tensors, p + "mlp.experts.down_proj.biases")) {
+                        lw.moe_down_biases = require_tensor(tensors, p + "mlp.experts.down_proj.biases");
+                    }
                 }
 
                 if (has_tensor(tensors, p + "mlp.shared_expert.gate_proj.weight") &&
@@ -585,14 +755,28 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 }
 
                 if (has_tensor(tensors, p + "mlp.shared_expert_gate.weight")) {
-                    array shared_gate_weight = require_tensor(tensors, p + "mlp.shared_expert_gate.weight");
-                    if (shared_gate_weight.ndim() == 2 && shared_gate_weight.shape(0) == 1) {
-                        shared_gate_weight = reshape(shared_gate_weight, {shared_gate_weight.shape(1)});
+                    const std::string shared_expert_gate_key = p + "mlp.shared_expert_gate.weight";
+                    if (has_nvfp4_metadata_for_key(tensors, shared_expert_gate_key)) {
+                        if (!capture_native_nvfp4_quant(
+                                tensors,
+                                shared_expert_gate_key,
+                                &lw.moe_shared_expert_gate_q_w,
+                                &lw.moe_shared_expert_gate_q_scales,
+                                &lw.moe_shared_expert_gate_q_biases))
+                        {
+                            throw std::runtime_error("failed to capture native NVFP4 shared expert gate tensor");
+                        }
+                        lw.moe_shared_expert_gate_has_q = true;
+                    } else {
+                        array shared_gate_weight = require_tensor(tensors, shared_expert_gate_key);
+                        if (shared_gate_weight.ndim() == 2 && shared_gate_weight.shape(0) == 1) {
+                            shared_gate_weight = reshape(shared_gate_weight, {shared_gate_weight.shape(1)});
+                        }
+                        if (shared_gate_weight.ndim() != 1) {
+                            throw std::runtime_error("shared expert gate must be rank-1 after reshape for layer: " + std::to_string(i));
+                        }
+                        lw.moe_shared_expert_gate_w = shared_gate_weight;
                     }
-                    if (shared_gate_weight.ndim() != 1) {
-                        throw std::runtime_error("shared expert gate must be rank-1 after reshape for layer: " + std::to_string(i));
-                    }
-                    lw.moe_shared_expert_gate_w = shared_gate_weight;
                 }
             } else {
                 const std::string mlp_down_key = has_tensor(tensors, p + "mlp.down_proj.weight")
@@ -1822,6 +2006,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             ctx_bytes += array_bytes(ctx->embed_tokens_q_scales);
             ctx_bytes += array_bytes(ctx->embed_tokens_q_biases);
             ctx_bytes += array_bytes(ctx->lm_head_rhs);
+            ctx_bytes += array_bytes(ctx->lm_head_lhs);
             ctx_bytes += array_bytes(ctx->lm_head_q_w);
             ctx_bytes += array_bytes(ctx->lm_head_q_scales);
             ctx_bytes += array_bytes(ctx->lm_head_q_biases);
@@ -1972,6 +2157,7 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         ctx->embed_tokens_q_bits = source_ctx->embed_tokens_q_bits;
         ctx->embed_tokens_has_q = source_ctx->embed_tokens_has_q;
         ctx->lm_head_rhs = source_ctx->lm_head_rhs;
+        ctx->lm_head_lhs = source_ctx->lm_head_lhs;
         ctx->lm_head_q_w = source_ctx->lm_head_q_w;
         ctx->lm_head_q_scales = source_ctx->lm_head_q_scales;
         ctx->lm_head_q_biases = source_ctx->lm_head_q_biases;

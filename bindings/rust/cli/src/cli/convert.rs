@@ -682,7 +682,7 @@ Arguments:
   <model>           HuggingFace model ID (e.g., Qwen/Qwen3-0.6B) or local path
 
 Options:
-  --scheme NAME     Quantization scheme (default: tq4)
+  --scheme NAME     Quantization scheme (default: nvfp4)
   --seed N          Deterministic calibration seed (default: 42)
   --output DIR      Output directory (default: $TALU_HOME/models)
   -f, --force       Overwrite existing output
@@ -693,14 +693,14 @@ Options:
   --opts KEY=VALUE  Override conversion knobs (activates custom behavior automatically). Repeat or pass CSV.
   OVERRIDE          (legacy positional, deprecated): same format as --opts
 
-Talu Quantized (DEFAULT):
-  tq4        4-bit quantized (DEFAULT). GROUP_SIZE env var overrides group size (default: 32).
+  Talu Quantized:
+  tq4        4-bit quantized. GROUP_SIZE env var overrides group size (default: 32).
   tq8        8-bit quantized. GROUP_SIZE env var overrides group size (default: 64).
 
-Hardware Float / Native:
+  Hardware Float / Native (DEFAULT: nvfp4):
   fp8        FP8 E4M3, block_size=128x128
   mxfp8      MXFP8 E4M3 + E8M0 scales, block_size=32 (Blackwell tensor cores)
-  nvfp4      NVFP4 surface (emits runtime-native 4-bit packed layout)
+  nvfp4      NVFP4 surface (DEFAULT; emits runtime-native 4-bit packed layout)
 
 Output naming:
   Models are saved with hierarchical paths: {output_dir}/{org}/{model}-{SUFFIX}
@@ -716,7 +716,7 @@ Environment Variables:
   HF_TOKEN          API token for private models
 
 Examples:
-  talu convert Qwen/Qwen3-0.6B                       # tq4 (default)
+  talu convert Qwen/Qwen3-0.6B                       # nvfp4 (default)
   talu convert Qwen/Qwen3-0.6B --scheme tq8          # Near-lossless
   talu convert Qwen/Qwen3-0.6B --scheme tq4          # Highest accuracy
   talu convert ./models/Qwen--Qwen3-0.6B --output /tmp -f
@@ -729,7 +729,7 @@ Examples:
 
   # CI/scripting: get JSON output
   talu convert Qwen/Qwen3-0.6B --json
-  # -> {"success": true, "output_path": "models/Qwen/Qwen3-0.6B-TQ4"}
+  # -> {"success": true, "output_path": "models/Qwen/Qwen3-0.6B-NVFP4"}
 
   # Custom override example (auto-switches to custom behavior)
   talu convert Qwen/Qwen3.5-2B --scheme nvfp4 --opts replay=weighted,preserve_blocks=2,preserve_format=bf16,lm_head_q=1,small_model_preserve=0,clip_mult=1.00,scale_refine_mult=1.00
@@ -741,14 +741,14 @@ Examples:
 fn print_available_schemes() {
     let schemes = r#"Available quantization schemes:
 
-  Talu Quantized (DEFAULT):
-    tq4        4-bit quantized (DEFAULT). GROUP_SIZE env var overrides group size (default: 32).
+  Talu Quantized:
+    tq4        4-bit quantized. GROUP_SIZE env var overrides group size (default: 32).
     tq8        8-bit quantized. GROUP_SIZE env var overrides group size (default: 64).
 
-  Hardware Float / Native:
+  Hardware Float / Native (DEFAULT: nvfp4):
     fp8        FP8 E4M3, block_size=128x128
     mxfp8      MXFP8 E4M3 + E8M0 scales, block_size=32 (Blackwell tensor cores)
-    nvfp4      NVFP4 surface (emits runtime-native 4-bit packed layout)
+    nvfp4      NVFP4 surface (DEFAULT; emits runtime-native 4-bit packed layout)
 
 Usage: talu convert -m <model> --scheme <SCHEME>
 Advanced: talu convert <model> --scheme mxfp8 --opts iters=...,samples=...
@@ -770,6 +770,8 @@ Custom parameters (active):
       bf16 is safest; mxfp8 reduces size for preserved blocks.
   lm_head_q=0|1
       Quantize lm_head when 1; keep dense when 0.
+      Untied-embedding models keep mmap-strict compatibility with lm_head_q=0 via
+      an auto-emitted dense RHS companion tensor.
   small_model_preserve=0|1
       Preserve boundary layers for small models when 1.
   clip_mult=FLOAT>0

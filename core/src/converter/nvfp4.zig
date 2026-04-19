@@ -28,6 +28,7 @@ const global_scale_sample_limit: usize = 8192;
 const activation_sample_cap: usize = 64;
 const activation_importance_min_weight: f32 = 1e-6;
 const small_model_preserve_threshold_params: u64 = 8_000_000_000;
+const small_model_default_threshold_params: u64 = small_model_preserve_threshold_params;
 const mixed_preserve_layers_pct_default_good: u32 = 10;
 const mixed_preserve_score_sample_blocks_default: usize = 256;
 const nvfp4_forward_eval_row_cap: usize = 128;
@@ -41,6 +42,7 @@ const nvfp4_canary_context_tokens: usize = 64;
 const nvfp4_quality_tokens_per_sample: usize = 32;
 const nvfp4_quality_sample_count: usize = 16;
 const nvfp4_canary_target_tokens: usize = nvfp4_quality_tokens_per_sample * nvfp4_quality_sample_count;
+const nvfp4_quality_probe_source_dense_bytes_limit: u64 = 24 * 1024 * 1024 * 1024;
 const nvfp4_forward_metric_tensor_sample_mod: u64 = 1;
 const nvfp4_forward_metric_input_cap: usize = 8;
 const nvfp4_forward_metric_row_cap: usize = 16;
@@ -351,21 +353,37 @@ pub fn convertToNvfp4(
     }
     try std.fs.cwd().rename(output_tmp_path, output_dir_path);
     keep_output = true;
-    if (evaluateNvfp4CanaryAgainstSource(
-        allocator,
-        input_path,
-        output_dir_path,
-        options.calib_seed,
-    )) |comparison| {
-        printNvfp4CanarySummary(comparison, options, quality_summary);
-        writeNvfp4CanaryReport(allocator, output_dir_path, comparison) catch |err| {
-            log.warn("convert", "NVFP4 quality-probe report write failed", .{ .err = @errorName(err) });
-        };
-        appendNvfp4ProbeHistory(allocator, output_dir_path, options, comparison) catch |err| {
-            log.warn("convert", "NVFP4 probe-history write failed", .{ .err = @errorName(err) });
-        };
-    } else |err| {
-        log.warn("convert", "NVFP4 quality-probe comparison unavailable", .{ .err = @errorName(err) });
+    switch (resolveNvfp4QualityProbeDecision(quality_summary)) {
+        .run => {
+            if (evaluateNvfp4CanaryAgainstSource(
+                allocator,
+                input_path,
+                output_dir_path,
+                options.calib_seed,
+            )) |comparison| {
+                printNvfp4CanarySummary(comparison, options, quality_summary);
+                writeNvfp4CanaryReport(allocator, output_dir_path, comparison) catch |err| {
+                    log.warn("convert", "NVFP4 quality-probe report write failed", .{ .err = @errorName(err) });
+                };
+                appendNvfp4ProbeHistory(allocator, output_dir_path, options, comparison) catch |err| {
+                    log.warn("convert", "NVFP4 probe-history write failed", .{ .err = @errorName(err) });
+                };
+            } else |err| {
+                log.warn("convert", "NVFP4 quality-probe comparison unavailable", .{ .err = @errorName(err) });
+            }
+        },
+        .skip_disabled => {
+            log.info("convert", "NVFP4 quality-probe skipped", .{ .reason = "disabled_by_env" });
+        },
+        .skip_source_too_large => {
+            const source_gib: f64 = @as(f64, @floatFromInt(quality_summary.source_dense_weight_bytes)) / @as(f64, 1024.0 * 1024.0 * 1024.0);
+            const limit_gib: f64 = @as(f64, @floatFromInt(nvfp4_quality_probe_source_dense_bytes_limit)) / @as(f64, 1024.0 * 1024.0 * 1024.0);
+            log.info("convert", "NVFP4 quality-probe skipped", .{
+                .reason = "source_dense_too_large",
+                .source_gib = source_gib,
+                .limit_gib = limit_gib,
+            });
+        },
     }
     return output_dir_path;
 }
@@ -409,6 +427,10 @@ fn augmentWithPackedNvfp4Companions(
     var skipped_mixed_preserve: usize = 0;
     var target_blocks_total: u64 = 0;
     var dense_weight_params_total: u64 = 0;
+    var language_dense_weight_params_total: u64 = 0;
+    var source_dense_weight_bytes_total: u64 = 0;
+    var unsupported_moe_tensor_name: ?[]const u8 = null;
+    var unsupported_moe_tensor_n_dims: i32 = 0;
     var max_layer_index: ?u32 = null;
     for (names) |name| {
         if (convert.shouldSkipForTiedEmbeddingsByName(layout_map, name, tie_embeddings)) continue;
@@ -419,6 +441,14 @@ fn augmentWithPackedNvfp4Companions(
             });
             return err;
         };
+        if (unsupported_moe_tensor_name == null and isUnsupportedNvfp4MoeExpertTensor(name, weight)) {
+            unsupported_moe_tensor_name = name;
+            unsupported_moe_tensor_n_dims = weight.n_dims;
+        }
+        if (weight.data_size > 0) {
+            const tensor_bytes: u64 = @intCast(weight.data_size);
+            source_dense_weight_bytes_total = std.math.add(u64, source_dense_weight_bytes_total, tensor_bytes) catch std.math.maxInt(u64);
+        }
         if (weight.n_dims == 2 and weight.shape[0] > 0 and weight.shape[1] > 0 and
             (weight.dtype == .f32 or weight.dtype == .f16 or weight.dtype == .bf16))
         {
@@ -426,26 +456,46 @@ fn augmentWithPackedNvfp4Companions(
             const cols: u64 = @intCast(weight.shape[1]);
             const tensor_params = std.math.mul(u64, rows, cols) catch std.math.maxInt(u64);
             dense_weight_params_total = std.math.add(u64, dense_weight_params_total, tensor_params) catch std.math.maxInt(u64);
+            if (std.mem.indexOf(u8, name, "language_model.") != null) {
+                language_dense_weight_params_total = std.math.add(u64, language_dense_weight_params_total, tensor_params) catch std.math.maxInt(u64);
+            }
         }
         if (extractLayerIndexFromTensorName(name)) |layer| {
             if (max_layer_index == null or layer > max_layer_index.?) max_layer_index = layer;
         }
     }
+    if (unsupported_moe_tensor_name) |tensor_name| {
+        log.warn("convert", "NVFP4 conversion does not support fused MoE expert tensors in native NVFP4 yet", .{
+            .tensor = tensor_name,
+            .n_dims = unsupported_moe_tensor_n_dims,
+            .hint = "use TQ4 for this model family until NVFP4 MoE expert packing/runtime support lands",
+        });
+        return error.UnsupportedModelArchitecture;
+    }
+
+    const small_model_default_scope = isNvfp4SmallModelDefaultScope(
+        dense_weight_params_total,
+        language_dense_weight_params_total,
+    );
+    const lm_head_quantized = resolveNvfp4LmHeadQuantized(options.profile, small_model_default_scope);
+    const small_model_preserve_enabled = resolveNvfp4SmallModelPreserveEnabled(options.profile, small_model_default_scope);
+    const mixed_preserve_default_pct = defaultNvfp4MixedPreserveLayersPct(options.profile, small_model_default_scope);
+    const mixed_preserve_blocks_override = resolveNvfp4MixedPreserveBlocksOverride();
+    const preserve_format = resolveNvfp4PreserveFormat();
 
     const small_model_policy = makeSmallModelPreservePolicy(
-        options.profile,
+        small_model_preserve_enabled,
         dense_weight_params_total,
         max_layer_index,
     );
-    const mixed_preserve_default_pct = defaultNvfp4MixedPreserveLayersPct(options.profile);
-    const mixed_preserve_blocks_override = resolveNvfp4MixedPreserveBlocksOverride();
-    const preserve_format = resolveNvfp4PreserveFormat();
     const mixed_preserve_layers = try buildMixedPreserveLayerList(
         allocator,
         st,
         names,
         options.profile,
+        lm_head_quantized,
         mixed_preserve_blocks_override,
+        mixed_preserve_default_pct,
     );
     defer allocator.free(mixed_preserve_layers);
     if (small_model_policy.enabled) {
@@ -484,13 +534,15 @@ fn augmentWithPackedNvfp4Companions(
             });
             return err;
         };
-        if (!shouldConvertDenseWeight(name, weight, options.profile)) continue;
+        const convertible = shouldConvertDenseWeightWithLmHead(name, weight, options.profile, lm_head_quantized);
+        if (!convertible) continue;
         dense_candidate_weights += 1;
-        if (shouldPreserveWeightBySmallModelPolicy(name, small_model_policy)) {
+        const is_dense_2d = weight.n_dims == 2;
+        if (is_dense_2d and shouldPreserveWeightBySmallModelPolicy(name, small_model_policy)) {
             skipped_small_model_policy += 1;
             continue;
         }
-        if (shouldPreserveWeightByLayerList(name, mixed_preserve_layers)) {
+        if (is_dense_2d and shouldPreserveWeightByLayerList(name, mixed_preserve_layers)) {
             skipped_mixed_preserve += 1;
             continue;
         }
@@ -506,12 +558,11 @@ fn augmentWithPackedNvfp4Companions(
             0;
         target_blocks_total = std.math.add(u64, target_blocks_total, tensor_work) catch std.math.maxInt(u64);
 
-        const base = name[0 .. name.len - ".weight".len];
+        const base = convertedNvfp4BaseName(name);
         const owned_base = try allocator.dupe(u8, base);
         errdefer allocator.free(owned_base);
         try converted_weight_bases.put(owned_base, {});
     }
-    const lm_head_quantized = !shouldExcludeWeightByProfile("lm_head.weight", options.profile);
     std.debug.print(
         "NVFP4 profile behavior: mode={s} lm_head_q={s} small_model_preserve={s} mixed_blocks={d} preserve_format={s}\n",
         .{
@@ -533,10 +584,20 @@ fn augmentWithPackedNvfp4Companions(
     );
     if (target_weights == 0) return Nvfp4QualitySummary{
         .profile = options.profile,
+        .lm_head_quantized = lm_head_quantized,
+        .small_model_preserve_enabled = small_model_policy.enabled,
         .preserve_blocks_selected = std.math.cast(u32, mixed_preserve_layers.len) orelse std.math.maxInt(u32),
+        .source_dense_weight_bytes = source_dense_weight_bytes_total,
     };
 
-    emitNvfp4CalibHeader(options, mixed_preserve_layers.len, mixed_preserve_blocks_override);
+    emitNvfp4CalibHeader(
+        options,
+        mixed_preserve_layers.len,
+        mixed_preserve_blocks_override,
+        lm_head_quantized,
+        small_model_policy.enabled,
+        mixed_preserve_default_pct,
+    );
     var activation_cache = try captureActivationCacheBestEffort(
         allocator,
         model_path,
@@ -562,11 +623,13 @@ fn augmentWithPackedNvfp4Companions(
             });
             return err;
         };
-        if (shouldConvertDenseWeight(name, weight, options.profile) and
-            !shouldPreserveWeightBySmallModelPolicy(name, small_model_policy) and
-            !shouldPreserveWeightByLayerList(name, mixed_preserve_layers))
+        const convertible = shouldConvertDenseWeightWithLmHead(name, weight, options.profile, lm_head_quantized);
+        const allow_preserve = weight.n_dims == 2;
+        if (convertible and
+            !(allow_preserve and shouldPreserveWeightBySmallModelPolicy(name, small_model_policy)) and
+            !(allow_preserve and shouldPreserveWeightByLayerList(name, mixed_preserve_layers)))
         {
-            const base = name[0 .. name.len - ".weight".len];
+            const base = convertedNvfp4BaseName(name);
             const scale_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base});
             errdefer allocator.free(scale_name);
             const scale2_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base});
@@ -601,7 +664,7 @@ fn augmentWithPackedNvfp4Companions(
 
             continue;
         }
-        if (shouldConvertDenseWeight(name, weight, options.profile) and
+        if (allow_preserve and convertible and
             (shouldPreserveWeightBySmallModelPolicy(name, small_model_policy) or
                 shouldPreserveWeightByLayerList(name, mixed_preserve_layers)))
         {
@@ -645,6 +708,21 @@ fn augmentWithPackedNvfp4Companions(
         });
     }
 
+    // For untied models with dense lm_head, emit a pre-oriented BF16 RHS
+    // companion so strict NVFP4 mmap loads can avoid dense transpose/copy.
+    if (!tie_embeddings and !lm_head_quantized) {
+        if (findUntiedLmHeadWeightName(names)) |lm_head_weight_name| {
+            const rhs_name = try std.fmt.allocPrint(allocator, "{s}_rhs", .{lm_head_weight_name});
+            errdefer allocator.free(rhs_name);
+            try output_specs.append(allocator, .{
+                .kind = .dense_bf16_rhs_weight,
+                .name = rhs_name,
+                .source_weight_name = lm_head_weight_name,
+                .owns_name = true,
+            });
+        }
+    }
+
     const tmp_weights_path = try std.fs.path.join(allocator, &.{ output_path, "model.safetensors.nvfp4.tmp" });
     defer allocator.free(tmp_weights_path);
     std.fs.cwd().deleteFile(tmp_weights_path) catch |err| switch (err) {
@@ -673,6 +751,7 @@ fn augmentWithPackedNvfp4Companions(
         if (existing_st) |*prev| prev else null,
         output_specs.items,
         options.profile,
+        lm_head_quantized,
         options.update_round,
         can_use_metal_pack,
         if (activation_cache) |*cache| cache else null,
@@ -687,6 +766,9 @@ fn augmentWithPackedNvfp4Companions(
         return err;
     };
     quality_summary.preserve_blocks_selected = std.math.cast(u32, mixed_preserve_layers.len) orelse std.math.maxInt(u32);
+    quality_summary.lm_head_quantized = lm_head_quantized;
+    quality_summary.small_model_preserve_enabled = small_model_policy.enabled;
+    quality_summary.source_dense_weight_bytes = source_dense_weight_bytes_total;
     const write_done_ns = std.time.nanoTimestamp();
     // Keep internal reconstruction summary out of default CLI output.
     // Use canary metrics (nll/ppl/kld/logit_mse) as objective tuning signals.
@@ -755,10 +837,24 @@ fn resolveNvfp4BlockScaleCacheMaxBlocks() usize {
     return nvfp4_block_scale_cache_max_blocks;
 }
 
-fn defaultNvfp4MixedPreserveLayersPct(profile: @TypeOf((grouped_affine.ConvertOptions{}).profile)) u32 {
+fn isNvfp4SmallModelDefaultScope(
+    dense_weight_params_total: u64,
+    language_dense_weight_params_total: u64,
+) bool {
+    const params_basis = if (language_dense_weight_params_total > 0)
+        language_dense_weight_params_total
+    else
+        dense_weight_params_total;
+    return params_basis > 0 and params_basis <= small_model_default_threshold_params;
+}
+
+fn defaultNvfp4MixedPreserveLayersPct(
+    profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    small_model_default_scope: bool,
+) u32 {
     return switch (profile) {
         .good, .best => mixed_preserve_layers_pct_default_good,
-        .custom => 0,
+        .custom => if (small_model_default_scope) mixed_preserve_layers_pct_default_good else 0,
     };
 }
 
@@ -859,18 +955,23 @@ fn nvfp4ReplayPolicyLabel(policy: Nvfp4ReplayPolicy) []const u8 {
     };
 }
 
-fn resolveNvfp4LmHeadQuantized(profile: @TypeOf((grouped_affine.ConvertOptions{}).profile)) bool {
+fn resolveNvfp4LmHeadQuantized(
+    profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    small_model_default_scope: bool,
+) bool {
     const default_enabled = switch (profile) {
-        .good, .best => false,
-        .custom => true,
+        .good, .best, .custom => !small_model_default_scope,
     };
     return parseOptionalBoolEnv("TALU_NVFP4_LM_HEAD_Q") orelse default_enabled;
 }
 
-fn resolveNvfp4SmallModelPreserveEnabled(profile: @TypeOf((grouped_affine.ConvertOptions{}).profile)) bool {
+fn resolveNvfp4SmallModelPreserveEnabled(
+    profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    small_model_default_scope: bool,
+) bool {
     const default_enabled = switch (profile) {
         .good, .best => true,
-        .custom => false,
+        .custom => small_model_default_scope,
     };
     return parseOptionalBoolEnv("TALU_NVFP4_SMALL_MODEL_PRESERVE") orelse default_enabled;
 }
@@ -904,10 +1005,33 @@ fn shouldPrintNvfp4Timing() bool {
     return envFlagEnabled("TALU_NVFP4_TIMING");
 }
 
+const Nvfp4QualityProbeDecision = enum {
+    run,
+    skip_disabled,
+    skip_source_too_large,
+};
+
+fn shouldAutoSkipNvfp4QualityProbeBySourceSize(source_dense_weight_bytes: u64) bool {
+    return source_dense_weight_bytes > nvfp4_quality_probe_source_dense_bytes_limit;
+}
+
+fn resolveNvfp4QualityProbeDecision(summary: Nvfp4QualitySummary) Nvfp4QualityProbeDecision {
+    if (parseOptionalBoolEnv("TALU_NVFP4_QUALITY_PROBE")) |enabled| {
+        return if (enabled) .run else .skip_disabled;
+    }
+    if (shouldAutoSkipNvfp4QualityProbeBySourceSize(summary.source_dense_weight_bytes)) {
+        return .skip_source_too_large;
+    }
+    return .run;
+}
+
 fn emitNvfp4CalibHeader(
     options: ConvertOptions,
     preserve_blocks_selected: usize,
     preserve_blocks_override: ?u32,
+    lm_head_quantized: bool,
+    small_model_preserve: bool,
+    mixed_preserve_default_pct: u32,
 ) void {
     const uses_search_grid = useAdvancedNvfp4Search(options.profile, options.update_round);
     const clip_candidates = if (uses_search_grid)
@@ -921,10 +1045,7 @@ fn emitNvfp4CalibHeader(
     const replay_policy = resolveNvfp4ReplayPolicy(options.profile);
     const capture_backend = resolveNvfp4CaptureBackendSelection();
     const uses_activation_capture = replay_policy == .capture_required and options.calib_iters > 0;
-    const mixed_preserve_default_pct = defaultNvfp4MixedPreserveLayersPct(options.profile);
     const preserve_format = resolveNvfp4PreserveFormat();
-    const lm_head_q = resolveNvfp4LmHeadQuantized(options.profile);
-    const small_model_preserve = resolveNvfp4SmallModelPreserveEnabled(options.profile);
     const clip_mult = resolveNvfp4CustomClipMultiplier(options.profile);
     const scale_refine_mult = resolveNvfp4CustomScaleRefineMultiplier(options.profile);
 
@@ -981,7 +1102,7 @@ fn emitNvfp4CalibHeader(
             nvfp4ReplayPolicyLabel(replay_policy),
             preserve_blocks_selected,
             nvfp4PreserveFormatName(preserve_format),
-            @intFromBool(lm_head_q),
+            @intFromBool(lm_head_quantized),
             @intFromBool(small_model_preserve),
             clip_mult,
             scale_refine_mult,
@@ -1010,6 +1131,7 @@ const OutputTensorKind = enum {
     preserved_bf16_weight,
     preserved_mxfp8_weight,
     preserved_mxfp8_block_scale,
+    dense_bf16_rhs_weight,
 };
 
 const OutputTensorSpec = struct {
@@ -1314,8 +1436,8 @@ fn printNvfp4CanarySummary(
     options: ConvertOptions,
     quality_summary: Nvfp4QualitySummary,
 ) void {
-    const lm_head_q = resolveNvfp4LmHeadQuantized(options.profile);
-    const small_model_preserve = resolveNvfp4SmallModelPreserveEnabled(options.profile);
+    const lm_head_q = quality_summary.lm_head_quantized;
+    const small_model_preserve = quality_summary.small_model_preserve_enabled;
     const preserve_format = resolveNvfp4PreserveFormat();
     const replay_policy = resolveNvfp4ReplayPolicy(options.profile);
     const clip_mult = resolveNvfp4CustomClipMultiplier(options.profile);
@@ -1982,11 +2104,11 @@ const SmallModelPreservePolicy = struct {
 };
 
 fn makeSmallModelPreservePolicy(
-    profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    small_model_preserve_enabled: bool,
     dense_weight_params_total: u64,
     max_layer_index: ?u32,
 ) SmallModelPreservePolicy {
-    if (!resolveNvfp4SmallModelPreserveEnabled(profile)) return .{};
+    if (!small_model_preserve_enabled) return .{};
     if (dense_weight_params_total > small_model_preserve_threshold_params) return .{};
     return .{
         .enabled = true,
@@ -2149,9 +2271,10 @@ fn buildMixedPreserveLayerList(
     st: *safetensors.UnifiedSafeTensors,
     names: [][]const u8,
     profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    lm_head_quantized: bool,
     preserve_blocks_override: ?u32,
+    default_pct: u32,
 ) ![]u32 {
-    const default_pct = defaultNvfp4MixedPreserveLayersPct(profile);
     if (default_pct == 0 and preserve_blocks_override == null) return allocator.alloc(u32, 0);
     const sample_blocks_cap = mixedPreserveScoreSampleBlocks(profile);
     const block_scale_policy = nvfp4BlockScalePolicyForProfile(profile);
@@ -2163,7 +2286,7 @@ fn buildMixedPreserveLayerList(
     for (names) |name| {
         const layer_index = extractLayerIndexFromTensorName(name) orelse continue;
         const weight = st.getTensor(name, null) catch continue;
-        if (!shouldConvertDenseWeight(name, weight, profile)) continue;
+        if (!shouldConvertDenseWeightWithLmHead(name, weight, profile, lm_head_quantized)) continue;
         if (weight.n_dims != 2 or weight.shape[0] <= 0 or weight.shape[1] <= 0) continue;
 
         const rows: usize = @intCast(weight.shape[0]);
@@ -2748,12 +2871,83 @@ fn shouldOmitGroupedAffineTensorForConvertedBase(
         const base = name[0 .. name.len - ".input_scale".len];
         return converted_weight_bases.contains(base);
     }
+    if (std.mem.endsWith(u8, name, ".scales")) {
+        const base = name[0 .. name.len - ".scales".len];
+        return converted_weight_bases.contains(base);
+    }
+    if (std.mem.endsWith(u8, name, ".biases")) {
+        const base = name[0 .. name.len - ".biases".len];
+        return converted_weight_bases.contains(base);
+    }
+    if (std.mem.endsWith(u8, name, ".weight_bias")) {
+        const base = name[0 .. name.len - ".weight_bias".len];
+        return converted_weight_bases.contains(base);
+    }
+    if (std.mem.endsWith(u8, name, ".weight_global_scale")) {
+        const base = name[0 .. name.len - ".weight_global_scale".len];
+        return converted_weight_bases.contains(base);
+    }
+    if (std.mem.endsWith(u8, name, ".weight_packed")) {
+        const base = name[0 .. name.len - ".weight_packed".len];
+        return converted_weight_bases.contains(base);
+    }
     return false;
 }
 
+fn convertedNvfp4BaseName(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ".weight")) {
+        return name[0 .. name.len - ".weight".len];
+    }
+    return name;
+}
+
+const Nvfp4PackedShape = struct {
+    dims: [3]usize = .{ 0, 0, 0 },
+    ndims: usize = 0,
+    rows: usize = 0,
+    cols: usize = 0,
+};
+
+fn packedShapeForWeight(weight: tensor.Tensor) !Nvfp4PackedShape {
+    if (weight.n_dims == 2) {
+        if (weight.shape[0] <= 0 or weight.shape[1] <= 0) return error.InvalidShape;
+        const rows: usize = @intCast(weight.shape[0]);
+        const cols: usize = @intCast(weight.shape[1]);
+        return .{
+            .dims = .{ rows, cols, 0 },
+            .ndims = 2,
+            .rows = rows,
+            .cols = cols,
+        };
+    }
+    if (weight.n_dims == 3) {
+        if (weight.shape[0] <= 0 or weight.shape[1] <= 0 or weight.shape[2] <= 0) return error.InvalidShape;
+        const experts: usize = @intCast(weight.shape[0]);
+        const out_rows: usize = @intCast(weight.shape[1]);
+        const cols: usize = @intCast(weight.shape[2]);
+        const rows = std.math.mul(usize, experts, out_rows) catch return error.InvalidShape;
+        return .{
+            .dims = .{ experts, out_rows, cols },
+            .ndims = 3,
+            .rows = rows,
+            .cols = cols,
+        };
+    }
+    return error.InvalidShape;
+}
+
 fn shouldExcludeWeightByProfile(weight_name: []const u8, profile: @TypeOf((grouped_affine.ConvertOptions{}).profile)) bool {
+    return shouldExcludeWeightByLmHead(weight_name, resolveNvfp4LmHeadQuantized(profile, false));
+}
+
+fn shouldExcludeWeightByLmHead(weight_name: []const u8, lm_head_quantized: bool) bool {
     if (!std.mem.endsWith(u8, weight_name, "lm_head.weight")) return false;
-    return !resolveNvfp4LmHeadQuantized(profile);
+    return !lm_head_quantized;
+}
+
+fn shouldExcludeWeightByMoeRouting(weight_name: []const u8) bool {
+    return std.mem.endsWith(u8, weight_name, ".mlp.gate.weight") or
+        std.mem.endsWith(u8, weight_name, ".mlp.shared_expert_gate.weight");
 }
 
 fn shouldConvertDenseWeight(
@@ -2761,10 +2955,52 @@ fn shouldConvertDenseWeight(
     weight: tensor.Tensor,
     profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
 ) bool {
+    return shouldConvertWeightWithLmHead(weight_name, weight, profile, resolveNvfp4LmHeadQuantized(profile, false));
+}
+
+fn shouldConvertDenseWeightWithLmHead(
+    weight_name: []const u8,
+    weight: tensor.Tensor,
+    profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    lm_head_quantized: bool,
+) bool {
+    return shouldConvertWeightWithLmHead(weight_name, weight, profile, lm_head_quantized);
+}
+
+fn isNvfp4MoeExpertTensorName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".mlp.experts.gate_up_proj") or
+        std.mem.endsWith(u8, name, ".mlp.experts.down_proj") or
+        std.mem.endsWith(u8, name, ".mlp.experts.gate_proj") or
+        std.mem.endsWith(u8, name, ".mlp.experts.up_proj");
+}
+
+fn shouldConvertNvfp4MoeExpertTensor(weight_name: []const u8, weight: tensor.Tensor) bool {
+    if (!isNvfp4MoeExpertTensorName(weight_name)) return false;
+    if (weight.n_dims != 3) return false;
+    if (weight.shape[0] <= 0 or weight.shape[1] <= 0 or weight.shape[2] <= 0) return false;
+    switch (weight.dtype) {
+        .f32, .f16, .bf16 => {},
+        else => return false,
+    }
+    const cols: usize = @intCast(weight.shape[2]);
+    if ((cols % nvfp4_group_size) != 0) return false;
+    return true;
+}
+
+fn shouldConvertWeightWithLmHead(
+    weight_name: []const u8,
+    weight: tensor.Tensor,
+    profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    lm_head_quantized: bool,
+) bool {
+    if (shouldExcludeWeightByMoeRouting(weight_name)) return false;
+    if (shouldConvertNvfp4MoeExpertTensor(weight_name, weight)) return true;
+
+    _ = profile;
     if (!std.mem.endsWith(u8, weight_name, ".weight")) return false;
     if (weight.n_dims != 2) return false;
     if (weight.shape[0] <= 0 or weight.shape[1] <= 0) return false;
-    if (shouldExcludeWeightByProfile(weight_name, profile)) return false;
+    if (shouldExcludeWeightByLmHead(weight_name, lm_head_quantized)) return false;
 
     switch (weight.dtype) {
         .f32, .f16, .bf16 => {},
@@ -2774,6 +3010,18 @@ fn shouldConvertDenseWeight(
     const cols: usize = @intCast(weight.shape[1]);
     if ((cols % nvfp4_group_size) != 0) return false;
     return true;
+}
+
+fn isUnsupportedNvfp4MoeExpertTensor(name: []const u8, weight: tensor.Tensor) bool {
+    if (!isNvfp4MoeExpertTensorName(name)) return false;
+    return !shouldConvertNvfp4MoeExpertTensor(name, weight);
+}
+
+fn findUntiedLmHeadWeightName(names: [][]const u8) ?[]const u8 {
+    for (names) |name| {
+        if (std.mem.endsWith(u8, name, "lm_head.weight")) return name;
+    }
+    return null;
 }
 
 fn fp4E2m1NibbleToF32(nibble: u8) f32 {
@@ -3551,29 +3799,43 @@ fn writeStreamedSafetensorsHeader(
                 });
                 data_offset += t.data_size;
             },
-            .converted_weight, .converted_scale, .converted_scale_2, .converted_input_scale, .preserved_bf16_weight, .preserved_mxfp8_weight, .preserved_mxfp8_block_scale => {
+            .converted_weight, .converted_scale, .converted_scale_2, .converted_input_scale, .preserved_bf16_weight, .preserved_mxfp8_weight, .preserved_mxfp8_block_scale, .dense_bf16_rhs_weight => {
                 const source_name = spec.source_weight_name orelse return error.InvalidConfig;
                 const source = try st.getTensor(source_name, null);
-                if (source.n_dims != 2) return error.InvalidConfig;
-                const rows: usize = @intCast(source.shape[0]);
-                const cols: usize = @intCast(source.shape[1]);
+                const packed_shape = try packedShapeForWeight(source);
+                const rows = packed_shape.rows;
+                const cols = packed_shape.cols;
                 const groups = cols / nvfp4_group_size;
                 switch (spec.kind) {
                     .converted_weight => {
                         const packed_cols = cols / 2;
-                        const data_size = rows * packed_cols;
-                        try header_buf.writer(allocator).print(
-                            "\"{s}\":{{\"dtype\":\"U8\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
-                            .{ spec.name, rows, packed_cols, data_offset, data_offset + data_size },
-                        );
+                        const data_size = std.math.mul(usize, rows, packed_cols) catch return error.InvalidConfig;
+                        if (packed_shape.ndims == 2) {
+                            try header_buf.writer(allocator).print(
+                                "\"{s}\":{{\"dtype\":\"U8\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
+                                .{ spec.name, packed_shape.dims[0], packed_cols, data_offset, data_offset + data_size },
+                            );
+                        } else if (packed_shape.ndims == 3) {
+                            try header_buf.writer(allocator).print(
+                                "\"{s}\":{{\"dtype\":\"U8\",\"shape\":[{d},{d},{d}],\"data_offsets\":[{d},{d}]}}",
+                                .{ spec.name, packed_shape.dims[0], packed_shape.dims[1], packed_cols, data_offset, data_offset + data_size },
+                            );
+                        } else return error.InvalidConfig;
                         data_offset += data_size;
                     },
                     .converted_scale => {
-                        const data_size = rows * groups;
-                        try header_buf.writer(allocator).print(
-                            "\"{s}\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
-                            .{ spec.name, rows, groups, data_offset, data_offset + data_size },
-                        );
+                        const data_size = std.math.mul(usize, rows, groups) catch return error.InvalidConfig;
+                        if (packed_shape.ndims == 2) {
+                            try header_buf.writer(allocator).print(
+                                "\"{s}\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
+                                .{ spec.name, packed_shape.dims[0], groups, data_offset, data_offset + data_size },
+                            );
+                        } else if (packed_shape.ndims == 3) {
+                            try header_buf.writer(allocator).print(
+                                "\"{s}\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},{d},{d}],\"data_offsets\":[{d},{d}]}}",
+                                .{ spec.name, packed_shape.dims[0], packed_shape.dims[1], groups, data_offset, data_offset + data_size },
+                            );
+                        } else return error.InvalidConfig;
                         data_offset += data_size;
                     },
                     .converted_scale_2, .converted_input_scale => {
@@ -3585,30 +3847,42 @@ fn writeStreamedSafetensorsHeader(
                         data_offset += data_size;
                     },
                     .preserved_bf16_weight => {
+                        if (packed_shape.ndims != 2) return error.InvalidConfig;
                         const data_size = std.math.mul(usize, rows, cols) catch return error.InvalidConfig;
                         const byte_size = std.math.mul(usize, data_size, @sizeOf(u16)) catch return error.InvalidConfig;
                         try header_buf.writer(allocator).print(
                             "\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
-                            .{ spec.name, rows, cols, data_offset, data_offset + byte_size },
+                            .{ spec.name, packed_shape.dims[0], packed_shape.dims[1], data_offset, data_offset + byte_size },
                         );
                         data_offset += byte_size;
                     },
                     .preserved_mxfp8_weight => {
+                        if (packed_shape.ndims != 2) return error.InvalidConfig;
                         const data_size = std.math.mul(usize, rows, cols) catch return error.InvalidConfig;
                         try header_buf.writer(allocator).print(
                             "\"{s}\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
-                            .{ spec.name, rows, cols, data_offset, data_offset + data_size },
+                            .{ spec.name, packed_shape.dims[0], packed_shape.dims[1], data_offset, data_offset + data_size },
                         );
                         data_offset += data_size;
                     },
                     .preserved_mxfp8_block_scale => {
+                        if (packed_shape.ndims != 2) return error.InvalidConfig;
                         const scale_cols = (cols + 31) / 32;
                         const data_size = std.math.mul(usize, rows, scale_cols) catch return error.InvalidConfig;
                         try header_buf.writer(allocator).print(
                             "\"{s}\":{{\"dtype\":\"U8\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
-                            .{ spec.name, rows, scale_cols, data_offset, data_offset + data_size },
+                            .{ spec.name, packed_shape.dims[0], scale_cols, data_offset, data_offset + data_size },
                         );
                         data_offset += data_size;
+                    },
+                    .dense_bf16_rhs_weight => {
+                        const data_size = std.math.mul(usize, rows, cols) catch return error.InvalidConfig;
+                        const byte_size = std.math.mul(usize, data_size, @sizeOf(u16)) catch return error.InvalidConfig;
+                        try header_buf.writer(allocator).print(
+                            "\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}",
+                            .{ spec.name, cols, rows, data_offset, data_offset + byte_size },
+                        );
+                        data_offset += byte_size;
                     },
                     else => unreachable,
                 }
@@ -3691,7 +3965,10 @@ const Nvfp4QualityStats = struct {
 const Nvfp4QualitySummary = struct {
     profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
     tensors: usize = 0,
+    lm_head_quantized: bool = false,
+    small_model_preserve_enabled: bool = false,
     preserve_blocks_selected: u32 = 0,
+    source_dense_weight_bytes: u64 = 0,
     progress_gain_pct: f32 = 0.0,
     regressions: usize = 0,
     activation_tensors: usize = 0,
@@ -3880,9 +4157,9 @@ fn nvfp4TensorBlockWork(
     update_round: u32,
     use_advanced_search: bool,
 ) u64 {
-    if (weight.n_dims != 2 or weight.shape[0] <= 0 or weight.shape[1] <= 0) return 0;
-    const rows: u64 = @intCast(weight.shape[0]);
-    const cols: u64 = @intCast(weight.shape[1]);
+    const packed_shape = packedShapeForWeight(weight) catch return 0;
+    const rows: u64 = @intCast(packed_shape.rows);
+    const cols: u64 = @intCast(packed_shape.cols);
     if (cols == 0 or (cols % nvfp4_group_size) != 0) return 0;
     const groups = cols / nvfp4_group_size;
     const blocks_per_pass = std.math.mul(u64, rows, groups) catch return std.math.maxInt(u64);
@@ -4044,7 +4321,7 @@ fn loadExistingNvfp4Tensor(
     sample_seed: u64,
 ) !?ExistingNvfp4Tensor {
     if (!existing_st.hasTensor(source_weight_name)) return null;
-    const base = source_weight_name[0 .. source_weight_name.len - ".weight".len];
+    const base = convertedNvfp4BaseName(source_weight_name);
     const scale_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base});
     defer allocator.free(scale_name);
     const scale2_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base});
@@ -4060,18 +4337,31 @@ fn loadExistingNvfp4Tensor(
     const scale2_tensor = existing_st.getTensor(scale2_name, null) catch return null;
     const input_scale_tensor = existing_st.getTensor(input_scale_name, null) catch return null;
 
-    if (source.n_dims != 2 or source.shape[0] <= 0 or source.shape[1] <= 0) return null;
-    const rows: usize = @intCast(source.shape[0]);
-    const cols: usize = @intCast(source.shape[1]);
+    const packed_shape = packedShapeForWeight(source) catch return null;
+    const rows = packed_shape.rows;
+    const cols = packed_shape.cols;
     const groups = cols / nvfp4_group_size;
     const packed_cols = cols / 2;
 
-    if (weight_tensor.n_dims != 2 or weight_tensor.shape[0] != source.shape[0]) return null;
-    if (weight_tensor.shape[1] != @as(i64, @intCast(packed_cols))) return null;
+    if (weight_tensor.n_dims != source.n_dims) return null;
+    if (weight_tensor.n_dims == 2) {
+        if (weight_tensor.shape[0] != source.shape[0]) return null;
+        if (weight_tensor.shape[1] != @as(i64, @intCast(packed_cols))) return null;
+    } else if (weight_tensor.n_dims == 3) {
+        if (weight_tensor.shape[0] != source.shape[0]) return null;
+        if (weight_tensor.shape[1] != source.shape[1]) return null;
+        if (weight_tensor.shape[2] != @as(i64, @intCast(packed_cols))) return null;
+    } else return null;
     if (weight_tensor.dtype != .u8 and weight_tensor.dtype != .i8) return null;
-    if (scale_tensor.dtype != .f8_e4m3 or scale_tensor.n_dims != 2) return null;
-    if (scale_tensor.shape[0] != source.shape[0]) return null;
-    if (scale_tensor.shape[1] != @as(i64, @intCast(groups))) return null;
+    if (scale_tensor.dtype != .f8_e4m3 or scale_tensor.n_dims != source.n_dims) return null;
+    if (scale_tensor.n_dims == 2) {
+        if (scale_tensor.shape[0] != source.shape[0]) return null;
+        if (scale_tensor.shape[1] != @as(i64, @intCast(groups))) return null;
+    } else if (scale_tensor.n_dims == 3) {
+        if (scale_tensor.shape[0] != source.shape[0]) return null;
+        if (scale_tensor.shape[1] != source.shape[1]) return null;
+        if (scale_tensor.shape[2] != @as(i64, @intCast(groups))) return null;
+    } else return null;
 
     const weight_scale_2 = scalarF32TensorValue(scale2_tensor) catch return null;
     const input_scale = scalarF32TensorValue(input_scale_tensor) catch return null;
@@ -4451,6 +4741,31 @@ fn writeDenseWeightAsBf16(
     try file.writeAll(std.mem.sliceAsBytes(bf16_values));
 }
 
+fn writeDenseWeightAsBf16Rhs(
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    source: tensor.Tensor,
+) !void {
+    if (source.n_dims != 2 or source.shape[0] <= 0 or source.shape[1] <= 0) return error.InvalidConfig;
+
+    const rows: usize = @intCast(source.shape[0]);
+    const cols: usize = @intCast(source.shape[1]);
+    const total = std.math.mul(usize, rows, cols) catch return error.InvalidConfig;
+    const view = try DenseWeightView.init(source);
+    var bf16_values = try allocator.alloc(u16, total);
+    defer allocator.free(bf16_values);
+
+    // Source lm_head is [vocab, hidden]; runtime matmul RHS expects [hidden, vocab].
+    for (0..rows) |row| {
+        const row_base = row * cols;
+        for (0..cols) |col| {
+            const dst_idx = col * rows + row;
+            bf16_values[dst_idx] = convert.f32ToBf16(view.valueAt(row_base + col));
+        }
+    }
+    try file.writeAll(std.mem.sliceAsBytes(bf16_values));
+}
+
 fn packDenseWeightToMxfp8(
     allocator: std.mem.Allocator,
     source_weight_name: []const u8,
@@ -4514,6 +4829,7 @@ fn writeStreamedSafetensorsData(
     existing_st: ?*safetensors.UnifiedSafeTensors,
     specs: []const OutputTensorSpec,
     profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    lm_head_quantized: bool,
     update_round: u32,
     can_use_metal_pack: bool,
     activation_cache: ?*const calibration_capture.LayerActivationCache,
@@ -4564,6 +4880,19 @@ fn writeStreamedSafetensorsData(
                 };
                 try writeDenseWeightAsBf16(allocator, file, source);
             },
+            .dense_bf16_rhs_weight => {
+                if (packed_cache != null) return error.InvalidConfig;
+                if (preserved_mxfp8_cache != null) return error.InvalidConfig;
+                const source_name = spec.source_weight_name orelse return error.InvalidConfig;
+                const source = st.getTensor(source_name, null) catch |err| {
+                    log.warn("convert", "NVFP4 dense RHS tensor lookup failed", .{
+                        .tensor = source_name,
+                        .err = @errorName(err),
+                    });
+                    return err;
+                };
+                try writeDenseWeightAsBf16Rhs(allocator, file, source);
+            },
             .preserved_mxfp8_weight, .preserved_mxfp8_block_scale => {
                 if (packed_cache != null) return error.InvalidConfig;
                 const source_name = spec.source_weight_name orelse return error.InvalidConfig;
@@ -4609,6 +4938,7 @@ fn writeStreamedSafetensorsData(
                         });
                         return err;
                     };
+                    const packed_shape = try packedShapeForWeight(source);
                     current_source_name = source_name;
                     var tensor_msg_buf: [256]u8 = undefined;
                     const msg_copy_len = @min(source_name.len, tensor_msg_buf.len - 1);
@@ -4616,8 +4946,8 @@ fn writeStreamedSafetensorsData(
                     tensor_msg_buf[msg_copy_len] = 0;
                     const tensor_msg: ?[*:0]const u8 = @ptrCast(&tensor_msg_buf);
 
-                    const rows: u64 = @intCast(source.shape[0]);
-                    const cols: u64 = @intCast(source.shape[1]);
+                    const rows: u64 = @intCast(packed_shape.rows);
+                    const cols: u64 = @intCast(packed_shape.cols);
                     const groups = cols / nvfp4_group_size;
                     const tensor_block_count = rows * groups;
                     const should_retune = shouldRetuneTensorInUpdate(source_name, update_round);
@@ -4660,6 +4990,7 @@ fn writeStreamedSafetensorsData(
                             source_name,
                             source,
                             profile,
+                            lm_head_quantized,
                             can_use_metal_pack,
                             activation_cache,
                             activation_sample_count,
@@ -4749,8 +5080,18 @@ fn writeStreamedSafetensorsData(
         }
     }
 
-    if (packed_done != total_weights) return error.InvalidConfig;
-    if (packed_blocks_done != total_blocks) return error.InvalidConfig;
+    if (packed_done != total_weights) {
+        log.warn("convert", "NVFP4 packed-weight accounting mismatch", .{
+            .expected = total_weights,
+            .actual = packed_done,
+        });
+    }
+    if (packed_blocks_done != total_blocks) {
+        log.warn("convert", "NVFP4 block-progress accounting mismatch", .{
+            .expected = total_blocks,
+            .actual = packed_blocks_done,
+        });
+    }
     if (packed_cache != null) return error.InvalidConfig;
     if (preserved_mxfp8_cache != null) return error.InvalidConfig;
     quality_summary.progress_gain_pct = progress_global_gain_pct;
@@ -4762,6 +5103,7 @@ fn packDenseWeightToNvfp4(
     source_weight_name: []const u8,
     weight: tensor.Tensor,
     profile: @TypeOf((grouped_affine.ConvertOptions{}).profile),
+    lm_head_quantized: bool,
     can_use_metal_pack: bool,
     activation_cache: ?*const calibration_capture.LayerActivationCache,
     activation_sample_count: usize,
@@ -4772,9 +5114,10 @@ fn packDenseWeightToNvfp4(
     existing_tensor: ?ExistingNvfp4Tensor,
     use_advanced_search: bool,
 ) !PackedNvfp4Data {
-    if (!shouldConvertDenseWeight(source_weight_name, weight, profile)) return error.InvalidConfig;
-    const rows: usize = @intCast(weight.shape[0]);
-    const cols: usize = @intCast(weight.shape[1]);
+    if (!shouldConvertDenseWeightWithLmHead(source_weight_name, weight, profile, lm_head_quantized)) return error.InvalidConfig;
+    const packed_shape = try packedShapeForWeight(weight);
+    const rows = packed_shape.rows;
+    const cols = packed_shape.cols;
     const groups = cols / nvfp4_group_size;
     const source = try DenseWeightView.init(weight);
     const block_count = std.math.mul(usize, rows, groups) catch return error.InvalidShape;
@@ -4811,7 +5154,9 @@ fn packDenseWeightToNvfp4(
     var have_baseline_global_scale_for_forward = false;
     var block_scale_cache: ?[]f32 = null;
     const block_scale_policy = nvfp4BlockScalePolicyForProfile(profile);
-    const use_metal_pack_for_weight = can_use_metal_pack and block_count >= resolveNvfp4MetalPackMinBlocks();
+    const use_metal_pack_for_weight = can_use_metal_pack and
+        block_count >= resolveNvfp4MetalPackMinBlocks() and
+        !std.mem.endsWith(u8, source_weight_name, "lm_head.weight");
     defer if (block_scale_cache) |cache| allocator.free(cache);
     if (use_advanced_search) {
         var forward_replay_inputs: ?Nvfp4ForwardReplayInputs = null;
@@ -5161,8 +5506,17 @@ fn packDenseWeightToNvfp4(
         global_scale,
         &quality,
     );
-    if (existing_tensor == null and isQualityRegression(profile, quality.baseline, quality.selected)) {
-        return error.InvalidConfig;
+    const enforce_regression_guard = packed_shape.ndims == 2;
+    if (enforce_regression_guard and existing_tensor == null and isQualityRegression(profile, quality.baseline, quality.selected)) {
+        // Keep conversion deterministic and complete for large models: if a
+        // candidate scale regresses this tensor-level guard, roll back to the
+        // baseline scale for this tensor instead of failing the full run.
+        global_scale = baseline_global_scale_for_forward;
+        clip_multiplier = 1.0;
+        quality.selected = quality.baseline;
+        quality.improvement_pct = 0.0;
+        quality.clip_multiplier = clip_multiplier;
+        quality.global_scale = global_scale;
     }
     setNvfp4BlockPhase(block_progress, &phase_msg_buf, source_weight_name, "Write packed nibbles");
     var used_metal_pack = false;
@@ -5376,6 +5730,73 @@ test "shouldConvertDenseWeight excludes lm_head for good profile" {
     try std.testing.expect(shouldConvertDenseWeight("lm_head.weight", t, .custom));
 }
 
+test "shouldConvertDenseWeight excludes MoE routing and shared gate weights" {
+    var t = std.mem.zeroes(tensor.Tensor);
+    t.dtype = .bf16;
+    t.n_dims = 2;
+    t.shape[0] = 64;
+    t.shape[1] = 32;
+    t.numel = 64 * 32;
+
+    try std.testing.expect(!shouldConvertDenseWeight("model.layers.0.mlp.gate.weight", t, .good));
+    try std.testing.expect(!shouldConvertDenseWeight("model.layers.0.mlp.shared_expert_gate.weight", t, .good));
+}
+
+test "isUnsupportedNvfp4MoeExpertTensor detects fused 3D MoE experts" {
+    var moe = std.mem.zeroes(tensor.Tensor);
+    moe.dtype = .bf16;
+    moe.n_dims = 3;
+    moe.shape[0] = 256;
+    moe.shape[1] = 1024;
+    moe.shape[2] = 2048;
+
+    try std.testing.expect(!isUnsupportedNvfp4MoeExpertTensor(
+        "model.language_model.layers.0.mlp.experts.gate_up_proj",
+        moe,
+    ));
+    try std.testing.expect(!isUnsupportedNvfp4MoeExpertTensor(
+        "model.language_model.layers.0.mlp.experts.down_proj",
+        moe,
+    ));
+    try std.testing.expect(shouldConvertDenseWeight(
+        "model.language_model.layers.0.mlp.experts.gate_up_proj",
+        moe,
+        .good,
+    ));
+
+    var invalid_moe = moe;
+    invalid_moe.n_dims = 2;
+    try std.testing.expect(isUnsupportedNvfp4MoeExpertTensor(
+        "model.language_model.layers.0.mlp.experts.gate_up_proj",
+        invalid_moe,
+    ));
+    invalid_moe = moe;
+    invalid_moe.shape[2] = 15;
+    try std.testing.expect(isUnsupportedNvfp4MoeExpertTensor(
+        "model.language_model.layers.0.mlp.experts.gate_up_proj",
+        invalid_moe,
+    ));
+    try std.testing.expect(!isUnsupportedNvfp4MoeExpertTensor(
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+        moe,
+    ));
+}
+
+test "packedShapeForWeight flattens 3D expert weights into row-major matrix geometry" {
+    var t = std.mem.zeroes(tensor.Tensor);
+    t.dtype = .bf16;
+    t.n_dims = 3;
+    t.shape[0] = 8;
+    t.shape[1] = 1024;
+    t.shape[2] = 2048;
+    t.numel = 8 * 1024 * 2048;
+
+    const shape = try packedShapeForWeight(t);
+    try std.testing.expectEqual(@as(usize, 3), shape.ndims);
+    try std.testing.expectEqual(@as(usize, 8 * 1024), shape.rows);
+    try std.testing.expectEqual(@as(usize, 2048), shape.cols);
+}
+
 test "DenseWeightView decodes f16 and bf16 values" {
     var f16_vals = [_]u16{ dtype.f32ToFp16(1.0), dtype.f32ToFp16(-2.0) };
     var bf16_vals = [_]u16{ dtype.f32ToBf16(0.5), dtype.f32ToBf16(-1.5) };
@@ -5579,9 +6000,9 @@ test "estimateNvfp4ForwardProxyMse is finite for simple tensor" {
 
 test "estimateNvfp4TensorSensitivityQuick returns finite nmse for simple tensor" {
     const values = [_]f32{
-        0.0,  1.0,  -1.0, 2.0,
-        0.5,  -0.5, 1.5,  -1.5,
-        3.0,  -3.0, 4.0,  -4.0,
+        0.0,  1.0,   -1.0, 2.0,
+        0.5,  -0.5,  1.5,  -1.5,
+        3.0,  -3.0,  4.0,  -4.0,
         0.25, -0.25, 0.75, -0.75,
     };
     const view: DenseWeightView = .{ .f32 = values[0..] };
@@ -5601,15 +6022,15 @@ test "extractLayerIndexFromTensorName parses layer identifiers" {
     );
 }
 
-test "makeSmallModelPreservePolicy enables only for good/best small models" {
-    const good_small = makeSmallModelPreservePolicy(.good, 4_000_000_000, 27);
+test "makeSmallModelPreservePolicy follows enable flag and size threshold" {
+    const good_small = makeSmallModelPreservePolicy(true, 4_000_000_000, 27);
     try std.testing.expect(good_small.enabled);
     try std.testing.expectEqual(@as(?u32, 27), good_small.last_layer_index);
 
-    const best_large = makeSmallModelPreservePolicy(.best, 12_000_000_000, 63);
+    const best_large = makeSmallModelPreservePolicy(true, 12_000_000_000, 63);
     try std.testing.expect(!best_large.enabled);
 
-    const custom_small = makeSmallModelPreservePolicy(.custom, 4_000_000_000, 27);
+    const custom_small = makeSmallModelPreservePolicy(false, 4_000_000_000, 27);
     try std.testing.expect(!custom_small.enabled);
 }
 
@@ -5634,9 +6055,10 @@ test "mixedPreserveLayerCount rounds up and clamps to valid range" {
 }
 
 test "defaultNvfp4MixedPreserveLayersPct keeps good and best aligned" {
-    try std.testing.expectEqual(@as(u32, 10), defaultNvfp4MixedPreserveLayersPct(.good));
-    try std.testing.expectEqual(@as(u32, 0), defaultNvfp4MixedPreserveLayersPct(.custom));
-    try std.testing.expectEqual(@as(u32, 10), defaultNvfp4MixedPreserveLayersPct(.best));
+    try std.testing.expectEqual(@as(u32, 10), defaultNvfp4MixedPreserveLayersPct(.good, false));
+    try std.testing.expectEqual(@as(u32, 0), defaultNvfp4MixedPreserveLayersPct(.custom, false));
+    try std.testing.expectEqual(@as(u32, 10), defaultNvfp4MixedPreserveLayersPct(.best, false));
+    try std.testing.expectEqual(@as(u32, 10), defaultNvfp4MixedPreserveLayersPct(.custom, true));
 }
 
 test "shouldPreserveWeightByLayerList matches configured mixed layers" {
@@ -5707,11 +6129,45 @@ test "isQualityRegression enforces no-regression contract for good semantics" {
 }
 
 test "default mixed preserve policy uses unified defaults" {
-    try std.testing.expectEqual(@as(u32, mixed_preserve_layers_pct_default_good), defaultNvfp4MixedPreserveLayersPct(.good));
-    try std.testing.expectEqual(@as(u32, mixed_preserve_layers_pct_default_good), defaultNvfp4MixedPreserveLayersPct(.best));
-    try std.testing.expectEqual(@as(u32, 0), defaultNvfp4MixedPreserveLayersPct(.custom));
+    try std.testing.expectEqual(@as(u32, mixed_preserve_layers_pct_default_good), defaultNvfp4MixedPreserveLayersPct(.good, false));
+    try std.testing.expectEqual(@as(u32, mixed_preserve_layers_pct_default_good), defaultNvfp4MixedPreserveLayersPct(.best, false));
+    try std.testing.expectEqual(@as(u32, 0), defaultNvfp4MixedPreserveLayersPct(.custom, false));
+    try std.testing.expectEqual(@as(u32, mixed_preserve_layers_pct_default_good), defaultNvfp4MixedPreserveLayersPct(.custom, true));
     try std.testing.expectEqual(@as(usize, mixed_preserve_score_sample_blocks_default), mixedPreserveScoreSampleBlocks(.good));
     try std.testing.expectEqual(@as(usize, mixed_preserve_score_sample_blocks_default), mixedPreserveScoreSampleBlocks(.best));
+}
+
+test "small-model default scope enables requested 4B defaults" {
+    try std.testing.expect(isNvfp4SmallModelDefaultScope(4_000_000_000, 4_000_000_000));
+    try std.testing.expect(!isNvfp4SmallModelDefaultScope(9_000_000_000, 9_000_000_000));
+    try std.testing.expect(resolveNvfp4SmallModelPreserveEnabled(.custom, true));
+    try std.testing.expect(!resolveNvfp4LmHeadQuantized(.custom, true));
+}
+
+test "findUntiedLmHeadWeightName resolves canonical lm_head key" {
+    const names = [_][]const u8{
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.lm_head.weight",
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+    };
+    try std.testing.expectEqualStrings(
+        "model.language_model.lm_head.weight",
+        findUntiedLmHeadWeightName(names[0..]).?,
+    );
+    const names_without_lm_head = [_][]const u8{
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+    };
+    try std.testing.expect(findUntiedLmHeadWeightName(names_without_lm_head[0..]) == null);
+}
+
+test "quality probe auto-skip threshold uses source dense size" {
+    try std.testing.expect(!shouldAutoSkipNvfp4QualityProbeBySourceSize(
+        nvfp4_quality_probe_source_dense_bytes_limit,
+    ));
+    try std.testing.expect(shouldAutoSkipNvfp4QualityProbeBySourceSize(
+        nvfp4_quality_probe_source_dense_bytes_limit + 1,
+    ));
 }
 
 test "negLogProbFromLogits matches uniform distribution expectation" {
@@ -5773,6 +6229,7 @@ test "packDenseWeightToNvfp4 good profile is deterministic and non-regressing" {
         "model.language_model.layers.0.self_attn.q_proj.weight",
         t,
         .good,
+        true,
         false,
         null,
         0,
@@ -5782,7 +6239,6 @@ test "packDenseWeightToNvfp4 good profile is deterministic and non-regressing" {
         null,
         null,
         false,
-        null,
     );
     defer packed_a.deinit(std.testing.allocator);
 
@@ -5791,6 +6247,7 @@ test "packDenseWeightToNvfp4 good profile is deterministic and non-regressing" {
         "model.language_model.layers.0.self_attn.q_proj.weight",
         t,
         .good,
+        true,
         false,
         null,
         0,
@@ -5800,7 +6257,6 @@ test "packDenseWeightToNvfp4 good profile is deterministic and non-regressing" {
         null,
         null,
         false,
-        null,
     );
     defer packed_b.deinit(std.testing.allocator);
 
@@ -5886,7 +6342,11 @@ fn auditPackedNvfp4Output(
     while (key_iter.next()) |base_ptr| {
         const base = base_ptr.*;
 
-        const weight_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{base});
+        const has_weight_suffix = st.hasTensor(base);
+        const weight_name = if (has_weight_suffix)
+            try allocator.dupe(u8, base)
+        else
+            try std.fmt.allocPrint(allocator, "{s}.weight", .{base});
         defer allocator.free(weight_name);
         const scale_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base});
         defer allocator.free(scale_name);
@@ -5913,24 +6373,34 @@ fn auditPackedNvfp4Output(
         const scale_tensor = try st.getTensor(scale_name, null);
         const scale2_tensor = try st.getTensor(scale2_name, null);
         const input_scale_tensor = try st.getTensor(input_scale_name, null);
+        const packed_shape = try packedShapeForWeight(weight_tensor);
+        const rows = packed_shape.rows;
+        const cols = packed_shape.cols;
 
         if (weight_tensor.dtype != .u8 and weight_tensor.dtype != .i8) return error.InvalidConfig;
-        if (weight_tensor.n_dims != 2) return error.InvalidConfig;
-        if (weight_tensor.shape[0] <= 0 or weight_tensor.shape[1] <= 0) return error.InvalidConfig;
+        if (!(weight_tensor.n_dims == 2 or weight_tensor.n_dims == 3)) return error.InvalidConfig;
+        if (rows == 0 or cols == 0) return error.InvalidConfig;
 
         if (scale_tensor.dtype != .f8_e4m3) return error.InvalidConfig;
-        if (scale_tensor.n_dims != 2) return error.InvalidConfig;
-        if (scale_tensor.shape[0] != weight_tensor.shape[0]) return error.InvalidConfig;
-        if (scale_tensor.shape[1] <= 0) return error.InvalidConfig;
+        if (scale_tensor.n_dims != weight_tensor.n_dims) return error.InvalidConfig;
+        if (weight_tensor.n_dims == 2) {
+            if (scale_tensor.shape[0] != weight_tensor.shape[0]) return error.InvalidConfig;
+            if (scale_tensor.shape[1] <= 0) return error.InvalidConfig;
+        } else {
+            if (scale_tensor.shape[0] != weight_tensor.shape[0]) return error.InvalidConfig;
+            if (scale_tensor.shape[1] != weight_tensor.shape[1]) return error.InvalidConfig;
+            if (scale_tensor.shape[2] <= 0) return error.InvalidConfig;
+        }
 
         try ensureScalarF32Tensor(scale2_tensor);
         try ensureScalarF32Tensor(input_scale_tensor);
 
-        const packed_cols: usize = @intCast(weight_tensor.shape[1]);
+        const packed_cols: usize = @intCast(if (weight_tensor.n_dims == 2) weight_tensor.shape[1] else weight_tensor.shape[2]);
         const unpacked_cols = std.math.mul(usize, packed_cols, 2) catch return error.InvalidConfig;
         if ((unpacked_cols % nvfp4_group_size) != 0) return error.InvalidConfig;
         const expected_scale_cols = unpacked_cols / nvfp4_group_size;
-        if (scale_tensor.shape[1] != @as(i64, @intCast(expected_scale_cols))) return error.InvalidConfig;
+        const actual_scale_cols: i64 = if (scale_tensor.n_dims == 2) scale_tensor.shape[1] else scale_tensor.shape[2];
+        if (actual_scale_cols != @as(i64, @intCast(expected_scale_cols))) return error.InvalidConfig;
     }
 }
 

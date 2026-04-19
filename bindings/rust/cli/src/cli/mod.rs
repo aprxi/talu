@@ -364,7 +364,7 @@ pub(super) struct ConvertArgs {
     pub model: Option<String>,
 
     /// Quantization scheme (use --scheme help to list available)
-    #[arg(long, default_value = "tq4", value_name = "SCHEME", num_args = 1)]
+    #[arg(long, default_value = "nvfp4", value_name = "SCHEME", num_args = 1)]
     pub scheme: String,
 
     /// Deterministic seed for conversion calibration/search
@@ -1180,6 +1180,19 @@ mod tests {
                 assert_eq!(args.seed, 42);
                 assert!(args.opts.is_empty());
                 assert!(args.profile_overrides.is_empty());
+            }
+            _ => panic!("expected convert command"),
+        }
+    }
+
+    #[test]
+    fn parse_convert_default_scheme_is_nvfp4() {
+        let cli = parse(&["talu", "convert", "Qwen/Qwen3.5-2B"]).expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Convert(args)) => {
+                assert_eq!(args.scheme, "nvfp4");
+                assert_eq!(args.seed, 42);
             }
             _ => panic!("expected convert command"),
         }
