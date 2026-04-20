@@ -11,13 +11,13 @@ const tensor = @import("tensor_pkg");
 const dtype = @import("dtype_pkg");
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
-const attention_mod = @import("attention.zig");
-const cpu_kernels = @import("../cpu/kernels/root.zig");
+const attention_mod = @import("../attention_path.zig");
+const cpu_kernels = @import("../../cpu/kernels/root.zig");
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("engine_types.zig");
+const engine_types = @import("../runtime/_types_impl.zig");
 const LayerAttentionExecConfig = engine_types.LayerAttentionExecConfig;
 const LayerAttentionRuntime = engine_types.LayerAttentionRuntime;
 const LinearWeight = engine_types.LinearWeight;
@@ -455,13 +455,13 @@ fn applyValueNormInPlace(
 const Tensor = tensor.Tensor;
 
 // --- Compute ops from engine_ops.zig ---
-const engine_ops = @import("engine_ops.zig");
+const engine_ops = @import("../operators/_ops_impl.zig");
 
 // --- Forward pass from engine_forward.zig ---
-const engine_forward = @import("engine_forward.zig");
+const engine_forward = @import("../exec/_forward_impl.zig");
 
 // --- Utilities from engine_weights.zig ---
-const engine_weights = @import("engine_weights.zig");
+const engine_weights = @import("../weights/_weights_impl.zig");
 const bufferSlice = engine_weights.bufferSlice;
 const resizeScratchBuffer = engine_weights.resizeScratchBuffer;
 

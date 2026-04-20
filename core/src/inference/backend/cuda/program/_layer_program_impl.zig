@@ -19,14 +19,14 @@ const op_types = models.op_types;
 const opcode_map = models.plan.opcode_map;
 const rope_scaling = models.rope_scaling;
 const runtime_contract = @import("runtime_contract_pkg");
-const attention_mod = @import("attention.zig");
-const smoke_checks = @import("smoke_checks.zig");
-const cpu_kernels = @import("../cpu/kernels/root.zig");
+const attention_mod = @import("../attention_path.zig");
+const smoke_checks = @import("../selftest.zig");
+const cpu_kernels = @import("../../cpu/kernels/root.zig");
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
 
 // --- Types from engine.zig (mutual import) ---
-const engine = @import("engine.zig");
+const engine = @import("../engine.zig");
 const CudaBackend = engine.CudaBackend;
 const LayerProgramExecutionContext = CudaBackend.LayerProgramExecutionContext;
 const BuiltLayerProgramHandles = CudaBackend.BuiltLayerProgramHandles;
@@ -39,7 +39,7 @@ const layerProgramExecutionState = CudaBackend.layerProgramExecutionState;
 const layer_program_adapter_capabilities = CudaBackend.layer_program_adapter_capabilities;
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("engine_types.zig");
+const engine_types = @import("../runtime/_types_impl.zig");
 const DeviceTensor = engine_types.DeviceTensor;
 const LinearWeight = engine_types.LinearWeight;
 const BlockRuntimeLayer = engine_types.BlockRuntimeLayer;
@@ -74,13 +74,13 @@ const AttentionPath = engine_types.AttentionPath;
 const gqa_prefill_f16_dynamic_smem_bytes: u32 = 65536;
 
 // --- Compute ops from engine_ops.zig ---
-const engine_ops = @import("engine_ops.zig");
+const engine_ops = @import("../operators/_ops_impl.zig");
 
 // --- Mixer functions from engine_mixers.zig ---
-const engine_mixers = @import("engine_mixers.zig");
+const engine_mixers = @import("../operators/_mixers_impl.zig");
 
 // --- Utilities from engine_weights.zig ---
-const engine_weights = @import("engine_weights.zig");
+const engine_weights = @import("../weights/_weights_impl.zig");
 const bufferSlice = engine_weights.bufferSlice;
 
 const ResolvedAttentionShape = struct {

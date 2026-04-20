@@ -11,7 +11,7 @@ const dtype = @import("dtype_pkg");
 const log = @import("log_pkg");
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("engine_types.zig");
+const engine_types = @import("../runtime/_types_impl.zig");
 const BlockRuntimeLayer = engine_types.BlockRuntimeLayer;
 const LayerAttentionRuntime = engine_types.LayerAttentionRuntime;
 const LinearWeight = engine_types.LinearWeight;
@@ -27,7 +27,7 @@ const models = @import("models_pkg");
 const layer_ops = models.layer_ops;
 
 // --- Utility functions from engine_weights.zig ---
-const engine_weights = @import("engine_weights.zig");
+const engine_weights = @import("../weights/_weights_impl.zig");
 const bufferSlice = engine_weights.bufferSlice;
 
 fn recordNvfp4Route(self: anytype, comptime kind: Nvfp4RouteKind) void {

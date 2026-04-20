@@ -3,7 +3,7 @@
 //! Vision preprocessing is shared host-side runtime logic and is reused by
 //! CUDA backend for multimodal prefill.
 
-const cpu_vision = @import("../../cpu/vision/root.zig");
+const cpu_vision = @import("../cpu/vision/root.zig");
 const std = @import("std");
 
 pub const PrefillVisionImage = cpu_vision.PrefillVisionImage;

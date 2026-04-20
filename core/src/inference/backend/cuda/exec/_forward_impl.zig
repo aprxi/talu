@@ -9,10 +9,10 @@ const compute = @import("compute_pkg");
 const tensor = @import("tensor_pkg");
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
-const staged_orchestrator = @import("../staged_orchestrator.zig");
+const staged_orchestrator = @import("../../staged_orchestrator.zig");
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("engine_types.zig");
+const engine_types = @import("../runtime/_types_impl.zig");
 const BatchDecodeInfo = engine_types.BatchDecodeInfo;
 const KvCacheDtype = engine_types.KvCacheDtype;
 const enable_dispatch_observability = engine_types.enable_dispatch_observability;
@@ -20,10 +20,10 @@ const enable_device_embedding_lookup = engine_types.enable_device_embedding_look
 const AttentionKernelSet = engine_types.AttentionKernelSet;
 
 // --- Compute ops from engine_ops.zig ---
-const engine_ops = @import("engine_ops.zig");
+const engine_ops = @import("../operators/_ops_impl.zig");
 
 // --- Utilities from engine_weights.zig ---
-const engine_weights = @import("engine_weights.zig");
+const engine_weights = @import("../weights/_weights_impl.zig");
 const bufferSlice = engine_weights.bufferSlice;
 const populatePrefillHiddenFromTokens = engine_weights.populatePrefillHiddenFromTokens;
 const tryPopulateHiddenFromToken = engine_weights.tryPopulateHiddenFromToken;

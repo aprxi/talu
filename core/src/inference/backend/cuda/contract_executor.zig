@@ -4,7 +4,7 @@
 //! lives in `engine.zig`.
 
 const topology = @import("models_pkg").op_types;
-const kernels = @import("../kernels/root.zig");
+const kernels = @import("contract_kernels.zig");
 const std = @import("std");
 
 pub const weights = struct {

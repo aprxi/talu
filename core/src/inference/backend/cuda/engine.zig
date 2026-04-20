@@ -22,9 +22,9 @@ const trace = @import("xray_pkg").trace;
 const load_transforms = @import("models_pkg").load.transforms;
 const vision_types = @import("../../vision_types.zig");
 const common_mrope = @import("../../vision_mrope.zig");
-const smoke_checks = @import("smoke_checks.zig");
+const smoke_checks = @import("selftest.zig");
 const attention_policy = @import("attention_policy.zig");
-const attention_mod = @import("attention.zig");
+const attention_mod = @import("attention_path.zig");
 const decode_mod = @import("decode.zig");
 const prefill_mod = @import("prefill.zig");
 const cpu_backend = @import("../cpu/root.zig");
@@ -33,7 +33,7 @@ const cpu_stage = @import("../cpu/stage.zig");
 const shared_scheduler = @import("../cpu/scheduler.zig");
 const progress_mod = @import("progress_pkg");
 const sampling_mod = @import("sampling.zig");
-const vision_runtime_mod = @import("vision/root.zig");
+const vision_runtime_mod = @import("vision.zig");
 const cpu_kernels = @import("../cpu/kernels/root.zig");
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
@@ -44,7 +44,7 @@ const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 
 // --- Re-exported types from engine_types.zig ---
-const engine_types = @import("engine_types.zig");
+const engine_types = @import("runtime/_types_impl.zig");
 const prototype_eps = engine_types.prototype_eps;
 const initial_kv_cache_tokens = engine_types.initial_kv_cache_tokens;
 const KvCacheDtype = engine_types.KvCacheDtype;
@@ -121,16 +121,16 @@ const buildCudaLayerProgramSlotWidthHints = engine_types.buildCudaLayerProgramSl
 const validateCompiledLayerPlanForCuda = engine_types.validateCompiledLayerPlanForCuda;
 
 // --- Compute ops from engine_ops.zig ---
-const engine_ops = @import("engine_ops.zig");
+const engine_ops = @import("operators/_ops_impl.zig");
 
 // --- Mixer functions from engine_mixers.zig ---
-const engine_mixers = @import("engine_mixers.zig");
+const engine_mixers = @import("operators/_mixers_impl.zig");
 
 // --- Forward pass from engine_forward.zig ---
-const engine_forward = @import("engine_forward.zig");
+const engine_forward = @import("exec/_forward_impl.zig");
 
 // --- Layer program from engine_layer_program.zig ---
-const engine_layer_program = @import("engine_layer_program.zig");
+const engine_layer_program = @import("program/_layer_program_impl.zig");
 
 pub const CudaBackend = struct {
     pub const capabilities: contract.Capabilities = .{
@@ -5070,7 +5070,7 @@ pub const CudaBackend = struct {
 };
 
 // --- Free functions from engine_weights.zig ---
-const engine_weights = @import("engine_weights.zig");
+const engine_weights = @import("weights/_weights_impl.zig");
 const argmaxHost = engine_weights.argmaxHost;
 const argminHost = engine_weights.argminHost;
 const bytesToMiB = engine_weights.bytesToMiB;
