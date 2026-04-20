@@ -23,6 +23,7 @@ const COVERED_CREATE_RESPONSE_FIELDS: &[&str] = &[
     "reasoning",
     "safety_identifier",
     "service_tier",
+    "store",
     "stream",
     "stream_options",
     "temperature",
@@ -357,6 +358,19 @@ fn contract_cases() -> Vec<Case> {
             extra: serde_json::json!({ "service_tier": "standard" }),
             expect: Expectation::StatusContains(400, "must be one of"),
         },
+        // store
+        Case {
+            name: "store_valid_true_ignored",
+            field: "store",
+            extra: serde_json::json!({ "store": true }),
+            expect: Expectation::NotStatus(400),
+        },
+        Case {
+            name: "store_invalid_type",
+            field: "store",
+            extra: serde_json::json!({ "store": "true" }),
+            expect: Expectation::Status(400),
+        },
         // stream
         Case {
             name: "stream_valid_bool",
@@ -671,6 +685,7 @@ fn responses_openapi_contract_case_shapes_match_create_response_schema() {
         "reasoning_invalid_effort_enum",
         "safety_identifier_invalid_too_long",
         "service_tier_invalid_enum",
+        "store_invalid_type",
         "stream_invalid_type",
         "stream_options_invalid_include_obfuscation_type",
         "text_invalid_json_object_not_in_request_schema",
@@ -701,6 +716,7 @@ fn responses_openapi_contract_case_shapes_match_create_response_schema() {
         "reasoning_valid_effort_unimplemented",
         "safety_identifier_valid",
         "service_tier_valid_priority_unimplemented",
+        "store_valid_true_ignored",
         "stream_valid_bool",
         "stream_options_valid_include_obfuscation_unimplemented",
         "stream_options_invalid_unknown_key",

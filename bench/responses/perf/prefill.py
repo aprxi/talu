@@ -97,7 +97,7 @@ def _make_run(target: int, filler: str, concurrency: int):
                     "input": filler,
                     "instructions": "ok",
                     "stream": config.get("streaming", True),
-                    "store": True,
+                    "store": False,
                     "max_output_tokens": _MAX_OUT,
                 }
                 for cfg_key, api_key in _API_FIELDS.items():

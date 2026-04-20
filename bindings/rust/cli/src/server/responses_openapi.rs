@@ -723,6 +723,7 @@ fn install_request_schemas(schemas: &mut Map<String, Value>) {
                 "reasoning": nullable(json!({ "$ref": "#/components/schemas/ReasoningConfig" })),
                 "safety_identifier": nullable(json!({ "type": "string", "maxLength": 64 })),
                 "service_tier": nullable(json!({ "type": "string", "enum": ["auto", "default", "flex", "priority"] })),
+                "store": json!({ "type": "boolean" }),
                 "stream": nullable(json!({ "type": "boolean" })),
                 "stream_options": nullable(json!({
                     "type": "object",

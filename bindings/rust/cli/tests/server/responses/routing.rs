@@ -513,7 +513,7 @@ fn responses_allows_previous_response_id_chaining_in_process() {
 }
 
 #[test]
-fn responses_store_field_is_output_only_when_model_is_available() {
+fn responses_accepts_store_true_but_reports_not_stored_when_model_is_available() {
     let model = require_model!();
     let mut cfg = model_config();
     cfg.model = Some(model.clone());
@@ -521,6 +521,7 @@ fn responses_store_field_is_output_only_when_model_is_available() {
     let body = serde_json::json!({
         "model": model,
         "input": "hello",
+        "store": true,
         "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);

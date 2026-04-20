@@ -28,6 +28,7 @@ pub struct CreateResponseBody {
     pub safety_identifier: Option<String>,
     pub seed: Option<u64>,
     pub service_tier: Option<String>,
+    pub store: Option<bool>,
     pub stream: Option<bool>,
     pub stream_options: Option<serde_json::Value>,
     pub temperature: Option<f64>,

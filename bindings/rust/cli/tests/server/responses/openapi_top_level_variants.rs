@@ -182,6 +182,20 @@ fn top_level_cases() -> Vec<Case> {
             tags: &["field:background", "field:background:false"],
         },
         Case {
+            name: "store_false",
+            extra: serde_json::json!({ "store": false }),
+            schema_valid: true,
+            expect: Expectation::MustNotBe400,
+            tags: &["field:store", "field:store:false"],
+        },
+        Case {
+            name: "store_true",
+            extra: serde_json::json!({ "store": true }),
+            schema_valid: true,
+            expect: Expectation::MustNotBe400,
+            tags: &["field:store", "field:store:true"],
+        },
+        Case {
             name: "max_output_tokens_null",
             extra: serde_json::json!({ "max_output_tokens": null }),
             schema_valid: true,
@@ -306,6 +320,13 @@ fn top_level_cases() -> Vec<Case> {
             schema_valid: false,
             expect: Expectation::MustBe400,
             tags: &["invalid:service_tier:enum"],
+        },
+        Case {
+            name: "store_invalid_type",
+            extra: serde_json::json!({ "store": "true" }),
+            schema_valid: false,
+            expect: Expectation::MustBe400,
+            tags: &["invalid:store:type"],
         },
         Case {
             name: "truncation_invalid_enum",
@@ -465,6 +486,8 @@ fn responses_openapi_top_level_runtime_contract_matrix() {
         "field:stream:false",
         "field:stream_options:null",
         "field:background:false",
+        "field:store:false",
+        "field:store:true",
         "field:max_output_tokens:null",
         "field:reasoning:null",
         "field:safety_identifier:null",
@@ -483,6 +506,7 @@ fn responses_openapi_top_level_runtime_contract_matrix() {
         "invalid:top_logprobs:min",
         "invalid:top_logprobs:max",
         "invalid:service_tier:enum",
+        "invalid:store:type",
         "invalid:truncation:enum",
     ];
     for tag in required_tags {

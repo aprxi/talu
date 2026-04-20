@@ -200,6 +200,12 @@ async fn handle_generate(
         Ok(val) => val,
         Err(err) => return parse_error(err),
     };
+    if parsed.store == Some(true) {
+        log::warn!(
+            target: "server::gen",
+            "`store=true` requested on /v1/responses, but this inference-only server does not persist responses; ignoring"
+        );
+    }
     if let Err(message) = validate_responses_request(&parsed) {
         return api_error(
             strict_responses,
@@ -4150,6 +4156,7 @@ mod tests {
             reasoning: None,
             safety_identifier: None,
             service_tier: None,
+            store: None,
             seed: None,
             stream: None,
             stream_options: None,
@@ -4164,6 +4171,13 @@ mod tests {
             max_completion_tokens: None,
             max_reasoning_tokens: None,
         }
+    }
+
+    #[test]
+    fn create_response_body_accepts_store_field() {
+        let parsed: responses_types::CreateResponseBody =
+            serde_json::from_str(r#"{"store":true}"#).expect("parse store field");
+        assert_eq!(parsed.store, Some(true));
     }
 
     #[test]
