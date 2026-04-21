@@ -805,6 +805,8 @@ pub fn build(b: *std.Build) void {
 
     const gen_cuda_kernels_step = b.step("gen-cuda-kernels", "Generate CUDA kernel module assets (requires nvcc)");
     var cuda_kernel_assets_step: ?*std.Build.Step = null;
+    const bundled_cuda_fatbin = "core/assets/cuda/kernels.fatbin";
+    const has_bundled_cuda_fatbin = pathExists(bundled_cuda_fatbin);
     {
         const nvcc_path = b.findProgram(&.{"nvcc"}, &.{
             "/usr/local/cuda/bin",
@@ -825,10 +827,10 @@ pub fn build(b: *std.Build) void {
         });
         gen_kernel_module.step.dependOn(&ensure_cuda_assets_dir.step);
         gen_cuda_kernels_step.dependOn(&gen_kernel_module.step);
-        // CUDA-bearing builds must embed kernels that match the current
-        // sources when nvcc is available. Consuming a stale checked-in fatbin
-        // makes CUDA performance/debug work impossible to trust.
-        if (enable_cuda) {
+        // Normal builds consume the checked-in fatbin when present.
+        // Regeneration is reserved for explicit asset refreshes or bootstrapping
+        // a workspace that does not have bundled CUDA assets yet.
+        if (enable_cuda and !has_bundled_cuda_fatbin) {
             cuda_kernel_assets_step = &gen_kernel_module.step;
         }
     }
