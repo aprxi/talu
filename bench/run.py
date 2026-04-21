@@ -49,6 +49,7 @@ from scenario import (
     get_scenario,
     scenario_names,
     load_config,
+    model_uri,
 )
 
 console = Console()
@@ -281,6 +282,20 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     print()
 
 
+def _with_server_model_arg(extra_args: list[str], server_model_uri: str) -> list[str]:
+    """Ensure talu serve preloads the selected model before benchmark traffic."""
+    for idx, arg in enumerate(extra_args):
+        if arg == "--model" or arg == "-m":
+            if idx + 1 < len(extra_args):
+                return list(extra_args)
+        elif arg.startswith("--model=") or arg.startswith("-m="):
+            return list(extra_args)
+
+    args = list(extra_args)
+    args.extend(["--model", server_model_uri])
+    return args
+
+
 def _is_eval_scenario(scenario_name: str, results: list[dict]) -> bool:
     """Detect eval scenarios by name prefix or result shape."""
     if "evals/" in scenario_name:
@@ -428,9 +443,17 @@ def cmd_run(args: argparse.Namespace) -> None:
                     )
                     results.extend(combo_results)
                 else:
+                    server_model = model_uri(
+                        model,
+                        None if precision == "original" else precision,
+                    )
+                    server_args = _with_server_model_arg(
+                        scenario.server_args(combo_config),
+                        server_model,
+                    )
                     srv = TaluServer(
                         port=args.port,
-                        extra_args=scenario.server_args(combo_config),
+                        extra_args=server_args,
                         env=env_vars,
                     )
                     try:
