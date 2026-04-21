@@ -109,11 +109,23 @@ fn tool_call_response_shape() {
     let json = resp.json();
     let choice = &json["choices"][0];
 
-    // Model may or may not produce a tool call depending on model capability.
-    // If tool_calls is present, validate the shape.
-    if let Some(tool_calls) = choice["message"]["tool_calls"].as_array() {
-        if !tool_calls.is_empty() {
-            let tc = &tool_calls[0];
+    let tool_calls = choice["message"]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let content = choice["message"]["content"]
+        .as_str()
+        .map(|s| s.trim())
+        .unwrap_or("");
+
+    assert!(
+        !tool_calls.is_empty() || !content.is_empty(),
+        "response must include either tool_calls or assistant content: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
+
+    if !tool_calls.is_empty() {
+        for tc in &tool_calls {
             assert!(
                 tc["id"].is_string(),
                 "tool call must have string id: {:?}",
@@ -135,14 +147,12 @@ fn tool_call_response_shape() {
                 "tool call must have function.arguments as string: {:?}",
                 tc
             );
-
-            // finish_reason should be "tool_calls"
-            assert_eq!(
-                choice["finish_reason"].as_str(),
-                Some("tool_calls"),
-                "finish_reason should be 'tool_calls' when tool calls are present"
-            );
         }
+        assert_eq!(
+            choice["finish_reason"].as_str(),
+            Some("tool_calls"),
+            "finish_reason should be 'tool_calls' when tool_calls are present"
+        );
     }
 }
 

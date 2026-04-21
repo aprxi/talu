@@ -18,6 +18,7 @@ pub mod http;
 pub mod listen;
 mod logger;
 pub mod openapi;
+pub mod repo;
 pub mod responses;
 mod responses_openapi;
 pub mod responses_types;

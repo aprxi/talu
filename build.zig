@@ -34,7 +34,45 @@ const FailStep = struct {
 // Version extraction from VERSION
 // =============================================================================
 
-fn getVersion(b: *std.Build) []const u8 {
+fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 16 * 1024 * 1024,
+    }) catch return null;
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                allocator.free(result.stdout);
+                return null;
+            }
+        },
+        else => {
+            allocator.free(result.stdout);
+            return null;
+        },
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    if (trimmed.ptr == result.stdout.ptr and trimmed.len == result.stdout.len) {
+        return result.stdout;
+    }
+
+    const copy = allocator.dupe(u8, trimmed) catch {
+        allocator.free(result.stdout);
+        return null;
+    };
+    allocator.free(result.stdout);
+    return copy;
+}
+
+fn readVersionFile(b: *std.Build) []const u8 {
     const content = std.fs.cwd().readFileAlloc(
         b.allocator,
         "VERSION",
@@ -46,6 +84,83 @@ fn getVersion(b: *std.Build) []const u8 {
         return "0.0.0";
     }
     return b.allocator.dupe(u8, trimmed) catch return "0.0.0";
+}
+
+fn isGitHubActionsBuild(b: *std.Build) bool {
+    const value = std.process.getEnvVarOwned(b.allocator, "GITHUB_ACTIONS") catch return false;
+    defer b.allocator.free(value);
+    return std.mem.eql(u8, value, "true");
+}
+
+fn isTrackedDirty(b: *std.Build) bool {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "git", "diff-index", "--quiet", "HEAD", "--" },
+        .max_output_bytes = 1024,
+    }) catch return false;
+    defer b.allocator.free(result.stdout);
+    defer b.allocator.free(result.stderr);
+
+    return switch (result.term) {
+        .Exited => |code| code != 0,
+        else => false,
+    };
+}
+
+fn isExactVersionTag(b: *std.Build, version: []const u8) bool {
+    const expected = b.fmt("v{s}", .{version});
+    const tagged = runCommandCapture(
+        b.allocator,
+        &.{ "git", "describe", "--tags", "--exact-match", "--match", expected, "HEAD" },
+    ) orelse return false;
+    defer b.allocator.free(tagged);
+    return std.mem.eql(u8, tagged, expected);
+}
+
+fn trackedDiffFingerprint(b: *std.Build) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "git", "diff", "--binary", "HEAD", "--" },
+        .max_output_bytes = 16 * 1024 * 1024,
+    }) catch return null;
+    defer b.allocator.free(result.stderr);
+    defer b.allocator.free(result.stdout);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code != 0 or result.stdout.len == 0) return null;
+        },
+        else => return null,
+    }
+
+    const fingerprint = hashBytesFnv1a(14695981039346656037, result.stdout);
+    return b.fmt("{x:0>8}", .{@as(u32, @truncate(fingerprint))});
+}
+
+fn deriveVersion(b: *std.Build, base_version: []const u8) []const u8 {
+    if (isGitHubActionsBuild(b)) return base_version;
+
+    const short_commit = runCommandCapture(
+        b.allocator,
+        &.{ "git", "rev-parse", "--short=10", "HEAD" },
+    ) orelse return b.fmt("{s}-local.unknown", .{base_version});
+    defer b.allocator.free(short_commit);
+
+    const dirty = isTrackedDirty(b);
+    if (!dirty and isExactVersionTag(b, base_version)) {
+        return base_version;
+    }
+    if (!dirty) {
+        return b.fmt("{s}-local.{s}", .{ base_version, short_commit });
+    }
+
+    const diff_hash = trackedDiffFingerprint(b) orelse return b.fmt("{s}-local.{s}.dirty", .{ base_version, short_commit });
+    return b.fmt("{s}-local.{s}.{s}", .{ base_version, short_commit, diff_hash });
+}
+
+fn getVersion(b: *std.Build) []const u8 {
+    const base_version = readVersionFile(b);
+    return deriveVersion(b, base_version);
 }
 
 fn pathExists(path: []const u8) bool {
@@ -895,6 +1010,7 @@ pub fn build(b: *std.Build) void {
             .root_module = cli_mod,
         });
         const cargo_cmd = b.addSystemCommand(&.{ "cargo", "build", "--release", "--manifest-path", "bindings/rust/Cargo.toml" });
+        cargo_cmd.setEnvironmentVariable("TALU_VERSION_OVERRIDE", version);
         exe.step.dependOn(&cargo_cmd.step);
         // Link CLI against the shared core library to avoid compiling core twice
         // (shared + static) in the release path.

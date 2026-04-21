@@ -546,3 +546,24 @@ fn talu_bin_path() -> PathBuf {
         "talu CLI binary not found. Build with `zig build release -Drelease` or set TALU_CLI_BIN."
     );
 }
+
+pub fn talu_cli_version() -> String {
+    let output = Command::new(talu_bin_path())
+        .arg("-V")
+        .output()
+        .expect("run talu -V");
+    assert!(
+        output.status.success(),
+        "talu -V failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("talu -V output should be utf-8");
+    let version_line = stdout.trim();
+    let prefix = "talu ";
+    assert!(
+        version_line.starts_with(prefix),
+        "unexpected talu -V output: {version_line:?}"
+    );
+    version_line[prefix.len()..].to_string()
+}

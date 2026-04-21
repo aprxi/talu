@@ -143,4 +143,8 @@ fn auth_health_exempt() {
     let response = get(ctx.addr(), "/health");
     assert_eq!(response.status, 200, "body: {}", response.body);
     assert_eq!(response.body, "ok");
+
+    let response = get(ctx.addr(), "/v1/health");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert_eq!(response.json()["service"], "talu");
 }

@@ -1,3 +1,6 @@
+#[path = "../build_support/version.rs"]
+mod version_support;
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -6,17 +9,39 @@ use std::process::Command;
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent());
 
     // --- VERSION -> TALU_VERSION ---
     // In the monorepo, vendor/VERSION is at ../vendor/VERSION relative to talu-sys/.
     // On crates.io the monorepo structure doesn't exist, so fall back to CARGO_PKG_VERSION.
-    let version = manifest_dir
-        .parent()
-        .map(|rust_root| rust_root.join("vendor").join("VERSION"))
-        .filter(|p| p.exists())
-        .and_then(|p| fs::read_to_string(p).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    println!("cargo:rerun-if-env-changed=TALU_VERSION_OVERRIDE");
+    println!("cargo:rerun-if-env-changed=GITHUB_ACTIONS");
+    if let Some(repo_root) = repo_root {
+        version_support::emit_git_rerun_hints(&repo_root.to_path_buf());
+    }
+    let version = env::var("TALU_VERSION_OVERRIDE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            manifest_dir
+                .parent()
+                .map(|rust_root| rust_root.join("vendor").join("VERSION"))
+                .filter(|p| p.exists())
+                .map(|path| {
+                    let base_version = version_support::read_base_version(&path);
+                    if let Some(repo_root) = &repo_root {
+                        version_support::local_compiled_version(
+                            &repo_root.to_path_buf(),
+                            &base_version,
+                        )
+                    } else {
+                        base_version
+                    }
+                })
+        })
         .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into()));
 
     println!("cargo:rustc-env=TALU_VERSION={}", version);

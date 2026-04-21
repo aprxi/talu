@@ -21,16 +21,21 @@ use crate::server::auth_gateway::AuthContext;
 use crate::server::completions;
 use crate::server::handlers;
 use crate::server::openapi;
+use crate::server::repo;
 use crate::server::responses;
 use crate::server::responses_openapi;
 use crate::server::state::AppState;
 use crate::server::tokenizer;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+const TALU_INSTANCE: &str = "talu";
+const TALU_API_VERSION: &str = "v1";
+const TALU_VERSION: &str = env!("TALU_VERSION");
 const CORS_ALLOW_ORIGIN: &str = "*";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS_DEFAULT: &str =
     "authorization, content-type, x-talu-gateway-secret, x-talu-tenant-id, x-talu-group-id, x-talu-user-id";
+const CORS_EXPOSE_HEADERS: &str = "x-talu-instance, x-talu-version, x-talu-api-version";
 const CORS_MAX_AGE_SECONDS: &str = "600";
 
 /// Structured error response returned by all endpoints.
@@ -46,13 +51,44 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+/// Machine-readable server identification and health response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthResponse {
+    /// Service status.
+    pub status: &'static str,
+    /// Stable product identifier for this server implementation.
+    pub service: &'static str,
+    /// API version exposed by this endpoint.
+    pub api_version: &'static str,
+    /// Talu build version.
+    pub version: &'static str,
+}
+
+#[utoipa::path(get, path = "/v1/health", tag = "Models",
+    responses((status = 200, body = HealthResponse, description = "Health and server identity")))]
+pub async fn handle_health(
+    _state: Arc<AppState>,
+    _req: Request<Incoming>,
+    _auth_ctx: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let payload = HealthResponse {
+        status: "ok",
+        service: TALU_INSTANCE,
+        api_version: TALU_API_VERSION,
+        version: TALU_VERSION,
+    };
+    json_response(StatusCode::OK, &payload)
+}
+
 static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
     let spec = openapi::build_openapi_json();
     filter_openapi_paths(
         &spec,
         &[
             "/v1/chat/completions",
+            "/v1/health",
             "/v1/models",
+            "/v1/repo",
             "/v1/responses",
             "/v1/tokenizer",
         ],
@@ -68,6 +104,8 @@ static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
 });
 static OPENAPI_MODELS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models"]));
+static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
 static OPENAPI_TOKENIZER_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tokenizer"]));
 
@@ -131,6 +169,7 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/health") => {
                     Response::new(Full::new(Bytes::from_static(b"ok")).boxed())
                 }
+                (Method::GET, "/v1/health") => handle_health(state, req, None).await,
                 (Method::GET, "/openapi.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -151,6 +190,11 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_MODELS_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/repo.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_REPO_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/openapi/tokenizer.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -165,6 +209,9 @@ impl Service<Request<Incoming>> for Router {
                 }
                 (Method::GET, "/docs/models") => {
                     swagger_ui_response("/openapi/models.json", "Talu API :: Models")
+                }
+                (Method::GET, "/docs/repo") => {
+                    swagger_ui_response("/openapi/repo.json", "Talu API :: Repository")
                 }
                 (Method::GET, "/docs/tokenizer") => {
                     swagger_ui_response("/openapi/tokenizer.json", "Talu API :: Tokenizer")
@@ -187,6 +234,44 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/models") => {
                             handlers::handle_models(state, req, auth).await
                         }
+                        (Method::GET, "/v1/repo/models") | (Method::GET, "/repo/models") => {
+                            repo::handle_list(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/repo/search") | (Method::GET, "/repo/search") => {
+                            repo::handle_search(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/repo/models") | (Method::POST, "/repo/models") => {
+                            repo::handle_fetch(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/repo/models/")
+                                || p.starts_with("/repo/models/"))
+                                && p.ends_with("/files") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/models/"
+                            } else {
+                                "/repo/models/"
+                            };
+                            let raw = &p[prefix.len()..p.len() - "/files".len()];
+                            let model_id =
+                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+                            repo::handle_list_files(state, req, auth, &model_id).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/repo/models/")
+                                || p.starts_with("/repo/models/") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/models/"
+                            } else {
+                                "/repo/models/"
+                            };
+                            let raw = &p[prefix.len()..];
+                            let model_id =
+                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+                            repo::handle_delete(state, req, auth, &model_id).await
+                        }
                         (Method::POST, "/v1/responses") => {
                             responses::handle_create(state, req, auth).await
                         }
@@ -194,6 +279,10 @@ impl Service<Request<Incoming>> for Router {
                             completions::handle_create(state, req, auth).await
                         }
                         (_, "/v1/models") => method_not_allowed(&["GET"]),
+                        (_, "/v1/repo/models") => method_not_allowed(&["GET", "POST"]),
+                        (_, "/repo/models") => method_not_allowed(&["GET", "POST"]),
+                        (_, "/v1/repo/search") => method_not_allowed(&["GET"]),
+                        (_, "/repo/search") => method_not_allowed(&["GET"]),
                         (_, "/v1/responses") => method_not_allowed(&["POST"]),
                         (_, "/v1/chat/completions") => method_not_allowed(&["POST"]),
                         (Method::POST, "/v1/tokenizer/instances") => {
@@ -314,6 +403,10 @@ fn apply_cors_headers(headers: &mut hyper::HeaderMap, req_headers: &hyper::Heade
         HeaderValue::from_static(CORS_ALLOW_ORIGIN),
     );
     headers.insert(
+        "access-control-expose-headers",
+        HeaderValue::from_static(CORS_EXPOSE_HEADERS),
+    );
+    headers.insert(
         "access-control-allow-methods",
         HeaderValue::from_static(CORS_ALLOW_METHODS),
     );
@@ -334,6 +427,12 @@ fn apply_cors_headers(headers: &mut hyper::HeaderMap, req_headers: &hyper::Heade
         HeaderValue::from_static(
             "origin, access-control-request-method, access-control-request-headers",
         ),
+    );
+    headers.insert("x-talu-instance", HeaderValue::from_static(TALU_INSTANCE));
+    headers.insert("x-talu-version", HeaderValue::from_static(TALU_VERSION));
+    headers.insert(
+        "x-talu-api-version",
+        HeaderValue::from_static(TALU_API_VERSION),
     );
 }
 
@@ -408,6 +507,15 @@ fn swagger_ui_response(spec_url: &str, title: &str) -> Response<BoxBody> {
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(swagger_ui_html(spec_url, title))).boxed())
+        .unwrap()
+}
+
+fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> Response<BoxBody> {
+    let body = serde_json::to_vec(payload).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
         .unwrap()
 }
 
@@ -585,6 +693,11 @@ a:hover {
           <td><a href="/docs/models"><code>models</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/models.json" title="/openapi/models.json">json</a><button class="copy-btn" data-url="/openapi/models.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td>Model discovery and listing.</td>
+        </tr>
+        <tr>
+          <td><a href="/docs/repo"><code>repo</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/repo.json" title="/openapi/repo.json">json</a><button class="copy-btn" data-url="/openapi/repo.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>Repository cache management, hub search, and streaming model downloads.</td>
         </tr>
         <tr>
           <td><a href="/docs/tokenizer"><code>tokenizer</code></a></td>

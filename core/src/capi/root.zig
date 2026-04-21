@@ -190,6 +190,7 @@ pub const talu_chat_set_messages = responses.talu_chat_set_messages;
 pub const talu_chat_load_completions_json = responses.talu_chat_load_completions_json;
 pub const talu_chat_count_tokens = responses.talu_chat_count_tokens;
 pub const talu_chat_max_context_length = responses.talu_chat_max_context_length;
+pub const talu_completions_validate_request = router.talu_completions_validate_request;
 
 // Re-export Router C API functions (routes generation to inference backends).
 pub const talu_router_generate_with_backend = router.talu_router_generate_with_backend;

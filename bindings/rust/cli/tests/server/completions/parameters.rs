@@ -1,6 +1,8 @@
 //! `/v1/chat/completions` parameter handling and edge cases.
 
-use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
+use crate::server::common::{
+    model_config, post_json, require_model, ServerConfig, ServerTestContext,
+};
 
 fn generate(ctx: &ServerTestContext, model: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -177,11 +179,10 @@ fn streaming_and_non_streaming_produce_same_content() {
 /// Content as array (vision format) should be accepted.
 #[test]
 fn content_as_array_accepted() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
+    let ctx = ServerTestContext::new(ServerConfig::new());
 
     let body = serde_json::json!({
-        "model": model,
+        "model": "test/model",
         "messages": [{
             "role": "user",
             "content": [{"type": "text", "text": "Say hello"}]
@@ -190,11 +191,14 @@ fn content_as_array_accepted() {
         "temperature": 0.0
     });
     let resp = post_json(ctx.addr(), "/v1/chat/completions", &body);
-    // Should either succeed or return a clear error — not crash or 500
-    assert!(
-        resp.status == 200 || resp.status == 400,
-        "content-as-array should be accepted (200) or cleanly rejected (400), got {}: {}",
-        resp.status,
+    // Parse/validation should accept content-array messages; without a backend loaded
+    // the request must then fail at generation with server_error.
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(
+        json["error"]["type"].as_str(),
+        Some("server_error"),
+        "body: {}",
         resp.body
     );
 }
