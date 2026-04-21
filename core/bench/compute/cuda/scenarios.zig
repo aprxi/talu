@@ -8,6 +8,11 @@ const perf_hints = models.perf_hints;
 const harness = @import("harness.zig");
 
 pub const Scenario = enum {
+    decode_gdelta_ssm_i8,
+    decode_gdelta_in_proj,
+    decode_gdelta_out_proj,
+    decode_gdelta_conv_silu_ptrs,
+    decode_gdelta_norm_gate_rows,
     decode_attn_rope,
     decode_attn_scores,
     decode_attn_softmax,
@@ -106,6 +111,21 @@ const DecodeAttentionDims = struct {
     }
 };
 
+const DecodeGatedDeltaDims = struct {
+    rows: usize,
+    hidden: usize,
+    qkv_len: usize,
+    d_inner: usize,
+    n_qk_heads: usize,
+    n_v_heads: usize,
+    d_head: usize,
+    d_conv: usize,
+
+    fn projLen(self: DecodeGatedDeltaDims) usize {
+        return self.qkv_len + self.d_inner + (2 * self.n_v_heads);
+    }
+};
+
 const DecodeTokenChainDims = struct {
     qkv: QkvDims,
     attention: DecodeAttentionDims,
@@ -118,6 +138,10 @@ const DecodeTokenChainDims = struct {
 
 fn roleBenchRowName(which: Scenario) []const u8 {
     return switch (which) {
+        .decode_gdelta_in_proj,
+        .decode_gdelta_out_proj,
+        .decode_gdelta_conv_silu_ptrs,
+        .decode_gdelta_norm_gate_rows,
         .decode_attn_rope,
         .decode_attn_scores,
         .decode_attn_softmax,
@@ -133,6 +157,7 @@ fn roleBenchRowName(which: Scenario) []const u8 {
         .decode_attn_i8_kv_ptrs,
         .decode_attn_i8_kv_fused,
         .decode_attn_i8_flash,
+        .decode_gdelta_ssm_i8,
         .decode_attn_qkv_fused,
         .decode_token_chain,
         .prefill_attn_qkv_fused,
@@ -159,6 +184,17 @@ fn gateUpBenchRowName(which: Scenario) []const u8 {
 }
 
 fn modelRoleDims(model_id: []const u8, which: Scenario, rows_override: ?usize) !RoleMatmulDims {
+    switch (which) {
+        .decode_gdelta_in_proj => {
+            const dims = try decodeGatedDeltaDims(model_id, rows_override);
+            return .{ .tokens = dims.rows, .hidden = dims.hidden, .out = dims.projLen() };
+        },
+        .decode_gdelta_out_proj => {
+            const dims = try decodeGatedDeltaDims(model_id, rows_override);
+            return .{ .tokens = dims.rows, .hidden = dims.n_qk_heads * dims.d_head, .out = dims.hidden };
+        },
+        else => {},
+    }
     const bench_row = roleBenchRowName(which);
     const dims = resolveRoleDims(model_id, bench_row) orelse return error.InvalidArgument;
     return .{
@@ -225,6 +261,37 @@ fn modelLayerCount(model_id: []const u8) ?usize {
     return null;
 }
 
+fn decodeGatedDeltaDims(model_id: []const u8, rows_override: ?usize) !DecodeGatedDeltaDims {
+    const rows = rows_override orelse 1;
+    if (rows == 0) return error.InvalidArgument;
+
+    if (std.mem.eql(u8, model_id, "qwen3_5_4b")) {
+        return .{
+            .rows = rows,
+            .hidden = 2560,
+            .qkv_len = 8192,
+            .d_inner = 4096,
+            .n_qk_heads = 16,
+            .n_v_heads = 32,
+            .d_head = 128,
+            .d_conv = 4,
+        };
+    }
+    if (std.mem.eql(u8, model_id, "qwen3_5")) {
+        return .{
+            .rows = rows,
+            .hidden = 1024,
+            .qkv_len = 4096,
+            .d_inner = 2048,
+            .n_qk_heads = 8,
+            .n_v_heads = 16,
+            .d_head = 128,
+            .d_conv = 4,
+        };
+    }
+    return error.InvalidArgument;
+}
+
 fn decodeTokenChainDims(model_id: []const u8, seq_len_override: ?usize, layers_override: ?usize) !DecodeTokenChainDims {
     return .{
         .qkv = try modelQkvDims(model_id, .decode_attn_qkv_fused, 1),
@@ -262,6 +329,11 @@ fn selectQuantLabel(tq4: []const u8, nvfp4: []const u8, nvfp4_i8cache: []const u
 
 fn scenarioName(which: Scenario, quant: QuantKind) []const u8 {
     return switch (which) {
+        .decode_gdelta_ssm_i8 => selectQuantLabel("decode.gdelta_ssm_i8.tq4", "decode.gdelta_ssm_i8.nvfp4", "decode.gdelta_ssm_i8.nvfp4_i8cache", "decode.gdelta_ssm_i8.nvfp4_native", quant),
+        .decode_gdelta_in_proj => selectQuantLabel("decode.gdelta_in_proj.tq4", "decode.gdelta_in_proj.nvfp4", "decode.gdelta_in_proj.nvfp4_i8cache", "decode.gdelta_in_proj.nvfp4_native", quant),
+        .decode_gdelta_out_proj => selectQuantLabel("decode.gdelta_out_proj.tq4", "decode.gdelta_out_proj.nvfp4", "decode.gdelta_out_proj.nvfp4_i8cache", "decode.gdelta_out_proj.nvfp4_native", quant),
+        .decode_gdelta_conv_silu_ptrs => selectQuantLabel("decode.gdelta_conv_silu_ptrs.tq4", "decode.gdelta_conv_silu_ptrs.nvfp4", "decode.gdelta_conv_silu_ptrs.nvfp4_i8cache", "decode.gdelta_conv_silu_ptrs.nvfp4_native", quant),
+        .decode_gdelta_norm_gate_rows => selectQuantLabel("decode.gdelta_norm_gate_rows.tq4", "decode.gdelta_norm_gate_rows.nvfp4", "decode.gdelta_norm_gate_rows.nvfp4_i8cache", "decode.gdelta_norm_gate_rows.nvfp4_native", quant),
         .decode_attn_rope => selectQuantLabel("decode.attn_rope.tq4", "decode.attn_rope.nvfp4", "decode.attn_rope.nvfp4_i8cache", "decode.attn_rope.nvfp4_native", quant),
         .decode_attn_scores => selectQuantLabel("decode.attn_scores.tq4", "decode.attn_scores.nvfp4", "decode.attn_scores.nvfp4_i8cache", "decode.attn_scores.nvfp4_native", quant),
         .decode_attn_softmax => selectQuantLabel("decode.attn_softmax.tq4", "decode.attn_softmax.nvfp4", "decode.attn_softmax.nvfp4_i8cache", "decode.attn_softmax.nvfp4_native", quant),
@@ -308,10 +380,15 @@ pub fn runScenario(allocator: std.mem.Allocator, which: Scenario, quant: QuantKi
     errdefer allocator.free(samples);
 
     return switch (which) {
+        .decode_gdelta_ssm_i8 => try runDecodeGatedDeltaSsmI8Scenario(allocator, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
+        .decode_gdelta_conv_silu_ptrs => try runDecodeGatedDeltaConvSiluPtrsScenario(allocator, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
+        .decode_gdelta_norm_gate_rows => try runDecodeGatedDeltaNormGateRowsScenario(allocator, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
         .decode_attn_rope => try runDecodeAttentionRopeScenario(allocator, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
         .decode_attn_scores => try runDecodeAttentionScoresScenario(allocator, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
         .decode_attn_softmax => try runDecodeAttentionSoftmaxScenario(allocator, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
         .decode_attn_weighted_sum => try runDecodeAttentionWeightedSumScenario(allocator, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
+        .decode_gdelta_in_proj,
+        .decode_gdelta_out_proj,
         .decode_attn_q,
         .decode_attn_out,
         .decode_ffn_gate,
@@ -331,6 +408,357 @@ pub fn runScenario(allocator: std.mem.Allocator, which: Scenario, quant: QuantKi
         .decode_ffn_gate_up_fused_silu,
         .prefill_ffn_gate_up_fused_silu,
         => try runGateUpSiluScenario(allocator, which, quant, cfg, &device, &registry, &arg_pack, stream, start_evt, stop_evt, samples),
+    };
+}
+
+fn runDecodeGatedDeltaSsmI8Scenario(
+    allocator: std.mem.Allocator,
+    quant: QuantKind,
+    cfg: RunConfig,
+    device: *cuda.Device,
+    registry: *cuda.Registry,
+    arg_pack: *cuda.ArgPack,
+    stream: cuda.StreamHandle,
+    start_evt: cuda.EventHandle,
+    stop_evt: cuda.EventHandle,
+    samples: []harness.Sample,
+) !ScenarioResult {
+    const dims = try decodeGatedDeltaDims(cfg.model_id, cfg.rows_override);
+    const rows = dims.rows;
+    const row_stride = dims.projLen();
+    const out_row_stride = dims.d_inner;
+    const beta_offset = dims.qkv_len + dims.d_inner;
+    const a_offset = beta_offset + dims.n_v_heads;
+    const qkv_rows_count = std.math.mul(usize, rows, row_stride) catch return error.InvalidArgument;
+    const out_count = std.math.mul(usize, rows, out_row_stride) catch return error.InvalidArgument;
+    const state_data_bytes = std.math.mul(usize, dims.n_v_heads * dims.d_head, dims.d_head) catch return error.InvalidArgument;
+    const state_scales_count = std.math.mul(usize, dims.n_v_heads, dims.d_head) catch return error.InvalidArgument;
+    const state_scales_offset = state_data_bytes;
+    const state_total_bytes = state_data_bytes + state_scales_count * @sizeOf(f32);
+
+    const qkv_rows_host = try allocator.alloc(f32, qkv_rows_count);
+    defer allocator.free(qkv_rows_host);
+    const a_log_host = try allocator.alloc(f32, dims.n_v_heads);
+    defer allocator.free(a_log_host);
+    const dt_bias_host = try allocator.alloc(f32, dims.n_v_heads);
+    defer allocator.free(dt_bias_host);
+    const state_i8_host = try allocator.alloc(i8, state_data_bytes);
+    defer allocator.free(state_i8_host);
+    const state_scales_host = try allocator.alloc(f32, state_scales_count);
+    defer allocator.free(state_scales_host);
+    fillInputPattern(qkv_rows_host);
+    fillF32ScalePattern(a_log_host);
+    fillF32ScalePattern(dt_bias_host);
+    fillI8Pattern(state_i8_host);
+    fillF32ScalePattern(state_scales_host);
+
+    const state_bytes_host = try allocator.alloc(u8, state_total_bytes);
+    defer allocator.free(state_bytes_host);
+    @memcpy(state_bytes_host[0..state_data_bytes], std.mem.sliceAsBytes(state_i8_host));
+    @memcpy(state_bytes_host[state_scales_offset .. state_scales_offset + state_scales_count * @sizeOf(f32)], std.mem.sliceAsBytes(state_scales_host));
+
+    var qkv_rows_dev = try device.allocBuffer(qkv_rows_count * @sizeOf(f32));
+    defer qkv_rows_dev.deinit(device);
+    var a_log_dev = try device.allocBuffer(dims.n_v_heads * @sizeOf(f32));
+    defer a_log_dev.deinit(device);
+    var dt_bias_dev = try device.allocBuffer(dims.n_v_heads * @sizeOf(f32));
+    defer dt_bias_dev.deinit(device);
+    var out_dev = try device.allocBuffer(out_count * @sizeOf(f32));
+    defer out_dev.deinit(device);
+    var state_dev = try device.allocBuffer(state_total_bytes);
+    defer state_dev.deinit(device);
+    var state_ptrs_dev = try device.allocBuffer(rows * @sizeOf(u64));
+    defer state_ptrs_dev.deinit(device);
+
+    try qkv_rows_dev.upload(device, std.mem.sliceAsBytes(qkv_rows_host));
+    try a_log_dev.upload(device, std.mem.sliceAsBytes(a_log_host));
+    try dt_bias_dev.upload(device, std.mem.sliceAsBytes(dt_bias_host));
+    try state_dev.upload(device, state_bytes_host);
+
+    const state_ptrs_host = try allocator.alloc(u64, rows);
+    defer allocator.free(state_ptrs_host);
+    for (state_ptrs_host, 0..) |*ptr, row| {
+        ptr.* = state_dev.pointer;
+        _ = row;
+    }
+    try state_ptrs_dev.upload(device, std.mem.sliceAsBytes(state_ptrs_host));
+
+    if (registry.embedded_module == null) try registry.loadEmbeddedModule(cuda.gated_delta_ssm_rows_ptrs_i8.embedded_module);
+    const fn_info = try registry.resolveFunction(cuda.gated_delta_ssm_rows_ptrs_i8.op_name, cuda.gated_delta_ssm_rows_ptrs_i8.embedded_symbol);
+
+    var warm: usize = 0;
+    while (warm < cfg.warmup) : (warm += 1) {
+        try cuda.gated_delta_ssm_rows_ptrs_i8.runWithFunction(
+            arg_pack,
+            device,
+            fn_info.function,
+            &qkv_rows_dev,
+            &state_ptrs_dev,
+            &a_log_dev,
+            &dt_bias_dev,
+            &out_dev,
+            @intCast(dims.n_qk_heads),
+            @intCast(dims.n_v_heads),
+            @intCast(dims.d_head),
+            @intCast(rows),
+            @intCast(row_stride),
+            @intCast(beta_offset),
+            @intCast(a_offset),
+            @intCast(out_row_stride),
+            @intCast(state_scales_offset),
+        );
+    }
+
+    for (samples) |*sample| {
+        try device.recordEvent(start_evt, stream);
+        try cuda.gated_delta_ssm_rows_ptrs_i8.runWithFunction(
+            arg_pack,
+            device,
+            fn_info.function,
+            &qkv_rows_dev,
+            &state_ptrs_dev,
+            &a_log_dev,
+            &dt_bias_dev,
+            &out_dev,
+            @intCast(dims.n_qk_heads),
+            @intCast(dims.n_v_heads),
+            @intCast(dims.d_head),
+            @intCast(rows),
+            @intCast(row_stride),
+            @intCast(beta_offset),
+            @intCast(a_offset),
+            @intCast(out_row_stride),
+            @intCast(state_scales_offset),
+        );
+        try device.recordEvent(stop_evt, stream);
+        try device.synchronizeEvent(stop_evt);
+        sample.* = .{ .eval_ns = try device.elapsedEventNs(start_evt, stop_evt) };
+    }
+
+    return .{
+        .name = scenarioName(.decode_gdelta_ssm_i8, quant),
+        .quant = quant,
+        .samples = samples,
+        .flops_per_iter = 0,
+        .bytes_per_iter = std.math.cast(u64, std.math.mul(u128, qkv_rows_count + out_count, @sizeOf(f32)) catch 0) orelse 0,
+        .rows = rows,
+        .in_dim = row_stride,
+        .out_dim = out_row_stride,
+    };
+}
+
+fn runDecodeGatedDeltaConvSiluPtrsScenario(
+    allocator: std.mem.Allocator,
+    quant: QuantKind,
+    cfg: RunConfig,
+    device: *cuda.Device,
+    registry: *cuda.Registry,
+    arg_pack: *cuda.ArgPack,
+    stream: cuda.StreamHandle,
+    start_evt: cuda.EventHandle,
+    stop_evt: cuda.EventHandle,
+    samples: []harness.Sample,
+) !ScenarioResult {
+    const dims = try decodeGatedDeltaDims(cfg.model_id, cfg.rows_override);
+    const rows = dims.rows;
+    const row_stride = dims.projLen();
+    const conv_dim = dims.qkv_len;
+    const state_elems_per_row = std.math.mul(usize, conv_dim, dims.d_conv) catch return error.InvalidArgument;
+    const row_count = std.math.mul(usize, rows, row_stride) catch return error.InvalidArgument;
+
+    const values_host = try allocator.alloc(f32, row_count);
+    defer allocator.free(values_host);
+    const weight_host = try allocator.alloc(f32, state_elems_per_row);
+    defer allocator.free(weight_host);
+    const bias_host = try allocator.alloc(f32, conv_dim);
+    defer allocator.free(bias_host);
+    const positions_host = try allocator.alloc(u32, rows);
+    defer allocator.free(positions_host);
+    fillInputPattern(values_host);
+    fillF32ScalePattern(weight_host);
+    fillF32ScalePattern(bias_host);
+    for (positions_host, 0..) |*position, row| {
+        position.* = @intCast(row % dims.d_conv);
+    }
+
+    var values_dev = try device.allocBuffer(row_count * @sizeOf(f32));
+    defer values_dev.deinit(device);
+    var weight_dev = try device.allocBuffer(state_elems_per_row * @sizeOf(f32));
+    defer weight_dev.deinit(device);
+    var bias_dev = try device.allocBuffer(conv_dim * @sizeOf(f32));
+    defer bias_dev.deinit(device);
+    var out_dev = try device.allocBuffer(row_count * @sizeOf(f32));
+    defer out_dev.deinit(device);
+    var state_dev = try device.allocBuffer(rows * state_elems_per_row * @sizeOf(f32));
+    defer state_dev.deinit(device);
+    var state_ptrs_dev = try device.allocBuffer(rows * @sizeOf(u64));
+    defer state_ptrs_dev.deinit(device);
+    var positions_dev = try device.allocBuffer(rows * @sizeOf(u32));
+    defer positions_dev.deinit(device);
+
+    try values_dev.upload(device, std.mem.sliceAsBytes(values_host));
+    try weight_dev.upload(device, std.mem.sliceAsBytes(weight_host));
+    try bias_dev.upload(device, std.mem.sliceAsBytes(bias_host));
+    try positions_dev.upload(device, std.mem.sliceAsBytes(positions_host));
+
+    const state_ptrs_host = try allocator.alloc(u64, rows);
+    defer allocator.free(state_ptrs_host);
+    for (state_ptrs_host, 0..) |*ptr, row| {
+        ptr.* = state_dev.pointer + row * state_elems_per_row * @sizeOf(f32);
+    }
+    try state_ptrs_dev.upload(device, std.mem.sliceAsBytes(state_ptrs_host));
+
+    if (registry.embedded_module == null) try registry.loadEmbeddedModule(cuda.gated_delta_conv_silu_rows_ptrs.embedded_module);
+    const fn_info = try registry.resolveFunction(cuda.gated_delta_conv_silu_rows_ptrs.op_name, cuda.gated_delta_conv_silu_rows_ptrs.embedded_symbol);
+
+    var warm: usize = 0;
+    while (warm < cfg.warmup) : (warm += 1) {
+        try cuda.gated_delta_conv_silu_rows_ptrs.runWithFunction(
+            arg_pack,
+            device,
+            fn_info.function,
+            &values_dev,
+            &state_ptrs_dev,
+            &positions_dev,
+            &weight_dev,
+            &bias_dev,
+            &out_dev,
+            @intCast(conv_dim),
+            @intCast(dims.d_conv),
+            @intCast(rows),
+            @intCast(row_stride),
+        );
+    }
+
+    for (samples) |*sample| {
+        try device.recordEvent(start_evt, stream);
+        try cuda.gated_delta_conv_silu_rows_ptrs.runWithFunction(
+            arg_pack,
+            device,
+            fn_info.function,
+            &values_dev,
+            &state_ptrs_dev,
+            &positions_dev,
+            &weight_dev,
+            &bias_dev,
+            &out_dev,
+            @intCast(conv_dim),
+            @intCast(dims.d_conv),
+            @intCast(rows),
+            @intCast(row_stride),
+        );
+        try device.recordEvent(stop_evt, stream);
+        try device.synchronizeEvent(stop_evt);
+        sample.* = .{ .eval_ns = try device.elapsedEventNs(start_evt, stop_evt) };
+    }
+
+    return .{
+        .name = scenarioName(.decode_gdelta_conv_silu_ptrs, quant),
+        .quant = quant,
+        .samples = samples,
+        .flops_per_iter = 0,
+        .bytes_per_iter = std.math.cast(u64, std.math.mul(u128, row_count * 2 + state_elems_per_row, @sizeOf(f32)) catch 0) orelse 0,
+        .rows = rows,
+        .in_dim = row_stride,
+        .out_dim = conv_dim,
+    };
+}
+
+fn runDecodeGatedDeltaNormGateRowsScenario(
+    allocator: std.mem.Allocator,
+    quant: QuantKind,
+    cfg: RunConfig,
+    device: *cuda.Device,
+    registry: *cuda.Registry,
+    arg_pack: *cuda.ArgPack,
+    stream: cuda.StreamHandle,
+    start_evt: cuda.EventHandle,
+    stop_evt: cuda.EventHandle,
+    samples: []harness.Sample,
+) !ScenarioResult {
+    const dims = try decodeGatedDeltaDims(cfg.model_id, cfg.rows_override);
+    const rows = dims.rows;
+    const rows_total = std.math.mul(usize, rows, dims.n_v_heads) catch return error.InvalidArgument;
+    const input_count = std.math.mul(usize, rows_total, dims.d_head) catch return error.InvalidArgument;
+    const gate_count = std.math.mul(usize, rows, dims.projLen()) catch return error.InvalidArgument;
+
+    const input_host = try allocator.alloc(f32, input_count);
+    defer allocator.free(input_host);
+    const gate_host = try allocator.alloc(f32, gate_count);
+    defer allocator.free(gate_host);
+    const weight_host = try allocator.alloc(f32, dims.d_head);
+    defer allocator.free(weight_host);
+    fillInputPattern(input_host);
+    fillInputPattern(gate_host);
+    fillF32ScalePattern(weight_host);
+
+    var input_dev = try device.allocBuffer(input_count * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var gate_dev = try device.allocBuffer(gate_count * @sizeOf(f32));
+    defer gate_dev.deinit(device);
+    var weight_dev = try device.allocBuffer(dims.d_head * @sizeOf(f32));
+    defer weight_dev.deinit(device);
+    var out_dev = try device.allocBuffer(input_count * @sizeOf(f32));
+    defer out_dev.deinit(device);
+    try input_dev.upload(device, std.mem.sliceAsBytes(input_host));
+    try gate_dev.upload(device, std.mem.sliceAsBytes(gate_host));
+    try weight_dev.upload(device, std.mem.sliceAsBytes(weight_host));
+
+    if (registry.embedded_module == null) try registry.loadEmbeddedModule(cuda.gated_delta_rmsnorm_silu_mul_rows.embedded_module);
+    const fn_info = try registry.resolveFunction(cuda.gated_delta_rmsnorm_silu_mul_rows.op_name, cuda.gated_delta_rmsnorm_silu_mul_rows.embedded_symbol);
+
+    var warm: usize = 0;
+    while (warm < cfg.warmup) : (warm += 1) {
+        try cuda.gated_delta_rmsnorm_silu_mul_rows.runWithFunction(
+            arg_pack,
+            device,
+            fn_info.function,
+            &input_dev,
+            &gate_dev,
+            &weight_dev,
+            &out_dev,
+            @intCast(rows_total),
+            @intCast(dims.d_head),
+            @intCast(dims.n_v_heads),
+            @intCast(dims.projLen()),
+            @intCast(dims.qkv_len),
+            1.0e-6,
+            0,
+        );
+    }
+
+    for (samples) |*sample| {
+        try device.recordEvent(start_evt, stream);
+        try cuda.gated_delta_rmsnorm_silu_mul_rows.runWithFunction(
+            arg_pack,
+            device,
+            fn_info.function,
+            &input_dev,
+            &gate_dev,
+            &weight_dev,
+            &out_dev,
+            @intCast(rows_total),
+            @intCast(dims.d_head),
+            @intCast(dims.n_v_heads),
+            @intCast(dims.projLen()),
+            @intCast(dims.qkv_len),
+            1.0e-6,
+            0,
+        );
+        try device.recordEvent(stop_evt, stream);
+        try device.synchronizeEvent(stop_evt);
+        sample.* = .{ .eval_ns = try device.elapsedEventNs(start_evt, stop_evt) };
+    }
+
+    return .{
+        .name = scenarioName(.decode_gdelta_norm_gate_rows, quant),
+        .quant = quant,
+        .samples = samples,
+        .flops_per_iter = 0,
+        .bytes_per_iter = std.math.cast(u64, std.math.mul(u128, input_count * 2 + gate_count + dims.d_head, @sizeOf(f32)) catch 0) orelse 0,
+        .rows = rows_total,
+        .in_dim = dims.d_head,
+        .out_dim = dims.d_head,
     };
 }
 
@@ -2215,6 +2643,7 @@ fn runNvfp4QkvLaunch(
     batch_tile: u32,
     total_out: u32,
 ) !void {
+    const single_row_dualout = batch_rows == 1 and batch_tile == 8;
     arg_pack.reset();
     try arg_pack.appendBufferPtr(input);
     try arg_pack.appendBufferPtr(&q_weights.packed_data);
@@ -2241,7 +2670,7 @@ fn runNvfp4QkvLaunch(
     try arg_pack.appendScalar(u32, in_dim);
     try arg_pack.appendScalar(u32, batch_rows);
     try cuda.launch.launchWithFamily(device, function, .{
-        .grid_x = (total_out + 3) / 4,
+        .grid_x = if (single_row_dualout) (total_out + 7) / 8 else (total_out + 3) / 4,
         .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
         .block_x = 128,
     }, arg_pack, .matvec_qkv);
@@ -2277,7 +2706,7 @@ fn runNvfp4GateUpSiluLaunch(
     try arg_pack.appendScalar(f32, up_weights.weight_global_scale);
     try arg_pack.appendScalar(u32, batch_rows);
     try cuda.launch.launchWithFamily(device, function, .{
-        .grid_x = (out_dim + 3) / 4,
+        .grid_x = if (batch_rows == 1 and batch_tile == 8) (out_dim + 7) / 8 else (out_dim + 3) / 4,
         .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
         .block_x = 128,
     }, arg_pack, .matvec_gate_up_silu);

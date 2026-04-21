@@ -10,6 +10,11 @@ const CliConfig = struct {
 };
 
 fn parseScenario(value: []const u8) !scenarios.Scenario {
+    if (std.mem.eql(u8, value, "decode_gdelta_ssm_i8")) return .decode_gdelta_ssm_i8;
+    if (std.mem.eql(u8, value, "decode_gdelta_in_proj")) return .decode_gdelta_in_proj;
+    if (std.mem.eql(u8, value, "decode_gdelta_out_proj")) return .decode_gdelta_out_proj;
+    if (std.mem.eql(u8, value, "decode_gdelta_conv_silu_ptrs")) return .decode_gdelta_conv_silu_ptrs;
+    if (std.mem.eql(u8, value, "decode_gdelta_norm_gate_rows")) return .decode_gdelta_norm_gate_rows;
     if (std.mem.eql(u8, value, "decode_attn_rope")) return .decode_attn_rope;
     if (std.mem.eql(u8, value, "decode_attn_scores")) return .decode_attn_scores;
     if (std.mem.eql(u8, value, "decode_attn_softmax")) return .decode_attn_softmax;
@@ -51,7 +56,7 @@ fn printUsage(writer: anytype) !void {
         \\  zig build bench-cuda-compute -Drelease -- [options]
         \\
         \\Options:
-        \\  --scenario <decode_attn_rope|decode_attn_scores|decode_attn_softmax|decode_attn_weighted_sum|decode_attn_q|decode_attn_out|decode_attn_i8_kv_ptrs|decode_attn_i8_kv_fused|decode_attn_i8_flash|decode_attn_qkv_fused|decode_token_chain|decode_ffn_gate|decode_ffn_down|decode_ffn_gate_up_fused_silu|decode_lm_head|prefill_attn_q|prefill_attn_qkv_fused|prefill_ffn_gate|prefill_ffn_gate_up_fused_silu|prefill_ffn_down>
+        \\  --scenario <decode_gdelta_ssm_i8|decode_gdelta_in_proj|decode_gdelta_out_proj|decode_gdelta_conv_silu_ptrs|decode_gdelta_norm_gate_rows|decode_attn_rope|decode_attn_scores|decode_attn_softmax|decode_attn_weighted_sum|decode_attn_q|decode_attn_out|decode_attn_i8_kv_ptrs|decode_attn_i8_kv_fused|decode_attn_i8_flash|decode_attn_qkv_fused|decode_token_chain|decode_ffn_gate|decode_ffn_down|decode_ffn_gate_up_fused_silu|decode_lm_head|prefill_attn_q|prefill_attn_qkv_fused|prefill_ffn_gate|prefill_ffn_gate_up_fused_silu|prefill_ffn_down>
         \\  --quant <tq4|nvfp4|nvfp4_i8cache|nvfp4_native>
         \\  --warmup <N>                  default: 10
         \\  --iters <N>                   default: 30
@@ -157,6 +162,11 @@ pub fn main() !void {
 }
 
 test "parseScenario accepts known scenarios" {
+    try std.testing.expectEqual(scenarios.Scenario.decode_gdelta_ssm_i8, try parseScenario("decode_gdelta_ssm_i8"));
+    try std.testing.expectEqual(scenarios.Scenario.decode_gdelta_in_proj, try parseScenario("decode_gdelta_in_proj"));
+    try std.testing.expectEqual(scenarios.Scenario.decode_gdelta_out_proj, try parseScenario("decode_gdelta_out_proj"));
+    try std.testing.expectEqual(scenarios.Scenario.decode_gdelta_conv_silu_ptrs, try parseScenario("decode_gdelta_conv_silu_ptrs"));
+    try std.testing.expectEqual(scenarios.Scenario.decode_gdelta_norm_gate_rows, try parseScenario("decode_gdelta_norm_gate_rows"));
     try std.testing.expectEqual(scenarios.Scenario.decode_attn_rope, try parseScenario("decode_attn_rope"));
     try std.testing.expectEqual(scenarios.Scenario.decode_attn_scores, try parseScenario("decode_attn_scores"));
     try std.testing.expectEqual(scenarios.Scenario.decode_attn_softmax, try parseScenario("decode_attn_softmax"));

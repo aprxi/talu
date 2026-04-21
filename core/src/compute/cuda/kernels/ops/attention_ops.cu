@@ -1972,7 +1972,7 @@ extern "C" __global__ void talu_attn_weighted_sum_heads_i8_kv_ptrs(
     unsigned int head_dim,
     unsigned int sliding_window
 ) {
-    constexpr unsigned int TALU_ATTN_WEIGHTED_SUM_VEC = 4u;
+    constexpr unsigned int TALU_ATTN_WEIGHTED_SUM_VEC = 16u;
     const unsigned int tid = threadIdx.x;
     const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
     const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
@@ -1996,16 +1996,34 @@ extern "C" __global__ void talu_attn_weighted_sum_heads_i8_kv_ptrs(
     const signed char* value_cache = reinterpret_cast<const signed char*>(value_cache_ptrs[row]);
     const float* v_scales = reinterpret_cast<const float*>(v_scale_ptrs[row]);
 
-    float partial[TALU_ATTN_WEIGHTED_SUM_VEC] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float partial[TALU_ATTN_WEIGHTED_SUM_VEC] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+    };
     for (unsigned int t = lane; t < visible_len; t += TALU_ATTN_WARP_SIZE) {
         const unsigned int actual_t = start_t + t;
         const float coeff = probs_row[t] * v_scales[actual_t * n_kv_heads + kv_head];
         const unsigned long long value_index = (unsigned long long)actual_t * row_stride + head_offset + d_base;
-        #pragma unroll
-        for (unsigned int i = 0; i < TALU_ATTN_WEIGHTED_SUM_VEC; ++i) {
-            const unsigned int d = d_base + i;
-            if (d < head_dim) {
-                partial[i] += coeff * (float)(value_cache[value_index + i]);
+        const signed char* value_ptr = value_cache + value_index;
+        const unsigned int dims_left = head_dim - d_base;
+        if (dims_left >= TALU_ATTN_WEIGHTED_SUM_VEC) {
+            #pragma unroll
+            for (unsigned int chunk = 0; chunk < TALU_ATTN_WEIGHTED_SUM_VEC / 4u; ++chunk) {
+                const char4 vals = reinterpret_cast<const char4*>(value_ptr)[chunk];
+                partial[chunk * 4u + 0u] += coeff * static_cast<float>(vals.x);
+                partial[chunk * 4u + 1u] += coeff * static_cast<float>(vals.y);
+                partial[chunk * 4u + 2u] += coeff * static_cast<float>(vals.z);
+                partial[chunk * 4u + 3u] += coeff * static_cast<float>(vals.w);
+            }
+        } else {
+            #pragma unroll
+            for (unsigned int i = 0; i < TALU_ATTN_WEIGHTED_SUM_VEC; ++i) {
+                const unsigned int d = d_base + i;
+                if (d < head_dim) {
+                    partial[i] += coeff * static_cast<float>(value_ptr[i]);
+                }
             }
         }
     }
