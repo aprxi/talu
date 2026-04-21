@@ -1972,14 +1972,16 @@ extern "C" __global__ void talu_attn_weighted_sum_heads_i8_kv_ptrs(
     unsigned int head_dim,
     unsigned int sliding_window
 ) {
+    constexpr unsigned int TALU_ATTN_WEIGHTED_SUM_VEC = 4u;
     const unsigned int tid = threadIdx.x;
     const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
     const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
     const unsigned int warps_per_block = blockDim.x / TALU_ATTN_WARP_SIZE;
-    const unsigned int d = blockIdx.x * warps_per_block + warp;
+    const unsigned int vec_index = blockIdx.x * warps_per_block + warp;
+    const unsigned int d_base = vec_index * TALU_ATTN_WEIGHTED_SUM_VEC;
     const unsigned int head = blockIdx.y;
     const unsigned int row = blockIdx.z;
-    if (head >= n_heads || d >= head_dim || kv_groups == 0) return;
+    if (head >= n_heads || d_base >= head_dim || kv_groups == 0) return;
 
     const unsigned int seq_len = seq_lens[row];
     const unsigned int position = positions[row];
@@ -1994,16 +1996,31 @@ extern "C" __global__ void talu_attn_weighted_sum_heads_i8_kv_ptrs(
     const signed char* value_cache = reinterpret_cast<const signed char*>(value_cache_ptrs[row]);
     const float* v_scales = reinterpret_cast<const float*>(v_scale_ptrs[row]);
 
-    float partial = 0.0f;
+    float partial[TALU_ATTN_WEIGHTED_SUM_VEC] = { 0.0f, 0.0f, 0.0f, 0.0f };
     for (unsigned int t = lane; t < visible_len; t += TALU_ATTN_WARP_SIZE) {
         const unsigned int actual_t = start_t + t;
-        const float v_sc = v_scales[actual_t * n_kv_heads + kv_head];
-        const unsigned long long value_index = (unsigned long long)actual_t * row_stride + head_offset + d;
-        partial += probs_row[t] * v_sc * (float)(value_cache[value_index]);
+        const float coeff = probs_row[t] * v_scales[actual_t * n_kv_heads + kv_head];
+        const unsigned long long value_index = (unsigned long long)actual_t * row_stride + head_offset + d_base;
+        #pragma unroll
+        for (unsigned int i = 0; i < TALU_ATTN_WEIGHTED_SUM_VEC; ++i) {
+            const unsigned int d = d_base + i;
+            if (d < head_dim) {
+                partial[i] += coeff * (float)(value_cache[value_index + i]);
+            }
+        }
     }
-    const float acc = talu_attn_warp_sum_f32(partial);
+    #pragma unroll
+    for (unsigned int i = 0; i < TALU_ATTN_WEIGHTED_SUM_VEC; ++i) {
+        partial[i] = talu_attn_warp_sum_f32(partial[i]);
+    }
     if (lane == 0) {
-        out[((unsigned long long)row * n_heads + head) * head_dim + d] = acc;
+        #pragma unroll
+        for (unsigned int i = 0; i < TALU_ATTN_WEIGHTED_SUM_VEC; ++i) {
+            const unsigned int d = d_base + i;
+            if (d < head_dim) {
+                out[((unsigned long long)row * n_heads + head) * head_dim + d] = partial[i];
+            }
+        }
     }
 }
 

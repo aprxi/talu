@@ -150,8 +150,8 @@ pub const MoEFFN = struct {
     kernel_name: ?[]const u8 = null,
 
     pub fn forward(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
-        // Dispatch to fused FFN+MoE path when internal norms are present.
-        // Qwen-style shared expert (no internal norms) is handled inline below.
+        // Dispatch to the fused FFN+MoE path when internal norms are present.
+        // Simpler shared-expert configurations without those norms are handled inline below.
         if (self.pre_ffn_norm_weight != null) {
             return self.forwardFusedMoE(input_tensor, output_tensor, scratch, matmul_scratch);
         }

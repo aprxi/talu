@@ -78,6 +78,31 @@ pub fn pointMappingFor(mappings: []const PointBenchMap, point: []const u8) ?[]co
     return null;
 }
 
+pub fn roleDimsFor(hints: *const PerfHints, bench_row: []const u8) ?RoleDims {
+    for (hints.role_dims) |dims| {
+        if (std.mem.eql(u8, dims.bench_row, bench_row)) return dims;
+    }
+    return null;
+}
+
+pub fn defaultRoleDimsFor(bench_row: []const u8) ?RoleDims {
+    return defaultRoleDimsForModel("qwen3_5", bench_row);
+}
+
+pub fn defaultRoleDimsForModel(model_id: []const u8, bench_row: []const u8) ?RoleDims {
+    const table = if (std.mem.eql(u8, model_id, "qwen3_5_4b"))
+        qwen3_5_4b_role_dims[0..]
+    else if (std.mem.eql(u8, model_id, "qwen3_5"))
+        qwen3_5_role_dims[0..]
+    else
+        return null;
+
+    for (table) |dims| {
+        if (std.mem.eql(u8, dims.bench_row, bench_row)) return dims;
+    }
+    return null;
+}
+
 pub fn writeJson(writer: anytype, hints: *const PerfHints) !void {
     try writer.writeAll("{\"bench_model\":");
     try writeJsonString(writer, hints.bench_model);
@@ -222,6 +247,31 @@ pub const qwen3_5_role_dims = [_]RoleDims{
     .{ .bench_row = "decode.final_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
 };
 
+pub const qwen3_5_4b_role_dims = [_]RoleDims{
+    .{ .bench_row = "prefill.attn_q", .tokens = 2048, .hidden = 2560, .out = 4096 },
+    .{ .bench_row = "prefill.attn_k", .tokens = 2048, .hidden = 2560, .out = 1024 },
+    .{ .bench_row = "prefill.attn_v", .tokens = 2048, .hidden = 2560, .out = 1024 },
+    .{ .bench_row = "prefill.attn_out", .tokens = 2048, .hidden = 4096, .out = 2560 },
+    .{ .bench_row = "prefill.ffn_gate", .tokens = 2048, .hidden = 2560, .out = 9216 },
+    .{ .bench_row = "prefill.ffn_down", .tokens = 2048, .hidden = 9216, .out = 2560 },
+    .{ .bench_row = "prefill.layer_attn_norm", .tokens = 2048, .hidden = 2560, .out = 2560 },
+    .{ .bench_row = "prefill.layer_ffn_norm", .tokens = 2048, .hidden = 2560, .out = 2560 },
+    .{ .bench_row = "prefill.final_norm", .tokens = 2048, .hidden = 2560, .out = 2560 },
+    .{ .bench_row = "decode.attn_q", .tokens = 1, .hidden = 2560, .out = 4096 },
+    .{ .bench_row = "decode.attn_k", .tokens = 1, .hidden = 2560, .out = 1024 },
+    .{ .bench_row = "decode.attn_v", .tokens = 1, .hidden = 2560, .out = 1024 },
+    .{ .bench_row = "decode.attn_out", .tokens = 1, .hidden = 4096, .out = 2560 },
+    .{ .bench_row = "decode.ffn_gate", .tokens = 1, .hidden = 2560, .out = 9216 },
+    .{ .bench_row = "decode.ffn_down", .tokens = 1, .hidden = 9216, .out = 2560 },
+    .{ .bench_row = "decode.lm_head_bf16", .tokens = 1, .hidden = 2560, .out = 248320 },
+    .{ .bench_row = "decode.lm_head_f16", .tokens = 1, .hidden = 2560, .out = 248320 },
+    .{ .bench_row = "decode.lm_head_f32", .tokens = 1, .hidden = 2560, .out = 248320 },
+    .{ .bench_row = "decode.lm_head_runtime_f32", .tokens = 1, .hidden = 2560, .out = 248320 },
+    .{ .bench_row = "decode.layer_attn_norm", .tokens = 1, .hidden = 2560, .out = 2560 },
+    .{ .bench_row = "decode.layer_ffn_norm", .tokens = 1, .hidden = 2560, .out = 2560 },
+    .{ .bench_row = "decode.final_norm", .tokens = 1, .hidden = 2560, .out = 2560 },
+};
+
 pub const qwen3_5_decode_point_mappings = [_]PointBenchMap{
     .{ .point = "attn.q", .bench_row = "decode.attn_q" },
     .{ .point = "attn.k", .bench_row = "decode.attn_k" },
@@ -289,6 +339,31 @@ test "pointMappingFor resolves known mapping" {
     };
     try std.testing.expectEqualStrings("prefill.ffn_gate", pointMappingFor(hints.prefill_point_mappings, "ffn.gate").?);
     try std.testing.expect(pointMappingFor(hints.prefill_point_mappings, "not_a_point") == null);
+}
+
+test "roleDimsFor resolves explicit model dims and defaults" {
+    const hints = PerfHints{
+        .bench_model = "demo",
+        .role_dims = qwen3_5_role_dims[0..2],
+    };
+    const explicit = roleDimsFor(&hints, "prefill.attn_q").?;
+    try std.testing.expectEqual(@as(usize, 14), explicit.tokens);
+    try std.testing.expectEqual(@as(usize, 1024), explicit.hidden);
+    try std.testing.expectEqual(@as(usize, 2048), explicit.out);
+
+    const fallback = defaultRoleDimsFor("decode.ffn_gate").?;
+    try std.testing.expectEqual(@as(usize, 1), fallback.tokens);
+    try std.testing.expectEqual(@as(usize, 1024), fallback.hidden);
+    try std.testing.expectEqual(@as(usize, 7168), fallback.out);
+
+    const exact = defaultRoleDimsForModel("qwen3_5_4b", "decode.ffn_gate").?;
+    try std.testing.expectEqual(@as(usize, 1), exact.tokens);
+    try std.testing.expectEqual(@as(usize, 2560), exact.hidden);
+    try std.testing.expectEqual(@as(usize, 9216), exact.out);
+
+    try std.testing.expect(roleDimsFor(&hints, "not_a_row") == null);
+    try std.testing.expect(defaultRoleDimsFor("not_a_row") == null);
+    try std.testing.expect(defaultRoleDimsForModel("not_a_model", "decode.ffn_gate") == null);
 }
 
 test "writeJson includes bench model and hidden rows" {

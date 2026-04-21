@@ -10,6 +10,29 @@ const transforms = @import("load/transforms.zig");
 
 const Tensor = tensor.Tensor;
 
+fn sliceNvfp4Rows(meta: tensor.Nvfp4Meta, row_start: usize, row_count: usize) !tensor.Nvfp4Meta {
+    const total_rows: usize = @intCast(meta.rows);
+    const scale_cols: usize = @intCast(meta.scale_cols);
+    if (row_count == 0 or scale_cols == 0) return error.InvalidShape;
+    if (row_start > total_rows or row_count > total_rows - row_start) return error.InvalidShape;
+
+    const scale_offset = std.math.mul(usize, row_start, scale_cols) catch return error.InvalidShape;
+    const scale_len = std.math.mul(usize, row_count, scale_cols) catch return error.InvalidShape;
+    if (meta.block_scales_len < scale_offset + scale_len) return error.InvalidShape;
+    const base_scales = meta.block_scales_data orelse return error.MissingScales;
+
+    return .{
+        .block_scales_data = base_scales + scale_offset,
+        .block_scales_len = scale_len,
+        .rows = @intCast(row_count),
+        .cols = meta.cols,
+        .packed_cols = meta.packed_cols,
+        .scale_cols = meta.scale_cols,
+        .group_size = meta.group_size,
+        .weight_global_scale = meta.weight_global_scale,
+    };
+}
+
 pub const GateUpLayout = enum {
     concat,
     interleaved,
@@ -388,6 +411,8 @@ fn buildFused3DMoEWeights(
     const gate_up_expert_biases_bytes = if (gate_up_3d.gaffine) |g| g.biases.len / num_experts else 0;
     const down_expert_scales_bytes = if (down_3d.gaffine) |g| g.scales.len / num_experts else 0;
     const down_expert_biases_bytes = if (down_3d.gaffine) |g| g.biases.len / num_experts else 0;
+    const gate_up_rows_per_expert = gate_up_out_dim;
+    const down_rows_per_expert = down_out_dim;
 
     var experts = try allocator.alloc(ExpertWeights, num_experts);
     errdefer allocator.free(experts);
@@ -408,6 +433,9 @@ fn buildFused3DMoEWeights(
                 .scales_dtype = g.scales_dtype,
             };
         }
+        if (gate_up_3d.nvfp4) |meta| {
+            gate_up_view.nvfp4 = try sliceNvfp4Rows(meta, e * gate_up_rows_per_expert, gate_up_rows_per_expert);
+        }
         if (down_3d.gaffine) |g| {
             down_view.gaffine = .{
                 .scales = g.scales[e * down_expert_scales_bytes ..][0..down_expert_scales_bytes],
@@ -415,6 +443,9 @@ fn buildFused3DMoEWeights(
                 .group_size = g.group_size,
                 .scales_dtype = g.scales_dtype,
             };
+        }
+        if (down_3d.nvfp4) |meta| {
+            down_view.nvfp4 = try sliceNvfp4Rows(meta, e * down_rows_per_expert, down_rows_per_expert);
         }
 
         experts[e] = .{
@@ -1117,4 +1148,119 @@ test "blockWeightsFromMap gated_delta rejects split in_proj missing in_proj_a" {
             .allocator = allocator,
         }),
     );
+}
+
+test "blockWeightsFromMap attention_mlp preserves NVFP4 metadata for fused 3D MoE experts" {
+    const allocator = std.testing.allocator;
+    var map = WeightMap{};
+    defer map.deinit(allocator);
+
+    var ln1_data = [_]f32{ 1, 1, 1, 1 };
+    var ln2_data = [_]f32{ 1, 1, 1, 1 };
+    var q_data = [_]f32{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12,
+        13, 14, 15, 16,
+    };
+    var k_data = q_data;
+    var v_data = q_data;
+    var o_data = q_data;
+    var router_data = [_]f32{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+    };
+
+    var gate_up_packed = [_]u8{
+        0x10, 0x32,
+        0x54, 0x76,
+        0x98, 0xBA,
+        0xDC, 0xFE,
+        0x11, 0x33,
+        0x55, 0x77,
+        0x99, 0xBB,
+        0xDD, 0xFF,
+    };
+    var gate_up_scales = [_]u8{
+        0x38, 0x39,
+        0x3A, 0x3B,
+        0x3C, 0x3D,
+        0x3E, 0x3F,
+    };
+    var down_packed = [_]u8{
+        0x21, 0x43,
+        0x65, 0x87,
+        0xA9, 0xCB,
+        0xED, 0x0F,
+        0x22, 0x44,
+        0x66, 0x88,
+        0xAA, 0xCC,
+        0xEE, 0x00,
+    };
+    var down_scales = [_]u8{
+        0x40, 0x41,
+        0x42, 0x43,
+        0x44, 0x45,
+        0x46, 0x47,
+    };
+
+    var ln1 = Tensor.view2DSlice(ln1_data[0..], 1, 4);
+    var ln2 = Tensor.view2DSlice(ln2_data[0..], 1, 4);
+    var q = Tensor.view2DSlice(q_data[0..], 4, 4);
+    var k = Tensor.view2DSlice(k_data[0..], 4, 4);
+    var v = Tensor.view2DSlice(v_data[0..], 4, 4);
+    var o = Tensor.view2DSlice(o_data[0..], 4, 4);
+    var router = Tensor.view2DSlice(router_data[0..], 2, 4);
+    var gate_up = Tensor.view(gate_up_packed[0..].ptr, &.{ 2, 4, 4 }, .u8, gate_up_packed.len);
+    gate_up.nvfp4 = .{
+        .block_scales_data = gate_up_scales[0..].ptr,
+        .block_scales_len = gate_up_scales.len,
+        .rows = 8,
+        .cols = 4,
+        .packed_cols = 2,
+        .scale_cols = 1,
+        .group_size = 4,
+        .weight_global_scale = 1.0,
+    };
+    var down = Tensor.view(down_packed[0..].ptr, &.{ 2, 4, 4 }, .u8, down_packed.len);
+    down.nvfp4 = .{
+        .block_scales_data = down_scales[0..].ptr,
+        .block_scales_len = down_scales.len,
+        .rows = 8,
+        .cols = 4,
+        .packed_cols = 2,
+        .scale_cols = 1,
+        .group_size = 4,
+        .weight_global_scale = 2.0,
+    };
+
+    try map.put(allocator, "input_layernorm.weight", &ln1);
+    try map.put(allocator, "post_attention_layernorm.weight", &ln2);
+    try map.put(allocator, "self_attn.q_proj.weight", &q);
+    try map.put(allocator, "self_attn.k_proj.weight", &k);
+    try map.put(allocator, "self_attn.v_proj.weight", &v);
+    try map.put(allocator, "self_attn.o_proj.weight", &o);
+    try map.put(allocator, "mlp.gate.weight", &router);
+    try map.put(allocator, "mlp.experts.gate_up_proj", &gate_up);
+    try map.put(allocator, "mlp.experts.down_proj", &down);
+
+    const block = try blockWeightsFromMap(&map, .attention_mlp, .{
+        .allocator = allocator,
+        .num_experts = 2,
+        .experts_per_token = 1,
+    });
+
+    try std.testing.expect(block == .attention_mlp);
+    const moe = block.attention_mlp.moe_weights orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), moe.experts.len);
+    const expert0_gate = moe.experts[0].gate_up_proj orelse return error.TestExpectedEqual;
+    const expert1_down = moe.experts[1].down_proj;
+    const gate_meta = expert0_gate.nvfp4 orelse return error.TestExpectedEqual;
+    const down_meta = expert1_down.nvfp4 orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 4), gate_meta.rows);
+    try std.testing.expectEqual(@as(i64, 4), down_meta.rows);
+    try std.testing.expectEqual(@as(usize, 4), gate_meta.block_scales_len);
+    try std.testing.expectEqual(@as(usize, 4), down_meta.block_scales_len);
+    try std.testing.expectEqualSlices(u8, gate_up_scales[0..4], gate_meta.block_scales_data.?[0..4]);
+    try std.testing.expectEqualSlices(u8, down_scales[4..8], down_meta.block_scales_data.?[0..4]);
 }

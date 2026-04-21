@@ -74,13 +74,13 @@ const AttentionPath = engine_types.AttentionPath;
 const gqa_prefill_f16_dynamic_smem_bytes: u32 = 65536;
 
 // --- Compute ops from engine_ops.zig ---
-const engine_ops = @import("../operators/_ops_impl.zig");
+const engine_ops = @import("../operators/root.zig");
 
 // --- Mixer functions from engine_mixers.zig ---
-const engine_mixers = @import("../operators/_mixers_impl.zig");
+const engine_mixers = @import("../operators/root.zig");
 
 // --- Utilities from engine_weights.zig ---
-const engine_weights = @import("../weights/_weights_impl.zig");
+const engine_weights = @import("../weights/root.zig");
 const bufferSlice = engine_weights.bufferSlice;
 
 const ResolvedAttentionShape = struct {
@@ -138,7 +138,7 @@ fn resolveAttentionShapeForInstruction(
     };
 }
 
-pub fn emitLayerProgramTracePoint(
+fn emitLayerProgramTracePoint(
     ctx: *LayerProgramExecutionContext,
     point: trace.TracePoint,
     shape: [4]u32,
@@ -254,7 +254,7 @@ pub fn emitLayerProgramTracePoint(
     );
 }
 
-pub fn inferNormTracePoint(layer: *const BlockRuntimeLayer, op_index: usize) trace.TracePoint {
+fn inferNormTracePoint(layer: *const BlockRuntimeLayer, op_index: usize) trace.TracePoint {
     const compiled = layer.compiled_plan orelse return .layer_ffn_norm;
     if (op_index + 1 < compiled.plan.instructions.len) {
         var idx = op_index + 1;
@@ -271,7 +271,7 @@ pub fn inferNormTracePoint(layer: *const BlockRuntimeLayer, op_index: usize) tra
     return .layer_ffn_norm;
 }
 
-pub fn layerProgramStateBlocksForInstruction(
+fn layerProgramStateBlocksForInstruction(
     insn: *const runtime_contract.Instruction,
     ctx: *LayerProgramExecutionContext,
 ) !LayerProgramInstructionStateBlocks {
@@ -291,11 +291,11 @@ pub fn layerProgramStateBlocksForInstruction(
     return blocks;
 }
 
-pub fn bufferFromTensorHandle(handle: runtime_contract.TensorHandle) *compute.cuda.Buffer {
+fn bufferFromTensorHandle(handle: runtime_contract.TensorHandle) *compute.cuda.Buffer {
     return @ptrCast(@alignCast(handle.ptr));
 }
 
-pub fn instructionIoSlices(
+fn instructionIoSlices(
     insn: *const runtime_contract.Instruction,
     registers: []runtime_contract.TensorHandle,
 ) !struct { inputs: []const runtime_contract.TensorHandle, outputs: []const runtime_contract.TensorHandle } {
@@ -307,7 +307,7 @@ pub fn instructionIoSlices(
     };
 }
 
-pub fn instructionWeightSlice(
+fn instructionWeightSlice(
     insn: *const runtime_contract.Instruction,
     registers: []runtime_contract.TensorHandle,
 ) ![]const runtime_contract.TensorHandle {
@@ -318,7 +318,7 @@ pub fn instructionWeightSlice(
     return weights;
 }
 
-pub fn layerProgramInstructionHandleCapacity(plan: *const runtime_contract.ExecutionPlan) usize {
+fn layerProgramInstructionHandleCapacity(plan: *const runtime_contract.ExecutionPlan) usize {
     var max_handles: usize = 0;
     for (plan.instructions) |insn| {
         const handle_count = insn.inputs.len + insn.outputs.len + insn.weights.len;
@@ -327,21 +327,21 @@ pub fn layerProgramInstructionHandleCapacity(plan: *const runtime_contract.Execu
     return max_handles;
 }
 
-pub fn deviceTensorFromWeightHandle(handle: runtime_contract.TensorHandle) *const DeviceTensor {
+fn deviceTensorFromWeightHandle(handle: runtime_contract.TensorHandle) *const DeviceTensor {
     return @ptrCast(@alignCast(handle.ptr));
 }
 
-pub fn optionalDeviceTensorFromWeightHandle(handle: runtime_contract.TensorHandle) ?*const DeviceTensor {
+fn optionalDeviceTensorFromWeightHandle(handle: runtime_contract.TensorHandle) ?*const DeviceTensor {
     const value: *const DeviceTensor = @ptrCast(@alignCast(handle.ptr));
     if (value == &missing_device_tensor) return null;
     return value;
 }
 
-pub fn linearWeightFromWeightHandle(handle: runtime_contract.TensorHandle) *const LinearWeight {
+fn linearWeightFromWeightHandle(handle: runtime_contract.TensorHandle) *const LinearWeight {
     return @ptrCast(@alignCast(handle.ptr));
 }
 
-pub fn decodeResidualScaleFromParams(params: []const runtime_contract.ParamBlock) !layer_ops.ResidualScale {
+fn decodeResidualScaleFromParams(params: []const runtime_contract.ParamBlock) !layer_ops.ResidualScale {
     const p = try runtime_contract.paramAs(runtime_contract.ResidualAddParam, params, .residual_add);
     return switch (p.scale_tag) {
         0 => .one,
@@ -351,7 +351,7 @@ pub fn decodeResidualScaleFromParams(params: []const runtime_contract.ParamBlock
     };
 }
 
-pub fn requireLayerProgramRuntimeState(
+fn requireLayerProgramRuntimeState(
     ctx: *LayerProgramExecutionContext,
     insn: *const runtime_contract.Instruction,
     state_blocks: []const runtime_contract.StateBlockHandle,
@@ -363,7 +363,7 @@ pub fn requireLayerProgramRuntimeState(
     return ctx.layer;
 }
 
-pub fn requireStateValue(
+fn requireStateValue(
     comptime T: type,
     state_blocks: []const runtime_contract.StateBlockHandle,
     state_id: u8,
@@ -377,7 +377,7 @@ pub fn requireStateValue(
     return value;
 }
 
-pub fn requireAttentionRuntimeBinding(state: *const KvRuntimeState, layer_index: usize) !*LayerAttentionRuntime {
+fn requireAttentionRuntimeBinding(state: *const KvRuntimeState, layer_index: usize) !*LayerAttentionRuntime {
     if (layer_index >= state.block_runtime.blocks.len) {
         log.warn("inference", "requireAttentionRuntimeBinding OOB", .{
             .layer_index = layer_index,
@@ -390,17 +390,17 @@ pub fn requireAttentionRuntimeBinding(state: *const KvRuntimeState, layer_index:
     return state.block_runtime.blocks[layer_index].attention_binding orelse error.InvalidStateDescriptorBinding;
 }
 
-pub fn requireShortConvRuntimeBinding(state: *const ShortConvRuntimeState, layer_index: usize) !*ShortConvBlockRuntime {
+fn requireShortConvRuntimeBinding(state: *const ShortConvRuntimeState, layer_index: usize) !*ShortConvBlockRuntime {
     if (layer_index >= state.block_runtime.blocks.len) return error.InvalidInstructionIndex;
     return state.block_runtime.blocks[layer_index].shortconv_binding orelse error.InvalidStateDescriptorBinding;
 }
 
-pub fn requireGatedDeltaRuntimeBinding(state: *const GatedDeltaRuntimeState, layer_index: usize) !*GatedDeltaBlockRuntime {
+fn requireGatedDeltaRuntimeBinding(state: *const GatedDeltaRuntimeState, layer_index: usize) !*GatedDeltaBlockRuntime {
     if (layer_index >= state.block_runtime.blocks.len) return error.InvalidInstructionIndex;
     return state.block_runtime.blocks[layer_index].gated_delta_binding orelse error.InvalidStateDescriptorBinding;
 }
 
-pub fn instructionParams(
+fn instructionParams(
     insn: *const runtime_contract.Instruction,
     compiled: *const runtime_contract.CompiledPlan,
     storage: *[1]runtime_contract.ParamBlock,
@@ -411,7 +411,7 @@ pub fn instructionParams(
     return storage[0..1];
 }
 
-pub fn tensorViewDescForCudaBuffer() runtime_contract.TensorViewDesc {
+fn tensorViewDescForCudaBuffer() runtime_contract.TensorViewDesc {
     return .{
         .dtype = .f32,
         .rank = 0,
@@ -421,7 +421,7 @@ pub fn tensorViewDescForCudaBuffer() runtime_contract.TensorViewDesc {
     };
 }
 
-pub fn layerProgramWeightHandlePtr(ctx: *LayerProgramExecutionContext, slot_idx: usize) !*anyopaque {
+fn layerProgramWeightHandlePtr(ctx: *LayerProgramExecutionContext, slot_idx: usize) !*anyopaque {
     if (ctx.op_index + 1 >= ctx.layer.instruction_weight_offsets.len) return error.InvalidInstructionBinding;
     const start: usize = ctx.layer.instruction_weight_offsets[ctx.op_index];
     const end: usize = ctx.layer.instruction_weight_offsets[ctx.op_index + 1];
@@ -433,7 +433,7 @@ pub fn layerProgramWeightHandlePtr(ctx: *LayerProgramExecutionContext, slot_idx:
     return ctx.layer.instruction_weight_ptrs[idx] orelse error.MissingWeight;
 }
 
-pub fn buildLayerProgramInstructionHandles(
+fn buildLayerProgramInstructionHandles(
     self: anytype,
     insn: *const runtime_contract.Instruction,
     ctx: *LayerProgramExecutionContext,
@@ -485,7 +485,7 @@ pub fn buildLayerProgramInstructionHandles(
     };
 }
 
-pub fn recordLayerProgramDispatch(self: anytype, opcode: opcode_map.Opcode) void {
+fn recordLayerProgramDispatch(self: anytype, opcode: opcode_map.Opcode) void {
     const opcode_idx = @intFromEnum(opcode);
     self.layer_program_dispatch_total[opcode_idx] +%= 1;
     if (enable_dispatch_observability) {
@@ -493,12 +493,12 @@ pub fn recordLayerProgramDispatch(self: anytype, opcode: opcode_map.Opcode) void
     }
 }
 
-pub fn prefillDispatchDelta(self: anytype, opcode: opcode_map.Opcode) u64 {
+fn prefillDispatchDelta(self: anytype, opcode: opcode_map.Opcode) u64 {
     const opcode_idx = @intFromEnum(opcode);
     return self.layer_program_dispatch_total[opcode_idx] - self.prefill_dispatch_window_start[opcode_idx];
 }
 
-pub fn prefillDispatchTotal(self: anytype) u64 {
+fn prefillDispatchTotal(self: anytype) u64 {
     var total: u64 = 0;
     for (0..self.layer_program_dispatch_total.len) |idx| {
         total += self.layer_program_dispatch_total[idx] - self.prefill_dispatch_window_start[idx];
@@ -506,7 +506,7 @@ pub fn prefillDispatchTotal(self: anytype) u64 {
     return total;
 }
 
-pub fn initCpuRuntimeRopeHandles(self: anytype) !void {
+fn initCpuRuntimeRopeHandles(self: anytype) !void {
     if (self.loaded.position_embeddings != null) return;
     if (self.rope_dim == 0) return;
 
@@ -551,7 +551,7 @@ pub fn initCpuRuntimeRopeHandles(self: anytype) !void {
     }
 }
 
-pub fn assignCpuRuntimeRopeToAttentionFallbacks(self: anytype) void {
+fn assignCpuRuntimeRopeToAttentionFallbacks(self: anytype) void {
     for (self.block_runtime.blocks) |*layer| {
         const block = layer.attention_binding orelse continue;
         if (block.cpu_kernel) |*kernel| {
@@ -563,7 +563,7 @@ pub fn assignCpuRuntimeRopeToAttentionFallbacks(self: anytype) void {
     }
 }
 
-fn residualScaleFactor(self: anytype, scale: layer_ops.ResidualScale) f32 {
+pub fn residualScaleFactor(self: anytype, scale: layer_ops.ResidualScale) f32 {
     return switch (scale) {
         .one => 1.0,
         .residual_multiplier => self.loaded.config.residual_multiplier,
@@ -571,7 +571,7 @@ fn residualScaleFactor(self: anytype, scale: layer_ops.ResidualScale) f32 {
     };
 }
 
-fn runResidualAddRmsnormRowsStrideAware(
+pub fn runResidualAddRmsnormRowsStrideAware(
     self: anytype,
     fused_fn: compute.cuda.Function,
     residual_out: *compute.cuda.Buffer,
@@ -659,7 +659,7 @@ fn runResidualAddRmsnormRowsStrideAware(
     );
 }
 
-fn tryFuseResidualAddIntoNextRmsnorm(
+pub fn tryFuseResidualAddIntoNextRmsnorm(
     self: anytype,
     insn: *const runtime_contract.Instruction,
     registers: []runtime_contract.TensorHandle,
@@ -700,7 +700,7 @@ fn tryFuseResidualAddIntoNextRmsnorm(
     return true;
 }
 
-pub fn layerProgramNormAdapter(
+fn layerProgramNormAdapter(
     self: anytype,
     _: *BlockRuntimeLayer,
     insn: *const runtime_contract.Instruction,
@@ -742,7 +742,7 @@ pub fn layerProgramNormAdapter(
     self.nvfp4_phase_counters.recordRmsnorm(rmsnorm_elapsed_ns);
 }
 
-pub fn layerProgramAttentionAdapter(
+fn layerProgramAttentionAdapter(
     self: anytype,
     layer: *BlockRuntimeLayer,
     insn: *const runtime_contract.Instruction,
@@ -960,7 +960,7 @@ pub fn layerProgramAttentionAdapter(
     };
 }
 
-pub fn layerProgramShortConvAdapter(
+fn layerProgramShortConvAdapter(
     self: anytype,
     layer: *BlockRuntimeLayer,
     insn: *const runtime_contract.Instruction,
@@ -1069,7 +1069,7 @@ pub fn layerProgramShortConvAdapter(
     }
 }
 
-pub fn layerProgramGatedDeltaAdapter(
+fn layerProgramGatedDeltaAdapter(
     self: anytype,
     layer: *BlockRuntimeLayer,
     insn: *const runtime_contract.Instruction,
@@ -1125,7 +1125,7 @@ pub fn layerProgramGatedDeltaAdapter(
     _ = layer;
 }
 
-pub fn layerProgramSwiGluAdapter(
+fn layerProgramSwiGluAdapter(
     self: anytype,
     _: *BlockRuntimeLayer,
     insn: *const runtime_contract.Instruction,
@@ -1167,7 +1167,7 @@ pub fn layerProgramSwiGluAdapter(
     );
 }
 
-pub fn layerProgramMoEAdapter(
+fn layerProgramMoEAdapter(
     self: anytype,
     layer: *BlockRuntimeLayer,
     insn: *const runtime_contract.Instruction,
@@ -1183,7 +1183,7 @@ pub fn layerProgramMoEAdapter(
     try engine_mixers.runMoEFusedStep(self, input, ctx.active_rows_u32, moe_ref, output);
 }
 
-fn standaloneLayerScalarOutputScale(self: anytype, ctx: *LayerProgramExecutionContext) f32 {
+pub fn standaloneLayerScalarOutputScale(self: anytype, ctx: *LayerProgramExecutionContext) f32 {
     if (comptime @hasField(@TypeOf(self.*), "enable_layer_scalars")) {
         if (!self.enable_layer_scalars) return 1.0;
     } else {
@@ -1201,7 +1201,7 @@ fn standaloneLayerScalarOutputScale(self: anytype, ctx: *LayerProgramExecutionCo
     return scalars[ctx.layer_index];
 }
 
-pub fn layerProgramResidualAddAdapter(
+fn layerProgramResidualAddAdapter(
     self: anytype,
     insn: *const runtime_contract.Instruction,
     registers: []runtime_contract.TensorHandle,
@@ -1240,7 +1240,7 @@ pub fn layerProgramResidualAddAdapter(
     self.nvfp4_phase_counters.recordResidualAdd(residual_add_elapsed_ns);
 }
 
-pub fn dispatchLayerProgramInstruction(
+fn dispatchLayerProgramInstruction(
     self: anytype,
     insn: *const runtime_contract.Instruction,
     ctx: *LayerProgramExecutionContext,
@@ -1289,7 +1289,7 @@ pub fn dispatchLayerProgramInstruction(
     );
 }
 
-pub fn tryExecuteLayerProgram(
+fn tryExecuteLayerProgram(
     self: anytype,
     layer: *BlockRuntimeLayer,
     slot_index: usize,
@@ -1457,7 +1457,7 @@ pub fn tryExecuteLayerProgram(
     return exec_ctx.input_view;
 }
 
-pub fn runAttentionContext(
+fn runAttentionContext(
     self: anytype,
     cfg: *const LayerAttentionExecConfig,
     q_stage: *const compute.cuda.Buffer,
@@ -1812,7 +1812,7 @@ pub fn runAttentionContext(
     }
 }
 
-fn finishAttentionRecord(self: anytype, path: AttentionPath, start_ns: i128, is_causal: bool) AttentionPath {
+pub fn finishAttentionRecord(self: anytype, path: AttentionPath, start_ns: i128, is_causal: bool) AttentionPath {
     const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
     const elapsed_ns: u64 = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
     const SelfType = @TypeOf(self.*);
@@ -1824,7 +1824,7 @@ fn finishAttentionRecord(self: anytype, path: AttentionPath, start_ns: i128, is_
     return path;
 }
 
-pub fn initKernelFunctions(self: anytype) !void {
+fn initKernelFunctions(self: anytype) !void {
     if (!self.device.supportsModuleLaunch()) return;
 
     try self.kernel_registry.loadEmbeddedModule(compute.cuda.vector_add.embedded_module);
@@ -1861,7 +1861,7 @@ pub fn initKernelFunctions(self: anytype) !void {
 /// Pre-dequantize all gaffine_u8 weights to persistent F16 and I8 device buffers.
 /// F16 cache: eliminates per-prefill dequant kernel overhead.
 /// I8 cache: enables cuBLAS INT8 tensor core GEMM for prefill.
-pub fn warmupDequantF16Cache(self: anytype) !void {
+fn warmupDequantF16Cache(self: anytype) !void {
     // Resolve INT8 GEMM helper kernels (optional — graceful degradation to F16 path).
     if (self.kernel_registry.resolveFunction("quantize_f32_to_i8", "talu_quantize_f32_to_i8")) |resolved| {
         self.quantize_f32_to_i8_function = resolved.function;
@@ -2457,7 +2457,7 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     }
 }
 
-pub fn resolveRequiredKernels(self: anytype) !void {
+fn resolveRequiredKernels(self: anytype) !void {
     for (required_kernels) |kernel| {
         const resolved = self.kernel_registry.resolveFunction(
             kernel.op_name,
@@ -2474,7 +2474,7 @@ pub fn resolveRequiredKernels(self: anytype) !void {
     }
 }
 
-pub fn assignResolvedKernel(
+fn assignResolvedKernel(
     self: anytype,
     slot: KernelSlot,
     resolved: compute.cuda.registry.ResolvedFunction,
@@ -2935,7 +2935,7 @@ pub fn assignResolvedKernel(
     }
 }
 
-pub fn tryLoadSideloadModule(self: anytype) !bool {
+fn tryLoadSideloadModule(self: anytype) !bool {
     const base_url_raw = std.process.getEnvVarOwned(self.allocator, compute.cuda.sideload.kernel_base_url_env) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return false,
         else => return err,

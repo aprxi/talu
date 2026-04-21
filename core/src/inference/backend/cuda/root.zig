@@ -36,5 +36,6 @@ pub const program = @import("program/root.zig");
 pub const operators = @import("operators/root.zig");
 pub const weights = @import("weights/root.zig");
 pub const engine_parts = @import("engine/root.zig");
+pub const per_layer_branch = @import("per_layer_branch.zig");
 
 pub const primitive_capabilities = compute.cuda.capabilities.support;

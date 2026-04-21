@@ -140,6 +140,13 @@ def load_config(
         if isinstance(val, str):
             config[key] = [v.strip() for v in val.split(",")]
 
+    # Treat an explicit model_uri override as an exact model selection.
+    # The user can still opt into a precision matrix by explicitly setting
+    # precision=..., but defaults must not synthesize non-existent URIs like
+    # Qwen/...-TQ4-TQ8 from an already-qualified model URI.
+    if "model_uri" in explicit_keys and "precision" not in explicit_keys:
+        config["precision"] = ["original"]
+
     # Normalize max_reasoning_tokens: comma-separated → list of ints.
     mrt = config.get("max_reasoning_tokens")
     if isinstance(mrt, str):

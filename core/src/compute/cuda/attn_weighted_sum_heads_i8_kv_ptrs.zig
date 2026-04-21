@@ -11,6 +11,7 @@ const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_attn_weighted_sum_heads_i8_kv_ptrs";
 pub const op_name: []const u8 = "attn_weighted_sum_heads_i8_kv_ptrs";
+const dims_per_warp: u32 = 4;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -65,7 +66,7 @@ pub fn runWithFunction(
 
     const block_x: u32 = 128;
     try launch_mod.launchWithFamily(device, function, .{
-        .grid_x = ceilDiv(head_dim, warpsPerBlock(block_x)),
+        .grid_x = ceilDiv(head_dim, warpsPerBlock(block_x) * dims_per_warp),
         .grid_y = n_heads,
         .grid_z = batch_rows,
         .block_x = block_x,

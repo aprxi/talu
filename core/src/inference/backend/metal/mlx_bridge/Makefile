@@ -1,5 +1,5 @@
 README ?= ../../../../../../README.md
-MODEL ?= Qwen/Qwen3.5-2B
+MODEL ?= model/id
 TOKENS ?= 120
 WARMUP ?= 1
 SEED ?= 42

@@ -54,41 +54,43 @@ from scenario import (
 console = Console()
 
 
+def _family_suffix_sort_key(suffix: str) -> tuple[object, ...]:
+    """Sort perf family suffixes numerically when they encode shape/batch."""
+    shape_match = re.fullmatch(r"(?P<a>\d+)(?:x(?P<b>\d+))?(?:b(?P<c>\d+))?", suffix)
+    if shape_match:
+        first = int(shape_match.group("a"))
+        second = int(shape_match.group("b") or "0")
+        batch = int(shape_match.group("c") or "0")
+        return (0, first, second, batch)
+    return (1, suffix)
+
+
 # ---------------------------------------------------------------------------
 # Version & hardware detection
 # ---------------------------------------------------------------------------
 
 
 def _infer_perf_shape(scenario_name: str) -> tuple[int, int] | None:
-    """Infer (token_budget, async in-flight) from tg*/pp* scenario names."""
-    prefix = None
-    for candidate in ("responses/perf/tg", "responses/perf/pp"):
-        if scenario_name.startswith(candidate):
-            prefix = candidate
-            break
-    if prefix is None:
+    """Infer (sequence_budget, async in-flight) from perf scenario names."""
+    mixed_match = re.fullmatch(
+        r"responses/perf/pptg(?P<prompt>\d+)x(?P<output>\d+)(?:b(?P<batch>\d+))?",
+        scenario_name,
+    )
+    if mixed_match:
+        prompt_tokens = int(mixed_match.group("prompt"))
+        output_tokens = int(mixed_match.group("output"))
+        batch = int(mixed_match.group("batch") or "1")
+        return prompt_tokens + output_tokens, batch if batch > 0 else 1
+
+    simple_match = re.fullmatch(
+        r"responses/perf/(?P<kind>tg|pp)(?P<tokens>\d+)(?:b(?P<batch>\d+))?",
+        scenario_name,
+    )
+    if simple_match is None:
         return None
 
-    suffix = scenario_name[len(prefix):]
-    if not suffix:
-        return None
-
-    i = 0
-    while i < len(suffix) and suffix[i].isdigit():
-        i += 1
-    if i == 0:
-        return None
-    token_budget = int(suffix[:i])
-    if i == len(suffix):
-        return token_budget, 1
-    if suffix[i] != "b":
-        return None
-
-    batch_part = suffix[i + 1:]
-    if not batch_part or not batch_part.isdigit():
-        return None
-
-    batch = int(batch_part)
+    token_budget = int(simple_match.group("tokens"))
+    batch = int(simple_match.group("batch") or "1")
     return token_budget, batch if batch > 0 else 1
 
 
@@ -179,7 +181,7 @@ def cmd_list() -> None:
         for fam, members in sorted(families.items()):
             suffixes = sorted(
                 (c.name.rsplit("/", 1)[-1][len(fam):] for c in members),
-                key=lambda s: (0, int(s)) if s.isdigit() else (1, s),
+                key=_family_suffix_sort_key,
             )
             label = f"{fam}{{{','.join(suffixes)}}}"
             desc = members[0].description
@@ -334,8 +336,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             config["precision"] = ["original"]
         args.rounds = 1
 
-    # For tg*/pp* perf scenarios, align scheduler capacity and sequence cap
-    # with the scenario shape unless explicitly overridden by user/config.
+    # For perf scenarios with shape-encoded names, align scheduler capacity and
+    # sequence cap with the scenario envelope unless explicitly overridden.
     tg_shape = _infer_perf_shape(args.scenario)
     if tg_shape is not None:
         tg_tokens, auto_batch = tg_shape
@@ -495,6 +497,10 @@ def print_report(
     console.print(f"  [dim]{' · '.join(param_parts)}[/]")
     console.print()
 
+    if _uses_combined_model_table(results):
+        _print_combined_model_table(console, scenario_name, results)
+        return
+
     # -- Group results by model, then by quant --
     by_model: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
     for r in results:
@@ -502,6 +508,179 @@ def print_report(
 
     for model, scheme_groups in by_model.items():
         _print_model_table(console, model, scheme_groups)
+
+
+def _uses_combined_model_table(results: list[dict]) -> bool:
+    """Use one shared perf table when multiple exact model URIs are present."""
+    model_uris = {r.get("model_uri", r["model"]) for r in results}
+    return len(model_uris) > 1
+
+
+def _print_combined_model_table(
+    console: Console,
+    scenario_name: str,
+    rows: list[dict],
+) -> None:
+    """Print one perf table across exact model URIs."""
+    col_defs = [
+        ("Model", "", False),
+        ("Size", "", True),
+        ("tok", "Prefill", False),
+        ("avg t/s", "Prefill", True),
+        ("min", "Prefill", True),
+        ("max", "Prefill", True),
+        ("tok", "Generate", True),
+        ("avg t/s", "Generate", True),
+        ("min", "Generate", True),
+        ("max", "Generate", True),
+        ("avg", "TTFT", True),
+        ("min", "TTFT", True),
+        ("max", "TTFT", True),
+    ]
+    gap_inner = 2
+    gap_group = 5
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        model_uri = row.get("model_uri", row["model"])
+        grouped.setdefault(model_uri, []).append(row)
+
+    data_rows: list[list[str]] = []
+    for model_uri, model_rows in grouped.items():
+        mi: dict = model_rows[0].get("model_info", {}) or {}
+        fs = mi.get("file_size_bytes", 0)
+        if fs >= 1 << 30:
+            size_str = f"{fs / (1 << 30):.1f} GB"
+        elif fs > 0:
+            size_str = f"{fs / (1 << 20):.0f} MB"
+        else:
+            size_str = "—"
+        rates = [r["engine_tok_s"] for r in model_rows if r["engine_tok_s"] > 0]
+        in_tok = str(model_rows[0].get("input_tokens", 0))
+        out_tok = str(model_rows[0].get("output_tokens", 0))
+        if rates:
+            avg = f"{sum(rates) / len(rates):.1f}"
+            mn = f"{min(rates):.1f}"
+            mx = f"{max(rates):.1f}"
+        else:
+            avg = mn = mx = "—"
+        prefill_rates = [r["prefill_tok_s"] for r in model_rows if r.get("prefill_tok_s", 0) > 0]
+        if prefill_rates:
+            prefill_avg = f"{sum(prefill_rates)/len(prefill_rates):.1f}"
+            prefill_mn = f"{min(prefill_rates):.1f}"
+            prefill_mx = f"{max(prefill_rates):.1f}"
+        else:
+            prefill_avg = prefill_mn = prefill_mx = "—"
+        ttft_vals = [r["ttft_ms"] for r in model_rows if r.get("ttft_ms", 0) > 0]
+        if ttft_vals:
+            ttft_avg = f"{sum(ttft_vals)/len(ttft_vals):.0f}ms"
+            ttft_mn = f"{min(ttft_vals):.0f}ms"
+            ttft_mx = f"{max(ttft_vals):.0f}ms"
+        else:
+            ttft_avg = ttft_mn = ttft_mx = "—"
+        data_rows.append([
+            model_uri,
+            size_str,
+            in_tok,
+            prefill_avg,
+            prefill_mn,
+            prefill_mx,
+            out_tok,
+            avg,
+            mn,
+            mx,
+            ttft_avg,
+            ttft_mn,
+            ttft_mx,
+        ])
+
+    gaps = []
+    for i in range(1, len(col_defs)):
+        gaps.append(gap_group if col_defs[i][1] != col_defs[i - 1][1] else gap_inner)
+
+    def join_parts(parts: list[str]) -> str:
+        out = parts[0]
+        for i, p in enumerate(parts[1:]):
+            out += " " * gaps[i] + p
+        return out
+
+    widths = [len(cd[0]) for cd in col_defs]
+    for row in data_rows:
+        for i, val in enumerate(row):
+            widths[i] = max(widths[i], len(val))
+
+    group_ranges: list[tuple[str, int, int]] = []
+    cur_group = col_defs[0][1]
+    cur_start = 0
+    for i in range(1, len(col_defs)):
+        g = col_defs[i][1]
+        if g != cur_group:
+            group_ranges.append((cur_group, cur_start, i - 1))
+            cur_group = g
+            cur_start = i
+    group_ranges.append((cur_group, cur_start, len(col_defs) - 1))
+
+    for name, start, end in group_ranges:
+        if not name:
+            continue
+        label_width = len(name)
+        inner_gaps = sum(gaps[start:end]) if end > start else 0
+        span_width = sum(widths[start:end + 1]) + inner_gaps
+        if label_width > span_width:
+            widths[start] += label_width - span_width
+
+    group_parts: list[str] = []
+    for name, start, end in group_ranges:
+        inner_gaps = sum(gaps[start:end]) if end > start else 0
+        w = sum(widths[start:end + 1]) + inner_gaps
+        if name:
+            side = (w - len(name)) // 2
+            span = " " * side + name + " " * (w - side - len(name))
+            group_parts.append(span)
+        else:
+            group_parts.append(" " * w)
+    group_line_parts: list[str] = []
+    for idx, (_, _, end) in enumerate(group_ranges):
+        group_line_parts.append(group_parts[idx])
+        if idx < len(group_ranges) - 1:
+            group_line_parts.append(" " * gaps[end])
+    group_line = "".join(group_line_parts)
+
+    header_parts = [
+        f"{cd[0]:>{w}}" if cd[2] else f"{cd[0]:<{w}}"
+        for cd, w in zip(col_defs, widths)
+    ]
+    header_line = join_parts(header_parts)
+    sep_line = join_parts(["─" * w for w in widths])
+
+    content_lines = [
+        f"[bold]{group_line}[/]",
+        f"[dim]{header_line}[/]",
+        f"[dim]{sep_line}[/]",
+    ]
+    for row in data_rows:
+        parts: list[str] = []
+        for i, (val, w) in enumerate(zip(row, widths)):
+            cell = f"{val:>{w}}" if col_defs[i][2] else f"{val:<{w}}"
+            if i == 0:
+                cell = f"[cyan bold]{cell}[/]"
+            elif i in (3, 7):
+                cell = f"[green bold]{cell}[/]"
+            elif i in (4, 5, 8, 9):
+                cell = f"[dim]{cell}[/]"
+            parts.append(cell)
+        content_lines.append(join_parts(parts))
+
+    panel = Panel(
+        "\n".join(content_lines),
+        title=f"[bold]{scenario_name}[/bold]",
+        title_align="left",
+        border_style="blue",
+        padding=(0, 1),
+        expand=False,
+    )
+    console.print(panel)
+    console.print()
 
 
 def _print_model_table(

@@ -38,7 +38,7 @@ const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 
 // --- Weight upload functions from engine_weights.zig ---
-const engine_weights = @import("../weights/_weights_impl.zig");
+const engine_weights = @import("../weights/root.zig");
 const uploadLinearWeight = engine_weights.uploadLinearWeight;
 const uploadLinearWeightWithContext = engine_weights.uploadLinearWeightWithContext;
 const uploadTensor = engine_weights.uploadTensor;
@@ -457,25 +457,34 @@ pub const ProjectionPath = enum {
 pub const Nvfp4RouteKind = enum {
     native_cublaslt,
     bf16_fallback,
-    small_rows_matvec,
-    fused_qkv,
-    fused_gate_up,
+    small_rows_nvfp4_matvec,
+    small_rows_i8_matvec,
+    fused_qkv_custom,
+    fused_qkv_native_cublaslt,
+    fused_gate_up_custom,
+    fused_gate_up_native_cublaslt,
 };
 
 pub const Nvfp4RouteCounters = struct {
     native_cublaslt: u64 = 0,
     bf16_fallback: u64 = 0,
-    small_rows_matvec: u64 = 0,
-    fused_qkv: u64 = 0,
-    fused_gate_up: u64 = 0,
+    small_rows_nvfp4_matvec: u64 = 0,
+    small_rows_i8_matvec: u64 = 0,
+    fused_qkv_custom: u64 = 0,
+    fused_qkv_native_cublaslt: u64 = 0,
+    fused_gate_up_custom: u64 = 0,
+    fused_gate_up_native_cublaslt: u64 = 0,
 
     pub fn record(self: *Nvfp4RouteCounters, kind: Nvfp4RouteKind) void {
         switch (kind) {
             .native_cublaslt => self.native_cublaslt += 1,
             .bf16_fallback => self.bf16_fallback += 1,
-            .small_rows_matvec => self.small_rows_matvec += 1,
-            .fused_qkv => self.fused_qkv += 1,
-            .fused_gate_up => self.fused_gate_up += 1,
+            .small_rows_nvfp4_matvec => self.small_rows_nvfp4_matvec += 1,
+            .small_rows_i8_matvec => self.small_rows_i8_matvec += 1,
+            .fused_qkv_custom => self.fused_qkv_custom += 1,
+            .fused_qkv_native_cublaslt => self.fused_qkv_native_cublaslt += 1,
+            .fused_gate_up_custom => self.fused_gate_up_custom += 1,
+            .fused_gate_up_native_cublaslt => self.fused_gate_up_native_cublaslt += 1,
         }
     }
 
@@ -487,18 +496,24 @@ pub const Nvfp4RouteCounters = struct {
         return .{
             .native_cublaslt = saturatingSub(current.native_cublaslt, start.native_cublaslt),
             .bf16_fallback = saturatingSub(current.bf16_fallback, start.bf16_fallback),
-            .small_rows_matvec = saturatingSub(current.small_rows_matvec, start.small_rows_matvec),
-            .fused_qkv = saturatingSub(current.fused_qkv, start.fused_qkv),
-            .fused_gate_up = saturatingSub(current.fused_gate_up, start.fused_gate_up),
+            .small_rows_nvfp4_matvec = saturatingSub(current.small_rows_nvfp4_matvec, start.small_rows_nvfp4_matvec),
+            .small_rows_i8_matvec = saturatingSub(current.small_rows_i8_matvec, start.small_rows_i8_matvec),
+            .fused_qkv_custom = saturatingSub(current.fused_qkv_custom, start.fused_qkv_custom),
+            .fused_qkv_native_cublaslt = saturatingSub(current.fused_qkv_native_cublaslt, start.fused_qkv_native_cublaslt),
+            .fused_gate_up_custom = saturatingSub(current.fused_gate_up_custom, start.fused_gate_up_custom),
+            .fused_gate_up_native_cublaslt = saturatingSub(current.fused_gate_up_native_cublaslt, start.fused_gate_up_native_cublaslt),
         };
     }
 
     pub fn total(self: *const Nvfp4RouteCounters) u64 {
         const total_u128 = @as(u128, self.native_cublaslt) +
             @as(u128, self.bf16_fallback) +
-            @as(u128, self.small_rows_matvec) +
-            @as(u128, self.fused_qkv) +
-            @as(u128, self.fused_gate_up);
+            @as(u128, self.small_rows_nvfp4_matvec) +
+            @as(u128, self.small_rows_i8_matvec) +
+            @as(u128, self.fused_qkv_custom) +
+            @as(u128, self.fused_qkv_native_cublaslt) +
+            @as(u128, self.fused_gate_up_custom) +
+            @as(u128, self.fused_gate_up_native_cublaslt);
         return saturatingU64FromU128(total_u128);
     }
 };
@@ -1322,6 +1337,22 @@ pub const RuntimeBuffers = struct {
         }
         const using_model_projection = !skip_projection;
         const projection_weight = projection_weight_opt.?;
+        if (std.posix.getenv("TALU_CUDA_PROJECTION_DEBUG") != null) {
+            const projection_kind = switch (projection_weight) {
+                .dense_f32 => "dense_f32",
+                .dense_u16 => "dense_u16",
+                .gaffine_u4 => "gaffine_u4",
+                .gaffine_u8 => "gaffine_u8",
+                .fp8 => "fp8",
+                .mxfp8 => "mxfp8",
+                .nvfp4 => "nvfp4",
+            };
+            log.warn("inference", "CUDA projection selection", .{
+                .from_lm_head = @as(u8, @intFromBool(projection_from_lm_head)),
+                .has_lm_head = @as(u8, @intFromBool(loaded.lm_head != null)),
+                .kind = projection_kind,
+            });
+        }
         const projected_vocab = if (skip_projection) vocab_size else projection_weight.cols();
         const projected_logits_host = try allocator.alloc(f32, projected_vocab);
         errdefer allocator.free(projected_logits_host);
@@ -2044,8 +2075,8 @@ pub const MoEWeightRefs = struct {
     shared_up: LinearWeight,
     shared_down: LinearWeight,
     router_proj: LinearWeight,
-    // Gemma4 MoE: router input/expert scales + 5 internal norms (all required).
-    // Qwen3.5 MoE: none of these (simple softmax router, no internal norms).
+    // Optional MoE routing/normalization features used by architectures with
+    // learned router input scaling and internal FFN/expert norms.
     router_input_scale: ?DeviceTensor = null,
     router_per_expert_scale: ?DeviceTensor = null,
     pre_ffn_norm: ?DeviceTensor = null,
@@ -2053,7 +2084,7 @@ pub const MoEWeightRefs = struct {
     pre_expert_norm: ?DeviceTensor = null,
     post_expert_norm: ?DeviceTensor = null,
     post_combine_norm: ?DeviceTensor = null,
-    // Qwen3.5 MoE: sigmoid gate for shared expert output scaling.
+    // Optional sigmoid gate for shared expert output scaling.
     shared_expert_gate: ?LinearWeight = null,
     num_experts: u32,
     experts_per_token: u32,

@@ -4,7 +4,7 @@
 //! The branch projects source embeddings through a narrow bottleneck, gates with
 //! the current hidden state, and adds the result back to the residual stream.
 //!
-//! Used by architectures that define per-layer embedding inputs (e.g. Gemma4 PLE).
+//! Used by architectures that define per-layer embedding inputs.
 //! This kernel is generic — it is parameterized by weights and scalars from the
 //! execution plan, not by model family.
 

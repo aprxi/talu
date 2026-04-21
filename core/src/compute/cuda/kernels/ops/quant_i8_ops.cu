@@ -60,6 +60,142 @@ extern "C" __global__ __launch_bounds__(128) void talu_i8_matvec_f32(
     }
 }
 
+template <unsigned int BATCH>
+static __device__ __forceinline__ void talu_i8_gate_up_silu_batched(
+    const float* input,
+    const signed char* gate_weight,
+    const float* gate_scales,
+    const signed char* up_weight,
+    const float* up_scales,
+    float* out,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int out_idx,
+    unsigned int lane,
+    unsigned int batch_rows
+) {
+    float gate_acc[BATCH] = {};
+    float up_acc[BATCH] = {};
+    const signed char* gate_row = gate_weight + (unsigned long long)out_idx * in_dim;
+    const signed char* up_row = up_weight + (unsigned long long)out_idx * in_dim;
+
+    for (unsigned int i = lane * I8_WARP_ELEMS_PER_THREAD; i < in_dim; i += I8_WARP_STEP) {
+        uint4 gw4, uw4;
+        const unsigned int* gate_addr = reinterpret_cast<const unsigned int*>(gate_row + i);
+        const unsigned int* up_addr = reinterpret_cast<const unsigned int*>(up_row + i);
+        asm volatile(
+            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(gw4.x), "=r"(gw4.y), "=r"(gw4.z), "=r"(gw4.w)
+            : "l"(gate_addr));
+        asm volatile(
+            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(uw4.x), "=r"(uw4.y), "=r"(uw4.z), "=r"(uw4.w)
+            : "l"(up_addr));
+
+        #pragma unroll
+        for (unsigned int b = 0; b < BATCH; ++b) {
+            if (b >= batch_rows) break;
+            const float* input_row = input + (unsigned long long)b * in_dim + i;
+            const float4 in0 = *reinterpret_cast<const float4*>(input_row);
+            const float4 in1 = *reinterpret_cast<const float4*>(input_row + 4);
+            const float4 in2 = *reinterpret_cast<const float4*>(input_row + 8);
+            const float4 in3 = *reinterpret_cast<const float4*>(input_row + 12);
+
+            #pragma unroll
+            for (unsigned int j = 0; j < 4; ++j) {
+                const unsigned int gq32 = (j == 0) ? gw4.x : (j == 1) ? gw4.y : (j == 2) ? gw4.z : gw4.w;
+                const unsigned int uq32 = (j == 0) ? uw4.x : (j == 1) ? uw4.y : (j == 2) ? uw4.z : uw4.w;
+                const float4 inv = (j == 0) ? in0 : (j == 1) ? in1 : (j == 2) ? in2 : in3;
+                gate_acc[b] = fmaf(inv.x, static_cast<float>(static_cast<signed char>(gq32 & 0xFFu)), gate_acc[b]);
+                gate_acc[b] = fmaf(inv.y, static_cast<float>(static_cast<signed char>((gq32 >> 8) & 0xFFu)), gate_acc[b]);
+                gate_acc[b] = fmaf(inv.z, static_cast<float>(static_cast<signed char>((gq32 >> 16) & 0xFFu)), gate_acc[b]);
+                gate_acc[b] = fmaf(inv.w, static_cast<float>(static_cast<signed char>(gq32 >> 24)), gate_acc[b]);
+                up_acc[b] = fmaf(inv.x, static_cast<float>(static_cast<signed char>(uq32 & 0xFFu)), up_acc[b]);
+                up_acc[b] = fmaf(inv.y, static_cast<float>(static_cast<signed char>((uq32 >> 8) & 0xFFu)), up_acc[b]);
+                up_acc[b] = fmaf(inv.z, static_cast<float>(static_cast<signed char>((uq32 >> 16) & 0xFFu)), up_acc[b]);
+                up_acc[b] = fmaf(inv.w, static_cast<float>(static_cast<signed char>(uq32 >> 24)), up_acc[b]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int b = 0; b < BATCH; ++b) {
+        if (b >= batch_rows) break;
+        const float gate = talu_quant_warp_sum_f32(gate_acc[b]) * gate_scales[out_idx];
+        const float up = talu_quant_warp_sum_f32(up_acc[b]) * up_scales[out_idx];
+        if (lane == 0) {
+            const float sigma = 1.0f / (1.0f + expf(-gate));
+            out[(unsigned long long)b * out_dim + out_idx] = gate * sigma * up;
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 3) void talu_i8_matvec_gate_up_silu_f32(
+    const float* input,
+    const signed char* gate_weight,
+    const float* gate_scales,
+    const signed char* up_weight,
+    const float* up_scales,
+    float* out,
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * 4u;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < 4u ? batch_rows - batch_base : 4u;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * I8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    switch (tile_rows) {
+        case 1u: talu_i8_gate_up_silu_batched<1>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 1u); break;
+        case 2u: talu_i8_gate_up_silu_batched<2>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 2u); break;
+        case 3u: talu_i8_gate_up_silu_batched<3>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 3u); break;
+        case 4u: talu_i8_gate_up_silu_batched<4>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 4u); break;
+        default: return;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 4) void talu_i8_matvec_gate_up_silu_f32_tile8(
+    const float* input,
+    const signed char* gate_weight,
+    const float* gate_scales,
+    const signed char* up_weight,
+    const float* up_scales,
+    float* out,
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * 8u;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < 8u ? batch_rows - batch_base : 8u;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * I8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    switch (tile_rows) {
+        case 1u: talu_i8_gate_up_silu_batched<1>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 1u); break;
+        case 2u: talu_i8_gate_up_silu_batched<2>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 2u); break;
+        case 3u: talu_i8_gate_up_silu_batched<3>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 3u); break;
+        case 4u: talu_i8_gate_up_silu_batched<4>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 4u); break;
+        case 5u: talu_i8_gate_up_silu_batched<5>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 5u); break;
+        case 6u: talu_i8_gate_up_silu_batched<6>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 6u); break;
+        case 7u: talu_i8_gate_up_silu_batched<7>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 7u); break;
+        case 8u: talu_i8_gate_up_silu_batched<8>(input_tile, gate_weight, gate_scales, up_weight, up_scales, out_tile, in_dim, out_dim, out_idx, lane, 8u); break;
+        default: return;
+    }
+}
+
 extern "C" __global__ void talu_quantize_f32_to_i8(
     const float* __restrict__ input,
     signed char* __restrict__ out_i8,

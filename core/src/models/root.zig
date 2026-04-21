@@ -16,6 +16,7 @@ pub const perf_hints = @import("perf_hints.zig");
 pub const runtime_blocks = @import("runtime_blocks.zig");
 pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");
+pub const per_layer_branch = @import("per_layer_branch.zig");
 pub const plan = @import("plan/root.zig");
 pub const config = @import("config/root.zig");
 pub const load = struct {

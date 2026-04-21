@@ -6947,7 +6947,7 @@ test "Scheduler.step - thinking disabled with tool-generation flags" {
 
     // Simulate a prompt with tool definitions (longer than usual).
     const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-    const eos_ids = [_]u32{151645}; // Qwen3.5 EOS
+    const eos_ids = [_]u32{999_999}; // Representative EOS id for request wiring.
 
     const request_id = try scheduler.submit(&prompt, 64, .{
         .eos_token_ids = &eos_ids,

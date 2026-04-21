@@ -727,7 +727,7 @@ int32_t mlx_test_talu_meta_nvfp4_detection(void) {
                 fs::remove_all(base);
                 return 0;
             }
-            out << "{\n  \"scheme\": \"NVFP4\",\n  \"source_model_id\": \"Qwen/Qwen3.5-9B\"\n}\n";
+            out << "{\n  \"scheme\": \"NVFP4\",\n  \"source_model_id\": \"model/id\"\n}\n";
         }
 
         const bool detected = model_has_talu_meta_scheme(base.string(), "NVFP4");

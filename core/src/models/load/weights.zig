@@ -317,6 +317,69 @@ fn findWeightSpecById(specs: []const model_types.WeightSpec, id: []const u8) ?*c
     return null;
 }
 
+const ResolvedTensor = struct {
+    name: []const u8,
+    tensor: Tensor,
+};
+
+fn resolveGlobalTensorBySpec(
+    allocator: std.mem.Allocator,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    spec: *const model_types.WeightSpec,
+    weight_prefixes: []const []const u8,
+) !?ResolvedTensor {
+    var name_buf: [512]u8 = undefined;
+    var prefix_buf: [256]u8 = undefined;
+    var qweight_buf: [1024]u8 = undefined;
+    var name_resolver: generic_weights.NameResolver = .{};
+    defer name_resolver.deinit(allocator);
+
+    var alias_idx: usize = 0;
+    while (alias_idx < spec.aliases.len + 1) : (alias_idx += 1) {
+        const candidate = if (alias_idx == 0) spec.suffix else spec.aliases[alias_idx - 1];
+        if (weight_prefixes.len == 0) {
+            const resolved_name = try name_resolver.resolve(allocator, safetensors_file, candidate, qweight_buf[0..]) orelse continue;
+            return .{ .name = resolved_name, .tensor = try safetensors_file.getTensor(resolved_name, null) };
+        }
+
+        for (weight_prefixes) |prefix_template| {
+            const expanded_prefix = generic_weights.expandLayerTemplate(prefix_buf[0..], prefix_template, 0) catch continue;
+            const total_len = expanded_prefix.len + candidate.len;
+            if (total_len > name_buf.len) continue;
+            @memcpy(name_buf[0..expanded_prefix.len], expanded_prefix);
+            @memcpy(name_buf[expanded_prefix.len..total_len], candidate);
+            const qualified_name = name_buf[0..total_len];
+            const resolved_name = try name_resolver.resolve(allocator, safetensors_file, qualified_name, qweight_buf[0..]) orelse continue;
+            return .{ .name = resolved_name, .tensor = try safetensors_file.getTensor(resolved_name, null) };
+        }
+    }
+
+    return null;
+}
+
+fn buildTiedLmHead(
+    allocator: std.mem.Allocator,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    arch: *const model_types.Architecture,
+    model_config: *const ModelConfig,
+    model_load_options: LoadOptions,
+) !?Tensor {
+    const spec = findWeightSpecById(arch.global_weights, "token_embeddings") orelse return null;
+    // Global tied-projection sources are not layer-scoped.
+    // Using layer weight prefixes here makes the lookup miss real global
+    // embedding tensors and silently fall back to a dequantized embedding copy.
+    const resolved = try resolveGlobalTensorBySpec(allocator, safetensors_file, spec, &.{}) orelse return null;
+    return try transforms.orientWeight(
+        allocator,
+        safetensors_file,
+        resolved.name,
+        @intCast(model_config.d_model),
+        model_config.*,
+        model_load_options.dequantize_mxfp8_to_bf16,
+        model_load_options.dequantize_nvfp4_to_bf16,
+    );
+}
+
 /// Try to get a tensor by name, with GPTQ .qweight and NVFP4 fallbacks.
 /// When a name ending in .weight is not found, tries .qweight and .weight_packed.
 /// When the resolved tensor is U8/I8 with a companion .weight_scale, recognizes
@@ -887,6 +950,9 @@ pub fn loadModelWithArchitecture(
     const lm_head: ?Tensor = if (global_map.get("lm_head")) |weight|
         weight.*
     else if (model_config.tie_word_embeddings) blk: {
+        if (try buildTiedLmHead(arena_allocator, &safetensors_file, arch, &model_config, model_load_options)) |tied_projection| {
+            break :blk tied_projection;
+        }
         if (token_embedding_weights.dtype == .f32) {
             break :blk try transposeToOwned(arena_allocator, token_embedding_weights, .f32);
         } else {
@@ -1652,6 +1718,72 @@ test "LoadedModel.deinit: cleanup without backend runtime state" {
 
     // Should not leak memory
     model.deinit();
+}
+
+test "buildTiedLmHead preserves NVFP4 for CUDA-native tied projection" {
+    const allocator = std.testing.allocator;
+    const writer = @import("io_pkg").safetensors.writer;
+
+    const tmp_dir_path = "/tmp/test_build_tied_lm_head_nvfp4";
+    std.fs.cwd().makeDir(tmp_dir_path) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir_path) catch {};
+
+    const packed_bytes = [_]u8{
+        0x21, 0xA9,
+        0x43, 0x65,
+    };
+    const scales = [_]u8{
+        0x38, 0x38,
+        0x38, 0x38,
+    };
+    const scale_2 = [_]f32{1.0};
+    const entries = [_]writer.TensorEntry{
+        .{ .name = "model.language_model.embed_tokens.weight", .dtype = .u8, .shape = &[_]usize{ 2, 2 }, .data = packed_bytes[0..] },
+        .{ .name = "model.language_model.embed_tokens.weight_scale", .dtype = .f8_e4m3, .shape = &[_]usize{ 2, 2 }, .data = scales[0..] },
+        .{ .name = "model.language_model.embed_tokens.weight_scale_2", .dtype = .f32, .shape = &[_]usize{1}, .data = std.mem.sliceAsBytes(&scale_2) },
+    };
+    const model_path = tmp_dir_path ++ "/model.safetensors";
+    try writer.write(allocator, model_path, &entries);
+
+    var safetensors_file = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer safetensors_file.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const arch = model_types.Architecture{
+        .name = "test",
+        .model_types = &.{},
+        .weight_prefixes = &.{
+            "model.layers.{d}.",
+            "layers.{d}.",
+        },
+        .global_weights = &.{
+            .{
+                .id = "token_embeddings",
+                .suffix = "model.language_model.embed_tokens.weight",
+                .module_type = "Embedding",
+                .layout = .embedding,
+                .dtype = "float32",
+                .required = true,
+            },
+        },
+    };
+    var config = std.mem.zeroes(ModelConfig);
+    config.d_model = 4;
+
+    const tied = (try buildTiedLmHead(
+        arena.allocator(),
+        &safetensors_file,
+        &arch,
+        &config,
+        .{ .dequantize_nvfp4_to_bf16 = false },
+    )) orelse return error.TestExpectedEqual;
+
+    try std.testing.expectEqual(DType.u8, tied.dtype);
+    try std.testing.expectEqual(@as(i64, 2), tied.shape[0]);
+    try std.testing.expectEqual(@as(i64, 4), tied.shape[1]);
+    try std.testing.expect(tied.nvfp4 != null);
 }
 
 test "orientWeight: error on missing tensor" {

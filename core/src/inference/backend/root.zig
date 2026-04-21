@@ -186,7 +186,7 @@ pub const InitOptions = struct {
     pub const MetalConfig = struct {
         /// Resolved model directory path (snapshot dir containing config/weights files).
         model_path: ?[]const u8 = null,
-        /// User model reference (e.g. "Qwen/Qwen3.5-0.8B") for metadata/logging.
+        /// User model reference (for example a registry/model identifier) for metadata/logging.
         model_id: ?[]const u8 = null,
         /// Absolute safetensors path used by Metal vision runtime when payload
         /// data is required beyond metadata-only load.
@@ -853,7 +853,7 @@ fn autoDetectTopologyForModel(
 
 /// Find the minimum KV shared source layer index across all shared layers.
 ///
-/// For models with KV sharing (e.g., Gemma4), later layers reuse the KV cache
+/// For models with KV sharing, later layers reuse the KV cache
 /// from earlier "source" layers. Returns the lowest such source layer index,
 /// or null if the model has no KV sharing.
 ///

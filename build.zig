@@ -689,14 +689,19 @@ pub fn build(b: *std.Build) void {
     validateInferenceBoundaryImports(b);
 
     const gen_cuda_kernels_step = b.step("gen-cuda-kernels", "Generate CUDA kernel module assets (requires nvcc)");
+    var cuda_kernel_assets_step: ?*std.Build.Step = null;
     {
+        const nvcc_path = b.findProgram(&.{"nvcc"}, &.{
+            "/usr/local/cuda/bin",
+            "/opt/cuda/bin",
+        }) catch "nvcc";
         const ensure_cuda_assets_dir = b.addSystemCommand(&.{
             "mkdir",
             "-p",
             "core/assets/cuda",
         });
         const gen_kernel_module = b.addSystemCommand(&.{
-            "nvcc",
+            nvcc_path,
             "--fatbin",
             "-arch=all-major",
             "core/src/compute/cuda/kernels/kernels.cu",
@@ -705,6 +710,7 @@ pub fn build(b: *std.Build) void {
         });
         gen_kernel_module.step.dependOn(&ensure_cuda_assets_dir.step);
         gen_cuda_kernels_step.dependOn(&gen_kernel_module.step);
+        cuda_kernel_assets_step = &gen_kernel_module.step;
     }
 
     const build_options = b.addOptions();
@@ -773,6 +779,9 @@ pub fn build(b: *std.Build) void {
         .name = "talu-inference",
         .root_module = inference_mod,
     });
+    if (enable_cuda) {
+        if (cuda_kernel_assets_step) |step| inference_lib.step.dependOn(step);
+    }
     // Keep this archive self-contained for internal linking; external archives
     // are linked by final binaries/shared libs.
     linkCDependencies(b, inference_lib, pcre2, miniz, sqlite3, true);
@@ -801,6 +810,9 @@ pub fn build(b: *std.Build) void {
         .name = "talu",
         .root_module = lib_mod,
     });
+    if (enable_cuda) {
+        if (cuda_kernel_assets_step) |step| lib.step.dependOn(step);
+    }
     linkCDependencies(b, lib, pcre2, miniz, sqlite3, false);
     addMetalSupport(b, lib_mod, lib, enable_metal);
 
@@ -867,6 +879,9 @@ pub fn build(b: *std.Build) void {
         .name = "talu",
         .root_module = static_lib_mod,
     });
+    if (enable_cuda) {
+        if (cuda_kernel_assets_step) |step| static_lib.step.dependOn(step);
+    }
     // Skip external .a archives for static lib - they'll be linked by the final executable
     linkCDependencies(b, static_lib, pcre2, miniz, sqlite3, true);
     addMetalSupport(b, static_lib_mod, static_lib, enable_metal);
@@ -894,6 +909,9 @@ pub fn build(b: *std.Build) void {
             .name = "talu",
             .root_module = cli_mod,
         });
+        if (enable_cuda) {
+            if (cuda_kernel_assets_step) |step| exe.step.dependOn(step);
+        }
         const cargo_cmd = b.addSystemCommand(&.{ "cargo", "build", "--release", "--manifest-path", "bindings/rust/Cargo.toml" });
         exe.step.dependOn(&cargo_cmd.step);
         // Link CLI against the shared core library to avoid compiling core twice
@@ -1039,6 +1057,9 @@ pub fn build(b: *std.Build) void {
             .name = "talu-dump-core",
             .root_module = dump_lib_mod,
         });
+        if (enable_cuda) {
+            if (cuda_kernel_assets_step) |step| dump_static_lib.step.dependOn(step);
+        }
         // Add C sources to static lib with skip_external_archives=true (matches main build pattern)
         linkCDependencies(b, dump_static_lib, pcre2, miniz, sqlite3, true);
         addMetalSupport(b, dump_lib_mod, dump_static_lib, enable_metal);
@@ -1056,6 +1077,9 @@ pub fn build(b: *std.Build) void {
             .name = "talu-dump",
             .root_module = dump_cli_mod,
         });
+        if (enable_cuda) {
+            if (cuda_kernel_assets_step) |step| dump_exe.step.dependOn(step);
+        }
         dump_exe.linkLibrary(dump_static_lib);
         // Only link external archives - C sources are in the static lib
         linkExternalArchives(b, dump_exe, pcre2, miniz, sqlite3);
@@ -1620,6 +1644,43 @@ pub fn build(b: *std.Build) void {
         bench_metal_compute_step.dependOn(&run_bench_metal_compute.step);
     } else |_| {
         // compute benchmark harness not present - skip
+    }
+
+    // ==========================================================================
+    // CUDA compute benchmark harness (core/bench/compute/cuda/)
+    // ==========================================================================
+    const bench_cuda_compute_path = "core/bench/compute/cuda/root.zig";
+    if (std.fs.cwd().access(bench_cuda_compute_path, .{})) |_| {
+        const host_target = b.resolveTargetQuery(.{});
+        const bench_cuda_compute_mod = b.createModule(.{
+            .root_source_file = b.path(bench_cuda_compute_path),
+            .target = host_target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        const bench_cuda_compute_exe = b.addExecutable(.{
+            .name = "bench-cuda-compute",
+            .root_module = bench_cuda_compute_mod,
+        });
+        if (enable_cuda) {
+            if (cuda_kernel_assets_step) |step| bench_cuda_compute_exe.step.dependOn(step);
+        }
+        linkCDependencies(b, bench_cuda_compute_exe, pcre2, miniz, sqlite3, false);
+        b.installArtifact(bench_cuda_compute_exe);
+
+        const run_bench_cuda_compute = b.addRunArtifact(bench_cuda_compute_exe);
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_bench_cuda_compute.addArg(arg);
+            }
+        }
+        const bench_cuda_compute_step = b.step("bench-cuda-compute", "Run CUDA compute benchmark harness");
+        bench_cuda_compute_step.dependOn(&run_bench_cuda_compute.step);
+    } else |_| {
+        // CUDA compute benchmark harness not present - skip
     }
 
     // ==========================================================================

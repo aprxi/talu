@@ -111,7 +111,7 @@ int32_t mlx_decode_topk_stream(
         if (!has_penalties) {
             // Fast path: chunk decode to avoid very large token graphs and avoid
             // per-token async scheduling overhead.
-            // Gemma4-style per-layer-input models are sensitive to the bulk
+            // Per-layer-input models are sensitive to the bulk
             // chunked decode graph; default to stepwise decode for correctness.
             const bool force_stepwise_decode = ctx->cfg.hidden_size_per_layer_input > 0;
             const int32_t topk_chunk_size = [force_stepwise_decode]() -> int32_t {

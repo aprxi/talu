@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from responses.evals import gpqa, ifeval, mmlu, mmmu
 from responses.evals._api import format_request
-from responses.perf import generate, prefill
+from responses.perf import generate, prefill, pptg
 
 
 def test_eval_api_adapter_sets_store_false() -> None:
@@ -82,8 +82,11 @@ def _capture_perf_body(module, run_factory, *factory_args) -> dict:
 def test_perf_builders_set_store_false() -> None:
     generate_body = _capture_perf_body(generate, generate._make_run, 8, 1)
     prefill_body = _capture_perf_body(prefill, prefill._make_run, 128, "hello", 1)
+    mixed_body = _capture_perf_body(pptg, pptg._make_run, 4096, "hello", 512, 1)
     assert generate_body.get("store") is False, generate_body
     assert prefill_body.get("store") is False, prefill_body
+    assert mixed_body.get("store") is False, mixed_body
+    assert mixed_body.get("max_output_tokens") == 512, mixed_body
 
 
 if __name__ == "__main__":

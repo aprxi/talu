@@ -52,6 +52,7 @@ const LoadedModel = models.LoadedModel;
 const ModelConfig = tensor_mod.ModelConfig;
 const LayerOp = layer_ops.LayerOp;
 const BlockKind = block_kernels.BlockType;
+const per_layer_branch_models = models.per_layer_branch;
 
 pub fn formatLinearLike(
     writer: anytype,
@@ -329,24 +330,13 @@ fn loadOrientedWeightAny(
 
 fn loadLayerTensorBySuffix(
     safetensors: *st_loader.UnifiedSafeTensors,
+    prefixes: []const []const u8,
     layer_idx: usize,
     suffix: []const u8,
 ) !Tensor {
     var name_buf: [256]u8 = undefined;
-    const first = std.fmt.bufPrint(name_buf[0..], "model.language_model.layers.{d}.{s}", .{ layer_idx, suffix }) catch null;
-    if (first) |full_name| {
-        if (safetensors.getTensor(full_name, null) catch null) |tensor_value| return tensor_value;
-    }
-    const second = std.fmt.bufPrint(name_buf[0..], "model.layers.{d}.{s}", .{ layer_idx, suffix }) catch null;
-    if (second) |full_name| {
-        if (safetensors.getTensor(full_name, null) catch null) |tensor_value| return tensor_value;
-    }
-    const third = std.fmt.bufPrint(name_buf[0..], "language_model.model.layers.{d}.{s}", .{ layer_idx, suffix }) catch null;
-    if (third) |full_name| {
-        if (safetensors.getTensor(full_name, null) catch null) |tensor_value| return tensor_value;
-    }
-    const fourth = std.fmt.bufPrint(name_buf[0..], "layers.{d}.{s}", .{ layer_idx, suffix }) catch null;
-    if (fourth) |full_name| {
+    for (prefixes) |prefix| {
+        const full_name = std.fmt.bufPrint(name_buf[0..], "{s}.{d}.{s}", .{ prefix, layer_idx, suffix }) catch continue;
         if (safetensors.getTensor(full_name, null) catch null) |tensor_value| return tensor_value;
     }
     return error.MissingWeight;
@@ -356,17 +346,12 @@ fn loadOrientedLayerWeightBySuffix(
     tensor_allocator: std.mem.Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,
     model_config: ModelConfig,
+    prefixes: []const []const u8,
     layer_idx: usize,
     suffix: []const u8,
     expected_in: usize,
 ) !Tensor {
     var name_buf: [256]u8 = undefined;
-    const prefixes = [_][]const u8{
-        "model.language_model.layers",
-        "model.layers",
-        "language_model.model.layers",
-        "layers",
-    };
     for (prefixes) |prefix| {
         const full_name = std.fmt.bufPrint(name_buf[0..], "{s}.{d}.{s}", .{ prefix, layer_idx, suffix }) catch continue;
         _ = safetensors.getTensor(full_name, null) catch continue;
@@ -427,6 +412,7 @@ fn initPerLayerBranchRuntime(
     layer_count: usize,
 ) !?PerLayerBranchRuntime {
     if (loaded.config.hidden_size_per_layer_input <= 0) return null;
+    const per_layer_branch_spec = per_layer_branch_models.specForLoadedModel(loaded) orelse return null;
     if (loaded.st == null) return error.MissingWeight;
     const safetensors = &(loaded.st.?);
     const tensor_allocator = loaded.arena.allocator();
@@ -439,33 +425,21 @@ fn initPerLayerBranchRuntime(
         tensor_allocator,
         safetensors,
         loaded.config,
-        &.{
-            "model.language_model.embed_tokens_per_layer.weight",
-            "model.embed_tokens_per_layer.weight",
-            "embed_tokens_per_layer.weight",
-        },
+        per_layer_branch_spec.per_layer_embedding_names,
         layer_width_total,
     );
     const per_layer_model_projection_weight = try loadOrientedWeightAny(
         tensor_allocator,
         safetensors,
         loaded.config,
-        &.{
-            "model.language_model.per_layer_model_projection.weight",
-            "model.per_layer_model_projection.weight",
-            "per_layer_model_projection.weight",
-        },
+        per_layer_branch_spec.per_layer_model_projection_names,
         hidden_size,
     );
     const per_layer_projection_norm_weight = try loadOrientedWeightAny(
         tensor_allocator,
         safetensors,
         loaded.config,
-        &.{
-            "model.language_model.per_layer_projection_norm.weight",
-            "model.per_layer_projection_norm.weight",
-            "per_layer_projection_norm.weight",
-        },
+        per_layer_branch_spec.per_layer_projection_norm_names,
         hidden_size_per_layer_input,
     );
 
@@ -500,27 +474,35 @@ fn initPerLayerBranchRuntime(
             tensor_allocator,
             safetensors,
             loaded.config,
+            per_layer_branch_spec.layer_prefixes,
             layer_idx,
-            "per_layer_input_gate.weight",
+            per_layer_branch_spec.per_layer_input_gate_suffix,
             hidden_size,
         );
         const projection_weight = try loadOrientedLayerWeightBySuffix(
             tensor_allocator,
             safetensors,
             loaded.config,
+            per_layer_branch_spec.layer_prefixes,
             layer_idx,
-            "per_layer_projection.weight",
+            per_layer_branch_spec.per_layer_projection_suffix,
             hidden_size_per_layer_input,
         );
         const post_norm_weight = try loadOrientedLayerWeightBySuffix(
             tensor_allocator,
             safetensors,
             loaded.config,
+            per_layer_branch_spec.layer_prefixes,
             layer_idx,
-            "post_per_layer_input_norm.weight",
+            per_layer_branch_spec.post_per_layer_input_norm_suffix,
             hidden_size,
         );
-        const layer_scalar = try loadLayerTensorBySuffix(safetensors, layer_idx, "layer_scalar");
+        const layer_scalar = try loadLayerTensorBySuffix(
+            safetensors,
+            per_layer_branch_spec.layer_prefixes,
+            layer_idx,
+            per_layer_branch_spec.layer_scalar_suffix,
+        );
 
         if (gate_weight.n_dims != 2 or
             @as(usize, @intCast(gate_weight.shape[0])) != hidden_size_per_layer_input or
@@ -564,7 +546,7 @@ fn initPerLayerBranchRuntime(
     return .{
         .hidden_size_per_layer_input = hidden_size_per_layer_input,
         .use_gelu = loaded.config.use_gelu,
-        .per_layer_input_scale = 0.70710677, // 2^-0.5
+        .per_layer_input_scale = per_layer_branch_spec.per_layer_input_scale,
         .per_layer_embed_scale = @sqrt(@as(f32, @floatFromInt(hidden_size_per_layer_input))),
         .per_layer_model_projection_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size))),
         .per_layer_embedding = per_layer_embedding,
@@ -588,16 +570,22 @@ fn initStandaloneLayerScalars(
 ) !?[]f32 {
     // PLE already loads and applies layer_scalars — don't double-apply.
     if (loaded.config.hidden_size_per_layer_input > 0) return null;
+    const per_layer_branch_spec = per_layer_branch_models.specForLoadedModel(loaded) orelse return null;
     if (loaded.st == null) return null;
     const safetensors = &(loaded.st.?);
 
     // Probe layer 0 to determine if layer_scalar weights exist.
-    _ = loadLayerTensorBySuffix(safetensors, 0, "layer_scalar") catch return null;
+    _ = loadLayerTensorBySuffix(safetensors, per_layer_branch_spec.layer_prefixes, 0, per_layer_branch_spec.layer_scalar_suffix) catch return null;
 
     const scalars = try allocator.alloc(f32, layer_count);
     errdefer allocator.free(scalars);
     for (0..layer_count) |layer_idx| {
-        const t = try loadLayerTensorBySuffix(safetensors, layer_idx, "layer_scalar");
+        const t = try loadLayerTensorBySuffix(
+            safetensors,
+            per_layer_branch_spec.layer_prefixes,
+            layer_idx,
+            per_layer_branch_spec.layer_scalar_suffix,
+        );
         scalars[layer_idx] = try tensorScalarToF32(&t);
     }
     return scalars;

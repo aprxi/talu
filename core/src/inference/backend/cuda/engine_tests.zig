@@ -46,7 +46,7 @@ const KernelSlot = engine_types.KernelSlot;
 const resolveGatedDeltaFfnUploadPlan = engine_types.resolveGatedDeltaFfnUploadPlan;
 
 // --- Functions from engine_weights.zig ---
-const engine_weights = @import("weights/_weights_impl.zig");
+const engine_weights = @import("weights/root.zig");
 const resolveDenseInOutLayout = engine_weights.resolveDenseInOutLayout;
 const resolveDenseOutInLayout = engine_weights.resolveDenseOutInLayout;
 const transposeRowMajor = engine_weights.transposeRowMajor;
@@ -63,11 +63,11 @@ const findPositionIndex = engine_weights.findPositionIndex;
 const deepstackLayersCompatibleWithPrompt = engine_weights.deepstackLayersCompatibleWithPrompt;
 
 // --- Functions from engine_ops.zig ---
-const engine_ops = @import("operators/_ops_impl.zig");
+const engine_ops = @import("operators/root.zig");
 
 // --- Functions from engine_mixers.zig ---
-const engine_mixers = @import("operators/_mixers_impl.zig");
-const engine_forward = @import("exec/_forward_impl.zig");
+const engine_mixers = @import("operators/root.zig");
+const engine_forward = @import("exec/root.zig");
 const resolveStagedPrefillChunkRows = engine_forward.resolveStagedPrefillChunkRows;
 
 test "resolveDenseInOutLayout keeps [in,out] orientation" {
