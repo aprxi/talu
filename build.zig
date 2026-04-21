@@ -1024,6 +1024,7 @@ pub fn build(b: *std.Build) void {
             .name = "talu",
             .root_module = cli_mod,
         });
+        exe.each_lib_rpath = false;
         if (enable_cuda) {
             if (cuda_kernel_assets_step) |step| exe.step.dependOn(step);
         }
@@ -1052,6 +1053,7 @@ pub fn build(b: *std.Build) void {
         // macOS frameworks already linked via linkCDependencies
 
         const install_exe = b.addInstallArtifact(exe, .{});
+        install_exe.step.dependOn(&install_lib.step);
         b.getInstallStep().dependOn(&install_exe.step);
         install_exe_step = &install_exe.step;
 

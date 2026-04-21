@@ -1345,7 +1345,12 @@ pub const Backend = union(enum) {
         plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
     ) shared_scheduler.SchedulerSingleDecodeRoute {
         return switch (self.*) {
-            .cpu => defaultSchedulerSingleDecodeRoute(plan),
+            // CPU intentionally stays on the queued scheduler path until it
+            // advertises explicit fast-path support through the backend
+            // support methods. The backend union itself exposes a planner, so
+            // using the default helper here would incorrectly trust planner
+            // probe flags that are only meaningful for GPU backends.
+            .cpu => .queued,
             .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "planSchedulerSingleDecodeRoute"))
                 b.planSchedulerSingleDecodeRoute(plan)
             else
@@ -2530,6 +2535,33 @@ test "supportsSchedulerBackendTopKDecodeRoute: cpu disabled" {
         .min_p = 0.0,
     };
     try std.testing.expectEqual(false, cpu_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
+}
+
+test "planSchedulerSingleDecodeRoute: cpu keeps unsupported fast paths queued" {
+    const cpu_backend: Backend = .{ .cpu = undefined };
+    const sampling_config = cpu.sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 20,
+        .temperature = 1.0,
+        .top_p = 0.95,
+    };
+
+    const route = cpu_backend.planSchedulerSingleDecodeRoute(&.{
+        .sampling_config = &sampling_config,
+        .decode_batch_size = 1,
+        .has_callback = true,
+        .capture_final_logits = false,
+        .has_grammar_sampler = false,
+        .prompt_token_count = 8,
+        .greedy_streaming_semantic_eligible = true,
+        .top_k_streaming_semantic_eligible = true,
+        .top_k_candidate_semantic_eligible = true,
+        .greedy_streaming_backend_supported = true,
+        .top_k_streaming_backend_supported = true,
+        .top_k_candidate_backend_supported = true,
+    });
+
+    try std.testing.expectEqual(shared_scheduler.SchedulerSingleDecodeRoute.queued, route);
 }
 
 test "supportsSchedulerBackendTopKDecodeRoute: cuda disabled" {

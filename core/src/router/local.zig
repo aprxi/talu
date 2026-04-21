@@ -96,7 +96,8 @@ fn isRecoverableMetalInitError(err: anyerror) bool {
 
 fn shouldUseMetadataOnlyLoad(backend_init_options: BackendInitOptions) bool {
     return switch (backend_root.effectiveLoadSelection(backend_init_options.selection)) {
-        .auto, .metal => true,
+        .auto => backend_root.has_metal,
+        .metal => true,
         .cpu, .cuda => false,
     };
 }
@@ -2427,8 +2428,8 @@ test "loadCachedChatTemplate reads inline template and special tokens" {
     try std.testing.expectEqualStrings("</s>", cached.eos_token);
 }
 
-test "shouldUseMetadataOnlyLoad keeps metadata-only startup for auto and metal" {
-    try std.testing.expect(shouldUseMetadataOnlyLoad(.{ .selection = .auto }));
+test "shouldUseMetadataOnlyLoad keeps metadata-only startup only when auto can resolve to metal" {
+    try std.testing.expectEqual(backend_root.has_metal, shouldUseMetadataOnlyLoad(.{ .selection = .auto }));
     try std.testing.expect(shouldUseMetadataOnlyLoad(.{ .selection = .metal }));
 }
 

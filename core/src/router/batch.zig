@@ -801,29 +801,23 @@ pub const BatchWrapper = struct {
             }
             callback(&c_events_buf, emit_count, callback_data);
 
-            // After the first step with events (prefill + first token done),
-            // try to switch to the scheduler's tight decode loop for the
-            // remaining tokens. This eliminates per-token event layering.
-            if (self.scheduler.activeCount() == 1 and self.scheduler.pendingCount() == 0) {
-                if (!events_buf[0].is_final) {
-                    const req_id = events_buf[0].request_id;
-                    if (self.requests.get(req_id)) |state| {
-                        self.runDecodeLoopSingle(
-                            req_id,
-                            state,
-                            pending_flag,
-                            callback,
-                            callback_data,
-                            &c_events_buf[0],
-                        ) catch |err| switch (err) {
-                            error.NotEligible => continue,
-                            else => return err,
-                        };
-                        // After tight loop: handle any completion.
-                        const completed = self.scheduler.popCompleted();
-                        if (completed.len > 0) allocator.free(completed);
-                        continue;
-                    }
+            if (shouldHandoffSingleDecodeLoop(self.scheduler.activeCount(), self.scheduler.pendingCount(), events_buf[0..emit_count])) {
+                const req_id = events_buf[0].request_id;
+                if (self.requests.get(req_id)) |state| {
+                    self.runDecodeLoopSingle(
+                        req_id,
+                        state,
+                        pending_flag,
+                        callback,
+                        callback_data,
+                        &c_events_buf[0],
+                    ) catch |err| switch (err) {
+                        error.NotEligible => continue,
+                        else => return err,
+                    };
+                    const completed = self.scheduler.popCompleted();
+                    if (completed.len > 0) allocator.free(completed);
+                    continue;
                 }
             }
         }
@@ -865,7 +859,37 @@ pub const BatchWrapper = struct {
                 };
             }
             callback(&c_events_buf, emit_count, callback_data);
+
+            if (shouldHandoffSingleDecodeLoop(self.scheduler.activeCount(), self.scheduler.pendingCount(), events_buf[0..emit_count])) {
+                const req_id = events_buf[0].request_id;
+                if (self.requests.get(req_id)) |state| {
+                    self.runDecodeLoopSingleNoText(
+                        req_id,
+                        state,
+                        pending_flag,
+                        callback,
+                        callback_data,
+                        &c_events_buf[0],
+                    ) catch |err| switch (err) {
+                        error.NotEligible => continue,
+                        else => return err,
+                    };
+                    const completed = self.scheduler.popCompleted();
+                    if (completed.len > 0) allocator.free(completed);
+                    continue;
+                }
+            }
         }
+    }
+
+    fn shouldHandoffSingleDecodeLoop(
+        active_count: usize,
+        pending_count: usize,
+        events: []const BatchEvent,
+    ) bool {
+        if (active_count != 1 or pending_count != 0) return false;
+        if (events.len == 0) return false;
+        return !events[0].is_final;
     }
 
     /// Single-request tight decode loop. Calls scheduler.runDecodeLoop
@@ -912,6 +936,40 @@ pub const BatchWrapper = struct {
         }
     }
 
+    fn runDecodeLoopSingleNoText(
+        self: *BatchWrapper,
+        request_id: u64,
+        state: *RequestState,
+        pending_flag: ?*const std.atomic.Value(bool),
+        outer_cb: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
+        outer_cb_data: ?*anyopaque,
+        c_event_buf: *CEvent,
+    ) !void {
+        var ctx = DecodeLoopNoTextCtx{
+            .state = state,
+            .outer_cb = outer_cb,
+            .outer_cb_data = outer_cb_data,
+            .c_event_buf = c_event_buf,
+        };
+
+        try self.scheduler.runDecodeLoop(
+            request_id,
+            pending_flag,
+            &decodeLoopTokenCbNoText,
+            @ptrCast(&ctx),
+        );
+
+        if (self.scheduler.getFinishReason(request_id)) |fr| {
+            if (fr != .in_progress) {
+                try self.completeRequest(request_id, state, self.determineFinishReason(state));
+            }
+        }
+        if (ctx.completed_event) |*ev| {
+            c_event_buf.* = ev.*;
+            outer_cb(@ptrCast(c_event_buf), 1, outer_cb_data);
+        }
+    }
+
     const DecodeLoopCtx = struct {
         engine: *LocalEngine,
         state: *RequestState,
@@ -923,6 +981,14 @@ pub const BatchWrapper = struct {
         /// can send it AFTER batch.completeRequest stores the result.
         /// The Rust callback calls take_result inside the callback, so
         /// the result must exist before the completed event fires.
+        completed_event: ?CEvent = null,
+    };
+
+    const DecodeLoopNoTextCtx = struct {
+        state: *RequestState,
+        outer_cb: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
+        outer_cb_data: ?*anyopaque,
+        c_event_buf: *CEvent,
         completed_event: ?CEvent = null,
     };
 
@@ -1044,6 +1110,70 @@ pub const BatchWrapper = struct {
             ev.is_final = 1;
             ev.token_id = token;
             ev.tokens_generated = state.engine_token_count;
+            ctx.completed_event = ev;
+        }
+    }
+
+    fn decodeLoopTokenCbNoText(
+        req_id: u64,
+        token: u32,
+        is_final: bool,
+        in_thinking: bool,
+        data: ?*anyopaque,
+    ) callconv(.c) void {
+        const ctx: *DecodeLoopNoTextCtx = @ptrCast(@alignCast(data));
+        const state = ctx.state;
+
+        if (gen_config_mod.isEosToken(if (state.owned_eos_tokens) |tokens| tokens else &.{}, token)) {
+            if (is_final) {
+                var ev = std.mem.zeroes(CEvent);
+                ev.request_id = req_id;
+                ev.event_type = @intFromEnum(EventType.completed);
+                ev.item_type = @intFromEnum(ItemType.message);
+                ev.content_type = @intFromEnum(ContentType.output_text);
+                ev.is_final = 1;
+                ev.token_id = token;
+                ev.tokens_generated = state.engine_token_count;
+                ctx.completed_event = ev;
+            }
+            return;
+        }
+
+        if (state.engine_token_count == 0 and state.starts_in_reasoning) {
+            state.filter_state = .reasoning;
+        }
+        state.engine_token_count += 1;
+        if (state.first_token_ns == 0) {
+            state.first_token_ns = std.time.nanoTimestamp();
+        }
+
+        const token_types = classifyFromThinking(state, in_thinking);
+        const now_ns = std.time.nanoTimestamp();
+        const elapsed_ns: i128 = if (now_ns > state.start_ns) now_ns - state.start_ns else 0;
+
+        ctx.c_event_buf.* = std.mem.zeroes(CEvent);
+        ctx.c_event_buf.request_id = req_id;
+        ctx.c_event_buf.event_type = @intFromEnum(EventType.text_delta);
+        ctx.c_event_buf.item_type = token_types.item_type;
+        ctx.c_event_buf.content_type = token_types.content_type;
+        ctx.c_event_buf.is_final = 0;
+        ctx.c_event_buf.text_ptr = null;
+        ctx.c_event_buf.text_len = 0;
+        ctx.c_event_buf.token_id = token;
+        ctx.c_event_buf.tokens_generated = state.engine_token_count;
+        ctx.c_event_buf.timestamp_ns = @intCast(@min(elapsed_ns, std.math.maxInt(i64)));
+        ctx.outer_cb(@ptrCast(ctx.c_event_buf), 1, ctx.outer_cb_data);
+
+        if (is_final) {
+            var ev = std.mem.zeroes(CEvent);
+            ev.request_id = req_id;
+            ev.event_type = @intFromEnum(EventType.completed);
+            ev.item_type = token_types.item_type;
+            ev.content_type = token_types.content_type;
+            ev.is_final = 1;
+            ev.token_id = token;
+            ev.tokens_generated = state.engine_token_count;
+            ev.timestamp_ns = @intCast(@min(elapsed_ns, std.math.maxInt(i64)));
             ctx.completed_event = ev;
         }
     }
@@ -1503,6 +1633,42 @@ fn longestCommonPrefixLen(a: []const u8, b: []const u8) usize {
     var i: usize = 0;
     while (i < n and a[i] == b[i]) : (i += 1) {}
     return i;
+}
+
+test "shouldHandoffSingleDecodeLoop requires one active request and a non-final event" {
+    const generating = [_]BatchEvent{
+        .{
+            .request_id = 1,
+            .event_type = .text_delta,
+            .item_type = @intFromEnum(ItemType.message),
+            .content_type = @intFromEnum(ContentType.output_text),
+            .is_final = false,
+            .text = "",
+            .token_id = 42,
+            .tokens_generated = 1,
+            .timestamp_ns = 0,
+        },
+    };
+    const completed = [_]BatchEvent{
+        .{
+            .request_id = 1,
+            .event_type = .completed,
+            .item_type = @intFromEnum(ItemType.message),
+            .content_type = @intFromEnum(ContentType.output_text),
+            .is_final = true,
+            .text = "",
+            .token_id = 42,
+            .tokens_generated = 1,
+            .timestamp_ns = 0,
+        },
+    };
+
+    try std.testing.expect(BatchWrapper.shouldHandoffSingleDecodeLoop(1, 0, generating[0..]));
+    try std.testing.expect(!BatchWrapper.shouldHandoffSingleDecodeLoop(1, 0, completed[0..]));
+    try std.testing.expect(!BatchWrapper.shouldHandoffSingleDecodeLoop(0, 0, generating[0..]));
+    try std.testing.expect(!BatchWrapper.shouldHandoffSingleDecodeLoop(1, 1, generating[0..]));
+    try std.testing.expect(!BatchWrapper.shouldHandoffSingleDecodeLoop(2, 0, generating[0..]));
+    try std.testing.expect(!BatchWrapper.shouldHandoffSingleDecodeLoop(1, 0, &.{}));
 }
 
 test "filterReasoningTags splits reasoning and response in one chunk" {
