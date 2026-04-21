@@ -219,7 +219,6 @@ pub(super) struct ConvertArgs {
     /// Repeat or pass CSV: --opts iters=16,samples=128 --opts clip_mult=0.97
     #[arg(long = "opts", value_name = "KEY=VALUE", num_args = 1..)]
     pub opts: Vec<String>,
-
 }
 
 #[derive(Args)]

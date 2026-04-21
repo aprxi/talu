@@ -54,6 +54,9 @@ pub async fn handle_create(
     if parsed.messages.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "messages array is empty");
     }
+    if let Err(e) = validate_completions_request_via_core(&parsed) {
+        return error_response(StatusCode::BAD_REQUEST, &e);
+    }
 
     let stream = parsed.stream.unwrap_or(false);
 
@@ -619,6 +622,55 @@ fn build_generate_config(
         other => other.to_string(),
     });
     cfg
+}
+
+/// Core-owned contract validation for chat-completions inputs.
+///
+/// Rust only serializes boundary inputs and forwards them to core/src/capi.
+fn validate_completions_request_via_core(body: &CreateChatCompletionBody) -> Result<(), String> {
+    let messages_json = serde_json::to_vec(&body.messages)
+        .map_err(|e| format!("failed to serialize messages for validation: {e}"))?;
+    let tools_json = body.tools.as_ref().map(|v| v.to_string().into_bytes());
+    let tool_choice_json = body
+        .tool_choice
+        .as_ref()
+        .map(|v| v.to_string().into_bytes());
+
+    let (tools_ptr, tools_len) = if let Some(v) = tools_json.as_ref() {
+        (v.as_ptr(), v.len())
+    } else {
+        (std::ptr::null(), 0)
+    };
+    let (tool_choice_ptr, tool_choice_len) = if let Some(v) = tool_choice_json.as_ref() {
+        (v.as_ptr(), v.len())
+    } else {
+        (std::ptr::null(), 0)
+    };
+
+    let rc = unsafe {
+        talu_sys::talu_completions_validate_request(
+            messages_json.as_ptr(),
+            messages_json.len(),
+            usize::from(body.max_tokens.is_some()),
+            body.max_tokens.unwrap_or_default(),
+            usize::from(body.max_completion_tokens.is_some()),
+            body.max_completion_tokens.unwrap_or_default(),
+            body.temperature.unwrap_or(f64::NAN),
+            body.top_p.unwrap_or(f64::NAN),
+            body.presence_penalty.unwrap_or(f64::NAN),
+            body.frequency_penalty.unwrap_or(f64::NAN),
+            tools_ptr,
+            tools_len,
+            tool_choice_ptr,
+            tool_choice_len,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    Err(talu::error::last_error_message()
+        .unwrap_or_else(|| "invalid chat/completions request".to_string()))
 }
 
 fn finish_reason_str(code: u8) -> &'static str {

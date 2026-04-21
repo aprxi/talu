@@ -6052,9 +6052,8 @@ mod tests {
         std::fs::write(reference_visible_text_path(&target), "metal-output")
             .expect("write target visible transcript");
 
-        let result =
-            compare_full_token_transcripts("unused-model", &source, &target, 2)
-                .expect("compare should succeed");
+        let result = compare_full_token_transcripts("unused-model", &source, &target, 2)
+            .expect("compare should succeed");
         assert!(!result.passed);
         assert!(result.report.contains("----- BEGIN cpu -----"));
         assert!(result.report.contains("----- END cpu -----"));
@@ -6093,15 +6092,12 @@ mod tests {
 
         // No *.visible.txt sidecars are written, so this exercises the decode
         // fallback path. Under cfg(test) this must remain non-interactive.
-        let result =
-            compare_full_token_transcripts("unused-model", &source, &target, 2)
-                .expect("compare should succeed");
+        let result = compare_full_token_transcripts("unused-model", &source, &target, 2)
+            .expect("compare should succeed");
         assert!(!result.passed);
         assert!(result.report.contains("token=2 -> FAILED"));
         assert!(
-            result
-                .report
-                .contains("<failed to decode cpu transcript>"),
+            result.report.contains("<failed to decode cpu transcript>"),
             "{}",
             result.report
         );

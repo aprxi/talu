@@ -14,11 +14,7 @@ fn assert_invalid_request(resp: &crate::server::common::HttpResponse) {
         "body: {}",
         resp.body
     );
-    assert!(
-        json["error"]["message"].is_string(),
-        "body: {}",
-        resp.body
-    );
+    assert!(json["error"]["message"].is_string(), "body: {}", resp.body);
 }
 
 #[test]
@@ -160,7 +156,10 @@ fn completions_streaming_invalid_request_returns_400_json() {
         resp.body
     );
     let json = resp.json();
-    assert_eq!(json["error"]["type"].as_str(), Some("invalid_request_error"));
+    assert_eq!(
+        json["error"]["type"].as_str(),
+        Some("invalid_request_error")
+    );
 }
 
 #[test]

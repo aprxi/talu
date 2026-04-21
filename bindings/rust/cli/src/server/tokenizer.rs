@@ -598,6 +598,12 @@ struct ErrorBody {
 // Instance lifecycle
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/instances",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Tokenizer instance created"))
+)]
 pub async fn handle_create_instance(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -729,6 +735,18 @@ pub async fn handle_create_instance(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/tokenizer/instances/{tokenizer_id}",
+    tag = "Tokenizer",
+    params(
+        ("tokenizer_id" = String, Path, description = "Tokenizer instance id")
+    ),
+    responses(
+        (status = 200, description = "Tokenizer instance metadata"),
+        (status = 404, description = "Tokenizer instance not found")
+    )
+)]
 pub async fn handle_get_instance(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -789,6 +807,18 @@ pub async fn handle_get_instance(
     )
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/tokenizer/instances/{tokenizer_id}",
+    tag = "Tokenizer",
+    params(
+        ("tokenizer_id" = String, Path, description = "Tokenizer instance id")
+    ),
+    responses(
+        (status = 204, description = "Tokenizer instance deleted"),
+        (status = 404, description = "Tokenizer instance not found")
+    )
+)]
 pub async fn handle_delete_instance(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -826,6 +856,12 @@ pub async fn handle_delete_instance(
 // Encode/decode
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/encode",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Single-sequence tokenization result"))
+)]
 pub async fn handle_encode(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -982,6 +1018,12 @@ pub async fn handle_encode(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/encode_batch",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Batch tokenization result"))
+)]
 pub async fn handle_encode_batch(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1207,6 +1249,12 @@ pub async fn handle_encode_batch(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/decode",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Single decode result"))
+)]
 pub async fn handle_decode(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1291,6 +1339,12 @@ pub async fn handle_decode(
     json_response(StatusCode::OK, &json!({ "text": text }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/decode_batch",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Batch decode result"))
+)]
 pub async fn handle_decode_batch(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1386,6 +1440,12 @@ pub async fn handle_decode_batch(
 // Vocabulary and token mapping
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/v1/tokenizer/vocab",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Tokenizer vocabulary"))
+)]
 pub async fn handle_vocab(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1456,6 +1516,12 @@ pub async fn handle_vocab(
     json_response(StatusCode::OK, &Value::Object(map))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/tokenizer/vocab_size",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Tokenizer vocabulary size"))
+)]
 pub async fn handle_vocab_size(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1510,6 +1576,12 @@ pub async fn handle_vocab_size(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/token_to_id",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Token id lookup"))
+)]
 pub async fn handle_token_to_id(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1557,6 +1629,12 @@ pub async fn handle_token_to_id(
     json_response(StatusCode::OK, &json!({ "id": id }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/id_to_token",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Token lookup by id"))
+)]
 pub async fn handle_id_to_token(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1592,6 +1670,12 @@ pub async fn handle_id_to_token(
 // Mutable configuration
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/enable_truncation",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Enable truncation for an instance"))
+)]
 pub async fn handle_enable_truncation(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1685,6 +1769,12 @@ pub async fn handle_enable_truncation(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/disable_truncation",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Disable truncation for an instance"))
+)]
 pub async fn handle_disable_truncation(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1712,6 +1802,12 @@ pub async fn handle_disable_truncation(
     json_response(StatusCode::OK, &json!({ "ok": true }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/enable_padding",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Enable padding for an instance"))
+)]
 pub async fn handle_enable_padding(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1793,6 +1889,12 @@ pub async fn handle_enable_padding(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/disable_padding",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Disable padding for an instance"))
+)]
 pub async fn handle_disable_padding(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1824,6 +1926,12 @@ pub async fn handle_disable_padding(
 // Token mutation + serialization
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/add_tokens",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Add regular tokens"))
+)]
 pub async fn handle_add_tokens(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1896,6 +2004,12 @@ pub async fn handle_add_tokens(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/add_special_tokens",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Add special tokens"))
+)]
 pub async fn handle_add_special_tokens(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1986,6 +2100,12 @@ pub async fn handle_add_special_tokens(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/train",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Train tokenizer from text"))
+)]
 pub async fn handle_train(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -2037,6 +2157,12 @@ pub async fn handle_train(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/train_from_iterator",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Train tokenizer from iterator-like input"))
+)]
 pub async fn handle_train_from_iterator(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -2088,6 +2214,12 @@ pub async fn handle_train_from_iterator(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/save",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Save tokenizer JSON to disk"))
+)]
 pub async fn handle_save(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -2232,6 +2364,12 @@ pub async fn handle_save(
 // Compare + capabilities
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/v1/tokenizer/compare",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Compare two tokenizer outputs"))
+)]
 pub async fn handle_compare(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -2365,6 +2503,12 @@ pub async fn handle_compare(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/tokenizer/capabilities",
+    tag = "Tokenizer",
+    responses((status = 200, description = "Tokenizer feature matrix"))
+)]
 pub async fn handle_capabilities(
     _state: Arc<AppState>,
     _req: Request<Incoming>,

@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 
 /// Request body for `POST /v1/chat/completions`.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateChatCompletionBody {
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,

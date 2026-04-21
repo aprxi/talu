@@ -8,6 +8,29 @@ fn health_endpoint_returns_ok() {
     let resp = get(ctx.addr(), "/health");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.body, "ok");
+    assert_eq!(resp.header("x-talu-instance"), Some("talu"));
+}
+
+#[test]
+fn v1_health_reports_identity_and_version() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let cli_version = talu_cli_version();
+    let resp = get(ctx.addr(), "/v1/health");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.header("content-type"), Some("application/json"));
+    assert_eq!(resp.header("x-talu-instance"), Some("talu"));
+    assert_eq!(resp.header("x-talu-api-version"), Some("v1"));
+    let version = resp
+        .header("x-talu-version")
+        .expect("x-talu-version header should be present");
+    assert!(!version.is_empty(), "x-talu-version should not be empty");
+    assert_eq!(version, cli_version);
+
+    let json = resp.json();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["service"], "talu");
+    assert_eq!(json["api_version"], "v1");
+    assert_eq!(json["version"].as_str(), Some(version));
 }
 
 #[test]
@@ -24,8 +47,16 @@ fn root_openapi_served_and_contains_paths() {
     let json = resp.json();
     let paths = json["paths"].as_object().expect("paths object");
     assert!(
+        paths.contains_key("/v1/health"),
+        "missing /v1/health in root spec"
+    );
+    assert!(
         paths.contains_key("/v1/models"),
         "missing /v1/models in root spec"
+    );
+    assert!(
+        paths.contains_key("/v1/repo/models"),
+        "missing /v1/repo/models in root spec"
     );
     assert!(
         paths.contains_key("/v1/chat/completions"),
@@ -61,6 +92,7 @@ fn docs_hub_lists_inference_sections() {
         "/docs/chat",
         "/docs/responses",
         "/docs/models",
+        "/docs/repo",
         "/docs/tokenizer",
     ] {
         assert!(resp.body.contains(link), "missing link: {link}");
@@ -75,6 +107,7 @@ fn scoped_docs_pages_point_to_scoped_specs() {
         ("/docs/chat", "/openapi/chat.json"),
         ("/docs/responses", "/openapi/responses.json"),
         ("/docs/models", "/openapi/models.json"),
+        ("/docs/repo", "/openapi/repo.json"),
         ("/docs/tokenizer", "/openapi/tokenizer.json"),
     ] {
         let resp = get(ctx.addr(), path);
@@ -103,6 +136,7 @@ fn scoped_openapi_specs_are_prefix_scoped() {
         ("/openapi/chat.json", vec!["/v1/chat/"]),
         ("/openapi/responses.json", vec!["/v1/responses"]),
         ("/openapi/models.json", vec!["/v1/models"]),
+        ("/openapi/repo.json", vec!["/v1/repo"]),
         ("/openapi/tokenizer.json", vec!["/v1/tokenizer"]),
     ] {
         let resp = get(ctx.addr(), path);

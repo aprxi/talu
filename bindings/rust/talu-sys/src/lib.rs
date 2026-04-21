@@ -2340,6 +2340,8 @@ extern "C" {
     // core/src/capi/validate.zig
     pub fn talu_clear_response_format(chat_handle: *mut c_void);
     // core/src/capi/router.zig
+    pub fn talu_completions_validate_request(messages_json_ptr: *const u8, messages_json_len: usize, has_max_tokens: usize, max_tokens: i64, has_max_completion_tokens: usize, max_completion_tokens: i64, temperature: f64, top_p: f64, presence_penalty: f64, frequency_penalty: f64, tools_json_ptr: *const u8, tools_json_len: usize, tool_choice_json_ptr: *const u8, tool_choice_json_len: usize) -> c_int;
+    // core/src/capi/router.zig
     pub fn talu_config_canonicalize(in_spec: *mut TaluModelSpec, out_handle: *mut c_void) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_config_free(handle: *mut c_void);
