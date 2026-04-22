@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
+#[cfg(not(windows))]
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::events;
@@ -1241,7 +1242,11 @@ async fn stream_response(
                             p.total,
                         );
                     }));
-                match provider::create_backend_for_model_with_progress(&model_id, callback) {
+                match load_backend_for_model_with_progress_blocking(
+                    &state_for_store,
+                    model_id.clone(),
+                    callback,
+                ) {
                     Ok(new_backend) => {
                         // Recreate batch scheduler for new backend.
                         let new_sched =
@@ -3238,31 +3243,32 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
 
     // 5. Load the model.
     log::info!(target: "server::gen", "loading backend for model {}", model_id);
-    let model = model_id.to_string();
     let model_key = model_id.to_string();
-    let load_result =
-        tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model)).await;
-
-    let backend = match load_result {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
+    let backend = match load_backend_for_model(&state, model_id.to_string()).await {
+        Ok(backend) => backend,
+        Err(e) => {
             let msg = format!("{e}");
             let _ = tx.send(ModelLoadResult::Err(msg.clone()));
             state.model_load_inflight.lock().unwrap().remove(&model_key);
             return Err(e);
         }
-        Err(e) => {
-            let msg = format!("model load task panicked: {e}");
-            let _ = tx.send(ModelLoadResult::Err(msg.clone()));
-            state.model_load_inflight.lock().unwrap().remove(&model_key);
-            return Err(anyhow!("{}", msg));
-        }
     };
+    log::info!(
+        target: "server::gen",
+        "backend created for model {}; creating scheduler",
+        model_id
+    );
 
     // 6. Install backend + scheduler, drain old.
     let new_sched = crate::server::batch_scheduler::SchedulerState::new(&backend, None)
         .ok()
         .map(Arc::new);
+    log::info!(
+        target: "server::gen",
+        "scheduler init finished for model {} (available={})",
+        model_id,
+        new_sched.is_some()
+    );
     let old_sched = if let Ok(mut sched_guard) = state.batch_scheduler.lock() {
         let old = sched_guard.take();
         *sched_guard = new_sched;
@@ -3312,6 +3318,74 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
         }
     }
     Ok(())
+}
+
+async fn load_backend_for_model(
+    state: &Arc<AppState>,
+    model: String,
+) -> Result<talu::InferenceBackend> {
+    #[cfg(windows)]
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let request = crate::server::state::ModelLoadRequest {
+            model,
+            reply: reply_tx,
+        };
+        let loader = state
+            .model_loader
+            .as_ref()
+            .ok_or_else(|| anyhow!("windows model loader unavailable"))?;
+        loader
+            .send(request)
+            .map_err(|_| anyhow!("windows model loader stopped"))?;
+        match reply_rx.await {
+            Ok(Ok(backend)) => Ok(backend),
+            Ok(Err(msg)) => Err(anyhow!(msg)),
+            Err(_) => Err(anyhow!("windows model loader dropped response")),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        match tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model)).await
+        {
+            Ok(result) => result,
+            Err(e) => Err(anyhow!("model load task panicked: {e}")),
+        }
+    }
+}
+
+fn load_backend_for_model_with_progress_blocking(
+    state: &Arc<AppState>,
+    model: String,
+    callback: Option<talu::LoadProgressCallback>,
+) -> Result<talu::InferenceBackend> {
+    #[cfg(windows)]
+    {
+        let _ = callback;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let request = crate::server::state::ModelLoadRequest {
+            model,
+            reply: reply_tx,
+        };
+        let loader = state
+            .model_loader
+            .as_ref()
+            .ok_or_else(|| anyhow!("windows model loader unavailable"))?;
+        loader
+            .send(request)
+            .map_err(|_| anyhow!("windows model loader stopped"))?;
+        match reply_rx.blocking_recv() {
+            Ok(Ok(backend)) => Ok(backend),
+            Ok(Err(msg)) => Err(anyhow!(msg)),
+            Err(_) => Err(anyhow!("windows model loader dropped response")),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        provider::create_backend_for_model_with_progress(&model, callback)
+    }
 }
 
 fn log_generation_completed(ctx: &AuthContext) {

@@ -1,22 +1,33 @@
 //! C API bridge for long-lived non-PTY process sessions (`talu_process_*`).
 
 const std = @import("std");
-const process_mod = @import("../../agent/process/root.zig");
-const shell_mod = @import("../../agent/shell/root.zig");
-const sandbox = @import("../../agent/sandbox/root.zig");
+const builtin = @import("builtin");
+const shell_safety = @import("../../agent/shell/safety.zig");
 const policy_api = @import("policy.zig");
 const runtime_api = @import("runtime.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
 const allocator = std.heap.c_allocator;
+const has_native_process_sessions = builtin.os.tag != .windows;
+const ProcessSession = if (has_native_process_sessions)
+    @import("../../agent/process/root.zig").session.ProcessSession
+else
+    opaque {};
 const ACTION_PROCESS = "tool.process";
 
 pub const TaluProcess = opaque {};
 
-fn toProcess(handle: ?*TaluProcess) !*process_mod.session.ProcessSession {
+fn toProcess(handle: ?*TaluProcess) !*ProcessSession {
+    if (!has_native_process_sessions) return error.ProcessUnsupported;
     const ptr = handle orelse return error.InvalidHandle;
     return @ptrCast(@alignCast(ptr));
+}
+
+fn unsupportedProcessSessions() i32 {
+    capi_error.clearError();
+    capi_error.setErrorWithCode(.shell_exec_failed, "process sessions are not supported on Windows", .{});
+    return @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
 }
 
 fn setPolicyDeniedError(reason: ?policy_api.ProcessDenyReason) i32 {
@@ -46,19 +57,19 @@ fn enforceProcessOpenPolicy(
     command: []const u8,
     cwd: ?[]const u8,
 ) i32 {
-    const safety_check = shell_mod.safety.checkCommand(command);
+    const safety_check = shell_safety.checkCommand(command);
     if (!safety_check.allowed) {
         const reason = safety_check.reason orelse "command denied by baseline shell safety";
         capi_error.setErrorWithCode(.shell_command_denied, "{s}", .{reason});
         return @intFromEnum(error_codes.ErrorCode.shell_command_denied);
     }
 
-    var iter = shell_mod.safety.ChainIterator.init(command);
+    var iter = shell_safety.ChainIterator.init(command);
     while (iter.next()) |segment_raw| {
         const segment = std.mem.trim(u8, segment_raw, &std.ascii.whitespace);
         if (segment.len == 0) continue;
 
-        const normalized = shell_mod.safety.normalizeCommand(allocator, segment) catch |err| {
+        const normalized = shell_safety.normalizeCommand(allocator, segment) catch |err| {
             capi_error.setError(err, "failed to normalize command segment", .{});
             return @intFromEnum(error_codes.errorToCode(err));
         };
@@ -120,6 +131,11 @@ pub fn talu_process_open(
         return setStrictError(err);
     };
 
+    if (!has_native_process_sessions) return unsupportedProcessSessions();
+
+    const process_mod = @import("../../agent/process/root.zig");
+    const sandbox = @import("../../agent/sandbox/root.zig");
+
     var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
     defer if (owned_exec_profile) |*p| p.deinit();
     var exec_profile_ptr: ?*const sandbox.profile.ExecProfile = null;
@@ -164,7 +180,8 @@ pub fn talu_process_open(
 /// Close a process session.
 pub fn talu_process_close(process_handle: ?*TaluProcess) callconv(.c) void {
     capi_error.clearError();
-    const session_ptr: *process_mod.session.ProcessSession = @ptrCast(@alignCast(process_handle orelse return));
+    if (!has_native_process_sessions) return;
+    const session_ptr: *ProcessSession = @ptrCast(@alignCast(process_handle orelse return));
     session_ptr.close();
 }
 
@@ -175,6 +192,7 @@ pub fn talu_process_write(
     len: usize,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_process_sessions) return unsupportedProcessSessions();
 
     const session_ptr = toProcess(process_handle) catch |err| {
         capi_error.setError(err, "invalid process handle", .{});
@@ -204,6 +222,7 @@ pub fn talu_process_read(
     out_read: ?*usize,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_process_sessions) return unsupportedProcessSessions();
     if (out_read) |n| n.* = 0;
     const out_read_ptr = out_read orelse {
         capi_error.setErrorWithCode(.invalid_argument, "out_read is null", .{});
@@ -237,6 +256,7 @@ pub fn talu_process_signal(
     sig: u8,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_process_sessions) return unsupportedProcessSessions();
     const session_ptr = toProcess(process_handle) catch |err| {
         capi_error.setError(err, "invalid process handle", .{});
         return @intFromEnum(error_codes.errorToCode(err));
@@ -251,6 +271,7 @@ pub fn talu_process_signal(
 /// Return true if process is still alive.
 pub fn talu_process_alive(process_handle: ?*TaluProcess) callconv(.c) bool {
     capi_error.clearError();
+    if (!has_native_process_sessions) return false;
     const session_ptr = toProcess(process_handle) catch |err| {
         capi_error.setError(err, "invalid process handle", .{});
         return false;
@@ -268,6 +289,7 @@ pub fn talu_process_exit_code(
     out_has_code: ?*bool,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_process_sessions) return unsupportedProcessSessions();
     if (out_has_code) |p| p.* = false;
     if (out_code) |p| p.* = 0;
 
@@ -297,6 +319,7 @@ pub fn talu_process_exit_code(
 }
 
 test "talu_process_open write read close roundtrip" {
+    if (!has_native_process_sessions) return;
     var handle: ?*TaluProcess = null;
     try std.testing.expectEqual(
         @as(i32, 0),
@@ -334,6 +357,7 @@ test "talu_process_open write read close roundtrip" {
 }
 
 test "talu_process_open enforces agent policy" {
+    if (!has_native_process_sessions) return;
     var policy_handle: ?*policy_api.TaluAgentPolicy = null;
     const policy_json =
         \\{"default":"deny","statements":[{"effect":"allow","action":"tool.fs.read","resource":"**"}]}

@@ -30,6 +30,9 @@ pub mod tenant;
 pub mod tokenizer;
 pub mod vision;
 
+#[cfg(windows)]
+use crate::server::state::ModelLoadRequest;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum AgentRuntimeMode {
     Host,
@@ -252,6 +255,9 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         warmup_batch_scheduler(sched, backend_state.current_model.as_deref());
     }
 
+    #[cfg(windows)]
+    let (model_loader_tx, model_loader_rx) = tokio::sync::mpsc::unbounded_channel();
+
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
         batch_scheduler: std::sync::Mutex::new(batch_scheduler),
@@ -274,6 +280,10 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
         model_load_inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+        #[cfg(windows)]
+        model_loader: Some(model_loader_tx),
+        #[cfg(not(windows))]
+        model_loader: None,
     };
 
     let addr = SocketAddr::new(args.host, args.port);
@@ -294,11 +304,29 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(listen::serve(state, addr, socket_path))?;
+    #[cfg(windows)]
+    {
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(run_model_loader(model_loader_rx));
+        local.block_on(&runtime, listen::serve(state, addr, socket_path))?;
+    }
+    #[cfg(not(windows))]
+    {
+        runtime.block_on(listen::serve(state, addr, socket_path))?;
+    }
     // Give spawn_blocking tasks up to 3 seconds to respond to stop flags,
     // then forcefully shut down so the process exits promptly on Ctrl+C.
     runtime.shutdown_timeout(std::time::Duration::from_secs(3));
     Ok(())
+}
+
+#[cfg(windows)]
+async fn run_model_loader(mut rx: tokio::sync::mpsc::UnboundedReceiver<ModelLoadRequest>) {
+    while let Some(request) = rx.recv().await {
+        let result = crate::provider::create_backend_for_model(&request.model)
+            .map_err(|e| e.to_string());
+        let _ = request.reply.send(result);
+    }
 }
 
 fn resolve_sandbox_backend(

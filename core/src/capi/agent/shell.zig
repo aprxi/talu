@@ -3,14 +3,19 @@
 //! Stateless functions — no handle needed (unlike fs.zig).
 
 const std = @import("std");
-const shell = @import("../../agent/shell/root.zig");
-const sandbox = @import("../../agent/sandbox/root.zig");
+const builtin = @import("builtin");
+const shell_safety = @import("../../agent/shell/safety.zig");
 const policy_api = @import("policy.zig");
 const runtime_api = @import("runtime.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
 const allocator = std.heap.c_allocator;
+const has_native_shell_sessions = builtin.os.tag != .windows;
+const ShellSession = if (has_native_shell_sessions)
+    @import("../../agent/shell/root.zig").session.ShellSession
+else
+    opaque {};
 const DEFAULT_SCROLLBACK_BYTES: usize = 64 * 1024;
 const ACTION_EXEC = "tool.exec";
 const ACTION_SHELL = "tool.shell";
@@ -19,8 +24,15 @@ pub const TaluShell = opaque {};
 
 pub const StreamCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) bool;
 
-fn toShell(handle: ?*TaluShell) !*shell.session.ShellSession {
+fn toShell(handle: ?*TaluShell) !*ShellSession {
+    if (!has_native_shell_sessions) return error.ShellUnsupported;
     return @ptrCast(@alignCast(handle orelse return error.InvalidHandle));
+}
+
+fn unsupportedShellSessions() i32 {
+    capi_error.clearError();
+    capi_error.setErrorWithCode(.shell_exec_failed, "shell sessions are not supported on Windows", .{});
+    return @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
 }
 
 fn setPolicyDeniedError(reason: ?policy_api.ProcessDenyReason) i32 {
@@ -48,7 +60,7 @@ fn setStrictError(err: anyerror) i32 {
 fn parseRuntime(
     runtime_mode: c_int,
     sandbox_backend: c_int,
-) !struct { mode: sandbox.RuntimeMode, backend: sandbox.Backend } {
+) !struct { mode: runtime_api.RuntimeMode, backend: runtime_api.Backend } {
     const mode = try runtime_api.parseRuntimeMode(runtime_mode);
     const backend = try runtime_api.parseBackend(sandbox_backend);
     return .{ .mode = mode, .backend = backend };
@@ -60,19 +72,19 @@ fn enforceShellExecPolicy(
     command: []const u8,
     cwd: ?[]const u8,
 ) i32 {
-    const safety_check = shell.safety.checkCommand(command);
+    const safety_check = shell_safety.checkCommand(command);
     if (!safety_check.allowed) {
         const reason = safety_check.reason orelse "command denied by baseline shell safety";
         capi_error.setErrorWithCode(.shell_command_denied, "{s}", .{reason});
         return @intFromEnum(error_codes.ErrorCode.shell_command_denied);
     }
 
-    var iter = shell.safety.ChainIterator.init(command);
+    var iter = shell_safety.ChainIterator.init(command);
     while (iter.next()) |segment_raw| {
         const segment = std.mem.trim(u8, segment_raw, &std.ascii.whitespace);
         if (segment.len == 0) continue;
 
-        const normalized = shell.safety.normalizeCommand(allocator, segment) catch |err| {
+        const normalized = shell_safety.normalizeCommand(allocator, segment) catch |err| {
             capi_error.setError(err, "failed to normalize command segment", .{});
             return @intFromEnum(error_codes.errorToCode(err));
         };
@@ -141,6 +153,11 @@ pub fn talu_shell_exec(
     runtime_api.validate(runtime.mode, runtime.backend) catch |err| {
         return setStrictError(err);
     };
+
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
+
+    const shell = @import("../../agent/shell/root.zig");
+    const sandbox = @import("../../agent/sandbox/root.zig");
 
     var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
     defer if (owned_exec_profile) |*p| p.deinit();
@@ -251,6 +268,11 @@ pub fn talu_shell_exec_streaming(
         return setStrictError(err);
     };
 
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
+
+    const shell = @import("../../agent/shell/root.zig");
+    const sandbox = @import("../../agent/sandbox/root.zig");
+
     var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
     defer if (owned_exec_profile) |*p| p.deinit();
     var exec_profile_ptr: ?*const sandbox.profile.ExecProfile = null;
@@ -353,7 +375,7 @@ pub fn talu_shell_check_command(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }, 0);
 
-    const check = shell.safety.checkCommand(cmd);
+    const check = shell_safety.checkCommand(cmd);
 
     if (out_allowed) |a| a.* = check.allowed;
     if (check.reason) |reason| {
@@ -383,7 +405,7 @@ pub fn talu_shell_default_policy_json(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
 
-    const json = shell.safety.defaultPolicyJson(allocator) catch |err| {
+    const json = shell_safety.defaultPolicyJson(allocator) catch |err| {
         capi_error.setError(err, "failed to build default policy JSON", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -419,7 +441,7 @@ pub fn talu_shell_normalize_command(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
 
-    const normalized = shell.safety.normalizeCommand(allocator, cmd) catch |err| {
+    const normalized = shell_safety.normalizeCommand(allocator, cmd) catch |err| {
         capi_error.setError(err, "failed to normalize command", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -467,6 +489,11 @@ pub fn talu_shell_open(
     runtime_api.validate(runtime.mode, runtime.backend) catch |err| {
         return setStrictError(err);
     };
+
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
+
+    const shell = @import("../../agent/shell/root.zig");
+    const sandbox = @import("../../agent/sandbox/root.zig");
 
     var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
     defer if (owned_exec_profile) |*p| p.deinit();
@@ -520,7 +547,8 @@ pub fn talu_shell_open(
 /// Close an interactive shell session.
 pub fn talu_shell_close(shell_handle: ?*TaluShell) callconv(.c) void {
     capi_error.clearError();
-    const session_ptr: *shell.session.ShellSession = @ptrCast(@alignCast(shell_handle orelse return));
+    if (!has_native_shell_sessions) return;
+    const session_ptr: *ShellSession = @ptrCast(@alignCast(shell_handle orelse return));
     session_ptr.close();
 }
 
@@ -531,6 +559,7 @@ pub fn talu_shell_write(
     len: usize,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
 
     const session_ptr = toShell(shell_handle) catch |err| {
         capi_error.setError(err, "invalid shell handle", .{});
@@ -560,6 +589,7 @@ pub fn talu_shell_read(
     out_read: ?*usize,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
     if (out_read) |n| n.* = 0;
     const out_read_ptr = out_read orelse {
         capi_error.setErrorWithCode(.invalid_argument, "out_read is null", .{});
@@ -594,6 +624,7 @@ pub fn talu_shell_resize(
     rows: u16,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
     const session_ptr = toShell(shell_handle) catch |err| {
         capi_error.setError(err, "invalid shell handle", .{});
         return @intFromEnum(error_codes.errorToCode(err));
@@ -611,6 +642,7 @@ pub fn talu_shell_signal(
     sig: u8,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
     const session_ptr = toShell(shell_handle) catch |err| {
         capi_error.setError(err, "invalid shell handle", .{});
         return @intFromEnum(error_codes.errorToCode(err));
@@ -625,6 +657,7 @@ pub fn talu_shell_signal(
 /// Return true if shell session process is still alive.
 pub fn talu_shell_alive(shell_handle: ?*TaluShell) callconv(.c) bool {
     capi_error.clearError();
+    if (!has_native_shell_sessions) return false;
     const session_ptr = toShell(shell_handle) catch |err| {
         capi_error.setError(err, "invalid shell handle", .{});
         return false;
@@ -642,6 +675,7 @@ pub fn talu_shell_scrollback(
     out_len: ?*usize,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    if (!has_native_shell_sessions) return unsupportedShellSessions();
     if (out_data) |ptr| ptr.* = null;
     if (out_len) |len| len.* = 0;
     const out_data_ptr = out_data orelse {
@@ -708,6 +742,7 @@ test "talu_shell_check_command null command returns error" {
 }
 
 test "talu_shell_exec runs whitelisted command" {
+    if (!has_native_shell_sessions) return;
     var stdout_ptr: ?[*]const u8 = null;
     var stdout_len: usize = 0;
     var stderr_ptr: ?[*]const u8 = null;
@@ -752,6 +787,7 @@ test "talu_shell_exec null command returns error" {
 }
 
 test "talu_shell_exec enforces agent policy" {
+    if (!has_native_shell_sessions) return;
     var policy_handle: ?*policy_api.TaluAgentPolicy = null;
     const policy_json =
         \\{"default":"deny","statements":[{"effect":"allow","action":"tool.fs.read","resource":"**"}]}
@@ -805,6 +841,7 @@ test "talu_shell_normalize_command strips path" {
 }
 
 test "talu_shell_exec_streaming invokes callbacks and returns exit" {
+    if (!has_native_shell_sessions) return;
     const callbacks = struct {
         fn onStdout(ctx: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) bool {
             const saw: *bool = @ptrCast(@alignCast(ctx.?));
@@ -846,6 +883,7 @@ test "talu_shell_exec_streaming invokes callbacks and returns exit" {
 }
 
 test "talu_shell_open write read and scrollback" {
+    if (!has_native_shell_sessions) return;
     var handle: ?*TaluShell = null;
     try std.testing.expectEqual(
         @as(i32, 0),

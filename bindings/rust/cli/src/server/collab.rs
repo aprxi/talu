@@ -2189,6 +2189,7 @@ mod tests {
             active_stop_flags: std::sync::Mutex::new(Vec::<Weak<AtomicBool>>::new()),
             drain_thread: std::sync::Mutex::new(None),
             model_load_inflight: std::sync::Mutex::new(HashMap::new()),
+            model_loader: None,
         }
     }
 

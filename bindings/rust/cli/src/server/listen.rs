@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -13,6 +13,9 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
+use std::path::Path;
 
 use crate::server::http::Router;
 use crate::server::state::AppState;

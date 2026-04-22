@@ -797,11 +797,11 @@ fn synchronize_backend(backend: &talu::InferenceBackend) -> Result<()> {
 
 fn maybe_hard_exit_after_verify(result: Result<()>) -> Result<()> {
     if should_process_scope_backend_teardown() {
-        let exit_code = if result.is_ok() { 0 } else { 1 };
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         #[cfg(target_os = "macos")]
         unsafe {
+            let exit_code = if result.is_ok() { 0 } else { 1 };
             _exit(exit_code);
         }
         #[allow(unreachable_code)]

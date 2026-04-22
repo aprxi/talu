@@ -31,6 +31,12 @@ pub struct BackendState {
     pub current_model: Option<String>,
 }
 
+pub struct ModelLoadRequest {
+    pub model: String,
+    pub reply:
+        tokio::sync::oneshot::Sender<std::result::Result<InferenceBackend, String>>,
+}
+
 /// Stored conversation state for `previous_response_id` lookups.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredResponse {
@@ -122,4 +128,7 @@ pub struct AppState {
     /// load's watch receiver. Waiters clone the receiver and await completion.
     pub model_load_inflight:
         std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<ModelLoadResult>>>,
+    /// Windows-only lazy model loader that keeps backend creation on the
+    /// server's main thread.
+    pub model_loader: Option<tokio::sync::mpsc::UnboundedSender<ModelLoadRequest>>,
 }

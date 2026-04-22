@@ -1,10 +1,13 @@
 //! C API bridge for agent runtime policy handles.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const policy_mod = @import("../../agent/policy/root.zig");
-const sandbox = @import("../../agent/sandbox/root.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
+
+const has_native_strict_runtime = builtin.os.tag != .windows;
+const sandbox = if (has_native_strict_runtime) @import("../../agent/sandbox/root.zig") else struct {};
 
 const allocator = std.heap.c_allocator;
 const Policy = policy_mod.Policy;
@@ -15,6 +18,7 @@ const ACTION_PROCESS = "tool.process";
 pub const TaluAgentPolicy = opaque {};
 pub const ProcessDenyReason = policy_mod.ProcessDenyReason;
 pub const TerminalShellMode = policy_mod.TerminalShellMode;
+pub const PreparedExecProfile = if (has_native_strict_runtime) sandbox.profile.ExecProfile else struct {};
 
 pub const ProcessPolicyResult = struct {
     allowed: bool,
@@ -36,15 +40,17 @@ pub const FileSubtreeDecision = enum {
 
 const PreparedProfiles = struct {
     cwd: ?[]u8 = null,
-    exec: ?sandbox.profile.ExecProfile = null,
-    shell: ?sandbox.profile.ExecProfile = null,
-    process: ?sandbox.profile.ExecProfile = null,
+    exec: ?PreparedExecProfile = null,
+    shell: ?PreparedExecProfile = null,
+    process: ?PreparedExecProfile = null,
 
     fn deinit(self: *PreparedProfiles) void {
-        if (self.exec) |*profile| profile.deinit();
-        if (self.shell) |*profile| profile.deinit();
-        if (self.process) |*profile| profile.deinit();
-        if (self.cwd) |value| allocator.free(value);
+        if (has_native_strict_runtime) {
+            if (self.exec) |*profile| profile.deinit();
+            if (self.shell) |*profile| profile.deinit();
+            if (self.process) |*profile| profile.deinit();
+            if (self.cwd) |value| allocator.free(value);
+        }
         self.* = .{};
     }
 };
@@ -73,7 +79,8 @@ pub fn preparedExecProfile(
     policy: ?*TaluAgentPolicy,
     action: []const u8,
     cwd: ?[]const u8,
-) ?*const sandbox.profile.ExecProfile {
+) ?*const PreparedExecProfile {
+    if (!has_native_strict_runtime) return null;
     const handle = toHandle(policy) orelse return null;
     if (!cwdMatches(handle.prepared.cwd, cwd)) return null;
     if (std.mem.eql(u8, action, ACTION_EXEC)) return if (handle.prepared.exec) |*p| p else null;
@@ -83,6 +90,7 @@ pub fn preparedExecProfile(
 }
 
 pub fn prepareRuntimeProfiles(policy: ?*TaluAgentPolicy, cwd: ?[]const u8) !void {
+    if (!has_native_strict_runtime) return error.StrictUnavailable;
     const handle = toHandle(policy) orelse return;
     var canonical_cwd: ?[]u8 = null;
     if (cwd) |value| {
@@ -257,8 +265,15 @@ pub fn talu_agent_policy_prepare_runtime(
     } else null;
 
     prepareRuntimeProfiles(policy, cwd_slice) catch |err| {
+        const code: error_codes.ErrorCode = if (has_native_strict_runtime)
+            switch (err) {
+                error.StrictUnavailable => .policy_strict_unavailable,
+                else => .policy_strict_setup_failed,
+            }
+        else
+            .policy_strict_unavailable;
         capi_error.setError(err, "failed to precompile strict runtime profiles", .{});
-        return @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+        return @intFromEnum(code);
     };
     return 0;
 }
@@ -562,6 +577,8 @@ test "talu_agent_policy_strict_emulation_decisions derives conservative flags" {
 }
 
 test "talu_agent_policy_prepare_runtime precompiles strict profiles" {
+    if (builtin.os.tag == .windows) return;
+
     var handle: ?*TaluAgentPolicy = null;
     const policy_json =
         \\{
@@ -585,6 +602,8 @@ test "talu_agent_policy_prepare_runtime precompiles strict profiles" {
 }
 
 test "prepareRuntimeProfiles defers cwd-dependent missing allow paths" {
+    if (builtin.os.tag == .windows) return;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");

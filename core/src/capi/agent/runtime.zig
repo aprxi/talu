@@ -2,10 +2,29 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const sandbox = @import("../../agent/sandbox/root.zig");
 const policy_api = @import("policy.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
+
+const has_native_strict_runtime = builtin.os.tag != .windows;
+const sandbox = if (has_native_strict_runtime) @import("../../agent/sandbox/root.zig") else struct {};
+
+pub const RuntimeMode = if (has_native_strict_runtime)
+    sandbox.RuntimeMode
+else
+    enum(u8) {
+        host = 0,
+        strict = 1,
+    };
+
+pub const Backend = if (has_native_strict_runtime)
+    sandbox.Backend
+else
+    enum(u8) {
+        linux_local = 0,
+        oci = 1,
+        apple_container = 2,
+    };
 
 pub const TaluAgentRuntimeMode = enum(c_int) {
     host = 0,
@@ -18,7 +37,7 @@ pub const TaluSandboxBackend = enum(c_int) {
     apple_container = 2,
 };
 
-pub fn parseRuntimeMode(value: c_int) !sandbox.RuntimeMode {
+pub fn parseRuntimeMode(value: c_int) !RuntimeMode {
     return switch (value) {
         0 => .host,
         1 => .strict,
@@ -26,7 +45,7 @@ pub fn parseRuntimeMode(value: c_int) !sandbox.RuntimeMode {
     };
 }
 
-pub fn parseBackend(value: c_int) !sandbox.Backend {
+pub fn parseBackend(value: c_int) !Backend {
     return switch (value) {
         0 => .linux_local,
         1 => .oci,
@@ -35,8 +54,14 @@ pub fn parseBackend(value: c_int) !sandbox.Backend {
     };
 }
 
-pub fn validate(mode: sandbox.RuntimeMode, backend: sandbox.Backend) !void {
-    return sandbox.validate(mode, backend);
+pub fn validate(mode: RuntimeMode, backend: Backend) !void {
+    if (has_native_strict_runtime) {
+        return sandbox.validate(mode, backend);
+    }
+    switch (backend) {
+        .linux_local, .oci, .apple_container => {},
+    }
+    if (mode == .strict) return error.StrictUnavailable;
 }
 
 pub fn talu_agent_runtime_validate_strict(
@@ -50,6 +75,11 @@ pub fn talu_agent_runtime_validate_strict(
         capi_error.setError(err, "invalid sandbox backend", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
+
+    if (!has_native_strict_runtime) {
+        capi_error.setErrorWithCode(.shell_command_denied, "strict runtime unavailable on Windows", .{});
+        return @intFromEnum(error_codes.ErrorCode.policy_strict_unavailable);
+    }
 
     validate(.strict, backend) catch |err| {
         capi_error.setError(err, "strict runtime unavailable", .{});
@@ -120,6 +150,15 @@ pub fn talu_agent_runtime_validate_strict_ext(
         return 0;
     }
 
+    if (!has_native_strict_runtime) {
+        if (out_report) |r| r.* = std.mem.zeroes(TaluCapabilityReport);
+        if (strict_required) {
+            capi_error.setErrorWithCode(.sandbox_detect_failed, "strict runtime unavailable on Windows", .{});
+            return @intFromEnum(error_codes.ErrorCode.sandbox_detect_failed);
+        }
+        return 0;
+    }
+
     const cap = sandbox.detect.detect();
     if (out_report) |r| {
         r.* = std.mem.zeroes(TaluCapabilityReport);
@@ -159,14 +198,14 @@ pub fn talu_agent_runtime_validate_strict_ext(
 }
 
 test "parseRuntimeMode accepts host and strict" {
-    try std.testing.expectEqual(sandbox.RuntimeMode.host, try parseRuntimeMode(0));
-    try std.testing.expectEqual(sandbox.RuntimeMode.strict, try parseRuntimeMode(1));
+    try std.testing.expectEqual(RuntimeMode.host, try parseRuntimeMode(0));
+    try std.testing.expectEqual(RuntimeMode.strict, try parseRuntimeMode(1));
 }
 
 test "parseBackend accepts known values" {
-    try std.testing.expectEqual(sandbox.Backend.linux_local, try parseBackend(0));
-    try std.testing.expectEqual(sandbox.Backend.oci, try parseBackend(1));
-    try std.testing.expectEqual(sandbox.Backend.apple_container, try parseBackend(2));
+    try std.testing.expectEqual(Backend.linux_local, try parseBackend(0));
+    try std.testing.expectEqual(Backend.oci, try parseBackend(1));
+    try std.testing.expectEqual(Backend.apple_container, try parseBackend(2));
 }
 
 test "strict validate rejects unsupported backend" {
