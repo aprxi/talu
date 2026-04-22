@@ -33,6 +33,8 @@ pub export fn talu_get_abi_version() callconv(.c) i32 {
 comptime {
     // ABI Version (Global Handshake)
     _ = &talu_get_abi_version;
+    _ = capi.agent_api;
+    _ = capi.collab;
 
     // Tensor API
 

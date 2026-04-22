@@ -23,6 +23,8 @@ pub struct ServerConfig {
     pub model: Option<String>,
     pub gateway_secret: Option<String>,
     pub tenants: Vec<TenantSpec>,
+    /// Optional storage bucket passed via `talu serve --bucket`.
+    pub bucket: Option<PathBuf>,
     /// Workdir root passed via `talu serve --workdir`.
     pub workdir: Option<PathBuf>,
     /// Extra environment variables to set on the server process.
@@ -35,6 +37,7 @@ impl ServerConfig {
             model: None,
             gateway_secret: None,
             tenants: Vec::new(),
+            bucket: None,
             workdir: None,
             env_vars: Vec::new(),
         }
@@ -120,6 +123,10 @@ impl ServerTestContext {
 
         if let Some(ref workdir) = config.workdir {
             command.arg("--workdir").arg(workdir);
+        }
+
+        if let Some(ref bucket) = config.bucket {
+            command.arg("--bucket").arg(bucket);
         }
 
         for (key, value) in &config.env_vars {

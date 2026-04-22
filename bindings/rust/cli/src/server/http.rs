@@ -17,7 +17,12 @@ use tower_service::Service;
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::server::agent::exec as agent_exec;
+use crate::server::agent::fs as agent_fs;
+use crate::server::agent::process as agent_process;
+use crate::server::agent::shell as agent_shell;
 use crate::server::auth_gateway::AuthContext;
+use crate::server::collab;
 use crate::server::completions;
 use crate::server::handlers;
 use crate::server::openapi;
@@ -91,6 +96,8 @@ static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
             "/v1/repo",
             "/v1/responses",
             "/v1/tokenizer",
+            "/v1/collab/",
+            "/v1/agent/",
         ],
     )
 });
@@ -108,6 +115,16 @@ static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
 static OPENAPI_TOKENIZER_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tokenizer"]));
+static OPENAPI_COLLAB_RESOURCES_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/resources/"]));
+static OPENAPI_AGENT_FS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/fs/"]));
+static OPENAPI_AGENT_EXEC_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/exec"]));
+static OPENAPI_AGENT_SHELL_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/shells"]));
+static OPENAPI_AGENT_PROCESS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/processes"]));
 
 static KNOWN_PATHS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut paths = HashSet::new();
@@ -200,6 +217,31 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_TOKENIZER_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/collab/resources.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_COLLAB_RESOURCES_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/agent/fs.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_FS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/agent/exec.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_EXEC_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/agent/shell.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_SHELL_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/agent/process.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_PROCESS_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/docs") => docs_hub_response(),
                 (Method::GET, "/docs/chat") => {
                     swagger_ui_response("/openapi/chat.json", "Talu API :: Chat Completions")
@@ -215,6 +257,22 @@ impl Service<Request<Incoming>> for Router {
                 }
                 (Method::GET, "/docs/tokenizer") => {
                     swagger_ui_response("/openapi/tokenizer.json", "Talu API :: Tokenizer")
+                }
+                (Method::GET, "/docs/collab/resources") => swagger_ui_response(
+                    "/openapi/collab/resources.json",
+                    "Talu API :: Collab::Resources",
+                ),
+                (Method::GET, "/docs/agent/fs") => {
+                    swagger_ui_response("/openapi/agent/fs.json", "Talu API :: Agent::FS")
+                }
+                (Method::GET, "/docs/agent/exec") => {
+                    swagger_ui_response("/openapi/agent/exec.json", "Talu API :: Agent::Exec")
+                }
+                (Method::GET, "/docs/agent/shell") => {
+                    swagger_ui_response("/openapi/agent/shell.json", "Talu API :: Agent::Shell")
+                }
+                (Method::GET, "/docs/agent/process") => {
+                    swagger_ui_response("/openapi/agent/process.json", "Talu API :: Agent::Process")
                 }
                 _ => {
                     // Authenticate all other routes.
@@ -285,6 +343,131 @@ impl Service<Request<Incoming>> for Router {
                         (_, "/repo/search") => method_not_allowed(&["GET"]),
                         (_, "/v1/responses") => method_not_allowed(&["POST"]),
                         (_, "/v1/chat/completions") => method_not_allowed(&["POST"]),
+                        (Method::POST, p) if collab::is_collab_session_open_path(p) => {
+                            collab::handle_open_session(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_resource_root_path(p) => {
+                            collab::handle_get_resource(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_snapshot_path(p) => {
+                            collab::handle_get_snapshot(state, req, auth).await
+                        }
+                        (Method::POST, p) if collab::is_collab_ops_path(p) => {
+                            collab::handle_submit_op(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_history_path(p) => {
+                            collab::handle_get_history(state, req, auth).await
+                        }
+                        (Method::POST, p) if collab::is_collab_presence_path(p) => {
+                            collab::handle_put_presence(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_presence_path(p) => {
+                            collab::handle_get_presence(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_events_stream_path(p) => {
+                            collab::handle_stream_events(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_ws_path(p) => {
+                            let is_ws = req
+                                .headers()
+                                .get("upgrade")
+                                .and_then(|value| value.to_str().ok())
+                                .map(|value| value.eq_ignore_ascii_case("websocket"))
+                                .unwrap_or(false);
+                            if !is_ws {
+                                method_not_allowed(&["GET (websocket)"])
+                            } else {
+                                collab::handle_ws(state, req, auth).await
+                            }
+                        }
+                        (Method::POST, "/v1/agent/fs/read") => {
+                            agent_fs::handle_read(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/write") => {
+                            agent_fs::handle_write(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/edit") => {
+                            agent_fs::handle_edit(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/stat") => {
+                            agent_fs::handle_stat(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/ls") => {
+                            agent_fs::handle_list(state, req, auth).await
+                        }
+                        (Method::DELETE, "/v1/agent/fs/rm") => {
+                            agent_fs::handle_remove(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/mkdir") => {
+                            agent_fs::handle_mkdir(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/rename") => {
+                            agent_fs::handle_rename(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/exec") => {
+                            agent_exec::handle_exec(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/shells") => {
+                            agent_shell::handle_create(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/agent/shells") => {
+                            agent_shell::handle_list(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/agent/shells/") && p.ends_with("/ws") =>
+                        {
+                            let is_ws = req
+                                .headers()
+                                .get("upgrade")
+                                .and_then(|value| value.to_str().ok())
+                                .map(|value| value.eq_ignore_ascii_case("websocket"))
+                                .unwrap_or(false);
+                            if !is_ws {
+                                method_not_allowed(&["GET (websocket)"])
+                            } else {
+                                agent_shell::handle_ws(state, req, auth).await
+                            }
+                        }
+                        (Method::GET, p) if p.starts_with("/v1/agent/shells/") => {
+                            agent_shell::handle_get(state, req, auth).await
+                        }
+                        (Method::DELETE, p) if p.starts_with("/v1/agent/shells/") => {
+                            agent_shell::handle_delete(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/processes/spawn") => {
+                            agent_process::handle_spawn(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/agent/processes") => {
+                            agent_process::handle_list(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.starts_with("/v1/agent/processes/") && p.ends_with("/send") =>
+                        {
+                            agent_process::handle_send(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/agent/processes/") && p.ends_with("/stream") =>
+                        {
+                            agent_process::handle_stream(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/agent/processes/") && p.ends_with("/ws") =>
+                        {
+                            let is_ws = req
+                                .headers()
+                                .get("upgrade")
+                                .and_then(|value| value.to_str().ok())
+                                .map(|value| value.eq_ignore_ascii_case("websocket"))
+                                .unwrap_or(false);
+                            if !is_ws {
+                                method_not_allowed(&["GET (websocket)"])
+                            } else {
+                                agent_process::handle_ws(state, req, auth).await
+                            }
+                        }
+                        (Method::DELETE, p) if p.starts_with("/v1/agent/processes/") => {
+                            agent_process::handle_delete(state, req, auth).await
+                        }
                         (Method::POST, "/v1/tokenizer/instances") => {
                             tokenizer::handle_create_instance(state, req, auth).await
                         }
@@ -667,7 +850,7 @@ a:hover {
 <body>
 <main class="page">
   <h1>Talu API Docs</h1>
-  <p class="muted">Inference-only server surface.</p>
+  <p class="muted">Inference, collaboration, and local agent runtime surface.</p>
 
   <div class="table-wrap">
     <table>
@@ -703,6 +886,31 @@ a:hover {
           <td><a href="/docs/tokenizer"><code>tokenizer</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/tokenizer.json" title="/openapi/tokenizer.json">json</a><button class="copy-btn" data-url="/openapi/tokenizer.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td>Full tokenizer lifecycle, encode/decode, training, and persistence APIs.</td>
+        </tr>
+        <tr>
+          <td><a href="/docs/collab/resources"><code>collab/resources</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/collab/resources.json" title="/openapi/collab/resources.json">json</a><button class="copy-btn" data-url="/openapi/collab/resources.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>Canonical resource-scoped collaboration API backed by KV durability lanes.</td>
+        </tr>
+        <tr>
+          <td><a href="/docs/agent/fs"><code>agent/fs</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>Workspace-scoped filesystem APIs.</td>
+        </tr>
+        <tr>
+          <td><a href="/docs/agent/exec"><code>agent/exec</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/exec.json" title="/openapi/agent/exec.json">json</a><button class="copy-btn" data-url="/openapi/agent/exec.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>One-shot shell command execution streamed as SSE.</td>
+        </tr>
+        <tr>
+          <td><a href="/docs/agent/shell"><code>agent/shell</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/shell.json" title="/openapi/agent/shell.json">json</a><button class="copy-btn" data-url="/openapi/agent/shell.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>Interactive PTY shell lifecycle and WebSocket attach endpoints.</td>
+        </tr>
+        <tr>
+          <td><a href="/docs/agent/process"><code>agent/process</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/process.json" title="/openapi/agent/process.json">json</a><button class="copy-btn" data-url="/openapi/agent/process.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td>Long-lived process sessions with stdin send and SSE/WebSocket streaming.</td>
         </tr>
       </tbody>
     </table>

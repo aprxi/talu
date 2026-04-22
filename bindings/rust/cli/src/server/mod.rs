@@ -2,14 +2,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use log::LevelFilter;
 use talu::ChatHandle;
 
+pub mod agent;
 pub mod auth_gateway;
 pub mod batch_scheduler;
+pub mod collab;
 pub mod completions;
 pub mod completions_types;
 pub mod events;
@@ -26,6 +29,27 @@ pub mod state;
 pub mod tenant;
 pub mod tokenizer;
 pub mod vision;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AgentRuntimeMode {
+    Host,
+    Strict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SandboxBackendArg {
+    Auto,
+    LinuxLocal,
+    Oci,
+    AppleContainer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxBackend {
+    LinuxLocal,
+    Oci,
+    AppleContainer,
+}
 
 #[derive(Args, Debug)]
 pub struct ServerArgs {
@@ -53,9 +77,34 @@ pub struct ServerArgs {
     #[arg(long)]
     pub tenant_config: Option<PathBuf>,
 
+    /// Storage bucket root for collab resources and other persisted runtime state.
+    #[arg(long, env = "TALU_BUCKET")]
+    pub bucket: Option<PathBuf>,
+
     /// Canonical workdir root for request-scoped integrations.
     #[arg(long, env = "TALU_WORKDIR")]
     pub workdir: Option<PathBuf>,
+
+    /// Path to runtime policy JSON applied to `/v1/agent/*`.
+    #[arg(long, env = "TALU_POLICY_FILE")]
+    pub policy_file: Option<PathBuf>,
+
+    /// Disable optional collab side effects for integrations such as agent fs
+    /// snapshot mirroring.
+    #[arg(long, env = "TALU_DISABLE_COLLAB", default_value_t = false)]
+    pub disable_collab: bool,
+
+    /// Runtime mode for `/v1/agent/*`.
+    #[arg(long, env = "TALU_AGENT_RUNTIME_MODE", value_enum, default_value_t = AgentRuntimeMode::Host)]
+    pub agent_runtime_mode: AgentRuntimeMode,
+
+    /// Sandbox backend selection for strict runtime mode.
+    #[arg(long, env = "TALU_SANDBOX_BACKEND", value_enum, default_value_t = SandboxBackendArg::Auto)]
+    pub sandbox_backend: SandboxBackendArg,
+
+    /// Run conformance probes at startup for strict runtime mode.
+    #[arg(long, env = "TALU_STRICT_PROBES", default_value_t = false)]
+    pub strict_probes: bool,
 }
 
 pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Result<()> {
@@ -77,6 +126,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
 
     let model = args.model.clone();
     let socket_path = expand_socket_path(&args.socket);
+    let sandbox_backend = resolve_sandbox_backend(args.agent_runtime_mode, args.sandbox_backend)?;
     let (gateway_secret, tenant_registry) = match (args.gateway_secret, args.tenant_config) {
         (Some(secret), Some(path)) => {
             let registry = tenant::TenantRegistry::load(&path)
@@ -113,6 +163,74 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
                 .with_context(|| format!("canonicalize workdir path: {}", path.display()))
         })
         .transpose()?;
+    let bucket_path = args
+        .bucket
+        .or_else(|| std::env::var_os("TALU_BUCKET").map(PathBuf::from));
+    let env_agent_policy_json = std::env::var("TALU_AGENT_POLICY_JSON").ok();
+    if args.policy_file.is_some() && env_agent_policy_json.is_some() {
+        bail!("--policy-file conflicts with TALU_AGENT_POLICY_JSON; use exactly one source");
+    }
+    let agent_policy_json = if let Some(path) = args.policy_file.as_ref() {
+        Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("read agent policy file {}", path.display()))?,
+        )
+    } else {
+        env_agent_policy_json
+    };
+    let agent_policy = if let Some(policy_json) = agent_policy_json.as_deref() {
+        Some(Arc::new(
+            talu::Policy::from_json(policy_json).context("parse agent runtime policy JSON")?,
+        ))
+    } else {
+        None
+    };
+    if args.agent_runtime_mode == AgentRuntimeMode::Strict && agent_policy.is_none() {
+        bail!("strict agent runtime mode requires a policy via --policy-file or TALU_AGENT_POLICY_JSON");
+    }
+    if args.agent_runtime_mode == AgentRuntimeMode::Strict {
+        let strict_policy = agent_policy
+            .as_deref()
+            .expect("strict runtime mode requires policy by prior check");
+        talu::validate_strict_runtime(
+            Some(strict_policy),
+            workdir
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref(),
+            sandbox_backend_for_talu(sandbox_backend),
+        )
+        .context("validate strict runtime policy and sandbox support")?;
+
+        let report = talu::validate_strict_runtime_ext(
+            sandbox_backend_for_talu(sandbox_backend),
+            true,
+            args.strict_probes,
+            workdir
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref(),
+        )
+        .context("validate strict runtime capabilities")?;
+        log::info!(
+            target: "server::init",
+            "sandbox capabilities: kernel={}.{} landlock_abi={} user_ns={} seccomp={} cgroupv2={}/{}",
+            report.kernel_version_major,
+            report.kernel_version_minor,
+            report.landlock_abi_version,
+            report.user_ns_available,
+            report.seccomp_available,
+            report.cgroupv2_available,
+            report.cgroupv2_writable,
+        );
+        if args.strict_probes {
+            log::info!(
+                target: "server::init",
+                "conformance probes: {}",
+                if report.probes_passed { "passed" } else { "FAILED" }
+            );
+        }
+    }
 
     // Create batch scheduler for the local backend (enables concurrent GPU decode).
     let batch_scheduler = backend_state.backend.as_ref().and_then(|b| {
@@ -141,7 +259,17 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         response_store: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         gateway_secret,
         tenant_registry,
+        bucket_path,
         workdir,
+        collab_enabled: !args.disable_collab,
+        agent_policy,
+        shell_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        process_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        collab_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        agent_runtime_mode: args.agent_runtime_mode,
+        sandbox_backend,
+        shell_session_ttl: Duration::from_secs(15 * 60),
+        process_session_ttl: Duration::from_secs(15 * 60),
         tokenizer_instances: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
@@ -151,6 +279,16 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     let addr = SocketAddr::new(args.host, args.port);
     log::info!(target: "server::init", "talu server starting");
     log::info!(target: "server::init", "stateless runtime (local persistence disabled)");
+    if let Some(bucket) = state.bucket_path.as_ref() {
+        log::info!(target: "server::init", "storage bucket: {}", bucket.display());
+    } else {
+        log::info!(target: "server::init", "storage bucket: none");
+    }
+    log::info!(
+        target: "server::init",
+        "collab side effects: {}",
+        if state.collab_enabled { "enabled" } else { "disabled" }
+    );
     log::info!(target: "server::init", "listening on http://{}", addr);
     log::info!(target: "server::init", "listening on unix://{}", socket_path.display());
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -161,6 +299,42 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     // then forcefully shut down so the process exits promptly on Ctrl+C.
     runtime.shutdown_timeout(std::time::Duration::from_secs(3));
     Ok(())
+}
+
+fn resolve_sandbox_backend(
+    runtime_mode: AgentRuntimeMode,
+    backend_arg: SandboxBackendArg,
+) -> Result<SandboxBackend> {
+    match backend_arg {
+        SandboxBackendArg::LinuxLocal => Ok(SandboxBackend::LinuxLocal),
+        SandboxBackendArg::Oci => Ok(SandboxBackend::Oci),
+        SandboxBackendArg::AppleContainer => Ok(SandboxBackend::AppleContainer),
+        SandboxBackendArg::Auto => {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = runtime_mode;
+                Ok(SandboxBackend::LinuxLocal)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = runtime_mode;
+                Ok(SandboxBackend::AppleContainer)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = runtime_mode;
+                Ok(SandboxBackend::LinuxLocal)
+            }
+        }
+    }
+}
+
+fn sandbox_backend_for_talu(backend: SandboxBackend) -> talu::SandboxBackend {
+    match backend {
+        SandboxBackend::LinuxLocal => talu::SandboxBackend::LinuxLocal,
+        SandboxBackend::Oci => talu::SandboxBackend::Oci,
+        SandboxBackend::AppleContainer => talu::SandboxBackend::AppleContainer,
+    }
 }
 
 pub(crate) fn warmup_batch_scheduler(
