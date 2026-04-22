@@ -41,7 +41,7 @@ const min_flash_decode_blocks_default: u32 = 8;
 const min_flash_decode_blocks_low_kv_heads: u32 = 1024;
 
 fn debugKernelSyncEnabled() bool {
-    const raw = std.posix.getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
+    const raw = @import("env_pkg").getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
     return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
 }
 

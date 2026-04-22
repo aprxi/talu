@@ -45,7 +45,7 @@ const DEFS = [_]SchemeDefinition{
 };
 
 fn parsedGroupSizeOverrideEnv() ?u32 {
-    const gs_env = std.posix.getenv("GROUP_SIZE") orelse return null;
+    const gs_env = @import("env_pkg").getenv("GROUP_SIZE") orelse return null;
     const gs = std.fmt.parseInt(u32, gs_env, 10) catch return null;
     return switch (gs) {
         32, 64, 128 => gs,
@@ -1207,7 +1207,7 @@ fn unsetEnvVar(alloc: std.mem.Allocator, key: []const u8) !void {
 }
 
 fn captureEnvVar(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-    const value = std.posix.getenv(key) orelse return null;
+    const value = @import("env_pkg").getenv(key) orelse return null;
     return try allocator.dupe(u8, value);
 }
 

@@ -35,7 +35,7 @@ const min_flash_decode_blocks_default: u32 = 8;
 const min_flash_decode_blocks_low_kv_heads: u32 = 1024;
 
 fn debugKernelSyncEnabled() bool {
-    const raw = std.posix.getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
+    const raw = @import("env_pkg").getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
     return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
 }
 
@@ -510,7 +510,7 @@ fn shouldUseFlashDecodePath(
     n_rows: u32,
     flash_decode_available: bool,
 ) bool {
-    if (std.posix.getenv("TALU_NO_FLASH_DECODE") != null) return false;
+    if (@import("env_pkg").getenv("TALU_NO_FLASH_DECODE") != null) return false;
     if (!flash_decode_available) return false;
     // Single-row decode does not provide enough row-level parallelism to
     // amortize split-K flash decode overhead; separate decode attention is

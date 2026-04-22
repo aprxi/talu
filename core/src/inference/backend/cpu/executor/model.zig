@@ -666,7 +666,7 @@ pub const Transformer = struct {
     /// Log first 8 f32 values + L2 norm from a CPU tensor row.
     /// Gated by TALU_DUMP_HIDDEN env var. Uses log.warn so it survives ReleaseFast.
     fn dumpCpuHiddenState(data: []const f32, d_model: usize, global_layer_idx: usize, label: []const u8) void {
-        const dump_env = std.posix.getenv("TALU_DUMP_HIDDEN");
+        const dump_env = @import("env_pkg").getenv("TALU_DUMP_HIDDEN");
         if (dump_env == null) return;
         if (data.len < d_model) return;
 

@@ -363,7 +363,7 @@ pub fn global() *ThreadPool {
             // THREADS env var takes priority, otherwise use platform-tuned default.
             // On Apple Silicon this favors P-core count for bandwidth-sensitive inference.
             var n_threads: usize = undefined; // Safe: both branches assign before use
-            if (std.posix.getenv("THREADS")) |env| {
+            if (@import("env_pkg").getenv("THREADS")) |env| {
                 n_threads = std.fmt.parseInt(usize, env, 10) catch getOptimalThreadCount();
             } else {
                 n_threads = getOptimalThreadCount();

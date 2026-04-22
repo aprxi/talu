@@ -39,7 +39,7 @@ const min_flash_decode_blocks_default: u32 = 8;
 const min_flash_decode_blocks_low_kv_heads: u32 = 1024;
 
 fn debugKernelSyncEnabled() bool {
-    const raw = std.posix.getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
+    const raw = @import("env_pkg").getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
     return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
 }
 
@@ -626,7 +626,7 @@ pub fn runBatchedDecodeAttentionMixer(
     // only as a strict fallback when native low-bit decode kernels are absent.
     const use_lowbit_gemm_decode_path = can_lowbit_gemm_decode and n_rows == 1 and
         !use_flash_decode and !use_batched_separate_decode_path and !use_batched_fused_decode_path;
-    if (std.posix.getenv("TALU_CUDA_LOG_DECODE_PATH") != null) {
+    if (@import("env_pkg").getenv("TALU_CUDA_LOG_DECODE_PATH") != null) {
         const route = if (use_lowbit_gemm_decode_path)
             "lowbit_gemm_bridge"
         else if (use_flash_decode)
@@ -1529,7 +1529,7 @@ fn shouldUseFlashDecodePath(
     n_rows: u32,
     flash_decode_available: bool,
 ) bool {
-    if (std.posix.getenv("TALU_NO_FLASH_DECODE") != null) return false;
+    if (@import("env_pkg").getenv("TALU_NO_FLASH_DECODE") != null) return false;
     if (!flash_decode_available) return false;
     // Single-row decode does not provide enough row-level parallelism to
     // amortize split-K flash decode overhead; separate decode attention is

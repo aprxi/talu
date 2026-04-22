@@ -404,7 +404,7 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     // NVFP4->I8 cache can improve some decode kernels but substantially
     // increases VRAM footprint; keep disabled by default until budgets and
     // route quality are validated across long-context prefill.
-    const enable_nvfp4_i8_cache = has_nvfp4_to_i8 and (std.posix.getenv("TALU_NVFP4_I8_CACHE") != null);
+    const enable_nvfp4_i8_cache = has_nvfp4_to_i8 and (@import("env_pkg").getenv("TALU_NVFP4_I8_CACHE") != null);
     if (!has_u8_dequant and !has_u4_dequant and !has_u4_to_i8 and !has_u8_to_i8 and !enable_nvfp4_i8_cache) {
         return;
     }
@@ -829,7 +829,12 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
 }
 
 pub fn resolveRequiredKernels(self: anytype) !void {
+    const fp8_required_kernels_supported = blk: {
+        const capability = self.device.computeCapability() catch break :blk false;
+        break :blk capability.major > 8 or (capability.major == 8 and capability.minor >= 9);
+    };
     for (required_kernels) |kernel| {
+        if (kernelRequiresSm89(kernel.slot) and !fp8_required_kernels_supported) continue;
         const resolved = self.kernel_registry.resolveFunction(
             kernel.op_name,
             kernel.embedded_symbol,
@@ -843,6 +848,28 @@ pub fn resolveRequiredKernels(self: anytype) !void {
         };
         assignResolvedKernel(self, kernel.slot, resolved);
     }
+}
+
+fn kernelRequiresSm89(slot: KernelSlot) bool {
+    return switch (slot) {
+        .kv_write_fp8,
+        .kv_write_fp8_rows,
+        .kv_write_fp8_rows_ptrs,
+        .dequant_kv_fp8_to_f16,
+        .rope_store_fp8,
+        .attn_scores_heads_fp8_kv,
+        .attn_scores_heads_fp8_kv_ptrs,
+        .attn_weighted_sum_heads_fp8_kv,
+        .attn_weighted_sum_heads_fp8_kv_ptrs,
+        .attn_fused_heads_fp8_kv,
+        .attn_fused_decode_heads_fp8_kv_ptrs,
+        .attn_fused_prefill_heads_fp8_kv,
+        .attn_fused_prefill_heads_fp8_kv_gqa,
+        .flash_decode_fp8,
+        .flash_prefill_fp8,
+        => true,
+        else => false,
+    };
 }
 
 pub fn assignResolvedKernel(

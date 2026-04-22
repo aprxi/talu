@@ -106,9 +106,13 @@ comptime {
     }
 }
 
-/// Default max concurrent decode slots for all backends.
+/// Default max concurrent decode slots on non-Windows backends.
 /// Override at runtime via TALU_MAX_BATCH_SIZE.
 const default_max_batch_size: usize = 8;
+
+/// Conservative Windows CPU default to avoid oversizing prompt/decode state on
+/// machines where the CPU backend is a practical fallback path.
+const windows_cpu_max_batch_size: usize = 1;
 
 /// Compute model-load options before backend initialization.
 /// This keeps backend/platform policy out of io/ while preserving optimized execution routes.
@@ -129,7 +133,7 @@ pub fn defaultModelLoadOptions(init_options: InitOptions) LoadOptions {
 
 pub fn effectiveLoadSelection(requested: Selection) Selection {
     if (requested != .auto) return requested;
-    if (std.posix.getenv("BACKEND")) |raw_ptr| {
+    if (@import("env_pkg").getenv("BACKEND")) |raw_ptr| {
         if (parseSelectionToken(raw_ptr)) |parsed| return parsed;
     }
     return .auto;
@@ -496,6 +500,12 @@ const AUTO_TOPO_OVERHEAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB per GPU
 /// model's theoretical max (e.g. 262K for Qwen) would wildly overestimate.
 /// 8192 is a practical generation context that covers most real-world usage.
 const AUTO_TOPO_KV_SEQ_LEN_CAP: usize = 8192;
+
+/// Practical Windows CPU runtime seq_len cap.
+/// The fused CPU backend currently pre-allocates KV cache for max_seq_len at
+/// startup, so using the model's theoretical maximum can blow up memory on
+/// long-context models. Users can override this with TALU_CPU_MAX_SEQ_LEN.
+const windows_cpu_runtime_kv_seq_len_cap: usize = 8192;
 
 /// Probe total memory on each visible CUDA device without creating contexts.
 /// Uses cuDeviceTotalMem which requires no CUDA context, avoiding interference
@@ -1079,18 +1089,26 @@ fn resolveCpuLayersTopology(
     return result;
 }
 
-fn resolveMaxBatchSize() usize {
+fn defaultMaxBatchSize(selection: Selection) usize {
+    return switch (selection) {
+        .cpu => if (builtin.os.tag == .windows) windows_cpu_max_batch_size else default_max_batch_size,
+        .auto, .metal, .cuda => default_max_batch_size,
+    };
+}
+
+fn resolveMaxBatchSize(selection: Selection) usize {
+    const default_value = defaultMaxBatchSize(selection);
     const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_MAX_BATCH_SIZE") catch {
-        return default_max_batch_size;
+        return default_value;
     };
     defer std.heap.c_allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
         log.warn("inference", "Invalid TALU_MAX_BATCH_SIZE; using default", .{
             .value = trimmed,
-            .default = default_max_batch_size,
+            .default = default_value,
         });
-        return default_max_batch_size;
+        return default_value;
     };
     if (parsed == 0) {
         log.warn("inference", "TALU_MAX_BATCH_SIZE must be >= 1; clamping", .{
@@ -1100,6 +1118,33 @@ fn resolveMaxBatchSize() usize {
         return 1;
     }
     return parsed;
+}
+
+pub fn resolveCpuMaxSeqLenForRuntime(allocator: std.mem.Allocator, model_max: usize) usize {
+    const default_value = if (builtin.os.tag == .windows)
+        @min(model_max, windows_cpu_runtime_kv_seq_len_cap)
+    else
+        model_max;
+    const raw = std.process.getEnvVarOwned(allocator, "TALU_CPU_MAX_SEQ_LEN") catch {
+        return default_value;
+    };
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CPU_MAX_SEQ_LEN; using default", .{
+            .value = trimmed,
+            .default = default_value,
+        });
+        return default_value;
+    };
+    if (parsed == 0) {
+        log.warn("inference", "TALU_CPU_MAX_SEQ_LEN must be >= 1; clamping", .{
+            .value = parsed,
+            .clamped = 1,
+        });
+        return 1;
+    }
+    return @min(model_max, parsed);
 }
 
 /// Backend type - tagged union of available backends
@@ -1841,7 +1886,22 @@ fn initCpu(
     reason: []const u8,
     progress: progress_mod.Context,
 ) !Backend {
-    const cpu_backend_state = cpu.BackendType.init(allocator, loaded, resolveMaxBatchSize(), progress) catch |err| {
+    const model_max_seq: usize = @intCast(@max(@as(i32, 1), loaded.config.max_seq_len));
+    const cpu_max_batch_size = resolveMaxBatchSize(.cpu);
+    const cpu_max_seq_len = resolveCpuMaxSeqLenForRuntime(allocator, model_max_seq);
+    log.info("inference", "CPU backend init config", .{
+        .max_batch = cpu_max_batch_size,
+        .runtime_max_seq_len = cpu_max_seq_len,
+        .model_max_seq_len = model_max_seq,
+    });
+
+    const cpu_backend_state = cpu.BackendType.init(
+        allocator,
+        loaded,
+        cpu_max_batch_size,
+        cpu_max_seq_len,
+        progress,
+    ) catch |err| {
         log.warn("inference", "CPU backend init failed", .{
             .reason = @errorName(err),
             .arch = @tagName(loaded.config.model_arch),
@@ -1957,6 +2017,16 @@ fn initCuda(
         return error.CudaUnavailable;
     }
     var topology = resolveCudaTopology(allocator, topology_override);
+    const has_explicit_topology_env = blk: {
+        const v = std.process.getEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY") catch break :blk false;
+        allocator.free(v);
+        break :blk true;
+    };
+    const has_explicit_cpu_layers_env = blk: {
+        const v = std.process.getEnvVarOwned(allocator, "TALU_CPU_LAYERS") catch break :blk false;
+        allocator.free(v);
+        break :blk true;
+    };
 
     // Topology resolution priority:
     //   1. topology_override (programmatic)
@@ -1964,12 +2034,7 @@ fn initCuda(
     //   3. TALU_CPU_LAYERS env var (user preference → auto-determines mode)
     //   4. Auto-detection (probe GPU memory, estimate model size)
     if (topology_override == null and topology.mode == .single) {
-        const has_explicit_env = blk: {
-            const v = std.process.getEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY") catch break :blk false;
-            allocator.free(v);
-            break :blk true;
-        };
-        if (!has_explicit_env) {
+        if (!has_explicit_topology_env) {
             if (resolveCpuLayersTopology(allocator, loaded, topology)) |from_layers| {
                 topology = from_layers;
             } else if (autoDetectTopologyForModel(allocator, loaded, topology)) |detected| {
@@ -1980,6 +2045,24 @@ fn initCuda(
                 });
             }
         }
+    }
+
+    if (topology_override == null and
+        !has_explicit_topology_env and
+        !has_explicit_cpu_layers_env and
+        (topology.mode == .cpu_gpu or topology.mode == .cpu_gpu_gpu) and
+        loadedModelHasPackedNvfp4Weights(loaded))
+    {
+        const primary_device = topology.primaryDeviceOrdinal();
+        log.warn("inference", "CUDA auto-topology disabled CPU stages for packed NVFP4 model", .{
+            .requested_topology = @tagName(topology.mode),
+            .fallback_topology = @tagName(CudaTopologyMode.single),
+            .device = primary_device,
+        });
+        topology = .{
+            .mode = .single,
+            .stage_device_ordinals = .{ primary_device, primary_device },
+        };
     }
 
     if (topology.mode != .single) {
@@ -2107,7 +2190,7 @@ fn initCuda(
             },
         };
     }
-    const cuda_max_batch_size = resolveMaxBatchSize();
+    const cuda_max_batch_size = resolveMaxBatchSize(.cuda);
     const n_layers = loaded.blocks.len;
     const cpu_layer_count: usize = switch (topology.mode) {
         .cpu_gpu, .cpu_gpu_gpu => topology.split_layer orelse 0,
@@ -2152,6 +2235,25 @@ fn initCuda(
     progress.completeLine(1);
     log.info("inference", "Backend selected: cuda", .{ .reason = reason });
     return .{ .cuda = cuda_backend_state };
+}
+
+fn loadedModelHasPackedNvfp4Weights(loaded: *const LoadedModel) bool {
+    if (loaded.token_embeddings.nvfp4 != null) return true;
+    if (loaded.lm_head) |tensor_view| if (tensor_view.nvfp4 != null) return true;
+    if (loaded.position_embeddings) |tensor_view| if (tensor_view.nvfp4 != null) return true;
+    if (loaded.token_type_embeddings) |tensor_view| if (tensor_view.nvfp4 != null) return true;
+    if (loaded.embedding_norm_weight) |tensor_view| if (tensor_view.nvfp4 != null) return true;
+    if (loaded.embedding_norm_bias) |tensor_view| if (tensor_view.nvfp4 != null) return true;
+
+    for (loaded.blocks) |layer| {
+        var it = layer.weight_map.iterator();
+        while (it.next()) |entry| {
+            const tensor_view = entry.value_ptr.*.*;
+            if (tensor_view.nvfp4 != null) return true;
+        }
+    }
+
+    return false;
 }
 
 // ============================================================================
@@ -2244,6 +2346,58 @@ test "defaultModelLoadOptions honors explicit metal selection" {
     try std.testing.expectEqual(has_metal, opts.preserve_native_norm_dtype);
     try std.testing.expectEqual(false, opts.dequantize_mxfp8_to_bf16);
     try std.testing.expectEqual(true, opts.dequantize_nvfp4_to_bf16);
+}
+
+test "defaultMaxBatchSize keeps CPU fallback policy platform-scoped" {
+    const expected_cpu_default: usize = if (builtin.os.tag == .windows) 1 else 8;
+    try std.testing.expectEqual(expected_cpu_default, defaultMaxBatchSize(.cpu));
+    try std.testing.expectEqual(@as(usize, 8), defaultMaxBatchSize(.cuda));
+    try std.testing.expectEqual(@as(usize, 8), defaultMaxBatchSize(.metal));
+    try std.testing.expectEqual(@as(usize, 8), defaultMaxBatchSize(.auto));
+}
+
+test "resolveCpuMaxSeqLenForRuntime keeps default cap platform-scoped" {
+    const existing = std.process.getEnvVarOwned(std.testing.allocator, "TALU_CPU_MAX_SEQ_LEN") catch null;
+    defer if (existing) |value| std.testing.allocator.free(value);
+    if (existing != null) return error.SkipZigTest;
+
+    const model_max: usize = 262144;
+    const expected_default: usize = if (builtin.os.tag == .windows) 8192 else model_max;
+    try std.testing.expectEqual(expected_default, resolveCpuMaxSeqLenForRuntime(std.testing.allocator, model_max));
+}
+
+test "loadedModelHasPackedNvfp4Weights detects packed tensors in layer maps" {
+    var packed_tensor = std.mem.zeroes(tensor.Tensor);
+    packed_tensor.dtype = .u8;
+    packed_tensor.nvfp4 = .{
+        .block_scales_data = &.{},
+        .block_scales_len = 0,
+        .rows = 1,
+        .cols = 1,
+        .packed_cols = 1,
+        .scale_cols = 1,
+        .group_size = 16,
+        .weight_global_scale = 1.0,
+    };
+
+    var layer_map: models.runtime_blocks.WeightMap = .{};
+    defer layer_map.deinit(std.testing.allocator);
+    try layer_map.put(std.testing.allocator, "weight", &packed_tensor);
+
+    const layers = [_]models.runtime_blocks.LayerWeights{.{
+        .block_type = .attention_mlp,
+        .weight_map = layer_map,
+        .map_context = .{},
+    }};
+
+    var embeddings = std.mem.zeroes(tensor.Tensor);
+    embeddings.dtype = .f32;
+
+    var loaded = std.mem.zeroes(LoadedModel);
+    loaded.token_embeddings = embeddings;
+    loaded.blocks = layers[0..];
+
+    try std.testing.expect(loadedModelHasPackedNvfp4Weights(&loaded));
 }
 
 test "parseSelectionToken accepts supported backend values" {

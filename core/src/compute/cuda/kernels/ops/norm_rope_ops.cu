@@ -75,7 +75,7 @@ extern "C" __global__ void talu_rmsnorm_f32(
     __syncthreads();
 
     const float irms = inv_rms;
-    if (vectorizable and ((reinterpret_cast<uintptr_t>(row_out) & 0xFu) == 0u) and
+    if (vectorizable && ((reinterpret_cast<uintptr_t>(row_out) & 0xFu) == 0u) &&
         ((reinterpret_cast<uintptr_t>(weight) & 0xFu) == 0u))
     {
         const float4* row_in4 = reinterpret_cast<const float4*>(row_in);
@@ -164,7 +164,7 @@ extern "C" __global__ void talu_rmsnorm_rows_strided_f32(
     __syncthreads();
 
     const float irms = inv_rms;
-    if (vectorizable and ((reinterpret_cast<uintptr_t>(row_out) & 0xFu) == 0u) and
+    if (vectorizable && ((reinterpret_cast<uintptr_t>(row_out) & 0xFu) == 0u) &&
         ((reinterpret_cast<uintptr_t>(weight) & 0xFu) == 0u))
     {
         const float4* row_in4 = reinterpret_cast<const float4*>(row_in);
@@ -218,7 +218,7 @@ extern "C" __global__ void talu_residual_scaled_rmsnorm_rows_strided_f32(
     float sum_sq = 0.0f;
     const unsigned int cols4 = cols / 4;
     const bool input_vectorizable =
-        ((reinterpret_cast<uintptr_t>(row_residual_in) & 0xFu) == 0u) and
+        ((reinterpret_cast<uintptr_t>(row_residual_in) & 0xFu) == 0u) &&
         ((reinterpret_cast<uintptr_t>(row_branch) & 0xFu) == 0u);
 
     if (input_vectorizable) {
@@ -268,9 +268,9 @@ extern "C" __global__ void talu_residual_scaled_rmsnorm_rows_strided_f32(
     __syncthreads();
 
     const float irms = inv_rms;
-    const bool output_vectorizable = input_vectorizable and
-        ((reinterpret_cast<uintptr_t>(row_residual_out) & 0xFu) == 0u) and
-        ((reinterpret_cast<uintptr_t>(row_norm_out) & 0xFu) == 0u) and
+    const bool output_vectorizable = input_vectorizable &&
+        ((reinterpret_cast<uintptr_t>(row_residual_out) & 0xFu) == 0u) &&
+        ((reinterpret_cast<uintptr_t>(row_norm_out) & 0xFu) == 0u) &&
         ((reinterpret_cast<uintptr_t>(weight) & 0xFu) == 0u);
     if (output_vectorizable) {
         const float4* residual4 = reinterpret_cast<const float4*>(row_residual_in);

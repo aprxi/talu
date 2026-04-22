@@ -674,7 +674,7 @@ pub const CudaBackend = struct {
         const resolved_max_seq_len = resolveCudaMaxSeqLen(model_max_seq_len);
         const resolved_kv_init_tokens = resolveCudaInitialKvCacheTokens(resolved_max_seq_len);
         const resolved_prefill_chunk_rows_cap = resolveCudaPrefillChunkRowsCap(resolved_max_seq_len);
-        const prefill_chunk_rows_override = std.posix.getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null;
+        const prefill_chunk_rows_override = @import("env_pkg").getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null;
         const is_staged_topology = init_options.topology_mode != .single or init_options.init_layer_range != null;
         // Staged topologies (pipeline/cpu+gpu variants) benefit from smaller
         // prefill chunks to enable overlap between stages. Keep single-device
@@ -804,6 +804,25 @@ pub const CudaBackend = struct {
         else
             1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
         backend.kv_cache_dtype = resolveKvCacheDtype();
+        kv_dtype_guard: {
+            if (backend.kv_cache_dtype != .fp8) break :kv_dtype_guard;
+            const capability = backend.device.computeCapability() catch |err| {
+                log.warn("inference", "CUDA disabling fp8 KV cache after capability query failed", .{
+                    .reason = @errorName(err),
+                    .fallback = @tagName(KvCacheDtype.i8),
+                });
+                backend.kv_cache_dtype = .i8;
+                break :kv_dtype_guard;
+            };
+            if (!(deviceSupportsFp8KvCache(&backend.device) catch false)) {
+                log.warn("inference", "CUDA disabling fp8 KV cache on unsupported GPU", .{
+                    .major = capability.major,
+                    .minor = capability.minor,
+                    .fallback = @tagName(KvCacheDtype.i8),
+                });
+                backend.kv_cache_dtype = .i8;
+            }
+        }
         engine_layer_program.initCpuRuntimeRopeHandles(&backend) catch |err| {
             log.warn("inference", "CUDA rope runtime init failed", .{
                 .reason = @errorName(err),
@@ -1316,6 +1335,10 @@ pub const CudaBackend = struct {
                     allocator,
                     loaded,
                     max_batch_size,
+                    backend_root.resolveCpuMaxSeqLenForRuntime(
+                        allocator,
+                        @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
+                    ),
                     progress_mod.Context.NONE,
                 );
                 errdefer {
@@ -1385,6 +1408,10 @@ pub const CudaBackend = struct {
                     allocator,
                     loaded,
                     max_batch_size,
+                    backend_root.resolveCpuMaxSeqLenForRuntime(
+                        allocator,
+                        @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
+                    ),
                     progress_mod.Context.NONE,
                 );
                 errdefer {
@@ -2792,7 +2819,7 @@ pub const CudaBackend = struct {
         var scratch_vals = self.topk_scratch_vals_dev orelse return error.CudaKernelUnavailable;
         var scratch_ids = self.topk_scratch_ids_dev orelse return error.CudaKernelUnavailable;
 
-        const decode_summary_enabled = std.posix.getenv("TALU_CUDA_DECODE_SUMMARY") != null;
+        const decode_summary_enabled = @import("env_pkg").getenv("TALU_CUDA_DECODE_SUMMARY") != null;
         var topk_kernel_ns: u64 = 0;
         var values_download_ns: u64 = 0;
         var ids_download_ns: u64 = 0;
@@ -4500,6 +4527,11 @@ const canUseModelEmbeddings = engine_weights.canUseModelEmbeddings;
 const decodeGaffineRow = engine_weights.decodeGaffineRow;
 const tryPopulateFinalNormWeight = engine_weights.tryPopulateFinalNormWeight;
 const tryPopulateProjectionFromWeight = engine_weights.tryPopulateProjectionFromWeight;
+
+fn deviceSupportsFp8KvCache(device: *compute.cuda.Device) !bool {
+    const capability = try device.computeCapability();
+    return capability.major > 8 or (capability.major == 8 and capability.minor >= 9);
+}
 const gaffineScaleBiasToF32 = engine_weights.gaffineScaleBiasToF32;
 const gaffineValueAt = engine_weights.gaffineValueAt;
 

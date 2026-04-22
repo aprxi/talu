@@ -96,7 +96,38 @@ extern "C" __global__ void talu_quantize_f32_to_nvfp4(
 
 #endif // __CUDA_ARCH__ >= 1000
 
+#if defined(__CUDA_ARCH__)
+
+static __device__ __forceinline__ float nvfp4_fp8e4m3_to_f32(unsigned char x) {
 #if __CUDA_ARCH__ >= 890
+    __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(x), __NV_E4M3);
+    __half h;
+    memcpy(&h, &hr, sizeof(h));
+    return __half2float(h);
+#else
+    const unsigned int bits = x;
+    const unsigned int sign = bits >> 7;
+    const unsigned int exponent = (bits >> 3) & 0x0Fu;
+    const unsigned int mantissa = bits & 0x07u;
+
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            return __uint_as_float(sign << 31);
+        }
+        const float result = static_cast<float>(mantissa) * (1.0f / 512.0f);
+        return sign != 0u ? -result : result;
+    }
+    if (exponent == 0x0Fu && mantissa == 0x07u) {
+        return __uint_as_float(0x7fc00000u);
+    }
+
+    const unsigned int f32_bits =
+        (sign << 31) |
+        ((exponent + 120u) << 23) |
+        (mantissa << 20);
+    return __uint_as_float(f32_bits);
+#endif
+}
 
 static __device__ __forceinline__ void nvfp4_lut_init(float* lut, unsigned int tid) {
     if (tid < 16u) {
@@ -108,6 +139,27 @@ static __device__ __forceinline__ void nvfp4_lut_init(float* lut, unsigned int t
         lut[tid] = __uint_as_float(
             (s << 31) | (((e + 126u) * is_nz) << 23) | (e_nz * (m << 22)));
     }
+}
+
+static __device__ __forceinline__ void nvfp4_load_word_pair(
+    const unsigned int* weight_words,
+    unsigned int word_pair_index,
+    unsigned int& w0,
+    unsigned int& w1
+) {
+#if defined(_WIN32)
+    // Windows CUDA builds have shown incorrect decode results for large NVFP4
+    // buffers when this path uses inline PTX streaming loads. Plain typed loads
+    // avoid that codegen hazard while keeping Linux/macOS on the tuned path.
+    const unsigned int base = word_pair_index << 1;
+    w0 = weight_words[base];
+    w1 = weight_words[base + 1];
+#else
+    asm volatile(
+        "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+        : "=r"(w0), "=r"(w1)
+        : "l"(&weight_words[word_pair_index << 1]));
+#endif
 }
 
 // Process one NVFP4 word (4 bytes = 8 nibbles) against 2 float4 inputs.
@@ -176,8 +228,7 @@ extern "C" __global__ void talu_nvfp4_to_i8(
         const unsigned char packed_byte = row_packed[i >> 1];
         const unsigned int nibble = (i & 1u) ? (packed_byte >> 4) : (packed_byte & 0x0Fu);
         const float fp4_val = nvfp4_nibble_to_f32(nibble);
-        const float block_scale = fp8e4m3_to_f32(
-            static_cast<__nv_fp8_storage_t>(scale_row[i >> 4]));
+        const float block_scale = nvfp4_fp8e4m3_to_f32(scale_row[i >> 4]);
         const float val = fp4_val * block_scale / weight_global_scale;
         local_max = fmaxf(local_max, fabsf(val));
     }
@@ -203,8 +254,7 @@ extern "C" __global__ void talu_nvfp4_to_i8(
         const unsigned char packed_byte = row_packed[i >> 1];
         const unsigned int nibble = (i & 1u) ? (packed_byte >> 4) : (packed_byte & 0x0Fu);
         const float fp4_val = nvfp4_nibble_to_f32(nibble);
-        const float block_scale = fp8e4m3_to_f32(
-            static_cast<__nv_fp8_storage_t>(scale_row[i >> 4]));
+        const float block_scale = nvfp4_fp8e4m3_to_f32(scale_row[i >> 4]);
         const float val = fp4_val * block_scale / weight_global_scale;
         int q = __float2int_rn(val * inv_scale);
         q = max(-128, min(127, q));
@@ -238,8 +288,7 @@ extern "C" __global__ void talu_dequant_nvfp4_to_bf16(
     const unsigned int nibble = (col & 1u) ? (packed_byte >> 4) : (packed_byte & 0x0Fu);
 
     const float fp4_val = nvfp4_nibble_to_f32(nibble);
-    const float scale = fp8e4m3_to_f32(
-        static_cast<__nv_fp8_storage_t>(scales[(unsigned long long)row * scale_cols + (col >> 4)]));
+    const float scale = nvfp4_fp8e4m3_to_f32(scales[(unsigned long long)row * scale_cols + (col >> 4)]);
     const float val = fp4_val * scale / weight_global_scale;
 
     // F32 → BF16: round-to-nearest-even (same as FP8 dequant kernel).
@@ -280,16 +329,12 @@ static __device__ __forceinline__ void talu_nvfp4_matvec_batched(
     for (unsigned int wp = lane; wp < scale_cols; wp += TALU_QUANT_WARP_SIZE) {
         // 64-bit streaming load: 2 u32 words = 8 bytes = 16 FP4 elements.
         unsigned int w0, w1;
-        asm volatile(
-            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-            : "=r"(w0), "=r"(w1)
-            : "l"(&weight_words[wp << 1]));
+        nvfp4_load_word_pair(weight_words, wp, w0, w1);
 
         const unsigned int base_elem = wp << 4;  // 16 elements per word-pair
 
         // 1 FP8 E4M3 scale per 16-element group.
-        const float scale = fp8e4m3_to_f32(
-            static_cast<__nv_fp8_storage_t>(scales[scale_row_off + wp])) * inv_global;
+        const float scale = nvfp4_fp8e4m3_to_f32(scales[scale_row_off + wp]) * inv_global;
 
         #pragma unroll
         for (unsigned int b = 0; b < BATCH; b++) {
@@ -799,22 +844,14 @@ static __device__ __forceinline__ void talu_nvfp4_gate_up_silu_batched(
     for (unsigned int wp = lane; wp < gate_scale_cols; wp += TALU_QUANT_WARP_SIZE) {
         // 64-bit streaming loads for gate and up weights.
         unsigned int gw0, gw1, uw0, uw1;
-        asm volatile(
-            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-            : "=r"(gw0), "=r"(gw1)
-            : "l"(&gate_words[wp << 1]));
-        asm volatile(
-            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-            : "=r"(uw0), "=r"(uw1)
-            : "l"(&up_words[wp << 1]));
+        nvfp4_load_word_pair(gate_words, wp, gw0, gw1);
+        nvfp4_load_word_pair(up_words, wp, uw0, uw1);
 
         const unsigned int base_elem = wp << 4;
 
         // 1 scale per 16-element group for gate and up.
-        const float gs = fp8e4m3_to_f32(
-            static_cast<__nv_fp8_storage_t>(gate_scales[gate_scale_row_off + wp])) * gate_inv_global;
-        const float us = fp8e4m3_to_f32(
-            static_cast<__nv_fp8_storage_t>(up_scales[up_scale_row_off + wp])) * up_inv_global;
+        const float gs = nvfp4_fp8e4m3_to_f32(gate_scales[gate_scale_row_off + wp]) * gate_inv_global;
+        const float us = nvfp4_fp8e4m3_to_f32(up_scales[up_scale_row_off + wp]) * up_inv_global;
 
         #pragma unroll
         for (unsigned int b = 0; b < BATCH; b++) {
@@ -994,21 +1031,13 @@ static __device__ __forceinline__ void talu_nvfp4_gate_up_gelu_batched(
 
     for (unsigned int wp = lane; wp < gate_scale_cols; wp += TALU_QUANT_WARP_SIZE) {
         unsigned int gw0, gw1, uw0, uw1;
-        asm volatile(
-            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-            : "=r"(gw0), "=r"(gw1)
-            : "l"(&gate_words[wp << 1]));
-        asm volatile(
-            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-            : "=r"(uw0), "=r"(uw1)
-            : "l"(&up_words[wp << 1]));
+        nvfp4_load_word_pair(gate_words, wp, gw0, gw1);
+        nvfp4_load_word_pair(up_words, wp, uw0, uw1);
 
         const unsigned int base_elem = wp << 4;
 
-        const float gs = fp8e4m3_to_f32(
-            static_cast<__nv_fp8_storage_t>(gate_scales[gate_scale_row_off + wp])) * gate_inv_global;
-        const float us = fp8e4m3_to_f32(
-            static_cast<__nv_fp8_storage_t>(up_scales[up_scale_row_off + wp])) * up_inv_global;
+        const float gs = nvfp4_fp8e4m3_to_f32(gate_scales[gate_scale_row_off + wp]) * gate_inv_global;
+        const float us = nvfp4_fp8e4m3_to_f32(up_scales[up_scale_row_off + wp]) * up_inv_global;
 
         #pragma unroll
         for (unsigned int b = 0; b < BATCH; b++) {

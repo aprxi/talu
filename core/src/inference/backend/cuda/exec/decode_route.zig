@@ -720,7 +720,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         self.phase_event_timing_enabled
     else
         false;
-    const no_graph = std.posix.getenv("TALU_NO_GRAPH") != null;
+    const no_graph = @import("env_pkg").getenv("TALU_NO_GRAPH") != null;
     const graph_eligible = self.compute_stream != null and
         !trace.isEnabled() and deepstack_layer_features_opt == null and
         !event_timing_enabled and
@@ -748,7 +748,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
 
         var final_hidden = input_row;
 
-    if (std.posix.getenv("TALU_DUMP_HIDDEN") != null) {
+    if (@import("env_pkg").getenv("TALU_DUMP_HIDDEN") != null) {
         log.warn("inference", "GPU_LOOP_ENTRY", .{
             .layer_limit = layer_limit,
             .split_layer = self.split_layer,
@@ -947,7 +947,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             );
         }
 
-        if (std.posix.getenv("TALU_CUDA_PROJECTION_DEBUG") != null) {
+        if (@import("env_pkg").getenv("TALU_CUDA_PROJECTION_DEBUG") != null) {
             const projection_kind = switch (self.runtime_buffers.projection_weight) {
                 .dense_f32 => "dense_f32",
                 .dense_u16 => "dense_u16",
@@ -1068,7 +1068,7 @@ pub fn computeBatchedDecodePipeline2WithMode(
         return error.InvalidTopologyConfig;
     }
     var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
-    const decode_summary_enabled = std.posix.getenv("TALU_CUDA_DECODE_SUMMARY") != null;
+    const decode_summary_enabled = @import("env_pkg").getenv("TALU_CUDA_DECODE_SUMMARY") != null;
     var decode_start_ns: i128 = 0;
     if (decode_summary_enabled and comptime @hasDecl(SelfType, "beginNvfp4RouteWindow") and
         @hasDecl(SelfType, "beginPhaseBudgetWindow"))
@@ -1334,7 +1334,7 @@ fn computeBatchedDecodeLogitsWithMode(
     output_mode: BatchedDecodeOutputMode,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    const force_prototype = std.posix.getenv("TALU_FORCE_PROTOTYPE") != null;
+    const force_prototype = @import("env_pkg").getenv("TALU_FORCE_PROTOTYPE") != null;
     if (!force_prototype and
         topologyModeIs(self, "pipeline2") and
         comptime @hasField(SelfType, "device") and
@@ -1372,7 +1372,7 @@ fn computeBatchedDecodeLogitsWithPlan(
     const SelfType = @TypeOf(self.*);
     if (!plan.compute_logits and output_mode == .host_logits) return error.InvalidArgument;
 
-    const decode_summary_enabled = plan.emit_decode_summary and std.posix.getenv("TALU_CUDA_DECODE_SUMMARY") != null;
+    const decode_summary_enabled = plan.emit_decode_summary and @import("env_pkg").getenv("TALU_CUDA_DECODE_SUMMARY") != null;
     var decode_start_ns: i128 = 0;
     if (decode_summary_enabled and comptime @hasDecl(SelfType, "beginNvfp4RouteWindow") and
         @hasDecl(SelfType, "beginPhaseBudgetWindow"))
@@ -1389,7 +1389,7 @@ fn computeBatchedDecodeLogitsWithPlan(
     if (n_usize == 0) return;
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
-    const force_prototype = std.posix.getenv("TALU_FORCE_PROTOTYPE") != null;
+    const force_prototype = @import("env_pkg").getenv("TALU_FORCE_PROTOTYPE") != null;
     if (!plan.bypass_topology_prototype and
         (force_prototype or topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")))
     {
@@ -1859,7 +1859,7 @@ fn computeBatchedDecodeLogitsWithPlan(
         self.runtime_buffers.batched_attn_max_seq_len = self.batched_decode_graph_seq_tier;
     }
 
-    const no_graph = std.posix.getenv("TALU_NO_GRAPH") != null;
+    const no_graph = @import("env_pkg").getenv("TALU_NO_GRAPH") != null;
 
     // CUDA graph: capture-once-replay-many. Three states:
     // 1. refresh_pointer_tables=true → run normally, no capture (batch changed).

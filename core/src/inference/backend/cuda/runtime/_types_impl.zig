@@ -81,7 +81,7 @@ pub const KvCacheDtype = enum(u8) {
     }
 };
 pub fn resolveKvCacheDtype() KvCacheDtype {
-    const raw = std.posix.getenv("TALU_KV_QUANT") orelse return .i8;
+    const raw = @import("env_pkg").getenv("TALU_KV_QUANT") orelse return .i8;
     if (std.ascii.eqlIgnoreCase(raw, "f16") or std.ascii.eqlIgnoreCase(raw, "fp16")) return .f16;
     if (std.ascii.eqlIgnoreCase(raw, "f8") or std.ascii.eqlIgnoreCase(raw, "fp8") or std.ascii.eqlIgnoreCase(raw, "e4m3")) return .fp8;
     return .i8;
@@ -1337,7 +1337,7 @@ pub const RuntimeBuffers = struct {
         }
         const using_model_projection = !skip_projection;
         const projection_weight = projection_weight_opt.?;
-        if (std.posix.getenv("TALU_CUDA_PROJECTION_DEBUG") != null) {
+        if (@import("env_pkg").getenv("TALU_CUDA_PROJECTION_DEBUG") != null) {
             const projection_kind = switch (projection_weight) {
                 .dense_f32 => "dense_f32",
                 .dense_u16 => "dense_u16",

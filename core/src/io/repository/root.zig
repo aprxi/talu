@@ -489,7 +489,7 @@ test "resolveModelPath respects offline mode for uncached remote" {
     const hf_home = try temp_dir.dir.realpathAlloc(allocator, ".");
     defer allocator.free(hf_home);
 
-    const old = std.posix.getenv("HF_HOME");
+    const old = @import("env_pkg").getenv("HF_HOME");
     try Env.setEnvVar(allocator, "HF_HOME", hf_home);
     defer {
         if (old) |val| {

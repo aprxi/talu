@@ -130,9 +130,9 @@ pub fn getLogLevel() Level {
     if (level_initialized) return cached_level;
 
     // Check environment variables (one-time cost)
-    if (std.posix.getenv("TALU_LOG_LEVEL")) |s| {
+    if (@import("env_pkg").getenv("TALU_LOG_LEVEL")) |s| {
         cached_level = Level.fromString(s);
-    } else if (std.posix.getenv("TALU_LOG")) |s| {
+    } else if (@import("env_pkg").getenv("TALU_LOG")) |s| {
         cached_level = Level.fromString(s);
     }
     // else keep default (.warn)
@@ -146,7 +146,7 @@ pub fn getLogFormat() Format {
     if (format_initialized) return cached_format;
 
     // Check environment variable (one-time cost)
-    if (std.posix.getenv("TALU_LOG_FORMAT")) |s| {
+    if (@import("env_pkg").getenv("TALU_LOG_FORMAT")) |s| {
         cached_format = Format.fromString(s);
     } else {
         // Auto-detect: human for TTY, json for pipe

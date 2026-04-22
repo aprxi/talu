@@ -1675,7 +1675,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         }
     }
 
-    if (std.posix.getenv("TALU_DBG_METAL_LMHEAD") != null) {
+    if (@import("env_pkg").getenv("TALU_DBG_METAL_LMHEAD") != null) {
         if (weight_handles.lm_head) |lm_head| {
             var shape: [8]usize = undefined;
             const rank = mlx_graph.getShape(lm_head, &shape);

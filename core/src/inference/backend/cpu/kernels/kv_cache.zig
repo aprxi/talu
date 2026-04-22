@@ -39,7 +39,7 @@ pub const QuantMode = enum {
     /// Default is int8 (K-only quantization: f32 perf + 50% memory savings).
     /// Set TALU_KV_QUANT=f32 to use full f32 for testing.
     pub fn fromEnv() QuantMode {
-        const env_val = std.posix.getenv("TALU_KV_QUANT") orelse return .int8;
+        const env_val = @import("env_pkg").getenv("TALU_KV_QUANT") orelse return .int8;
         if (std.mem.eql(u8, env_val, "f32") or std.mem.eql(u8, env_val, "none")) return .f32;
         return .int8;
     }

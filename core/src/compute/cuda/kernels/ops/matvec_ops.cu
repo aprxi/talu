@@ -23,7 +23,7 @@ static __device__ __forceinline__ float talu_dot_f16_u16_vec8(
     unsigned int lane
 ) {
     float acc = 0.0f;
-    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) and
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) &&
         ((((unsigned long long)input) & 0xFu) == 0u);
     if (!can_vec8) {
         for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
@@ -73,7 +73,7 @@ static __device__ __forceinline__ float talu_dot_bf16_u16_vec8(
     unsigned int lane
 ) {
     float acc = 0.0f;
-    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) and
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) &&
         ((((unsigned long long)input) & 0xFu) == 0u);
     if (!can_vec8) {
         for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
@@ -213,7 +213,7 @@ static __device__ void talu_matvec_f16_batched(
     if (out_idx >= out_dim) return;
 
     const unsigned short* row = weight + (unsigned long long)out_idx * in_dim;
-    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) and
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) &&
         ((((unsigned long long)input) & 0xFu) == 0u);
 
     float acc[BATCH] = {};
@@ -315,7 +315,7 @@ static __device__ void talu_matvec_bf16_batched(
     if (out_idx >= out_dim) return;
 
     const unsigned short* row = weight + (unsigned long long)out_idx * in_dim;
-    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) and
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) &&
         ((((unsigned long long)input) & 0xFu) == 0u);
 
     float acc[BATCH] = {};
@@ -501,7 +501,7 @@ __device__ __forceinline__ void talu_matvec_qkv_u16_batched(
         out_dim = v_out_dim;
     }
 
-    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) and
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) &&
         ((((unsigned long long)input) & 0xFu) == 0u);
 
     float acc[BATCH] = {};
@@ -829,8 +829,8 @@ static __device__ void talu_gate_up_silu_f16_inner(
 
     float gacc[BATCH] = {}, uacc[BATCH] = {};
 
-    const bool can_vec8 = ((((unsigned long long)gate_row) & 0xFu) == 0u) and
-        ((((unsigned long long)up_row) & 0xFu) == 0u) and
+    const bool can_vec8 = ((((unsigned long long)gate_row) & 0xFu) == 0u) &&
+        ((((unsigned long long)up_row) & 0xFu) == 0u) &&
         ((((unsigned long long)input) & 0xFu) == 0u);
     if (can_vec8) {
         const unsigned int vec_elems = in_dim & ~7u;
@@ -969,8 +969,8 @@ static __device__ void talu_gate_up_silu_bf16_inner(
 
     float gacc[BATCH] = {}, uacc[BATCH] = {};
 
-    const bool can_vec8 = ((((unsigned long long)gate_row) & 0xFu) == 0u) and
-        ((((unsigned long long)up_row) & 0xFu) == 0u) and
+    const bool can_vec8 = ((((unsigned long long)gate_row) & 0xFu) == 0u) &&
+        ((((unsigned long long)up_row) & 0xFu) == 0u) &&
         ((((unsigned long long)input) & 0xFu) == 0u);
     if (can_vec8) {
         const unsigned int vec_elems = in_dim & ~7u;

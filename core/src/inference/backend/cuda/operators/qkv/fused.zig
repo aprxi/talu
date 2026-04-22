@@ -1,5 +1,6 @@
 //! Fused QKV helpers for the CUDA inference backend.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const compute = @import("compute_pkg");
 const tensor = @import("tensor_pkg");
@@ -38,6 +39,12 @@ fn recordPhaseLinearNs(self: anytype, elapsed_ns: u64) void {
     if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
         self.nvfp4_phase_counters.recordLinear(elapsed_ns);
     }
+}
+
+fn shouldAvoidWindowsPreSm89Nvfp4Fused(self: anytype) bool {
+    if (builtin.os.tag != .windows) return false;
+    const capability = self.device.computeCapability() catch return true;
+    return capability.major < 8 or (capability.major == 8 and capability.minor < 9);
 }
 
 fn recordPhaseQkvPath(self: anytype, path: ProjectionPath) void {
@@ -281,6 +288,7 @@ pub fn tryFusedNvfp4QkvForward(
     rows: usize,
     q_out_dest: *compute.cuda.Buffer,
 ) !bool {
+    if (shouldAvoidWindowsPreSm89Nvfp4Fused(self)) return false;
     if (rows == 0 or rows > 32) return false;
     if (rows > 1 and !self.nvfp4_sequence_fused_qkv_supported) return false;
     const q = switch (q_proj.*) {

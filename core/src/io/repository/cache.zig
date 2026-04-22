@@ -236,12 +236,34 @@ pub fn isModelId(path: []const u8) bool {
     return true;
 }
 
+/// Get the current user's home directory.
+///
+/// Resolution order:
+/// 1. HOME
+/// 2. USERPROFILE (Windows)
+/// 3. HOMEDRIVE + HOMEPATH (Windows)
+pub fn getUserHome(allocator: std.mem.Allocator) ![]const u8 {
+    if (@import("env_pkg").getenv("HOME")) |home_dir| {
+        return allocator.dupe(u8, home_dir);
+    }
+    if (@import("env_pkg").getenv("USERPROFILE")) |user_profile| {
+        return allocator.dupe(u8, user_profile);
+    }
+    if (@import("env_pkg").getenv("HOMEDRIVE")) |home_drive| {
+        if (@import("env_pkg").getenv("HOMEPATH")) |home_path| {
+            return std.mem.concat(allocator, u8, &.{ home_drive, home_path });
+        }
+    }
+    return error.NoHomeDir;
+}
+
 /// Get HF_HOME directory (defaults to ~/.cache/huggingface).
 pub fn getHfHome(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.posix.getenv("HF_HOME")) |hf_home| {
+    if (@import("env_pkg").getenv("HF_HOME")) |hf_home| {
         return allocator.dupe(u8, hf_home);
     }
-    const home_dir = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    const home_dir = try getUserHome(allocator);
+    defer allocator.free(home_dir);
     return std.fs.path.join(allocator, &.{ home_dir, ".cache", "huggingface" });
 }
 
@@ -255,7 +277,7 @@ pub fn getHfHome(allocator: std.mem.Allocator) ![]const u8 {
 /// Caller owns returned memory.
 pub fn getHfToken(allocator: std.mem.Allocator) !?[]const u8 {
     // 1. Check HF_TOKEN environment variable first
-    if (std.posix.getenv("HF_TOKEN")) |token| {
+    if (@import("env_pkg").getenv("HF_TOKEN")) |token| {
         log.info("fetch", "Using HF token from HF_TOKEN env", .{});
         return try allocator.dupe(u8, token);
     }
@@ -263,7 +285,7 @@ pub fn getHfToken(allocator: std.mem.Allocator) !?[]const u8 {
     // 2. Try to read token from HF_HOME/token file
     const hf_home = getHfHome(allocator) catch |err| switch (err) {
         error.NoHomeDir => {
-            log.info("fetch", "No HF token (no HOME directory)", .{});
+            log.info("fetch", "No HF token (no HOME/USERPROFILE directory)", .{});
             return null;
         },
         error.OutOfMemory => return error.OutOfMemory,
@@ -636,7 +658,7 @@ test "getModelCacheDir" {
 test "getHfHome with HF_HOME environment variable" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -709,7 +731,7 @@ test "getHfHome defaults to HOME/.cache/huggingface" {
         }
     };
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     defer {
         if (old_hf_home) |previous_value| {
             Env.setEnvVar(allocator, "HF_HOME", std.mem.sliceTo(previous_value, 0)) catch {};
@@ -722,7 +744,7 @@ test "getHfHome defaults to HOME/.cache/huggingface" {
     try Env.unsetEnvVar(allocator, "HF_HOME");
 
     // Only test if HOME is set
-    if (std.posix.getenv("HOME")) |home| {
+    if (@import("env_pkg").getenv("HOME")) |home| {
         const hf_home = try getHfHome(allocator);
         defer allocator.free(hf_home);
 
@@ -743,7 +765,7 @@ test "getCachedPath returns null for non-existent model" {
 test "getCachedPath returns path for cached model with weights" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -814,8 +836,8 @@ test "getCachedPath returns path for cached model with weights" {
 test "getHfToken returns HF_TOKEN env var first" {
     const allocator = std.testing.allocator;
 
-    const old_hf_token = std.posix.getenv("HF_TOKEN");
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_token = @import("env_pkg").getenv("HF_TOKEN");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -868,8 +890,8 @@ test "getHfToken returns HF_TOKEN env var first" {
 test "getHfToken reads from HF_HOME/token file" {
     const allocator = std.testing.allocator;
 
-    const old_hf_token = std.posix.getenv("HF_TOKEN");
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_token = @import("env_pkg").getenv("HF_TOKEN");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -940,8 +962,8 @@ test "getHfToken reads from HF_HOME/token file" {
 test "getHfToken returns null when no token available" {
     const allocator = std.testing.allocator;
 
-    const old_hf_token = std.posix.getenv("HF_TOKEN");
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_token = @import("env_pkg").getenv("HF_TOKEN");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1001,8 +1023,8 @@ test "getHfToken returns null when no token available" {
 test "getHfToken prefers HF_TOKEN env over file" {
     const allocator = std.testing.allocator;
 
-    const old_hf_token = std.posix.getenv("HF_TOKEN");
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_token = @import("env_pkg").getenv("HF_TOKEN");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1080,7 +1102,7 @@ test "isCached returns false for non-existent model" {
 test "isCached returns true for cached model with weights" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1148,7 +1170,7 @@ test "isCached returns true for cached model with weights" {
 test "listCachedModels returns empty list when no models cached" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1206,7 +1228,7 @@ test "listCachedModels returns empty list when no models cached" {
 test "listCachedModels filters models without weights when require_weights is true" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1269,7 +1291,7 @@ test "listCachedModels filters models without weights when require_weights is tr
 test "listCachedSnapshots returns snapshots for cached model" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1361,7 +1383,7 @@ test "listCachedSnapshots returns snapshots for cached model" {
 test "deleteCachedModel removes entire model directory" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1434,7 +1456,7 @@ test "deleteCachedModel removes entire model directory" {
 test "deleteCachedSnapshot removes specific snapshot" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1641,7 +1663,7 @@ test "getDirSize calculates size of files in directory" {
 test "getModelSize returns size of cached model directory" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1717,7 +1739,7 @@ test "getModelSize returns size of cached model directory" {
 test "getModelSize returns 0 for non-existent model" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1773,7 +1795,7 @@ test "getModelSize returns 0 for non-existent model" {
 test "getTotalCacheSize returns total size of hub directory" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1857,7 +1879,7 @@ test "getTotalCacheSize returns total size of hub directory" {
 test "getTotalCacheSize returns 0 for empty hub" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -1909,7 +1931,7 @@ test "getTotalCacheSize returns 0 for empty hub" {
 test "cache listing and removal (HF_HOME override)" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -2077,7 +2099,7 @@ test "getDirMtime returns max mtime of files in directory" {
 test "getModelMtime returns mtime for cached model (HF_HOME override)" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -2162,7 +2184,7 @@ test "getModelMtime returns mtime for cached model (HF_HOME override)" {
 test "getModelMtime returns 0 for uncached model" {
     const allocator = std.testing.allocator;
 
-    const old_hf_home = std.posix.getenv("HF_HOME");
+    const old_hf_home = @import("env_pkg").getenv("HF_HOME");
     const EnvFns = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
