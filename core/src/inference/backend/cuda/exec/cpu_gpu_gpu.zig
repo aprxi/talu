@@ -112,7 +112,7 @@ pub fn computeBatchedPrefillCpuGpuGpu(
     const chunk_cap = resolveStagedPrefillChunkRows(
         total_rows,
         staged_chunk_cap_base,
-        std.posix.getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null,
+        @import("env_pkg").getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null,
     );
 
     // ── CPU stage0: batched embed + forward through [0, split_layer) ──

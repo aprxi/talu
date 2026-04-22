@@ -225,6 +225,7 @@ pub const FusedCpuBackend = struct {
     fn initRuntimeRopeHandles(
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
+        max_sequence_len: usize,
     ) !RuntimeRopeHandles {
         if (loaded.position_embeddings != null) return .{};
 
@@ -290,7 +291,7 @@ pub const FusedCpuBackend = struct {
         global_rope.* = try cpu_blocks.RoPE.initFromInvFreq(
             allocator,
             global_rope_dim,
-            @intCast(loaded.config.max_seq_len),
+            max_sequence_len,
             global_inv_freq,
             global_attention_scaling,
         );
@@ -311,7 +312,7 @@ pub const FusedCpuBackend = struct {
             local_rope.* = try cpu_blocks.RoPE.initFromInvFreq(
                 allocator,
                 local_dim,
-                @intCast(loaded.config.max_seq_len),
+                max_sequence_len,
                 local_freqs.inv_freq,
                 local_freqs.attention_scaling,
             );
@@ -354,6 +355,7 @@ pub const FusedCpuBackend = struct {
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
         max_batch_size: usize,
+        max_sequence_len: usize,
         progress: progress_mod.Context,
     ) !FusedCpuBackend {
         if (!loaded.config.tie_word_embeddings and loaded.lm_head == null) {
@@ -366,13 +368,12 @@ pub const FusedCpuBackend = struct {
         const head_total: usize = @intCast(loaded.config.n_heads);
         const kv_head_total: usize = @intCast(loaded.config.n_kv_groups); // n_kv_groups = n_kv_heads
         const head_dim: usize = @intCast(loaded.config.head_dim);
-        const max_sequence_len: usize = @intCast(loaded.config.max_seq_len);
 
         // Progress: n_layers (buildBlocks) + 3 (KV cache, scratch, model build)
         const progress_total: u64 = @intCast(layer_total + 3);
         progress.addLine(1, "Devices", progress_total, null, null);
 
-        var runtime_rope = try initRuntimeRopeHandles(allocator, loaded);
+        var runtime_rope = try initRuntimeRopeHandles(allocator, loaded, max_sequence_len);
         errdefer deinitRuntimeRopeHandles(allocator, &runtime_rope);
 
         const cpu_block_set = cpu_blocks.buildBlocksFromLayers(
@@ -2849,7 +2850,11 @@ test "initRuntimeRopeHandles preserves logical pairing when rope_dim is smaller 
     loaded.config = config;
     loaded.position_embeddings = null;
 
-    var handles = try FusedCpuBackend.initRuntimeRopeHandles(std.testing.allocator, &loaded);
+    var handles = try FusedCpuBackend.initRuntimeRopeHandles(
+        std.testing.allocator,
+        &loaded,
+        @intCast(config.max_seq_len),
+    );
     defer FusedCpuBackend.deinitRuntimeRopeHandles(std.testing.allocator, &handles);
 
     const rope = handles.global orelse return error.TestUnexpectedResult;

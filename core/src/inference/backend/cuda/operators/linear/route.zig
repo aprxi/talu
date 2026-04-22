@@ -1322,19 +1322,7 @@ pub fn linearForwardRows(
                 return;
             }
 
-            // Strict NVFP4 policy for multi-row paths:
-            // do not dequantize NVFP4 weights; require native FP4 tensor-core route.
-            if (rows > 4) {
-                log.warn("inference", "CUDA NVFP4 strict mode rejected multi-row linear op (native FP4 route unavailable)", .{
-                    .rows = rows,
-                    .in_dim = w.rows,
-                    .out_dim = w.cols,
-                    .has_scales_lt = @as(u8, @intFromBool(w.scales_lt_buffer.size > 0)),
-                });
-                return error.CudaKernelUnavailable;
-            }
-
-            if (prefer_native_single_row and std.posix.getenv("TALU_CUDA_NVFP4_NATIVE_DEBUG") != null) {
+            if (prefer_native_single_row and @import("env_pkg").getenv("TALU_CUDA_NVFP4_NATIVE_DEBUG") != null) {
                 log.warn("inference", "CUDA NVFP4 native single-row skipped", .{
                     .rows = rows,
                     .in_dim = w.rows,
@@ -1358,7 +1346,7 @@ pub fn linearForwardRows(
             if (rows <= 4 and
                 w.dequant_i8_cache.pointer != 0 and
                 w.mean_scale_cache.pointer != 0 and
-                w.cols < 65536)
+                (w.cols < 65536 or @import("builtin").os.tag == .windows))
             i8_decode: {
                 const i8_fn = self.i8_matvec_function orelse break :i8_decode;
                 const batch_rows: u32 = @intCast(rows);
@@ -1412,7 +1400,8 @@ pub fn linearForwardRows(
             var nvfp4_batch_tile: u32 = 4;
             // Decode is overwhelmingly single-row on NVFP4; prefer the wider
             // tile8 kernel for practical decode projection widths.
-            const prefer_tile8 = rows > 4 or (rows == 1 and w.cols >= 2048);
+            const prefer_tile8 = rows > 4 or
+                (rows == 1 and w.cols >= 2048 and @import("builtin").os.tag != .windows);
             if (prefer_tile8) {
                 if (self.nvfp4_matvec_tile8_function) |tile8_fn| {
                     nvfp4_fn = tile8_fn;

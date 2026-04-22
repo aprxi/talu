@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const device_mod = @import("device.zig");
+const windows = std.os.windows;
 
 const cublas_status_success: c_int = 0;
 const cublas_status_alloc_failed: c_int = 3;
@@ -135,7 +136,7 @@ pub const Blas = struct {
 
         // Provide a persistent workspace so cuBLAS does not need to perform
         // internal alloc/free churn on hot decode GEMM calls.
-        const ws_mb = if (std.posix.getenv("TALU_CUBLAS_WORKSPACE_MB")) |s|
+        const ws_mb = if (@import("env_pkg").getenv("TALU_CUBLAS_WORKSPACE_MB")) |s|
             std.fmt.parseInt(usize, s, 10) catch default_workspace_mb
         else
             default_workspace_mb;
@@ -700,7 +701,7 @@ pub const BlasLt = struct {
         errdefer _ = api.destroy(handle);
 
         // Allocate workspace — larger workspace enables cuBLASLt split-K and better tiling.
-        const ws_mb = if (std.posix.getenv("TALU_CUBLASLT_WORKSPACE_MB")) |s|
+        const ws_mb = if (@import("env_pkg").getenv("TALU_CUBLASLT_WORKSPACE_MB")) |s|
             std.fmt.parseInt(usize, s, 10) catch default_lt_workspace_mb
         else
             default_lt_workspace_mb;
@@ -1005,11 +1006,12 @@ pub const BlasLt = struct {
 fn openCublasLtLibrary() !std.DynLib {
     const names: []const []const u8 = switch (builtin.os.tag) {
         .linux => &.{ "libcublasLt.so.12", "libcublasLt.so.13", "libcublasLt.so" },
-        .windows => &.{ "cublasLt64_12.dll", "cublasLt64_11.dll" },
+        .windows => &.{ "cublasLt64_13.dll", "cublasLt64_12.dll", "cublasLt64_11.dll" },
         else => &.{},
     };
-    for (names) |name| {
-        if (std.DynLib.open(name)) |lib| return lib else |_| {}
+    if (tryOpenDynamicLibrary(names)) |lib| return lib;
+    if (builtin.os.tag == .windows) {
+        if (tryOpenWindowsCudaLibrary(names)) |lib| return lib;
     }
     return error.CublasLtUnavailable;
 }
@@ -1038,13 +1040,129 @@ fn dimsFitCublas(m: usize, n: usize, k: usize) bool {
 fn openCublasLibrary() !std.DynLib {
     const names: []const []const u8 = switch (builtin.os.tag) {
         .linux => &.{ "libcublas.so.12", "libcublas.so.11", "libcublas.so" },
-        .windows => &.{ "cublas64_12.dll", "cublas64_11.dll" },
+        .windows => &.{ "cublas64_13.dll", "cublas64_12.dll", "cublas64_11.dll" },
         else => &.{},
     };
+    if (tryOpenDynamicLibrary(names)) |lib| return lib;
+    if (builtin.os.tag == .windows) {
+        if (tryOpenWindowsCudaLibrary(names)) |lib| return lib;
+    }
+    return error.CublasUnavailable;
+}
+
+fn tryOpenDynamicLibrary(names: []const []const u8) ?std.DynLib {
     for (names) |name| {
         if (std.DynLib.open(name)) |lib| return lib else |_| {}
     }
-    return error.CublasUnavailable;
+    return null;
+}
+
+fn tryOpenWindowsCudaLibrary(names: []const []const u8) ?std.DynLib {
+    if (builtin.os.tag != .windows) return null;
+
+    const allocator = std.heap.page_allocator;
+    var env_map = std.process.getEnvMap(allocator) catch return null;
+    defer env_map.deinit();
+
+    if (env_map.get("TALU_CUDA_DLL_DIR")) |cuda_dll_dir| {
+        prependWindowsDllDirToPath(allocator, cuda_dll_dir);
+        if (tryOpenDynamicLibrary(names)) |lib| return lib;
+        if (tryOpenWindowsCudaLibraryFromDir(allocator, cuda_dll_dir, names)) |lib| return lib;
+    }
+
+    if (env_map.get("CUDA_PATH")) |cuda_root| {
+        if (tryOpenWindowsCudaLibraryFromRoot(allocator, cuda_root, names)) |lib| return lib;
+    }
+
+    var env_iter = env_map.iterator();
+    while (env_iter.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, key, "CUDA_PATH_V")) continue;
+        if (tryOpenWindowsCudaLibraryFromRoot(allocator, entry.value_ptr.*, names)) |lib| return lib;
+    }
+
+    const default_root = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA";
+    var dir = std.fs.openDirAbsolute(default_root, .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    var dir_iter = dir.iterate();
+    while (dir_iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const cuda_root = std.fs.path.join(allocator, &.{ default_root, entry.name }) catch continue;
+        defer allocator.free(cuda_root);
+
+        if (tryOpenWindowsCudaLibraryFromRoot(allocator, cuda_root, names)) |lib| return lib;
+    }
+
+    return null;
+}
+
+fn tryOpenWindowsCudaLibraryFromRoot(
+    allocator: std.mem.Allocator,
+    cuda_root: []const u8,
+    names: []const []const u8,
+) ?std.DynLib {
+    const cuda_bin_x64_dir = std.fs.path.join(allocator, &.{ cuda_root, "bin", "x64" }) catch null;
+    defer if (cuda_bin_x64_dir) |path| allocator.free(path);
+    if (cuda_bin_x64_dir) |path| {
+        if (tryOpenWindowsCudaLibraryFromDir(allocator, path, names)) |lib| return lib;
+    }
+
+    const cuda_bin_dir = std.fs.path.join(allocator, &.{ cuda_root, "bin" }) catch return null;
+    defer allocator.free(cuda_bin_dir);
+    return tryOpenWindowsCudaLibraryFromDir(allocator, cuda_bin_dir, names);
+}
+
+fn tryOpenWindowsCudaLibraryFromDir(
+    allocator: std.mem.Allocator,
+    cuda_bin_dir: []const u8,
+    names: []const []const u8,
+) ?std.DynLib {
+    for (names) |name| {
+        const full_path = std.fs.path.join(allocator, &.{ cuda_bin_dir, name }) catch continue;
+        defer allocator.free(full_path);
+
+        if (tryOpenWindowsDynLibAlteredSearch(full_path)) |lib| return lib;
+    }
+    return null;
+}
+
+fn tryOpenWindowsDynLibAlteredSearch(path: []const u8) ?std.DynLib {
+    if (builtin.os.tag != .windows) return null;
+
+    const path_w = windows.sliceToPrefixedFileW(null, path) catch return null;
+    var offset: usize = 0;
+    if (path_w.span()[0] == '\\' and path_w.span()[1] == '?' and path_w.span()[2] == '?' and path_w.span()[3] == '\\') {
+        offset = 4;
+    }
+
+    const dll = windows.LoadLibraryExW(path_w.span().ptr + offset, .load_with_altered_search_path) catch return null;
+    return .{ .inner = .{ .dll = dll } };
+}
+
+fn prependWindowsDllDirToPath(allocator: std.mem.Allocator, dll_dir: []const u8) void {
+    if (builtin.os.tag != .windows) return;
+
+    const current_path = std.process.getEnvVarOwned(allocator, "PATH") catch null;
+    defer if (current_path) |path| allocator.free(path);
+
+    if (current_path) |path| {
+        if (std.mem.indexOf(u8, path, dll_dir) != null) return;
+    }
+
+    const new_path = if (current_path) |path|
+        std.fmt.allocPrint(allocator, "{s};{s}", .{ dll_dir, path }) catch return
+    else
+        allocator.dupe(u8, dll_dir) catch return;
+    defer allocator.free(new_path);
+
+    const path_name_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, "PATH") catch return;
+    defer allocator.free(path_name_w);
+
+    const new_path_w = std.unicode.wtf8ToWtf16LeAllocZ(allocator, new_path) catch return;
+    defer allocator.free(new_path_w);
+
+    _ = windows.kernel32.SetEnvironmentVariableW(path_name_w.ptr, new_path_w.ptr);
 }
 
 fn lookupRequired(comptime T: type, lib: *std.DynLib, symbol: [:0]const u8) !T {

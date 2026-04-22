@@ -2033,7 +2033,7 @@ fn warmupDequantF16Cache(self: anytype) !void {
     // NVFP4->I8 cache can improve some decode kernels but substantially
     // increases VRAM footprint; keep disabled by default until budgets and
     // route quality are validated across long-context prefill.
-    const enable_nvfp4_i8_cache = has_nvfp4_to_i8 and (std.posix.getenv("TALU_NVFP4_I8_CACHE") != null);
+    const enable_nvfp4_i8_cache = has_nvfp4_to_i8 and (@import("env_pkg").getenv("TALU_NVFP4_I8_CACHE") != null);
     if (!has_u8_dequant and !has_u4_dequant and !has_u4_to_i8 and !has_u8_to_i8 and !enable_nvfp4_i8_cache) {
         return;
     }

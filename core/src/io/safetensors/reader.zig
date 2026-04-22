@@ -4,10 +4,14 @@
 //! lazy tensor loading with memory mapping support.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tensor = @import("tensor_pkg");
 const dtype = @import("dtype_pkg");
 const json = @import("../json/root.zig");
 const mmap_policy = @import("compute_pkg").mmap_policy;
+const windows_c = if (builtin.os.tag == .windows) @cImport({
+    @cInclude("windows.h");
+}) else struct {};
 
 const Tensor = tensor.Tensor;
 const DType = dtype.DType;
@@ -27,6 +31,8 @@ pub const LoadError = error{
 /// Buffer for model weights - uses mmap with MAP_POPULATE for zero-copy loading
 const MappedBuffer = struct {
     mapped_data: []align(std.heap.page_size_min) u8,
+    owns_allocation: bool = false,
+    mapping_handle: if (builtin.os.tag == .windows) windows_c.HANDLE else void = if (builtin.os.tag == .windows) null else {},
 
     /// Validate that mapped memory is accessible by touching pages.
     /// This converts potential SIGBUS (fatal) into a catchable error.
@@ -49,25 +55,75 @@ const MappedBuffer = struct {
     }
 
     fn mapFromFile(file: std.fs.File, size: usize) !MappedBuffer {
+        if (builtin.os.tag == .windows) {
+            const size_hi: windows_c.DWORD = @truncate(size >> 32);
+            const size_lo: windows_c.DWORD = @truncate(size & 0xffff_ffff);
+            const mapping = windows_c.CreateFileMappingW(
+                file.handle,
+                null,
+                windows_c.PAGE_READONLY,
+                size_hi,
+                size_lo,
+                null,
+            ) orelse return error.OutOfMemory;
+            errdefer _ = windows_c.CloseHandle(mapping);
+
+            const view_ptr = windows_c.MapViewOfFile(
+                mapping,
+                windows_c.FILE_MAP_READ,
+                0,
+                0,
+                size,
+            ) orelse return error.OutOfMemory;
+
+            const data: []align(std.heap.page_size_min) u8 = @as(
+                [*]align(std.heap.page_size_min) u8,
+                @ptrCast(@alignCast(view_ptr)),
+            )[0..size];
+
+            return .{
+                .mapped_data = data,
+                .owns_allocation = false,
+                .mapping_handle = mapping,
+            };
+        }
+
         // Optionally use MAP_POPULATE to fault in all pages immediately.
         // For large shards this can take minutes and appears like a hang.
-        var flags: std.posix.MAP = .{ .TYPE = .PRIVATE };
-        mmap_policy.applyReadOnlyMapPolicy(&flags, size);
+        const data = blk: {
+            var flags: std.posix.MAP = .{ .TYPE = .PRIVATE };
+            mmap_policy.applyReadOnlyMapPolicy(&flags, size);
 
-        const data = try std.posix.mmap(
-            null,
-            size,
-            std.posix.PROT.READ,
-            flags,
-            file.handle,
-            0,
-        );
+            break :blk try std.posix.mmap(
+                null,
+                size,
+                std.posix.PROT.READ,
+                flags,
+                file.handle,
+                0,
+            );
+        };
 
-        return .{ .mapped_data = data };
+        return .{
+            .mapped_data = data,
+            .owns_allocation = false,
+        };
     }
 
     fn deinit(self: MappedBuffer) void {
-        if (self.mapped_data.len > 0) std.posix.munmap(self.mapped_data);
+        if (self.mapped_data.len == 0) return;
+        if (builtin.os.tag == .windows) {
+            if (self.owns_allocation) {
+                std.heap.page_allocator.free(self.mapped_data);
+            } else {
+                _ = windows_c.UnmapViewOfFile(self.mapped_data.ptr);
+                if (self.mapping_handle) |mapping| {
+                    _ = windows_c.CloseHandle(mapping);
+                }
+            }
+        } else {
+            std.posix.munmap(self.mapped_data);
+        }
     }
 };
 

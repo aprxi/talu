@@ -1,5 +1,6 @@
 //! Fused gate-up helpers for the CUDA inference backend.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const compute = @import("compute_pkg");
 const tensor = @import("tensor_pkg");
@@ -38,6 +39,12 @@ fn recordPhaseLinearNs(self: anytype, elapsed_ns: u64) void {
     if (comptime @hasField(SelfType, "nvfp4_phase_counters")) {
         self.nvfp4_phase_counters.recordLinear(elapsed_ns);
     }
+}
+
+fn shouldAvoidWindowsPreSm89Nvfp4Fused(self: anytype) bool {
+    if (builtin.os.tag != .windows) return false;
+    const capability = self.device.computeCapability() catch return true;
+    return capability.major < 8 or (capability.major == 8 and capability.minor < 9);
 }
 
 fn recordPhaseQkvPath(self: anytype, path: ProjectionPath) void {
@@ -441,6 +448,7 @@ pub fn tryFusedNvfp4GateUpSiluForward(
     rows: usize,
     expected_out_dim: u32,
 ) !bool {
+    if (shouldAvoidWindowsPreSm89Nvfp4Fused(self)) return false;
     if (self.loaded.config.use_gelu) return false;
     if (rows == 0 or rows > 32) return false;
     if (rows > 1 and !self.nvfp4_sequence_fused_gate_up_supported) return false;
@@ -509,6 +517,7 @@ pub fn tryFusedNvfp4GateUpGeluForward(
     rows: usize,
     expected_out_dim: u32,
 ) !bool {
+    if (shouldAvoidWindowsPreSm89Nvfp4Fused(self)) return false;
     if (!self.loaded.config.use_gelu) return false;
     if (rows == 0 or rows > 32) return false;
     if (rows > 1 and !self.nvfp4_sequence_fused_gate_up_supported) return false;
@@ -635,6 +644,7 @@ pub fn tryFusedNvfp4GateUpForward(
     up_weight: *const LinearWeight,
     rows: usize,
 ) !bool {
+    if (shouldAvoidWindowsPreSm89Nvfp4Fused(self)) return false;
     // Fused GEMV gate+up: efficient for decode (small row counts).
     // For prefill (rows > 32), per-projection cuBLASLt GEMM is faster.
     if (rows == 0 or rows > 32) return false;

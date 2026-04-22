@@ -715,7 +715,7 @@ fn writeMxfp8Weights(
 }
 
 fn envFlagEnabled(name: []const u8) bool {
-    const raw = std.posix.getenv(name) orelse return false;
+    const raw = @import("env_pkg").getenv(name) orelse return false;
     if (raw.len == 0) return true;
     if (std.mem.eql(u8, raw, "0")) return false;
     if (std.mem.eql(u8, raw, "false")) return false;
@@ -726,7 +726,7 @@ fn envFlagEnabled(name: []const u8) bool {
 }
 
 fn parseLayerBoundEnv(name: []const u8) ?u32 {
-    const raw = std.posix.getenv(name) orelse return null;
+    const raw = @import("env_pkg").getenv(name) orelse return null;
     if (raw.len == 0) return null;
     return std.fmt.parseInt(u32, raw, 10) catch null;
 }
@@ -760,7 +760,7 @@ const CalibrationLayerWindow = struct {
 };
 
 fn envFlagEnabledDefault(name: []const u8, default_value: bool) bool {
-    const raw = std.posix.getenv(name) orelse return default_value;
+    const raw = @import("env_pkg").getenv(name) orelse return default_value;
     if (raw.len == 0) return true;
     if (std.mem.eql(u8, raw, "0")) return false;
     if (std.mem.eql(u8, raw, "false")) return false;
@@ -801,7 +801,7 @@ fn parseCalibrationOptimizer(raw: []const u8) ?CalibrationOptimizer {
 }
 
 fn calibrationOptimizerFromEnv(profile: convert.scheme.QualityProfile) CalibrationOptimizer {
-    if (std.posix.getenv("TALU_CONVERT_CALIB_OPTIMIZER")) |raw| {
+    if (@import("env_pkg").getenv("TALU_CONVERT_CALIB_OPTIMIZER")) |raw| {
         return parseCalibrationOptimizer(raw) orelse .search;
     }
     return switch (profile) {
@@ -811,7 +811,7 @@ fn calibrationOptimizerFromEnv(profile: convert.scheme.QualityProfile) Calibrati
 }
 
 fn calibrationProgressModeFromEnv() CalibrationProgressMode {
-    const raw = std.posix.getenv("TALU_CONVERT_CALIB_PROGRESS_UNIT") orelse return .block;
+    const raw = @import("env_pkg").getenv("TALU_CONVERT_CALIB_PROGRESS_UNIT") orelse return .block;
     return parseCalibrationProgressMode(raw) orelse .block;
 }
 
@@ -1866,7 +1866,7 @@ const CalibrationExperimentSettings = struct {
 };
 
 fn parseCalibrationFloatEnv(name: []const u8, fallback: f32, min_value: f32, max_value: f32) f32 {
-    const raw = std.posix.getenv(name) orelse return fallback;
+    const raw = @import("env_pkg").getenv(name) orelse return fallback;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return fallback;
     const parsed = std.fmt.parseFloat(f32, trimmed) catch return fallback;
@@ -1893,7 +1893,7 @@ fn calibrationEvalBudget(rows: usize, cols: usize, options: ConvertOptions) Cali
     const batch_size = @as(usize, @intCast(@max(options.calib_batch_size, 1)));
     const nblocks = @as(usize, @intCast(@max(options.calib_nblocks, 1)));
     const fast_budget_mode = blk: {
-        const raw = std.posix.getenv("TALU_CONVERT_CALIB_BUDGET_MODE") orelse break :blk false;
+        const raw = @import("env_pkg").getenv("TALU_CONVERT_CALIB_BUDGET_MODE") orelse break :blk false;
         if (std.ascii.eqlIgnoreCase(raw, "fast")) break :blk true;
         break :blk false;
     };
@@ -3415,7 +3415,7 @@ test "parseCalibrationOptimizer accepts aliases and rejects unknown values" {
 }
 
 test "calibrationOptimizerFromEnv maps defaults per profile" {
-    if (std.posix.getenv("TALU_CONVERT_CALIB_OPTIMIZER") != null) return error.SkipZigTest;
+    if (@import("env_pkg").getenv("TALU_CONVERT_CALIB_OPTIMIZER") != null) return error.SkipZigTest;
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.good));
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.best));
     try std.testing.expectEqual(CalibrationOptimizer.search, calibrationOptimizerFromEnv(.custom));

@@ -467,9 +467,27 @@ pub const ReferenceVerifier = struct {
 /// JSON serialization format
 /// Format: { "metadata": {...}, "tokens": [...], "stats": [...] }
 pub const JsonFormat = struct {
+    fn writeJsonString(writer: anytype, value: []const u8) !void {
+        try writer.writeByte('"');
+        for (value) |ch| {
+            switch (ch) {
+                '\\' => try writer.writeAll("\\\\"),
+                '"' => try writer.writeAll("\\\""),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                0...0x08, 0x0B, 0x0C, 0x0E...0x1F => try writer.print("\\u00{x:0>2}", .{ch}),
+                else => try writer.writeByte(ch),
+            }
+        }
+        try writer.writeByte('"');
+    }
+
     pub fn serialize(ref: *const ReferenceData, writer: anytype) !void {
         try writer.writeAll("{\"metadata\":{");
-        try writer.print("\"model_name\":\"{s}\",", .{ref.model_name});
+        try writer.writeAll("\"model_name\":");
+        try writeJsonString(writer, ref.model_name);
+        try writer.writeAll(",");
         try writer.print("\"seed\":{d},", .{ref.seed});
         try writer.print("\"temperature\":{d},", .{ref.temperature});
         try writer.print("\"max_tokens\":{d}", .{ref.max_tokens});
@@ -489,7 +507,9 @@ pub const JsonFormat = struct {
             try writer.writeAll("{");
             try writer.print("\"token_idx\":{d},", .{record.token_idx});
             try writer.print("\"layer\":{d},", .{record.layer});
-            try writer.print("\"point\":\"{s}\",", .{record.point.name()});
+            try writer.writeAll("\"point\":");
+            try writeJsonString(writer, record.point.name());
+            try writer.writeAll(",");
             try writer.print("\"position\":{d},", .{record.position});
             try writer.writeAll("\"stats\":{");
             try writer.print("\"count\":{d},", .{record.stats.count});
@@ -778,6 +798,43 @@ test "ReferenceVerifier matches good stats" {
     // Should pass with identical stats
     try verifier.checkEmission(emission, golden_stats);
     try std.testing.expect(!verifier.has_diverged);
+}
+
+test "JsonFormat serializes Windows-style model paths safely" {
+    const allocator = std.testing.allocator;
+    const ref = ReferenceData{
+        .model_name = "C:\\Users\\example\\.cache\\talu\\models\\Qwen\\Qwen3.5-2B-NVFP4",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{31248},
+        .stats_records = &[_]StatsRecord{.{
+            .token_idx = 0,
+            .layer = trace.TraceEmission.NO_LAYER,
+            .point = .lm_head,
+            .position = 0,
+            .stats = .{
+                .count = 1,
+                .min = 0.5,
+                .max = 0.5,
+                .sum = 0.5,
+                .sum_sq = 0.25,
+                .nan_count = 0,
+                .inf_count = 0,
+            },
+        }},
+        .allocator = allocator,
+    };
+
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+    try JsonFormat.serialize(&ref, buffer.writer(allocator));
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, buffer.items, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings(ref.model_name, parsed.value.object.get("metadata").?.object.get("model_name").?.string);
+    try std.testing.expectEqualStrings("lm_head", parsed.value.object.get("stats").?.array.items[0].object.get("point").?.string);
 }
 
 test "ReferenceVerifier detects divergence" {

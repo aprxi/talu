@@ -10,7 +10,7 @@ const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_gated_delta_ssm_rows_ptrs_i8_f32";
 pub const op_name: []const u8 = "gated_delta_ssm_rows_ptrs_i8_f32";
-const out_tile: u32 = 64;
+const out_tile: u32 = 32;
 const warp_size: u32 = 32;
 
 pub fn runWithFunction(

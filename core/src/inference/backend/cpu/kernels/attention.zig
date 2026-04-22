@@ -388,7 +388,7 @@ pub const MultiHeadAttention = struct {
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1); // Only batch=1 supported
         const sequence_len: usize = @intCast(input_tensor.shape[1]);
         // Debug: print per-layer attention config on first token
-        if (std.posix.getenv("TALU_DEBUG_ATTN_PARAMS") != null and cache.cache_position == 0) {
+        if (@import("env_pkg").getenv("TALU_DEBUG_ATTN_PARAMS") != null and cache.cache_position == 0) {
             var dbuf: [512]u8 = undefined;
             const rope_dim: usize = if (self.rope) |r| r.dim else 0;
             const dmsg = std.fmt.bufPrint(&dbuf, "[DEBUG ATTN L{d}] n_heads={d} n_kv={d} head_dim={d} scale={d:.4} sw={d} rope_dim={d} d_model={d} seq={d}\n", .{
@@ -1296,7 +1296,7 @@ pub const MultiHeadAttention = struct {
         std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
 
         // Debug: print per-layer attention config on first token
-        if (std.posix.getenv("TALU_DEBUG_ATTN_PARAMS") != null and cache.getPosition(slot_index) == 0) {
+        if (@import("env_pkg").getenv("TALU_DEBUG_ATTN_PARAMS") != null and cache.getPosition(slot_index) == 0) {
             var dbuf: [512]u8 = undefined;
             const rope_dim: usize = if (self.rope) |r| r.dim else 0;
             const dmsg = std.fmt.bufPrint(&dbuf, "[DEBUG ATTN L{d}] n_heads={d} n_kv={d} head_dim={d} scale={d:.4} sw={d} rope_dim={d} d_model={d} seq={d}\n", .{

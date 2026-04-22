@@ -294,7 +294,7 @@ pub const VerifyCapture = struct {
     }
 
     fn logVerificationDivergence(verifier: *const ReferenceVerifier, err: anyerror) void {
-        if (std.posix.getenv("TALU_PARITY_QUIET")) |raw| {
+        if (@import("env_pkg").getenv("TALU_PARITY_QUIET")) |raw| {
             const enabled = !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
             if (enabled) return;
         }
@@ -416,7 +416,7 @@ pub const VerifyCapture = struct {
         divergence: *const ReferenceVerifier.DivergenceInfo,
     ) !void {
         const quiet = blk: {
-            if (std.posix.getenv("TALU_PARITY_QUIET")) |raw| {
+            if (@import("env_pkg").getenv("TALU_PARITY_QUIET")) |raw| {
                 break :blk !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
             }
             break :blk false;

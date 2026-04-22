@@ -14,12 +14,16 @@ const CacheError = cache.CacheError;
 const ListOptions = cache.ListOptions;
 
 /// Get the Talu home directory.
-/// Resolution: $TALU_HOME > ~/.cache/talu
+/// Resolution: $TALU_HOME > home-directory/.cache/talu
 pub fn getTaluHome(allocator: std.mem.Allocator) CacheError![]const u8 {
-    if (std.posix.getenv("TALU_HOME")) |talu_home| {
+    if (@import("env_pkg").getenv("TALU_HOME")) |talu_home| {
         return allocator.dupe(u8, talu_home) catch return CacheError.OutOfMemory;
     }
-    const home_dir = std.posix.getenv("HOME") orelse return CacheError.NoHomeDir;
+    const home_dir = cache.getUserHome(allocator) catch |err| switch (err) {
+        error.NoHomeDir => return CacheError.NoHomeDir,
+        error.OutOfMemory => return CacheError.OutOfMemory,
+    };
+    defer allocator.free(home_dir);
     return std.fs.path.join(allocator, &.{ home_dir, ".cache", "talu" }) catch return CacheError.OutOfMemory;
 }
 
@@ -234,7 +238,7 @@ const Env = struct {
 test "getTaluHome respects TALU_HOME env" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -252,7 +256,7 @@ test "getTaluHome respects TALU_HOME env" {
 test "getTaluHome defaults to HOME/.cache/talu" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -263,7 +267,7 @@ test "getTaluHome defaults to HOME/.cache/talu" {
 
     try Env.unsetEnvVar(allocator, "TALU_HOME");
 
-    if (std.posix.getenv("HOME")) |home| {
+    if (@import("env_pkg").getenv("HOME")) |home| {
         const talu_home = try getTaluHome(allocator);
         defer allocator.free(talu_home);
 
@@ -277,7 +281,7 @@ test "getTaluHome defaults to HOME/.cache/talu" {
 test "getTaluModelsDir returns TALU_HOME/models" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -295,7 +299,7 @@ test "getTaluModelsDir returns TALU_HOME/models" {
 test "getTaluCachedPath returns path when model exists with weights" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -334,7 +338,7 @@ test "getTaluCachedPath returns path when model exists with weights" {
 test "getTaluCachedPath returns null when model doesn't exist" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -363,7 +367,7 @@ test "getTaluCachedPath returns null when model doesn't exist" {
 test "getTaluCachedPath returns null when model exists but has no weights" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -399,7 +403,7 @@ test "getTaluCachedPath returns null when model exists but has no weights" {
 
 test "deleteTaluCachedModel removes model directory" {
     const allocator = std.testing.allocator;
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -433,7 +437,7 @@ test "deleteTaluCachedModel removes model directory" {
 
 test "taluModelDirExists returns true when directory exists" {
     const allocator = std.testing.allocator;
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -469,7 +473,7 @@ test "taluModelDirExists returns true when directory exists" {
 test "listTaluModels returns empty when directory doesn't exist" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -496,7 +500,7 @@ test "listTaluModels returns empty when directory doesn't exist" {
 test "listTaluModels finds models in org/name structure" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
@@ -544,7 +548,7 @@ test "listTaluModels finds models in org/name structure" {
 test "listTaluModels filters models without weights" {
     const allocator = std.testing.allocator;
 
-    const old_talu_home = std.posix.getenv("TALU_HOME");
+    const old_talu_home = @import("env_pkg").getenv("TALU_HOME");
     defer {
         if (old_talu_home) |prev| {
             Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};

@@ -739,7 +739,12 @@ pub const Device = struct {
         try self.makeCurrent();
 
         var module_handle: ?*anyopaque = null;
-        if (cu_module_load_data(&module_handle, image) != cuda_success or module_handle == null) {
+        const status = cu_module_load_data(&module_handle, image);
+        if (status != cuda_success or module_handle == null) {
+            log.warn("compute", "CUDA module load failed", .{
+                .status = status,
+                .module_handle_null = if (module_handle == null) @as(u8, 1) else @as(u8, 0),
+            });
             return error.CudaModuleLoadFailed;
         }
         return module_handle.?;
@@ -750,7 +755,13 @@ pub const Device = struct {
         try self.makeCurrent();
 
         var function_handle: ?*anyopaque = null;
-        if (cu_module_get_function(&function_handle, module, symbol.ptr) != cuda_success or function_handle == null) {
+        const status = cu_module_get_function(&function_handle, module, symbol.ptr);
+        if (status != cuda_success or function_handle == null) {
+            log.warn("compute", "CUDA function lookup failed", .{
+                .status = status,
+                .symbol = symbol,
+                .function_handle_null = if (function_handle == null) @as(u8, 1) else @as(u8, 0),
+            });
             return error.CudaFunctionLookupFailed;
         }
         return function_handle.?;

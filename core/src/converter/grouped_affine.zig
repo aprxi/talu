@@ -949,7 +949,7 @@ fn writeQuantizedWeights(
                         if (map.layouts.get(tensor_name)) |layout| {
                             if (layout == .embedding) {
                                 const default_embed_bits: u8 = 8;
-                                const bits: u8 = if (std.posix.getenv("TALU_CONVERT_EMBED_BITS")) |raw|
+                                const bits: u8 = if (@import("env_pkg").getenv("TALU_CONVERT_EMBED_BITS")) |raw|
                                     std.fmt.parseInt(u8, raw, 10) catch default_embed_bits
                                 else
                                     default_embed_bits;
@@ -1099,7 +1099,7 @@ fn writeQuantizedWeights(
 }
 
 fn envFlagEnabledDefault(name: []const u8, default_value: bool) bool {
-    const raw = std.posix.getenv(name) orelse return default_value;
+    const raw = @import("env_pkg").getenv(name) orelse return default_value;
     if (raw.len == 0) return true;
     if (std.mem.eql(u8, raw, "0")) return false;
     if (std.mem.eql(u8, raw, "false")) return false;
@@ -1128,7 +1128,7 @@ fn parseCalibrationOptimizer(raw: []const u8) ?CalibrationOptimizer {
 }
 
 fn calibrationOptimizerFromEnv(profile: convert.scheme.QualityProfile) CalibrationOptimizer {
-    if (std.posix.getenv("TALU_CONVERT_CALIB_OPTIMIZER")) |raw| {
+    if (@import("env_pkg").getenv("TALU_CONVERT_CALIB_OPTIMIZER")) |raw| {
         return parseCalibrationOptimizer(raw) orelse .search;
     }
     return switch (profile) {
@@ -1146,7 +1146,7 @@ fn parseCalibrationProgressMode(raw: []const u8) ?CalibrationProgressMode {
 }
 
 fn calibrationProgressModeFromEnv() CalibrationProgressMode {
-    const raw = std.posix.getenv("TALU_CONVERT_CALIB_PROGRESS_UNIT") orelse return .block;
+    const raw = @import("env_pkg").getenv("TALU_CONVERT_CALIB_PROGRESS_UNIT") orelse return .block;
     return parseCalibrationProgressMode(raw) orelse .block;
 }
 
@@ -1177,7 +1177,7 @@ fn estimateGroupedTargetQuantizedTensorCount(
 }
 
 fn parseLayerBoundEnv(name: []const u8) ?u32 {
-    const raw = std.posix.getenv(name) orelse return null;
+    const raw = @import("env_pkg").getenv(name) orelse return null;
     if (raw.len == 0) return null;
     return std.fmt.parseInt(u32, raw, 10) catch null;
 }
@@ -1212,7 +1212,7 @@ const CalibrationLayerWindow = struct {
 
 fn isMetalCalibrationEnabled() bool {
     if (comptime !has_metal_gpu_calib) return false;
-    if (std.posix.getenv("BACKEND")) |raw| {
+    if (@import("env_pkg").getenv("BACKEND")) |raw| {
         const token = std.mem.trim(u8, raw, " \t\r\n");
         if (!std.ascii.eqlIgnoreCase(token, "metal") and
             !std.ascii.eqlIgnoreCase(token, "auto") and
@@ -1247,7 +1247,7 @@ fn isMlxMetallibAvailableForCalibration() bool {
         if (runtime_path.len > 0 and pathExistsAbsoluteOrCwd(runtime_path)) return true;
     }
 
-    if (std.posix.getenv("MLX_METALLIB")) |env_path| {
+    if (@import("env_pkg").getenv("MLX_METALLIB")) |env_path| {
         const trimmed = std.mem.trim(u8, env_path, " \t\r\n");
         if (trimmed.len > 0) return pathExistsAbsoluteOrCwd(trimmed);
     }
@@ -1288,7 +1288,7 @@ fn ensureMlxMetallibColocatedForCalibration() void {
         (std.fmt.bufPrint(&exe_lib_candidate_buf, "{s}/../lib/mlx.metallib", .{exe_dir}) catch "")
     else
         "";
-    const candidate_env = std.posix.getenv("MLX_METALLIB") orelse "";
+    const candidate_env = @import("env_pkg").getenv("MLX_METALLIB") orelse "";
 
     const candidates = [_][]const u8{
         candidate_env,
@@ -1320,7 +1320,7 @@ fn ensureMlxMetallibColocatedForCalibration() void {
 
 fn isCudaCalibrationEnabled() bool {
     if (comptime !has_cuda_gpu_calib) return false;
-    const raw = std.posix.getenv("BACKEND") orelse return false;
+    const raw = @import("env_pkg").getenv("BACKEND") orelse return false;
     const token = std.mem.trim(u8, raw, " \t\r\n");
     return std.ascii.eqlIgnoreCase(token, "cuda");
 }
@@ -1456,7 +1456,7 @@ const CudaCalibContext = struct {
 
 fn cudaCalibrationBufferBudgetBytes(device: *compute.cuda.device.Device) usize {
     const mib: usize = 1024 * 1024;
-    if (std.posix.getenv("TALU_CONVERT_CUDA_CALIB_BUF_MIB")) |raw| {
+    if (@import("env_pkg").getenv("TALU_CONVERT_CUDA_CALIB_BUF_MIB")) |raw| {
         if (std.fmt.parseInt(usize, raw, 10)) |buffer_mib| {
             if (buffer_mib > 0) {
                 const requested = std.math.mul(usize, buffer_mib, mib) catch cuda_calibration_max_buffer_bytes;
@@ -1476,7 +1476,7 @@ fn cudaCalibrationBufferBudgetBytes(device: *compute.cuda.device.Device) usize {
 
 fn cudaGroupedQuantTileBudgetBytes(device: *compute.cuda.device.Device) usize {
     const mib: usize = 1024 * 1024;
-    if (std.posix.getenv("TALU_CONVERT_CUDA_QUANT_TILE_MIB")) |raw| {
+    if (@import("env_pkg").getenv("TALU_CONVERT_CUDA_QUANT_TILE_MIB")) |raw| {
         if (std.fmt.parseInt(usize, raw, 10)) |tile_mib| {
             if (tile_mib > 0) {
                 const requested = std.math.mul(usize, tile_mib, mib) catch cuda_grouped_quant_max_tile_bytes;
@@ -5217,7 +5217,7 @@ test "parseCalibrationOptimizer accepts aliases and rejects unknown values" {
 }
 
 test "calibrationOptimizerFromEnv maps defaults per profile" {
-    if (std.posix.getenv("TALU_CONVERT_CALIB_OPTIMIZER") != null) return error.SkipZigTest;
+    if (@import("env_pkg").getenv("TALU_CONVERT_CALIB_OPTIMIZER") != null) return error.SkipZigTest;
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.good));
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.best));
     try std.testing.expectEqual(CalibrationOptimizer.search, calibrationOptimizerFromEnv(.custom));

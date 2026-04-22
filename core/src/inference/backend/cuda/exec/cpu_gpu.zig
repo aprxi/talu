@@ -333,7 +333,7 @@ pub fn runCpuGpuWithPipelineRuntime(
         ctx: *const Ctx,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            if (std.posix.getenv("TALU_DUMP_HIDDEN") != null) {
+            if (@import("env_pkg").getenv("TALU_DUMP_HIDDEN") != null) {
                 log.warn("inference", "STAGE1_EXEC", .{
                     .layer_start = layer_start,
                     .layer_end = layer_end,

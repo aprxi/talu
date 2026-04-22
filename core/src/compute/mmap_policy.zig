@@ -17,7 +17,7 @@ pub fn shouldPopulatePages(size: usize) bool {
     if (builtin.os.tag != .linux) return false;
 
     // Explicit override via environment variable
-    if (std.posix.getenv("TALU_MMAP_POPULATE")) |v| {
+    if (@import("env_pkg").getenv("TALU_MMAP_POPULATE")) |v| {
         if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) return false;
         if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) return true;
     }

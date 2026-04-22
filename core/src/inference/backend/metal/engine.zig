@@ -438,7 +438,7 @@ pub const MetalBackend = struct {
             (std.fmt.bufPrint(&cand2_buf, "{s}/../lib/mlx.metallib", .{exe_dir}) catch "")
         else
             "";
-        const candidate_env = std.posix.getenv("MLX_METALLIB") orelse "";
+        const candidate_env = @import("env_pkg").getenv("MLX_METALLIB") orelse "";
         const candidates = [_][]const u8{
             candidate_env,
             candidate_exe,
@@ -466,7 +466,7 @@ pub const MetalBackend = struct {
     }
 
     fn envTruthy(name: []const u8, fallback: bool) bool {
-        const raw = std.posix.getenv(name) orelse return fallback;
+        const raw = @import("env_pkg").getenv(name) orelse return fallback;
         if (raw.len == 0) return true;
         if (std.mem.eql(u8, raw, "0")) return false;
         if (std.ascii.eqlIgnoreCase(raw, "false")) return false;

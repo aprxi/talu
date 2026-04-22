@@ -220,6 +220,48 @@ fn hasSuffixAny(name: []const u8, suffixes: []const []const u8) bool {
     return false;
 }
 
+fn normalizePathSeparators(allocator: std.mem.Allocator, path: []const u8) []const u8 {
+    if (builtin.os.tag != .windows or std.mem.indexOfScalar(u8, path, '\\') == null) {
+        return path;
+    }
+    const normalized = allocator.dupe(u8, path) catch @panic("OOM");
+    for (normalized) |*ch| {
+        if (ch.* == '\\') ch.* = '/';
+    }
+    return normalized;
+}
+
+fn curlArchivePath(target_os: std.Target.Os.Tag) []const u8 {
+    return switch (target_os) {
+        .windows => "deps/curl/build/lib/Release/libcurl.lib",
+        else => "deps/curl/build/lib/libcurl.a",
+    };
+}
+
+fn mbedtlsArchivePath(target_os: std.Target.Os.Tag, name: []const u8) []const u8 {
+    return switch (target_os) {
+        .windows => if (std.mem.eql(u8, name, "mbedtls"))
+            "deps/mbedtls/build/library/Release/mbedtls.lib"
+        else if (std.mem.eql(u8, name, "mbedx509"))
+            "deps/mbedtls/build/library/Release/mbedx509.lib"
+        else
+            "deps/mbedtls/build/library/Release/mbedcrypto.lib",
+        else => if (std.mem.eql(u8, name, "mbedtls"))
+            "deps/mbedtls/build/library/libmbedtls.a"
+        else if (std.mem.eql(u8, name, "mbedx509"))
+            "deps/mbedtls/build/library/libmbedx509.a"
+        else
+            "deps/mbedtls/build/library/libmbedcrypto.a",
+    };
+}
+
+fn rustCliArchivePath(target_os: std.Target.Os.Tag) []const u8 {
+    return switch (target_os) {
+        .windows => "bindings/rust/target/release/talu_cli.lib",
+        else => "bindings/rust/target/release/libtalu_cli.a",
+    };
+}
+
 fn mlxIncludeFingerprintFlag(b: *std.Build) []const u8 {
     const dir_path = "core/src/compute/metal/mlx";
     const tracked_suffixes = [_][]const u8{ ".inc", ".h" };
@@ -287,9 +329,12 @@ fn validateInferenceBoundaryImports(b: *std.Build) void {
     }) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
-        if (std.mem.startsWith(u8, entry.path, "inference/")) continue;
+        const normalized_path = normalizePathSeparators(b.allocator, entry.path);
+        defer if (normalized_path.ptr != entry.path.ptr) b.allocator.free(normalized_path);
 
-        const abs_path = b.fmt("core/src/{s}", .{entry.path});
+        if (std.mem.startsWith(u8, normalized_path, "inference/")) continue;
+
+        const abs_path = b.fmt("core/src/{s}", .{normalized_path});
         const source = std.fs.cwd().readFileAlloc(b.allocator, abs_path, 16 * 1024 * 1024) catch |err| {
             std.debug.panic("failed reading {s} for boundary validation: {s}", .{ abs_path, @errorName(err) });
         };
@@ -306,12 +351,12 @@ fn validateInferenceBoundaryImports(b: *std.Build) void {
             const targets_inference = std.mem.indexOf(u8, import_path, "inference/") != null or
                 std.mem.eql(u8, import_path, "inference_pkg");
             if (!targets_inference) continue;
-            if (isAllowedInferenceBoundaryImport(entry.path, import_path)) continue;
+            if (isAllowedInferenceBoundaryImport(normalized_path, import_path)) continue;
 
             has_violations = true;
             std.debug.print(
                 "inference boundary violation: core/src/{s} imports {s}; route via inference_pkg bridge\n",
-                .{ entry.path, import_path },
+                .{ normalized_path, import_path },
             );
         }
     }
@@ -334,6 +379,7 @@ const Miniz = miniz_port.Miniz;
 const Sqlite3 = sqlite_port.Sqlite3;
 
 const CorePackages = struct {
+    env_pkg: *std.Build.Module,
     models_pkg: *std.Build.Module,
     tensor_pkg: *std.Build.Module,
     compute_pkg: *std.Build.Module,
@@ -348,6 +394,12 @@ const CorePackages = struct {
 
     fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) CorePackages {
         return .{
+            .env_pkg = b.createModule(.{
+                .root_source_file = b.path("core/src/env.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
             .models_pkg = b.createModule(.{
                 .root_source_file = b.path("core/src/models/root.zig"),
                 .target = target,
@@ -419,6 +471,7 @@ const CorePackages = struct {
 };
 
 fn addCorePackageImports(mod: *std.Build.Module, pkgs: *const CorePackages) void {
+    mod.addImport("env_pkg", pkgs.env_pkg);
     mod.addImport("models_pkg", pkgs.models_pkg);
     if (mod != pkgs.tensor_pkg) mod.addImport("tensor_pkg", pkgs.tensor_pkg);
     mod.addImport("compute_pkg", pkgs.compute_pkg);
@@ -511,34 +564,44 @@ fn linkCDependencies(
     artifact.linkLibrary(pcre2.lib);
     artifact.linkLibrary(miniz.lib);
     artifact.linkLibrary(sqlite3.lib);
+    const target_os = artifact.rootModuleTarget().os.tag;
 
     // For static libraries, skip external .a archives to avoid nested archive warnings.
     // The final executable/shared lib will link them directly.
     if (!skip_external_archives) {
-        // Link pre-built libcurl static library
-        artifact.addObjectFile(b.path("deps/curl/build/lib/libcurl.a"));
+        artifact.addObjectFile(b.path(curlArchivePath(target_os)));
 
-        // Link mbedTLS for HTTPS support (used on all platforms)
-        artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedtls.a"));
-        artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedx509.a"));
-        artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedcrypto.a"));
+        artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedtls")));
+        artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedx509")));
+        artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedcrypto")));
 
-        const target_os = artifact.rootModuleTarget().os.tag;
         if (target_os == .macos) {
             artifact.linkFramework("CoreFoundation");
             artifact.linkFramework("SystemConfiguration");
             artifact.linkFramework("Security");
         }
-        artifact.linkSystemLibrary("pthread");
+        if (target_os == .linux or target_os == .macos) {
+            artifact.linkSystemLibrary("pthread");
+        } else if (target_os == .windows) {
+            artifact.linkSystemLibrary("ws2_32");
+            artifact.linkSystemLibrary("bcrypt");
+            artifact.linkSystemLibrary("crypt32");
+            artifact.linkSystemLibrary("advapi32");
+            artifact.linkSystemLibrary("iphlpapi");
+            artifact.linkSystemLibrary("user32");
+            artifact.linkSystemLibrary("ntdll");
+        }
 
         artifact.addCSourceFiles(.{
             .files = &.{"deps/utf8proc/utf8proc.c"},
-            .flags = &.{"-std=gnu11"},
+            .flags = if (target_os == .windows)
+                &.{ "-std=gnu11", "-DUTF8PROC_STATIC=1" }
+            else
+                &.{"-std=gnu11"},
         });
     }
 
     // Signal guard for graceful SIGBUS handling
-    const target_os = artifact.rootModuleTarget().os.tag;
     if (target_os == .linux or target_os == .macos) {
         artifact.addCSourceFiles(.{
             .files = &.{"core/src/capi/signal_guard.c"},
@@ -560,22 +623,30 @@ fn linkExternalArchives(
     artifact.linkLibrary(pcre2.lib);
     artifact.linkLibrary(miniz.lib);
     artifact.linkLibrary(sqlite3.lib);
-
-    // Link pre-built libcurl static library
-    artifact.addObjectFile(b.path("deps/curl/build/lib/libcurl.a"));
-
-    // Link mbedTLS for HTTPS support (used on all platforms)
-    artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedtls.a"));
-    artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedx509.a"));
-    artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedcrypto.a"));
-
     const target_os = artifact.rootModuleTarget().os.tag;
+
+    artifact.addObjectFile(b.path(curlArchivePath(target_os)));
+
+    artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedtls")));
+    artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedx509")));
+    artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedcrypto")));
+
     if (target_os == .macos) {
         artifact.linkFramework("CoreFoundation");
         artifact.linkFramework("SystemConfiguration");
         artifact.linkFramework("Security");
     }
-    artifact.linkSystemLibrary("pthread");
+    if (target_os == .linux or target_os == .macos) {
+        artifact.linkSystemLibrary("pthread");
+    } else if (target_os == .windows) {
+        artifact.linkSystemLibrary("ws2_32");
+        artifact.linkSystemLibrary("bcrypt");
+        artifact.linkSystemLibrary("crypt32");
+        artifact.linkSystemLibrary("advapi32");
+        artifact.linkSystemLibrary("iphlpapi");
+        artifact.linkSystemLibrary("user32");
+        artifact.linkSystemLibrary("ntdll");
+    }
 }
 
 // =============================================================================
@@ -745,6 +816,12 @@ pub fn build(b: *std.Build) void {
         target = b.resolveTargetQuery(query);
     }
 
+    if (target.result.os.tag == .windows and target.result.abi != .msvc) {
+        var query = target.query;
+        query.abi = .msvc;
+        target = b.resolveTargetQuery(query);
+    }
+
     // For Linux targets: enforce GLIBC 2.28 for broad distro compatibility
     if (target.result.os.tag == .linux) {
         var query = target.query;
@@ -812,11 +889,18 @@ pub fn build(b: *std.Build) void {
             "/usr/local/cuda/bin",
             "/opt/cuda/bin",
         }) catch "nvcc";
-        const ensure_cuda_assets_dir = b.addSystemCommand(&.{
-            "mkdir",
-            "-p",
-            "core/assets/cuda",
-        });
+        const ensure_cuda_assets_dir = if (builtin.os.tag == .windows)
+            b.addSystemCommand(&.{
+                "cmd",
+                "/c",
+                "if not exist core\\assets\\cuda mkdir core\\assets\\cuda",
+            })
+        else
+            b.addSystemCommand(&.{
+                "mkdir",
+                "-p",
+                "core/assets/cuda",
+            });
         const gen_kernel_module = b.addSystemCommand(&.{
             nvcc_path,
             "--fatbin",
@@ -827,9 +911,8 @@ pub fn build(b: *std.Build) void {
         });
         gen_kernel_module.step.dependOn(&ensure_cuda_assets_dir.step);
         gen_cuda_kernels_step.dependOn(&gen_kernel_module.step);
-        // Normal builds consume the checked-in fatbin when present.
-        // Regeneration is reserved for explicit asset refreshes or bootstrapping
-        // a workspace that does not have bundled CUDA assets yet.
+        // Normal builds should consume the checked-in fatbin when present.
+        // Regeneration is only required for fresh CUDA asset production.
         if (enable_cuda and !has_bundled_cuda_fatbin) {
             cuda_kernel_assets_step = &gen_kernel_module.step;
         }
@@ -1043,10 +1126,10 @@ pub fn build(b: *std.Build) void {
         exe.linkLibrary(lib);
         // Link all deps including external .a archives (curl, mbedtls)
         linkCDependencies(b, exe, pcre2, miniz, sqlite3, false);
-        exe.addObjectFile(b.path("bindings/rust/target/release/libtalu_cli.a"));
 
         // Link platform-specific runtime libraries for Rust CLI
         const cli_target_os = exe.rootModuleTarget().os.tag;
+        exe.addObjectFile(b.path(rustCliArchivePath(cli_target_os)));
         if (cli_target_os == .linux) {
             exe.root_module.addRPathSpecial("$ORIGIN/../lib");
             exe.linkSystemLibrary("unwind");
@@ -1900,27 +1983,51 @@ pub fn build(b: *std.Build) void {
         run_gen.addArg("."); // project root
         run_gen.addArg("zig-out/lib/_native.py"); // output path (same pattern as .so)
 
-        // Format the generated file with ruff (auto-generated code, use defaults + line-length)
-        const format_cmd = b.addSystemCommand(&.{
-            "uvx", "ruff", "format", "--line-length", "100", "zig-out/lib/_native.py",
-        });
-        format_cmd.step.dependOn(&run_gen.step);
+        var release_gen_step: *std.Build.Step = &run_gen.step;
+        var gen_post_step: *std.Build.Step = &run_gen.step;
 
-        // Copy generated _native.py to Python package (best-effort: dir may not exist in sdist builds)
-        const copy_native = b.addSystemCommand(&.{
-            "sh", "-c", "[ -d bindings/python/talu ] && cp zig-out/lib/_native.py bindings/python/talu/_native.py || true",
-        });
-        copy_native.step.dependOn(&format_cmd.step);
+        if (builtin.os.tag == .windows) {
+            if (b.findProgram(&.{"uvx"}, &.{})) |_| {
+                const format_cmd = b.addSystemCommand(&.{
+                    "uvx", "ruff", "format", "--line-length", "100", "zig-out/lib/_native.py",
+                });
+                format_cmd.step.dependOn(release_gen_step);
+                release_gen_step = &format_cmd.step;
+                gen_post_step = &format_cmd.step;
+            } else |_| {}
+        } else {
+            const format_cmd = b.addSystemCommand(&.{
+                "uvx", "ruff", "format", "--line-length", "100", "zig-out/lib/_native.py",
+            });
+            format_cmd.step.dependOn(release_gen_step);
+            release_gen_step = &format_cmd.step;
+            gen_post_step = &format_cmd.step;
+        }
+
+        const copy_native = if (builtin.os.tag == .windows)
+            b.addSystemCommand(&.{
+                "cmd",
+                "/c",
+                "if exist bindings\\python\\talu copy /Y zig-out\\lib\\_native.py bindings\\python\\talu\\_native.py >NUL",
+            })
+        else
+            b.addSystemCommand(&.{
+                "sh",
+                "-c",
+                "[ -d bindings/python/talu ] && cp zig-out/lib/_native.py bindings/python/talu/_native.py || true",
+            });
+        copy_native.step.dependOn(gen_post_step);
+        gen_post_step = &copy_native.step;
 
         const gen_step = b.step(
             "gen-bindings-python",
             "Generate Python ctypes bindings from C API",
         );
-        gen_step.dependOn(&copy_native.step);
+        gen_step.dependOn(gen_post_step);
 
         // Release step generates _native.py but skips the cp to bindings/python/
         // (build_hook.py handles that copy — the bindings dir doesn't exist in sdist builds)
-        release_step.dependOn(&format_cmd.step);
+        release_step.dependOn(release_gen_step);
     } else |_| {
         // gen_bindings module not present - skip
     }

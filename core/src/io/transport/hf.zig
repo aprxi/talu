@@ -258,7 +258,7 @@ fn getEffectiveEndpoint(config_endpoint: ?[]const u8) []const u8 {
         return endpoint;
     }
     // 2. Environment variable
-    if (std.posix.getenv("HF_ENDPOINT")) |env_endpoint| {
+    if (@import("env_pkg").getenv("HF_ENDPOINT")) |env_endpoint| {
         return std.mem.sliceTo(env_endpoint, 0);
     }
     // 3. Default
@@ -386,7 +386,13 @@ pub fn fetchModel(
     log.info("fetch", "Found files to download", .{ .count = repo_file_names.len });
 
     // Create cache directory structure
-    const cache_dir = cache.getModelCacheDir(allocator, model_id) catch return DownloadError.OutOfMemory;
+    const cache_dir = cache.getModelCacheDir(allocator, model_id) catch |err| switch (err) {
+        error.OutOfMemory => return DownloadError.OutOfMemory,
+        error.NoHomeDir => {
+            error_context.setContext("HOME/USERPROFILE/HOMEDRIVE+HOMEPATH not set", .{});
+            return DownloadError.Unexpected;
+        },
+    };
     defer allocator.free(cache_dir);
 
     // Use a fixed snapshot hash for simplicity
@@ -558,8 +564,13 @@ pub fn fetchFile(
         return DownloadError.InvalidModelId;
     }
 
-    const cache_dir = cache.getModelCacheDir(allocator, model_id) catch
-        return DownloadError.OutOfMemory;
+    const cache_dir = cache.getModelCacheDir(allocator, model_id) catch |err| switch (err) {
+        error.OutOfMemory => return DownloadError.OutOfMemory,
+        error.NoHomeDir => {
+            error_context.setContext("HOME/USERPROFILE/HOMEDRIVE+HOMEPATH not set", .{});
+            return DownloadError.Unexpected;
+        },
+    };
     defer allocator.free(cache_dir);
 
     const snapshot_revision = "main";

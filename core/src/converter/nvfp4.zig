@@ -818,11 +818,11 @@ fn augmentWithPackedNvfp4Companions(
 }
 
 fn resolveNvfp4ConvertThreads() usize {
-    if (std.posix.getenv("TALU_CONVERT_THREADS")) |raw| {
+    if (@import("env_pkg").getenv("TALU_CONVERT_THREADS")) |raw| {
         const parsed = std.fmt.parseInt(usize, raw, 10) catch null;
         if (parsed) |value| if (value > 0) return value;
     }
-    if (std.posix.getenv("THREADS")) |raw| {
+    if (@import("env_pkg").getenv("THREADS")) |raw| {
         const parsed = std.fmt.parseInt(usize, raw, 10) catch null;
         if (parsed) |value| if (value > 0) return value;
     }
@@ -830,7 +830,7 @@ fn resolveNvfp4ConvertThreads() usize {
 }
 
 fn resolveNvfp4BlockScaleCacheMaxBlocks() usize {
-    if (std.posix.getenv("TALU_NVFP4_BLOCK_SCALE_CACHE_MAX_BLOCKS")) |raw| {
+    if (@import("env_pkg").getenv("TALU_NVFP4_BLOCK_SCALE_CACHE_MAX_BLOCKS")) |raw| {
         const parsed = std.fmt.parseInt(usize, raw, 10) catch null;
         if (parsed) |value| if (value > 0) return value;
     }
@@ -864,7 +864,7 @@ fn mixedPreserveScoreSampleBlocks(profile: @TypeOf((grouped_affine.ConvertOption
 }
 
 fn resolveNvfp4MixedPreserveBlocksOverride() ?u32 {
-    const raw = std.posix.getenv("TALU_NVFP4_MIXED_PRESERVE_BLOCKS") orelse return null;
+    const raw = @import("env_pkg").getenv("TALU_NVFP4_MIXED_PRESERVE_BLOCKS") orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     const parsed = std.fmt.parseInt(u32, trimmed, 10) catch {
@@ -877,7 +877,7 @@ fn resolveNvfp4MixedPreserveBlocksOverride() ?u32 {
 }
 
 fn resolveNvfp4PreserveFormat() Nvfp4PreserveFormat {
-    const raw = std.posix.getenv("TALU_NVFP4_PRESERVE_FORMAT") orelse return .bf16;
+    const raw = @import("env_pkg").getenv("TALU_NVFP4_PRESERVE_FORMAT") orelse return .bf16;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return .bf16;
     if (std.ascii.eqlIgnoreCase(trimmed, "bf16")) return .bf16;
@@ -896,7 +896,7 @@ fn nvfp4PreserveFormatName(format: Nvfp4PreserveFormat) []const u8 {
 }
 
 fn parseOptionalBoolEnv(name: []const u8) ?bool {
-    const raw = std.posix.getenv(name) orelse return null;
+    const raw = @import("env_pkg").getenv(name) orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(trimmed, "1")) return true;
@@ -938,7 +938,7 @@ fn resolveNvfp4ReplayPolicy(profile: @TypeOf((grouped_affine.ConvertOptions{}).p
     const default_policy: Nvfp4ReplayPolicy = switch (profile) {
         .good, .best, .custom => .proxy_only,
     };
-    const raw = std.posix.getenv("TALU_NVFP4_REPLAY_POLICY") orelse return default_policy;
+    const raw = @import("env_pkg").getenv("TALU_NVFP4_REPLAY_POLICY") orelse return default_policy;
     const parsed = parseNvfp4ReplayPolicyEnv(raw) orelse {
         log.warn("convert", "Invalid TALU_NVFP4_REPLAY_POLICY; using default", .{
             .value = raw,
@@ -977,7 +977,7 @@ fn resolveNvfp4SmallModelPreserveEnabled(
 }
 
 fn parsePositiveF32Env(name: []const u8) ?f32 {
-    const raw = std.posix.getenv(name) orelse return null;
+    const raw = @import("env_pkg").getenv(name) orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     const parsed = std.fmt.parseFloat(f32, trimmed) catch return null;
@@ -996,7 +996,7 @@ fn resolveNvfp4CustomScaleRefineMultiplier(profile: @TypeOf((grouped_affine.Conv
 }
 
 fn resolveNvfp4MetalPackMinBlocks() usize {
-    const raw = std.posix.getenv("TALU_NVFP4_METAL_MIN_BLOCKS") orelse return nvfp4_metal_pack_min_blocks_default;
+    const raw = @import("env_pkg").getenv("TALU_NVFP4_METAL_MIN_BLOCKS") orelse return nvfp4_metal_pack_min_blocks_default;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return nvfp4_metal_pack_min_blocks_default;
     return parsed;
 }
@@ -2535,7 +2535,7 @@ fn evaluateNvfp4ForwardReplayMseMetal(
 }
 
 fn envFlagEnabled(name: []const u8) bool {
-    const raw = std.posix.getenv(name) orelse return false;
+    const raw = @import("env_pkg").getenv(name) orelse return false;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return false;
     if (std.ascii.eqlIgnoreCase(trimmed, "0")) return false;
@@ -2546,19 +2546,19 @@ fn envFlagEnabled(name: []const u8) bool {
 }
 
 fn shouldEnableNvfp4MetalReplay() bool {
-    if (std.posix.getenv("TALU_NVFP4_METAL_REPLAY")) |_| {
+    if (@import("env_pkg").getenv("TALU_NVFP4_METAL_REPLAY")) |_| {
         return envFlagEnabled("TALU_NVFP4_METAL_REPLAY");
     }
-    const backend_raw = std.posix.getenv("BACKEND") orelse return false;
+    const backend_raw = @import("env_pkg").getenv("BACKEND") orelse return false;
     return std.ascii.eqlIgnoreCase(backend_raw, "metal");
 }
 
 fn shouldEnableNvfp4MetalPack() bool {
     if (!has_metal_gpu_eval) return false;
-    if (std.posix.getenv("TALU_NVFP4_METAL_PACK")) |_| {
+    if (@import("env_pkg").getenv("TALU_NVFP4_METAL_PACK")) |_| {
         if (!envFlagEnabled("TALU_NVFP4_METAL_PACK")) return false;
     }
-    const backend_raw = std.posix.getenv("BACKEND") orelse return true;
+    const backend_raw = @import("env_pkg").getenv("BACKEND") orelse return true;
     if (std.ascii.eqlIgnoreCase(backend_raw, "cpu")) return false;
     if (std.ascii.eqlIgnoreCase(backend_raw, "cuda")) return false;
     if (backend_raw.len == 0) return true;
@@ -2623,7 +2623,7 @@ fn ensureMlxMetallibColocatedForNvfp4() void {
         (std.fmt.bufPrint(&cand2_buf, "{s}/../lib/mlx.metallib", .{exe_dir}) catch "")
     else
         "";
-    const candidate_env = std.posix.getenv("MLX_METALLIB") orelse "";
+    const candidate_env = @import("env_pkg").getenv("MLX_METALLIB") orelse "";
 
     const candidates = [_][]const u8{
         candidate_env,
@@ -2652,7 +2652,7 @@ fn ensureMlxMetallibForNvfp4Replay(allocator: std.mem.Allocator) bool {
         .unknown => {},
     }
 
-    if (std.posix.getenv("MLX_METALLIB")) |configured| {
+    if (@import("env_pkg").getenv("MLX_METALLIB")) |configured| {
         if (pathExists(configured)) {
             mlx_metallib_status.store(@intFromEnum(MlxMetallibStatus.ready), .release);
             return true;
@@ -3493,13 +3493,13 @@ fn shouldUseNvfp4MetalPack(
 
     ensureMlxMetallibColocatedForNvfp4();
     if (!ensureMlxMetallibForNvfp4Replay(allocator)) {
-        if (std.posix.getenv("BACKEND")) |raw| {
+        if (@import("env_pkg").getenv("BACKEND")) |raw| {
             if (std.ascii.eqlIgnoreCase(raw, "metal")) return error.InvalidConfig;
         }
         return false;
     }
     if (!compute.metal.isAvailable()) {
-        if (std.posix.getenv("BACKEND")) |raw| {
+        if (@import("env_pkg").getenv("BACKEND")) |raw| {
             if (std.ascii.eqlIgnoreCase(raw, "metal")) return error.InvalidConfig;
         }
         return false;
@@ -5595,7 +5595,7 @@ fn packDenseWeightToNvfp4(
 
 fn shouldUseMetalBlockScaleCollection() bool {
     if (!shouldEnableNvfp4MetalPack()) return false;
-    if (std.posix.getenv("TALU_NVFP4_METAL_BLOCK_SCALES")) |raw| {
+    if (@import("env_pkg").getenv("TALU_NVFP4_METAL_BLOCK_SCALES")) |raw| {
         return !std.mem.eql(u8, raw, "0");
     }
     return true;
