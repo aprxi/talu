@@ -154,6 +154,11 @@ pub fn stat(path: []const u8) !StatResult {
                 .created_at = 0,
             };
         },
+        error.IsDir => blk: {
+            var dir = try std.fs.cwd().openDir(path, .{});
+            defer dir.close();
+            break :blk try dir.stat();
+        },
         else => return err,
     };
 
@@ -492,6 +497,21 @@ test "stat returns metadata for existing file" {
     try std.testing.expect(result.is_file);
     try std.testing.expect(!result.is_dir);
     try std.testing.expectEqual(@as(u64, 3), result.size);
+}
+
+test "stat returns metadata for existing directory" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("core");
+    const path = try tmp.dir.realpathAlloc(allocator, "core");
+    defer allocator.free(path);
+
+    const result = try stat(path);
+    try std.testing.expect(result.exists);
+    try std.testing.expect(!result.is_file);
+    try std.testing.expect(result.is_dir);
 }
 
 test "listDir lists files with glob and limit" {
