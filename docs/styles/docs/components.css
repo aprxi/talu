@@ -3,8 +3,7 @@
    Tables, API reference, theme selector overrides
    ============================================================================= */
 
-/* Tables — shared markdown.css provides .markdown-body table base styles.
-   Docs-specific table overrides (td color) are in docs/typography.css. */
+/* Docs-specific table overrides (td color) are in docs/typography.css. */
 
 /* =============================================================================
    Dark/Light Mode Toggle

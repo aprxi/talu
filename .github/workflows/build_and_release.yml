@@ -138,12 +138,6 @@ jobs:
             | tar -xJ -C /tmp
           sudo /tmp/rust-${RUST_VERSION}-${RUST_TARGET}/install.sh --prefix=/usr/local --disable-ldconfig
 
-      - name: Install bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Build UI
-        run: make ui
-
       # Python wheel build
       - name: Install uv
         if: env.RELEASE_TYPE == 'python'
@@ -175,9 +169,6 @@ jobs:
           mkdir -p bindings/python/vendor/talu/bindings
           cp -r core build.zig VERSION Makefile ports bindings/python/vendor/talu/
           cp -r bindings/rust bindings/python/vendor/talu/bindings/
-          # Include pre-built UI assets so wheel build bundles the console UI
-          mkdir -p bindings/python/vendor/talu/ui
-          cp -r ui/dist bindings/python/vendor/talu/ui/
 
           # Update vendor VERSION files with correct formats
           # VERSION (SemVer) - used by Zig build.zig

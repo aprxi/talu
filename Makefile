@@ -1,12 +1,13 @@
-.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build gen-bindings-python ui
+.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build gen-bindings-python
 
 WINDOWS := $(filter Windows_NT,$(OS))
 CURDIR_POSIX := $(subst \,/,$(CURDIR))
 WINDOWS_GIT_ROOT_NATIVE := $(ProgramFiles)\Git
-WINDOWS_CMAKE_EXE := $(strip $(shell powershell -NoProfile -ExecutionPolicy Bypass -File "$(CURDIR)\ports\windows\find-cmake.ps1"))
+WINDOWS_CMAKE_EXE :=
 WINDOWS_LOCAL_ZIG := $(CURDIR_POSIX)/.tools/zig-x86_64-windows-0.15.2/zig.exe
 
 ifeq ($(WINDOWS),Windows_NT)
+WINDOWS_CMAKE_EXE := $(strip $(shell powershell -NoProfile -ExecutionPolicy Bypass -File "$(CURDIR)\ports\windows\find-cmake.ps1"))
 export PATH := $(WINDOWS_GIT_ROOT_NATIVE)\usr\bin;$(WINDOWS_GIT_ROOT_NATIVE)\bin;$(WINDOWS_GIT_ROOT_NATIVE)\cmd;$(PATH)
 SHELL := sh.exe
 UNAME_S := Windows
@@ -321,16 +322,16 @@ else
 endif
 	@cd deps/curl/build && "$(CMAKE)" --build . --config Release -j$(BUILD_JOBS)
 
-build: deps sync-version ui
+build: deps sync-version
 	$(ZIG) build release $(ZIG_BUILD_FLAGS)
 
-core: deps sync-version ui
+core: deps sync-version
 	$(ZIG) build core $(ZIG_BUILD_FLAGS)
 
 inference: deps sync-version
 	$(ZIG) build inference $(ZIG_BUILD_FLAGS)
 
-cuda: deps sync-version ui
+cuda: deps sync-version
 	@if [ -z "$(CUDA_NVCC)" ]; then \
 		echo "Error: nvcc not found. Install CUDA toolkit or add nvcc to PATH." >&2; \
 		exit 1; \
@@ -356,13 +357,6 @@ test: deps
 	TALU_LOG_LEVEL=off $(ZIG) build test-integration $(ZIG_BUILD_FLAGS)
 	./core/tests/check_signal_tests.sh
 
-ui:
-	@if [ -d ui ]; then \
-		echo "Skipping ui build: ui/ exists but no UI build step is defined in this Makefile."; \
-	else \
-		echo "Skipping ui build: ui/ not present in this checkout."; \
-	fi
-
 docs:
 	cd docs && uv run python scripts/build.py
 
@@ -375,7 +369,6 @@ clean:
 	rm -rf deps/curl/build
 	rm -rf deps/mlx-src/build
 	rm -rf deps/mbedtls/build
-	rm -rf ui/node_modules ui/dist
 
 clean-deps:
 	rm -rf deps/

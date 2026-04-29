@@ -49,7 +49,7 @@ build-backend = "hatchling.build"
 path = "talu/_version.py"
 
 [tool.hatch.build]
-artifacts = ["talu/*.so", "talu/*.dylib", "talu/*.dll", "talu/*.metallib", "vendor/talu/ui/dist/"]
+artifacts = ["talu/*.so", "talu/*.dylib", "talu/*.dll", "talu/*.metallib"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["talu"]

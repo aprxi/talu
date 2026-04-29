@@ -21,7 +21,7 @@ docs/
 │       ├── quickstart.html
 │       └── supported-models.html
 ├── styles/                 # Docs-specific CSS overrides only
-│   └── docs/               # Layered on top of ui/src/styles shared base
+│   └── docs/               # Docs CSS source files
 ├── js/                     # Hand-authored JavaScript
 │   └── nav.js
 ├── scripts/

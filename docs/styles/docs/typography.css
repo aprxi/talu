@@ -1,6 +1,5 @@
 /* =============================================================================
    Docs Typography (docs-specific overrides)
-   Base typography comes from shared markdown.css (.markdown-body)
    ============================================================================= */
 
 /* Docs body copy is driven by --text-muted so theme editor changes

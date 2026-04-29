@@ -48,7 +48,7 @@
 .guide-header-spaced { margin-top: 0.75rem; }
 .guide-detail-spaced { margin-top: 0.5rem; }
 
-/* Quickstart cards (extends shared .card-grid / .card) */
+/* Quickstart cards */
 .quickstart-section { margin-top: 2rem; }
 .quickstart-cards { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 0.75rem; }
 .quickstart-card { padding: 0.75rem 1rem; text-decoration: none; }
@@ -108,8 +108,6 @@
    ----------------------------------------------------------------------------- */
 
 .subtitle { color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.9rem; }
-
-/* .note/.note-label styles are in shared components.css */
 
 /* Build panels (toggled by .platform-tabs) */
 .build-panel { display: none; margin-top: 0.75rem; }
@@ -173,7 +171,7 @@
    Examples Pages
    ----------------------------------------------------------------------------- */
 
-/* Examples index - 2-column grid (extends shared .card-grid / .card) */
+/* Examples index - 2-column grid */
 .examples-grid {
   grid-template-columns: repeat(2, 1fr);
   gap: 1.25rem;
