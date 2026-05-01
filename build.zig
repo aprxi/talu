@@ -1333,7 +1333,6 @@ pub fn build(b: *std.Build) void {
         \\  inference-cpu
         \\  inference-metal
         \\  inference-cuda
-        \\  collab
         \\
         \\Example: zig build test-io -Drelease
         \\
@@ -1432,13 +1431,6 @@ pub fn build(b: *std.Build) void {
     });
     ut.addLazy("inference-cuda", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.cuda",
-    });
-    ut.addLazy("collab", b.path("core/src/lib_dev.zig"), &.{
-        "collab",
-        "ResourceStore",
-        "SessionStore",
-        "LamportClock",
-        "TextCrdt",
     });
     ut.addLazy("train", b.path("core/src/lib_dev.zig"), &.{
         "GradTensor",

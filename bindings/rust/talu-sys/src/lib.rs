@@ -181,6 +181,26 @@ impl From<i32> for BackendType {
     }
 }
 
+/// Source: core/src/capi/agent/root.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CProcessDenyReason {
+    None = 0,
+    Action = 1,
+    Cwd = 2,
+}
+
+impl From<i32> for CProcessDenyReason {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => CProcessDenyReason::None,
+            1 => CProcessDenyReason::Action,
+            2 => CProcessDenyReason::Cwd,
+            _ => CProcessDenyReason::Cwd,
+        }
+    }
+}
+
 /// Source: core/src/capi/error_codes.zig
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -398,6 +418,24 @@ impl From<u8> for ActivationRole {
     }
 }
 
+/// Source: core/src/capi/agent/runtime.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TaluAgentRuntimeMode {
+    Host = 0,
+    Strict = 1,
+}
+
+impl From<i32> for TaluAgentRuntimeMode {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => TaluAgentRuntimeMode::Host,
+            1 => TaluAgentRuntimeMode::Strict,
+            _ => TaluAgentRuntimeMode::Strict,
+        }
+    }
+}
+
 /// Source: core/src/converter/scheme.zig
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -414,6 +452,26 @@ impl From<u32> for QuantLevel {
             1 => QuantLevel::Q8,
             2 => QuantLevel::Q16,
             _ => QuantLevel::Q16,
+        }
+    }
+}
+
+/// Source: core/src/capi/agent/runtime.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TaluSandboxBackend {
+    LinuxLocal = 0,
+    Oci = 1,
+    AppleContainer = 2,
+}
+
+impl From<i32> for TaluSandboxBackend {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => TaluSandboxBackend::LinuxLocal,
+            1 => TaluSandboxBackend::Oci,
+            2 => TaluSandboxBackend::AppleContainer,
+            _ => TaluSandboxBackend::AppleContainer,
         }
     }
 }
@@ -618,6 +676,31 @@ impl Default for TokenizeResult {
     }
 }
 
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabValue {
+    pub data: *const u8,
+    pub len: usize,
+    pub updated_at_ms: i64,
+    pub found: bool,
+    pub _reserved: [u8; 7],
+    pub _arena: *mut c_void,
+}
+
+impl Default for CCollabValue {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null(),
+            len: 0,
+            updated_at_ms: 0,
+            found: false,
+            _reserved: [0; 7],
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// Source: core/src/capi/router.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -743,6 +826,35 @@ impl Default for EncodeResult {
             special_tokens_mask: std::ptr::null_mut(),
             num_tokens: 0,
             error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabHistoryEntry {
+    pub actor_id: *const c_char,
+    pub actor_seq: u64,
+    pub op_id: *const c_char,
+    pub payload: *const u8,
+    pub payload_len: usize,
+    pub updated_at_ms: i64,
+    pub key: *const c_char,
+    pub _reserved: [u8; 8],
+}
+
+impl Default for CCollabHistoryEntry {
+    fn default() -> Self {
+        Self {
+            actor_id: std::ptr::null(),
+            actor_seq: 0,
+            op_id: std::ptr::null(),
+            payload: std::ptr::null(),
+            payload_len: 0,
+            updated_at_ms: 0,
+            key: std::ptr::null(),
+            _reserved: [0; 8],
         }
     }
 }
@@ -903,6 +1015,27 @@ impl Default for ModelInfo {
             num_experts: 0,
             experts_per_token: 0,
             error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DownloadQueueOptions {
+    pub token: *const c_char,
+    pub force: bool,
+    pub endpoint_url: *const c_char,
+    pub skip_weights: bool,
+}
+
+impl Default for DownloadQueueOptions {
+    fn default() -> Self {
+        Self {
+            token: std::ptr::null(),
+            force: false,
+            endpoint_url: std::ptr::null(),
+            skip_weights: false,
         }
     }
 }
@@ -1380,6 +1513,39 @@ impl Default for BatchEncodeResult {
     }
 }
 
+/// Source: core/src/capi/agent/runtime.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TaluCapabilityReport {
+    pub kernel_version_ok: bool,
+    pub kernel_version_major: u32,
+    pub kernel_version_minor: u32,
+    pub landlock_available: bool,
+    pub landlock_abi_version: u8,
+    pub user_ns_available: bool,
+    pub seccomp_available: bool,
+    pub cgroupv2_available: bool,
+    pub cgroupv2_writable: bool,
+    pub probes_passed: bool,
+}
+
+impl Default for TaluCapabilityReport {
+    fn default() -> Self {
+        Self {
+            kernel_version_ok: false,
+            kernel_version_major: 0,
+            kernel_version_minor: 0,
+            landlock_available: false,
+            landlock_abi_version: 0,
+            user_ns_available: false,
+            seccomp_available: false,
+            cgroupv2_available: false,
+            cgroupv2_writable: false,
+            probes_passed: false,
+        }
+    }
+}
+
 /// Source: core/src/router/capi_bridge.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1453,6 +1619,33 @@ impl Default for CGenerateConfig {
     }
 }
 
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabSession {
+    pub namespace: *const c_char,
+    pub participant_id: *const c_char,
+    pub participant_kind: u8,
+    pub _flags_reserved: [u8; 7],
+    pub status: *const c_char,
+    pub _reserved: [u8; 8],
+    pub _arena: *mut c_void,
+}
+
+impl Default for CCollabSession {
+    fn default() -> Self {
+        Self {
+            namespace: std::ptr::null(),
+            participant_id: std::ptr::null(),
+            participant_kind: 0,
+            _flags_reserved: [0; 7],
+            status: std::ptr::null(),
+            _reserved: [0; 8],
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1476,6 +1669,27 @@ impl Default for SamplingParams {
             min_p: 0.0,
             repetition_penalty: 1.0,
             seed: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabOpResult {
+    pub op_key: *const c_char,
+    pub accepted: bool,
+    pub _flags_reserved: [u8; 7],
+    pub _arena: *mut c_void,
+}
+
+impl Default for CCollabOpResult {
+    fn default() -> Self {
+        Self {
+            op_key: std::ptr::null(),
+            accepted: false,
+            _flags_reserved: [0; 7],
+            _arena: std::ptr::null_mut(),
         }
     }
 }
@@ -1522,6 +1736,35 @@ impl Default for CBatchResult {
 #[derive(Copy, Clone)]
 pub union BackendUnion {
     pub local: LocalConfig,
+}
+
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabSummary {
+    pub namespace: *const c_char,
+    pub meta_json: *const c_char,
+    pub total_live_entries: usize,
+    pub batched_pending: usize,
+    pub ephemeral_live_entries: usize,
+    pub watch_published: u64,
+    pub _reserved: [u8; 8],
+    pub _arena: *mut c_void,
+}
+
+impl Default for CCollabSummary {
+    fn default() -> Self {
+        Self {
+            namespace: std::ptr::null(),
+            meta_json: std::ptr::null(),
+            total_live_entries: 0,
+            batched_pending: 0,
+            ephemeral_live_entries: 0,
+            watch_published: 0,
+            _reserved: [0; 8],
+            _arena: std::ptr::null_mut(),
+        }
+    }
 }
 
 /// Source: core/src/capi/validate.zig
@@ -1687,6 +1930,37 @@ impl Default for CToolCallRef {
     }
 }
 
+/// Source: core/src/capi/agent/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TaluFsStat {
+    pub exists: bool,
+    pub is_file: bool,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub mode: u32,
+    pub modified_at: i64,
+    pub created_at: i64,
+    pub _reserved: [u8; 32],
+}
+
+impl Default for TaluFsStat {
+    fn default() -> Self {
+        Self {
+            exists: false,
+            is_file: false,
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            modified_at: 0,
+            created_at: 0,
+            _reserved: [0; 32],
+        }
+    }
+}
+
 /// Source: core/src/router/capi_bridge.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1708,6 +1982,41 @@ impl Default for GenerateContentPart {
     }
 }
 
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabWatchEvent {
+    pub seq: u64,
+    pub event_type: u8,
+    pub durability_class: u8,
+    pub has_durability: bool,
+    pub ttl_ms: u64,
+    pub has_ttl: bool,
+    pub _flags_reserved: [u8; 6],
+    pub key: *const c_char,
+    pub value_len: usize,
+    pub updated_at_ms: i64,
+    pub _reserved: [u8; 8],
+}
+
+impl Default for CCollabWatchEvent {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            event_type: 0,
+            durability_class: 0,
+            has_durability: false,
+            ttl_ms: 0,
+            has_ttl: false,
+            _flags_reserved: [0; 6],
+            key: std::ptr::null(),
+            value_len: 0,
+            updated_at_ms: 0,
+            _reserved: [0; 8],
+        }
+    }
+}
+
 /// Source: core/src/capi/validate.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1723,6 +2032,48 @@ impl Default for SemanticValidationResultC {
             is_valid: false,
             path: std::ptr::null(),
             message: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabWatchBatch {
+    pub items: *mut CCollabWatchEvent,
+    pub count: usize,
+    pub lost: bool,
+    pub _flags_reserved: [u8; 7],
+    pub _arena: *mut c_void,
+}
+
+impl Default for CCollabWatchBatch {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            lost: false,
+            _flags_reserved: [0; 7],
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabHistoryList {
+    pub items: *mut CCollabHistoryEntry,
+    pub count: usize,
+    pub _arena: *mut c_void,
+}
+
+impl Default for CCollabHistoryList {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            _arena: std::ptr::null_mut(),
         }
     }
 }
@@ -1846,6 +2197,25 @@ impl Default for COutputSpan {
             end: 0,
             source_type: CSpanSourceType::from(0),
             variable_path: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabWatchWaitResult {
+    pub published_seq: u64,
+    pub timed_out: bool,
+    pub _flags_reserved: [u8; 7],
+}
+
+impl Default for CCollabWatchWaitResult {
+    fn default() -> Self {
+        Self {
+            published_seq: 0,
+            timed_out: false,
+            _flags_reserved: [0; 7],
         }
     }
 }
@@ -2229,6 +2599,73 @@ impl From<u8> for ItemStatus {
 // =============================================================================
 
 extern "C" {
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_action(
+        policy: *mut c_void,
+        action: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
+        resource: *const c_char,
+        timeout_ms: u64,
+        out_allowed: *mut c_void,
+        out_reason: *mut c_void,
+        out_reason_len: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_file(
+        policy: *mut c_void,
+        action: *const c_char,
+        resource: *const c_char,
+        is_dir: bool,
+        out_allowed: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_process(
+        policy: *mut c_void,
+        action: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
+        out_allowed: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_process_detailed(
+        policy: *mut c_void,
+        action: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
+        out_allowed: *mut c_void,
+        out_deny_reason: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_create(json: *const u8, len: usize, out_policy: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_free(policy: *mut c_void);
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_prepare_runtime(policy: *mut c_void, cwd: *const c_char) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_strict_emulation_decisions(
+        policy: *mut c_void,
+        cwd: *const c_char,
+        out_deny_descendant_exec: *mut c_void,
+        out_deny_write: *mut c_void,
+        out_allow_python_exec: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_validate_strict_emulation(policy: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_runtime_validate_strict(
+        policy: *mut c_void,
+        cwd: *const c_char,
+        sandbox_backend: c_int,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_runtime_validate_strict_ext(
+        sandbox_backend: c_int,
+        strict_required: bool,
+        run_probes: bool,
+        cwd: *const c_char,
+        out_report: *mut TaluCapabilityReport,
+    ) -> c_int;
     // core/src/capi/memory.zig
     pub fn talu_alloc_string(len: usize) -> *mut u8;
     // core/src/capi/session.zig
@@ -2418,6 +2855,100 @@ extern "C" {
     pub fn talu_clear_error();
     // core/src/capi/validate.zig
     pub fn talu_clear_response_format(chat_handle: *mut c_void);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_clear_snapshot(
+        handle: *mut c_void,
+        actor_id: *const c_char,
+        actor_kind: u8,
+        role: *const c_char,
+        op_kind: *const c_char,
+        out_result: *mut CCollabOpResult,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_free(handle: *mut c_void);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_free_history(history: *mut CCollabHistoryList);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_free_op_result(result: *mut CCollabOpResult);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_free_session(session: *mut CCollabSession);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_free_summary(summary: *mut CCollabSummary);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_free_value(value: *mut CCollabValue);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_free_watch_batch(batch: *mut CCollabWatchBatch);
+    // core/src/capi/collab.zig
+    pub fn talu_collab_get_history(
+        handle: *mut c_void,
+        after_key: *const c_char,
+        limit: usize,
+        out_history: *mut CCollabHistoryList,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_get_presence(
+        handle: *mut c_void,
+        participant_id: *const c_char,
+        out_value: *mut CCollabValue,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_get_snapshot(handle: *mut c_void, out_value: *mut CCollabValue) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_get_summary(handle: *mut c_void, out_summary: *mut CCollabSummary) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_init(
+        db_path: *const c_char,
+        resource_kind: *const c_char,
+        resource_id: *const c_char,
+        out_handle: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_open_session(
+        handle: *mut c_void,
+        participant_id: *const c_char,
+        participant_kind: u8,
+        role: *const c_char,
+        out_session: *mut CCollabSession,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_put_presence(
+        handle: *mut c_void,
+        participant_id: *const c_char,
+        payload: *const u8,
+        payload_len: usize,
+        ttl_ms: u64,
+        out_ttl_ms: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_submit_op(
+        handle: *mut c_void,
+        actor_id: *const c_char,
+        actor_seq: u64,
+        op_id: *const c_char,
+        payload: *const u8,
+        payload_len: usize,
+        issued_at_ms: i64,
+        has_issued_at_ms: bool,
+        snapshot: *const u8,
+        snapshot_len: usize,
+        has_snapshot: bool,
+        durability_class: u8,
+        out_result: *mut CCollabOpResult,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_watch_drain(
+        handle: *mut c_void,
+        after_seq: u64,
+        max_events: usize,
+        out_batch: *mut CCollabWatchBatch,
+    ) -> c_int;
+    // core/src/capi/collab.zig
+    pub fn talu_collab_watch_wait(
+        handle: *mut c_void,
+        after_seq: u64,
+        timeout_ms: u64,
+        out_result: *mut CCollabWatchWaitResult,
+    ) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_completions_validate_request(
         messages_json_ptr: *const u8,
@@ -2467,6 +2998,68 @@ extern "C" {
     pub fn talu_free_spans(spans: *mut COutputSpan, count: u32);
     // core/src/capi/memory.zig
     pub fn talu_free_string(ptr: *mut u8, len: usize);
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_create(
+        workspace_dir: *const c_char,
+        policy: *mut c_void,
+        out_handle: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_edit(
+        handle: *mut c_void,
+        path: *const c_char,
+        old_text: *const u8,
+        old_len: usize,
+        new_text: *const u8,
+        new_len: usize,
+        replace_all: bool,
+        out_replacements: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_free(handle: *mut c_void);
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_free_string(ptr: *const u8, len: usize);
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_list(
+        handle: *mut c_void,
+        path: *const c_char,
+        glob: *const c_char,
+        recursive: bool,
+        limit: usize,
+        out_json: *mut c_void,
+        out_json_len: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_mkdir(handle: *mut c_void, path: *const c_char, recursive: bool) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_read(
+        handle: *mut c_void,
+        path: *const c_char,
+        max_bytes: usize,
+        out_content: *mut c_void,
+        out_content_len: *mut c_void,
+        out_size: *mut c_void,
+        out_truncated: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_remove(handle: *mut c_void, path: *const c_char, recursive: bool) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_rename(handle: *mut c_void, from: *const c_char, to: *const c_char) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_stat(
+        handle: *mut c_void,
+        path: *const c_char,
+        out_stat: *mut TaluFsStat,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_write(
+        handle: *mut c_void,
+        path: *const c_char,
+        content: *const u8,
+        content_len: usize,
+        mkdir: bool,
+        out_bytes_written: *mut c_void,
+    ) -> c_int;
     // core/src/capi/template.zig
     pub fn talu_get_chat_template_source(
         model_path: *const c_char,
@@ -2502,10 +3095,58 @@ extern "C" {
         num_sequences: usize,
         padded_length: usize,
     );
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_alive(process_handle: *mut c_void) -> bool;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_close(process_handle: *mut c_void);
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_exit_code(
+        process_handle: *mut c_void,
+        out_code: *mut c_void,
+        out_has_code: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_open(
+        command: *const c_char,
+        cwd: *const c_char,
+        policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
+        out_process: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_read(
+        process_handle: *mut c_void,
+        buf: *mut u8,
+        buf_len: usize,
+        out_read: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_signal(process_handle: *mut c_void, sig: u8) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_write(process_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_cache_dir_exists(model_id: *const c_char) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_delete(model_id: *const c_char) -> c_int;
+    // core/src/capi/repository.zig
+    pub fn talu_repo_download_cancel(id: *const c_char) -> c_int;
+    // core/src/capi/repository.zig
+    pub fn talu_repo_download_cancel_all(out_affected: *mut c_void) -> c_int;
+    // core/src/capi/repository.zig
+    pub fn talu_repo_download_clear_finished(out_removed: *mut c_void) -> c_int;
+    // core/src/capi/repository.zig
+    pub fn talu_repo_download_enqueue(
+        model_id: *const c_char,
+        options: *const DownloadQueueOptions,
+        out_id: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/repository.zig
+    pub fn talu_repo_download_pause(id: *const c_char) -> c_int;
+    // core/src/capi/repository.zig
+    pub fn talu_repo_download_resume(id: *const c_char) -> c_int;
+    // core/src/capi/repository.zig
+    pub fn talu_repo_downloads_json(out_json: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_fetch(
         model_id: *const c_char,
@@ -2927,6 +3568,86 @@ extern "C" {
         prefix_token_ids: *const u32,
         prefix_token_ids_len: usize,
     ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_alive(shell_handle: *mut c_void) -> bool;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_check_command(
+        command: *const c_char,
+        out_allowed: *mut c_void,
+        out_reason: *mut c_void,
+        out_reason_len: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_close(shell_handle: *mut c_void);
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_default_policy_json(
+        out_json: *mut c_void,
+        out_json_len: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_exec(
+        command: *const c_char,
+        cwd: *const c_char,
+        policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
+        out_stdout: *mut c_void,
+        out_stdout_len: *mut c_void,
+        out_stderr: *mut c_void,
+        out_stderr_len: *mut c_void,
+        out_exit_code: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_exec_streaming(
+        command: *const c_char,
+        cwd: *const c_char,
+        policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
+        timeout_ms: u64,
+        on_stdout: *mut c_void,
+        on_stdout_ctx: *mut c_void,
+        on_stderr: *mut c_void,
+        on_stderr_ctx: *mut c_void,
+        out_exit_code: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_free_string(ptr: *const u8, len: usize);
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_normalize_command(
+        command: *const c_char,
+        out_normalized: *mut c_void,
+        out_normalized_len: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_open(
+        cols: u16,
+        rows: u16,
+        cwd: *const c_char,
+        policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
+        out_shell: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_read(
+        shell_handle: *mut c_void,
+        buf: *mut u8,
+        buf_len: usize,
+        out_read: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_resize(shell_handle: *mut c_void, cols: u16, rows: u16) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_scrollback(
+        shell_handle: *mut c_void,
+        out_data: *mut c_void,
+        out_len: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_signal(shell_handle: *mut c_void, sig: u8) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_write(shell_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
     // core/src/capi/error.zig
     pub fn talu_take_last_error(
         out_buf: *mut u8,

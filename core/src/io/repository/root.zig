@@ -68,6 +68,7 @@ pub const resolver = @import("resolver.zig");
 pub const ResolveOptions = resolver.ResolveOptions;
 pub const cache = @import("cache.zig");
 pub const talu_cache = @import("talu_cache.zig");
+pub const download_queue = @import("download_queue.zig");
 pub const scheme = @import("scheme.zig");
 pub const source = @import("source.zig");
 

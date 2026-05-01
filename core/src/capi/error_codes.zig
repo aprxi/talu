@@ -64,24 +64,6 @@ pub const ErrorCode = enum(i32) {
     session_not_found = 703, // Requested session does not exist
     tag_not_found = 704, // Requested tag does not exist
 
-    // Shell errors (800-899)
-    shell_command_denied = 800,
-    shell_exec_failed = 801,
-    shell_session_closed = 802,
-    shell_timeout = 803,
-    shell_process_exited = 804,
-    policy_denied_file_read = 805,
-    policy_denied_file_write = 806,
-    policy_denied_file_delete = 807,
-    policy_denied_exec = 808,
-    policy_denied_cwd = 809,
-    policy_invalid = 810,
-    policy_strict_unavailable = 811,
-    policy_strict_setup_failed = 812,
-    sandbox_detect_failed = 813,
-    sandbox_probe_failed = 814,
-    sandbox_cgroup_unavailable = 815,
-
     // System errors (900-999)
     out_of_memory = 900,
     invalid_argument = 901,
@@ -120,7 +102,6 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.DirNotEmpty => .io_not_empty,
         error.FileTooBig => .io_file_too_big,
         error.InvalidArgument => .invalid_argument,
-        error.AlreadyExists => .invalid_argument,
         error.IdempotencyConflict => .invalid_argument,
         error.ManifestGenerationConflict => .invalid_argument,
         error.InvalidHandle => .invalid_handle,
@@ -162,15 +143,6 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.TagNotFound => .tag_not_found,
         error.StorageForkFailed => .storage_error,
         error.InvalidTokenId => .tokenizer_invalid_token_id,
-        // Shell errors
-        error.SessionClosed => .shell_session_closed,
-        error.Timeout => .shell_timeout,
-        error.ProcessExited => .shell_process_exited,
-        error.StrictUnavailable => .policy_strict_unavailable,
-        error.StrictSetupFailed => .policy_strict_setup_failed,
-        error.SandboxDetectFailed => .sandbox_detect_failed,
-        error.SandboxProbeFailed => .sandbox_probe_failed,
-        error.SandboxCgroupUnavailable => .sandbox_cgroup_unavailable,
         // Image pipeline errors
         error.UnsupportedImageFormat => .convert_unsupported_format,
         error.ImageInputTooLarge,
@@ -209,9 +181,6 @@ test "ErrorCode: error codes are stable" {
     try std.testing.expectEqual(@as(i32, 900), @intFromEnum(ErrorCode.out_of_memory));
     try std.testing.expectEqual(@as(i32, 903), @intFromEnum(ErrorCode.ambiguous_backend));
     try std.testing.expectEqual(@as(i32, 904), @intFromEnum(ErrorCode.unsupported_abi_version));
-    try std.testing.expectEqual(@as(i32, 813), @intFromEnum(ErrorCode.sandbox_detect_failed));
-    try std.testing.expectEqual(@as(i32, 814), @intFromEnum(ErrorCode.sandbox_probe_failed));
-    try std.testing.expectEqual(@as(i32, 815), @intFromEnum(ErrorCode.sandbox_cgroup_unavailable));
     try std.testing.expectEqual(@as(i32, 1000), @intFromEnum(ErrorCode.train_invalid_state));
     try std.testing.expectEqual(@as(i32, 1010), @intFromEnum(ErrorCode.train_cancelled));
 }

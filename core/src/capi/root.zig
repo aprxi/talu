@@ -32,8 +32,6 @@ const scheduler = @import("scheduler.zig");
 const batch = @import("batch.zig");
 const train = @import("train.zig");
 const train_full = @import("train_full.zig");
-pub const agent_api = @import("agent/root.zig");
-pub const collab = @import("collab.zig");
 
 // Re-export Chat/session lifecycle APIs.
 pub const talu_chat_set_ttl_ts = responses.talu_chat_set_ttl_ts;

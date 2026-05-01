@@ -17,12 +17,8 @@ use tower_service::Service;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::server::agent::exec as agent_exec;
-use crate::server::agent::fs as agent_fs;
-use crate::server::agent::process as agent_process;
-use crate::server::agent::shell as agent_shell;
+use crate::server::admin_ui;
 use crate::server::auth_gateway::AuthContext;
-use crate::server::collab;
 use crate::server::completions;
 use crate::server::handlers;
 use crate::server::openapi;
@@ -38,8 +34,7 @@ const TALU_API_VERSION: &str = "v1";
 const TALU_VERSION: &str = env!("TALU_VERSION");
 const CORS_ALLOW_ORIGIN: &str = "*";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
-const CORS_ALLOW_HEADERS_DEFAULT: &str =
-    "authorization, content-type, x-talu-gateway-secret, x-talu-tenant-id, x-talu-group-id, x-talu-user-id";
+const CORS_ALLOW_HEADERS_DEFAULT: &str = "authorization, content-type, x-talu-gateway-secret, x-talu-tenant-id, x-talu-group-id, x-talu-user-id";
 const CORS_EXPOSE_HEADERS: &str = "x-talu-instance, x-talu-version, x-talu-api-version";
 const CORS_MAX_AGE_SECONDS: &str = "600";
 
@@ -96,8 +91,6 @@ static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
             "/v1/repo",
             "/v1/responses",
             "/v1/tokenizer",
-            "/v1/collab/",
-            "/v1/agent/",
         ],
     )
 });
@@ -115,17 +108,6 @@ static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
 static OPENAPI_TOKENIZER_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tokenizer"]));
-static OPENAPI_COLLAB_RESOURCES_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/resources/"]));
-static OPENAPI_AGENT_FS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/fs/"]));
-static OPENAPI_AGENT_EXEC_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/exec"]));
-static OPENAPI_AGENT_SHELL_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/shells"]));
-static OPENAPI_AGENT_PROCESS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/processes"]));
-
 static KNOWN_PATHS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut paths = HashSet::new();
     let parsed: Value = serde_json::from_slice(&OPENAPI_SPEC).unwrap_or(Value::Null);
@@ -180,402 +162,259 @@ impl Service<Request<Incoming>> for Router {
             log::debug!(target: "server::http", "{} {} (content-length={}, content-type={})",
                 method, path, content_length, content_type);
 
-            // Auth-exempt routes.
-            let response = if let Some(response) =
-                dispatch_public_collab_agent_docs(&method, path.as_str())
-            {
-                response
-            } else {
-                match (method.clone(), path.as_str()) {
-                    (Method::OPTIONS, _) => cors_preflight_response(&cors_request_headers),
-                    (Method::GET, "/health") => {
-                        Response::new(Full::new(Bytes::from_static(b"ok")).boxed())
-                    }
-                    (Method::GET, "/v1/health") => handle_health(state, req, None).await,
-                    (Method::GET, "/openapi.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/chat.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_CHAT_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/responses.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_RESPONSES_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/models.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_MODELS_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/repo.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_REPO_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/tokenizer.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_TOKENIZER_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/collab/resources.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_COLLAB_RESOURCES_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/agent/fs.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_AGENT_FS_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/agent/exec.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_AGENT_EXEC_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/agent/shell.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_AGENT_SHELL_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/openapi/agent/process.json") => Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(OPENAPI_AGENT_PROCESS_SPEC.clone())).boxed())
-                        .unwrap(),
-                    (Method::GET, "/docs") => docs_hub_response(),
-                    (Method::GET, "/docs/chat") => {
-                        swagger_ui_response("/openapi/chat.json", "Talu API :: Chat Completions")
-                    }
-                    (Method::GET, "/docs/responses") => {
-                        swagger_ui_response("/openapi/responses.json", "Talu API :: Responses")
-                    }
-                    (Method::GET, "/docs/models") => {
-                        swagger_ui_response("/openapi/models.json", "Talu API :: Models")
-                    }
-                    (Method::GET, "/docs/repo") => {
-                        swagger_ui_response("/openapi/repo.json", "Talu API :: Repository")
-                    }
-                    (Method::GET, "/docs/tokenizer") => {
-                        swagger_ui_response("/openapi/tokenizer.json", "Talu API :: Tokenizer")
-                    }
-                    (Method::GET, "/docs/collab/resources") => swagger_ui_response(
-                        "/openapi/collab/resources.json",
-                        "Talu API :: Collab::Resources",
-                    ),
-                    (Method::GET, "/docs/agent/fs") => {
-                        swagger_ui_response("/openapi/agent/fs.json", "Talu API :: Agent::FS")
-                    }
-                    (Method::GET, "/docs/agent/exec") => {
-                        swagger_ui_response("/openapi/agent/exec.json", "Talu API :: Agent::Exec")
-                    }
-                    (Method::GET, "/docs/agent/shell") => {
-                        swagger_ui_response("/openapi/agent/shell.json", "Talu API :: Agent::Shell")
-                    }
-                    (Method::GET, "/docs/agent/process") => swagger_ui_response(
-                        "/openapi/agent/process.json",
-                        "Talu API :: Agent::Process",
-                    ),
-                    _ => {
-                        // Authenticate all other routes.
-                        let auth = match authenticate(&state, req.headers()) {
-                            Ok(ctx) => ctx,
-                            Err(resp) => {
-                                let resp = with_cors(resp, &cors_request_headers);
-                                let status = resp.status();
-                                if status.is_client_error() {
-                                    log::warn!(target: "server::http", "{} {} -> {}", method_log, path_log, status);
-                                }
-                                return Ok(resp);
+            let response = match (method.clone(), path.as_str()) {
+                (Method::OPTIONS, _) => cors_preflight_response(&cors_request_headers),
+                (Method::GET, "/health") => {
+                    Response::new(Full::new(Bytes::from_static(b"ok")).boxed())
+                }
+                (Method::GET, "/") | (Method::GET, "/admin") => admin_ui_response(),
+                (Method::GET, "/v1/health") => handle_health(state, req, None).await,
+                (Method::GET, "/openapi.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/chat.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_CHAT_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/responses.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_RESPONSES_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/models.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_MODELS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/repo.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_REPO_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/tokenizer.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_TOKENIZER_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/docs") => docs_hub_response(),
+                (Method::GET, "/docs/chat") => {
+                    swagger_ui_response("/openapi/chat.json", "Talu API :: Chat Completions")
+                }
+                (Method::GET, "/docs/responses") => {
+                    swagger_ui_response("/openapi/responses.json", "Talu API :: Responses")
+                }
+                (Method::GET, "/docs/models") => {
+                    swagger_ui_response("/openapi/models.json", "Talu API :: Models")
+                }
+                (Method::GET, "/docs/repo") => {
+                    swagger_ui_response("/openapi/repo.json", "Talu API :: Repository")
+                }
+                (Method::GET, "/docs/tokenizer") => {
+                    swagger_ui_response("/openapi/tokenizer.json", "Talu API :: Tokenizer")
+                }
+                _ => {
+                    // Authenticate all other routes.
+                    let auth = match authenticate(&state, req.headers()) {
+                        Ok(ctx) => ctx,
+                        Err(resp) => {
+                            let resp = with_cors(resp, &cors_request_headers);
+                            let status = resp.status();
+                            if status.is_client_error() {
+                                log::warn!(target: "server::http", "{} {} -> {}", method_log, path_log, status);
                             }
-                        };
-
-                        match dispatch_authenticated_collab_agent_routes(
-                            state.clone(),
-                            req,
-                            auth.clone(),
-                            &method,
-                            path.as_str(),
-                        )
-                        .await
+                            return Ok(resp);
+                        }
+                    };
+                    match (method, path.as_str()) {
+                        (Method::GET, "/v1/models") => {
+                            handlers::handle_models(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/repo/models") | (Method::GET, "/repo/models") => {
+                            repo::handle_list(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/repo/search") | (Method::GET, "/repo/search") => {
+                            repo::handle_search(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/repo/stats") | (Method::GET, "/repo/stats") => {
+                            repo::handle_stats(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/repo/downloads") | (Method::GET, "/repo/downloads") => {
+                            repo::handle_downloads(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/repo/downloads")
+                        | (Method::POST, "/repo/downloads") => {
+                            repo::handle_download_enqueue(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/repo/downloads/clear/finished")
+                        | (Method::POST, "/repo/downloads/clear/finished") => {
+                            repo::handle_download_clear_finished(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/repo/downloads/cancel/all")
+                        | (Method::POST, "/repo/downloads/cancel/all") => {
+                            repo::handle_download_cancel_all(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.starts_with("/v1/repo/downloads/")
+                                || p.starts_with("/repo/downloads/") =>
                         {
-                            Ok(response) => response,
-                            Err(req) => match (method, path.as_str()) {
-                                (Method::GET, "/v1/models") => {
-                                    handlers::handle_models(state, req, auth).await
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/downloads/"
+                            } else {
+                                "/repo/downloads/"
+                            };
+                            let tail = &p[prefix.len()..];
+                            let Some((raw_id, action)) = tail.rsplit_once('/') else {
+                                return Ok(method_not_allowed(&["GET", "POST"]));
+                            };
+                            let id =
+                                percent_encoding::percent_decode_str(raw_id).decode_utf8_lossy();
+                            match action {
+                                "pause" => repo::handle_download_pause(state, req, auth, &id).await,
+                                "resume" => {
+                                    repo::handle_download_resume(state, req, auth, &id).await
                                 }
-                                (Method::GET, "/v1/repo/models")
-                                | (Method::GET, "/repo/models") => {
-                                    repo::handle_list(state, req, auth).await
+                                "cancel" => {
+                                    repo::handle_download_cancel(state, req, auth, &id).await
                                 }
-                                (Method::GET, "/v1/repo/search")
-                                | (Method::GET, "/repo/search") => {
-                                    repo::handle_search(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/repo/models")
-                                | (Method::POST, "/repo/models") => {
-                                    repo::handle_fetch(state, req, auth).await
-                                }
-                                (Method::GET, p)
-                                    if (p.starts_with("/v1/repo/models/")
-                                        || p.starts_with("/repo/models/"))
-                                        && p.ends_with("/files") =>
-                                {
-                                    let prefix = if p.starts_with("/v1") {
-                                        "/v1/repo/models/"
-                                    } else {
-                                        "/repo/models/"
-                                    };
-                                    let raw = &p[prefix.len()..p.len() - "/files".len()];
-                                    let model_id = percent_encoding::percent_decode_str(raw)
-                                        .decode_utf8_lossy();
-                                    repo::handle_list_files(state, req, auth, &model_id).await
-                                }
-                                (Method::DELETE, p)
-                                    if p.starts_with("/v1/repo/models/")
-                                        || p.starts_with("/repo/models/") =>
-                                {
-                                    let prefix = if p.starts_with("/v1") {
-                                        "/v1/repo/models/"
-                                    } else {
-                                        "/repo/models/"
-                                    };
-                                    let raw = &p[prefix.len()..];
-                                    let model_id = percent_encoding::percent_decode_str(raw)
-                                        .decode_utf8_lossy();
-                                    repo::handle_delete(state, req, auth, &model_id).await
-                                }
-                                (Method::POST, "/v1/responses") => {
-                                    responses::handle_create(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/chat/completions") => {
-                                    completions::handle_create(state, req, auth).await
-                                }
-                                (_, "/v1/models") => method_not_allowed(&["GET"]),
-                                (_, "/v1/repo/models") => method_not_allowed(&["GET", "POST"]),
-                                (_, "/repo/models") => method_not_allowed(&["GET", "POST"]),
-                                (_, "/v1/repo/search") => method_not_allowed(&["GET"]),
-                                (_, "/repo/search") => method_not_allowed(&["GET"]),
-                                (_, "/v1/responses") => method_not_allowed(&["POST"]),
-                                (_, "/v1/chat/completions") => method_not_allowed(&["POST"]),
-                                (Method::POST, p) if collab::is_collab_session_open_path(p) => {
-                                    collab::handle_open_session(state, req, auth).await
-                                }
-                                (Method::GET, p) if collab::is_collab_resource_root_path(p) => {
-                                    collab::handle_get_resource(state, req, auth).await
-                                }
-                                (Method::GET, p) if collab::is_collab_snapshot_path(p) => {
-                                    collab::handle_get_snapshot(state, req, auth).await
-                                }
-                                (Method::POST, p) if collab::is_collab_ops_path(p) => {
-                                    collab::handle_submit_op(state, req, auth).await
-                                }
-                                (Method::GET, p) if collab::is_collab_history_path(p) => {
-                                    collab::handle_get_history(state, req, auth).await
-                                }
-                                (Method::POST, p) if collab::is_collab_presence_path(p) => {
-                                    collab::handle_put_presence(state, req, auth).await
-                                }
-                                (Method::GET, p) if collab::is_collab_presence_path(p) => {
-                                    collab::handle_get_presence(state, req, auth).await
-                                }
-                                (Method::GET, p) if collab::is_collab_events_stream_path(p) => {
-                                    collab::handle_stream_events(state, req, auth).await
-                                }
-                                (Method::GET, p) if collab::is_collab_ws_path(p) => {
-                                    let is_ws = req
-                                        .headers()
-                                        .get("upgrade")
-                                        .and_then(|value| value.to_str().ok())
-                                        .map(|value| value.eq_ignore_ascii_case("websocket"))
-                                        .unwrap_or(false);
-                                    if !is_ws {
-                                        method_not_allowed(&["GET (websocket)"])
-                                    } else {
-                                        collab::handle_ws(state, req, auth).await
-                                    }
-                                }
-                                (Method::POST, "/v1/agent/fs/read") => {
-                                    agent_fs::handle_read(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/fs/write") => {
-                                    agent_fs::handle_write(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/fs/edit") => {
-                                    agent_fs::handle_edit(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/fs/stat") => {
-                                    agent_fs::handle_stat(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/fs/ls") => {
-                                    agent_fs::handle_list(state, req, auth).await
-                                }
-                                (Method::DELETE, "/v1/agent/fs/rm") => {
-                                    agent_fs::handle_remove(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/fs/mkdir") => {
-                                    agent_fs::handle_mkdir(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/fs/rename") => {
-                                    agent_fs::handle_rename(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/exec") => {
-                                    agent_exec::handle_exec(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/shells") => {
-                                    agent_shell::handle_create(state, req, auth).await
-                                }
-                                (Method::GET, "/v1/agent/shells") => {
-                                    agent_shell::handle_list(state, req, auth).await
-                                }
-                                (Method::GET, p)
-                                    if p.starts_with("/v1/agent/shells/") && p.ends_with("/ws") =>
-                                {
-                                    let is_ws = req
-                                        .headers()
-                                        .get("upgrade")
-                                        .and_then(|value| value.to_str().ok())
-                                        .map(|value| value.eq_ignore_ascii_case("websocket"))
-                                        .unwrap_or(false);
-                                    if !is_ws {
-                                        method_not_allowed(&["GET (websocket)"])
-                                    } else {
-                                        agent_shell::handle_ws(state, req, auth).await
-                                    }
-                                }
-                                (Method::GET, p) if p.starts_with("/v1/agent/shells/") => {
-                                    agent_shell::handle_get(state, req, auth).await
-                                }
-                                (Method::DELETE, p) if p.starts_with("/v1/agent/shells/") => {
-                                    agent_shell::handle_delete(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/agent/processes/spawn") => {
-                                    agent_process::handle_spawn(state, req, auth).await
-                                }
-                                (Method::GET, "/v1/agent/processes") => {
-                                    agent_process::handle_list(state, req, auth).await
-                                }
-                                (Method::POST, p)
-                                    if p.starts_with("/v1/agent/processes/")
-                                        && p.ends_with("/send") =>
-                                {
-                                    agent_process::handle_send(state, req, auth).await
-                                }
-                                (Method::GET, p)
-                                    if p.starts_with("/v1/agent/processes/")
-                                        && p.ends_with("/stream") =>
-                                {
-                                    agent_process::handle_stream(state, req, auth).await
-                                }
-                                (Method::GET, p)
-                                    if p.starts_with("/v1/agent/processes/")
-                                        && p.ends_with("/ws") =>
-                                {
-                                    let is_ws = req
-                                        .headers()
-                                        .get("upgrade")
-                                        .and_then(|value| value.to_str().ok())
-                                        .map(|value| value.eq_ignore_ascii_case("websocket"))
-                                        .unwrap_or(false);
-                                    if !is_ws {
-                                        method_not_allowed(&["GET (websocket)"])
-                                    } else {
-                                        agent_process::handle_ws(state, req, auth).await
-                                    }
-                                }
-                                (Method::DELETE, p) if p.starts_with("/v1/agent/processes/") => {
-                                    agent_process::handle_delete(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/instances") => {
-                                    tokenizer::handle_create_instance(state, req, auth).await
-                                }
-                                (Method::GET, p) if p.starts_with("/v1/tokenizer/instances/") => {
-                                    tokenizer::handle_get_instance(state, req, auth).await
-                                }
-                                (Method::DELETE, p)
-                                    if p.starts_with("/v1/tokenizer/instances/") =>
-                                {
-                                    tokenizer::handle_delete_instance(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/encode") => {
-                                    tokenizer::handle_encode(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/encode_batch") => {
-                                    tokenizer::handle_encode_batch(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/decode") => {
-                                    tokenizer::handle_decode(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/decode_batch") => {
-                                    tokenizer::handle_decode_batch(state, req, auth).await
-                                }
-                                (Method::GET, "/v1/tokenizer/vocab") => {
-                                    tokenizer::handle_vocab(state, req, auth).await
-                                }
-                                (Method::GET, "/v1/tokenizer/vocab_size") => {
-                                    tokenizer::handle_vocab_size(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/token_to_id") => {
-                                    tokenizer::handle_token_to_id(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/id_to_token") => {
-                                    tokenizer::handle_id_to_token(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/add_tokens") => {
-                                    tokenizer::handle_add_tokens(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/add_special_tokens") => {
-                                    tokenizer::handle_add_special_tokens(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/enable_truncation") => {
-                                    tokenizer::handle_enable_truncation(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/disable_truncation") => {
-                                    tokenizer::handle_disable_truncation(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/enable_padding") => {
-                                    tokenizer::handle_enable_padding(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/disable_padding") => {
-                                    tokenizer::handle_disable_padding(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/train") => {
-                                    tokenizer::handle_train(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/train_from_iterator") => {
-                                    tokenizer::handle_train_from_iterator(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/save") => {
-                                    tokenizer::handle_save(state, req, auth).await
-                                }
-                                (Method::POST, "/v1/tokenizer/compare") => {
-                                    tokenizer::handle_compare(state, req, auth).await
-                                }
-                                (Method::GET, "/v1/tokenizer/capabilities") => {
-                                    tokenizer::handle_capabilities(state, req, auth).await
-                                }
-                                _ => {
-                                    if is_known_path(&path) {
-                                        log::warn!(target: "server::http", "unimplemented endpoint: {} {}", method_log, path_log);
-                                        json_error(
-                                            StatusCode::NOT_IMPLEMENTED,
-                                            "not_implemented",
-                                            "Not implemented",
-                                        )
-                                    } else {
-                                        Response::builder()
-                                            .status(StatusCode::NOT_FOUND)
-                                            .body(
-                                                Full::new(Bytes::from_static(b"not found")).boxed(),
-                                            )
-                                            .unwrap()
-                                    }
-                                }
-                            },
+                                _ => method_not_allowed(&["POST"]),
+                            }
+                        }
+                        (Method::POST, "/v1/repo/models") | (Method::POST, "/repo/models") => {
+                            repo::handle_fetch(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/repo/models/")
+                                || p.starts_with("/repo/models/"))
+                                && p.ends_with("/files") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/models/"
+                            } else {
+                                "/repo/models/"
+                            };
+                            let raw = &p[prefix.len()..p.len() - "/files".len()];
+                            let model_id =
+                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+                            repo::handle_list_files(state, req, auth, &model_id).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/repo/models/")
+                                || p.starts_with("/repo/models/") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/models/"
+                            } else {
+                                "/repo/models/"
+                            };
+                            let raw = &p[prefix.len()..];
+                            let model_id =
+                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+                            repo::handle_delete(state, req, auth, &model_id).await
+                        }
+                        (Method::POST, "/v1/responses") => {
+                            responses::handle_create(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/chat/completions") => {
+                            completions::handle_create(state, req, auth).await
+                        }
+                        (_, "/v1/models") => method_not_allowed(&["GET"]),
+                        (_, "/v1/repo/models") => method_not_allowed(&["GET", "POST"]),
+                        (_, "/repo/models") => method_not_allowed(&["GET", "POST"]),
+                        (_, "/v1/repo/search") => method_not_allowed(&["GET"]),
+                        (_, "/repo/search") => method_not_allowed(&["GET"]),
+                        (_, "/v1/repo/stats") => method_not_allowed(&["GET"]),
+                        (_, "/repo/stats") => method_not_allowed(&["GET"]),
+                        (_, "/v1/repo/downloads") => method_not_allowed(&["GET", "POST"]),
+                        (_, "/repo/downloads") => method_not_allowed(&["GET", "POST"]),
+                        (_, "/v1/repo/downloads/clear/finished") => method_not_allowed(&["POST"]),
+                        (_, "/repo/downloads/clear/finished") => method_not_allowed(&["POST"]),
+                        (_, "/v1/repo/downloads/cancel/all") => method_not_allowed(&["POST"]),
+                        (_, "/repo/downloads/cancel/all") => method_not_allowed(&["POST"]),
+                        (_, "/v1/responses") => method_not_allowed(&["POST"]),
+                        (_, "/v1/chat/completions") => method_not_allowed(&["POST"]),
+                        (Method::POST, "/v1/tokenizer/instances") => {
+                            tokenizer::handle_create_instance(state, req, auth).await
+                        }
+                        (Method::GET, p) if p.starts_with("/v1/tokenizer/instances/") => {
+                            tokenizer::handle_get_instance(state, req, auth).await
+                        }
+                        (Method::DELETE, p) if p.starts_with("/v1/tokenizer/instances/") => {
+                            tokenizer::handle_delete_instance(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/encode") => {
+                            tokenizer::handle_encode(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/encode_batch") => {
+                            tokenizer::handle_encode_batch(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/decode") => {
+                            tokenizer::handle_decode(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/decode_batch") => {
+                            tokenizer::handle_decode_batch(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/tokenizer/vocab") => {
+                            tokenizer::handle_vocab(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/tokenizer/vocab_size") => {
+                            tokenizer::handle_vocab_size(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/token_to_id") => {
+                            tokenizer::handle_token_to_id(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/id_to_token") => {
+                            tokenizer::handle_id_to_token(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/add_tokens") => {
+                            tokenizer::handle_add_tokens(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/add_special_tokens") => {
+                            tokenizer::handle_add_special_tokens(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/enable_truncation") => {
+                            tokenizer::handle_enable_truncation(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/disable_truncation") => {
+                            tokenizer::handle_disable_truncation(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/enable_padding") => {
+                            tokenizer::handle_enable_padding(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/disable_padding") => {
+                            tokenizer::handle_disable_padding(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/train") => {
+                            tokenizer::handle_train(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/train_from_iterator") => {
+                            tokenizer::handle_train_from_iterator(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/save") => {
+                            tokenizer::handle_save(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/compare") => {
+                            tokenizer::handle_compare(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/tokenizer/capabilities") => {
+                            tokenizer::handle_capabilities(state, req, auth).await
+                        }
+                        _ => {
+                            if is_known_path(&path) {
+                                log::warn!(target: "server::http", "unimplemented endpoint: {} {}", method_log, path_log);
+                                json_error(
+                                    StatusCode::NOT_IMPLEMENTED,
+                                    "not_implemented",
+                                    "Not implemented",
+                                )
+                            } else {
+                                Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from_static(b"not found")).boxed())
+                                    .unwrap()
+                            }
                         }
                     }
                 }
@@ -592,205 +431,6 @@ impl Service<Request<Incoming>> for Router {
             Ok(response)
         })
     }
-}
-
-fn dispatch_public_collab_agent_docs(method: &Method, path: &str) -> Option<Response<BoxBody>> {
-    if *method != Method::GET {
-        return None;
-    }
-
-    match path {
-        "/openapi/collab/resources.json" => Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(OPENAPI_COLLAB_RESOURCES_SPEC.clone())).boxed())
-                .unwrap(),
-        ),
-        "/openapi/agent/fs.json" => Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(OPENAPI_AGENT_FS_SPEC.clone())).boxed())
-                .unwrap(),
-        ),
-        "/openapi/agent/exec.json" => Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(OPENAPI_AGENT_EXEC_SPEC.clone())).boxed())
-                .unwrap(),
-        ),
-        "/openapi/agent/shell.json" => Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(OPENAPI_AGENT_SHELL_SPEC.clone())).boxed())
-                .unwrap(),
-        ),
-        "/openapi/agent/process.json" => Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(OPENAPI_AGENT_PROCESS_SPEC.clone())).boxed())
-                .unwrap(),
-        ),
-        "/docs/collab/resources" => Some(swagger_ui_response(
-            "/openapi/collab/resources.json",
-            "Talu API :: Collab::Resources",
-        )),
-        "/docs/agent/fs" => Some(swagger_ui_response(
-            "/openapi/agent/fs.json",
-            "Talu API :: Agent::FS",
-        )),
-        "/docs/agent/exec" => Some(swagger_ui_response(
-            "/openapi/agent/exec.json",
-            "Talu API :: Agent::Exec",
-        )),
-        "/docs/agent/shell" => Some(swagger_ui_response(
-            "/openapi/agent/shell.json",
-            "Talu API :: Agent::Shell",
-        )),
-        "/docs/agent/process" => Some(swagger_ui_response(
-            "/openapi/agent/process.json",
-            "Talu API :: Agent::Process",
-        )),
-        _ => None,
-    }
-}
-
-async fn dispatch_authenticated_collab_agent_routes(
-    state: Arc<AppState>,
-    req: Request<Incoming>,
-    auth: Option<AuthContext>,
-    method: &Method,
-    path: &str,
-) -> Result<Response<BoxBody>, Request<Incoming>> {
-    if *method == Method::POST && collab::is_collab_session_open_path(path) {
-        return Ok(collab::handle_open_session(state, req, auth).await);
-    }
-    if *method == Method::GET && collab::is_collab_resource_root_path(path) {
-        return Ok(collab::handle_get_resource(state, req, auth).await);
-    }
-    if *method == Method::GET && collab::is_collab_snapshot_path(path) {
-        return Ok(collab::handle_get_snapshot(state, req, auth).await);
-    }
-    if *method == Method::POST && collab::is_collab_ops_path(path) {
-        return Ok(collab::handle_submit_op(state, req, auth).await);
-    }
-    if *method == Method::GET && collab::is_collab_history_path(path) {
-        return Ok(collab::handle_get_history(state, req, auth).await);
-    }
-    if *method == Method::POST && collab::is_collab_presence_path(path) {
-        return Ok(collab::handle_put_presence(state, req, auth).await);
-    }
-    if *method == Method::GET && collab::is_collab_presence_path(path) {
-        return Ok(collab::handle_get_presence(state, req, auth).await);
-    }
-    if *method == Method::GET && collab::is_collab_events_stream_path(path) {
-        return Ok(collab::handle_stream_events(state, req, auth).await);
-    }
-    if *method == Method::GET && collab::is_collab_ws_path(path) {
-        let is_ws = req
-            .headers()
-            .get("upgrade")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false);
-        return Ok(if !is_ws {
-            method_not_allowed(&["GET (websocket)"])
-        } else {
-            collab::handle_ws(state, req, auth).await
-        });
-    }
-    if *method == Method::POST && path == "/v1/agent/fs/read" {
-        return Ok(agent_fs::handle_read(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/fs/write" {
-        return Ok(agent_fs::handle_write(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/fs/edit" {
-        return Ok(agent_fs::handle_edit(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/fs/stat" {
-        return Ok(agent_fs::handle_stat(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/fs/ls" {
-        return Ok(agent_fs::handle_list(state, req, auth).await);
-    }
-    if *method == Method::DELETE && path == "/v1/agent/fs/rm" {
-        return Ok(agent_fs::handle_remove(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/fs/mkdir" {
-        return Ok(agent_fs::handle_mkdir(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/fs/rename" {
-        return Ok(agent_fs::handle_rename(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/exec" {
-        return Ok(agent_exec::handle_exec(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/shells" {
-        return Ok(agent_shell::handle_create(state, req, auth).await);
-    }
-    if *method == Method::GET && path == "/v1/agent/shells" {
-        return Ok(agent_shell::handle_list(state, req, auth).await);
-    }
-    if *method == Method::GET && path.starts_with("/v1/agent/shells/") && path.ends_with("/ws") {
-        let is_ws = req
-            .headers()
-            .get("upgrade")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false);
-        return Ok(if !is_ws {
-            method_not_allowed(&["GET (websocket)"])
-        } else {
-            agent_shell::handle_ws(state, req, auth).await
-        });
-    }
-    if *method == Method::GET && path.starts_with("/v1/agent/shells/") {
-        return Ok(agent_shell::handle_get(state, req, auth).await);
-    }
-    if *method == Method::DELETE && path.starts_with("/v1/agent/shells/") {
-        return Ok(agent_shell::handle_delete(state, req, auth).await);
-    }
-    if *method == Method::POST && path == "/v1/agent/processes/spawn" {
-        return Ok(agent_process::handle_spawn(state, req, auth).await);
-    }
-    if *method == Method::GET && path == "/v1/agent/processes" {
-        return Ok(agent_process::handle_list(state, req, auth).await);
-    }
-    if *method == Method::POST
-        && path.starts_with("/v1/agent/processes/")
-        && path.ends_with("/send")
-    {
-        return Ok(agent_process::handle_send(state, req, auth).await);
-    }
-    if *method == Method::GET
-        && path.starts_with("/v1/agent/processes/")
-        && path.ends_with("/stream")
-    {
-        return Ok(agent_process::handle_stream(state, req, auth).await);
-    }
-    if *method == Method::GET && path.starts_with("/v1/agent/processes/") && path.ends_with("/ws") {
-        let is_ws = req
-            .headers()
-            .get("upgrade")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false);
-        return Ok(if !is_ws {
-            method_not_allowed(&["GET (websocket)"])
-        } else {
-            agent_process::handle_ws(state, req, auth).await
-        });
-    }
-    if *method == Method::DELETE && path.starts_with("/v1/agent/processes/") {
-        return Ok(agent_process::handle_delete(state, req, auth).await);
-    }
-
-    Err(req)
 }
 
 fn with_cors(mut response: Response<BoxBody>, req_headers: &hyper::HeaderMap) -> Response<BoxBody> {
@@ -868,7 +508,7 @@ fn authenticate(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "Gateway auth enabled but tenant registry is missing",
-            ))
+            ));
         }
     };
 
@@ -934,6 +574,14 @@ fn docs_hub_response() -> Response<BoxBody> {
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(docs_hub_html())).boxed())
+        .unwrap()
+}
+
+fn admin_ui_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(admin_ui::html())).boxed())
         .unwrap()
 }
 
@@ -1077,7 +725,6 @@ a:hover {
 <body>
 <main class="page">
   <h1>Talu API Docs</h1>
-  <p class="muted">Inference, collaboration, and local agent runtime surface.</p>
 
   <div class="table-wrap">
     <table>
@@ -1113,31 +760,6 @@ a:hover {
           <td><a href="/docs/tokenizer"><code>tokenizer</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/tokenizer.json" title="/openapi/tokenizer.json">json</a><button class="copy-btn" data-url="/openapi/tokenizer.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td>Full tokenizer lifecycle, encode/decode, training, and persistence APIs.</td>
-        </tr>
-        <tr>
-          <td><a href="/docs/collab/resources"><code>collab/resources</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/collab/resources.json" title="/openapi/collab/resources.json">json</a><button class="copy-btn" data-url="/openapi/collab/resources.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td>Canonical resource-scoped collaboration API backed by KV durability lanes.</td>
-        </tr>
-        <tr>
-          <td><a href="/docs/agent/fs"><code>agent/fs</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td>Workspace-scoped filesystem APIs.</td>
-        </tr>
-        <tr>
-          <td><a href="/docs/agent/exec"><code>agent/exec</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/exec.json" title="/openapi/agent/exec.json">json</a><button class="copy-btn" data-url="/openapi/agent/exec.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td>One-shot shell command execution streamed as SSE.</td>
-        </tr>
-        <tr>
-          <td><a href="/docs/agent/shell"><code>agent/shell</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/shell.json" title="/openapi/agent/shell.json">json</a><button class="copy-btn" data-url="/openapi/agent/shell.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td>Interactive PTY shell lifecycle and WebSocket attach endpoints.</td>
-        </tr>
-        <tr>
-          <td><a href="/docs/agent/process"><code>agent/process</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/process.json" title="/openapi/agent/process.json">json</a><button class="copy-btn" data-url="/openapi/agent/process.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td>Long-lived process sessions with stdin send and SSE/WebSocket streaming.</td>
         </tr>
       </tbody>
     </table>

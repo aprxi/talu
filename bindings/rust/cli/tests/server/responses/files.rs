@@ -1,9 +1,8 @@
 //! `/v1/responses` file reference integration tests.
 
 use crate::server::common::{
-    model_config, post_json, require_model, send_request, ServerConfig, ServerTestContext,
+    model_config, post_json, require_model, send_request, ServerTestContext,
 };
-use tempfile::TempDir;
 
 fn upload_text_file(ctx: &ServerTestContext, filename: &str, content: &str) -> String {
     let boundary = "----talu-file-responses";
@@ -35,17 +34,10 @@ fn upload_fake_image(ctx: &ServerTestContext, filename: &str) -> String {
     id
 }
 
-fn model_config_with_temp_workdir(workdir: &std::path::Path) -> ServerConfig {
-    let mut cfg = model_config();
-    cfg.workdir = Some(workdir.to_path_buf());
-    cfg
-}
-
 #[test]
 fn responses_file_reference_resolved_in_generation() {
     let model = require_model!();
-    let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(model_config_with_temp_workdir(temp.path()));
+    let ctx = ServerTestContext::new(model_config());
     let file_id = upload_text_file(&ctx, "notes.txt", "The secret word is pineapple.");
 
     let body = serde_json::json!({
@@ -72,8 +64,7 @@ fn responses_file_reference_resolved_in_generation() {
 #[test]
 fn responses_image_reference_resolved_in_generation() {
     let model = require_model!();
-    let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(model_config_with_temp_workdir(temp.path()));
+    let ctx = ServerTestContext::new(model_config());
     let file_id = upload_fake_image(&ctx, "photo.jpg");
 
     let body = serde_json::json!({
@@ -100,8 +91,7 @@ fn responses_image_reference_resolved_in_generation() {
 #[test]
 fn responses_dangling_file_reference_does_not_crash_server() {
     let model = require_model!();
-    let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(model_config_with_temp_workdir(temp.path()));
+    let ctx = ServerTestContext::new(model_config());
 
     let body = serde_json::json!({
         "model": &model,

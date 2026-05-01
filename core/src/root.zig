@@ -16,8 +16,6 @@ pub const tensor = @import("tensor_pkg");
 pub const dtype = @import("dtype_pkg");
 pub const compute = @import("compute_pkg");
 pub const validate = @import("validate_pkg");
-pub const agent = @import("agent/root.zig");
-pub const collab = @import("collab/root.zig");
 
 // =============================================================================
 // Behavioral Type Exports

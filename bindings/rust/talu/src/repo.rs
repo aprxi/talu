@@ -51,6 +51,19 @@ impl Default for DownloadOptions {
     }
 }
 
+/// Options for enqueuing a managed repository download.
+#[derive(Debug, Clone, Default)]
+pub struct DownloadQueueOptions {
+    /// HuggingFace token for private repos.
+    pub token: Option<String>,
+    /// Force re-download even if cached.
+    pub force: bool,
+    /// Custom endpoint URL.
+    pub endpoint_url: Option<String>,
+    /// Skip downloading weight files (.safetensors).
+    pub skip_weights: bool,
+}
+
 /// Progress action type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressAction {
@@ -550,6 +563,126 @@ pub fn repo_fetch(
     unsafe { talu_sys::talu_text_free(out) };
 
     Ok(path)
+}
+
+/// Enqueues a model download in the core repository queue and returns its job id.
+pub fn repo_download_enqueue(model_id: &str, options: DownloadQueueOptions) -> Result<String> {
+    let c_model = CString::new(model_id)?;
+    let c_token = options
+        .token
+        .as_ref()
+        .map(|t| CString::new(t.as_str()))
+        .transpose()?;
+    let c_endpoint = options
+        .endpoint_url
+        .as_ref()
+        .map(|e| CString::new(e.as_str()))
+        .transpose()?;
+    let c_options = talu_sys::DownloadQueueOptions {
+        token: c_token
+            .as_ref()
+            .map(|t| t.as_ptr())
+            .unwrap_or(std::ptr::null()),
+        force: options.force,
+        endpoint_url: c_endpoint
+            .as_ref()
+            .map(|e| e.as_ptr())
+            .unwrap_or(std::ptr::null()),
+        skip_weights: options.skip_weights,
+    };
+    let mut out: *mut c_char = std::ptr::null_mut();
+    let rc = unsafe {
+        talu_sys::talu_repo_download_enqueue(
+            c_model.as_ptr(),
+            &c_options,
+            &mut out as *mut _ as *mut c_void,
+        )
+    };
+    take_c_string(rc, out, "Failed to enqueue repository download")
+}
+
+/// Returns the core repository download queue snapshot as JSON.
+pub fn repo_downloads_json() -> Result<String> {
+    let mut out: *mut c_char = std::ptr::null_mut();
+    let rc = unsafe { talu_sys::talu_repo_downloads_json(&mut out as *mut _ as *mut c_void) };
+    take_c_string(rc, out, "Failed to read repository downloads")
+}
+
+/// Pauses a queued or active repository download.
+pub fn repo_download_pause(id: &str) -> Result<()> {
+    repo_download_control(
+        id,
+        talu_sys::talu_repo_download_pause,
+        "Failed to pause download",
+    )
+}
+
+/// Resumes a paused repository download.
+pub fn repo_download_resume(id: &str) -> Result<()> {
+    repo_download_control(
+        id,
+        talu_sys::talu_repo_download_resume,
+        "Failed to resume download",
+    )
+}
+
+/// Cancels a queued, paused, or active repository download.
+pub fn repo_download_cancel(id: &str) -> Result<()> {
+    repo_download_control(
+        id,
+        talu_sys::talu_repo_download_cancel,
+        "Failed to cancel download",
+    )
+}
+
+/// Removes terminal queue jobs (completed/failed/cancelled) and returns how many were removed.
+pub fn repo_download_clear_finished() -> Result<usize> {
+    let mut removed: usize = 0;
+    let rc = unsafe {
+        talu_sys::talu_repo_download_clear_finished(&mut removed as *mut _ as *mut c_void)
+    };
+    if rc == 0 {
+        Ok(removed)
+    } else {
+        Err(error_from_last_or("Failed to clear finished downloads"))
+    }
+}
+
+/// Cancels all non-terminal queue jobs and returns how many were affected.
+pub fn repo_download_cancel_all() -> Result<usize> {
+    let mut affected: usize = 0;
+    let rc =
+        unsafe { talu_sys::talu_repo_download_cancel_all(&mut affected as *mut _ as *mut c_void) };
+    if rc == 0 {
+        Ok(affected)
+    } else {
+        Err(error_from_last_or("Failed to cancel all downloads"))
+    }
+}
+
+fn repo_download_control(
+    id: &str,
+    f: unsafe extern "C" fn(*const c_char) -> i32,
+    fallback: &str,
+) -> Result<()> {
+    let c_id = CString::new(id)?;
+    let rc = unsafe { f(c_id.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(error_from_last_or(fallback))
+    }
+}
+
+fn take_c_string(rc: i32, ptr: *mut c_char, fallback: &str) -> Result<String> {
+    if rc != 0 || ptr.is_null() {
+        return Err(error_from_last_or(fallback));
+    }
+    let value = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { talu_sys::talu_text_free(ptr) };
+    Ok(value)
 }
 
 /// Returns the total size in bytes of all cached models.

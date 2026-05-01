@@ -74,6 +74,13 @@ pub const DownloadOptions = extern struct {
     }
 };
 
+pub const DownloadQueueOptions = extern struct {
+    token: ?[*:0]const u8 = null,
+    force: bool = false,
+    endpoint_url: ?[*:0]const u8 = null,
+    skip_weights: bool = false,
+};
+
 // =============================================================================
 // Cache Query Operations
 // =============================================================================
@@ -442,6 +449,88 @@ pub export fn talu_repo_fetch(
     }
 
     return executeFetch(out, parsed.path, options);
+}
+
+/// Enqueues a model download and returns a core-owned queue job id.
+pub export fn talu_repo_download_enqueue(
+    model_id: [*:0]const u8,
+    options: ?*const DownloadQueueOptions,
+    out_id: *?[*:0]u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_id.* = null;
+    const id = repository.download_queue.enqueue(allocator, std.mem.span(model_id), .{
+        .token = if (options) |o| (if (o.token) |t| std.mem.span(t) else null) else null,
+        .force = if (options) |o| o.force else false,
+        .endpoint_url = if (options) |o| (if (o.endpoint_url) |e| std.mem.span(e) else null) else null,
+        .skip_weights = if (options) |o| o.skip_weights else false,
+    }) catch |e| {
+        setErr("download_enqueue", e);
+        return @intFromEnum(error_codes.errorToCode(e));
+    };
+    defer allocator.free(id);
+    out_id.* = (allocZSlice(id) orelse return @intFromEnum(error_codes.ErrorCode.out_of_memory)).ptr;
+    return 0;
+}
+
+/// Returns the repository download queue snapshot as JSON.
+pub export fn talu_repo_downloads_json(out_json: *?[*:0]u8) callconv(.c) i32 {
+    capi_error.clearError();
+    out_json.* = null;
+    const json = repository.download_queue.snapshotJson(allocator) catch |e| {
+        setErr("downloads_json", e);
+        return @intFromEnum(error_codes.errorToCode(e));
+    };
+    defer allocator.free(json);
+    out_json.* = (allocZSlice(json) orelse return @intFromEnum(error_codes.ErrorCode.out_of_memory)).ptr;
+    return 0;
+}
+
+pub export fn talu_repo_download_pause(id: [*:0]const u8) callconv(.c) i32 {
+    capi_error.clearError();
+    repository.download_queue.pause(std.mem.span(id)) catch |e| {
+        setErr("download_pause", e);
+        return @intFromEnum(error_codes.errorToCode(e));
+    };
+    return 0;
+}
+
+pub export fn talu_repo_download_resume(id: [*:0]const u8) callconv(.c) i32 {
+    capi_error.clearError();
+    repository.download_queue.resumeJob(std.mem.span(id)) catch |e| {
+        setErr("download_resume", e);
+        return @intFromEnum(error_codes.errorToCode(e));
+    };
+    return 0;
+}
+
+pub export fn talu_repo_download_cancel(id: [*:0]const u8) callconv(.c) i32 {
+    capi_error.clearError();
+    repository.download_queue.cancel(std.mem.span(id)) catch |e| {
+        setErr("download_cancel", e);
+        return @intFromEnum(error_codes.errorToCode(e));
+    };
+    return 0;
+}
+
+pub export fn talu_repo_download_clear_finished(out_removed: *usize) callconv(.c) i32 {
+    capi_error.clearError();
+    out_removed.* = 0;
+    out_removed.* = repository.download_queue.clearFinished() catch |e| {
+        setErr("download_clear_finished", e);
+        return @intFromEnum(error_codes.errorToCode(e));
+    };
+    return 0;
+}
+
+pub export fn talu_repo_download_cancel_all(out_affected: *usize) callconv(.c) i32 {
+    capi_error.clearError();
+    out_affected.* = 0;
+    out_affected.* = repository.download_queue.cancelAll() catch |e| {
+        setErr("download_cancel_all", e);
+        return @intFromEnum(error_codes.errorToCode(e));
+    };
+    return 0;
 }
 
 /// Build DownloadConfig from C API options.

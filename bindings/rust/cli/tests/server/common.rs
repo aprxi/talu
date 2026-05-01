@@ -25,8 +25,6 @@ pub struct ServerConfig {
     pub tenants: Vec<TenantSpec>,
     /// Optional storage bucket passed via `talu serve --bucket`.
     pub bucket: Option<PathBuf>,
-    /// Workdir root passed via `talu serve --workdir`.
-    pub workdir: Option<PathBuf>,
     /// Extra environment variables to set on the server process.
     pub env_vars: Vec<(String, String)>,
 }
@@ -38,7 +36,6 @@ impl ServerConfig {
             gateway_secret: None,
             tenants: Vec::new(),
             bucket: None,
-            workdir: None,
             env_vars: Vec::new(),
         }
     }
@@ -103,7 +100,6 @@ impl ServerTestContext {
             .env_remove("LD_PRELOAD")
             .env_remove("MALLOC_CHECK_")
             .env_remove("MALLOC_PERTURB_")
-            .env_remove("TALU_WORKDIR")
             .env_remove("TALU_WORKSPACE_DIR")
             // Ensure clean environment for subprocess
             .env("TALU_LOG_LEVEL", "info");
@@ -119,10 +115,6 @@ impl ServerTestContext {
                 .arg(secret)
                 .arg("--tenant-config")
                 .arg(&tenant_path);
-        }
-
-        if let Some(ref workdir) = config.workdir {
-            command.arg("--workdir").arg(workdir);
         }
 
         if let Some(ref bucket) = config.bucket {

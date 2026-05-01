@@ -49,6 +49,8 @@ fn list_model_entries_have_expected_fields() {
             "model[{i}] missing 'size_bytes'"
         );
         assert!(obj.contains_key("mtime"), "model[{i}] missing 'mtime'");
+        assert!(obj.contains_key("ready"), "model[{i}] missing 'ready'");
+        assert!(obj.contains_key("enabled"), "model[{i}] missing 'enabled'");
 
         assert!(model["id"].is_string(), "model[{i}].id should be string");
         assert!(
@@ -62,6 +64,14 @@ fn list_model_entries_have_expected_fields() {
         assert!(
             model["mtime"].is_number(),
             "model[{i}].mtime should be number"
+        );
+        assert!(
+            model["ready"].is_boolean(),
+            "model[{i}].ready should be boolean"
+        );
+        assert!(
+            model["enabled"].is_boolean(),
+            "model[{i}].enabled should be boolean"
         );
 
         let source = model["source"]
@@ -85,6 +95,12 @@ fn list_model_entries_have_expected_fields() {
             assert!(
                 source_model_id.is_string(),
                 "model[{i}].source_model_id should be string"
+            );
+        }
+        if let Some(last_used) = obj.get("last_used") {
+            assert!(
+                last_used.is_number(),
+                "model[{i}].last_used should be number"
             );
         }
     }
@@ -123,6 +139,103 @@ fn list_bare_path() {
     let resp = get(ctx.addr(), "/repo/models");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert!(resp.json()["models"].is_array());
+}
+
+#[test]
+fn stats_returns_cache_summary() {
+    let ctx = ServerTestContext::new(repo_config());
+    let resp = get(ctx.addr(), "/v1/repo/stats");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    for field in [
+        "total_models",
+        "total_size_bytes",
+        "hub_models",
+        "hub_size_bytes",
+        "managed_models",
+        "managed_size_bytes",
+        "ready_models",
+        "enabled_models",
+    ] {
+        assert!(json[field].is_number(), "{field} should be numeric");
+    }
+}
+
+#[test]
+fn stats_bare_path() {
+    let ctx = ServerTestContext::new(repo_config());
+    let resp = get(ctx.addr(), "/repo/stats");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert!(resp.json()["total_models"].is_number());
+}
+
+#[test]
+fn downloads_returns_state_buckets() {
+    let ctx = ServerTestContext::new(repo_config());
+    let resp = get(ctx.addr(), "/v1/repo/downloads");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    assert!(json["active"].is_array());
+    assert!(json["queued"].is_array());
+    assert!(json["paused"].is_array());
+    assert!(json["recent"].is_array());
+}
+
+#[test]
+fn downloads_enqueue_returns_core_job() {
+    let ctx = ServerTestContext::new(repo_config());
+
+    let enqueue = post_json(
+        ctx.addr(),
+        "/v1/repo/downloads",
+        &json!({"model_id": "nonexistent-org/nonexistent-model"}),
+    );
+    assert_eq!(enqueue.status, 202, "body: {}", enqueue.body);
+    let id = enqueue.json()["id"].as_str().unwrap().to_string();
+
+    let after = get(ctx.addr(), "/v1/repo/downloads");
+    assert_eq!(after.status, 200, "body: {}", after.body);
+    let json = after.json();
+    let contains_job = ["active", "queued", "paused", "recent"]
+        .iter()
+        .any(|bucket| {
+            json[*bucket]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == id)
+        });
+    assert!(
+        contains_job,
+        "queued job should appear in downloads: {}",
+        json
+    );
+
+    let _ = post_json(
+        ctx.addr(),
+        &format!("/v1/repo/downloads/{id}/cancel"),
+        &json!({}),
+    );
+}
+
+#[test]
+fn downloads_clear_finished_endpoint_works() {
+    let ctx = ServerTestContext::new(repo_config());
+    let resp = post_json(ctx.addr(), "/v1/repo/downloads/clear/finished", &json!({}));
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.json()["ok"], true);
+    assert!(resp.json()["count"].is_number());
+}
+
+#[test]
+fn downloads_cancel_all_endpoint_works() {
+    let ctx = ServerTestContext::new(repo_config());
+    let resp = post_json(ctx.addr(), "/v1/repo/downloads/cancel/all", &json!({}));
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.json()["ok"], true);
+    assert!(resp.json()["count"].is_number());
 }
 
 fn assert_search_accepted(resp: &HttpResponse) {
@@ -358,6 +471,8 @@ fn repo_endpoints_in_root_openapi() {
     let paths = json["paths"].as_object().expect("paths object");
     assert!(paths.contains_key("/v1/repo/models"));
     assert!(paths.contains_key("/v1/repo/search"));
+    assert!(paths.contains_key("/v1/repo/stats"));
+    assert!(paths.contains_key("/v1/repo/downloads"));
     assert!(paths.contains_key("/v1/repo/models/{model_id}"));
     assert!(paths.contains_key("/v1/repo/models/{model_id}/files"));
 }
