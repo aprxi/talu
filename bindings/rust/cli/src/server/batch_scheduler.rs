@@ -18,15 +18,15 @@
 //! without going through the step thread, so results survive shutdown.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use talu::batch::{BatchConfig, BatchEvent, BatchHandle, BatchResult, EventType};
+use talu::responses::{ContentType, ItemType};
 use talu::router::GenerateConfig;
-use talu::InferenceBackend;
+use talu::{ChatHandle, InferenceBackend};
 
 // =============================================================================
 // Commands sent from HTTP handlers to the step thread
@@ -34,9 +34,8 @@ use talu::InferenceBackend;
 
 enum SchedulerCommand {
     Submit {
-        /// Raw ChatHandle pointer, borrowed from the caller. Valid for the
-        /// duration of the submit because the caller blocks on reply_rx.
-        chat_ptr: *mut c_void,
+        /// Owned chat kept alive by the scheduler until final completion.
+        chat: ChatHandle,
         config: GenerateConfig,
         /// Event sender for this request — registered by the step thread
         /// before any step() call, preventing lost events.
@@ -56,26 +55,26 @@ enum SchedulerCommand {
     Shutdown,
 }
 
-// SAFETY: SchedulerCommand contains raw pointers (chat_ptr) and GenerateConfig
-// which may contain Arc<AtomicBool>. The chat_ptr is only dereferenced on the
-// step thread during Submit handling, and the caller blocks until that completes,
-// guaranteeing the pointer remains valid. GenerateConfig's Arc fields are
-// thread-safe by design.
-unsafe impl Send for SchedulerCommand {}
-
 // =============================================================================
 // Per-request slot
 // =============================================================================
 
 struct RequestSlot {
+    chat: ChatHandle,
     tx: std::sync::mpsc::Sender<BatchEvent>,
     stream_events: bool,
     stop_flag: Arc<AtomicBool>,
 }
 
+/// Completed scheduler request state returned to HTTP handlers.
+pub struct CompletedRequest {
+    pub chat: ChatHandle,
+    pub result: Option<BatchResult>,
+}
+
 /// Entry in the completed-results map, with insertion time for stale eviction.
 struct CompletedEntry {
-    result: BatchResult,
+    completed: CompletedRequest,
     inserted_at: std::time::Instant,
 }
 
@@ -286,14 +285,14 @@ impl SchedulerState {
 
     /// Submit a generation request.
     ///
-    /// Borrows the `ChatHandle` for tokenization only — the handle remains
-    /// available to the caller after this returns (e.g. for serialization).
+    /// Moves the `ChatHandle` into the scheduler. The handle is returned from
+    /// `take_result()` after final completion so callers can serialize it.
     ///
     /// Returns `(request_id, event_receiver)`. The receiver yields `BatchEvent`s
     /// until the final event (is_final=true) or the channel closes.
     pub fn submit(
         &self,
-        chat: &talu::ChatHandle,
+        chat: ChatHandle,
         config: GenerateConfig,
         stop_flag: Arc<AtomicBool>,
     ) -> Result<(u64, std::sync::mpsc::Receiver<BatchEvent>)> {
@@ -306,7 +305,7 @@ impl SchedulerState {
     /// reducing channel/clone overhead for non-streaming endpoints.
     pub fn submit_final_only(
         &self,
-        chat: &talu::ChatHandle,
+        chat: ChatHandle,
         config: GenerateConfig,
         stop_flag: Arc<AtomicBool>,
     ) -> Result<(u64, std::sync::mpsc::Receiver<BatchEvent>)> {
@@ -315,7 +314,7 @@ impl SchedulerState {
 
     fn submit_with_event_mode(
         &self,
-        chat: &talu::ChatHandle,
+        chat: ChatHandle,
         config: GenerateConfig,
         stop_flag: Arc<AtomicBool>,
         stream_events: bool,
@@ -331,7 +330,7 @@ impl SchedulerState {
         // registers the slot BEFORE any step() can produce events.
         self.cmd_tx
             .send(SchedulerCommand::Submit {
-                chat_ptr: chat.as_ptr(),
+                chat,
                 config,
                 event_tx,
                 stream_events,
@@ -362,12 +361,12 @@ impl SchedulerState {
     /// thread to be alive — results survive scheduler shutdown.
     ///
     /// Returns `None` if the request hasn't completed or was already taken.
-    pub fn take_result(&self, request_id: u64) -> Option<BatchResult> {
+    pub fn take_result(&self, request_id: u64) -> Option<CompletedRequest> {
         self.completed
             .lock()
             .ok()?
             .remove(&request_id)
-            .map(|e| e.result)
+            .map(|e| e.completed)
     }
 
     /// Shut down the scheduler. Blocks until the step thread exits.
@@ -451,7 +450,7 @@ fn step_loop(
                 }
                 Ok(cmd) => {
                     let is_submit = matches!(cmd, SchedulerCommand::Submit { .. });
-                    handle_command(&batch, cmd, &requests, max_inflight);
+                    handle_command(&batch, cmd, &requests, &completed, max_inflight);
                     if had_work_in_scheduler && is_submit {
                         serviced_submit_count = serviced_submit_count.saturating_add(1);
                     }
@@ -492,7 +491,7 @@ fn step_loop(
                 Ok(SchedulerCommand::Shutdown) => return,
                 Ok(cmd) => {
                     first_command_was_submit = matches!(cmd, SchedulerCommand::Submit { .. });
-                    handle_command(&batch, cmd, &requests, max_inflight);
+                    handle_command(&batch, cmd, &requests, &completed, max_inflight);
                 }
                 Err(_) => return,
             }
@@ -549,7 +548,7 @@ fn step_loop(
                                         idle_submit_budget_remaining.saturating_sub(1);
                                 }
                             }
-                            handle_command(&batch, cmd, &requests, max_inflight);
+                            handle_command(&batch, cmd, &requests, &completed, max_inflight);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -597,7 +596,7 @@ fn step_loop(
                                             idle_submit_budget_remaining.saturating_sub(1);
                                     }
                                 }
-                                handle_command(&batch, cmd, &requests, max_inflight);
+                                handle_command(&batch, cmd, &requests, &completed, max_inflight);
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -648,7 +647,7 @@ fn step_loop(
                                             idle_submit_budget_remaining.saturating_sub(1);
                                     }
                                 }
-                                handle_command(&batch, cmd, &requests, max_inflight);
+                                handle_command(&batch, cmd, &requests, &completed, max_inflight);
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => break,
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -692,7 +691,7 @@ fn step_loop(
                                         idle_submit_budget_remaining.saturating_sub(1);
                                 }
                             }
-                            handle_command(&batch, cmd, &requests, max_inflight);
+                            handle_command(&batch, cmd, &requests, &completed, max_inflight);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -716,9 +715,8 @@ fn step_loop(
         // it sets pending_flag to break the Zig loop. Cancellations
         // are collected and applied after run_loop returns.
         {
-            let mut to_cancel: Vec<u64> = Vec::new();
-            let mut deferred_finals: Vec<(BatchEvent, std::sync::mpsc::Sender<BatchEvent>)> =
-                Vec::new();
+            let mut to_cancel: Vec<(u64, RequestSlot)> = Vec::new();
+            let mut deferred_finals: Vec<(BatchEvent, RequestSlot)> = Vec::new();
             let has_stream_subscribers = requests
                 .lock()
                 .ok()
@@ -726,84 +724,87 @@ fn step_loop(
                 .unwrap_or(true);
 
             let mut non_stream_scan_ticks: u32 = 0;
-            let mut dispatch_event = |event: &BatchEvent, to_cancel: &mut Vec<u64>| {
-                step_count += 1;
+            let mut dispatch_event =
+                |event: &BatchEvent, to_cancel: &mut Vec<(u64, RequestSlot)>| {
+                    step_count += 1;
 
-                // Non-streaming hot path: most events are token deltas that do
-                // not need per-request channel dispatch. Keep command wakeups
-                // immediate while avoiding per-token map lock/scans.
-                if !has_stream_subscribers && !event.is_final {
-                    non_stream_scan_ticks = non_stream_scan_ticks.wrapping_add(1);
-                    // Poll command-pending at a bounded cadence to avoid
-                    // breaking the Zig run loop on every token when submits are
-                    // continuously arriving.
-                    if cmd_pending.load(Ordering::Acquire)
-                        && (non_stream_scan_ticks % non_stream_cmd_poll_tokens_u32 == 0)
-                    {
-                        pending_flag.store(true, Ordering::Release);
-                    }
+                    // Non-streaming hot path: most events are token deltas that do
+                    // not need per-request channel dispatch. Keep command wakeups
+                    // immediate while avoiding per-token map lock/scans.
+                    if !has_stream_subscribers && !event.is_final {
+                        non_stream_scan_ticks = non_stream_scan_ticks.wrapping_add(1);
+                        // Poll command-pending at a bounded cadence to avoid
+                        // breaking the Zig run loop on every token when submits are
+                        // continuously arriving.
+                        if cmd_pending.load(Ordering::Acquire)
+                            && (non_stream_scan_ticks % non_stream_cmd_poll_tokens_u32 == 0)
+                        {
+                            pending_flag.store(true, Ordering::Release);
+                        }
 
-                    // Periodic cancel sweep to honor stop flags without
-                    // imposing O(active) work on every token callback.
-                    if (non_stream_scan_ticks & 0x0f) == 0 {
-                        if let Ok(mut reqs) = requests.lock() {
-                            let cancelled: Vec<u64> = reqs
-                                .iter()
-                                .filter(|(_, slot)| slot.stop_flag.load(Ordering::Acquire))
-                                .map(|(id, _)| *id)
-                                .collect();
-                            for id in &cancelled {
-                                reqs.remove(id);
-                                to_cancel.push(*id);
+                        // Periodic cancel sweep to honor stop flags without
+                        // imposing O(active) work on every token callback.
+                        if (non_stream_scan_ticks & 0x0f) == 0 {
+                            if let Ok(mut reqs) = requests.lock() {
+                                let cancelled: Vec<u64> = reqs
+                                    .iter()
+                                    .filter(|(_, slot)| slot.stop_flag.load(Ordering::Acquire))
+                                    .map(|(id, _)| *id)
+                                    .collect();
+                                for id in &cancelled {
+                                    if let Some(slot) = reqs.remove(id) {
+                                        to_cancel.push((*id, slot));
+                                    }
+                                }
                             }
                         }
-                    }
-                    if !to_cancel.is_empty() {
-                        pending_flag.store(true, Ordering::Release);
-                    }
-                    return;
-                }
-
-                // --- Dispatch event + check stop flags ---
-                let mut reqs = match requests.lock() {
-                    Ok(reqs) => reqs,
-                    Err(e) => {
-                        log::error!(target: "batch_scheduler", "request state unavailable: {e}");
-                        pending_flag.store(true, Ordering::Release);
+                        if !to_cancel.is_empty() {
+                            pending_flag.store(true, Ordering::Release);
+                        }
                         return;
                     }
+
+                    // --- Dispatch event + check stop flags ---
+                    let mut reqs = match requests.lock() {
+                        Ok(reqs) => reqs,
+                        Err(e) => {
+                            log::error!(target: "batch_scheduler", "request state unavailable: {e}");
+                            pending_flag.store(true, Ordering::Release);
+                            return;
+                        }
+                    };
+
+                    if event.is_final {
+                        if let Some(slot) = reqs.remove(&event.request_id) {
+                            // Do not call batch.take_result() from inside the
+                            // run_loop callback. BatchWrapper callback paths are
+                            // non-reentrant by contract.
+                            deferred_finals.push((event.clone(), slot));
+                        }
+                    } else if let Some(slot) = reqs.get(&event.request_id) {
+                        if slot.stream_events {
+                            let _ = slot.tx.send(event.clone());
+                        }
+                    }
+
+                    // Check stop flags for client disconnects.
+                    let cancelled: Vec<u64> = reqs
+                        .iter()
+                        .filter(|(_, slot)| slot.stop_flag.load(Ordering::Acquire))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in &cancelled {
+                        if let Some(slot) = reqs.remove(id) {
+                            to_cancel.push((*id, slot));
+                        }
+                    }
+
+                    // Break the Zig loop if there are cancellations or
+                    // new commands waiting on the channel.
+                    if !to_cancel.is_empty() || cmd_pending.load(Ordering::Acquire) {
+                        pending_flag.store(true, Ordering::Release);
+                    }
                 };
-
-                if event.is_final {
-                    if let Some(slot) = reqs.remove(&event.request_id) {
-                        // Do not call batch.take_result() from inside the
-                        // run_loop callback. BatchWrapper callback paths are
-                        // non-reentrant by contract.
-                        deferred_finals.push((event.clone(), slot.tx));
-                    }
-                } else if let Some(slot) = reqs.get(&event.request_id) {
-                    if slot.stream_events {
-                        let _ = slot.tx.send(event.clone());
-                    }
-                }
-
-                // Check stop flags for client disconnects.
-                let cancelled: Vec<u64> = reqs
-                    .iter()
-                    .filter(|(_, slot)| slot.stop_flag.load(Ordering::Acquire))
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in &cancelled {
-                    reqs.remove(id);
-                    to_cancel.push(*id);
-                }
-
-                // Break the Zig loop if there are cancellations or
-                // new commands waiting on the channel.
-                if !to_cancel.is_empty() || cmd_pending.load(Ordering::Acquire) {
-                    pending_flag.store(true, Ordering::Release);
-                }
-            };
 
             let result = if has_stream_subscribers {
                 batch.run_loop(&pending_flag, |event| dispatch_event(event, &mut to_cancel))
@@ -813,24 +814,40 @@ fn step_loop(
 
             // Apply collected cancellations now that we're outside
             // the Zig loop (safe to call cancel on the batch handle).
-            for id in to_cancel {
+            for (id, slot) in to_cancel {
                 batch.cancel(id);
+                if let Ok(mut comp) = completed.lock() {
+                    comp.insert(
+                        id,
+                        CompletedEntry {
+                            completed: CompletedRequest {
+                                chat: slot.chat,
+                                result: None,
+                            },
+                            inserted_at: std::time::Instant::now(),
+                        },
+                    );
+                }
             }
 
             // Materialize and dispatch deferred finals now that we are outside
             // the non-reentrant run_loop callback.
-            for (event, tx) in deferred_finals {
-                if let Some(result) = batch.take_result(event.request_id) {
-                    if let Ok(mut comp) = completed.lock() {
-                        comp.insert(
-                            event.request_id,
-                            CompletedEntry {
+            for (event, slot) in deferred_finals {
+                let result = batch.take_result(event.request_id);
+                let had_result = result.is_some();
+                if let Ok(mut comp) = completed.lock() {
+                    comp.insert(
+                        event.request_id,
+                        CompletedEntry {
+                            completed: CompletedRequest {
+                                chat: slot.chat,
                                 result,
-                                inserted_at: std::time::Instant::now(),
                             },
-                        );
-                    }
-                } else {
+                            inserted_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                if !had_result {
                     log::warn!(
                         target: "batch_scheduler",
                         "final event without result: request_id={} tracked={} active={}",
@@ -839,7 +856,7 @@ fn step_loop(
                         batch.active_count()
                     );
                 }
-                let _ = tx.send(event);
+                let _ = slot.tx.send(event);
             }
 
             if let Err(e) = result {
@@ -881,8 +898,8 @@ fn fail_tracked_requests_after_run_loop_error(
         let _ = slot.tx.send(BatchEvent {
             request_id,
             event_type: EventType::Error,
-            item_type: 0,
-            content_type: 0,
+            item_type: ItemType::Message,
+            content_type: ContentType::OutputText,
             is_final: true,
             text: error_message.to_string(),
             token_id: 0,
@@ -897,19 +914,18 @@ fn handle_command(
     batch: &BatchHandle,
     cmd: SchedulerCommand,
     requests: &Arc<Mutex<HashMap<u64, RequestSlot>>>,
+    completed: &Arc<Mutex<HashMap<u64, CompletedEntry>>>,
     max_inflight: usize,
 ) {
     match cmd {
         SchedulerCommand::Submit {
-            chat_ptr,
+            chat,
             config,
             event_tx,
             stream_events,
             stop_flag,
             reply,
         } => {
-            // SAFETY: chat_ptr is a valid ChatHandle pointer borrowed from the
-            // caller, who blocks on reply_rx.recv() until we send the reply.
             if max_inflight > 0 {
                 let tracked = match requests.lock() {
                     Ok(reqs) => reqs.len(),
@@ -938,7 +954,7 @@ fn handle_command(
                 }
             }
             let result = batch
-                .submit_raw(chat_ptr, &config)
+                .submit(&chat, &config)
                 .map_err(|e| anyhow!("batch submit failed: {}", e));
             // Register the event slot BEFORE replying, so no step() can
             // produce events for this request before the slot exists.
@@ -947,11 +963,18 @@ fn handle_command(
                     reqs.insert(
                         *request_id,
                         RequestSlot {
+                            chat,
                             tx: event_tx,
                             stream_events,
                             stop_flag,
                         },
                     );
+                } else {
+                    batch.cancel(*request_id);
+                    let _ = reply.send(Err(anyhow!(
+                        "scheduler internal error: request registry unavailable"
+                    )));
+                    return;
                 }
             }
             let _ = reply.send(result);
@@ -959,7 +982,20 @@ fn handle_command(
         SchedulerCommand::Cancel { request_id } => {
             batch.cancel(request_id);
             if let Ok(mut reqs) = requests.lock() {
-                reqs.remove(&request_id);
+                if let Some(slot) = reqs.remove(&request_id) {
+                    if let Ok(mut comp) = completed.lock() {
+                        comp.insert(
+                            request_id,
+                            CompletedEntry {
+                                completed: CompletedRequest {
+                                    chat: slot.chat,
+                                    result: None,
+                                },
+                                inserted_at: std::time::Instant::now(),
+                            },
+                        );
+                    }
+                }
             }
         }
         SchedulerCommand::Shutdown => {

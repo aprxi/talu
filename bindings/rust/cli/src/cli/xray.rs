@@ -372,21 +372,7 @@ fn effective_tensor_bundle_tokens(tokens: u32) -> u32 {
 fn format_token_text_for_report(model: &str, token_id: u32) -> Option<String> {
     let resolved_model = resolve_xray_model(model).ok()?;
     let tokenizer = talu::TokenizerHandle::new(&resolved_model).ok()?;
-    let options = talu_sys::DecodeOptionsC {
-        skip_special_tokens: 0,
-    };
-    let result =
-        unsafe { talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), &token_id, 1, &options) };
-    if !result.error_msg.is_null() || result.text.is_null() {
-        return None;
-    }
-    let text = unsafe {
-        let bytes = std::slice::from_raw_parts(result.text, result.text_len);
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    unsafe {
-        talu_sys::talu_decode_result_free(result.text, result.text_len);
-    }
+    let text = tokenizer.decode(&[token_id], false).ok()?;
     let escaped: String = text.chars().flat_map(|ch| ch.escape_default()).collect();
     Some(format!("'{}'", escaped))
 }
@@ -397,23 +383,7 @@ fn decode_token_sequence_for_report(model: &str, tokens: &[u32]) -> Option<Strin
     }
     let resolved_model = resolve_xray_model(model).ok()?;
     let tokenizer = talu::TokenizerHandle::new(&resolved_model).ok()?;
-    let options = talu_sys::DecodeOptionsC {
-        skip_special_tokens: 0,
-    };
-    let result = unsafe {
-        talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), tokens.as_ptr(), tokens.len(), &options)
-    };
-    if !result.error_msg.is_null() || result.text.is_null() {
-        return None;
-    }
-    let text = unsafe {
-        let bytes = std::slice::from_raw_parts(result.text, result.text_len);
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    unsafe {
-        talu_sys::talu_decode_result_free(result.text, result.text_len);
-    }
-    Some(text)
+    tokenizer.decode(tokens, false).ok()
 }
 
 fn load_reference_tokens(path: &str) -> Result<Vec<u32>> {
@@ -786,13 +756,7 @@ impl Drop for ScopedTempJson {
 }
 
 fn synchronize_backend(backend: &talu::InferenceBackend) -> Result<()> {
-    let rc = unsafe { talu_sys::talu_backend_synchronize(backend.as_ptr()) };
-    if rc != 0 {
-        let message =
-            last_error_message().unwrap_or_else(|| "backend synchronize failed".to_string());
-        return Err(anyhow!("Error: {} (code {})", message, rc));
-    }
-    Ok(())
+    backend.synchronize().map_err(|e| anyhow!("Error: {}", e))
 }
 
 fn maybe_hard_exit_after_verify(result: Result<()>) -> Result<()> {

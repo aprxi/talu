@@ -18,8 +18,134 @@ use std::marker::PhantomData;
 use std::os::raw::{c_char, c_void};
 use talu_sys;
 
-// Re-export enums from talu_sys for convenience
-pub use talu_sys::{ContentType, ImageDetail, ItemStatus, ItemType, MessageRole};
+/// The discriminator for a Responses item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ItemType {
+    Message = 0,
+    FunctionCall = 1,
+    FunctionCallOutput = 2,
+    Reasoning = 3,
+    ItemReference = 4,
+    Unknown = 255,
+}
+
+impl From<u8> for ItemType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Message,
+            1 => Self::FunctionCall,
+            2 => Self::FunctionCallOutput,
+            3 => Self::Reasoning,
+            4 => Self::ItemReference,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The content discriminator for a Responses content part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ContentType {
+    InputText = 0,
+    InputImage = 1,
+    InputAudio = 2,
+    InputFile = 3,
+    InputVideo = 4,
+    OutputText = 5,
+    Refusal = 6,
+    Text = 7,
+    ReasoningText = 8,
+    SummaryText = 9,
+    Unknown = 255,
+}
+
+impl From<u8> for ContentType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::InputText,
+            1 => Self::InputImage,
+            2 => Self::InputAudio,
+            3 => Self::InputFile,
+            4 => Self::InputVideo,
+            5 => Self::OutputText,
+            6 => Self::Refusal,
+            7 => Self::Text,
+            8 => Self::ReasoningText,
+            9 => Self::SummaryText,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Processing status for a Responses item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ItemStatus {
+    #[default]
+    InProgress = 0,
+    Waiting = 1,
+    Completed = 2,
+    Incomplete = 3,
+    Failed = 4,
+}
+
+impl From<u8> for ItemStatus {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::InProgress,
+            1 => Self::Waiting,
+            2 => Self::Completed,
+            3 => Self::Incomplete,
+            4 => Self::Failed,
+            _ => Self::InProgress,
+        }
+    }
+}
+
+/// Role discriminator for a Responses message item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MessageRole {
+    System = 0,
+    User = 1,
+    Assistant = 2,
+    Developer = 3,
+    Unknown = 255,
+}
+
+impl From<u8> for MessageRole {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::System,
+            1 => Self::User,
+            2 => Self::Assistant,
+            3 => Self::Developer,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Detail level for input image content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ImageDetail {
+    #[default]
+    Auto = 0,
+    Low = 1,
+    High = 2,
+}
+
+impl From<u8> for ImageDetail {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Auto,
+            1 => Self::Low,
+            2 => Self::High,
+            _ => Self::Auto,
+        }
+    }
+}
 
 /// Returns the OpenResponses SSE delta event name for a streamed token.
 pub fn stream_delta_event_name(item_type: ItemType, content_type: ContentType) -> &'static str {
@@ -77,7 +203,7 @@ pub fn new_session_id() -> Result<String> {
 
 // SAFETY (module-wide invariant): All `ResponsesView` trait methods and
 // `ResponsesHandle` mutation methods call C API functions through
-// `self.as_ptr()`, which is guaranteed to be a valid, non-null handle by
+// `self.raw_responses_ptr()`, which is guaranteed to be a valid, non-null handle by
 // construction (checked at creation time in `new()` / `from_raw_owned()` /
 // `from_raw()`).  The C API returns either:
 //   - scalar values (counts, type codes, status codes) — no pointer concerns;
@@ -91,29 +217,33 @@ pub fn new_session_id() -> Result<String> {
 /// Trait for types that provide read access to a conversation's items.
 ///
 /// Both owned [`ResponsesHandle`] and borrowed [`ResponsesRef`] implement this trait.
-pub trait ResponsesView {
-    /// Returns the raw pointer to the underlying handle.
-    /// Note: The C API uses `*mut` for all handle parameters, even for read-only operations.
-    fn as_ptr(&self) -> *mut talu_sys::ResponsesHandle;
+trait ResponsesRawHandle {
+    fn raw_responses_ptr(&self) -> *mut talu_sys::ResponsesHandle;
+}
 
+#[allow(private_bounds)]
+pub trait ResponsesView: ResponsesRawHandle {
     /// Returns the number of items in the conversation.
     fn item_count(&self) -> usize {
-        // SAFETY: self.as_ptr() is a valid handle (module invariant).
-        unsafe { talu_sys::talu_responses_item_count(self.as_ptr()) }
+        // SAFETY: self.raw_responses_ptr() is a valid handle (module invariant).
+        unsafe { talu_sys::talu_responses_item_count(self.raw_responses_ptr()) }
     }
 
     /// Returns the type of item at the given index.
     fn item_type(&self, index: usize) -> ItemType {
-        // SAFETY: self.as_ptr() is a valid handle (module invariant).
-        let type_code = unsafe { talu_sys::talu_responses_item_type(self.as_ptr(), index) };
+        // SAFETY: self.raw_responses_ptr() is a valid handle (module invariant).
+        let type_code =
+            unsafe { talu_sys::talu_responses_item_type(self.raw_responses_ptr(), index) };
         ItemType::from(type_code)
     }
 
     /// Gets the item header at the given index.
     fn get_item(&self, index: usize) -> Result<Item> {
         let mut c_item = talu_sys::CItem::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_item is a valid out-param (module invariant).
-        let rc = unsafe { talu_sys::talu_responses_get_item(self.as_ptr(), index, &mut c_item) };
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_item is a valid out-param (module invariant).
+        let rc = unsafe {
+            talu_sys::talu_responses_get_item(self.raw_responses_ptr(), index, &mut c_item)
+        };
         if rc != 0 {
             return Err(error_from_last_or(&format!(
                 "Failed to get item at index {}",
@@ -131,10 +261,10 @@ pub trait ResponsesView {
     fn get_item_generation_json(&self, index: usize) -> Option<String> {
         let mut ptr: *const u8 = std::ptr::null();
         let mut len: usize = 0;
-        // SAFETY: self.as_ptr() is a valid handle; ptr/len are valid out-params.
+        // SAFETY: self.raw_responses_ptr() is a valid handle; ptr/len are valid out-params.
         let rc = unsafe {
             talu_sys::talu_responses_item_get_generation_json(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 index,
                 std::ptr::addr_of_mut!(ptr) as *mut std::ffi::c_void,
                 std::ptr::addr_of_mut!(len) as *mut std::ffi::c_void,
@@ -194,9 +324,10 @@ pub trait ResponsesView {
     /// Gets message data if the item at index is a message.
     fn get_message(&self, index: usize) -> Result<MessageItem> {
         let mut c_msg = talu_sys::CMessageItem::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_msg is a valid out-param (module invariant).
-        let rc =
-            unsafe { talu_sys::talu_responses_item_as_message(self.as_ptr(), index, &mut c_msg) };
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_msg is a valid out-param (module invariant).
+        let rc = unsafe {
+            talu_sys::talu_responses_item_as_message(self.raw_responses_ptr(), index, &mut c_msg)
+        };
         if rc != 0 {
             return Err(error_from_last_or(&format!(
                 "Item at index {} is not a message",
@@ -226,9 +357,13 @@ pub trait ResponsesView {
     /// Gets function call data if the item at index is a function call.
     fn get_function_call(&self, index: usize) -> Result<FunctionCallItem> {
         let mut c_fc = talu_sys::CFunctionCallItem::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_fc is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_fc is a valid out-param (module invariant).
         let rc = unsafe {
-            talu_sys::talu_responses_item_as_function_call(self.as_ptr(), index, &mut c_fc)
+            talu_sys::talu_responses_item_as_function_call(
+                self.raw_responses_ptr(),
+                index,
+                &mut c_fc,
+            )
         };
         if rc != 0 {
             return Err(error_from_last_or(&format!(
@@ -274,9 +409,13 @@ pub trait ResponsesView {
     /// Gets function call output data if the item at index is a function call output.
     fn get_function_call_output(&self, index: usize) -> Result<FunctionCallOutputItem> {
         let mut c_fco = talu_sys::CFunctionCallOutputItem::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_fco is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_fco is a valid out-param (module invariant).
         let rc = unsafe {
-            talu_sys::talu_responses_item_as_function_call_output(self.as_ptr(), index, &mut c_fco)
+            talu_sys::talu_responses_item_as_function_call_output(
+                self.raw_responses_ptr(),
+                index,
+                &mut c_fco,
+            )
         };
         if rc != 0 {
             return Err(error_from_last_or(&format!(
@@ -319,10 +458,10 @@ pub trait ResponsesView {
         part_index: usize,
     ) -> Result<ContentPart> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_fco_get_part(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -344,10 +483,10 @@ pub trait ResponsesView {
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_message_get_content(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -369,10 +508,10 @@ pub trait ResponsesView {
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_content(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -394,10 +533,10 @@ pub trait ResponsesView {
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_summary(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -419,10 +558,10 @@ pub trait ResponsesView {
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_fco_get_part(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -440,9 +579,13 @@ pub trait ResponsesView {
     /// Gets reasoning data if the item at index is a reasoning item.
     fn get_reasoning(&self, index: usize) -> Result<ReasoningItem> {
         let mut c_reasoning = talu_sys::CReasoningItem::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_reasoning is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_reasoning is a valid out-param (module invariant).
         let rc = unsafe {
-            talu_sys::talu_responses_item_as_reasoning(self.as_ptr(), index, &mut c_reasoning)
+            talu_sys::talu_responses_item_as_reasoning(
+                self.raw_responses_ptr(),
+                index,
+                &mut c_reasoning,
+            )
         };
         if rc != 0 {
             return Err(error_from_last_or(&format!(
@@ -476,9 +619,13 @@ pub trait ResponsesView {
     /// Gets item reference data if the item at index is an item reference.
     fn get_item_reference(&self, index: usize) -> Result<ItemReferenceItem> {
         let mut c_ref = talu_sys::CItemReferenceItem::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_ref is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_ref is a valid out-param (module invariant).
         let rc = unsafe {
-            talu_sys::talu_responses_item_as_item_reference(self.as_ptr(), index, &mut c_ref)
+            talu_sys::talu_responses_item_as_item_reference(
+                self.raw_responses_ptr(),
+                index,
+                &mut c_ref,
+            )
         };
         if rc != 0 {
             return Err(error_from_last_or(&format!(
@@ -502,10 +649,10 @@ pub trait ResponsesView {
     /// Gets a content part from a message item.
     fn get_message_content(&self, item_index: usize, part_index: usize) -> Result<ContentPart> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_message_get_content(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -522,17 +669,19 @@ pub trait ResponsesView {
 
     /// Gets the number of content parts in a message.
     fn message_content_count(&self, index: usize) -> usize {
-        // SAFETY: self.as_ptr() is a valid handle (module invariant).
-        unsafe { talu_sys::talu_responses_item_message_content_count(self.as_ptr(), index) }
+        // SAFETY: self.raw_responses_ptr() is a valid handle (module invariant).
+        unsafe {
+            talu_sys::talu_responses_item_message_content_count(self.raw_responses_ptr(), index)
+        }
     }
 
     /// Gets a content part from a reasoning item.
     fn get_reasoning_content(&self, item_index: usize, part_index: usize) -> Result<ContentPart> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_content(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -549,17 +698,19 @@ pub trait ResponsesView {
 
     /// Gets the number of content parts in a reasoning item.
     fn reasoning_content_count(&self, index: usize) -> usize {
-        // SAFETY: self.as_ptr() is a valid handle (module invariant).
-        unsafe { talu_sys::talu_responses_item_reasoning_content_count(self.as_ptr(), index) }
+        // SAFETY: self.raw_responses_ptr() is a valid handle (module invariant).
+        unsafe {
+            talu_sys::talu_responses_item_reasoning_content_count(self.raw_responses_ptr(), index)
+        }
     }
 
     /// Gets a summary part from a reasoning item.
     fn get_reasoning_summary(&self, item_index: usize, part_index: usize) -> Result<ContentPart> {
         let mut c_part = talu_sys::CResponsesContentPart::default();
-        // SAFETY: self.as_ptr() is a valid handle; c_part is a valid out-param (module invariant).
+        // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_summary(
-                self.as_ptr(),
+                self.raw_responses_ptr(),
                 item_index,
                 part_index,
                 &mut c_part,
@@ -576,16 +727,20 @@ pub trait ResponsesView {
 
     /// Gets the number of summary parts in a reasoning item.
     fn reasoning_summary_count(&self, index: usize) -> usize {
-        // SAFETY: self.as_ptr() is a valid handle (module invariant).
-        unsafe { talu_sys::talu_responses_item_reasoning_summary_count(self.as_ptr(), index) }
+        // SAFETY: self.raw_responses_ptr() is a valid handle (module invariant).
+        unsafe {
+            talu_sys::talu_responses_item_reasoning_summary_count(self.raw_responses_ptr(), index)
+        }
     }
 
     /// Serializes the conversation to Open Responses JSON format.
     ///
     /// `direction`: 0 = request (ItemParam schemas), 1 = response (ItemField schemas)
     fn to_responses_json(&self, direction: u8) -> Result<String> {
-        // SAFETY: self.as_ptr() is a valid handle (module invariant).
-        let ptr = unsafe { talu_sys::talu_responses_to_responses_json(self.as_ptr(), direction) };
+        // SAFETY: self.raw_responses_ptr() is a valid handle (module invariant).
+        let ptr = unsafe {
+            talu_sys::talu_responses_to_responses_json(self.raw_responses_ptr(), direction)
+        };
         if ptr.is_null() {
             return Err(error_from_last_or("Failed to serialize to Responses JSON"));
         }
@@ -600,8 +755,8 @@ pub trait ResponsesView {
 
     /// Serializes the conversation to Chat Completions JSON format.
     fn to_completions_json(&self) -> Result<String> {
-        // SAFETY: self.as_ptr() is a valid handle (module invariant).
-        let ptr = unsafe { talu_sys::talu_responses_to_completions_json(self.as_ptr()) };
+        // SAFETY: self.raw_responses_ptr() is a valid handle (module invariant).
+        let ptr = unsafe { talu_sys::talu_responses_to_completions_json(self.raw_responses_ptr()) };
         if ptr.is_null() {
             return Err(error_from_last_or(
                 "Failed to serialize to Completions JSON",
@@ -640,16 +795,6 @@ impl ResponsesHandle {
         Ok(Self { ptr })
     }
 
-    /// Creates a handle from a raw pointer, taking ownership.
-    ///
-    /// # Safety
-    ///
-    /// The pointer must be a valid `ResponsesHandle` allocated by the C API.
-    /// This struct will free the pointer on Drop.
-    pub unsafe fn from_raw_owned(ptr: *mut talu_sys::ResponsesHandle) -> Self {
-        Self { ptr }
-    }
-
     /// Creates a new conversation with a session identifier.
     pub fn with_session(session_id: &str) -> Result<Self> {
         let c_session = CString::new(session_id)?;
@@ -661,11 +806,6 @@ impl ResponsesHandle {
             ));
         }
         Ok(Self { ptr })
-    }
-
-    /// Returns the raw mutable pointer to the handle.
-    pub fn as_mut_ptr(&mut self) -> *mut talu_sys::ResponsesHandle {
-        self.ptr
     }
 
     /// Loads conversation from OpenAI Completions JSON format.
@@ -861,11 +1001,13 @@ impl ResponsesHandle {
     }
 }
 
-impl ResponsesView for ResponsesHandle {
-    fn as_ptr(&self) -> *mut talu_sys::ResponsesHandle {
+impl ResponsesRawHandle for ResponsesHandle {
+    fn raw_responses_ptr(&self) -> *mut talu_sys::ResponsesHandle {
         self.ptr
     }
 }
+
+impl ResponsesView for ResponsesHandle {}
 
 impl Drop for ResponsesHandle {
     fn drop(&mut self) {
@@ -906,7 +1048,7 @@ impl<'a> ResponsesRef<'a> {
     /// - The pointer must be a valid ResponsesHandle from the C API.
     /// - The handle must remain valid for the lifetime `'a`.
     /// - The caller must ensure the pointed-to data is not mutated while this reference exists.
-    pub unsafe fn from_raw(ptr: *mut c_void) -> Self {
+    pub(crate) unsafe fn from_raw(ptr: *mut c_void) -> Self {
         Self {
             ptr: ptr as *const talu_sys::ResponsesHandle,
             _marker: PhantomData,
@@ -926,11 +1068,13 @@ impl<'a> ResponsesRef<'a> {
     }
 }
 
-impl<'a> ResponsesView for ResponsesRef<'a> {
-    fn as_ptr(&self) -> *mut talu_sys::ResponsesHandle {
+impl<'a> ResponsesRawHandle for ResponsesRef<'a> {
+    fn raw_responses_ptr(&self) -> *mut talu_sys::ResponsesHandle {
         self.ptr as *mut _
     }
 }
+
+impl<'a> ResponsesView for ResponsesRef<'a> {}
 
 // ResponsesRef does NOT implement Drop - it's a borrowed reference
 

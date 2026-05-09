@@ -216,7 +216,7 @@ pub(crate) fn warmup_batch_scheduler(
     cfg.temperature = 0.0;
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let submit = scheduler.submit_final_only(&chat, cfg, stop_flag);
+    let submit = scheduler.submit_final_only(chat, cfg, stop_flag);
     let (request_id, event_rx) = match submit {
         Ok(v) => v,
         Err(e) => {
@@ -287,7 +287,11 @@ pub(crate) fn warmup_batch_scheduler(
         return;
     }
 
-    if scheduler.take_result(request_id).is_none() {
+    if scheduler
+        .take_result(request_id)
+        .and_then(|completed| completed.result)
+        .is_none()
+    {
         log::warn!(
             target: "server::init",
             "warmup finished without result: model={}",

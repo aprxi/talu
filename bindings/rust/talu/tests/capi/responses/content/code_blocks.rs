@@ -3,9 +3,8 @@
 //! Tests for `talu_content_get_code_blocks_json` which retrieves code block
 //! metadata from output_text content parts.
 
-use crate::capi::responses::common::ResponsesTestContext;
+use crate::capi::responses::common::RawResponsesHandle;
 use std::ptr;
-use talu::responses::{MessageRole, ResponsesView};
 
 // =============================================================================
 // Success Cases
@@ -14,12 +13,10 @@ use talu::responses::{MessageRole, ResponsesView};
 /// Get code blocks returns null when no code blocks present.
 #[test]
 fn get_code_blocks_returns_null_when_none() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
     // Add assistant message (output_text) without code blocks
-    h.append_message(MessageRole::Assistant, "Hello, no code here.")
-        .unwrap();
+    h.append_message(talu_sys::MessageRole::Assistant, "Hello, no code here.");
 
     let mut out_ptr: *const u8 = ptr::null();
     let mut out_len: usize = 0;
@@ -42,12 +39,10 @@ fn get_code_blocks_returns_null_when_none() {
 /// Get code blocks on user message (input_text) returns null.
 #[test]
 fn get_code_blocks_input_text_returns_null() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
     // User messages have input_text, not output_text
-    h.append_message(MessageRole::User, "Hello with ```code```")
-        .unwrap();
+    h.append_message(talu_sys::MessageRole::User, "Hello with ```code```");
 
     let mut out_ptr: *const u8 = ptr::null();
     let mut out_len: usize = 0;
@@ -92,10 +87,9 @@ fn get_code_blocks_null_handle_returns_error() {
 /// Item index out of bounds returns error.
 #[test]
 fn get_code_blocks_item_out_of_bounds() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
-    h.append_message(MessageRole::User, "Hello").unwrap();
+    h.append_message(talu_sys::MessageRole::User, "Hello");
 
     let mut out_ptr: *const u8 = ptr::null();
     let mut out_len: usize = 0;
@@ -116,11 +110,9 @@ fn get_code_blocks_item_out_of_bounds() {
 /// Part index out of bounds returns error.
 #[test]
 fn get_code_blocks_part_out_of_bounds() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
-    h.append_message(MessageRole::Assistant, "Single part message")
-        .unwrap();
+    h.append_message(talu_sys::MessageRole::Assistant, "Single part message");
 
     let mut out_ptr: *const u8 = ptr::null();
     let mut out_len: usize = 0;
@@ -141,11 +133,10 @@ fn get_code_blocks_part_out_of_bounds() {
 /// Non-message item (function_call) returns error.
 #[test]
 fn get_code_blocks_non_message_item_returns_error() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
-    h.append_message(MessageRole::User, "Call a function").unwrap();
-    h.append_function_call("call_1", "my_func", "{}").unwrap();
+    h.append_message(talu_sys::MessageRole::User, "Call a function");
+    h.append_function_call("call_1", "my_func", "{}");
 
     let mut out_ptr: *const u8 = ptr::null();
     let mut out_len: usize = 0;
@@ -171,10 +162,9 @@ fn get_code_blocks_non_message_item_returns_error() {
 /// Null output pointers are handled safely.
 #[test]
 fn get_code_blocks_null_outputs_handled() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
-    h.append_message(MessageRole::Assistant, "Test").unwrap();
+    h.append_message(talu_sys::MessageRole::Assistant, "Test");
 
     // Call with null output pointers - should not crash
     let result = unsafe {
@@ -194,11 +184,9 @@ fn get_code_blocks_null_outputs_handled() {
 /// Repeated calls don't leak memory.
 #[test]
 fn get_code_blocks_repeated_calls_no_leak() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
-    h.append_message(MessageRole::Assistant, "Test message")
-        .unwrap();
+    h.append_message(talu_sys::MessageRole::Assistant, "Test message");
 
     for _ in 0..100 {
         let mut out_ptr: *const u8 = ptr::null();
@@ -222,11 +210,10 @@ fn get_code_blocks_repeated_calls_no_leak() {
 /// Multiple content parts in same message.
 #[test]
 fn get_code_blocks_multiple_parts() {
-    let mut ctx = ResponsesTestContext::new();
-    let h = ctx.handle_mut();
+    let mut h = RawResponsesHandle::new();
 
     // Create message with multiple content parts
-    h.append_message(MessageRole::Assistant, "First part").unwrap();
+    h.append_message(talu_sys::MessageRole::Assistant, "First part");
 
     // Only one part exists, so part_index 1 should error
     let mut out_ptr: *const u8 = ptr::null();
@@ -258,8 +245,7 @@ fn get_code_blocks_multiple_parts() {
 /// Empty conversation returns error for any index.
 #[test]
 fn get_code_blocks_empty_conversation() {
-    let ctx = ResponsesTestContext::new();
-    let h = ctx.handle();
+    let h = RawResponsesHandle::new();
 
     let mut out_ptr: *const u8 = ptr::null();
     let mut out_len: usize = 0;

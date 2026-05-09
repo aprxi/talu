@@ -61,8 +61,10 @@ pub mod xray;
 pub use batch::{BatchConfig, BatchEvent, BatchHandle, BatchResult, EventType};
 pub use error::Error;
 pub use wrappers::{
-    CanonicalSpec, ChatHandle, EncodeResult, FinishReason, GenerateResult, InferenceBackend,
-    LoadProgress, LoadProgressCallback, TextPtr, TokenizerHandle, ToolCall,
+    BackendModelInfo, ChatHandle, EncodeResult, FinishReason, GenerateResult, InferenceBackend,
+    JointTokenScore, LoadProgress, LoadProgressCallback, TokenNllScore, TokenizerEncodeOptions,
+    TokenizerEncoding, TokenizerHandle, TokenizerSpecialTokens, TokenizerTruncation,
+    TokenizerTruncationSide, TokenizerVocabEntry, ToolCall,
 };
 
 // Re-export commonly used types for CLI convenience

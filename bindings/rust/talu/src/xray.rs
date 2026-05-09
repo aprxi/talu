@@ -304,8 +304,7 @@ impl ReferenceDataHandle {
         Ok(())
     }
 
-    /// Get raw handle for passing to other FFI functions.
-    pub fn as_ptr(&self) -> *mut c_void {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.handle
     }
 }
@@ -374,8 +373,7 @@ impl ReferenceVerifierHandle {
         Ok(())
     }
 
-    /// Get raw handle for passing to other FFI functions.
-    pub fn as_ptr(&self) -> *mut c_void {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.handle
     }
 }

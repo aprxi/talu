@@ -113,6 +113,55 @@ pub struct GenerateConfig {
     pub vision_prefill: Option<VisionPrefillInput>,
 }
 
+/// Core validation inputs for chat-completions request contracts.
+pub struct CompletionsValidationRequest<'a> {
+    pub messages_json: &'a [u8],
+    pub max_tokens: Option<i64>,
+    pub max_completion_tokens: Option<i64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    pub frequency_penalty: Option<f64>,
+    pub tools_json: Option<&'a [u8]>,
+    pub tool_choice_json: Option<&'a [u8]>,
+}
+
+/// Validates chat-completions request inputs using the core contract.
+pub fn validate_completions_request(request: CompletionsValidationRequest<'_>) -> Result<()> {
+    let (tools_ptr, tools_len) = nullable_bytes(request.tools_json);
+    let (tool_choice_ptr, tool_choice_len) = nullable_bytes(request.tool_choice_json);
+
+    let rc = unsafe {
+        talu_sys::talu_completions_validate_request(
+            request.messages_json.as_ptr(),
+            request.messages_json.len(),
+            usize::from(request.max_tokens.is_some()),
+            request.max_tokens.unwrap_or_default(),
+            usize::from(request.max_completion_tokens.is_some()),
+            request.max_completion_tokens.unwrap_or_default(),
+            request.temperature.unwrap_or(f64::NAN),
+            request.top_p.unwrap_or(f64::NAN),
+            request.presence_penalty.unwrap_or(f64::NAN),
+            request.frequency_penalty.unwrap_or(f64::NAN),
+            tools_ptr,
+            tools_len,
+            tool_choice_ptr,
+            tool_choice_len,
+        )
+    };
+    if rc != 0 {
+        return Err(error_from_last_or("invalid chat/completions request"));
+    }
+    Ok(())
+}
+
+fn nullable_bytes(value: Option<&[u8]>) -> (*const u8, usize) {
+    match value {
+        Some(bytes) => (bytes.as_ptr(), bytes.len()),
+        None => (std::ptr::null(), 0),
+    }
+}
+
 impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
@@ -153,9 +202,9 @@ pub struct StreamToken<'a> {
     /// Decoded token text.
     pub text: &'a str,
     /// Item type (e.g. Message, FunctionCall, Reasoning).
-    pub item_type: talu_sys::ItemType,
+    pub item_type: crate::responses::ItemType,
     /// Content type (e.g. OutputText, ReasoningText).
-    pub content_type: talu_sys::ContentType,
+    pub content_type: crate::responses::ContentType,
     /// Cumulative count of tokens streamed so far (from engine).
     pub tokens_generated: usize,
     /// Nanoseconds elapsed since first token (from engine timestamps).
@@ -586,8 +635,8 @@ pub fn generate_stream(
 
         let stream_token = StreamToken {
             text: text_ref,
-            item_type: talu_sys::ItemType::from(item_type),
-            content_type: talu_sys::ContentType::from(content_type),
+            item_type: crate::responses::ItemType::from(item_type),
+            content_type: crate::responses::ContentType::from(content_type),
             tokens_generated: state.token_count,
             elapsed_ns: 0,
         };
@@ -627,8 +676,8 @@ pub fn generate_stream(
             if has_visible_text(&text) {
                 let fallback = StreamToken {
                     text: text.as_str(),
-                    item_type: talu_sys::ItemType::Message,
-                    content_type: talu_sys::ContentType::OutputText,
+                    item_type: crate::responses::ItemType::Message,
+                    content_type: crate::responses::ContentType::OutputText,
                     tokens_generated: 0,
                     elapsed_ns: 0,
                 };

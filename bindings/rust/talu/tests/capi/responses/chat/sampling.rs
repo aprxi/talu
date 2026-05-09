@@ -1,9 +1,9 @@
 //! Sampling parameter get/set tests.
 
-use talu::ChatHandle;
+use crate::capi::responses::common::RawChatHandle;
 
-fn chat() -> ChatHandle {
-    ChatHandle::new(None).unwrap()
+fn chat() -> RawChatHandle {
+    RawChatHandle::new()
 }
 
 #[test]

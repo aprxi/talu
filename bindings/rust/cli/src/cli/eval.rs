@@ -1,28 +1,10 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::ffi::c_void;
 use std::fs;
 use std::time::Instant;
 
 use super::{EvalArgs, EvalCommands, EvalPplArgs};
-use talu::error::last_error_message;
 use talu::{InferenceBackend, TokenizerHandle};
-
-unsafe extern "C" {
-    fn talu_scheduler_score_tokens_joint(
-        reference_backend: *mut c_void,
-        model_backend: *mut c_void,
-        context_tokens: *const u32,
-        context_len: usize,
-        target_tokens: *const u32,
-        target_len: usize,
-        max_context: usize,
-        out_reference_nll: *mut c_void,
-        out_model_nll: *mut c_void,
-        out_kld: *mut c_void,
-        out_scored_tokens: *mut c_void,
-    ) -> i32;
-}
 
 #[derive(Debug, Clone, Serialize)]
 struct ModelEvalMetrics {
@@ -73,41 +55,12 @@ fn evaluate_model_ppl(
     let backend = InferenceBackend::new(model)
         .with_context(|| format!("failed to initialize backend for model '{}'", model))?;
 
-    let mut nll_sum: f64 = 0.0;
-    let mut scored_tokens: usize = 0;
     let started = Instant::now();
-
-    // SAFETY: pointers are valid for provided lengths and out-params are initialized.
-    let rc = unsafe {
-        talu_sys::talu_scheduler_score_tokens_nll(
-            backend.as_ptr(),
-            if context.is_empty() {
-                std::ptr::null()
-            } else {
-                context.as_ptr()
-            },
-            context.len(),
-            if targets.is_empty() {
-                std::ptr::null()
-            } else {
-                targets.as_ptr()
-            },
-            targets.len(),
-            max_context,
-            &mut nll_sum as *mut f64 as *mut std::ffi::c_void,
-            &mut scored_tokens as *mut usize as *mut std::ffi::c_void,
-        )
-    };
-
-    if rc != 0 {
-        let detail = last_error_message().unwrap_or_else(|| "scoring failed".to_string());
-        bail!(
-            "failed to score model '{}': {} (code={})",
-            model,
-            detail,
-            rc
-        );
-    }
+    let score = backend
+        .score_tokens_nll(context, targets, max_context)
+        .with_context(|| format!("failed to score model '{}'", model))?;
+    let nll_sum = score.nll_sum;
+    let scored_tokens = score.scored_tokens;
 
     if scored_tokens == 0 {
         bail!("scoring produced zero tokens for model '{}'", model);
@@ -144,48 +97,24 @@ fn evaluate_joint_metrics(
     let model_backend = InferenceBackend::new(model)
         .with_context(|| format!("failed to initialize backend for model '{}'", model))?;
 
-    let mut reference_nll_sum: f64 = 0.0;
-    let mut model_nll_sum: f64 = 0.0;
-    let mut kld_sum: f64 = 0.0;
-    let mut scored_tokens: usize = 0;
     let started = Instant::now();
-
-    // SAFETY: backend handles are valid, token pointers are valid for lengths,
-    // and out-params are valid writable pointers.
-    let rc = unsafe {
-        talu_scheduler_score_tokens_joint(
-            reference_backend.as_ptr(),
-            model_backend.as_ptr(),
-            if context.is_empty() {
-                std::ptr::null()
-            } else {
-                context.as_ptr()
-            },
-            context.len(),
-            if targets.is_empty() {
-                std::ptr::null()
-            } else {
-                targets.as_ptr()
-            },
-            targets.len(),
-            max_context,
-            &mut reference_nll_sum as *mut f64 as *mut c_void,
-            &mut model_nll_sum as *mut f64 as *mut c_void,
-            &mut kld_sum as *mut f64 as *mut c_void,
-            &mut scored_tokens as *mut usize as *mut c_void,
+    let score = InferenceBackend::score_tokens_joint(
+        &reference_backend,
+        &model_backend,
+        context,
+        targets,
+        max_context,
+    )
+    .with_context(|| {
+        format!(
+            "failed to score joint metrics for model '{}' vs reference '{}'",
+            model, reference_model
         )
-    };
-
-    if rc != 0 {
-        let detail = last_error_message().unwrap_or_else(|| "joint scoring failed".to_string());
-        bail!(
-            "failed to score joint metrics for model '{}' vs reference '{}': {} (code={})",
-            model,
-            reference_model,
-            detail,
-            rc
-        );
-    }
+    })?;
+    let reference_nll_sum = score.reference_nll_sum;
+    let model_nll_sum = score.model_nll_sum;
+    let kld_sum = score.kld_sum;
+    let scored_tokens = score.scored_tokens;
     if scored_tokens == 0 {
         bail!(
             "joint scoring produced zero tokens for model '{}' vs reference '{}'",

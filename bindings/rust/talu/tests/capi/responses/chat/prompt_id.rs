@@ -2,13 +2,13 @@
 //!
 //! These functions allow getting/setting the prompt document ID for lineage tracking.
 
+use crate::capi::responses::common::RawChatHandle;
 use std::ffi::CString;
-use talu::ChatHandle;
 
 /// Setting and getting prompt_id on a chat handle.
 #[test]
 fn set_and_get_prompt_id() {
-    let chat = ChatHandle::new(None).expect("ChatHandle::new failed");
+    let chat = RawChatHandle::new();
     let prompt_id = CString::new("doc_abc123").expect("CString");
 
     // Initially null
@@ -38,7 +38,7 @@ fn set_and_get_prompt_id() {
 /// Setting prompt_id to null clears it.
 #[test]
 fn set_prompt_id_null_clears() {
-    let chat = ChatHandle::new(None).expect("ChatHandle::new failed");
+    let chat = RawChatHandle::new();
     let prompt_id = CString::new("doc_xyz").expect("CString");
 
     // Set prompt_id
@@ -79,7 +79,7 @@ fn set_prompt_id_null_handle() {
 /// Prompt_id with special characters.
 #[test]
 fn prompt_id_special_characters() {
-    let chat = ChatHandle::new(None).expect("ChatHandle::new failed");
+    let chat = RawChatHandle::new();
     let prompt_id = CString::new("doc-with_special.chars:123").expect("CString");
 
     let rc = unsafe { talu_sys::talu_chat_set_prompt_id(chat.as_ptr(), prompt_id.as_ptr()) };
@@ -97,7 +97,7 @@ fn prompt_id_special_characters() {
 /// Setting empty string is equivalent to clearing.
 #[test]
 fn set_prompt_id_empty_string() {
-    let chat = ChatHandle::new(None).expect("ChatHandle::new failed");
+    let chat = RawChatHandle::new();
 
     // Set a value first
     let prompt_id = CString::new("doc_initial").expect("CString");
@@ -117,7 +117,7 @@ fn set_prompt_id_empty_string() {
 /// Multiple set/get cycles work correctly.
 #[test]
 fn prompt_id_multiple_set_get() {
-    let chat = ChatHandle::new(None).expect("ChatHandle::new failed");
+    let chat = RawChatHandle::new();
 
     for i in 0..10 {
         let prompt_id = CString::new(format!("doc_iteration_{}", i)).expect("CString");

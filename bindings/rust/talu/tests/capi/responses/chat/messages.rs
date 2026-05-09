@@ -1,11 +1,11 @@
 //! Chat message management tests.
 
+use crate::capi::responses::common::RawChatHandle;
 use std::ffi::CString;
-use talu::ChatHandle;
 
 #[test]
 fn chat_to_json_roundtrip() {
-    let chat = ChatHandle::new(Some("system msg")).unwrap();
+    let chat = RawChatHandle::with_system("system msg");
 
     // Append a user message
     {
@@ -29,7 +29,7 @@ fn chat_to_json_roundtrip() {
     unsafe { talu_sys::talu_text_free(json_ptr as *mut _) };
 
     // Load into another chat
-    let chat2 = ChatHandle::new(None).unwrap();
+    let chat2 = RawChatHandle::new();
     let c_json = CString::new(json).unwrap();
     let rc = unsafe { talu_sys::talu_chat_set_messages(chat2.as_ptr(), c_json.as_ptr()) };
     assert_eq!(rc, 0, "set_messages should succeed");
@@ -37,7 +37,7 @@ fn chat_to_json_roundtrip() {
 
 #[test]
 fn set_system_prompt() {
-    let chat = ChatHandle::new(None).unwrap();
+    let chat = RawChatHandle::new();
     let sys = CString::new("New system").unwrap();
     let rc = unsafe { talu_sys::talu_chat_set_system(chat.as_ptr(), sys.as_ptr()) };
     assert_eq!(rc, 0, "set_system should succeed");
@@ -52,7 +52,7 @@ fn set_system_prompt() {
 
 #[test]
 fn get_system_returns_null_when_unset() {
-    let chat = ChatHandle::new(None).unwrap();
+    let chat = RawChatHandle::new();
     let system = unsafe { talu_sys::talu_chat_get_system(chat.as_ptr()) };
     assert!(
         system.is_null(),

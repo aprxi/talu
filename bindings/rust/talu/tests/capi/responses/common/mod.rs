@@ -1,6 +1,140 @@
 //! Shared test fixtures for the Responses integration test suite.
 
+use std::ffi::CString;
+use std::os::raw::c_void;
 use talu::responses::{ContentType, ItemType, MessageRole, ResponsesHandle, ResponsesView};
+
+/// Test-only owner for raw C chat handles.
+pub struct RawChatHandle {
+    ptr: *mut c_void,
+}
+
+impl RawChatHandle {
+    pub fn new() -> Self {
+        // SAFETY: null options are accepted by the C API; null return is checked below.
+        let ptr = unsafe { talu_sys::talu_chat_create(std::ptr::null_mut()) };
+        assert!(!ptr.is_null(), "talu_chat_create returned null");
+        Self { ptr }
+    }
+
+    pub fn with_system(system: &str) -> Self {
+        let system = CString::new(system).expect("system CString");
+        // SAFETY: system is a valid C string for the duration of the call.
+        let ptr = unsafe {
+            talu_sys::talu_chat_create_with_system(system.as_ptr(), std::ptr::null_mut())
+        };
+        assert!(!ptr.is_null(), "talu_chat_create_with_system returned null");
+        Self { ptr }
+    }
+
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+impl Drop for RawChatHandle {
+    fn drop(&mut self) {
+        // SAFETY: ptr is either null or owned by this fixture.
+        unsafe { talu_sys::talu_chat_free(self.ptr) };
+    }
+}
+
+/// Test-only owner for raw C responses handles.
+pub struct RawResponsesHandle {
+    ptr: *mut talu_sys::ResponsesHandle,
+}
+
+impl RawResponsesHandle {
+    pub fn new() -> Self {
+        // SAFETY: no preconditions. Null return is checked below.
+        let ptr = unsafe { talu_sys::talu_responses_create() };
+        assert!(!ptr.is_null(), "talu_responses_create returned null");
+        Self { ptr }
+    }
+
+    pub fn as_ptr(&self) -> *mut talu_sys::ResponsesHandle {
+        self.ptr
+    }
+
+    pub fn append_message(&mut self, role: talu_sys::MessageRole, content: &str) {
+        // SAFETY: self.ptr is valid and content bytes remain live for the call.
+        let id = unsafe {
+            talu_sys::talu_responses_append_message(
+                self.ptr,
+                role as u8,
+                content.as_ptr(),
+                content.len(),
+            )
+        };
+        assert!(id >= 0, "append_message failed for {content:?}");
+    }
+
+    #[allow(dead_code)]
+    pub fn append_function_call(&mut self, call_id: &str, name: &str, arguments: &str) {
+        let call_id = CString::new(call_id).expect("call_id CString");
+        let name = CString::new(name).expect("name CString");
+        // SAFETY: self.ptr is valid; C strings and argument bytes remain live for the call.
+        let id = unsafe {
+            talu_sys::talu_responses_append_function_call(
+                self.ptr,
+                call_id.as_ptr(),
+                name.as_ptr(),
+                arguments.as_ptr(),
+                arguments.len(),
+            )
+        };
+        assert!(id >= 0, "append_function_call failed");
+    }
+
+    pub fn item_count(&self) -> usize {
+        // SAFETY: self.ptr is valid for the lifetime of this fixture.
+        unsafe { talu_sys::talu_responses_item_count(self.ptr) }
+    }
+
+    pub fn message_text(&self, index: usize) -> String {
+        let mut msg = talu_sys::CMessageItem::default();
+        // SAFETY: self.ptr is valid and msg is a valid out-parameter.
+        let rc = unsafe { talu_sys::talu_responses_item_as_message(self.ptr, index, &mut msg) };
+        assert_eq!(rc, 0, "item {index} should be a message");
+
+        let mut out = String::new();
+        for part_index in 0..msg.content_count {
+            let mut part = talu_sys::CResponsesContentPart::default();
+            // SAFETY: self.ptr is valid and part is a valid out-parameter.
+            let rc = unsafe {
+                talu_sys::talu_responses_item_message_get_content(
+                    self.ptr, index, part_index, &mut part,
+                )
+            };
+            assert_eq!(rc, 0, "message content {index}:{part_index} should exist");
+            if part.data_ptr.is_null() || part.data_len == 0 {
+                continue;
+            }
+            let content_type = talu_sys::ContentType::from(part.content_type);
+            if matches!(
+                content_type,
+                talu_sys::ContentType::InputText
+                    | talu_sys::ContentType::OutputText
+                    | talu_sys::ContentType::Text
+                    | talu_sys::ContentType::ReasoningText
+                    | talu_sys::ContentType::SummaryText
+                    | talu_sys::ContentType::Refusal
+            ) {
+                // SAFETY: C API returns a valid data pointer and length for the handle lifetime.
+                let bytes = unsafe { std::slice::from_raw_parts(part.data_ptr, part.data_len) };
+                out.push_str(&String::from_utf8_lossy(bytes));
+            }
+        }
+        out
+    }
+}
+
+impl Drop for RawResponsesHandle {
+    fn drop(&mut self) {
+        // SAFETY: ptr is either null or owned by this fixture.
+        unsafe { talu_sys::talu_responses_free(self.ptr) };
+    }
+}
 
 /// Ephemeral conversation context for tests.
 ///
@@ -48,6 +182,7 @@ pub fn build_simple_conversation(h: &mut ResponsesHandle) {
 }
 
 /// Alternating user/assistant pairs.
+#[allow(dead_code)]
 pub fn build_multi_turn(h: &mut ResponsesHandle, turns: usize) {
     for i in 0..turns {
         h.append_message(MessageRole::User, &format!("User turn {}", i))

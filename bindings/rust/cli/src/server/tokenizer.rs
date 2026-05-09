@@ -4,8 +4,6 @@
 //! core tokenizer C APIs.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_void};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +15,10 @@ use hyper::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use talu::{
+    TokenizerEncodeOptions, TokenizerHandle, TokenizerSpecialTokens, TokenizerTruncation,
+    TokenizerTruncationSide,
+};
 use uuid::Uuid;
 
 use crate::server::auth_gateway::AuthContext;
@@ -103,42 +105,13 @@ impl PaddingDirection {
 }
 
 #[derive(Debug)]
-pub struct TokenizerOwnedHandle {
-    ptr: *mut c_void,
-}
-
-impl TokenizerOwnedHandle {
-    fn from_raw(ptr: *mut c_void) -> Self {
-        Self { ptr }
-    }
-
-    fn as_ptr(&self) -> *mut c_void {
-        self.ptr
-    }
-}
-
-impl Drop for TokenizerOwnedHandle {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // SAFETY: pointer was returned by talu_tokenizer_create*.
-            unsafe { talu_sys::talu_tokenizer_free(self.ptr) };
-            self.ptr = std::ptr::null_mut();
-        }
-    }
-}
-
-// Raw pointers are used behind AppState mutex for C API calls.
-unsafe impl Send for TokenizerOwnedHandle {}
-unsafe impl Sync for TokenizerOwnedHandle {}
-
-#[derive(Debug)]
 pub struct TokenizerInstance {
     pub backend: TokenizerBackend,
     pub source_kind: String,
     pub source_value: String,
     pub tokenizer_sha256: String,
     pub vocab_size: usize,
-    pub handle: TokenizerOwnedHandle,
+    pub handle: TokenizerHandle,
     pub truncation: Option<InstanceTruncationConfig>,
     pub padding: Option<InstancePaddingConfig>,
     pub added_tokens: Vec<AddedTokenEntry>,
@@ -650,57 +623,39 @@ pub async fn handle_create_instance(
     }
 
     let (tokenizer_id, tokenizer_sha256, vocab_size, instance) = {
-        let mut handle_ptr: *mut c_void = std::ptr::null_mut();
-        let create_rc = if source_kind == "path" {
-            let c_path = match CString::new(source_value.clone()) {
-                Ok(v) => v,
-                Err(_) => {
+        let handle = if source_kind == "path" {
+            match TokenizerHandle::new(&source_value) {
+                Ok(handle) => handle,
+                Err(err) => {
                     return json_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_request",
-                        "source.value contains interior NUL bytes",
-                        Some(json!({ "field": "source.value" })),
+                        &format!("failed to create tokenizer instance: {err}"),
+                        None,
                     )
                 }
-            };
-            // SAFETY: c_path is NUL-terminated and output pointer is valid.
-            unsafe {
-                talu_sys::talu_tokenizer_create(
-                    c_path.as_ptr(),
-                    &mut handle_ptr as *mut _ as *mut c_void,
-                )
             }
         } else {
-            // SAFETY: source_value bytes are valid for the duration of the call.
-            unsafe {
-                talu_sys::talu_tokenizer_create_from_json(
-                    source_value.as_bytes().as_ptr(),
-                    source_value.len(),
-                    &mut handle_ptr as *mut _ as *mut c_void,
-                )
+            match TokenizerHandle::from_json(&source_value) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        &format!("failed to create tokenizer instance: {err}"),
+                        None,
+                    )
+                }
             }
         };
 
-        if create_rc != 0 || handle_ptr.is_null() {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                &format!(
-                    "failed to create tokenizer instance: {}",
-                    take_last_error().unwrap_or_else(|| "unknown error".to_string())
-                ),
-                None,
-            );
-        }
-
         let tokenizer_sha256 = if source_kind == "path" {
-            tokenizer_sha256_from_path_source(&source_value, handle_ptr)
+            tokenizer_sha256_from_path_source(&source_value, &handle)
         } else {
             sha256_hex(source_value.as_bytes())
         };
 
-        // SAFETY: handle is valid from create call above.
-        let vocab_size = unsafe { talu_sys::talu_tokenizer_get_vocab_size(handle_ptr) };
+        let vocab_size = handle.vocab_size();
 
         let tokenizer_id = format!("tok_{}", Uuid::new_v4().simple());
         let instance = TokenizerInstance {
@@ -709,7 +664,7 @@ pub async fn handle_create_instance(
             source_value: source_value.clone(),
             tokenizer_sha256: tokenizer_sha256.clone(),
             vocab_size,
-            handle: TokenizerOwnedHandle::from_raw(handle_ptr),
+            handle,
             truncation: None,
             padding: None,
             added_tokens: Vec::new(),
@@ -1477,41 +1432,26 @@ pub async fn handle_vocab(
     };
     let instance = instance_handle.lock().await;
 
-    // SAFETY: tokenizer handle is valid while instance is held.
-    let vocab = unsafe { talu_sys::talu_tokenizer_get_vocab(instance.handle.as_ptr()) };
-    if !vocab.error_msg.is_null() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            &ffi_message(vocab.error_msg, "failed to fetch vocab"),
-            None,
-        );
-    }
+    let vocab = match instance.handle.vocab() {
+        Ok(vocab) => vocab,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &err.to_string(),
+                None,
+            );
+        }
+    };
 
     let mut map = serde_json::Map::new();
-    if vocab.num_entries > 0 {
-        for idx in 0..vocab.num_entries {
-            // SAFETY: returned arrays have num_entries elements per C API contract.
-            let token_ptr = unsafe { *vocab.tokens.add(idx) };
-            // SAFETY: lengths pointer valid for num_entries.
-            let token_len = unsafe { *vocab.lengths.add(idx) as usize };
-            // SAFETY: ids pointer valid for num_entries.
-            let token_id = unsafe { *vocab.ids.add(idx) };
-            // SAFETY: token_ptr points to token_len bytes; tokens can contain any UTF-8 bytes.
-            let bytes = unsafe { std::slice::from_raw_parts(token_ptr as *const u8, token_len) };
-            let token = String::from_utf8_lossy(bytes).to_string();
-            map.insert(token, json!(token_id));
-        }
+    for entry in vocab {
+        map.insert(entry.token, json!(entry.id));
     }
 
     for added in &instance.added_tokens {
         map.insert(added.content.clone(), json!(added.id));
     }
-
-    // SAFETY: frees buffers returned by talu_tokenizer_get_vocab.
-    unsafe {
-        talu_sys::talu_vocab_result_free(vocab.tokens, vocab.lengths, vocab.ids, vocab.num_entries)
-    };
 
     json_response(StatusCode::OK, &Value::Object(map))
 }
@@ -1558,9 +1498,7 @@ pub async fn handle_vocab_size(
     };
     let instance = instance_handle.lock().await;
 
-    // SAFETY: tokenizer handle is valid while instance is held.
-    let base_vocab_size =
-        unsafe { talu_sys::talu_tokenizer_get_vocab_size(instance.handle.as_ptr()) };
+    let base_vocab_size = instance.handle.vocab_size();
     let vocab_size = if with_added_tokens {
         base_vocab_size.saturating_add(instance.added_tokens.len())
     } else {
@@ -1613,18 +1551,17 @@ pub async fn handle_token_to_id(
         return json_response(StatusCode::OK, &json!({ "id": added.id }));
     }
 
-    // SAFETY: handle is valid; token bytes pointer valid for call duration.
-    let id = unsafe {
-        talu_sys::talu_tokenizer_token_to_id(
-            instance.handle.as_ptr(),
-            request.token.as_bytes().as_ptr(),
-            request.token.len(),
-        )
+    let id = match instance.handle.token_to_id(&request.token) {
+        Ok(id) => id,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &err.to_string(),
+                None,
+            )
+        }
     };
-
-    if let Some(err) = take_last_error() {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request", &err, None);
-    }
 
     json_response(StatusCode::OK, &json!({ "id": id }))
 }
@@ -3016,15 +2953,7 @@ fn token_exists(instance: &mut TokenizerInstance, content: &str) -> bool {
         return true;
     }
 
-    // SAFETY: handle is valid; content pointer valid during call.
-    let base_or_dynamic = unsafe {
-        talu_sys::talu_tokenizer_token_to_id(
-            instance.handle.as_ptr(),
-            content.as_bytes().as_ptr(),
-            content.len(),
-        )
-    };
-    base_or_dynamic >= 0
+    instance.handle.token_to_id(content).is_ok()
 }
 
 fn next_added_token_id(instance: &TokenizerInstance) -> u32 {
@@ -3259,17 +3188,20 @@ fn train_from_texts(
 fn build_encode_options(
     add_special_tokens: bool,
     truncation: Option<&InstanceTruncationConfig>,
-) -> talu_sys::EncodeOptions {
-    let mut options = talu_sys::EncodeOptions::default();
-    options.add_bos = if add_special_tokens { 1 } else { 0 };
-    options.add_eos = if add_special_tokens { 1 } else { 0 };
+) -> TokenizerEncodeOptions {
+    let mut options = TokenizerEncodeOptions {
+        add_bos: add_special_tokens,
+        add_eos: add_special_tokens,
+        truncation: None,
+    };
     if let Some(config) = truncation {
-        options.truncation = 1;
-        options.max_length = config.max_length;
-        options.truncation_side = match config.direction {
-            TruncationDirection::Right => 0,
-            TruncationDirection::Left => 1,
-        };
+        options.truncation = Some(TokenizerTruncation {
+            max_length: config.max_length,
+            side: match config.direction {
+                TruncationDirection::Right => TokenizerTruncationSide::Right,
+                TruncationDirection::Left => TokenizerTruncationSide::Left,
+            },
+        });
     }
     options
 }
@@ -3282,39 +3214,26 @@ fn encode_one(
 ) -> Result<MutableEncoding, String> {
     let options = build_encode_options(add_special_tokens, instance.truncation.as_ref());
 
-    // SAFETY: tokenizer handle is valid while instance exists; text pointer valid for call.
-    let result = unsafe {
-        talu_sys::talu_tokenizer_encode(
-            instance.handle.as_ptr(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-            &options,
-        )
-    };
-
-    if !result.error_msg.is_null() {
-        return Err(ffi_message(result.error_msg, "encode failed"));
-    }
-
-    let ids = copy_u32_slice(result.ids, result.num_tokens);
+    let result = instance
+        .handle
+        .encode_with_options(text, options)
+        .map_err(|e| e.to_string())?;
+    let ids = result.ids;
     let attention_mask = if build_flags.include_attention_mask {
-        copy_u32_slice(result.attention_mask, result.num_tokens)
+        result.attention_mask
     } else {
         Vec::new()
     };
     let special_tokens_mask = if build_flags.include_special_tokens_mask {
-        copy_u32_slice(result.special_tokens_mask, result.num_tokens)
+        result.special_tokens_mask
     } else {
         Vec::new()
     };
     let offsets = if build_flags.include_offsets {
-        copy_offsets_slice(result.offsets, result.num_tokens)
+        result.offsets
     } else {
         Vec::new()
     };
-
-    // SAFETY: result was returned by talu_tokenizer_encode and must be freed once.
-    unsafe { talu_sys::talu_encode_result_free(result) };
 
     let tokens = if build_flags.include_tokens {
         ids_to_tokens(instance, &ids)?
@@ -3347,72 +3266,15 @@ fn encode_batch_ids_only_native(
     }
 
     let options = build_encode_options(add_special_tokens, instance.truncation.as_ref());
-    let text_ptrs: Vec<*const u8> = texts.iter().map(|text| text.as_bytes().as_ptr()).collect();
-    let lengths: Vec<usize> = texts.iter().map(String::len).collect();
+    let id_rows = instance
+        .handle
+        .encode_batch_ids(texts, options)
+        .map_err(|e| e.to_string())?;
 
-    // SAFETY: tokenizer handle is valid while instance lock is held; text pointers
-    // and length arrays stay alive for the duration of the FFI call.
-    let result = unsafe {
-        talu_sys::talu_tokenizer_encode_batch(
-            instance.handle.as_ptr(),
-            text_ptrs.as_ptr(),
-            lengths.as_ptr(),
-            texts.len(),
-            &options,
-        )
-    };
-
-    if !result.error_msg.is_null() {
-        return Err(ffi_message(result.error_msg, "batch encode failed"));
-    }
-
-    let num_sequences = result.num_sequences;
-    if num_sequences != texts.len() {
-        // SAFETY: result was returned by talu_tokenizer_encode_batch.
-        unsafe {
-            talu_sys::talu_batch_encode_result_free(
-                result.ids,
-                result.offsets,
-                result.total_tokens,
-                result.num_sequences,
-            );
-        }
-        return Err("batch encode returned mismatched sequence count".to_string());
-    }
-
-    let ids = copy_u32_slice(result.ids, result.total_tokens);
-    let offsets = copy_usize_slice(result.offsets, num_sequences.saturating_add(1));
-
-    // SAFETY: result was returned by talu_tokenizer_encode_batch.
-    unsafe {
-        talu_sys::talu_batch_encode_result_free(
-            result.ids,
-            result.offsets,
-            result.total_tokens,
-            result.num_sequences,
-        );
-    }
-
-    if offsets.len() != num_sequences.saturating_add(1) {
-        return Err("batch encode returned invalid offsets".to_string());
-    }
-    if offsets.first().copied().unwrap_or(usize::MAX) != 0 {
-        return Err("batch encode returned invalid offsets".to_string());
-    }
-    if offsets.last().copied().unwrap_or(usize::MAX) != ids.len() {
-        return Err("batch encode returned invalid offsets".to_string());
-    }
-
-    let mut rows = Vec::with_capacity(num_sequences);
-    for pair in offsets.windows(2) {
-        let start = pair[0];
-        let end = pair[1];
-        if start > end || end > ids.len() {
-            return Err("batch encode returned invalid offsets".to_string());
-        }
-
+    let mut rows = Vec::with_capacity(id_rows.len());
+    for ids in id_rows {
         rows.push(MutableEncoding {
-            ids: ids[start..end].to_vec(),
+            ids,
             tokens: Vec::new(),
             type_ids: Vec::new(),
             attention_mask: Vec::new(),
@@ -3429,27 +3291,10 @@ fn decode_ids(
     ids: &[u32],
     skip_special_tokens: bool,
 ) -> Result<String, String> {
-    let options = talu_sys::DecodeOptionsC {
-        skip_special_tokens: if skip_special_tokens { 1 } else { 0 },
-    };
-
-    // SAFETY: handle valid; ids pointer is valid for ids.len elements.
-    let result = unsafe {
-        talu_sys::talu_tokenizer_decode(instance.handle.as_ptr(), ids.as_ptr(), ids.len(), &options)
-    };
-
-    if !result.error_msg.is_null() {
-        return Err(ffi_message(result.error_msg, "decode failed"));
-    }
-
-    // SAFETY: decode result points to UTF-8 bytes returned by C API.
-    let text_bytes = unsafe { std::slice::from_raw_parts(result.text, result.text_len) };
-    let text = String::from_utf8_lossy(text_bytes).to_string();
-
-    // SAFETY: free decode result buffers from C API.
-    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
-
-    Ok(text)
+    instance
+        .handle
+        .decode(ids, skip_special_tokens)
+        .map_err(|e| e.to_string())
 }
 
 fn ids_to_tokens(instance: &mut TokenizerInstance, ids: &[u32]) -> Result<Vec<String>, String> {
@@ -3462,34 +3307,10 @@ fn ids_to_tokens(instance: &mut TokenizerInstance, ids: &[u32]) -> Result<Vec<St
 }
 
 fn id_to_token(instance: &mut TokenizerInstance, token_id: i32) -> Result<String, String> {
-    let mut out_ptr: *mut c_char = std::ptr::null_mut();
-    // SAFETY: out pointer is valid for write and handle is valid.
-    let rc = unsafe {
-        talu_sys::talu_tokenizer_id_to_token(
-            instance.handle.as_ptr(),
-            token_id,
-            &mut out_ptr as *mut _ as *mut c_void,
-        )
-    };
-
-    if rc != 0 {
-        return Err(take_last_error()
-            .unwrap_or_else(|| format!("token id {token_id} is not in vocabulary")));
-    }
-
-    if out_ptr.is_null() {
-        return Err(format!("token id {token_id} returned null token"));
-    }
-
-    // SAFETY: pointer is owned C string from core.
-    let token = unsafe { CStr::from_ptr(out_ptr) }
-        .to_string_lossy()
-        .to_string();
-
-    // SAFETY: free string allocated by core tokenizer API.
-    unsafe { talu_sys::talu_text_free(out_ptr) };
-
-    Ok(token)
+    instance
+        .handle
+        .id_to_token(token_id)
+        .map_err(|e| e.to_string())
 }
 
 fn id_to_token_with_added(
@@ -3508,9 +3329,8 @@ fn id_to_token_with_added(
     id_to_token(instance, token_id)
 }
 
-fn special_tokens(instance: &mut TokenizerInstance) -> talu_sys::SpecialTokensResult {
-    // SAFETY: handle valid while instance is locked.
-    unsafe { talu_sys::talu_tokenizer_get_special_tokens(instance.handle.as_ptr()) }
+fn special_tokens(instance: &mut TokenizerInstance) -> TokenizerSpecialTokens {
+    instance.handle.special_tokens()
 }
 
 fn build_effective_padding(
@@ -3712,33 +3532,6 @@ fn encoding_payload_from_owned(
     }
 }
 
-fn copy_u32_slice(ptr: *mut u32, len: usize) -> Vec<u32> {
-    if ptr.is_null() || len == 0 {
-        return Vec::new();
-    }
-    // SAFETY: caller guarantees ptr points to len elements.
-    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
-}
-
-fn copy_usize_slice(ptr: *mut usize, len: usize) -> Vec<usize> {
-    if ptr.is_null() || len == 0 {
-        return Vec::new();
-    }
-    // SAFETY: caller guarantees ptr points to len elements.
-    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
-}
-
-fn copy_offsets_slice(ptr: *mut talu_sys::TokenOffset, len: usize) -> Vec<[u32; 2]> {
-    if ptr.is_null() || len == 0 {
-        return Vec::new();
-    }
-    // SAFETY: caller guarantees ptr points to len elements.
-    unsafe { std::slice::from_raw_parts(ptr, len) }
-        .iter()
-        .map(|off| [off.start, off.end])
-        .collect()
-}
-
 fn encode_ids_binary_v1(ids: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + ids.len() * 4);
     out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
@@ -3803,7 +3596,7 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-fn tokenizer_sha256_from_path_source(source_value: &str, handle_ptr: *mut c_void) -> String {
+fn tokenizer_sha256_from_path_source(source_value: &str, handle: &TokenizerHandle) -> String {
     let source_path = Path::new(source_value);
 
     if let Ok(bytes) = std::fs::read(source_path) {
@@ -3812,7 +3605,7 @@ fn tokenizer_sha256_from_path_source(source_value: &str, handle_ptr: *mut c_void
     if let Ok(bytes) = std::fs::read(source_path.join("tokenizer.json")) {
         return sha256_hex(&bytes);
     }
-    if let Some(model_dir) = tokenizer_model_dir(handle_ptr) {
+    if let Some(model_dir) = handle.model_dir() {
         let model_path = Path::new(&model_dir);
         if let Ok(bytes) = std::fs::read(model_path.join("tokenizer.json")) {
             return sha256_hex(&bytes);
@@ -3820,30 +3613,6 @@ fn tokenizer_sha256_from_path_source(source_value: &str, handle_ptr: *mut c_void
     }
 
     sha256_hex(source_value.as_bytes())
-}
-
-fn tokenizer_model_dir(handle_ptr: *mut c_void) -> Option<String> {
-    let mut out_ptr: *mut c_char = std::ptr::null_mut();
-    // SAFETY: handle pointer is a valid tokenizer handle and out pointer is valid for write.
-    let rc = unsafe {
-        talu_sys::talu_tokenizer_get_model_dir(handle_ptr, &mut out_ptr as *mut _ as *mut c_void)
-    };
-    if rc != 0 || out_ptr.is_null() {
-        return None;
-    }
-
-    // SAFETY: C API returns a NUL-terminated allocated string.
-    let model_dir = unsafe { CStr::from_ptr(out_ptr) }
-        .to_string_lossy()
-        .to_string();
-    // SAFETY: free string allocated by C API.
-    unsafe { talu_sys::talu_text_free(out_ptr) };
-
-    if model_dir.is_empty() {
-        None
-    } else {
-        Some(model_dir)
-    }
 }
 
 fn sha256_ids(ids: &[u32]) -> String {
@@ -3868,27 +3637,4 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
-}
-
-fn ffi_message(error_msg_ptr: *const u8, fallback: &str) -> String {
-    if !error_msg_ptr.is_null() {
-        // SAFETY: C API returns NUL-terminated error strings.
-        return unsafe { CStr::from_ptr(error_msg_ptr as *const c_char) }
-            .to_string_lossy()
-            .to_string();
-    }
-    take_last_error().unwrap_or_else(|| fallback.to_string())
-}
-
-fn take_last_error() -> Option<String> {
-    // SAFETY: returns thread-local pointer or null.
-    let ptr = unsafe { talu_sys::talu_last_error() };
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: non-null C string pointer from C API.
-    let msg = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().to_string();
-    // SAFETY: clear thread-local error state.
-    unsafe { talu_sys::talu_clear_error() };
-    Some(msg)
 }

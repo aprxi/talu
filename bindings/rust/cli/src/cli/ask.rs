@@ -867,8 +867,8 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
         // This mirrors the server's batch path — segments are later converted to responses JSON
         // and loaded into each ChatHandle so the responses API handles reasoning/message display.
         struct Segment {
-            item_type: u8,
-            content_type: u8,
+            item_type: talu::responses::ItemType,
+            content_type: talu::responses::ContentType,
             text: String,
         }
         let total_requests = request_ids.len();
@@ -910,9 +910,11 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
                 let mut si = 0;
                 while si < segments.len() {
                     match segments[si].item_type {
-                        0 => {
+                        talu::responses::ItemType::Message => {
                             let mut parts = Vec::new();
-                            while si < segments.len() && segments[si].item_type == 0 {
+                            while si < segments.len()
+                                && segments[si].item_type == talu::responses::ItemType::Message
+                            {
                                 parts.push(serde_json::json!({
                                     "type": "output_text", "text": segments[si].text
                                 }));
@@ -922,9 +924,11 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
                                 "type": "message", "role": "assistant", "content": parts
                             }));
                         }
-                        3 => {
+                        talu::responses::ItemType::Reasoning => {
                             let mut text = String::new();
-                            while si < segments.len() && segments[si].item_type == 3 {
+                            while si < segments.len()
+                                && segments[si].item_type == talu::responses::ItemType::Reasoning
+                            {
                                 text.push_str(&segments[si].text);
                                 si += 1;
                             }
@@ -948,7 +952,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
                 // Text mode: format segments with ANSI like the streaming path.
                 let mut in_reasoning = false;
                 for seg in segments {
-                    let is_reasoning = seg.item_type == 3;
+                    let is_reasoning = seg.item_type == talu::responses::ItemType::Reasoning;
                     if hide_thinking && is_reasoning {
                         continue;
                     }

@@ -30,8 +30,7 @@ impl ChatHandle {
         Ok(Self { ptr })
     }
 
-    /// Returns the raw pointer to the chat handle.
-    pub fn as_ptr(&self) -> *mut c_void {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.ptr
     }
 
@@ -196,20 +195,84 @@ impl Drop for ChatHandle {
     }
 }
 
-// ChatHandle is not Send/Sync by default due to raw pointer
-// If the C API is thread-safe, these can be implemented:
-// unsafe impl Send for ChatHandle {}
-// unsafe impl Sync for ChatHandle {}
+// SAFETY: A ChatHandle owns a single conversation handle. Moving ownership to
+// another thread is sound when no references remain on the source thread. The
+// type intentionally does not implement Sync; shared concurrent access must be
+// externally serialized by higher-level code.
+unsafe impl Send for ChatHandle {}
 
 /// RAII wrapper for a tokenizer handle.
+#[derive(Debug)]
 pub struct TokenizerHandle {
     ptr: *mut c_void,
 }
+
+// SAFETY: Tokenizer handles are immutable after construction. Sharing across
+// threads is valid for read-only tokenizer operations; Drop still owns and frees
+// exactly one handle.
+unsafe impl Send for TokenizerHandle {}
+unsafe impl Sync for TokenizerHandle {}
 
 /// Result of tokenization.
 pub struct EncodeResult {
     /// The encoded token IDs.
     pub tokens: Vec<u32>,
+}
+
+/// Options for tokenizer encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenizerEncodeOptions {
+    pub add_bos: bool,
+    pub add_eos: bool,
+    pub truncation: Option<TokenizerTruncation>,
+}
+
+impl Default for TokenizerEncodeOptions {
+    fn default() -> Self {
+        Self {
+            add_bos: false,
+            add_eos: false,
+            truncation: None,
+        }
+    }
+}
+
+/// Tokenizer truncation settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenizerTruncation {
+    pub max_length: usize,
+    pub side: TokenizerTruncationSide,
+}
+
+/// Which side is truncated when encoded IDs exceed `max_length`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerTruncationSide {
+    Right,
+    Left,
+}
+
+/// Owned tokenizer encoding result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenizerEncoding {
+    pub ids: Vec<u32>,
+    pub attention_mask: Vec<u32>,
+    pub special_tokens_mask: Vec<u32>,
+    pub offsets: Vec<[u32; 2]>,
+}
+
+/// Owned tokenizer vocabulary entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenizerVocabEntry {
+    pub token: String,
+    pub id: u32,
+}
+
+/// Special token IDs reported by the tokenizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenizerSpecialTokens {
+    pub bos_token_id: i32,
+    pub unk_token_id: i32,
+    pub pad_token_id: i32,
 }
 
 impl TokenizerHandle {
@@ -227,59 +290,245 @@ impl TokenizerHandle {
         Ok(Self { ptr })
     }
 
+    /// Creates a new tokenizer from a tokenizer.json payload.
+    pub fn from_json(json: &str) -> Result<Self> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: json bytes and out pointer are valid for the duration of the call.
+        let rc = unsafe {
+            talu_sys::talu_tokenizer_create_from_json(
+                json.as_bytes().as_ptr(),
+                json.len(),
+                &mut ptr as *mut _ as *mut c_void,
+            )
+        };
+        if rc != 0 || ptr.is_null() {
+            return Err(error_from_last_or("Failed to load tokenizer from JSON"));
+        }
+        Ok(Self { ptr })
+    }
+
     /// Encodes text into tokens, returning a Vec of token IDs.
     pub fn encode(&self, text: &str) -> Result<EncodeResult> {
-        let options = talu_sys::EncodeOptions::default();
+        self.encode_with_options(text, TokenizerEncodeOptions::default())
+            .map(|encoding| EncodeResult {
+                tokens: encoding.ids,
+            })
+    }
+
+    /// Encodes text with explicit options.
+    pub fn encode_with_options(
+        &self,
+        text: &str,
+        options: TokenizerEncodeOptions,
+    ) -> Result<TokenizerEncoding> {
+        let c_options = encode_options_to_c(options);
         // SAFETY: self.ptr is valid, text is valid UTF-8.
         let result = unsafe {
             talu_sys::talu_tokenizer_encode(
                 self.ptr,
                 text.as_bytes().as_ptr(),
                 text.len(),
-                &options,
+                &c_options,
             )
         };
         if !result.error_msg.is_null() {
             return Err(error_from_last_or("Failed to encode text"));
         }
-
-        // Copy tokens to a Vec for safe ownership
-        let tokens = if result.ids.is_null() || result.num_tokens == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: ids is a valid pointer with num_tokens elements.
-            let slice = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
-            slice.to_vec()
-        };
-
-        // Free the C-allocated result (ids, offsets, masks)
+        let encoding = tokenizer_encoding_from_c(&result);
+        // SAFETY: result was returned by talu_tokenizer_encode and must be freed once.
         unsafe { talu_sys::talu_encode_result_free(result) };
-
-        Ok(EncodeResult { tokens })
+        Ok(encoding)
     }
 
-    /// Encodes text and returns the raw result (for internal use).
-    /// Caller is responsible for freeing the result via `talu_encode_result_free`.
-    pub fn encode_raw(&self, text: &str) -> Result<talu_sys::EncodeResult> {
-        let options = talu_sys::EncodeOptions::default();
-        // SAFETY: self.ptr is valid, text is valid UTF-8.
+    /// Encodes a batch of texts and returns owned token ID rows.
+    pub fn encode_batch_ids(
+        &self,
+        texts: &[String],
+        options: TokenizerEncodeOptions,
+    ) -> Result<Vec<Vec<u32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let c_options = encode_options_to_c(options);
+        let text_ptrs: Vec<*const u8> = texts.iter().map(|text| text.as_bytes().as_ptr()).collect();
+        let lengths: Vec<usize> = texts.iter().map(String::len).collect();
+
+        // SAFETY: tokenizer handle is valid; text pointers and length arrays
+        // stay alive for the duration of the call.
         let result = unsafe {
-            talu_sys::talu_tokenizer_encode(
+            talu_sys::talu_tokenizer_encode_batch(
                 self.ptr,
-                text.as_bytes().as_ptr(),
-                text.len(),
-                &options,
+                text_ptrs.as_ptr(),
+                lengths.as_ptr(),
+                texts.len(),
+                &c_options,
             )
         };
         if !result.error_msg.is_null() {
-            return Err(error_from_last_or("Failed to encode text"));
+            return Err(error_from_last_or("Batch encode failed"));
         }
-        Ok(result)
+
+        let ids = copy_u32_slice(result.ids, result.total_tokens);
+        let offsets = copy_usize_slice(result.offsets, result.num_sequences.saturating_add(1));
+
+        // SAFETY: result was returned by the tokenizer C API.
+        unsafe {
+            talu_sys::talu_batch_encode_result_free(
+                result.ids,
+                result.offsets,
+                result.total_tokens,
+                result.num_sequences,
+            );
+        }
+
+        if result.num_sequences != texts.len()
+            || offsets.len() != result.num_sequences.saturating_add(1)
+            || offsets.first().copied().unwrap_or(usize::MAX) != 0
+            || offsets.last().copied().unwrap_or(usize::MAX) != ids.len()
+        {
+            return Err(error_from_last_or("Batch encode returned invalid offsets"));
+        }
+
+        let mut rows = Vec::with_capacity(result.num_sequences);
+        for pair in offsets.windows(2) {
+            let start = pair[0];
+            let end = pair[1];
+            if start > end || end > ids.len() {
+                return Err(error_from_last_or("Batch encode returned invalid offsets"));
+            }
+            rows.push(ids[start..end].to_vec());
+        }
+        Ok(rows)
     }
 
-    /// Returns the raw pointer to the tokenizer handle.
-    pub fn as_ptr(&self) -> *mut c_void {
-        self.ptr
+    /// Decodes token IDs into owned UTF-8 text.
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        let options = talu_sys::DecodeOptionsC {
+            skip_special_tokens: if skip_special_tokens { 1 } else { 0 },
+        };
+        // SAFETY: tokenizer handle is valid and ids points to ids.len elements.
+        let result =
+            unsafe { talu_sys::talu_tokenizer_decode(self.ptr, ids.as_ptr(), ids.len(), &options) };
+        if !result.error_msg.is_null() {
+            return Err(error_from_last_or("Decode failed"));
+        }
+        let text = if result.text.is_null() || result.text_len == 0 {
+            String::new()
+        } else {
+            // SAFETY: result.text is valid for result.text_len bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(result.text, result.text_len) };
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        // SAFETY: result buffers were allocated by the C API.
+        unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+        Ok(text)
+    }
+
+    /// Returns the tokenizer vocabulary size.
+    pub fn vocab_size(&self) -> usize {
+        // SAFETY: self.ptr is a valid tokenizer handle.
+        unsafe { talu_sys::talu_tokenizer_get_vocab_size(self.ptr) }
+    }
+
+    /// Returns the full tokenizer vocabulary.
+    pub fn vocab(&self) -> Result<Vec<TokenizerVocabEntry>> {
+        // SAFETY: self.ptr is a valid tokenizer handle.
+        let vocab = unsafe { talu_sys::talu_tokenizer_get_vocab(self.ptr) };
+        if !vocab.error_msg.is_null() {
+            return Err(error_from_last_or("Failed to fetch vocab"));
+        }
+
+        let mut entries = Vec::with_capacity(vocab.num_entries);
+        for idx in 0..vocab.num_entries {
+            // SAFETY: returned arrays have num_entries elements per C API contract.
+            let token_ptr = unsafe { *vocab.tokens.add(idx) };
+            let token_len = unsafe { *vocab.lengths.add(idx) as usize };
+            let token_id = unsafe { *vocab.ids.add(idx) };
+            let bytes = unsafe { std::slice::from_raw_parts(token_ptr as *const u8, token_len) };
+            entries.push(TokenizerVocabEntry {
+                token: String::from_utf8_lossy(bytes).into_owned(),
+                id: token_id,
+            });
+        }
+
+        // SAFETY: frees buffers returned by talu_tokenizer_get_vocab.
+        unsafe {
+            talu_sys::talu_vocab_result_free(
+                vocab.tokens,
+                vocab.lengths,
+                vocab.ids,
+                vocab.num_entries,
+            )
+        };
+        Ok(entries)
+    }
+
+    /// Looks up a token string and returns its token ID.
+    pub fn token_to_id(&self, token: &str) -> Result<u32> {
+        // SAFETY: Clears the thread-local error buffer before a sentinel-returning lookup.
+        unsafe { talu_sys::talu_clear_error() };
+        // SAFETY: self.ptr is valid and token bytes are valid for the call.
+        let id = unsafe {
+            talu_sys::talu_tokenizer_token_to_id(self.ptr, token.as_bytes().as_ptr(), token.len())
+        };
+        if let Some(err) = crate::error::last_error_message() {
+            return Err(crate::Error::talu(err));
+        }
+        u32::try_from(id).map_err(|_| crate::Error::talu(format!("token {token:?} was not found")))
+    }
+
+    /// Looks up a token ID and returns its token string.
+    pub fn id_to_token(&self, token_id: i32) -> Result<String> {
+        let mut out_ptr: *mut c_char = std::ptr::null_mut();
+        // SAFETY: out pointer is valid and self.ptr is a valid tokenizer handle.
+        let rc = unsafe {
+            talu_sys::talu_tokenizer_id_to_token(
+                self.ptr,
+                token_id,
+                &mut out_ptr as *mut _ as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(error_from_last_or(&format!(
+                "token id {token_id} is not in vocabulary"
+            )));
+        }
+        let text = TextPtr::new(out_ptr)
+            .ok_or_else(|| {
+                crate::Error::generic(format!("token id {token_id} returned null token"))
+            })?
+            .to_string_lossy();
+        Ok(text)
+    }
+
+    /// Returns tokenizer special token IDs.
+    pub fn special_tokens(&self) -> TokenizerSpecialTokens {
+        // SAFETY: self.ptr is a valid tokenizer handle.
+        let special = unsafe { talu_sys::talu_tokenizer_get_special_tokens(self.ptr) };
+        TokenizerSpecialTokens {
+            bos_token_id: special.bos_token_id,
+            unk_token_id: special.unk_token_id,
+            pad_token_id: special.pad_token_id,
+        }
+    }
+
+    /// Returns the resolved tokenizer model directory, if available.
+    pub fn model_dir(&self) -> Option<String> {
+        let mut out_ptr: *mut c_char = std::ptr::null_mut();
+        // SAFETY: out pointer is valid and self.ptr is a valid tokenizer handle.
+        let rc = unsafe {
+            talu_sys::talu_tokenizer_get_model_dir(self.ptr, &mut out_ptr as *mut _ as *mut c_void)
+        };
+        if rc != 0 || out_ptr.is_null() {
+            return None;
+        }
+        let text = TextPtr::new(out_ptr)?.to_string_lossy();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 }
 
@@ -292,14 +541,65 @@ impl Drop for TokenizerHandle {
     }
 }
 
+fn encode_options_to_c(options: TokenizerEncodeOptions) -> talu_sys::EncodeOptions {
+    let mut c_options = talu_sys::EncodeOptions::default();
+    c_options.add_bos = if options.add_bos { 1 } else { 0 };
+    c_options.add_eos = if options.add_eos { 1 } else { 0 };
+    if let Some(truncation) = options.truncation {
+        c_options.truncation = 1;
+        c_options.max_length = truncation.max_length;
+        c_options.truncation_side = match truncation.side {
+            TokenizerTruncationSide::Right => 0,
+            TokenizerTruncationSide::Left => 1,
+        };
+    }
+    c_options
+}
+
+fn tokenizer_encoding_from_c(result: &talu_sys::EncodeResult) -> TokenizerEncoding {
+    TokenizerEncoding {
+        ids: copy_u32_slice(result.ids, result.num_tokens),
+        attention_mask: copy_u32_slice(result.attention_mask, result.num_tokens),
+        special_tokens_mask: copy_u32_slice(result.special_tokens_mask, result.num_tokens),
+        offsets: copy_token_offsets_slice(result.offsets, result.num_tokens),
+    }
+}
+
+fn copy_u32_slice(ptr: *mut u32, len: usize) -> Vec<u32> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: caller passes pointers returned by the C API with the matching length.
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
+fn copy_usize_slice(ptr: *mut usize, len: usize) -> Vec<usize> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: caller passes pointers returned by the C API with the matching length.
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
+fn copy_token_offsets_slice(ptr: *mut talu_sys::TokenOffset, len: usize) -> Vec<[u32; 2]> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: caller passes pointers returned by the C API with the matching length.
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+        .iter()
+        .map(|offset| [offset.start, offset.end])
+        .collect()
+}
+
 /// RAII wrapper for a text pointer allocated by the C API.
-pub struct TextPtr {
+pub(crate) struct TextPtr {
     ptr: *mut c_char,
 }
 
 impl TextPtr {
     /// Creates a TextPtr from a raw pointer, returning None if null.
-    pub fn new(ptr: *mut c_char) -> Option<Self> {
+    pub(crate) fn new(ptr: *mut c_char) -> Option<Self> {
         if ptr.is_null() {
             None
         } else {
@@ -308,16 +608,11 @@ impl TextPtr {
     }
 
     /// Converts the text to a lossy String.
-    pub fn to_string_lossy(&self) -> String {
+    pub(crate) fn to_string_lossy(&self) -> String {
         // SAFETY: self.ptr is non-null (checked in new()) and points to a valid C string.
         unsafe { CStr::from_ptr(self.ptr) }
             .to_string_lossy()
             .to_string()
-    }
-
-    /// Returns the raw pointer.
-    pub fn as_ptr(&self) -> *const c_char {
-        self.ptr
     }
 }
 
@@ -331,13 +626,13 @@ impl Drop for TextPtr {
 }
 
 /// RAII wrapper for a CanonicalSpec handle.
-pub struct CanonicalSpec {
+pub(crate) struct CanonicalSpec {
     ptr: *mut c_void,
 }
 
 impl CanonicalSpec {
     /// Returns a const pointer to the canonical spec.
-    pub fn as_ptr(&self) -> *const c_void {
+    pub(crate) fn as_ptr(&self) -> *const c_void {
         self.ptr
     }
 }
@@ -428,6 +723,44 @@ unsafe extern "C" fn load_progress_callback_wrapper(
 pub struct InferenceBackend {
     ptr: *mut c_void,
     _canonical: CanonicalSpec, // Keep canonical spec alive
+}
+
+/// Static model metadata returned by an inference backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackendModelInfo {
+    pub file_size: u64,
+    pub tensor_count: u64,
+    pub vocab_size: i32,
+    pub d_model: i32,
+    pub n_layers: i32,
+    pub n_heads: i32,
+    pub n_kv_groups: i32,
+    pub d_ff: i32,
+    pub max_seq_len: i32,
+    pub gaffine_group_size: i32,
+    pub weight_dtype: u8,
+}
+
+impl BackendModelInfo {
+    pub fn is_empty(&self) -> bool {
+        self.file_size == 0 && self.d_model == 0
+    }
+}
+
+/// Negative log-likelihood scoring result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenNllScore {
+    pub nll_sum: f64,
+    pub scored_tokens: usize,
+}
+
+/// Joint scoring result for two backends on the same token stream.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JointTokenScore {
+    pub reference_nll_sum: f64,
+    pub model_nll_sum: f64,
+    pub kld_sum: f64,
+    pub scored_tokens: usize,
 }
 
 // SAFETY: The backend handle is synchronized by callers (e.g., a Mutex) and the
@@ -546,15 +879,112 @@ impl InferenceBackend {
         })
     }
 
-    /// Returns the raw pointer to the backend handle.
-    pub fn as_ptr(&self) -> *mut c_void {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.ptr
     }
 
     /// Return static model metadata from a local backend.
     /// Returns a zero struct for non-local backends.
-    pub fn model_info(&self) -> talu_sys::CModelInfo {
-        unsafe { talu_sys::talu_backend_model_info(self.ptr) }
+    pub fn model_metadata(&self) -> BackendModelInfo {
+        let info = unsafe { talu_sys::talu_backend_model_info(self.ptr) };
+        BackendModelInfo {
+            file_size: info.file_size,
+            tensor_count: info.tensor_count,
+            vocab_size: info.vocab_size,
+            d_model: info.d_model,
+            n_layers: info.n_layers,
+            n_heads: info.n_heads,
+            n_kv_groups: info.n_kv_groups,
+            d_ff: info.d_ff,
+            max_seq_len: info.max_seq_len,
+            gaffine_group_size: info.gaffine_group_size,
+            weight_dtype: info.weight_dtype,
+        }
+    }
+
+    /// Synchronizes backend work and returns any backend error.
+    pub fn synchronize(&self) -> Result<()> {
+        let rc = unsafe { talu_sys::talu_backend_synchronize(self.ptr) };
+        if rc != 0 {
+            return Err(error_from_last_or("backend synchronize failed"));
+        }
+        Ok(())
+    }
+
+    /// Scores target tokens using negative log-likelihood.
+    pub fn score_tokens_nll(
+        &self,
+        context: &[u32],
+        targets: &[u32],
+        max_context: usize,
+    ) -> Result<TokenNllScore> {
+        let mut nll_sum = 0.0;
+        let mut scored_tokens = 0usize;
+        let rc = unsafe {
+            talu_sys::talu_scheduler_score_tokens_nll(
+                self.ptr,
+                nullable_u32_ptr(context),
+                context.len(),
+                nullable_u32_ptr(targets),
+                targets.len(),
+                max_context,
+                &mut nll_sum as *mut f64 as *mut c_void,
+                &mut scored_tokens as *mut usize as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(error_from_last_or("scoring failed"));
+        }
+        Ok(TokenNllScore {
+            nll_sum,
+            scored_tokens,
+        })
+    }
+
+    /// Scores target tokens against a reference backend and this backend.
+    pub fn score_tokens_joint(
+        reference: &InferenceBackend,
+        model: &InferenceBackend,
+        context: &[u32],
+        targets: &[u32],
+        max_context: usize,
+    ) -> Result<JointTokenScore> {
+        let mut reference_nll_sum = 0.0;
+        let mut model_nll_sum = 0.0;
+        let mut kld_sum = 0.0;
+        let mut scored_tokens = 0usize;
+        let rc = unsafe {
+            talu_sys::talu_scheduler_score_tokens_joint(
+                reference.ptr,
+                model.ptr,
+                nullable_u32_ptr(context),
+                context.len(),
+                nullable_u32_ptr(targets),
+                targets.len(),
+                max_context,
+                &mut reference_nll_sum as *mut f64 as *mut c_void,
+                &mut model_nll_sum as *mut f64 as *mut c_void,
+                &mut kld_sum as *mut f64 as *mut c_void,
+                &mut scored_tokens as *mut usize as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(error_from_last_or("joint scoring failed"));
+        }
+        Ok(JointTokenScore {
+            reference_nll_sum,
+            model_nll_sum,
+            kld_sum,
+            scored_tokens,
+        })
+    }
+}
+
+fn nullable_u32_ptr(values: &[u32]) -> *const u32 {
+    if values.is_empty() {
+        std::ptr::null()
+    } else {
+        values.as_ptr()
     }
 }
 
@@ -608,13 +1038,8 @@ pub struct GenerateResult {
 
 impl GenerateResult {
     /// Creates a new GenerateResult from the raw FFI result.
-    pub fn new(inner: talu_sys::CGenerateResult) -> Self {
+    pub(crate) fn new(inner: talu_sys::CGenerateResult) -> Self {
         Self { inner }
-    }
-
-    /// Returns a reference to the inner result.
-    pub fn inner(&self) -> &talu_sys::CGenerateResult {
-        &self.inner
     }
 
     /// Returns the error code.

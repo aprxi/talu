@@ -158,7 +158,7 @@ async fn handle_non_streaming(
                 .as_ref()
                 .ok_or_else(|| anyhow!("batch scheduler unavailable"))?;
             let (request_id, event_rx) = sched
-                .submit_final_only(&chat, cfg, stop_flag)
+                .submit_final_only(chat, cfg, stop_flag)
                 .map_err(|e| anyhow!("batch submit failed: {e}"))?;
 
             let mut final_error: Option<String> = None;
@@ -190,7 +190,10 @@ async fn handle_non_streaming(
 
             let r = sched.take_result(request_id);
             match r {
-                Some(r) => {
+                Some(completed) => {
+                    let Some(r) = completed.result else {
+                        return Err(anyhow!("batch generation completed without a result"));
+                    };
                     let has_tool_calls = !r.tool_calls.is_empty();
                     let tool_calls = if has_tool_calls {
                         let tc: Vec<serde_json::Value> = r
@@ -410,7 +413,7 @@ async fn handle_streaming(
                     return;
                 }
             };
-            let submit_result = sched.submit(&chat, cfg, stop_flag);
+            let submit_result = sched.submit(chat, cfg, stop_flag);
             let (request_id, event_rx) = match submit_result {
                 Ok(v) => v,
                 Err(e) => {
@@ -471,7 +474,11 @@ async fn handle_streaming(
             }
 
             let batch_result = sched.take_result(request_id);
-            if let Some(r) = batch_result {
+            if let Some(completed) = batch_result {
+                let Some(r) = completed.result else {
+                    let _ = send_error_chunk(&tx, "batch generation completed without a result");
+                    return;
+                };
                 prompt_tokens = r.prompt_tokens as u64;
                 completion_tokens = r.completion_tokens as u64;
                 finish_reason = finish_reason_str(r.finish_reason);
@@ -652,47 +659,24 @@ fn validate_completions_request_via_core(body: &CreateChatCompletionBody) -> Res
         .as_ref()
         .map(|v| v.to_string().into_bytes());
 
-    let (tools_ptr, tools_len) = if let Some(v) = tools_json.as_ref() {
-        (v.as_ptr(), v.len())
-    } else {
-        (std::ptr::null(), 0)
-    };
-    let (tool_choice_ptr, tool_choice_len) = if let Some(v) = tool_choice_json.as_ref() {
-        (v.as_ptr(), v.len())
-    } else {
-        (std::ptr::null(), 0)
-    };
-
-    let rc = unsafe {
-        talu_sys::talu_completions_validate_request(
-            messages_json.as_ptr(),
-            messages_json.len(),
-            usize::from(body.max_tokens.is_some()),
-            body.max_tokens.unwrap_or_default(),
-            usize::from(body.max_completion_tokens.is_some()),
-            body.max_completion_tokens.unwrap_or_default(),
-            body.temperature.unwrap_or(f64::NAN),
-            body.top_p.unwrap_or(f64::NAN),
-            body.presence_penalty.unwrap_or(f64::NAN),
-            body.frequency_penalty.unwrap_or(f64::NAN),
-            tools_ptr,
-            tools_len,
-            tool_choice_ptr,
-            tool_choice_len,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-
-    Err(talu::error::last_error_message()
-        .unwrap_or_else(|| "invalid chat/completions request".to_string()))
+    talu::router::validate_completions_request(talu::router::CompletionsValidationRequest {
+        messages_json: &messages_json,
+        max_tokens: body.max_tokens,
+        max_completion_tokens: body.max_completion_tokens,
+        temperature: body.temperature,
+        top_p: body.top_p,
+        presence_penalty: body.presence_penalty,
+        frequency_penalty: body.frequency_penalty,
+        tools_json: tools_json.as_deref(),
+        tool_choice_json: tool_choice_json.as_deref(),
+    })
+    .map_err(|e| e.to_string())
 }
 
-fn finish_reason_str(code: u8) -> &'static str {
-    match code {
-        1 => "length",
-        3 => "tool_calls",
+fn finish_reason_str(reason: talu::FinishReason) -> &'static str {
+    match reason {
+        talu::FinishReason::Length => "length",
+        talu::FinishReason::ToolCalls => "tool_calls",
         _ => "stop",
     }
 }

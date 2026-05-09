@@ -749,7 +749,7 @@ async fn generate_response(
                     .ok_or_else(|| anyhow!("batch scheduler unavailable"))?;
                 // --- Batch scheduler path (concurrent GPU decode) ---
                 let (request_id, event_rx) = sched
-                    .submit_final_only(&chat, cfg, stop_flag_for_gen)
+                    .submit_final_only(chat, cfg, stop_flag_for_gen)
                     .map_err(|e| anyhow!("batch submit failed: {}", e))?;
 
                 // Drain events until final and surface scheduler error events.
@@ -782,10 +782,15 @@ async fn generate_response(
                 // materialized), so surface it as an internal error.
                 let (prompt_tokens, completion_tokens, prefill_ns, generation_ns, ttft_ns,
                      batch_status, batch_incomplete_reason) =
-                    if let Some(ref r) = batch_result {
+                    if let Some(ref completed) = batch_result {
+                        let Some(r) = completed.result.as_ref() else {
+                            return Err(anyhow!(
+                                "batch request {request_id} completed without a result"
+                            ));
+                        };
                         let (status, reason) = match r.finish_reason {
-                            1 => ("incomplete", Some("max_output_tokens")),
-                            5 => ("incomplete", Some("cancelled")),
+                            FinishReason::Length => ("incomplete", Some("max_output_tokens")),
+                            FinishReason::Cancelled => ("incomplete", Some("cancelled")),
                             _ => ("completed", None),
                         };
                         (r.prompt_tokens, r.completion_tokens, r.prefill_ns,
@@ -804,7 +809,8 @@ async fn generate_response(
                 // with correct reasoning + message items. Read from the
                 // conversation directly — no segment-based reconstruction.
 
-                let all_json = chat
+                let completed = batch_result.expect("checked above");
+                let all_json = completed.chat
                     .to_responses_json(1)
                     .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
                 let all_items: serde_json::Value =
@@ -1895,7 +1901,7 @@ fn run_batch_streaming_generation(
 
     // --- Submit to batch scheduler ---
     let (request_id, event_rx) = scheduler
-        .submit(&chat, cfg, stop_flag.clone())
+        .submit(chat, cfg, stop_flag.clone())
         .map_err(|e| anyhow!("batch submit failed: {}", e))?;
 
     // --- Consume events, feed to StreamCtx ---
@@ -1910,12 +1916,10 @@ fn run_batch_streaming_generation(
 
                 // Map BatchEvent to StreamToken for StreamCtx.
                 if !event.text.is_empty() {
-                    let item_type = talu_sys::ItemType::from(event.item_type);
-                    let content_type = talu_sys::ContentType::from(event.content_type);
                     let token = talu::router::StreamToken {
                         text: &event.text,
-                        item_type,
-                        content_type,
+                        item_type: event.item_type,
+                        content_type: event.content_type,
                         tokens_generated: event.tokens_generated,
                         elapsed_ns: event.timestamp_ns as u64,
                     };
@@ -1936,23 +1940,21 @@ fn run_batch_streaming_generation(
     let batch_result = scheduler.take_result(request_id);
 
     let (prompt_tokens, completion_tokens, prefill_ns, generation_ns, ttft_ns, finish_reason) =
-        if let Some(ref r) = batch_result {
-            (
-                r.prompt_tokens,
-                r.completion_tokens,
-                r.prefill_ns,
-                r.generation_ns,
-                r.ttft_ns,
-                match r.finish_reason {
-                    0 => FinishReason::EosToken,
-                    1 => FinishReason::Length,
-                    2 => FinishReason::StopSequence,
-                    3 => FinishReason::ToolCalls,
-                    4 => FinishReason::ContentFilter,
-                    5 => FinishReason::Cancelled,
-                    _ => FinishReason::EosToken,
-                },
-            )
+        if let Some(ref completed) = batch_result {
+            if let Some(r) = completed.result.as_ref() {
+                (
+                    r.prompt_tokens,
+                    r.completion_tokens,
+                    r.prefill_ns,
+                    r.generation_ns,
+                    r.ttft_ns,
+                    r.finish_reason,
+                )
+            } else {
+                log::warn!(target: "server::gen",
+                    "batch request {request_id}: take_result returned chat without result");
+                (0, 0, 0, 0, 0, FinishReason::Cancelled)
+            }
         } else {
             // No result means cancellation or scheduler drain — surface as
             // incomplete/cancelled rather than masking under EOS.
@@ -1968,7 +1970,12 @@ fn run_batch_streaming_generation(
     // BatchResult.tool_calls which are parsed from the full generated text.
     // Invariant: tool_calls order matches output_items function_call order
     // (both from the same left-to-right parse of generated text).
-    if let Some(ref r) = batch_result {
+    if let Some(ref completed) = batch_result {
+        let Some(r) = completed.result.as_ref() else {
+            return Err(anyhow!(
+                "batch request {request_id} completed without a result"
+            ));
+        };
         if !r.tool_calls.is_empty() {
             if let Ok(mut guard) = ctx.lock() {
                 let mut tc_idx = 0;
@@ -2041,9 +2048,14 @@ fn run_batch_streaming_generation(
         }
     }
 
-    let all_json = chat
-        .to_responses_json(1)
-        .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
+    let all_json = if let Some(completed) = batch_result {
+        completed
+            .chat
+            .to_responses_json(1)
+            .map_err(|e| anyhow!("failed to serialize output: {}", e))?
+    } else {
+        String::new()
+    };
 
     // Get model info from the backend (quick metadata read, no generation lock).
     let model_info_json = {
@@ -2973,8 +2985,8 @@ fn dtype_name(val: u8) -> &'static str {
 }
 
 fn build_model_info_json(backend: &talu::InferenceBackend) -> serde_json::Value {
-    let info = backend.model_info();
-    if info.file_size == 0 && info.d_model == 0 {
+    let info = backend.model_metadata();
+    if info.is_empty() {
         return serde_json::Value::Null;
     }
     json!({

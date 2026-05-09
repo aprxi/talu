@@ -1,5 +1,6 @@
 //! ChatHandle creation and access tests.
 
+use crate::capi::responses::common::RawChatHandle;
 use std::ffi::CString;
 use talu::responses::ResponsesView;
 use talu::ChatHandle;
@@ -13,7 +14,7 @@ fn create_empty_chat() {
 
 #[test]
 fn create_with_system_prompt() {
-    let chat = ChatHandle::new(Some("You are helpful.")).unwrap();
+    let chat = RawChatHandle::with_system("You are helpful.");
     let system = unsafe { talu_sys::talu_chat_get_system(chat.as_ptr()) };
     assert!(!system.is_null(), "system prompt should be retrievable");
     let text = unsafe { std::ffi::CStr::from_ptr(system) }

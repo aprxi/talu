@@ -51,8 +51,9 @@
 //! ```
 
 use crate::error::error_from_last_or;
+use crate::responses::{ContentType, ItemType};
 use crate::router::GenerateConfig;
-use crate::{ChatHandle, InferenceBackend, Result};
+use crate::{ChatHandle, FinishReason, InferenceBackend, Result};
 use std::ffi::{c_void, CStr, CString};
 use std::sync::atomic::AtomicBool;
 
@@ -101,10 +102,10 @@ pub struct BatchEvent {
     pub request_id: u64,
     /// Event type (text delta, completed, error).
     pub event_type: EventType,
-    /// Item type from the responses type system (0=message, 1=function_call, 3=reasoning).
-    pub item_type: u8,
-    /// Content type (5=output_text, 8=reasoning_text).
-    pub content_type: u8,
+    /// Item type from the responses type system.
+    pub item_type: ItemType,
+    /// Content type from the responses type system.
+    pub content_type: ContentType,
     /// Whether this is the final event for this request.
     pub is_final: bool,
     /// Decoded text delta (empty for completion events).
@@ -122,8 +123,8 @@ impl Default for BatchEvent {
         Self {
             request_id: 0,
             event_type: EventType::TextDelta,
-            item_type: 0,
-            content_type: 0,
+            item_type: ItemType::Message,
+            content_type: ContentType::OutputText,
             is_final: false,
             text: String::new(),
             token_id: 0,
@@ -146,8 +147,8 @@ pub struct BatchResult {
     pub generation_ns: u64,
     /// Time to first token in nanoseconds.
     pub ttft_ns: u64,
-    /// Finish reason (0=eos, 1=length, 2=stop_sequence, 3=tool_calls, 4=content_filter, 5=cancelled).
-    pub finish_reason: u8,
+    /// Reason generation stopped.
+    pub finish_reason: FinishReason,
     /// Full generated text.
     pub text: Option<String>,
     /// Tool calls (if finish_reason == tool_calls).
@@ -202,20 +203,10 @@ impl BatchHandle {
     /// Applies the chat template, tokenizes, sets up grammar constraints,
     /// and submits to the scheduler. Returns a non-zero request ID.
     pub fn submit(&self, chat: &ChatHandle, config: &GenerateConfig) -> Result<u64> {
-        self.submit_raw(chat.as_ptr(), config)
-    }
-
-    /// Submit using a raw chat handle pointer.
-    ///
-    /// # Safety
-    ///
-    /// `chat_ptr` must be a valid, non-null pointer to a `TaluChatHandle`
-    /// that remains valid for the duration of this call.
-    pub fn submit_raw(&self, chat_ptr: *mut c_void, config: &GenerateConfig) -> Result<u64> {
         let config_holder = ConfigHolder::new(config)?;
 
         let request_id =
-            unsafe { talu_sys::talu_batch_submit(self.ptr, chat_ptr, config_holder.as_ptr()) };
+            unsafe { talu_sys::talu_batch_submit(self.ptr, chat.as_ptr(), config_holder.as_ptr()) };
 
         if request_id == 0 {
             return Err(error_from_last_or("Batch submit failed"));
@@ -252,8 +243,8 @@ impl BatchHandle {
             events_out[i] = BatchEvent {
                 request_id: c.request_id,
                 event_type: EventType::from(c.event_type),
-                item_type: c.item_type,
-                content_type: c.content_type,
+                item_type: ItemType::from(c.item_type),
+                content_type: ContentType::from(c.content_type),
                 is_final: c.is_final != 0,
                 text,
                 token_id: c.token_id,
@@ -342,7 +333,9 @@ impl BatchHandle {
             prefill_ns: c_result.prefill_ns,
             generation_ns: c_result.generation_ns,
             ttft_ns: c_result.ttft_ns,
-            finish_reason: c_result.finish_reason,
+            finish_reason: FinishReason::from(talu_sys::CFinishReason::from(
+                c_result.finish_reason,
+            )),
             text,
             tool_calls,
         };
@@ -431,8 +424,8 @@ impl BatchHandle {
                 let event = BatchEvent {
                     request_id: c.request_id,
                     event_type: EventType::from(c.event_type),
-                    item_type: c.item_type,
-                    content_type: c.content_type,
+                    item_type: ItemType::from(c.item_type),
+                    content_type: ContentType::from(c.content_type),
                     is_final: c.is_final != 0,
                     text,
                     token_id: c.token_id,
