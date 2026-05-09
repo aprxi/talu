@@ -19,24 +19,6 @@ pub const EosTokenResult = tokenizer_mod.EosTokenResult;
 // Native build uses C allocator
 const allocator = std.heap.c_allocator;
 
-/// Sampling configuration for C API
-pub const SamplingParams = extern struct {
-    /// Sampling strategy: 0=greedy, 1=top_k, 2=top_p
-    strategy: u32 = 0,
-    /// Temperature (default 1.0, 0 means use model default)
-    temperature: f32 = 1.0,
-    /// Top-k value (default 50)
-    top_k: u32 = 50,
-    /// Top-p value (default 0.9)
-    top_p: f32 = 0.9,
-    /// Min-p value (default 0.0 = disabled)
-    min_p: f32 = 0.0,
-    /// Repetition penalty (default 1.0 = no penalty)
-    repetition_penalty: f32 = 1.0,
-    /// Random seed for reproducibility (0 = time-based)
-    seed: u64 = 0,
-};
-
 pub const GenerationConfigInfo = extern struct {
     temperature: f32,
     top_k: usize,

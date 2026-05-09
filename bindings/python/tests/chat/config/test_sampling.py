@@ -63,8 +63,8 @@ class TestSamplingParamsCreation:
 class TestSamplingParamsStructLayout:
     """Tests for SamplingParams ctypes struct layout."""
 
-    def test_struct_can_be_passed_to_c(self):
-        """SamplingParams struct can be passed to C (no exceptions)."""
+    def test_struct_has_expected_ctypes_layout(self):
+        """SamplingParams keeps the expected ctypes field layout."""
         params = SamplingParams(
             strategy=1,
             temperature=0.7,
@@ -73,7 +73,6 @@ class TestSamplingParamsStructLayout:
             min_p=0.05,
             repetition_penalty=1.2,
         )
-        # Verify struct can be passed to C (no exceptions)
         assert params.strategy == 1
         assert abs(params.min_p - 0.05) < 1e-5
         assert abs(params.repetition_penalty - 1.2) < 1e-5

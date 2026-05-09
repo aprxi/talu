@@ -23,6 +23,12 @@
 #include <stdatomic.h>
 #include <stddef.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define TALU_INTERNAL __attribute__((visibility("hidden")))
+#else
+#define TALU_INTERNAL
+#endif
+
 /* Thread-local jump buffer and state */
 static _Thread_local sigjmp_buf talu_signal_guard_jmpbuf;
 static _Thread_local volatile sig_atomic_t talu_signal_guard_active = 0;
@@ -39,7 +45,7 @@ static void talu_signal_handler(int sig) {
 }
 
 /* Install signal handlers - call once per thread */
-void talu_signal_guard_install(void) {
+TALU_INTERNAL void talu_signal_guard_install(void) {
     struct sigaction sa;
     sa.sa_handler = talu_signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -57,7 +63,7 @@ void talu_signal_guard_install(void) {
  *         func's return value if func returned non-zero
  *         -1 if SIGBUS was caught during execution
  */
-int talu_signal_guard_call(int (*func)(void*), void* ctx) {
+TALU_INTERNAL int talu_signal_guard_call(int (*func)(void*), void* ctx) {
     if (sigsetjmp(talu_signal_guard_jmpbuf, 1) == 0) {
         talu_signal_guard_active = 1;
         int result = func(ctx);

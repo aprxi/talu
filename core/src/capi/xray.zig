@@ -52,16 +52,6 @@ pub const CapturedTensorInfo = extern struct {
     timestamp_ns: i64,
 };
 
-/// Query result
-pub const QueryResult = extern struct {
-    /// Pointer to array of CapturedTensorInfo (caller must free)
-    results: ?[*]CapturedTensorInfo,
-    /// Number of results
-    count: usize,
-    /// Error message if failed (null on success)
-    error_msg: ?[*:0]const u8,
-};
-
 // =============================================================================
 // Capture Management
 // =============================================================================

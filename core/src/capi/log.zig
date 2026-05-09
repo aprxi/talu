@@ -5,23 +5,6 @@
 
 const log = @import("log_pkg");
 
-/// Log levels (matches log.Level enum values)
-pub const LogLevel = enum(c_int) {
-    trace = 1,
-    debug = 5,
-    info = 9,
-    warn = 13,
-    err = 17,
-    fatal = 21,
-    off = 255,
-};
-
-/// Log formats (matches log.Format enum values)
-pub const LogFormat = enum(c_int) {
-    json = 0,
-    human = 1,
-};
-
 /// Callback receiving core log records.
 pub const CLogCallback = ?*const fn (
     level: c_int,

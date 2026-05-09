@@ -440,11 +440,11 @@ class GenerationConfig:
 
     def _to_sampling_params(self) -> SamplingParams:
         """
-        Convert to C-compatible SamplingParams struct.
+        Convert to a SamplingParams helper struct.
 
         Returns
         -------
-            SamplingParams struct for passing to C-API.
+            SamplingParams struct with the effective sampling fields.
         """
         # Determine strategy based on temperature
         if self.temperature == 0.0:

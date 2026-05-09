@@ -164,7 +164,6 @@ class TestSamplingParamsConversion:
             min_p=0.05,
             repetition_penalty=1.2,
         )
-        # Verify struct can be passed to C (no exceptions)
         assert params.strategy == 1
         assert abs(params.min_p - 0.05) < 1e-5
         assert abs(params.repetition_penalty - 1.2) < 1e-5

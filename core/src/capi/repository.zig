@@ -48,7 +48,6 @@ fn setErr(comptime ctx: []const u8, err: anyerror) void {
 
 /// Re-export types for C API consumers.
 pub const CachedModelList = repository.CachedModelListC;
-pub const CachedModelEntry = repository.CachedModelC;
 pub const StringList = ffi.StringList;
 
 /// Re-export unified progress types.

@@ -31,6 +31,252 @@ fn isRemovedApiStubFile(file_name: []const u8) bool {
     return std.mem.eql(u8, file_name, "removed_apis_stubs.zig");
 }
 
+/// C API functions owned by the Rust binding.
+///
+/// The core C API is shared with Python/CLI/server. `talu-sys` should expose
+/// only symbols that Rust crates or Rust binding tests call directly. Keep this
+/// list explicit so new C exports do not silently become part of the Rust raw
+/// binding surface.
+const RUST_BINDING_FUNCTIONS = std.StaticStringMap(void).initComptime(.{
+    .{ "talu_apply_chat_template", {} },
+    .{ "talu_apply_chat_template_string", {} },
+    .{ "talu_backend_create_from_canonical", {} },
+    .{ "talu_backend_free", {} },
+    .{ "talu_backend_get_capabilities", {} },
+    .{ "talu_backend_model_info", {} },
+    .{ "talu_backend_synchronize", {} },
+    .{ "talu_batch_active_count", {} },
+    .{ "talu_batch_cancel", {} },
+    .{ "talu_batch_create", {} },
+    .{ "talu_batch_destroy", {} },
+    .{ "talu_batch_encode_result_free", {} },
+    .{ "talu_batch_has_active", {} },
+    .{ "talu_batch_result_free", {} },
+    .{ "talu_batch_run_loop", {} },
+    .{ "talu_batch_run_loop_final_only", {} },
+    .{ "talu_batch_step", {} },
+    .{ "talu_batch_submit", {} },
+    .{ "talu_batch_take_result", {} },
+    .{ "talu_batch_to_padded_tensor", {} },
+    .{ "talu_chat_create", {} },
+    .{ "talu_chat_create_with_session", {} },
+    .{ "talu_chat_create_with_system", {} },
+    .{ "talu_chat_create_with_system_and_session", {} },
+    .{ "talu_chat_free", {} },
+    .{ "talu_chat_get_conversation", {} },
+    .{ "talu_chat_get_prompt_id", {} },
+    .{ "talu_chat_get_system", {} },
+    .{ "talu_chat_get_tool_choice", {} },
+    .{ "talu_chat_get_tools", {} },
+    .{ "talu_chat_load_completions_json", {} },
+    .{ "talu_chat_set_messages", {} },
+    .{ "talu_chat_set_prompt_id", {} },
+    .{ "talu_chat_set_system", {} },
+    .{ "talu_chat_set_tool_choice", {} },
+    .{ "talu_chat_set_tools", {} },
+    .{ "talu_chat_to_json", {} },
+    .{ "talu_clear_error", {} },
+    .{ "talu_completions_validate_request", {} },
+    .{ "talu_config_canonicalize", {} },
+    .{ "talu_config_free", {} },
+    .{ "talu_config_get_view", {} },
+    .{ "talu_convert", {} },
+    .{ "talu_convert_free_string", {} },
+    .{ "talu_convert_parse_scheme", {} },
+    .{ "talu_decode_result_free", {} },
+    .{ "talu_describe", {} },
+    .{ "talu_encode_result_free", {} },
+    .{ "talu_execution_plan", {} },
+    .{ "talu_free_string", {} },
+    .{ "talu_get_eos_tokens", {} },
+    .{ "talu_get_generation_config", {} },
+    .{ "talu_get_log_format", {} },
+    .{ "talu_get_log_level", {} },
+    .{ "talu_last_error", {} },
+    .{ "talu_last_error_code", {} },
+    .{ "talu_model_hf_config_json", {} },
+    .{ "talu_model_info_free", {} },
+    .{ "talu_model_performance_hints", {} },
+    .{ "talu_padded_tensor_result_free", {} },
+    .{ "talu_repo_cache_dir_exists", {} },
+    .{ "talu_repo_delete", {} },
+    .{ "talu_repo_download_cancel", {} },
+    .{ "talu_repo_download_cancel_all", {} },
+    .{ "talu_repo_download_clear_finished", {} },
+    .{ "talu_repo_download_enqueue", {} },
+    .{ "talu_repo_download_pause", {} },
+    .{ "talu_repo_download_resume", {} },
+    .{ "talu_repo_downloads_json", {} },
+    .{ "talu_repo_fetch", {} },
+    .{ "talu_repo_get_cached_path", {} },
+    .{ "talu_repo_get_hf_home", {} },
+    .{ "talu_repo_get_talu_home", {} },
+    .{ "talu_repo_is_cached", {} },
+    .{ "talu_repo_is_model_id", {} },
+    .{ "talu_repo_list", {} },
+    .{ "talu_repo_list_count", {} },
+    .{ "talu_repo_list_free", {} },
+    .{ "talu_repo_list_get_id", {} },
+    .{ "talu_repo_list_get_path", {} },
+    .{ "talu_repo_list_get_source", {} },
+    .{ "talu_repo_list_models", {} },
+    .{ "talu_repo_mtime", {} },
+    .{ "talu_repo_resolve_path", {} },
+    .{ "talu_repo_search", {} },
+    .{ "talu_repo_search_result_count", {} },
+    .{ "talu_repo_search_result_free", {} },
+    .{ "talu_repo_search_result_get_downloads", {} },
+    .{ "talu_repo_search_result_get_id", {} },
+    .{ "talu_repo_search_result_get_last_modified", {} },
+    .{ "talu_repo_search_result_get_likes", {} },
+    .{ "talu_repo_search_result_get_params", {} },
+    .{ "talu_repo_search_result_get_pipeline_tag", {} },
+    .{ "talu_repo_search_rich", {} },
+    .{ "talu_repo_size", {} },
+    .{ "talu_repo_string_list_count", {} },
+    .{ "talu_repo_string_list_free", {} },
+    .{ "talu_repo_string_list_get", {} },
+    .{ "talu_repo_total_size", {} },
+    .{ "talu_resolve_effective_generation_config", {} },
+    .{ "talu_responses_append_function_call", {} },
+    .{ "talu_responses_append_function_call_output", {} },
+    .{ "talu_responses_append_message", {} },
+    .{ "talu_responses_append_text_content", {} },
+    .{ "talu_responses_clear", {} },
+    .{ "talu_responses_clear_keeping_system", {} },
+    .{ "talu_responses_clone", {} },
+    .{ "talu_responses_clone_prefix", {} },
+    .{ "talu_responses_create", {} },
+    .{ "talu_responses_create_with_session", {} },
+    .{ "talu_responses_free", {} },
+    .{ "talu_responses_get_item", {} },
+    .{ "talu_responses_insert_message", {} },
+    .{ "talu_responses_item_as_function_call", {} },
+    .{ "talu_responses_item_as_function_call_output", {} },
+    .{ "talu_responses_item_as_item_reference", {} },
+    .{ "talu_responses_item_as_message", {} },
+    .{ "talu_responses_item_as_reasoning", {} },
+    .{ "talu_responses_item_count", {} },
+    .{ "talu_responses_item_fco_get_part", {} },
+    .{ "talu_responses_item_get_generation_json", {} },
+    .{ "talu_responses_item_message_content_count", {} },
+    .{ "talu_responses_item_message_get_content", {} },
+    .{ "talu_responses_item_reasoning_content_count", {} },
+    .{ "talu_responses_item_reasoning_get_content", {} },
+    .{ "talu_responses_item_reasoning_get_summary", {} },
+    .{ "talu_responses_item_reasoning_summary_count", {} },
+    .{ "talu_responses_item_type", {} },
+    .{ "talu_responses_load_completions_json", {} },
+    .{ "talu_responses_load_responses_json", {} },
+    .{ "talu_responses_pop", {} },
+    .{ "talu_responses_remove", {} },
+    .{ "talu_responses_set_item_status", {} },
+    .{ "talu_responses_to_completions_json", {} },
+    .{ "talu_responses_to_responses_json", {} },
+    .{ "talu_responses_truncate_after", {} },
+    .{ "talu_router_close_all", {} },
+    .{ "talu_router_embed", {} },
+    .{ "talu_router_embedding_dim", {} },
+    .{ "talu_router_embedding_free", {} },
+    .{ "talu_scheduler_score_tokens_joint", {} },
+    .{ "talu_scheduler_score_tokens_nll", {} },
+    .{ "talu_session_id_new", {} },
+    .{ "talu_set_log_callback", {} },
+    .{ "talu_set_log_filter", {} },
+    .{ "talu_set_log_format", {} },
+    .{ "talu_set_log_level", {} },
+    .{ "talu_take_last_error", {} },
+    .{ "talu_template_render", {} },
+    .{ "talu_text_free", {} },
+    .{ "talu_tokenize_bytes_result_free", {} },
+    .{ "talu_tokenize_result_free", {} },
+    .{ "talu_tokenizer_create", {} },
+    .{ "talu_tokenizer_create_from_json", {} },
+    .{ "talu_tokenizer_decode", {} },
+    .{ "talu_tokenizer_encode", {} },
+    .{ "talu_tokenizer_encode_batch", {} },
+    .{ "talu_tokenizer_free", {} },
+    .{ "talu_tokenizer_get_eos_tokens", {} },
+    .{ "talu_tokenizer_get_model_dir", {} },
+    .{ "talu_tokenizer_get_model_max_length", {} },
+    .{ "talu_tokenizer_get_special_tokens", {} },
+    .{ "talu_tokenizer_get_vocab", {} },
+    .{ "talu_tokenizer_get_vocab_size", {} },
+    .{ "talu_tokenizer_id_to_token", {} },
+    .{ "talu_tokenizer_token_to_id", {} },
+    .{ "talu_tokenizer_tokenize", {} },
+    .{ "talu_tokenizer_tokenize_bytes", {} },
+    .{ "talu_tokens_concat", {} },
+    .{ "talu_tokens_free", {} },
+    .{ "talu_vocab_result_free", {} },
+    .{ "talu_xray_capture_clear", {} },
+    .{ "talu_xray_capture_count", {} },
+    .{ "talu_xray_capture_create", {} },
+    .{ "talu_xray_capture_create_all", {} },
+    .{ "talu_xray_capture_destroy", {} },
+    .{ "talu_xray_capture_disable", {} },
+    .{ "talu_xray_capture_enable", {} },
+    .{ "talu_xray_get", {} },
+    .{ "talu_xray_point_name", {} },
+    .{ "talu_xray_reference_data_destroy", {} },
+    .{ "talu_xray_reference_data_load_json", {} },
+    .{ "talu_xray_reference_data_save_json", {} },
+    .{ "talu_xray_reference_recorder_create", {} },
+    .{ "talu_xray_reference_recorder_destroy", {} },
+    .{ "talu_xray_reference_recorder_finalize", {} },
+    .{ "talu_xray_reference_recorder_next_token", {} },
+    .{ "talu_xray_reference_recorder_record_token", {} },
+    .{ "talu_xray_reference_verifier_create", {} },
+    .{ "talu_xray_reference_verifier_destroy", {} },
+    .{ "talu_xray_reference_verifier_finish", {} },
+    .{ "talu_xray_reference_verifier_get_next_token", {} },
+    .{ "talu_xray_reference_verifier_has_diverged", {} },
+    .{ "talu_xray_reference_verifier_next_token", {} },
+    .{ "talu_xray_teacher_forcing_disable", {} },
+    .{ "talu_xray_teacher_forcing_enable_with_verifier", {} },
+    .{ "talu_xray_teacher_forcing_get_next_token", {} },
+    .{ "talu_xray_teacher_forcing_is_enabled", {} },
+    .{ "talu_xray_verify_capture_create_recording", {} },
+    .{ "talu_xray_verify_capture_create_verification", {} },
+    .{ "talu_xray_verify_capture_destroy", {} },
+    .{ "talu_xray_verify_capture_disable", {} },
+    .{ "talu_xray_verify_capture_enable", {} },
+    .{ "talu_xray_verify_capture_save_recording_full_npz", {} },
+    .{ "talu_xray_verify_clear_exact_emission_filter", {} },
+    .{ "talu_xray_verify_clear_full_capture_override", {} },
+    .{ "talu_xray_verify_clear_ignore_token_parity_override", {} },
+    .{ "talu_xray_verify_clear_point_mask_override", {} },
+    .{ "talu_xray_verify_clear_token_only_override", {} },
+    .{ "talu_xray_verify_set_exact_emission_filter", {} },
+    .{ "talu_xray_verify_set_full_capture", {} },
+    .{ "talu_xray_verify_set_ignore_token_parity", {} },
+    .{ "talu_xray_verify_set_point_mask", {} },
+    .{ "talu_xray_verify_set_token_only", {} },
+});
+
+/// C API types owned by Rust even when no allowed raw function signature names
+/// them directly. These are semantic helper types used by the safe Rust layer
+/// to interpret integer fields or callback payloads.
+const RUST_BINDING_TYPES = [_][]const u8{
+    "CEvent",
+    "CFinishReason",
+    "ErrorCode",
+};
+
+fn isRustBindingFunction(name: []const u8) bool {
+    return RUST_BINDING_FUNCTIONS.has(name);
+}
+
+fn filterFunctionsForRustBinding(functions: *std.ArrayListUnmanaged(FunctionSignature)) void {
+    var write_index: usize = 0;
+    for (functions.items) |func| {
+        if (!isRustBindingFunction(func.name)) continue;
+        functions.items[write_index] = func;
+        write_index += 1;
+    }
+    functions.shrinkRetainingCapacity(write_index);
+}
+
 fn rustPointerType(is_const: bool, pointee: []const u8) []const u8 {
     return std.fmt.allocPrint(
         std.heap.page_allocator,
@@ -80,6 +326,107 @@ const FunctionSignature = struct {
         zig_type: []const u8,
     };
 };
+
+fn rustBindingTypeName(zig_type: []const u8) []const u8 {
+    var type_name = std.mem.trim(u8, zig_type, " \t\r\n");
+
+    while (type_name.len > 0) {
+        if (std.mem.startsWith(u8, type_name, "?")) {
+            type_name = std.mem.trim(u8, type_name[1..], " \t\r\n");
+            continue;
+        }
+        if (std.mem.startsWith(u8, type_name, "*")) {
+            type_name = std.mem.trim(u8, type_name[1..], " \t\r\n");
+            continue;
+        }
+        if (std.mem.startsWith(u8, type_name, "[")) {
+            if (std.mem.indexOfScalar(u8, type_name, ']')) |end| {
+                type_name = std.mem.trim(u8, type_name[end + 1 ..], " \t\r\n");
+                continue;
+            }
+        }
+        if (std.mem.startsWith(u8, type_name, "const ")) {
+            type_name = std.mem.trim(u8, type_name["const ".len..], " \t\r\n");
+            continue;
+        }
+        break;
+    }
+
+    if (std.mem.lastIndexOfScalar(u8, type_name, '.')) |dot| {
+        type_name = type_name[dot + 1 ..];
+    }
+
+    if (eql(type_name, "RouterGenerateConfig")) return "CGenerateConfig";
+    return type_name;
+}
+
+fn markRustBindingType(
+    zig_type: []const u8,
+    structs: *const std.StringHashMap(StructInfo),
+    enums: *const std.StringHashMap(EnumInfo),
+    keep_structs: *std.StringHashMap(void),
+    keep_enums: *std.StringHashMap(void),
+) !void {
+    const type_name = rustBindingTypeName(zig_type);
+
+    if (structs.get(type_name)) |info| {
+        if (keep_structs.contains(type_name)) return;
+        try keep_structs.put(type_name, {});
+        for (info.fields) |field| {
+            try markRustBindingType(field.zig_type, structs, enums, keep_structs, keep_enums);
+        }
+        return;
+    }
+
+    if (enums.contains(type_name)) {
+        if (!keep_enums.contains(type_name)) {
+            try keep_enums.put(type_name, {});
+        }
+    }
+}
+
+fn filterRustBindingTypes(
+    allocator: std.mem.Allocator,
+    functions: []const FunctionSignature,
+    structs: *std.StringHashMap(StructInfo),
+    enums: *std.StringHashMap(EnumInfo),
+) !void {
+    var keep_structs = std.StringHashMap(void).init(allocator);
+    defer keep_structs.deinit();
+    var keep_enums = std.StringHashMap(void).init(allocator);
+    defer keep_enums.deinit();
+
+    for (functions) |func| {
+        try markRustBindingType(func.return_type, structs, enums, &keep_structs, &keep_enums);
+        for (func.params) |param| {
+            try markRustBindingType(param.zig_type, structs, enums, &keep_structs, &keep_enums);
+        }
+    }
+
+    for (RUST_BINDING_TYPES) |type_name| {
+        try markRustBindingType(type_name, structs, enums, &keep_structs, &keep_enums);
+    }
+
+    var filtered_structs = std.StringHashMap(StructInfo).init(allocator);
+    var struct_it = structs.iterator();
+    while (struct_it.next()) |entry| {
+        if (keep_structs.contains(entry.key_ptr.*)) {
+            try filtered_structs.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    structs.deinit();
+    structs.* = filtered_structs;
+
+    var filtered_enums = std.StringHashMap(EnumInfo).init(allocator);
+    var enum_it = enums.iterator();
+    while (enum_it.next()) |entry| {
+        if (keep_enums.contains(entry.key_ptr.*)) {
+            try filtered_enums.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    enums.deinit();
+    enums.* = filtered_enums;
+}
 
 // Known opaque handle types (manually generated in output)
 const OPAQUE_HANDLES = [_][]const u8{
@@ -514,6 +861,9 @@ pub fn main() !void {
             }
         }
     }
+
+    filterFunctionsForRustBinding(&functions);
+    try filterRustBindingTypes(allocator, functions.items, &structs, &enums);
 
     // Generate Rust output to buffer first, then write
     var output_buffer = std.ArrayListUnmanaged(u8){};
@@ -1694,4 +2044,93 @@ test "zigToRustType preserves nested C pointer arrays for tokenizer batches" {
         "*const *const u8",
         zigToRustType("[*c]const [*c]const u8", &structs, &enums),
     );
+}
+
+test "rustBindingTypeName normalizes C ABI pointer syntax" {
+    try std.testing.expectEqualStrings("CGenerateConfig", rustBindingTypeName("?*const RouterGenerateConfig"));
+    try std.testing.expectEqualStrings("CToolCallRef", rustBindingTypeName("?[*]const CToolCallRef"));
+    try std.testing.expectEqualStrings("u8", rustBindingTypeName("[*:0]const u8"));
+}
+
+test "filterRustBindingTypes keeps only function-reachable types" {
+    var structs = std.StringHashMap(StructInfo).init(std.testing.allocator);
+    defer structs.deinit();
+    var enums = std.StringHashMap(EnumInfo).init(std.testing.allocator);
+    defer enums.deinit();
+
+    var live_inner_fields = [_]StructInfo.FieldInfo{
+        .{ .name = "mode", .zig_type = "LiveEnum" },
+    };
+    var live_outer_fields = [_]StructInfo.FieldInfo{
+        .{ .name = "inner", .zig_type = "LiveInner" },
+    };
+
+    try structs.put("LiveInner", .{
+        .name = "LiveInner",
+        .fields = &live_inner_fields,
+        .source_file = "test",
+    });
+    try structs.put("LiveOuter", .{
+        .name = "LiveOuter",
+        .fields = &live_outer_fields,
+        .source_file = "test",
+    });
+    try structs.put("DeadStruct", .{
+        .name = "DeadStruct",
+        .fields = &.{},
+        .source_file = "test",
+    });
+    try structs.put("CEvent", .{
+        .name = "CEvent",
+        .fields = &.{},
+        .source_file = "test",
+    });
+    try enums.put("LiveEnum", .{
+        .name = "LiveEnum",
+        .repr_type = "u8",
+        .variants = &.{},
+        .source_file = "test",
+    });
+    try enums.put("DeadEnum", .{
+        .name = "DeadEnum",
+        .repr_type = "u8",
+        .variants = &.{},
+        .source_file = "test",
+    });
+    try enums.put("CFinishReason", .{
+        .name = "CFinishReason",
+        .repr_type = "u8",
+        .variants = &.{},
+        .source_file = "test",
+    });
+    try enums.put("ErrorCode", .{
+        .name = "ErrorCode",
+        .repr_type = "i32",
+        .variants = &.{},
+        .source_file = "test",
+    });
+
+    var params = [_]FunctionSignature.ParamInfo{
+        .{ .name = "config", .zig_type = "?*const LiveOuter" },
+    };
+    var functions = [_]FunctionSignature{
+        .{
+            .name = "talu_test_live",
+            .params = &params,
+            .return_type = "i32",
+            .source_file = "test",
+            .line = 1,
+        },
+    };
+
+    try filterRustBindingTypes(std.testing.allocator, &functions, &structs, &enums);
+
+    try std.testing.expect(structs.contains("LiveOuter"));
+    try std.testing.expect(structs.contains("LiveInner"));
+    try std.testing.expect(!structs.contains("DeadStruct"));
+    try std.testing.expect(structs.contains("CEvent"));
+    try std.testing.expect(enums.contains("LiveEnum"));
+    try std.testing.expect(!enums.contains("DeadEnum"));
+    try std.testing.expect(enums.contains("CFinishReason"));
+    try std.testing.expect(enums.contains("ErrorCode"));
 }

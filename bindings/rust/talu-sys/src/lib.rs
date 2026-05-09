@@ -85,105 +85,6 @@ impl From<u32> for Scheme {
     }
 }
 
-/// Source: core/src/converter/scheme.zig
-#[repr(u32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum QualityProfile {
-    Best,
-    Good,
-    Custom,
-}
-
-impl From<u32> for QualityProfile {
-    fn from(value: u32) -> Self {
-        match value {
-            _ => QualityProfile::Custom,
-        }
-    }
-}
-
-/// Source: core/src/router/batch.zig
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum EventType {
-    TextDelta = 0,
-    Completed = 1,
-    Err = 2,
-}
-
-impl From<u8> for EventType {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => EventType::TextDelta,
-            1 => EventType::Completed,
-            2 => EventType::Err,
-            _ => EventType::Err,
-        }
-    }
-}
-
-/// Source: core/src/router/capi_bridge.zig
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CFinishReason {
-    EosToken = 0,
-    Length = 1,
-    StopSequence = 2,
-    ToolCalls = 3,
-    ContentFilter = 4,
-    Cancelled = 5,
-}
-
-impl From<u8> for CFinishReason {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => CFinishReason::EosToken,
-            1 => CFinishReason::Length,
-            2 => CFinishReason::StopSequence,
-            3 => CFinishReason::ToolCalls,
-            4 => CFinishReason::ContentFilter,
-            5 => CFinishReason::Cancelled,
-            _ => CFinishReason::Cancelled,
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(i32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LogFormat {
-    Json = 0,
-    Human = 1,
-}
-
-impl From<i32> for LogFormat {
-    fn from(value: i32) -> Self {
-        match value {
-            0 => LogFormat::Json,
-            1 => LogFormat::Human,
-            _ => LogFormat::Human,
-        }
-    }
-}
-
-/// Source: core/src/capi/types.zig
-#[repr(i32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BackendType {
-    Unspecified = -1,
-    Local = 0,
-}
-
-impl From<i32> for BackendType {
-    fn from(value: i32) -> Self {
-        match value {
-            -1 => BackendType::Unspecified,
-            0 => BackendType::Local,
-            _ => BackendType::Local,
-        }
-    }
-}
-
 /// Source: core/src/capi/error_codes.zig
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -322,49 +223,19 @@ impl From<i32> for ErrorCode {
     }
 }
 
-/// Source: core/src/capi/root.zig
-#[repr(i32)]
+/// Source: core/src/converter/scheme.zig
+#[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LogLevel {
-    Trace = 1,
-    Debug = 5,
-    Info = 9,
-    Warn = 13,
-    Err = 17,
-    Fatal = 21,
-    Off = 255,
+pub enum QualityProfile {
+    Best,
+    Good,
+    Custom,
 }
 
-impl From<i32> for LogLevel {
-    fn from(value: i32) -> Self {
+impl From<u32> for QualityProfile {
+    fn from(value: u32) -> Self {
         match value {
-            1 => LogLevel::Trace,
-            5 => LogLevel::Debug,
-            9 => LogLevel::Info,
-            13 => LogLevel::Warn,
-            17 => LogLevel::Err,
-            21 => LogLevel::Fatal,
-            255 => LogLevel::Off,
-            _ => LogLevel::Off,
-        }
-    }
-}
-
-/// Source: core/src/converter/calibration_capture.zig
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ActivationRole {
-    Generic,
-    AttnInput,
-    AttnOutput,
-    FfnInput,
-    FfnOutput,
-}
-
-impl From<u8> for ActivationRole {
-    fn from(value: u8) -> Self {
-        match value {
-            _ => ActivationRole::FfnOutput,
+            _ => QualityProfile::Custom,
         }
     }
 }
@@ -389,22 +260,28 @@ impl From<u32> for QuantLevel {
     }
 }
 
-/// Source: core/src/capi/template.zig
-#[repr(i32)]
+/// Source: core/src/router/capi_bridge.zig
+#[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CSpanSourceType {
-    StaticText = 0,
-    Variable = 1,
-    Expression = 2,
+pub enum CFinishReason {
+    EosToken = 0,
+    Length = 1,
+    StopSequence = 2,
+    ToolCalls = 3,
+    ContentFilter = 4,
+    Cancelled = 5,
 }
 
-impl From<i32> for CSpanSourceType {
-    fn from(value: i32) -> Self {
+impl From<u8> for CFinishReason {
+    fn from(value: u8) -> Self {
         match value {
-            0 => CSpanSourceType::StaticText,
-            1 => CSpanSourceType::Variable,
-            2 => CSpanSourceType::Expression,
-            _ => CSpanSourceType::Expression,
+            0 => CFinishReason::EosToken,
+            1 => CFinishReason::Length,
+            2 => CFinishReason::StopSequence,
+            3 => CFinishReason::ToolCalls,
+            4 => CFinishReason::ContentFilter,
+            5 => CFinishReason::Cancelled,
+            _ => CFinishReason::Cancelled,
         }
     }
 }
@@ -517,62 +394,6 @@ impl Default for ConvertOptions {
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CFullSessionInfo {
-    pub current_step: u64,
-    pub total_steps: u64,
-    pub total_params: u64,
-    pub batch_size: u32,
-    pub state: u8,
-    pub _padding: [u8; 3],
-}
-
-impl Default for CFullSessionInfo {
-    fn default() -> Self {
-        Self {
-            current_step: 0,
-            total_steps: 0,
-            total_params: 0,
-            batch_size: 0,
-            state: 0,
-            _padding: [0; 3],
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CTransformerConfig {
-    pub vocab_size: u32,
-    pub d_model: u32,
-    pub num_layers: u32,
-    pub num_heads: u32,
-    pub num_kv_heads: u32,
-    pub d_ff: u32,
-    pub seq_len: u32,
-    pub rope_theta: f32,
-    pub norm_eps: f32,
-}
-
-impl Default for CTransformerConfig {
-    fn default() -> Self {
-        Self {
-            vocab_size: 0,
-            d_model: 0,
-            num_layers: 0,
-            num_heads: 0,
-            num_kv_heads: 0,
-            d_ff: 0,
-            seq_len: 0,
-            rope_theta: 0.0,
-            norm_eps: 0.0,
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
 pub struct TokenizeResult {
     pub tokens: *const *const c_char,
     pub num_tokens: usize,
@@ -626,25 +447,91 @@ impl Default for CModelInfo {
     }
 }
 
-/// Source: core/src/capi/validate.zig
+/// Source: core/src/capi/converter.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct ValidateConfigC {
-    pub allow_thinking: bool,
-    pub max_thinking_tokens: usize,
-    pub start_marker: *const c_char,
-    pub soft_limit_ratio: f32,
-    pub soft_limit_bias: f32,
+pub struct ExecutionPlanInfo {
+    pub matmul_kernel: *const c_char,
+    pub attention_type: *const c_char,
+    pub ffn_type: *const c_char,
+    pub num_layers: c_int,
+    pub hidden_size: c_int,
+    pub num_heads: c_int,
+    pub num_kv_heads: c_int,
+    pub head_dim: c_int,
+    pub num_experts: c_int,
+    pub experts_per_token: c_int,
+    pub quant_bits: c_int,
+    pub quant_group_size: c_int,
+    pub uses_gqa: bool,
+    pub uses_moe: bool,
+    pub uses_quantization: bool,
+    pub uses_gelu: bool,
+    pub is_supported: bool,
+    pub error_msg: *const c_char,
 }
 
-impl Default for ValidateConfigC {
+impl Default for ExecutionPlanInfo {
     fn default() -> Self {
         Self {
-            allow_thinking: false,
-            max_thinking_tokens: 512,
-            start_marker: std::ptr::null(),
-            soft_limit_ratio: 0.9,
-            soft_limit_bias: -2.0,
+            matmul_kernel: std::ptr::null(),
+            attention_type: std::ptr::null(),
+            ffn_type: std::ptr::null(),
+            num_layers: 0,
+            hidden_size: 0,
+            num_heads: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            num_experts: 0,
+            experts_per_token: 0,
+            quant_bits: 0,
+            quant_group_size: 0,
+            uses_gqa: false,
+            uses_moe: false,
+            uses_quantization: false,
+            uses_gelu: false,
+            is_supported: false,
+            error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct BatchEncodeResult {
+    pub ids: *mut u32,
+    pub offsets: *mut usize,
+    pub total_tokens: usize,
+    pub num_sequences: usize,
+    pub error_msg: *const u8,
+}
+
+impl Default for BatchEncodeResult {
+    fn default() -> Self {
+        Self {
+            ids: std::ptr::null_mut(),
+            offsets: std::ptr::null_mut(),
+            total_tokens: 0,
+            num_sequences: 0,
+            error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/router/capi_bridge.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CLogitBiasEntry {
+    pub token_id: u32,
+    pub bias: f32,
+}
+
+impl Default for CLogitBiasEntry {
+    fn default() -> Self {
+        Self {
+            token_id: 0,
+            bias: 0.0,
         }
     }
 }
@@ -721,6 +608,64 @@ impl Default for EncodeResult {
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct CBatchResult {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub prefill_ns: u64,
+    pub generation_ns: u64,
+    pub ttft_ns: u64,
+    pub finish_reason: u8,
+    pub _pad: [u8; 7],
+    pub text: *const c_char,
+    pub tool_calls: *const CToolCallRef,
+    pub tool_call_count: usize,
+    pub error_code: c_int,
+    pub _pad2: [u8; 4],
+}
+
+impl Default for CBatchResult {
+    fn default() -> Self {
+        Self {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prefill_ns: 0,
+            generation_ns: 0,
+            ttft_ns: 0,
+            finish_reason: 0,
+            _pad: [0; 7],
+            text: std::ptr::null(),
+            tool_calls: std::ptr::null(),
+            tool_call_count: 0,
+            error_code: 0,
+            _pad2: [0; 4],
+        }
+    }
+}
+
+/// Source: core/src/capi/types.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct LocalConfig {
+    pub gpu_layers: c_int,
+    pub use_mmap: u8,
+    pub num_threads: c_int,
+    pub _reserved: [u8; 32],
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            gpu_layers: 0,
+            use_mmap: 0,
+            num_threads: 0,
+            _reserved: [0; 32],
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct GenerationConfigInfo {
     pub temperature: f32,
     pub top_k: usize,
@@ -742,16 +687,61 @@ impl Default for GenerationConfigInfo {
 /// Source: core/src/router/capi_bridge.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CLogitBiasEntry {
-    pub token_id: u32,
-    pub bias: f32,
+pub struct CGenerateVisionImage {
+    pub pixels_ptr: *const f32,
+    pub pixel_count: usize,
+    pub width: u32,
+    pub height: u32,
+    pub grid_temporal: u32,
+    pub grid_height: u32,
+    pub grid_width: u32,
+    pub token_count: usize,
 }
 
-impl Default for CLogitBiasEntry {
+impl Default for CGenerateVisionImage {
     fn default() -> Self {
         Self {
-            token_id: 0,
-            bias: 0.0,
+            pixels_ptr: std::ptr::null(),
+            pixel_count: 0,
+            width: 0,
+            height: 0,
+            grid_temporal: 0,
+            grid_height: 0,
+            grid_width: 0,
+            token_count: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EffectiveGenConfig {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub seed: u64,
+    pub max_tokens: usize,
+    pub do_sample: bool,
+}
+
+impl Default for EffectiveGenConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            seed: 0,
+            max_tokens: 0,
+            do_sample: false,
         }
     }
 }
@@ -878,6 +868,30 @@ impl Default for ModelInfo {
     }
 }
 
+/// Source: core/src/capi/router.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct BackendCreateOptions {
+    pub progress_callback: *mut c_void,
+    pub progress_user_data: *mut c_void,
+}
+
+impl Default for BackendCreateOptions {
+    fn default() -> Self {
+        Self {
+            progress_callback: std::ptr::null_mut(),
+            progress_user_data: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Source: core/src/capi/types.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union BackendUnion {
+    pub local: LocalConfig,
+}
+
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -902,13 +916,86 @@ impl Default for DownloadQueueOptions {
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct PaddedTensorOptions {
+    pub pad_id: u32,
+    pub padding_side: u8,
+    pub max_length: usize,
+    pub truncate: bool,
+    pub return_attention_mask: bool,
+}
+
+impl Default for PaddedTensorOptions {
+    fn default() -> Self {
+        Self {
+            pad_id: 0,
+            padding_side: 0,
+            max_length: 0,
+            truncate: false,
+            return_attention_mask: false,
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DownloadOptions {
+    pub token: *const c_char,
+    pub progress_callback: *mut c_void,
+    pub user_data: *mut c_void,
+    pub force: bool,
+    pub endpoint_url: *const c_char,
+    pub skip_weights: bool,
+    pub cancel_flag: *mut c_void,
+}
+
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        Self {
+            token: std::ptr::null(),
+            progress_callback: std::ptr::null_mut(),
+            user_data: std::ptr::null_mut(),
+            force: false,
+            endpoint_url: std::ptr::null(),
+            skip_weights: false,
+            cancel_flag: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Source: core/src/router/capi_bridge.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CToolCallRef {
+    pub item_index: usize,
+    pub call_id: *const c_char,
+    pub name: *const c_char,
+    pub arguments: *const c_char,
+}
+
+impl Default for CToolCallRef {
+    fn default() -> Self {
+        Self {
+            item_index: 0,
+            call_id: std::ptr::null(),
+            name: std::ptr::null(),
+            arguments: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct CBatchConfig {
     pub max_concurrent: usize,
 }
 
 impl Default for CBatchConfig {
     fn default() -> Self {
-        Self { max_concurrent: 0 }
+        Self {
+            max_concurrent: 0,
+        }
     }
 }
 
@@ -979,395 +1066,6 @@ impl Default for CContentPart {
             tertiary_len: 0,
             quaternary_ptr: std::ptr::null(),
             quaternary_len: 0,
-        }
-    }
-}
-
-/// Source: core/src/router/capi_bridge.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CGenerateVisionImage {
-    pub pixels_ptr: *const f32,
-    pub pixel_count: usize,
-    pub width: u32,
-    pub height: u32,
-    pub grid_temporal: u32,
-    pub grid_height: u32,
-    pub grid_width: u32,
-    pub token_count: usize,
-}
-
-impl Default for CGenerateVisionImage {
-    fn default() -> Self {
-        Self {
-            pixels_ptr: std::ptr::null(),
-            pixel_count: 0,
-            width: 0,
-            height: 0,
-            grid_temporal: 0,
-            grid_height: 0,
-            grid_width: 0,
-            token_count: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CFunctionCallOutputItem {
-    pub call_id_ptr: *const c_char,
-    pub output_text_ptr: *const u8,
-    pub output_text_len: usize,
-    pub output_parts_count: usize,
-    pub is_text_output: bool,
-    pub _padding: [u8; 7],
-}
-
-impl Default for CFunctionCallOutputItem {
-    fn default() -> Self {
-        Self {
-            call_id_ptr: std::ptr::null(),
-            output_text_ptr: std::ptr::null(),
-            output_text_len: 0,
-            output_parts_count: 0,
-            is_text_output: false,
-            _padding: [0; 7],
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CMessageItem {
-    pub role: u8,
-    pub _padding: [u8; 7],
-    pub content_count: usize,
-    pub raw_role_ptr: *const c_char,
-}
-
-impl Default for CMessageItem {
-    fn default() -> Self {
-        Self {
-            role: 0,
-            _padding: [0; 7],
-            content_count: 0,
-            raw_role_ptr: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CapturedTensorInfo {
-    pub point: u8,
-    pub layer: u16,
-    pub token: u32,
-    pub position: u32,
-    pub backend: u8,
-    pub shape: [u32; 4],
-    pub ndim: u8,
-    pub dtype: u8,
-    pub kernel_name: [u8; 48],
-    pub work_flops: u64,
-    pub work_bytes: u64,
-    pub stats: TensorStats,
-    pub timestamp_ns: i64,
-}
-
-impl Default for CapturedTensorInfo {
-    fn default() -> Self {
-        Self {
-            point: 0,
-            layer: 0,
-            token: 0,
-            position: 0,
-            backend: 0,
-            shape: [0; 4],
-            ndim: 0,
-            dtype: 0,
-            kernel_name: [0; 48],
-            work_flops: 0,
-            work_bytes: 0,
-            stats: TensorStats::default(),
-            timestamp_ns: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct QueryResult {
-    pub results: *mut CapturedTensorInfo,
-    pub count: usize,
-    pub error_msg: *const c_char,
-}
-
-impl Default for QueryResult {
-    fn default() -> Self {
-        Self {
-            results: std::ptr::null_mut(),
-            count: 0,
-            error_msg: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CItemReferenceItem {
-    pub id_ptr: *const c_char,
-}
-
-impl Default for CItemReferenceItem {
-    fn default() -> Self {
-        Self {
-            id_ptr: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/converter/scheme.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct OverrideRule {
-    pub pattern: *const c_char,
-    pub scheme: Scheme,
-}
-
-impl Default for OverrideRule {
-    fn default() -> Self {
-        Self {
-            pattern: std::ptr::null(),
-            scheme: Scheme::from(0),
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TokenOffset {
-    pub start: u32,
-    pub end: u32,
-}
-
-impl Default for TokenOffset {
-    fn default() -> Self {
-        Self { start: 0, end: 0 }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct SpecialTokensResult {
-    pub bos_token_id: c_int,
-    pub unk_token_id: c_int,
-    pub pad_token_id: c_int,
-}
-
-impl Default for SpecialTokensResult {
-    fn default() -> Self {
-        Self {
-            bos_token_id: 0,
-            unk_token_id: 0,
-            pad_token_id: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/types.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TaluCapabilities {
-    pub abi_version: u32,
-    pub struct_size: u32,
-    pub streaming: u8,
-    pub tool_calling: u8,
-    pub logprobs: u8,
-    pub embeddings: u8,
-    pub json_schema: u8,
-    pub _reserved: [u8; 32],
-}
-
-impl Default for TaluCapabilities {
-    fn default() -> Self {
-        Self {
-            abi_version: 0,
-            struct_size: 0,
-            streaming: 0,
-            tool_calling: 0,
-            logprobs: 0,
-            embeddings: 0,
-            json_schema: 0,
-            _reserved: [0; 32],
-        }
-    }
-}
-
-/// Source: core/src/capi/converter.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ConvertResult {
-    pub output_path: *const c_char,
-    pub error_msg: *const c_char,
-    pub success: bool,
-}
-
-impl Default for ConvertResult {
-    fn default() -> Self {
-        Self {
-            output_path: std::ptr::null(),
-            error_msg: std::ptr::null(),
-            success: false,
-        }
-    }
-}
-
-/// Source: core/src/capi/types.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct LocalConfig {
-    pub gpu_layers: c_int,
-    pub use_mmap: u8,
-    pub num_threads: c_int,
-    pub _reserved: [u8; 32],
-}
-
-impl Default for LocalConfig {
-    fn default() -> Self {
-        Self {
-            gpu_layers: 0,
-            use_mmap: 0,
-            num_threads: 0,
-            _reserved: [0; 32],
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ChatCreateOptions {
-    pub offline: bool,
-}
-
-impl Default for ChatCreateOptions {
-    fn default() -> Self {
-        Self { offline: false }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CBatchEvent {
-    pub request_id: u64,
-    pub event_type: u8,
-    pub item_type: u8,
-    pub content_type: u8,
-    pub is_final: u8,
-    pub _pad: [u8; 4],
-    pub text_ptr: *const u8,
-    pub text_len: usize,
-    pub token_id: u32,
-    pub _pad2: [u8; 4],
-    pub tokens_generated: usize,
-    pub timestamp_ns: i64,
-}
-
-impl Default for CBatchEvent {
-    fn default() -> Self {
-        Self {
-            request_id: 0,
-            event_type: 0,
-            item_type: 0,
-            content_type: 0,
-            is_final: 0,
-            _pad: [0; 4],
-            text_ptr: std::ptr::null(),
-            text_len: 0,
-            token_id: 0,
-            _pad2: [0; 4],
-            tokens_generated: 0,
-            timestamp_ns: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/converter.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ExecutionPlanInfo {
-    pub matmul_kernel: *const c_char,
-    pub attention_type: *const c_char,
-    pub ffn_type: *const c_char,
-    pub num_layers: c_int,
-    pub hidden_size: c_int,
-    pub num_heads: c_int,
-    pub num_kv_heads: c_int,
-    pub head_dim: c_int,
-    pub num_experts: c_int,
-    pub experts_per_token: c_int,
-    pub quant_bits: c_int,
-    pub quant_group_size: c_int,
-    pub uses_gqa: bool,
-    pub uses_moe: bool,
-    pub uses_quantization: bool,
-    pub uses_gelu: bool,
-    pub is_supported: bool,
-    pub error_msg: *const c_char,
-}
-
-impl Default for ExecutionPlanInfo {
-    fn default() -> Self {
-        Self {
-            matmul_kernel: std::ptr::null(),
-            attention_type: std::ptr::null(),
-            ffn_type: std::ptr::null(),
-            num_layers: 0,
-            hidden_size: 0,
-            num_heads: 0,
-            num_kv_heads: 0,
-            head_dim: 0,
-            num_experts: 0,
-            experts_per_token: 0,
-            quant_bits: 0,
-            quant_group_size: 0,
-            uses_gqa: false,
-            uses_moe: false,
-            uses_quantization: false,
-            uses_gelu: false,
-            is_supported: false,
-            error_msg: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct BatchEncodeResult {
-    pub ids: *mut u32,
-    pub offsets: *mut usize,
-    pub total_tokens: usize,
-    pub num_sequences: usize,
-    pub error_msg: *const u8,
-}
-
-impl Default for BatchEncodeResult {
-    fn default() -> Self {
-        Self {
-            ids: std::ptr::null_mut(),
-            offsets: std::ptr::null_mut(),
-            total_tokens: 0,
-            num_sequences: 0,
-            error_msg: std::ptr::null(),
         }
     }
 }
@@ -1448,26 +1146,24 @@ impl Default for CGenerateConfig {
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct SamplingParams {
-    pub strategy: u32,
-    pub temperature: f32,
-    pub top_k: u32,
-    pub top_p: f32,
-    pub min_p: f32,
-    pub repetition_penalty: f32,
-    pub seed: u64,
+pub struct CFunctionCallOutputItem {
+    pub call_id_ptr: *const c_char,
+    pub output_text_ptr: *const u8,
+    pub output_text_len: usize,
+    pub output_parts_count: usize,
+    pub is_text_output: bool,
+    pub _padding: [u8; 7],
 }
 
-impl Default for SamplingParams {
+impl Default for CFunctionCallOutputItem {
     fn default() -> Self {
         Self {
-            strategy: 0,
-            temperature: 1.0,
-            top_k: 50,
-            top_p: 0.9,
-            min_p: 0.0,
-            repetition_penalty: 1.0,
-            seed: 0,
+            call_id_ptr: std::ptr::null(),
+            output_text_ptr: std::ptr::null(),
+            output_text_len: 0,
+            output_parts_count: 0,
+            is_text_output: false,
+            _padding: [0; 7],
         }
     }
 }
@@ -1475,225 +1171,20 @@ impl Default for SamplingParams {
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CBatchResult {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub prefill_ns: u64,
-    pub generation_ns: u64,
-    pub ttft_ns: u64,
-    pub finish_reason: u8,
-    pub _pad: [u8; 7],
-    pub text: *const c_char,
-    pub tool_calls: *const CToolCallRef,
-    pub tool_call_count: usize,
-    pub error_code: c_int,
-    pub _pad2: [u8; 4],
+pub struct CMessageItem {
+    pub role: u8,
+    pub _padding: [u8; 7],
+    pub content_count: usize,
+    pub raw_role_ptr: *const c_char,
 }
 
-impl Default for CBatchResult {
+impl Default for CMessageItem {
     fn default() -> Self {
         Self {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            prefill_ns: 0,
-            generation_ns: 0,
-            ttft_ns: 0,
-            finish_reason: 0,
-            _pad: [0; 7],
-            text: std::ptr::null(),
-            tool_calls: std::ptr::null(),
-            tool_call_count: 0,
-            error_code: 0,
-            _pad2: [0; 4],
-        }
-    }
-}
-
-/// Source: core/src/capi/types.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub union BackendUnion {
-    pub local: LocalConfig,
-}
-
-/// Source: core/src/capi/validate.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct SemanticViolationC {
-    pub path: *const c_char,
-    pub message: *const c_char,
-    pub constraint_type: c_int,
-}
-
-impl Default for SemanticViolationC {
-    fn default() -> Self {
-        Self {
-            path: std::ptr::null(),
-            message: std::ptr::null(),
-            constraint_type: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EffectiveGenConfig {
-    pub temperature: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub min_p: f32,
-    pub repetition_penalty: f32,
-    pub presence_penalty: f32,
-    pub frequency_penalty: f32,
-    pub seed: u64,
-    pub max_tokens: usize,
-    pub do_sample: bool,
-}
-
-impl Default for EffectiveGenConfig {
-    fn default() -> Self {
-        Self {
-            temperature: 0.0,
-            top_k: 0,
-            top_p: 0.0,
-            min_p: 0.0,
-            repetition_penalty: 0.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            seed: 0,
-            max_tokens: 0,
-            do_sample: false,
-        }
-    }
-}
-
-/// Source: core/src/capi/router.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct BackendCreateOptions {
-    pub progress_callback: *mut c_void,
-    pub progress_user_data: *mut c_void,
-}
-
-impl Default for BackendCreateOptions {
-    fn default() -> Self {
-        Self {
-            progress_callback: std::ptr::null_mut(),
-            progress_user_data: std::ptr::null_mut(),
-        }
-    }
-}
-
-/// Source: core/src/capi/types.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TaluModelSpec {
-    pub abi_version: u32,
-    pub struct_size: u32,
-    pub ref_: *const c_char,
-    pub backend_type_raw: c_int,
-    pub backend_config: BackendUnion,
-}
-
-impl Default for TaluModelSpec {
-    fn default() -> Self {
-        Self {
-            abi_version: 0,
-            struct_size: 0,
-            ref_: std::ptr::null(),
-            backend_type_raw: 0,
-            backend_config: unsafe { std::mem::zeroed() },
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct PaddedTensorOptions {
-    pub pad_id: u32,
-    pub padding_side: u8,
-    pub max_length: usize,
-    pub truncate: bool,
-    pub return_attention_mask: bool,
-}
-
-impl Default for PaddedTensorOptions {
-    fn default() -> Self {
-        Self {
-            pad_id: 0,
-            padding_side: 0,
-            max_length: 0,
-            truncate: false,
-            return_attention_mask: false,
-        }
-    }
-}
-
-/// Source: core/src/capi/root.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct DownloadOptions {
-    pub token: *const c_char,
-    pub progress_callback: *mut c_void,
-    pub user_data: *mut c_void,
-    pub force: bool,
-    pub endpoint_url: *const c_char,
-    pub skip_weights: bool,
-    pub cancel_flag: *mut c_void,
-}
-
-impl Default for DownloadOptions {
-    fn default() -> Self {
-        Self {
-            token: std::ptr::null(),
-            progress_callback: std::ptr::null_mut(),
-            user_data: std::ptr::null_mut(),
-            force: false,
-            endpoint_url: std::ptr::null(),
-            skip_weights: false,
-            cancel_flag: std::ptr::null_mut(),
-        }
-    }
-}
-
-/// Source: core/src/router/capi_bridge.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CToolCallRef {
-    pub item_index: usize,
-    pub call_id: *const c_char,
-    pub name: *const c_char,
-    pub arguments: *const c_char,
-}
-
-impl Default for CToolCallRef {
-    fn default() -> Self {
-        Self {
-            item_index: 0,
-            call_id: std::ptr::null(),
-            name: std::ptr::null(),
-            arguments: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/validate.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct SemanticValidationResultC {
-    pub is_valid: bool,
-    pub path: *const c_char,
-    pub message: *const c_char,
-}
-
-impl Default for SemanticValidationResultC {
-    fn default() -> Self {
-        Self {
-            is_valid: false,
-            path: std::ptr::null(),
-            message: std::ptr::null(),
+            role: 0,
+            _padding: [0; 7],
+            content_count: 0,
+            raw_role_ptr: std::ptr::null(),
         }
     }
 }
@@ -1757,6 +1248,142 @@ impl Default for DecodeResult {
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct CapturedTensorInfo {
+    pub point: u8,
+    pub layer: u16,
+    pub token: u32,
+    pub position: u32,
+    pub backend: u8,
+    pub shape: [u32; 4],
+    pub ndim: u8,
+    pub dtype: u8,
+    pub kernel_name: [u8; 48],
+    pub work_flops: u64,
+    pub work_bytes: u64,
+    pub stats: TensorStats,
+    pub timestamp_ns: i64,
+}
+
+impl Default for CapturedTensorInfo {
+    fn default() -> Self {
+        Self {
+            point: 0,
+            layer: 0,
+            token: 0,
+            position: 0,
+            backend: 0,
+            shape: [0; 4],
+            ndim: 0,
+            dtype: 0,
+            kernel_name: [0; 48],
+            work_flops: 0,
+            work_bytes: 0,
+            stats: TensorStats::default(),
+            timestamp_ns: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CItemReferenceItem {
+    pub id_ptr: *const c_char,
+}
+
+impl Default for CItemReferenceItem {
+    fn default() -> Self {
+        Self {
+            id_ptr: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/converter/scheme.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct OverrideRule {
+    pub pattern: *const c_char,
+    pub scheme: Scheme,
+}
+
+impl Default for OverrideRule {
+    fn default() -> Self {
+        Self {
+            pattern: std::ptr::null(),
+            scheme: Scheme::from(0),
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TokenOffset {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Default for TokenOffset {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SpecialTokensResult {
+    pub bos_token_id: c_int,
+    pub unk_token_id: c_int,
+    pub pad_token_id: c_int,
+}
+
+impl Default for SpecialTokensResult {
+    fn default() -> Self {
+        Self {
+            bos_token_id: 0,
+            unk_token_id: 0,
+            pad_token_id: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/types.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TaluCapabilities {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub streaming: u8,
+    pub tool_calling: u8,
+    pub logprobs: u8,
+    pub embeddings: u8,
+    pub json_schema: u8,
+    pub _reserved: [u8; 32],
+}
+
+impl Default for TaluCapabilities {
+    fn default() -> Self {
+        Self {
+            abi_version: 0,
+            struct_size: 0,
+            streaming: 0,
+            tool_calling: 0,
+            logprobs: 0,
+            embeddings: 0,
+            json_schema: 0,
+            _reserved: [0; 32],
+        }
+    }
+}
+
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct PaddedTensorResult {
     pub input_ids: *mut u32,
     pub attention_mask: *mut u32,
@@ -1773,6 +1400,25 @@ impl Default for PaddedTensorResult {
             num_sequences: 0,
             padded_length: 0,
             error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/converter.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ConvertResult {
+    pub output_path: *const c_char,
+    pub error_msg: *const c_char,
+    pub success: bool,
+}
+
+impl Default for ConvertResult {
+    fn default() -> Self {
+        Self {
+            output_path: std::ptr::null(),
+            error_msg: std::ptr::null(),
+            success: false,
         }
     }
 }
@@ -1800,23 +1446,25 @@ impl Default for VocabResult {
     }
 }
 
-/// Source: core/src/capi/template.zig
+/// Source: core/src/capi/types.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct COutputSpan {
-    pub start: u32,
-    pub end: u32,
-    pub source_type: CSpanSourceType,
-    pub variable_path: *const c_char,
+pub struct TaluModelSpec {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub ref_: *const c_char,
+    pub backend_type_raw: c_int,
+    pub backend_config: BackendUnion,
 }
 
-impl Default for COutputSpan {
+impl Default for TaluModelSpec {
     fn default() -> Self {
         Self {
-            start: 0,
-            end: 0,
-            source_type: CSpanSourceType::from(0),
-            variable_path: std::ptr::null(),
+            abi_version: 0,
+            struct_size: 0,
+            ref_: std::ptr::null(),
+            backend_type_raw: 0,
+            backend_config: unsafe { std::mem::zeroed() },
         }
     }
 }
@@ -1857,32 +1505,14 @@ impl Default for CItem {
 /// Source: core/src/capi/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CFullSessionConfig {
-    pub learning_rate: f32,
-    pub min_learning_rate: f32,
-    pub weight_decay: f32,
-    pub beta1: f32,
-    pub beta2: f32,
-    pub epsilon: f32,
-    pub max_grad_norm: f32,
-    pub batch_size: u32,
-    pub warmup_steps: u64,
-    pub total_steps: u64,
+pub struct ChatCreateOptions {
+    pub offline: bool,
 }
 
-impl Default for CFullSessionConfig {
+impl Default for ChatCreateOptions {
     fn default() -> Self {
         Self {
-            learning_rate: 0.0,
-            min_learning_rate: 0.0,
-            weight_decay: 0.0,
-            beta1: 0.0,
-            beta2: 0.0,
-            epsilon: 0.0,
-            max_grad_norm: 0.0,
-            batch_size: 0,
-            warmup_steps: 0,
-            total_steps: 0,
+            offline: false,
         }
     }
 }
@@ -1918,6 +1548,43 @@ impl Default for EffectiveGenConfigRequest {
     }
 }
 
+/// Source: core/src/capi/root.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CBatchEvent {
+    pub request_id: u64,
+    pub event_type: u8,
+    pub item_type: u8,
+    pub content_type: u8,
+    pub is_final: u8,
+    pub _pad: [u8; 4],
+    pub text_ptr: *const u8,
+    pub text_len: usize,
+    pub token_id: u32,
+    pub _pad2: [u8; 4],
+    pub tokens_generated: usize,
+    pub timestamp_ns: i64,
+}
+
+impl Default for CBatchEvent {
+    fn default() -> Self {
+        Self {
+            request_id: 0,
+            event_type: 0,
+            item_type: 0,
+            content_type: 0,
+            is_final: 0,
+            _pad: [0; 4],
+            text_ptr: std::ptr::null(),
+            text_len: 0,
+            token_id: 0,
+            _pad2: [0; 4],
+            tokens_generated: 0,
+            timestamp_ns: 0,
+        }
+    }
+}
+
 // =============================================================================
 // Opaque Handles
 // =============================================================================
@@ -1949,13 +1616,16 @@ pub struct CachedModelList {
 
 /// Unified progress callback - receives structured progress updates from core.
 /// This is the new callback type used by all long-running operations.
-pub type CProgressCallback = Option<unsafe extern "C" fn(*const ProgressUpdate, *mut c_void)>;
+pub type CProgressCallback =
+    Option<unsafe extern "C" fn(*const ProgressUpdate, *mut c_void)>;
 
 /// Legacy progress callback (deprecated - use CProgressCallback).
-pub type ProgressCallback = Option<unsafe extern "C" fn(u64, u64, *mut c_void)>;
+pub type ProgressCallback =
+    Option<unsafe extern "C" fn(u64, u64, *mut c_void)>;
 
 /// Legacy file start callback (deprecated - use CProgressCallback).
-pub type FileStartCallback = Option<unsafe extern "C" fn(*const c_char, *mut c_void)>;
+pub type FileStartCallback =
+    Option<unsafe extern "C" fn(*const c_char, *mut c_void)>;
 
 // =============================================================================
 // Type Aliases (Backwards Compatibility)
@@ -2160,39 +1830,16 @@ impl From<u8> for ItemStatus {
 // =============================================================================
 
 extern "C" {
-    // core/src/capi/memory.zig
-    pub fn talu_alloc_string(len: usize) -> *mut u8;
     // core/src/capi/session.zig
-    pub fn talu_apply_chat_template(
-        model_path: *const c_char,
-        messages_json: *const c_char,
-        add_generation_prompt: c_int,
-        out_prompt: *mut c_void,
-    ) -> c_int;
+    pub fn talu_apply_chat_template(model_path: *const c_char, messages_json: *const c_char, add_generation_prompt: c_int, out_prompt: *mut c_void) -> c_int;
     // core/src/capi/session.zig
-    pub fn talu_apply_chat_template_string(
-        template_ptr: *const u8,
-        template_len: usize,
-        messages_json: *const c_char,
-        add_generation_prompt: c_int,
-        bos_token: *const c_char,
-        eos_token: *const c_char,
-        out_prompt: *mut c_void,
-    ) -> c_int;
+    pub fn talu_apply_chat_template_string(template_ptr: *const u8, template_len: usize, messages_json: *const c_char, add_generation_prompt: c_int, bos_token: *const c_char, eos_token: *const c_char, out_prompt: *mut c_void) -> c_int;
     // core/src/capi/router.zig
-    pub fn talu_backend_create_from_canonical(
-        canon: *mut c_void,
-        options: BackendCreateOptions,
-        out_backend: *mut c_void,
-    ) -> c_int;
+    pub fn talu_backend_create_from_canonical(canon: *mut c_void, options: BackendCreateOptions, out_backend: *mut c_void) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_backend_free(backend: *mut c_void);
     // core/src/capi/router.zig
-    pub fn talu_backend_get_capabilities(
-        backend_type_raw: c_int,
-        backend_config: *const BackendUnion,
-        out_caps: *mut TaluCapabilities,
-    ) -> c_int;
+    pub fn talu_backend_get_capabilities(backend_type_raw: c_int, backend_config: *const BackendUnion, out_caps: *mut TaluCapabilities) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_backend_model_info(backend: *mut c_void) -> CModelInfo;
     // core/src/capi/router.zig
@@ -2206,107 +1853,31 @@ extern "C" {
     // core/src/capi/batch.zig
     pub fn talu_batch_destroy(handle: *mut c_void);
     // core/src/capi/tokenizer.zig
-    pub fn talu_batch_encode_result_free(
-        ids: *mut u32,
-        offsets: *mut usize,
-        total_tokens: usize,
-        num_sequences: usize,
-    );
+    pub fn talu_batch_encode_result_free(ids: *mut u32, offsets: *mut usize, total_tokens: usize, num_sequences: usize);
     // core/src/capi/batch.zig
     pub fn talu_batch_has_active(handle: *mut c_void) -> u8;
-    // core/src/capi/dlpack.zig
-    pub fn talu_batch_mask_to_dlpack(
-        ids: *const u32,
-        offsets: *const usize,
-        num_sequences: usize,
-        max_length: usize,
-        padding_side: u8,
-    ) -> *mut c_void;
     // core/src/capi/batch.zig
     pub fn talu_batch_result_free(result: *mut CBatchResult);
     // core/src/capi/batch.zig
-    pub fn talu_batch_run_loop(
-        handle: *mut c_void,
-        pending_flag: *mut c_void,
-        callback: *mut c_void,
-        callback_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_batch_run_loop(handle: *mut c_void, pending_flag: *mut c_void, callback: *mut c_void, callback_data: *mut c_void) -> c_int;
     // core/src/capi/batch.zig
-    pub fn talu_batch_run_loop_final_only(
-        handle: *mut c_void,
-        pending_flag: *mut c_void,
-        callback: *mut c_void,
-        callback_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_batch_run_loop_final_only(handle: *mut c_void, pending_flag: *mut c_void, callback: *mut c_void, callback_data: *mut c_void) -> c_int;
     // core/src/capi/batch.zig
-    pub fn talu_batch_step(
-        handle: *mut c_void,
-        events_out: *mut CBatchEvent,
-        max_events: usize,
-    ) -> usize;
+    pub fn talu_batch_step(handle: *mut c_void, events_out: *mut CBatchEvent, max_events: usize) -> usize;
     // core/src/capi/batch.zig
-    pub fn talu_batch_submit(
-        handle: *mut c_void,
-        chat_handle: *mut c_void,
-        config: *const CGenerateConfig,
-    ) -> u64;
+    pub fn talu_batch_submit(handle: *mut c_void, chat_handle: *mut c_void, config: *const CGenerateConfig) -> u64;
     // core/src/capi/batch.zig
     pub fn talu_batch_take_result(handle: *mut c_void, request_id: u64) -> *mut CBatchResult;
-    // core/src/capi/dlpack.zig
-    pub fn talu_batch_to_dlpack(
-        ids: *const u32,
-        offsets: *const usize,
-        num_sequences: usize,
-        pad_id: u32,
-        max_length: usize,
-        padding_side: u8,
-    ) -> *mut c_void;
     // core/src/capi/tokenizer.zig
-    pub fn talu_batch_to_padded_tensor(
-        ids: *const u32,
-        offsets: *const usize,
-        num_sequences: usize,
-        options: *const PaddedTensorOptions,
-    ) -> PaddedTensorResult;
-    // core/src/capi/buffer.zig
-    pub fn talu_buffer_create_from_copy(tokens: *const u32, num_tokens: usize) -> *mut c_void;
-    // core/src/capi/buffer.zig
-    pub fn talu_buffer_create_from_owned(tokens: *mut u32, num_tokens: usize) -> *mut c_void;
-    // core/src/capi/buffer.zig
-    pub fn talu_buffer_get_data_ptr(handle: *mut c_void) -> *mut u32;
-    // core/src/capi/buffer.zig
-    pub fn talu_buffer_release(handle: *mut c_void) -> u8;
-    // core/src/capi/dlpack.zig
-    pub fn talu_buffer_to_dlpack(
-        buffer_handle: *mut c_void,
-        offset_elems: usize,
-        len: usize,
-    ) -> *mut c_void;
-    // core/src/capi/responses.zig
-    pub fn talu_chat_count_tokens(
-        chat_handle: *mut c_void,
-        model: *const c_char,
-        additional_message: *const u8,
-        additional_message_len: usize,
-    ) -> i64;
+    pub fn talu_batch_to_padded_tensor(ids: *const u32, offsets: *const usize, num_sequences: usize, options: *const PaddedTensorOptions) -> PaddedTensorResult;
     // core/src/capi/responses.zig
     pub fn talu_chat_create(options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
-    pub fn talu_chat_create_with_session(
-        session_id: *const c_char,
-        options: *mut ChatCreateOptions,
-    ) -> *mut c_void;
+    pub fn talu_chat_create_with_session(session_id: *const c_char, options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
-    pub fn talu_chat_create_with_system(
-        system: *const c_char,
-        options: *mut ChatCreateOptions,
-    ) -> *mut c_void;
+    pub fn talu_chat_create_with_system(system: *const c_char, options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
-    pub fn talu_chat_create_with_system_and_session(
-        system: *const c_char,
-        session_id: *const c_char,
-        options: *mut ChatCreateOptions,
-    ) -> *mut c_void;
+    pub fn talu_chat_create_with_system_and_session(system: *const c_char, session_id: *const c_char, options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
     pub fn talu_chat_free(handle: *mut c_void);
     // core/src/capi/responses.zig
@@ -2320,13 +1891,7 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_chat_get_tools(handle: *mut c_void) -> *const c_char;
     // core/src/capi/responses.zig
-    pub fn talu_chat_load_completions_json(
-        handle: *mut c_void,
-        json_ptr: *const u8,
-        json_len: usize,
-    ) -> c_int;
-    // core/src/capi/responses.zig
-    pub fn talu_chat_max_context_length(model: *const c_char) -> u64;
+    pub fn talu_chat_load_completions_json(handle: *mut c_void, json_ptr: *const u8, json_len: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_chat_set_messages(handle: *mut c_void, json: *const c_char) -> c_int;
     // core/src/capi/responses.zig
@@ -2334,38 +1899,15 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_chat_set_system(handle: *mut c_void, system: *const c_char) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_chat_set_tool_choice(
-        handle: *mut c_void,
-        json: *const c_char,
-        json_len: usize,
-    ) -> c_int;
+    pub fn talu_chat_set_tool_choice(handle: *mut c_void, json: *const c_char, json_len: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_chat_set_tools(handle: *mut c_void, json: *const c_char, json_len: usize) -> c_int;
-    // core/src/capi/responses.zig
-    pub fn talu_chat_set_ttl_ts(handle: *mut c_void, ttl_ts: i64) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_chat_to_json(handle: *mut c_void) -> *const c_char;
     // core/src/capi/error.zig
     pub fn talu_clear_error();
-    // core/src/capi/validate.zig
-    pub fn talu_clear_response_format(chat_handle: *mut c_void);
     // core/src/capi/router.zig
-    pub fn talu_completions_validate_request(
-        messages_json_ptr: *const u8,
-        messages_json_len: usize,
-        has_max_tokens: usize,
-        max_tokens: i64,
-        has_max_completion_tokens: usize,
-        max_completion_tokens: i64,
-        temperature: f64,
-        top_p: f64,
-        presence_penalty: f64,
-        frequency_penalty: f64,
-        tools_json_ptr: *const u8,
-        tools_json_len: usize,
-        tool_choice_json_ptr: *const u8,
-        tool_choice_json_len: usize,
-    ) -> c_int;
+    pub fn talu_completions_validate_request(messages_json_ptr: *const u8, messages_json_len: usize, has_max_tokens: usize, max_tokens: i64, has_max_completion_tokens: usize, max_completion_tokens: i64, temperature: f64, top_p: f64, presence_penalty: f64, frequency_penalty: f64, tools_json_ptr: *const u8, tools_json_len: usize, tool_choice_json_ptr: *const u8, tool_choice_json_len: usize) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_config_canonicalize(in_spec: *mut TaluModelSpec, out_handle: *mut c_void) -> c_int;
     // core/src/capi/router.zig
@@ -2373,75 +1915,41 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_config_get_view(handle: *mut c_void, out_spec: *mut TaluModelSpec) -> c_int;
     // core/src/capi/converter.zig
-    pub fn talu_convert(
-        model_path: *const c_char,
-        output_dir: *const c_char,
-        options: *const ConvertOptions,
-    ) -> ConvertResult;
+    pub fn talu_convert(model_path: *const c_char, output_dir: *const c_char, options: *const ConvertOptions) -> ConvertResult;
     // core/src/capi/converter.zig
     pub fn talu_convert_free_string(string_ptr: *const c_char);
     // core/src/capi/converter.zig
     pub fn talu_convert_parse_scheme(name: *const c_char) -> c_int;
-    // core/src/capi/converter.zig
-    pub fn talu_convert_schemes(out_schemes: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
     pub fn talu_decode_result_free(text: *mut u8, text_len: usize);
     // core/src/capi/converter.zig
     pub fn talu_describe(model_path: *const c_char) -> ModelInfo;
     // core/src/capi/tokenizer.zig
     pub fn talu_encode_result_free(result: EncodeResult);
-    // core/src/capi/error.zig
-    pub fn talu_error_buf_size() -> usize;
     // core/src/capi/converter.zig
     pub fn talu_execution_plan(info: *mut ModelInfo) -> ExecutionPlanInfo;
-    // core/src/capi/template.zig
-    pub fn talu_free_spans(spans: *mut COutputSpan, count: u32);
     // core/src/capi/memory.zig
     pub fn talu_free_string(ptr: *mut u8, len: usize);
-    // core/src/capi/template.zig
-    pub fn talu_get_chat_template_source(
-        model_path: *const c_char,
-        out_source: *mut c_void,
-    ) -> c_int;
     // core/src/capi/session.zig
     pub fn talu_get_eos_tokens(model_dir: *const c_char) -> EosTokenResult;
     // core/src/capi/session.zig
-    pub fn talu_get_generation_config(
-        model_dir: *const c_char,
-        out_config: *mut GenerationConfigInfo,
-    ) -> c_int;
+    pub fn talu_get_generation_config(model_dir: *const c_char, out_config: *mut GenerationConfigInfo) -> c_int;
     // core/src/capi/log.zig
     pub fn talu_get_log_format() -> c_int;
     // core/src/capi/log.zig
     pub fn talu_get_log_level() -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_grammar_compile(schema_json: *const c_char) -> *mut c_void;
-    // core/src/capi/validate.zig
-    pub fn talu_grammar_free(handle: *mut c_void);
     // core/src/capi/error.zig
     pub fn talu_last_error() -> *const c_char;
     // core/src/capi/error.zig
     pub fn talu_last_error_code() -> c_int;
     // core/src/capi/model.zig
-    pub fn talu_model_hf_config_json(
-        model_id: *const c_char,
-        revision: *const c_char,
-        endpoint_url: *const c_char,
-        token: *const c_char,
-        force_refresh: bool,
-        include_size: bool,
-    ) -> *const c_char;
+    pub fn talu_model_hf_config_json(model_id: *const c_char, revision: *const c_char, endpoint_url: *const c_char, token: *const c_char, force_refresh: bool, include_size: bool) -> *const c_char;
     // core/src/capi/converter.zig
     pub fn talu_model_info_free(info: *mut ModelInfo);
     // core/src/capi/converter.zig
     pub fn talu_model_performance_hints(name: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_padded_tensor_result_free(
-        input_ids: *mut u32,
-        attention_mask: *mut u32,
-        num_sequences: usize,
-        padded_length: usize,
-    );
+    pub fn talu_padded_tensor_result_free(input_ids: *mut u32, attention_mask: *mut u32, num_sequences: usize, padded_length: usize);
     // core/src/capi/repository.zig
     pub fn talu_repo_cache_dir_exists(model_id: *const c_char) -> c_int;
     // core/src/capi/repository.zig
@@ -2453,11 +1961,7 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_download_clear_finished(out_removed: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_download_enqueue(
-        model_id: *const c_char,
-        options: *const DownloadQueueOptions,
-        out_id: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_download_enqueue(model_id: *const c_char, options: *const DownloadQueueOptions, out_id: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_download_pause(id: *const c_char) -> c_int;
     // core/src/capi/repository.zig
@@ -2465,24 +1969,9 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_downloads_json(out_json: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_fetch(
-        model_id: *const c_char,
-        options: *mut DownloadOptions,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_fetch(model_id: *const c_char, options: *mut DownloadOptions, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_fetch_file(
-        model_id: *const c_char,
-        filename: *const c_char,
-        options: *mut DownloadOptions,
-        out: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/repository.zig
-    pub fn talu_repo_get_cached_path(
-        model_id: *const c_char,
-        require_weights: bool,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_get_cached_path(model_id: *const c_char, require_weights: bool, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_get_hf_home(out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
@@ -2492,24 +1981,15 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_is_model_id(path: *const c_char) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_list(
-        model_path: *const c_char,
-        token: *const c_char,
-        out: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_list(model_path: *const c_char, token: *const c_char, out: *mut *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_list_count(list: *mut CachedModelList) -> usize;
     // core/src/capi/repository.zig
     pub fn talu_repo_list_free(list: *mut CachedModelList);
     // core/src/capi/repository.zig
-    pub fn talu_repo_list_get_id(list: *mut CachedModelList, idx: usize, out: *mut c_void)
-        -> c_int;
+    pub fn talu_repo_list_get_id(list: *mut CachedModelList, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_list_get_path(
-        list: *mut CachedModelList,
-        idx: usize,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_list_get_path(list: *mut CachedModelList, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_list_get_source(list: *mut CachedModelList, idx: usize) -> u8;
     // core/src/capi/repository.zig
@@ -2517,22 +1997,9 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_mtime(model_id: *const c_char) -> i64;
     // core/src/capi/repository.zig
-    pub fn talu_repo_resolve_path(
-        uri: *const c_char,
-        offline: bool,
-        token: *const c_char,
-        endpoint_url: *const c_char,
-        require_weights: bool,
-        out_path: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_resolve_path(uri: *const c_char, offline: bool, token: *const c_char, endpoint_url: *const c_char, require_weights: bool, out_path: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search(
-        query: *const c_char,
-        limit: usize,
-        token: *const c_char,
-        endpoint_url: *const c_char,
-        out: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search(query: *const c_char, limit: usize, token: *const c_char, endpoint_url: *const c_char, out: *mut *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_count(list: *mut c_void) -> usize;
     // core/src/capi/repository.zig
@@ -2540,36 +2007,17 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_get_downloads(list: *mut c_void, idx: usize) -> i64;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_result_get_id(list: *mut c_void, idx: usize, out: *mut c_void)
-        -> c_int;
+    pub fn talu_repo_search_result_get_id(list: *mut c_void, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_result_get_last_modified(
-        list: *mut c_void,
-        idx: usize,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search_result_get_last_modified(list: *mut c_void, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_get_likes(list: *mut c_void, idx: usize) -> i64;
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_get_params(list: *mut c_void, idx: usize) -> i64;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_result_get_pipeline_tag(
-        list: *mut c_void,
-        idx: usize,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search_result_get_pipeline_tag(list: *mut c_void, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_rich(
-        query: *const c_char,
-        limit: usize,
-        token: *const c_char,
-        endpoint_url: *const c_char,
-        filter: *const c_char,
-        sort: u8,
-        direction: u8,
-        library: *const c_char,
-        out: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search_rich(query: *const c_char, limit: usize, token: *const c_char, endpoint_url: *const c_char, filter: *const c_char, sort: u8, direction: u8, library: *const c_char, out: *mut *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_size(model_id: *const c_char) -> u64;
     // core/src/capi/repository.zig
@@ -2581,67 +2029,23 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_total_size() -> u64;
     // core/src/capi/session.zig
-    pub fn talu_resolve_effective_generation_config(
-        model_dir: *const c_char,
-        request: *const EffectiveGenConfigRequest,
-        out_config: *mut EffectiveGenConfig,
-    ) -> c_int;
-    // core/src/capi/session.zig
-    pub fn talu_resolve_model_path(model_path: *const c_char, out_path: *mut c_void) -> c_int;
+    pub fn talu_resolve_effective_generation_config(model_dir: *const c_char, request: *const EffectiveGenConfigRequest, out_config: *mut EffectiveGenConfig) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_function_call(
-        handle: *mut ResponsesHandle,
-        call_id: *const c_char,
-        name: *const c_char,
-        arguments_ptr: *const u8,
-        arguments_len: usize,
-    ) -> i64;
+    pub fn talu_responses_append_function_call(handle: *mut ResponsesHandle, call_id: *const c_char, name: *const c_char, arguments_ptr: *const u8, arguments_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_function_call_output(
-        handle: *mut ResponsesHandle,
-        call_id: *const c_char,
-        output_ptr: *const u8,
-        output_len: usize,
-    ) -> i64;
+    pub fn talu_responses_append_function_call_output(handle: *mut ResponsesHandle, call_id: *const c_char, output_ptr: *const u8, output_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_message(
-        handle: *mut ResponsesHandle,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-    ) -> i64;
+    pub fn talu_responses_append_message(handle: *mut ResponsesHandle, role: u8, content_ptr: *const u8, content_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_message_hidden(
-        handle: *mut ResponsesHandle,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-        hidden: bool,
-    ) -> i64;
-    // core/src/capi/responses.zig
-    pub fn talu_responses_append_text_content(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        content_ptr: *const u8,
-        content_len: usize,
-    ) -> c_int;
+    pub fn talu_responses_append_text_content(handle: *mut ResponsesHandle, item_index: usize, content_ptr: *const u8, content_len: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_clear(handle: *mut ResponsesHandle);
     // core/src/capi/responses.zig
     pub fn talu_responses_clear_keeping_system(handle: *mut ResponsesHandle);
     // core/src/capi/responses.zig
-    pub fn talu_responses_clone(
-        dest_handle: *mut ResponsesHandle,
-        source_handle: *mut ResponsesHandle,
-        batch_size: usize,
-    ) -> c_int;
+    pub fn talu_responses_clone(dest_handle: *mut ResponsesHandle, source_handle: *mut ResponsesHandle, batch_size: usize) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_clone_prefix(
-        dest_handle: *mut ResponsesHandle,
-        source_handle: *mut ResponsesHandle,
-        last_index: usize,
-        batch_size: usize,
-    ) -> c_int;
+    pub fn talu_responses_clone_prefix(dest_handle: *mut ResponsesHandle, source_handle: *mut ResponsesHandle, last_index: usize, batch_size: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_create() -> *mut ResponsesHandle;
     // core/src/capi/responses.zig
@@ -2649,192 +2053,67 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_responses_free(handle: *mut ResponsesHandle);
     // core/src/capi/responses.zig
-    pub fn talu_responses_get_item(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CItem,
-    ) -> c_int;
+    pub fn talu_responses_get_item(handle: *mut ResponsesHandle, index: usize, out: *mut CItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_insert_message(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-    ) -> i64;
+    pub fn talu_responses_insert_message(handle: *mut ResponsesHandle, index: usize, role: u8, content_ptr: *const u8, content_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_insert_message_hidden(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-        hidden: bool,
-    ) -> i64;
+    pub fn talu_responses_item_as_function_call(handle: *mut ResponsesHandle, index: usize, out: *mut CFunctionCallItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_function_call(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CFunctionCallItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_function_call_output(handle: *mut ResponsesHandle, index: usize, out: *mut CFunctionCallOutputItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_function_call_output(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CFunctionCallOutputItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_item_reference(handle: *mut ResponsesHandle, index: usize, out: *mut CItemReferenceItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_item_reference(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CItemReferenceItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_message(handle: *mut ResponsesHandle, index: usize, out: *mut CMessageItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_message(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CMessageItem,
-    ) -> c_int;
-    // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_reasoning(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CReasoningItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_reasoning(handle: *mut ResponsesHandle, index: usize, out: *mut CReasoningItem) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_item_count(handle: *mut ResponsesHandle) -> usize;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_fco_get_part(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_fco_get_part(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_get_generation_json(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out_ptr: *mut c_void,
-        out_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_responses_item_get_generation_json(handle: *mut ResponsesHandle, index: usize, out_ptr: *mut c_void, out_len: *mut c_void) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_message_content_count(
-        handle: *mut ResponsesHandle,
-        index: usize,
-    ) -> usize;
+    pub fn talu_responses_item_message_content_count(handle: *mut ResponsesHandle, index: usize) -> usize;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_message_get_content(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_message_get_content(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_content_count(
-        handle: *mut ResponsesHandle,
-        index: usize,
-    ) -> usize;
+    pub fn talu_responses_item_reasoning_content_count(handle: *mut ResponsesHandle, index: usize) -> usize;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_get_content(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_reasoning_get_content(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_get_summary(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_reasoning_get_summary(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_summary_count(
-        handle: *mut ResponsesHandle,
-        index: usize,
-    ) -> usize;
+    pub fn talu_responses_item_reasoning_summary_count(handle: *mut ResponsesHandle, index: usize) -> usize;
     // core/src/capi/responses.zig
     pub fn talu_responses_item_type(handle: *mut ResponsesHandle, index: usize) -> u8;
     // core/src/capi/responses.zig
-    pub fn talu_responses_load_completions_json(
-        handle: *mut ResponsesHandle,
-        json: *const c_char,
-    ) -> c_int;
+    pub fn talu_responses_load_completions_json(handle: *mut ResponsesHandle, json: *const c_char) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_load_responses_json(
-        handle: *mut ResponsesHandle,
-        json: *const c_char,
-    ) -> c_int;
+    pub fn talu_responses_load_responses_json(handle: *mut ResponsesHandle, json: *const c_char) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_pop(handle: *mut ResponsesHandle) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_remove(handle: *mut ResponsesHandle, index: usize) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_set_item_status(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        status: u8,
-    ) -> c_int;
+    pub fn talu_responses_set_item_status(handle: *mut ResponsesHandle, item_index: usize, status: u8) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_to_completions_json(handle: *mut ResponsesHandle) -> *const c_char;
     // core/src/capi/responses.zig
-    pub fn talu_responses_to_responses_json(
-        handle: *mut ResponsesHandle,
-        direction: u8,
-    ) -> *const c_char;
+    pub fn talu_responses_to_responses_json(handle: *mut ResponsesHandle, direction: u8) -> *const c_char;
     // core/src/capi/responses.zig
     pub fn talu_responses_truncate_after(handle: *mut ResponsesHandle, last_index: usize) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_router_close_all();
     // core/src/capi/router.zig
-    pub fn talu_router_embed(
-        model: *const c_char,
-        text: *const c_char,
-        pooling: CPoolingStrategy,
-        normalize: bool,
-        out_embedding: *mut c_void,
-        out_dim: *mut c_void,
-    ) -> c_int;
+    pub fn talu_router_embed(model: *const c_char, text: *const c_char, pooling: CPoolingStrategy, normalize: bool, out_embedding: *mut c_void, out_dim: *mut c_void) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_router_embedding_dim(model: *const c_char) -> usize;
     // core/src/capi/router.zig
     pub fn talu_router_embedding_free(embedding: *const f32, dim: usize);
     // core/src/capi/scheduler.zig
-    pub fn talu_scheduler_score_tokens_joint(
-        reference_backend: *mut c_void,
-        model_backend: *mut c_void,
-        context_tokens: *const u32,
-        context_len: usize,
-        target_tokens: *const u32,
-        target_len: usize,
-        max_context: usize,
-        out_reference_nll: *mut c_void,
-        out_model_nll: *mut c_void,
-        out_kld: *mut c_void,
-        out_scored_tokens: *mut c_void,
-    ) -> c_int;
+    pub fn talu_scheduler_score_tokens_joint(reference_backend: *mut c_void, model_backend: *mut c_void, context_tokens: *const u32, context_len: usize, target_tokens: *const u32, target_len: usize, max_context: usize, out_reference_nll: *mut c_void, out_model_nll: *mut c_void, out_kld: *mut c_void, out_scored_tokens: *mut c_void) -> c_int;
     // core/src/capi/scheduler.zig
-    pub fn talu_scheduler_score_tokens_nll(
-        backend: *mut c_void,
-        context_tokens: *const u32,
-        context_len: usize,
-        target_tokens: *const u32,
-        target_len: usize,
-        max_context: usize,
-        out_nll: *mut c_void,
-        out_scored_tokens: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_semantic_validator_check(
-        handle: *mut c_void,
-        json_str: *const u8,
-        json_len: usize,
-        out_violation: *mut SemanticViolationC,
-    ) -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_semantic_validator_create(schema_json: *const c_char) -> *mut c_void;
-    // core/src/capi/validate.zig
-    pub fn talu_semantic_validator_destroy(handle: *mut c_void);
+    pub fn talu_scheduler_score_tokens_nll(backend: *mut c_void, context_tokens: *const u32, context_len: usize, target_tokens: *const u32, target_len: usize, max_context: usize, out_nll: *mut c_void, out_scored_tokens: *mut c_void) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_session_id_new(out_session_id: *mut c_void) -> c_int;
     // core/src/capi/log.zig
@@ -2845,106 +2124,26 @@ extern "C" {
     pub fn talu_set_log_format(format: c_int);
     // core/src/capi/log.zig
     pub fn talu_set_log_level(level: c_int);
-    // core/src/capi/validate.zig
-    pub fn talu_set_response_format(
-        chat_handle: *mut c_void,
-        schema_json: *const c_char,
-        config: *const ValidateConfigC,
-        stop_tokens: *const u32,
-        stop_tokens_len: usize,
-        prefix_token_ids: *const u32,
-        prefix_token_ids_len: usize,
-    ) -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_set_response_format_handle(
-        chat_handle: *mut c_void,
-        grammar_handle: *mut c_void,
-        config: *const ValidateConfigC,
-        stop_tokens: *const u32,
-        stop_tokens_len: usize,
-        prefix_token_ids: *const u32,
-        prefix_token_ids_len: usize,
-    ) -> c_int;
     // core/src/capi/error.zig
-    pub fn talu_take_last_error(
-        out_buf: *mut u8,
-        out_buf_size: usize,
-        out_code: *mut c_void,
-    ) -> usize;
+    pub fn talu_take_last_error(out_buf: *mut u8, out_buf_size: usize, out_code: *mut c_void) -> usize;
     // core/src/capi/template.zig
-    pub fn talu_template_render(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        strict: bool,
-        out_rendered: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/template.zig
-    pub fn talu_template_render_debug(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        strict: bool,
-        out_rendered: *mut c_void,
-        out_spans: *mut c_void,
-        out_span_count: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/template.zig
-    pub fn talu_template_render_with_filters(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        strict: bool,
-        filter_names: *const *const c_char,
-        filter_callbacks: *mut c_void,
-        filter_user_data: *mut c_void,
-        num_filters: usize,
-        out_rendered: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/template.zig
-    pub fn talu_template_validate(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        out_result_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_template_render(template_str: *const c_char, json_vars: *const c_char, strict: bool, out_rendered: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
     pub fn talu_text_free(text: *const c_char);
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenize_bytes_result_free(
-        data: *mut u8,
-        data_len: usize,
-        offsets: *mut usize,
-        num_tokens: usize,
-    );
+    pub fn talu_tokenize_bytes_result_free(data: *mut u8, data_len: usize, offsets: *mut usize, num_tokens: usize);
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenize_result_free(tokens: *const *const c_char, num_tokens: usize);
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenizer_create(model_path: *const c_char, out_tokenizer: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_create_from_json(
-        json_ptr: *const u8,
-        json_len: usize,
-        out_tokenizer: *mut c_void,
-    ) -> c_int;
+    pub fn talu_tokenizer_create_from_json(json_ptr: *const u8, json_len: usize, out_tokenizer: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_decode(
-        handle: *mut c_void,
-        tokens: *const u32,
-        num_tokens: usize,
-        options: *const DecodeOptionsC,
-    ) -> DecodeResult;
+    pub fn talu_tokenizer_decode(handle: *mut c_void, tokens: *const u32, num_tokens: usize, options: *const DecodeOptionsC) -> DecodeResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_encode(
-        handle: *mut c_void,
-        text: *const u8,
-        text_len: usize,
-        options: *const EncodeOptions,
-    ) -> EncodeResult;
+    pub fn talu_tokenizer_encode(handle: *mut c_void, text: *const u8, text_len: usize, options: *const EncodeOptions) -> EncodeResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_encode_batch(
-        handle: *mut c_void,
-        texts: *const *const u8,
-        lengths: *const usize,
-        num_texts: usize,
-        options: *const EncodeOptions,
-    ) -> BatchEncodeResult;
+    pub fn talu_tokenizer_encode_batch(handle: *mut c_void, texts: *const *const u8, lengths: *const usize, num_texts: usize, options: *const EncodeOptions) -> BatchEncodeResult;
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenizer_free(handle: *mut c_void);
     // core/src/capi/tokenizer.zig
@@ -2960,164 +2159,19 @@ extern "C" {
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenizer_get_vocab_size(handle: *mut c_void) -> usize;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_id_to_token(
-        handle: *mut c_void,
-        token_id: c_int,
-        out_token: *mut c_void,
-    ) -> c_int;
+    pub fn talu_tokenizer_id_to_token(handle: *mut c_void, token_id: c_int, out_token: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_token_to_id(
-        handle: *mut c_void,
-        token: *const u8,
-        token_len: usize,
-    ) -> c_int;
+    pub fn talu_tokenizer_token_to_id(handle: *mut c_void, token: *const u8, token_len: usize) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_tokenize(
-        handle: *mut c_void,
-        text: *const u8,
-        text_len: usize,
-    ) -> TokenizeResult;
+    pub fn talu_tokenizer_tokenize(handle: *mut c_void, text: *const u8, text_len: usize) -> TokenizeResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_tokenize_bytes(
-        handle: *mut c_void,
-        text: *const u8,
-        text_len: usize,
-    ) -> TokenizeBytesResult;
+    pub fn talu_tokenizer_tokenize_bytes(handle: *mut c_void, text: *const u8, text_len: usize) -> TokenizeBytesResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokens_concat(
-        tokens_a: *const u32,
-        num_a: usize,
-        tokens_b: *const u32,
-        num_b: usize,
-    ) -> *mut u32;
+    pub fn talu_tokens_concat(tokens_a: *const u32, num_a: usize, tokens_b: *const u32, num_b: usize) -> *mut u32;
     // core/src/capi/tokenizer.zig
     pub fn talu_tokens_free(tokens: *mut u32, num_tokens: usize);
-    // core/src/capi/train.zig
-    pub fn talu_train_configure(handle: *mut c_void, config: *mut c_void) -> c_int;
-    // core/src/capi/train.zig
-    pub fn talu_train_create(out: *mut c_void) -> c_int;
-    // core/src/capi/train.zig
-    pub fn talu_train_destroy(handle: *mut c_void);
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_configure(
-        handle: *mut c_void,
-        config: *const CFullSessionConfig,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_copy_optimizer_state_f32(
-        handle: *mut c_void,
-        out_state: *const f32,
-        out_len: usize,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_copy_weights_f32(
-        handle: *mut c_void,
-        out_weights: *const f32,
-        out_len: usize,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_create(out: *mut c_void) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_destroy(handle: *mut c_void);
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_get_info(handle: *mut c_void, out_info: *mut CFullSessionInfo) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_init_model(
-        handle: *mut c_void,
-        config: *const CTransformerConfig,
-        seed: u64,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_load_data(handle: *mut c_void, data_path: *const c_char) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_load_optimizer_state_f32(
-        handle: *mut c_void,
-        in_state: *const f32,
-        in_len: usize,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_load_weights_f32(
-        handle: *mut c_void,
-        in_weights: *const f32,
-        in_len: usize,
-        step: u64,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_run(
-        handle: *mut c_void,
-        callback: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_set_data(
-        handle: *mut c_void,
-        tokens_ptr: *const u32,
-        tokens_len: usize,
-    ) -> c_int;
-    // core/src/capi/train_full.zig
-    pub fn talu_train_full_step(handle: *mut c_void, out_metrics: *mut c_void) -> c_int;
-    // core/src/capi/train.zig
-    pub fn talu_train_get_info(handle: *mut c_void, out_info: *mut c_void) -> c_int;
-    // core/src/capi/train.zig
-    pub fn talu_train_load_data(handle: *mut c_void, data_path: *const c_char) -> c_int;
-    // core/src/capi/train.zig
-    pub fn talu_train_load_model(
-        handle: *mut c_void,
-        model_path: *const c_char,
-        lora_config: *mut c_void,
-        target_modules: *const *const c_char,
-        num_targets: usize,
-    ) -> c_int;
-    // core/src/capi/train.zig
-    pub fn talu_train_run(
-        handle: *mut c_void,
-        callback: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/train.zig
-    pub fn talu_train_save_checkpoint(handle: *mut c_void, output_path: *const c_char) -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_advance(handle: *mut c_void, bytes: *const u8, len: usize)
-        -> usize;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_can_accept(
-        handle: *mut c_void,
-        bytes: *const u8,
-        len: usize,
-    ) -> bool;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_create(schema_json: *const c_char) -> *mut c_void;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_destroy(handle: *mut c_void);
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_get_position(handle: *mut c_void) -> usize;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_get_valid_bytes(
-        handle: *mut c_void,
-        out_valid: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_is_complete(handle: *mut c_void) -> bool;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_reset(handle: *mut c_void) -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_engine_validate(
-        handle: *mut c_void,
-        bytes: *const u8,
-        len: usize,
-    ) -> c_int;
-    // core/src/capi/validate.zig
-    pub fn talu_validate_response_format(
-        chat_handle: *mut c_void,
-        out_result: *mut SemanticValidationResultC,
-    ) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_vocab_result_free(
-        tokens: *const *const c_char,
-        lengths: *mut u32,
-        ids: *mut u32,
-        num_entries: usize,
-    );
+    pub fn talu_vocab_result_free(tokens: *const *const c_char, lengths: *mut u32, ids: *mut u32, num_entries: usize);
     // core/src/capi/xray.zig
     pub fn talu_xray_capture_clear(handle: *mut c_void);
     // core/src/capi/xray.zig
@@ -3133,41 +2187,7 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_capture_enable(handle: *mut c_void);
     // core/src/capi/xray.zig
-    pub fn talu_xray_capture_is_enabled() -> bool;
-    // core/src/capi/xray.zig
-    pub fn talu_xray_capture_overflow(handle: *mut c_void) -> bool;
-    // core/src/capi/xray.zig
-    pub fn talu_xray_count_matching(
-        handle: *mut c_void,
-        point: u8,
-        layer: u16,
-        token: u32,
-    ) -> usize;
-    // core/src/capi/xray.zig
-    pub fn talu_xray_find_anomaly(
-        handle: *mut c_void,
-        out_point: *mut c_void,
-        out_layer: *mut c_void,
-        out_token: *mut c_void,
-    ) -> bool;
-    // core/src/capi/xray.zig
     pub fn talu_xray_get(handle: *mut c_void, index: usize, out: *mut CapturedTensorInfo) -> bool;
-    // core/src/capi/xray.zig
-    pub fn talu_xray_get_data(
-        handle: *mut c_void,
-        index: usize,
-        out_data: *mut u8,
-        max_len: usize,
-    ) -> usize;
-    // core/src/capi/xray.zig
-    pub fn talu_xray_get_data_size(handle: *mut c_void, index: usize) -> usize;
-    // core/src/capi/xray.zig
-    pub fn talu_xray_get_samples(
-        handle: *mut c_void,
-        index: usize,
-        out_samples: *const f32,
-        max_samples: usize,
-    ) -> usize;
     // core/src/capi/xray.zig
     pub fn talu_xray_point_name(point: u8) -> *const c_char;
     // core/src/capi/xray.zig
@@ -3175,17 +2195,9 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_data_load_json(file_path: *const c_char) -> *mut c_void;
     // core/src/capi/xray.zig
-    pub fn talu_xray_reference_data_save_json(
-        handle: *mut c_void,
-        file_path: *const c_char,
-    ) -> bool;
+    pub fn talu_xray_reference_data_save_json(handle: *mut c_void, file_path: *const c_char) -> bool;
     // core/src/capi/xray.zig
-    pub fn talu_xray_reference_recorder_create(
-        model_name: *const c_char,
-        seed: u64,
-        temperature: f32,
-        max_tokens: u32,
-    ) -> *mut c_void;
+    pub fn talu_xray_reference_recorder_create(model_name: *const c_char, seed: u64, temperature: f32, max_tokens: u32) -> *mut c_void;
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_recorder_destroy(handle: *mut c_void);
     // core/src/capi/xray.zig
@@ -3195,11 +2207,7 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_recorder_record_token(handle: *mut c_void, token_id: u32) -> bool;
     // core/src/capi/xray.zig
-    pub fn talu_xray_reference_verifier_create(
-        ref_data_handle: *mut c_void,
-        rel_tolerance: f32,
-        abs_tolerance: f32,
-    ) -> *mut c_void;
+    pub fn talu_xray_reference_verifier_create(ref_data_handle: *mut c_void, rel_tolerance: f32, abs_tolerance: f32) -> *mut c_void;
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_verifier_destroy(handle: *mut c_void);
     // core/src/capi/xray.zig
@@ -3221,10 +2229,7 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_verify_capture_create_recording(recorder_handle: *mut c_void) -> *mut c_void;
     // core/src/capi/xray.zig
-    pub fn talu_xray_verify_capture_create_verification(
-        verifier_handle: *mut c_void,
-        panic_dump_dir: *const c_char,
-    ) -> *mut c_void;
+    pub fn talu_xray_verify_capture_create_verification(verifier_handle: *mut c_void, panic_dump_dir: *const c_char) -> *mut c_void;
     // core/src/capi/xray.zig
     pub fn talu_xray_verify_capture_destroy(handle: *mut c_void);
     // core/src/capi/xray.zig
@@ -3232,10 +2237,7 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_verify_capture_enable(handle: *mut c_void);
     // core/src/capi/xray.zig
-    pub fn talu_xray_verify_capture_save_recording_full_npz(
-        handle: *mut c_void,
-        file_path: *const c_char,
-    ) -> bool;
+    pub fn talu_xray_verify_capture_save_recording_full_npz(handle: *mut c_void, file_path: *const c_char) -> bool;
     // core/src/capi/xray.zig
     pub fn talu_xray_verify_clear_exact_emission_filter();
     // core/src/capi/xray.zig
@@ -3261,6 +2263,7 @@ extern "C" {
 // =============================================================================
 // Safe Helpers
 // =============================================================================
+
 
 /// Safe wrapper for xray capture creation.
 pub fn xray_capture_create(points_mask: u32, mode: u8, sample_count: u32) -> *mut c_void {
@@ -3303,8 +2306,6 @@ pub fn xray_point_name(point: u8) -> &'static str {
     if ptr.is_null() {
         "unknown"
     } else {
-        unsafe { std::ffi::CStr::from_ptr(ptr) }
-            .to_str()
-            .unwrap_or("unknown")
+        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap_or("unknown")
     }
 }

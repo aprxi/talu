@@ -2,12 +2,12 @@
 FFI bindings for router module.
 
 Provides SamplingParams with Python defaults, StopFlag for cooperative
-cancellation, RouterGenerateConfig and GrammarConfigC with custom __init__
-methods that handle Python-to-C conversion with proper reference counting
-for stop sequences and logit bias arrays. CBackendUnion (ctypes.Union) for
-model spec backend configuration. Model spec FFI functions (build_c_spec,
-config_canonicalize, config_get_view, backend_get_capabilities).
-Response format FFI functions. Router generation and streaming FFI functions.
+cancellation, RouterGenerateConfig with custom __init__ methods that handle
+Python-to-C conversion with proper reference counting for stop sequences and
+logit bias arrays. CBackendUnion (ctypes.Union) for model spec backend
+configuration. Model spec FFI functions (build_c_spec, config_canonicalize,
+config_get_view, backend_get_capabilities). Response format FFI functions.
+Router generation and streaming FFI functions.
 """
 
 import ctypes
@@ -25,9 +25,6 @@ from .._native import (
 )
 from .._native import (
     LocalConfig as CLocalConfig,
-)
-from .._native import (
-    SamplingParams as _CSamplingParams,
 )
 from ..exceptions import GenerationError
 
@@ -75,12 +72,20 @@ class SamplingStrategy:
     TOP_P = 2
 
 
-class SamplingParams(_CSamplingParams):
-    """Sampling configuration with Python default values.
+class _CSamplingParams(ctypes.Structure):
+    _fields_ = [
+        ("strategy", ctypes.c_uint32),
+        ("temperature", ctypes.c_float),
+        ("top_k", ctypes.c_uint32),
+        ("top_p", ctypes.c_float),
+        ("min_p", ctypes.c_float),
+        ("repetition_penalty", ctypes.c_float),
+        ("seed", ctypes.c_uint64),
+    ]
 
-    Extends the auto-generated SamplingParams struct with a custom __init__
-    that provides sensible defaults for common use cases.
-    """
+
+class SamplingParams(_CSamplingParams):
+    """Sampling configuration with Python default values."""
 
     def __init__(
         self,
