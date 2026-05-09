@@ -18,6 +18,7 @@ pub mod handlers;
 pub mod http;
 pub mod listen;
 mod logger;
+pub mod model;
 pub mod openapi;
 pub mod repo;
 pub mod responses;

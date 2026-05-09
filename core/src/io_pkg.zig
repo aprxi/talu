@@ -12,6 +12,8 @@ pub const safetensors = struct {
 pub const repository = struct {
     pub const root = @import("io/repository/root.zig");
     pub const scheme = @import("io/repository/scheme.zig");
+    pub const talu_cache = @import("io/repository/talu_cache.zig");
 };
 pub const json_helpers = @import("io/json_helpers.zig");
 pub const json = @import("io/json/root.zig");
+pub const model_config = @import("io/model_config.zig");

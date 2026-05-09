@@ -9,6 +9,7 @@ mod server {
     pub mod common;
     pub mod completions;
     pub mod cors;
+    pub mod model;
     pub mod openapi_docs;
     pub mod repo;
     pub mod responses;

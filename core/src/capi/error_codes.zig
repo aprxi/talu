@@ -134,6 +134,7 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.AmbiguousBackend => .ambiguous_backend,
         error.UnsupportedAbiVersion => .unsupported_abi_version,
         error.ModelNotFound => .model_not_found,
+        error.ModelConfigMissing => .model_config_missing,
         // Model architecture errors
         error.UnsupportedModel => .model_unsupported_architecture,
         // Storage errors

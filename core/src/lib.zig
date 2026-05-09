@@ -66,6 +66,7 @@ comptime {
     // Session utilities (model resolution, chat templates, EOS tokens)
     _ = &capi.talu_resolve_model_path;
     _ = &capi.talu_model_performance_hints;
+    _ = &capi.talu_model_hf_config_json;
     _ = &capi.talu_get_eos_tokens;
     _ = &capi.talu_get_generation_config;
     _ = &capi.talu_apply_chat_template;

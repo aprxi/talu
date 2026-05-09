@@ -4,7 +4,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    completions, completions_types, handlers, http, repo, responses, responses_types, tokenizer,
+    completions, completions_types, handlers, http, model, repo, responses, responses_types,
+    tokenizer,
 };
 
 #[derive(OpenApi)]
@@ -28,6 +29,7 @@ use crate::server::{
     paths(
         http::handle_health,
         handlers::handle_models,
+        model::handle_config,
         repo::handle_list,
         repo::handle_search,
         repo::handle_stats,
@@ -67,6 +69,8 @@ use crate::server::{
         http::ErrorResponse,
         http::ErrorBody,
         http::HealthResponse,
+        model::ModelConfigRequest,
+        model::ModelConfigResponse,
         responses_types::CreateResponseBody,
         responses_types::ResponseResource,
         responses_types::ResponsesErrorResponse,

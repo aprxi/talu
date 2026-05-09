@@ -16,6 +16,7 @@ const template = @import("template.zig");
 const tokenizer = @import("tokenizer.zig");
 const dlpack = @import("dlpack.zig");
 const converter = @import("converter.zig");
+const model = @import("model.zig");
 const repo = @import("repository.zig");
 const err = @import("error.zig");
 const responses = @import("responses.zig");
@@ -85,6 +86,7 @@ pub const talu_describe = converter.talu_describe;
 pub const talu_model_performance_hints = converter.talu_model_performance_hints;
 pub const talu_model_info_free = converter.talu_model_info_free;
 pub const talu_execution_plan = converter.talu_execution_plan;
+pub const talu_model_hf_config_json = model.talu_model_hf_config_json;
 
 // Re-export template C API functions.
 pub const talu_template_render = template.talu_template_render;

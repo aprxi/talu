@@ -9,6 +9,9 @@ pub const repository = @import("repository/root.zig");
 /// Transport layer (HTTP, HuggingFace Hub API).
 pub const transport = @import("transport/root.zig");
 
+/// HuggingFace model config fetch and minimal metadata view.
+pub const model_config = @import("io_pkg").model_config;
+
 /// SafeTensors format parsing.
 pub const safetensors = struct {
     pub const root = @import("safetensors/root.zig");

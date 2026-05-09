@@ -21,6 +21,7 @@ use crate::server::admin_ui;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::completions;
 use crate::server::handlers;
+use crate::server::model;
 use crate::server::openapi;
 use crate::server::repo;
 use crate::server::responses;
@@ -87,6 +88,7 @@ static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
         &[
             "/v1/chat/completions",
             "/v1/health",
+            "/v1/model",
             "/v1/models",
             "/v1/repo",
             "/v1/responses",
@@ -103,7 +105,7 @@ static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
     ))
 });
 static OPENAPI_MODELS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models"]));
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/model", "/v1/models"]));
 static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
 static OPENAPI_TOKENIZER_SPEC: Lazy<Vec<u8>> =
@@ -232,6 +234,9 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/models") => {
                             handlers::handle_models(state, req, auth).await
                         }
+                        (Method::POST, "/v1/model/config") => {
+                            model::handle_config(state, req, auth).await
+                        }
                         (Method::GET, "/v1/repo/models") | (Method::GET, "/repo/models") => {
                             repo::handle_list(state, req, auth).await
                         }
@@ -321,6 +326,7 @@ impl Service<Request<Incoming>> for Router {
                             completions::handle_create(state, req, auth).await
                         }
                         (_, "/v1/models") => method_not_allowed(&["GET"]),
+                        (_, "/v1/model/config") => method_not_allowed(&["POST"]),
                         (_, "/v1/repo/models") => method_not_allowed(&["GET", "POST"]),
                         (_, "/repo/models") => method_not_allowed(&["GET", "POST"]),
                         (_, "/v1/repo/search") => method_not_allowed(&["GET"]),

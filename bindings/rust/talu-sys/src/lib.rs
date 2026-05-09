@@ -3088,6 +3088,15 @@ extern "C" {
     pub fn talu_model_info_free(info: *mut ModelInfo);
     // core/src/capi/converter.zig
     pub fn talu_model_performance_hints(name: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/model.zig
+    pub fn talu_model_hf_config_json(
+        model_id: *const c_char,
+        revision: *const c_char,
+        endpoint_url: *const c_char,
+        token: *const c_char,
+        force_refresh: bool,
+        include_size: bool,
+    ) -> *mut c_char;
     // core/src/capi/tokenizer.zig
     pub fn talu_padded_tensor_result_free(
         input_ids: *mut u32,

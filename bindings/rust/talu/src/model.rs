@@ -68,6 +68,57 @@ pub struct GenerationConfigInfo {
     pub do_sample: bool,
 }
 
+/// Fetch HuggingFace model config (raw + normalized) as JSON.
+///
+/// The returned JSON is produced by core and can be forwarded directly to HTTP
+/// callers without serde re-serialization.
+pub fn fetch_hf_model_config_json(
+    model: &str,
+    revision: Option<&str>,
+    endpoint_url: Option<&str>,
+    token: Option<&str>,
+    force_refresh: bool,
+    include_size: bool,
+) -> Result<String> {
+    let c_model = CString::new(model)?;
+    let c_revision = revision.map(CString::new).transpose()?;
+    let c_endpoint = endpoint_url.map(CString::new).transpose()?;
+    let c_token = token.map(CString::new).transpose()?;
+
+    // SAFETY: All pointers are either valid C strings for the call duration or null.
+    let out_ptr = unsafe {
+        talu_sys::talu_model_hf_config_json(
+            c_model.as_ptr(),
+            c_revision
+                .as_ref()
+                .map(|s| s.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            c_endpoint
+                .as_ref()
+                .map(|s| s.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            c_token
+                .as_ref()
+                .map(|s| s.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            force_refresh,
+            include_size,
+        )
+    };
+
+    if out_ptr.is_null() {
+        return Err(error_from_last_or("Failed to fetch model config"));
+    }
+
+    // SAFETY: `out_ptr` is a valid NUL-terminated string returned by core.
+    let json = unsafe { CStr::from_ptr(out_ptr as *const c_char) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: Must be released with core text free.
+    unsafe { talu_sys::talu_text_free(out_ptr as *mut c_char) };
+    Ok(json)
+}
+
 /// Describes a model, returning its architecture information.
 pub fn describe(model_path: &str) -> Result<ModelInfo> {
     let c_path = CString::new(model_path)?;

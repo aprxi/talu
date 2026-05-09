@@ -55,6 +55,10 @@ fn root_openapi_served_and_contains_paths() {
         "missing /v1/models in root spec"
     );
     assert!(
+        paths.contains_key("/v1/model/config"),
+        "missing /v1/model/config in root spec"
+    );
+    assert!(
         paths.contains_key("/v1/repo/models"),
         "missing /v1/repo/models in root spec"
     );
@@ -135,7 +139,7 @@ fn scoped_openapi_specs_are_prefix_scoped() {
     for (path, prefixes) in [
         ("/openapi/chat.json", vec!["/v1/chat/"]),
         ("/openapi/responses.json", vec!["/v1/responses"]),
-        ("/openapi/models.json", vec!["/v1/models"]),
+        ("/openapi/models.json", vec!["/v1/model", "/v1/models"]),
         ("/openapi/repo.json", vec!["/v1/repo"]),
         ("/openapi/tokenizer.json", vec!["/v1/tokenizer"]),
     ] {
