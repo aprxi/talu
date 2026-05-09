@@ -1112,9 +1112,12 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
 
         let ctx_clone = ctx.clone();
         let callback: talu::router::StreamCallback = Box::new(move |token| {
-            let mut guard = ctx_clone.lock().unwrap();
-            guard.on_token(token);
-            true
+            if let Ok(mut guard) = ctx_clone.lock() {
+                guard.on_token(token);
+                true
+            } else {
+                false
+            }
         });
         let stream_result =
             talu::router::generate_stream(&chat, &content, &backend, &cfg, callback)?;

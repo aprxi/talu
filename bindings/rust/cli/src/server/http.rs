@@ -237,40 +237,29 @@ impl Service<Request<Incoming>> for Router {
                         (Method::POST, "/v1/model/config") => {
                             model::handle_config(state, req, auth).await
                         }
-                        (Method::GET, "/v1/repo/models") | (Method::GET, "/repo/models") => {
+                        (Method::GET, "/v1/repo/models") => {
                             repo::handle_list(state, req, auth).await
                         }
-                        (Method::GET, "/v1/repo/search") | (Method::GET, "/repo/search") => {
+                        (Method::GET, "/v1/repo/search") => {
                             repo::handle_search(state, req, auth).await
                         }
-                        (Method::GET, "/v1/repo/stats") | (Method::GET, "/repo/stats") => {
+                        (Method::GET, "/v1/repo/stats") => {
                             repo::handle_stats(state, req, auth).await
                         }
-                        (Method::GET, "/v1/repo/downloads") | (Method::GET, "/repo/downloads") => {
+                        (Method::GET, "/v1/repo/downloads") => {
                             repo::handle_downloads(state, req, auth).await
                         }
-                        (Method::POST, "/v1/repo/downloads")
-                        | (Method::POST, "/repo/downloads") => {
+                        (Method::POST, "/v1/repo/downloads") => {
                             repo::handle_download_enqueue(state, req, auth).await
                         }
-                        (Method::POST, "/v1/repo/downloads/clear/finished")
-                        | (Method::POST, "/repo/downloads/clear/finished") => {
+                        (Method::POST, "/v1/repo/downloads/clear/finished") => {
                             repo::handle_download_clear_finished(state, req, auth).await
                         }
-                        (Method::POST, "/v1/repo/downloads/cancel/all")
-                        | (Method::POST, "/repo/downloads/cancel/all") => {
+                        (Method::POST, "/v1/repo/downloads/cancel/all") => {
                             repo::handle_download_cancel_all(state, req, auth).await
                         }
-                        (Method::POST, p)
-                            if p.starts_with("/v1/repo/downloads/")
-                                || p.starts_with("/repo/downloads/") =>
-                        {
-                            let prefix = if p.starts_with("/v1") {
-                                "/v1/repo/downloads/"
-                            } else {
-                                "/repo/downloads/"
-                            };
-                            let tail = &p[prefix.len()..];
+                        (Method::POST, p) if p.starts_with("/v1/repo/downloads/") => {
+                            let tail = &p["/v1/repo/downloads/".len()..];
                             let Some((raw_id, action)) = tail.rsplit_once('/') else {
                                 return Ok(method_not_allowed(&["GET", "POST"]));
                             };
@@ -287,34 +276,19 @@ impl Service<Request<Incoming>> for Router {
                                 _ => method_not_allowed(&["POST"]),
                             }
                         }
-                        (Method::POST, "/v1/repo/models") | (Method::POST, "/repo/models") => {
+                        (Method::POST, "/v1/repo/models") => {
                             repo::handle_fetch(state, req, auth).await
                         }
                         (Method::GET, p)
-                            if (p.starts_with("/v1/repo/models/")
-                                || p.starts_with("/repo/models/"))
-                                && p.ends_with("/files") =>
+                            if p.starts_with("/v1/repo/models/") && p.ends_with("/files") =>
                         {
-                            let prefix = if p.starts_with("/v1") {
-                                "/v1/repo/models/"
-                            } else {
-                                "/repo/models/"
-                            };
-                            let raw = &p[prefix.len()..p.len() - "/files".len()];
+                            let raw = &p["/v1/repo/models/".len()..p.len() - "/files".len()];
                             let model_id =
                                 percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
                             repo::handle_list_files(state, req, auth, &model_id).await
                         }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/repo/models/")
-                                || p.starts_with("/repo/models/") =>
-                        {
-                            let prefix = if p.starts_with("/v1") {
-                                "/v1/repo/models/"
-                            } else {
-                                "/repo/models/"
-                            };
-                            let raw = &p[prefix.len()..];
+                        (Method::DELETE, p) if p.starts_with("/v1/repo/models/") => {
+                            let raw = &p["/v1/repo/models/".len()..];
                             let model_id =
                                 percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
                             repo::handle_delete(state, req, auth, &model_id).await
@@ -328,17 +302,11 @@ impl Service<Request<Incoming>> for Router {
                         (_, "/v1/models") => method_not_allowed(&["GET"]),
                         (_, "/v1/model/config") => method_not_allowed(&["POST"]),
                         (_, "/v1/repo/models") => method_not_allowed(&["GET", "POST"]),
-                        (_, "/repo/models") => method_not_allowed(&["GET", "POST"]),
                         (_, "/v1/repo/search") => method_not_allowed(&["GET"]),
-                        (_, "/repo/search") => method_not_allowed(&["GET"]),
                         (_, "/v1/repo/stats") => method_not_allowed(&["GET"]),
-                        (_, "/repo/stats") => method_not_allowed(&["GET"]),
                         (_, "/v1/repo/downloads") => method_not_allowed(&["GET", "POST"]),
-                        (_, "/repo/downloads") => method_not_allowed(&["GET", "POST"]),
                         (_, "/v1/repo/downloads/clear/finished") => method_not_allowed(&["POST"]),
-                        (_, "/repo/downloads/clear/finished") => method_not_allowed(&["POST"]),
                         (_, "/v1/repo/downloads/cancel/all") => method_not_allowed(&["POST"]),
-                        (_, "/repo/downloads/cancel/all") => method_not_allowed(&["POST"]),
                         (_, "/v1/responses") => method_not_allowed(&["POST"]),
                         (_, "/v1/chat/completions") => method_not_allowed(&["POST"]),
                         (Method::POST, "/v1/tokenizer/instances") => {

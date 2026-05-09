@@ -765,7 +765,14 @@ fn step_loop(
                 }
 
                 // --- Dispatch event + check stop flags ---
-                let mut reqs = requests.lock().unwrap();
+                let mut reqs = match requests.lock() {
+                    Ok(reqs) => reqs,
+                    Err(e) => {
+                        log::error!(target: "batch_scheduler", "request state unavailable: {e}");
+                        pending_flag.store(true, Ordering::Release);
+                        return;
+                    }
+                };
 
                 if event.is_final {
                     if let Some(slot) = reqs.remove(&event.request_id) {

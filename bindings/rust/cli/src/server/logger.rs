@@ -13,8 +13,6 @@
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::server::events;
-
 /// Stored filter pattern for Rust-side log scope filtering.
 static FILTER: OnceLock<String> = OnceLock::new();
 
@@ -55,12 +53,6 @@ impl log::Log for TaluServerLogger {
             record.level(),
             record.target(),
             record.args()
-        );
-
-        events::publish_ambient_rust_log(
-            record.level(),
-            record.target(),
-            &record.args().to_string(),
         );
     }
 

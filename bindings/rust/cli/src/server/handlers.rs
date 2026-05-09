@@ -17,7 +17,6 @@ use tokio_stream::StreamExt;
 #[cfg(not(windows))]
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
-use crate::server::events;
 use crate::server::responses_types;
 use crate::server::state::{AppState, ModelLoadResult, StoredResponse};
 use crate::server::vision;
@@ -642,7 +641,14 @@ async fn generate_response(
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
     let reasoning_effort_for_generation = reasoning.effort.clone();
-    let batch_scheduler_for_task = state.batch_scheduler.lock().unwrap().clone();
+    let batch_scheduler_for_task = state
+        .batch_scheduler
+        .lock()
+        .map_err(|e| ResponseError::Internal {
+            code: "server_state_unavailable",
+            message: format!("batch scheduler state unavailable: {e}"),
+        })?
+        .clone();
     let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json, response_status, incomplete_reason) =
         tokio::task::spawn_blocking(move || {
             // Create ChatHandle with system prompt if prompt_id was provided
@@ -977,7 +983,6 @@ async fn stream_response(
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-    let request_id = format!("req_{}", random_id());
     let response_id = format!("resp_{}", random_id());
     let message_id = format!("msg_{}", random_id());
     let created_at = now_unix_seconds();
@@ -1149,11 +1154,6 @@ async fn stream_response(
     let title_input = input_string.clone();
     let title_session_id = session_id.clone();
     let title_backend = state.backend.clone();
-    let events_tenant_id = auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone());
-    let events_request_id = request_id.clone();
-    let events_response_id = response_id.clone();
-    let events_session_id = session_id.clone();
-
     let previous_response_id_for_ctx = previous_response_id.clone();
     let has_prepared_vision_prefill = prepared_vision_prefill.is_some();
     let contains_images_hint =
@@ -1220,32 +1220,16 @@ async fn stream_response(
             seq += 1;
         }
 
-        // Load/switch backend if needed, emitting progress events through SSE.
+        // Load/switch backend if needed before generation.
         {
             let mut guard = backend.blocking_lock();
             let needs_load =
                 guard.current_model.as_deref() != Some(&model_id) || guard.backend.is_none();
             if needs_load {
-                let progress_tenant_id = events_tenant_id.clone();
-                let progress_request_id = events_request_id.clone();
-                let progress_response_id = events_response_id.clone();
-                let progress_session_id = events_session_id.clone();
-                let callback: Option<talu::LoadProgressCallback> =
-                    Some(Box::new(move |p: talu::LoadProgress| {
-                        events::publish_inference_progress(
-                            progress_tenant_id.as_deref(),
-                            Some(progress_request_id.as_str()),
-                            Some(progress_response_id.as_str()),
-                            Some(progress_session_id.as_str()),
-                            &p.label,
-                            p.current,
-                            p.total,
-                        );
-                    }));
                 match load_backend_for_model_with_progress_blocking(
                     &state_for_store,
                     model_id.clone(),
-                    callback,
+                    None,
                 ) {
                     Ok(new_backend) => {
                         // Recreate batch scheduler for new backend.
@@ -1432,7 +1416,29 @@ async fn stream_response(
         }));
         let ctx_for_complete = ctx.clone();
 
-        let batch_sched = state_for_store.batch_scheduler.lock().unwrap().clone();
+        let batch_sched = match state_for_store.batch_scheduler.lock() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                if let Ok(ctx) = ctx_for_complete.lock() {
+                    let _ = ctx.try_send(
+                        "response.failed",
+                        json!({
+                            "type": "response.failed",
+                            "sequence_number": ctx.seq,
+                            "response": {
+                                "error": {
+                                    "code": "server_state_unavailable",
+                                    "message": format!("batch scheduler state unavailable: {e}"),
+                                }
+                            }
+                        }),
+                    );
+                } else {
+                    log::error!(target: "server::gen", "stream state unavailable after batch scheduler lock failure: {e}");
+                }
+                return;
+            }
+        };
         let contains_images =
             vision::payload_may_include_images(input_json.as_deref(), prev_json.as_deref());
         let use_batch_stream = has_prepared_vision_prefill || !contains_images;
@@ -1464,10 +1470,6 @@ async fn stream_response(
                     ctx,
                     stop_flag_for_gen,
                     reasoning_for_events.effort.clone(),
-                    events_tenant_id.clone(),
-                    Some(events_request_id.clone()),
-                    Some(events_response_id.clone()),
-                    Some(events_session_id.clone()),
                     effective_config,
                     prepared_vision_prefill,
                 )
@@ -1497,10 +1499,6 @@ async fn stream_response(
                     ctx,
                     stop_flag_for_gen,
                     reasoning_for_events.effort.clone(),
-                    events_tenant_id.clone(),
-                    Some(events_request_id.clone()),
-                    Some(events_response_id.clone()),
-                    Some(events_session_id.clone()),
                     effective_config,
                     prepared_vision_prefill,
                 )
@@ -1531,10 +1529,6 @@ async fn stream_response(
                 ctx,
                 stop_flag_for_gen,
                 reasoning_for_events.effort.clone(),
-                events_tenant_id.clone(),
-                Some(events_request_id.clone()),
-                Some(events_response_id.clone()),
-                Some(events_session_id.clone()),
                 effective_config,
                 prepared_vision_prefill,
             )
@@ -1620,10 +1614,6 @@ fn run_streaming_generation(
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
     reasoning_effort: Option<String>,
-    event_tenant_id: Option<String>,
-    event_request_id: Option<String>,
-    event_response_id: Option<String>,
-    event_session_id: Option<String>,
     effective_config: Option<talu::model::EffectiveGenConfig>,
     prepared_vision_prefill: Option<talu::router::VisionPrefillInput>,
 ) -> Result<StreamGenResult> {
@@ -1721,18 +1711,6 @@ fn run_streaming_generation(
     let stop_flag_for_cb = stop_flag.clone();
     cfg.stop_flag = Some(stop_flag);
 
-    cfg.prefill_progress = Some(Box::new(move |completed: usize, total: usize| {
-        events::publish_inference_progress(
-            event_tenant_id.as_deref(),
-            event_request_id.as_deref(),
-            event_response_id.as_deref(),
-            event_session_id.as_deref(),
-            "prefill",
-            completed as u64,
-            total as u64,
-        );
-    }));
-
     log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
         model_id, max_output_tokens, temperature, top_p);
 
@@ -1817,10 +1795,6 @@ fn run_batch_streaming_generation(
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
     reasoning_effort: Option<String>,
-    _event_tenant_id: Option<String>,
-    _event_request_id: Option<String>,
-    _event_response_id: Option<String>,
-    _event_session_id: Option<String>,
     effective_config: Option<talu::model::EffectiveGenConfig>,
     prepared_vision_prefill: Option<talu::router::VisionPrefillInput>,
 ) -> Result<StreamGenResult> {
@@ -2136,7 +2110,10 @@ fn generate_title(
     talu::router::generate_stream(&chat, &[], backend, &cfg, callback)
         .map_err(|e| anyhow!("title generation failed: {e}"))?;
 
-    let title = title_buf.lock().unwrap().clone();
+    let title = title_buf
+        .lock()
+        .map_err(|e| anyhow!("title buffer unavailable: {e}"))?
+        .clone();
     // Clean up: trim whitespace, strip surrounding quotes.
     let title = title.trim().to_string();
     let title = title
@@ -3184,7 +3161,10 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
     //    The std::sync::Mutex is safe here — critical section is a HashMap
     //    lookup/insert/clone (nanoseconds), never held across .await.
     let maybe_rx = {
-        let inflight = state.model_load_inflight.lock().unwrap();
+        let inflight = state
+            .model_load_inflight
+            .lock()
+            .map_err(|e| anyhow!("model load state unavailable: {e}"))?;
         inflight.get(model_id).cloned()
     };
 
@@ -3204,7 +3184,10 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
     //    Atomically check-and-register under the inflight mutex.
     let (tx, rx) = tokio::sync::watch::channel(ModelLoadResult::Pending);
     let lost_race_rx = {
-        let mut inflight = state.model_load_inflight.lock().unwrap();
+        let mut inflight = state
+            .model_load_inflight
+            .lock()
+            .map_err(|e| anyhow!("model load state unavailable: {e}"))?;
         // Double-check: another task may have registered between our read
         // and this write (two callers passed step 2 concurrently).
         if let Some(existing_rx) = inflight.get(model_id) {
@@ -3236,7 +3219,9 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
             && guard.backend.is_some()
         {
             let _ = tx.send(ModelLoadResult::Ok);
-            state.model_load_inflight.lock().unwrap().remove(model_id);
+            if let Ok(mut inflight) = state.model_load_inflight.lock() {
+                inflight.remove(model_id);
+            }
             return Ok(());
         }
     }
@@ -3249,7 +3234,9 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
         Err(e) => {
             let msg = format!("{e}");
             let _ = tx.send(ModelLoadResult::Err(msg.clone()));
-            state.model_load_inflight.lock().unwrap().remove(&model_key);
+            if let Ok(mut inflight) = state.model_load_inflight.lock() {
+                inflight.remove(&model_key);
+            }
             return Err(e);
         }
     };
@@ -3287,7 +3274,9 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
 
     // 7. Signal waiters and clean up inflight entry.
     let _ = tx.send(ModelLoadResult::Ok);
-    state.model_load_inflight.lock().unwrap().remove(&model_key);
+    if let Ok(mut inflight) = state.model_load_inflight.lock() {
+        inflight.remove(&model_key);
+    }
 
     // 8. Drain old scheduler in background.
     if old_sched.is_some() || old_backend.is_some() {

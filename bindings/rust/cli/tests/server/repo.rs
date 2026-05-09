@@ -134,11 +134,10 @@ fn list_source_filter_invalid_ignored() {
 }
 
 #[test]
-fn list_bare_path() {
+fn list_bare_path_is_not_supported() {
     let ctx = ServerTestContext::new(repo_config());
     let resp = get(ctx.addr(), "/repo/models");
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
-    assert!(resp.json()["models"].is_array());
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
 #[test]
@@ -163,11 +162,10 @@ fn stats_returns_cache_summary() {
 }
 
 #[test]
-fn stats_bare_path() {
+fn stats_bare_path_is_not_supported() {
     let ctx = ServerTestContext::new(repo_config());
     let resp = get(ctx.addr(), "/repo/stats");
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
-    assert!(resp.json()["total_models"].is_number());
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
 #[test]
@@ -273,10 +271,10 @@ fn search_accepts_optional_params() {
 }
 
 #[test]
-fn search_bare_path_accepted() {
+fn search_bare_path_is_not_supported() {
     let ctx = ServerTestContext::new(repo_config());
     let resp = get(ctx.addr(), "/repo/search?query=");
-    assert_search_accepted(&resp);
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
 #[test]
@@ -386,8 +384,6 @@ fn fetch_stream_client_disconnect_does_not_crash_server() {
         stream.flush().expect("flush");
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
     let resp = get(ctx.addr(), "/v1/repo/models");
     assert_eq!(resp.status, 200, "server should remain alive");
 }
@@ -405,10 +401,10 @@ fn delete_returns_json_shape() {
 }
 
 #[test]
-fn delete_bare_path() {
+fn delete_bare_path_is_not_supported() {
     let ctx = ServerTestContext::new(repo_config());
     let resp = delete(ctx.addr(), "/repo/models/nonexistent-org/nonexistent-model");
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
 #[test]
@@ -452,13 +448,13 @@ fn files_percent_encoded_model_id() {
 }
 
 #[test]
-fn files_bare_path() {
+fn files_bare_path_is_not_supported() {
     let ctx = ServerTestContext::new(repo_config());
     let resp = get(
         ctx.addr(),
         "/repo/models/nonexistent-org/nonexistent-model/files",
     );
-    assert_eq!(resp.header("content-type"), Some("application/json"));
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
 #[test]

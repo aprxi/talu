@@ -13,7 +13,6 @@ pub mod auth_gateway;
 pub mod batch_scheduler;
 pub mod completions;
 pub mod completions_types;
-pub mod events;
 pub mod handlers;
 pub mod http;
 pub mod listen;
@@ -70,8 +69,6 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         _ => LevelFilter::Trace,
     };
     logger::init(level, log_filter);
-    events::maybe_reset_global_for_tests();
-    events::install_core_log_bridge();
 
     // Pass filter to Zig core logging as well.
     if let Some(filter) = log_filter {

@@ -119,7 +119,15 @@ async fn handle_non_streaming(
     let stop_flag_for_gen = stop_flag.clone();
 
     let backend = state.backend.clone();
-    let batch_scheduler = state.batch_scheduler.lock().unwrap().clone();
+    let batch_scheduler = match state.batch_scheduler.lock() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("batch scheduler state unavailable: {e}"),
+            )
+        }
+    };
     let model_id_for_task = model_id.clone();
     let model_id_for_task_inner = model_id_for_task.clone();
     let created = now_unix_seconds();
@@ -327,7 +335,15 @@ async fn handle_streaming(
     let created = now_unix_seconds();
     let completion_id = format!("chatcmpl-{}", random_id());
     let backend = state.backend.clone();
-    let batch_scheduler = state.batch_scheduler.lock().unwrap().clone();
+    let batch_scheduler = match state.batch_scheduler.lock() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("batch scheduler state unavailable: {e}"),
+            )
+        }
+    };
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_for_gen = stop_flag.clone();

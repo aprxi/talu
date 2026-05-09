@@ -277,25 +277,6 @@ pub fn send_request(
     body: Option<&str>,
 ) -> HttpResponse {
     let body = body.unwrap_or("");
-    let mut request_preview = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
-        host = addr
-    );
-    for (name, value) in headers {
-        request_preview.push_str(&format!("{name}: {value}\r\n"));
-    }
-    request_preview.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-    if body.len() > 4096 {
-        let preview: String = body.chars().take(4096).collect();
-        request_preview.push_str(&preview);
-        request_preview.push_str(&format!(
-            "\n...[truncated request body: {} bytes omitted]",
-            body.len().saturating_sub(preview.len())
-        ));
-    } else {
-        request_preview.push_str(body);
-    }
-
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
         host = addr
@@ -306,31 +287,23 @@ pub fn send_request(
     request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
     request.push_str(body);
 
-    eprintln!("[DEBUG] Connecting to {addr}...");
     let mut stream =
         TcpStream::connect_timeout(&addr.into(), Duration::from_secs(5)).expect("connect");
-    eprintln!("[DEBUG] Connected to {addr}");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("set read timeout");
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .expect("set write timeout");
-    eprintln!("[DEBUG] Request:\n{request_preview}");
     stream.write_all(request.as_bytes()).expect("write request");
     stream.flush().expect("flush");
-    eprintln!("[DEBUG] Request sent to {addr}");
 
     let mut raw = Vec::new();
     loop {
         let mut buf = [0u8; 8192];
         match stream.read(&mut buf) {
-            Ok(0) => {
-                eprintln!("[DEBUG] Read returned 0 bytes (EOF)");
-                break;
-            }
+            Ok(0) => break,
             Ok(n) => {
-                eprintln!("[DEBUG] Read {n} bytes");
                 raw.extend_from_slice(&buf[..n]);
                 // WebSocket 101 has no body — stop after headers.
                 if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -341,7 +314,6 @@ pub fn send_request(
                         .and_then(|line| line.split_whitespace().nth(1))
                         == Some("101");
                     if is_switching_protocols {
-                        eprintln!("[DEBUG] WebSocket 101 upgrade — done");
                         break;
                     }
                 }
@@ -357,7 +329,6 @@ pub fn send_request(
                     );
                 }
                 // Partial response received, server stopped sending — done.
-                eprintln!("[DEBUG] Read timeout after {} bytes", raw.len());
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -368,10 +339,6 @@ pub fn send_request(
             Err(e) => panic!("read error: {e}"),
         }
     }
-    if raw.is_empty() {
-        eprintln!("[DEBUG] Empty response from server for {method} {path}");
-    }
-
     let response = String::from_utf8_lossy(&raw);
     let (head, body_raw) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
 
@@ -480,9 +447,6 @@ fn wait_for_ready(rx: &Receiver<String>, child: &mut Child) -> SocketAddr {
                         .trim()
                         .parse()
                         .unwrap_or_else(|e| panic!("bad addr in log: {addr_str:?}: {e}"));
-                    eprintln!("[DEBUG] Server ready at {addr}");
-                    // Small delay to ensure server is fully ready to accept connections
-                    std::thread::sleep(Duration::from_millis(50));
                     return addr;
                 }
                 logs.push(line);
