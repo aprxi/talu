@@ -194,10 +194,7 @@ pub const talu_chat_count_tokens = responses.talu_chat_count_tokens;
 pub const talu_chat_max_context_length = responses.talu_chat_max_context_length;
 pub const talu_completions_validate_request = router.talu_completions_validate_request;
 
-// Re-export Router C API functions (routes generation to inference backends).
-pub const talu_router_generate_with_backend = router.talu_router_generate_with_backend;
-pub const talu_router_generate_streaming = router.talu_router_generate_streaming;
-pub const talu_router_result_free = router.talu_router_result_free;
+// Re-export Router C API functions (backend helpers and embeddings).
 pub const talu_router_close_all = router.talu_router_close_all;
 pub const talu_router_embedding_dim = router.talu_router_embedding_dim;
 pub const talu_router_embed = router.talu_router_embed;
@@ -215,7 +212,7 @@ pub const talu_batch_step = batch.talu_batch_step;
 pub const talu_batch_has_active = batch.talu_batch_has_active;
 pub const talu_batch_active_count = batch.talu_batch_active_count;
 pub const talu_batch_run_loop = batch.talu_batch_run_loop;
-pub const talu_batch_run_loop_no_text = batch.talu_batch_run_loop_no_text;
+pub const talu_batch_run_loop_final_only = batch.talu_batch_run_loop_final_only;
 pub const talu_batch_take_result = batch.talu_batch_take_result;
 pub const talu_batch_result_free = batch.talu_batch_result_free;
 

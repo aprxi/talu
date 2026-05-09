@@ -69,23 +69,6 @@ impl RawResponsesHandle {
         assert!(id >= 0, "append_message failed for {content:?}");
     }
 
-    #[allow(dead_code)]
-    pub fn append_function_call(&mut self, call_id: &str, name: &str, arguments: &str) {
-        let call_id = CString::new(call_id).expect("call_id CString");
-        let name = CString::new(name).expect("name CString");
-        // SAFETY: self.ptr is valid; C strings and argument bytes remain live for the call.
-        let id = unsafe {
-            talu_sys::talu_responses_append_function_call(
-                self.ptr,
-                call_id.as_ptr(),
-                name.as_ptr(),
-                arguments.as_ptr(),
-                arguments.len(),
-            )
-        };
-        assert!(id >= 0, "append_function_call failed");
-    }
-
     pub fn item_count(&self) -> usize {
         // SAFETY: self.ptr is valid for the lifetime of this fixture.
         unsafe { talu_sys::talu_responses_item_count(self.ptr) }
@@ -99,7 +82,7 @@ impl RawResponsesHandle {
 
         let mut out = String::new();
         for part_index in 0..msg.content_count {
-            let mut part = talu_sys::CResponsesContentPart::default();
+            let mut part = talu_sys::CContentPart::default();
             // SAFETY: self.ptr is valid and part is a valid out-parameter.
             let rc = unsafe {
                 talu_sys::talu_responses_item_message_get_content(
@@ -179,17 +162,6 @@ pub fn build_simple_conversation(h: &mut ResponsesHandle) {
     h.append_message(MessageRole::User, "Hello!").unwrap();
     h.append_message(MessageRole::Assistant, "Hi there!")
         .unwrap();
-}
-
-/// Alternating user/assistant pairs.
-#[allow(dead_code)]
-pub fn build_multi_turn(h: &mut ResponsesHandle, turns: usize) {
-    for i in 0..turns {
-        h.append_message(MessageRole::User, &format!("User turn {}", i))
-            .unwrap();
-        h.append_message(MessageRole::Assistant, &format!("Assistant turn {}", i))
-            .unwrap();
-    }
 }
 
 /// user + FC + FCO + assistant (single tool turn).

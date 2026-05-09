@@ -539,7 +539,7 @@ pub struct EffectiveGenConfig {
 /// Resolve effective generation config by applying model defaults and overrides.
 ///
 /// This is the SINGLE source of truth for generation config policy. All entrypoints
-/// (CLI ask, xray, shell, server) must use this function instead of implementing
+/// (CLI ask, xray, server) must use this function instead of implementing
 /// their own policy logic.
 ///
 /// The policy matches core/src/router/local.zig sampling decision:

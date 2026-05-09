@@ -176,10 +176,7 @@ comptime {
     // Template API
     _ = &capi.talu_template_render;
 
-    // Router API (backend-based)
-    _ = &capi.talu_router_generate_with_backend;
-    _ = &capi.talu_router_generate_streaming;
-    _ = &capi.talu_router_result_free;
+    // Router API
     _ = &capi.talu_router_close_all;
     _ = &capi.talu_router_embedding_dim;
     _ = &capi.talu_router_embed;
@@ -197,7 +194,7 @@ comptime {
     _ = &capi.talu_batch_has_active;
     _ = &capi.talu_batch_active_count;
     _ = &capi.talu_batch_run_loop;
-    _ = &capi.talu_batch_run_loop_no_text;
+    _ = &capi.talu_batch_run_loop_final_only;
     _ = &capi.talu_batch_take_result;
     _ = &capi.talu_batch_result_free;
 

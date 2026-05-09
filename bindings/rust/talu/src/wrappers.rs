@@ -1031,15 +1031,40 @@ pub struct ToolCall {
     pub item_index: usize,
 }
 
+struct OwnedGenerateResult {
+    text: Option<String>,
+    token_count: usize,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    prefill_ns: u64,
+    generation_ns: u64,
+    ttft_ns: u64,
+    error_code: i32,
+    finish_reason: FinishReason,
+    tool_calls: Vec<ToolCall>,
+}
+
 /// RAII wrapper for generation results.
 pub struct GenerateResult {
-    inner: talu_sys::CGenerateResult,
+    inner: OwnedGenerateResult,
 }
 
 impl GenerateResult {
-    /// Creates a new GenerateResult from the raw FFI result.
-    pub(crate) fn new(inner: talu_sys::CGenerateResult) -> Self {
-        Self { inner }
+    pub(crate) fn from_batch(result: crate::batch::BatchResult) -> Self {
+        Self {
+            inner: OwnedGenerateResult {
+                token_count: result.completion_tokens,
+                prompt_tokens: result.prompt_tokens,
+                completion_tokens: result.completion_tokens,
+                prefill_ns: result.prefill_ns,
+                generation_ns: result.generation_ns,
+                ttft_ns: result.ttft_ns,
+                error_code: 0,
+                finish_reason: result.finish_reason,
+                text: result.text,
+                tool_calls: result.tool_calls,
+            },
+        }
     }
 
     /// Returns the error code.
@@ -1079,21 +1104,12 @@ impl GenerateResult {
 
     /// Returns the generated text, if any.
     pub fn text(&self) -> Option<String> {
-        if self.inner.text.is_null() {
-            None
-        } else {
-            // SAFETY: Non-null text pointer from the C generate result.
-            Some(
-                unsafe { CStr::from_ptr(self.inner.text) }
-                    .to_string_lossy()
-                    .to_string(),
-            )
-        }
+        self.inner.text.clone()
     }
 
     /// Returns the finish reason for this generation.
     pub fn finish_reason(&self) -> FinishReason {
-        FinishReason::from(talu_sys::CFinishReason::from(self.inner.finish_reason))
+        self.inner.finish_reason
     }
 
     /// Extracts tool calls from the generation result.
@@ -1105,48 +1121,6 @@ impl GenerateResult {
     /// the caller should fall back to `GenerateResult::text()` which contains
     /// the raw model output including any tool-call markup.
     pub fn tool_calls(&self) -> Vec<ToolCall> {
-        if self.inner.tool_calls.is_null() || self.inner.tool_call_count == 0 {
-            return Vec::new();
-        }
-
-        // SAFETY: Non-null tool_calls ptr with valid count from C API.
-        let slice = unsafe {
-            std::slice::from_raw_parts(self.inner.tool_calls, self.inner.tool_call_count)
-        };
-
-        slice
-            .iter()
-            .map(|tc| {
-                let id = if tc.call_id.is_null() {
-                    String::new()
-                } else {
-                    // SAFETY: Non-null C string from C API.
-                    unsafe { CStr::from_ptr(tc.call_id) }
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                let name = if tc.name.is_null() {
-                    String::new()
-                } else {
-                    // SAFETY: Non-null C string from C API.
-                    unsafe { CStr::from_ptr(tc.name) }
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                ToolCall {
-                    id,
-                    name,
-                    arguments: String::new(),
-                    item_index: tc.item_index,
-                }
-            })
-            .collect()
-    }
-}
-
-impl Drop for GenerateResult {
-    fn drop(&mut self) {
-        // SAFETY: self.inner was populated by talu_router_generate and must be freed.
-        unsafe { talu_sys::talu_router_result_free(&mut self.inner) };
+        self.inner.tool_calls.clone()
     }
 }

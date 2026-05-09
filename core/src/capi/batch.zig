@@ -398,10 +398,11 @@ pub export fn talu_batch_run_loop(
     return 0;
 }
 
-/// Run loop variant that skips per-token text decoding in core.
+/// Run loop variant for final-only non-streaming callers.
 ///
-/// Intended for non-streaming server handlers that only need terminal events.
-pub export fn talu_batch_run_loop_no_text(
+/// Emits only terminal events. Callers fetch generated text and metadata with
+/// talu_batch_take_result after receiving a final event.
+pub export fn talu_batch_run_loop_final_only(
     handle: ?*anyopaque,
     pending_flag: ?*anyopaque,
     callback: ?*anyopaque,
@@ -423,8 +424,8 @@ pub export fn talu_batch_run_loop_no_text(
     const cb: RunLoopCallback = @ptrCast(@alignCast(cb_ptr));
     const pending: ?*const std.atomic.Value(bool) = if (pending_flag) |pf| @ptrCast(@alignCast(pf)) else null;
 
-    wrapper.runLoopNoText(pending, cb, callback_data) catch |err| {
-        capi_error.setError(err, "batch run_loop_no_text failed: {s}", .{@errorName(err)});
+    wrapper.runLoopFinalOnly(pending, cb, callback_data) catch |err| {
+        capi_error.setError(err, "batch run_loop_final_only failed: {s}", .{@errorName(err)});
         return -1;
     };
 

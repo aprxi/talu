@@ -1,7 +1,8 @@
 """
 Model routing and endpoint configuration.
 
-Holds model targets and optional custom endpoints for generation requests.
+Holds model targets for local generation requests. Endpoint fields are retained
+for future Python remote routing support, but are not executed yet.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from talu.types import ContentType, ItemType
 from ..exceptions import GenerationError, StateError, TaluError, ValidationError
 from . import _bindings as _c
 from ._bindings import TaluInferenceBackendHandle, get_spec_lib
-from .spec import ModelSpec, normalize_to_handle
+from .spec import ModelSpec, OpenAICompatibleBackend, normalize_to_handle
 
 if TYPE_CHECKING:
     from talu.chat.session import AsyncChat, Chat
@@ -73,8 +74,8 @@ class ModelTarget:
 
     Attributes
     ----------
-        model: Model identifier (e.g., "Qwen/Qwen3-0.6B", "openai::gpt-4o").
-        endpoint: Optional custom endpoint URL (overrides provider defaults).
+        model: Model identifier (e.g., "Qwen/Qwen3-0.6B").
+        endpoint: Future remote endpoint URL. Stored but not executable yet.
         spec: The ModelSpec used to create this target.
     """
 
@@ -173,9 +174,8 @@ class Router:
         self._active_threads: set[threading.Thread] = set()
         self._active_threads_lock = threading.Lock()
 
-
     def _is_external_api(self, model: str) -> bool:
-        """Check if model is an external API (openai::, vllm::, etc.).
+        """Check if a model ref uses a non-native backend namespace.
 
         The :: separator identifies the backend. native:: is the native
         backend (talu's inference engine), not an external API.
@@ -207,7 +207,7 @@ class Router:
         return list(self._targets.keys())
 
     def get_endpoint(self, model: str | None = None) -> str | None:
-        """Get custom endpoint for a model, if any.
+        """Get stored endpoint metadata for a model, if any.
 
         Args:
             model: Model name, or None for the default model.
@@ -219,7 +219,7 @@ class Router:
 
     def set_endpoint(self, model: str, endpoint: str | None) -> None:
         """
-        Set custom endpoint for a model.
+        Set future endpoint metadata for a model.
 
         Args:
             model: Model identifier.
@@ -280,6 +280,20 @@ class Router:
         self._backend_handles.append(backend_handle)
 
         return backend_handle
+
+    def _raise_remote_route_not_implemented(self, model: str) -> None:
+        """Raise for future remote routes that Python does not execute yet."""
+        target = self._targets[model]
+        if target.endpoint is not None or (
+            target.spec is not None and isinstance(target.spec.backend, OpenAICompatibleBackend)
+        ):
+            raise GenerationError(
+                "Python outbound OpenAI-compatible remote routing is not implemented yet. "
+                "Use a local model with Router, or run the Talu server and call its "
+                "/v1/chat/completions endpoint.",
+                code="REMOTE_ROUTING_NOT_IMPLEMENTED",
+                details={"model": model},
+            )
 
     def _check_closed(self) -> None:
         """Raise if router has been closed."""
@@ -356,6 +370,7 @@ class Router:
         from ._bindings import RouterGenerateConfig
 
         model = self._resolve_model(model)
+        self._raise_remote_route_not_implemented(model)
 
         # Build C config struct from GenerationConfig
         c_config = None
@@ -382,69 +397,25 @@ class Router:
                 extra_body=config.extra_body if config else None,
             )
 
-        # Convert string to content parts if needed
-        if isinstance(user_message, str):
-            parts_list = [{"type": "text", "text": user_message}]
-        else:
-            # Warn if non-text content types are used (not yet supported for inference)
-            self._warn_unsupported_content_types(user_message)
-            parts_list = user_message
-
-        # Build content parts and call generate with backend-based API
-        parts, data_refs = _c.build_router_content_parts(parts_list)
-
         # Get or create backend handle for this model (lazy initialization)
         backend_handle = self._get_or_create_backend(model)
 
-        result = _c.router_generate_with_backend(
+        user_text = self._coerce_batch_user_text(user_message)
+        _c.router_append_user_message(self._lib, chat._chat_ptr, user_text)
+        result = _c.router_generate_batch_final(
             self._lib,
             chat._chat_ptr,
-            parts,
-            len(parts_list),
             backend_handle,
             c_config,
         )
-        # Keep data_refs alive until after the call
-        del data_refs
 
-        # Check for errors
-        if result.error_code != 0:
-            from talu._bindings import get_last_error
-
-            # Get detailed error from Zig (includes context like model path, etc.)
-            zig_error = get_last_error()
-            if zig_error:
-                raise GenerationError(
-                    f"Router.generate() failed: {zig_error}",
-                    code="GENERATION_FAILED",
-                )
-
-            # Fallback to generic messages if Zig didn't set an error
-            error_messages = {
-                -1: "Invalid chat handle",
-                -2: "Invalid user message",
-                -3: "Invalid model",
-                -4: "Engine creation failed",
-                -5: "Failed to add user message",
-                -6: "Generation failed",
-                -8: "Memory allocation failed",
-                -10: f"External API model '{model}' not yet supported",
-            }
-            msg = error_messages.get(result.error_code, f"Unknown error: {result.error_code}")
-            raise GenerationError(
-                f"Router.generate() failed: {msg}",
-                code="GENERATION_FAILED",
-                details={"error_code": result.error_code},
-            )
-
-        # Extract result
-        text = _c.router_result_extract_text(result)
-        token_count = result.token_count
-        prompt_tokens = result.prompt_tokens
-        completion_tokens = result.completion_tokens
-        prefill_ns = result.prefill_ns
-        generation_ns = result.generation_ns
-        tool_calls_raw = _c.router_result_extract_tool_calls(result)
+        text = result["text"]
+        token_count = result["token_count"]
+        prompt_tokens = result["prompt_tokens"]
+        completion_tokens = result["completion_tokens"]
+        prefill_ns = result["prefill_ns"]
+        generation_ns = result["generation_ns"]
+        tool_calls_raw = result["tool_calls"]
         finish_reason = {
             0: "stop",
             1: "length",
@@ -452,10 +423,7 @@ class Router:
             3: "tool_calls",
             4: "content_filter",
             5: "cancelled",
-        }.get(result.finish_reason)
-
-        # Free result memory
-        _c.router_result_free(self._lib, result)
+        }.get(result["finish_reason"])
 
         tool_calls = None
         if tool_calls_raw:
@@ -474,9 +442,41 @@ class Router:
             "completion_tokens": completion_tokens,
             "prefill_ns": prefill_ns,
             "generation_ns": generation_ns,
+            "ttft_ns": result["ttft_ns"],
             "finish_reason": finish_reason,
             "tool_calls": tool_calls,
         }
+
+    def _coerce_batch_user_text(
+        self, user_message: str | list[dict], operation: str = "Router.generate()"
+    ) -> str:
+        """Return text content accepted by local batch generation."""
+        if isinstance(user_message, str):
+            return user_message
+        if not user_message:
+            raise GenerationError(
+                f"{operation} failed: generation prompt is empty",
+                code="GENERATION_FAILED",
+            )
+
+        text_parts: list[str] = []
+        unsupported: set[str] = set()
+        for part in user_message:
+            content_type = part.get("type", "text")
+            if content_type in {"text", "input_text"}:
+                text_parts.append(str(part.get("text", "")))
+            else:
+                unsupported.add(content_type)
+
+        if unsupported:
+            types_str = ", ".join(sorted(unsupported))
+            raise GenerationError(
+                f"{operation} failed: local multimodal generation "
+                f"requires batch vision support; unsupported content type(s): {types_str}",
+                code="GENERATION_FAILED",
+            )
+
+        return "".join(text_parts)
 
     def submit(
         self,
@@ -531,31 +531,6 @@ class Router:
             chat, user_message=user_message, config=config, model=model, stop_flag=stop_flag
         )
 
-    def _warn_unsupported_content_types(self, parts: list[dict]) -> None:
-        """
-        Warn if non-text content types are used.
-
-        Multimodal content (images, audio, video) can be stored in messages but
-        is not yet processed by the inference engine. This method emits a warning
-        if such content is detected.
-        """
-        import warnings
-
-        unsupported = set()
-        for part in parts:
-            content_type = part.get("type", "text")
-            if content_type != "text":
-                unsupported.add(content_type)
-
-        if unsupported:
-            types_str = ", ".join(sorted(unsupported))
-            warnings.warn(
-                f"Content type(s) [{types_str}] not yet supported for inference. "
-                f"Non-text content will be stored but not processed by the model.",
-                UserWarning,
-                stacklevel=4,
-            )
-
     def stream(
         self,
         chat: Chat,
@@ -568,8 +543,8 @@ class Router:
         """
         Stream a response for a Chat.
 
-        Submits request to Zig C API. Zig handles all message management.
-        Tokens are yielded in real-time as they are generated.
+        Submits request through the local batch scheduler. Tokens are yielded
+        in real-time as they are generated.
 
         Each yielded ``StreamToken`` carries ``text``, ``item_type``, and
         ``content_type`` metadata for content classification.
@@ -578,10 +553,8 @@ class Router:
             chat: The Chat instance with conversation history.
             user_message: The user's message. Can be:
                 - A string for simple text messages
-                - A list of content parts for multimodal input (Open Responses format):
-                  [{"type": "input_text", "text": "..."},
-                   {"type": "input_image", "image_url": "data:image/png;base64,..."}]
-                  Or use InputImage/InputAudio/InputVideo classes and normalize_content().
+                - A list of text content parts in Open Responses format:
+                  [{"type": "input_text", "text": "..."}]
             config: Generation configuration.
             model: Model to use, or None for default.
             stop_flag: Optional flag to cancel generation mid-stream.
@@ -597,13 +570,13 @@ class Router:
             ValidationError: If the specified model is not found in targets.
             StateError: If the router has been closed.
         """
-        import ctypes
         import queue
         import threading
 
-        from ._bindings import RouterGenerateConfig, StopFlag, StreamCallbackType
+        from ._bindings import RouterGenerateConfig, StopFlag
 
         model = self._resolve_model(model)
+        self._raise_remote_route_not_implemented(model)
 
         # Use caller's stop flag or create an internal one for cancellation
         # Important: StopFlag defines __bool__ as the underlying flag value.
@@ -631,19 +604,16 @@ class Router:
             extra_body=config.extra_body if config else None,
         )
 
-        # Warn if non-text content types are used
-        if isinstance(user_message, list):
-            self._warn_unsupported_content_types(user_message)
-
-        # Build content parts
-        if isinstance(user_message, str):
-            parts_list = [{"type": "text", "text": user_message}]
-        else:
-            parts_list = user_message
-        parts, data_refs = _c.build_router_content_parts(parts_list)
-
         # Get or create backend handle for this model
         backend_handle = self._get_or_create_backend(model)
+
+        user_text = self._coerce_batch_user_text(user_message, "Router.stream()")
+        _c.router_append_user_message(
+            self._lib,
+            chat._chat_ptr,
+            user_text,
+            context="Router.stream()",
+        )
 
         # Token queue: callback pushes StreamToken, generator pulls.
         # Use bounded capacity to prevent unbounded buffering. Without backpressure,
@@ -664,43 +634,29 @@ class Router:
                 except queue.Full:
                     continue
 
-        # Define the C callback that receives tokens from Zig.
-        # Must be kept alive for the duration of the call.
-        @StreamCallbackType
-        def on_token(text_ptr, text_len, item_type, content_type, is_final, _userdata):
-            if is_final:
-                return 1
+        def on_token(text: str, item_type: int, content_type: int, *_metadata: int) -> bool:
             if stream_closed.is_set() or internal_stop.is_set():
-                return 0
-            if text_len > 0:
-                text = ctypes.string_at(text_ptr, text_len).decode("utf-8", errors="replace")
+                return False
+            if text:
                 if not _enqueue_token(StreamToken(text, item_type, content_type)):
-                    return 0
-            return 0 if (stream_closed.is_set() or internal_stop.is_set()) else 1
+                    internal_stop.signal()
+                    return False
+            return not (stream_closed.is_set() or internal_stop.is_set())
 
         def run_generation():
+            result = None
             try:
-                result = _c.router_generate_streaming(
+                result = _c.router_generate_batch_streaming(
                     self._lib,
                     chat._chat_ptr,
-                    parts,
-                    len(parts_list),
                     backend_handle,
                     c_config,
                     on_token,
                 )
-                if result.error_code != 0:
-                    from talu._bindings import get_last_error
-
-                    zig_error = get_last_error()
-                    gen_error[0] = GenerationError(
-                        f"Router.stream() failed: {zig_error or f'error code {result.error_code}'}",
-                        code="GENERATION_FAILED",
-                        details={"error_code": result.error_code},
-                    )
             except BaseException as e:
                 gen_error[0] = e
             finally:
+                del result
                 while not stream_closed.is_set():
                     try:
                         token_queue.put(None, timeout=0.01)
@@ -731,8 +687,7 @@ class Router:
         finally:
             stream_closed.set()
             gen_thread.join()
-            # Keep data_refs and on_token alive until generation thread completes
-            del data_refs
+            # Keep callback alive until generation thread completes.
             del on_token
             # Untrack thread
             with self._active_threads_lock:
@@ -874,6 +829,7 @@ class Router:
             >>> len(embedding)  # d_model (e.g., 1024)
         """
         model = self._resolve_model(model)
+        self._raise_remote_route_not_implemented(model)
 
         # Convert pooling strategy to enum value
         pooling_map = {"last": 0, "mean": 1, "first": 2}
@@ -901,6 +857,7 @@ class Router:
             GenerationError: If the model cannot be loaded or doesn't support embeddings.
         """
         model_str = self._resolve_model(model)
+        self._raise_remote_route_not_implemented(model_str)
         dim = self._lib.talu_router_embedding_dim(model_str.encode("utf-8"))
         if dim == 0:
             raise GenerationError(

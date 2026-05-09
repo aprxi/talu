@@ -823,9 +823,9 @@ class TestPopErrorHandling:
         with pytest.raises(StateError, match="No messages to remove"):
             chat.pop()
 
-    def test_pop_returns_self_for_chaining(self, test_model_path):
+    def test_pop_returns_self_for_chaining(self, deterministic_chat_generation):
         """pop() returns self for method chaining."""
-        chat = Chat(test_model_path)
+        chat = Chat()
         chat.send("Hello", max_tokens=3)
 
         result = chat.pop()

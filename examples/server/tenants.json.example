@@ -2,7 +2,7 @@
   {
     "id": "acme",
     "storage_prefix": "acme-prod",
-    "allowed_models": ["openai::gpt-4o", "openai::gpt-4o-mini"]
+    "allowed_models": ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B"]
   },
   {
     "id": "globex",

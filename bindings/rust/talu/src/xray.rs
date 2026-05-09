@@ -455,11 +455,6 @@ impl VerifyCaptureHandle {
         Ok(())
     }
 
-    /// Backward-compatible alias.
-    pub fn save_recording_full_npz(&self, path: &str) -> Result<()> {
-        self.save_full_npz(path)
-    }
-
     /// Disable verify capture (stop receiving trace emissions).
     pub fn disable() {
         unsafe { talu_sys::talu_xray_verify_capture_disable() };

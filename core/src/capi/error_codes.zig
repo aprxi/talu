@@ -102,6 +102,7 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.DirNotEmpty => .io_not_empty,
         error.FileTooBig => .io_file_too_big,
         error.InvalidArgument => .invalid_argument,
+        error.UnsupportedContentType => .invalid_argument,
         error.IdempotencyConflict => .invalid_argument,
         error.ManifestGenerationConflict => .invalid_argument,
         error.InvalidHandle => .invalid_handle,

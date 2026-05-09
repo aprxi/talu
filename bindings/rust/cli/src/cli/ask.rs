@@ -120,10 +120,48 @@ impl StreamCtx {
     }
 }
 
+fn append_content_for_batch_stream(
+    chat: &ChatHandle,
+    content: &[talu::router::ContentPart],
+) -> Result<()> {
+    if content.is_empty() {
+        if chat.item_count() == 0 {
+            bail!("Error: ask requires a prompt.");
+        }
+        return Ok(());
+    }
+
+    let mut text = String::new();
+    for part in content {
+        match part {
+            talu::router::ContentPart::Text(part_text) => text.push_str(part_text),
+            talu::router::ContentPart::ImageUrl { .. }
+            | talu::router::ContentPart::ImageBase64 { .. } => {
+                bail!(
+                    "Error: local streaming image input requires batch vision support, which is not available yet."
+                );
+            }
+            talu::router::ContentPart::AudioUrl { .. }
+            | talu::router::ContentPart::AudioBase64 { .. } => {
+                bail!(
+                    "Error: local streaming audio input requires batch support, which is not available yet."
+                );
+            }
+        }
+    }
+
+    if text.is_empty() {
+        bail!("Error: ask requires a prompt.");
+    }
+    chat.append_user_message(&text)?;
+    Ok(())
+}
+
 pub(super) fn reasoning_text_for_item(conv: &impl ResponsesView, index: usize) -> Result<String> {
     let reasoning = conv.get_reasoning(index)?;
     let mut out = String::new();
-    // Content parts (populated by direct generation).
+    // Content parts are produced by local generation when reasoning text is
+    // preserved as a first-class response item.
     for part_index in 0..reasoning.content_count {
         let part = conv.get_reasoning_content(index, part_index)?;
         out.push_str(&part.data_utf8_lossy());
@@ -1114,17 +1152,33 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
             }
         }
 
-        let ctx_clone = ctx.clone();
-        let callback: talu::router::StreamCallback = Box::new(move |token| {
-            if let Ok(mut guard) = ctx_clone.lock() {
-                guard.on_token(token);
-                true
-            } else {
-                false
+        if cfg.vision_prefill.is_some() {
+            bail!(
+                "Error: local streaming image input requires batch vision support, which is not available yet."
+            );
+        }
+
+        append_content_for_batch_stream(&chat, &content)?;
+
+        let batch = talu::batch::BatchHandle::new(&backend, None)?;
+        let request_id = batch.submit(&chat, &cfg)?;
+        let pending = std::sync::atomic::AtomicBool::new(false);
+        batch.run_loop_borrowed(&pending, |event| {
+            if event.request_id != request_id || event.text.is_empty() {
+                return;
             }
-        });
-        let stream_result =
-            talu::router::generate_stream(&chat, &content, &backend, &cfg, callback)?;
+            let token = talu::router::StreamToken {
+                text: event.text,
+                item_type: event.item_type,
+                content_type: event.content_type,
+                tokens_generated: event.tokens_generated,
+                elapsed_ns: event.timestamp_ns as u64,
+            };
+            if let Ok(mut guard) = ctx.lock() {
+                guard.on_token(&token);
+            }
+        })?;
+
         // Flush after streaming
         let mut emitted_visible = false;
         if let Ok(mut guard) = ctx.lock() {
@@ -1146,9 +1200,22 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
         }
 
         // Print stats (cyan color)
+        let stream_result = batch
+            .take_result(request_id)
+            .ok_or_else(|| anyhow!("batch generation completed without a result"))?;
         if !quiet && !silent && !use_json && output_path.is_none() {
-            let input_tok_per_sec = stream_result.prefill_tokens_per_second();
-            let output_tok_per_sec = stream_result.tokens_per_second();
+            let input_tok_per_sec = if stream_result.prefill_ns > 0 {
+                (stream_result.prompt_tokens as f64)
+                    / (stream_result.prefill_ns as f64 / 1_000_000_000.0)
+            } else {
+                0.0
+            };
+            let output_tok_per_sec = if stream_result.generation_ns > 0 {
+                (stream_result.completion_tokens as f64)
+                    / (stream_result.generation_ns as f64 / 1_000_000_000.0)
+            } else {
+                0.0
+            };
             eprintln!(
                 "\n\x1b[36minput: {} tok @ {:.1} t/s | output: {} tok @ {:.1} t/s\x1b[0m",
                 stream_result.prompt_tokens,

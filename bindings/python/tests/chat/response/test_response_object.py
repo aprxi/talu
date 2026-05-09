@@ -492,10 +492,9 @@ class TestResponseMsgIndex:
 class TestResponseAutoFork:
     """Tests for Response.append() auto-fork behavior."""
 
-    @pytest.mark.requires_model
-    def test_linear_append_uses_same_chat(self, test_model_path):
+    def test_linear_append_uses_same_chat(self, deterministic_chat_generation):
         """Linear append (at tip) continues on same chat."""
-        chat = Chat(test_model_path)
+        chat = Chat()
 
         r1 = chat.send("Hello", max_tokens=3)
         original_chat = r1.chat
@@ -508,10 +507,9 @@ class TestResponseAutoFork:
         # or just user + assistant + user + assistant if no system
         assert len(chat.items) >= 4
 
-    @pytest.mark.requires_model
-    def test_branching_append_forks_chat(self, test_model_path):
+    def test_branching_append_forks_chat(self, deterministic_chat_generation):
         """Branching append (past tip) auto-forks."""
-        chat = Chat(test_model_path)
+        chat = Chat()
 
         r1 = chat.send("Idea 1", max_tokens=3)
         original_len = len(chat.items)
@@ -535,10 +533,9 @@ class TestResponseAutoFork:
         # (should have: user "Idea 1", assistant response, user "Expand", assistant response)
         # The exact count depends on whether there's a system message
 
-    @pytest.mark.requires_model
-    def test_multiple_branches_from_same_response(self, test_model_path):
+    def test_multiple_branches_from_same_response(self, deterministic_chat_generation):
         """Can create multiple branches from same response."""
-        chat = Chat(test_model_path)
+        chat = Chat()
 
         r1 = chat.send("Base idea", max_tokens=3)
 

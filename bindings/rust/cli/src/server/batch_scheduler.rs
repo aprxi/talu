@@ -809,7 +809,9 @@ fn step_loop(
             let result = if has_stream_subscribers {
                 batch.run_loop(&pending_flag, |event| dispatch_event(event, &mut to_cancel))
             } else {
-                batch.run_loop_no_text(&pending_flag, |event| dispatch_event(event, &mut to_cancel))
+                batch.run_loop_final_only(cmd_pending.as_ref(), |event| {
+                    dispatch_event(event, &mut to_cancel)
+                })
             };
 
             // Apply collected cancellations now that we're outside

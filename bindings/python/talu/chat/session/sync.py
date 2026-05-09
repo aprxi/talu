@@ -154,11 +154,11 @@ class Chat(ChatBase):
 
     Separation of Concerns:
         - **Chat** manages session state: conversation history, system prompt, templates
-        - **Client** manages infrastructure: model loading, GPU layers, API keys, threading
+        - **Client** manages infrastructure: model loading, GPU layers, threading
 
         For custom hardware or backend configuration, create a Client first::
 
-            client = Client("model", gpu_layers=20, api_key="...")
+            client = Client("model", gpu_layers=20)
             chat = client.chat(system="You are helpful.")
 
     Concurrency:
@@ -171,7 +171,7 @@ class Chat(ChatBase):
 
     Args:
         model: Model to load (HuggingFace ID or local path). Creates a default Client.
-            For custom configuration (GPU layers, API keys, etc.), use Client instead.
+            For custom configuration (GPU layers, etc.), use Client instead.
         client: Existing Client to use (for multi-user serving or custom config).
         config: Default GenerationConfig for this session. If provided, these
             settings are used for all send/stream calls unless overridden.
@@ -220,11 +220,6 @@ class Chat(ChatBase):
         >>> response = chat("What is 2+2?")
         >>> print(response)
         4
-
-    Example - Remote backend (use Client for backend config):
-        >>> client = Client("gpt-4", base_url="http://localhost:8080/v1", api_key="sk-...")
-        >>> chat = client.chat()
-        >>> response = chat("Hello!")
 
     Example - Local backend with GPU offload (use Client for hardware config):
         >>> client = Client("Qwen/Qwen3-0.6B", gpu_layers=20, num_threads=4)

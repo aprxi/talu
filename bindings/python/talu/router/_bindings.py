@@ -14,11 +14,14 @@ import ctypes
 import json
 from typing import Any
 
-from .._bindings import check, get_lib
+from .._bindings import check, get_lib, take_last_error
 from .._native import (
+    CBatchResult,
+    CEvent,
     BackendCreateOptions,
     CGenerateConfig,
     CLogitBiasEntry,
+    CToolCallRef,
 )
 from .._native import (
     LocalConfig as CLocalConfig,
@@ -26,6 +29,7 @@ from .._native import (
 from .._native import (
     SamplingParams as _CSamplingParams,
 )
+from ..exceptions import GenerationError
 
 try:
     from .._native import OpenAICompatibleConfig as COpenAICompatibleConfig
@@ -43,6 +47,7 @@ except ImportError:
             ("custom_headers_json", ctypes.c_char_p),
             ("_reserved", ctypes.c_uint8 * 24),
         ]
+
 
 # Get the library handle (signatures are set up by _native.py at import time)
 _lib = get_lib()
@@ -160,25 +165,6 @@ class StopFlag:
 # =============================================================================
 # Structs with Custom Initialization (keep full definitions here)
 # =============================================================================
-
-
-class CContentPart(ctypes.Structure):
-    """
-    C-compatible content part structure for router API.
-
-    Matches GenerateContentPart in Zig's router/capi_bridge.zig (32 bytes).
-    Used for multimodal input (text, images, etc.).
-
-    Note: This has a different layout than the CContentPart in responses.zig.
-    """
-
-    _fields_ = [
-        ("content_type", ctypes.c_uint8),  # 0=text, 1=image, 2=audio, 3=video
-        ("_padding", ctypes.c_uint8 * 7),  # Align data_ptr to 8 bytes
-        ("data_ptr", ctypes.POINTER(ctypes.c_char)),
-        ("data_len", ctypes.c_size_t),
-        ("mime_ptr", ctypes.c_char_p),  # MIME type (null for text)
-    ]
 
 
 class RouterGenerateConfig(CGenerateConfig):
@@ -664,69 +650,229 @@ def router_create_backend(
     return backend_handle
 
 
-def router_generate_with_backend(
-    lib: Any,
-    chat_ptr: Any,
-    content_parts: "ctypes.Array",
-    parts_count: int,
-    backend_handle: "TaluInferenceBackendHandle",
-    config: "RouterGenerateConfig | None",
-) -> Any:
-    """Call talu_router_generate_with_backend C API.
-
-    Args:
-        lib: The loaded talu shared library.
-        chat_ptr: Pointer to the chat handle.
-        content_parts: CContentPart array.
-        parts_count: Number of content parts.
-        backend_handle: Backend handle.
-        config: Optional RouterGenerateConfig.
-
-    Returns
-    -------
-        RouterResult struct from C API.
-    """
-    return lib.talu_router_generate_with_backend(
-        chat_ptr,
-        content_parts,
-        parts_count,
-        backend_handle,
-        ctypes.byref(config) if config else None,
+def _raise_generation_error_from_last(message: str) -> None:
+    """Raise GenerationError with the latest Zig error context."""
+    code, detail = take_last_error()
+    details = {"zig_code": code} if code != 0 else {}
+    full_message = f"{message}: {detail}" if detail else message
+    raise GenerationError(
+        full_message,
+        code="GENERATION_FAILED",
+        details=details,
+        original_code=code if code != 0 else None,
     )
 
 
-def router_result_extract_text(result: Any) -> str:
-    """Extract text from RouterResult struct.
+def router_append_user_message(
+    lib: Any,
+    chat_ptr: Any,
+    content: str,
+    *,
+    context: str = "Router.generate()",
+) -> None:
+    """Append a user message to a chat before batch generation."""
+    conversation_ptr = lib.talu_chat_get_conversation(chat_ptr)
+    if not conversation_ptr:
+        _raise_generation_error_from_last(f"{context} failed: chat has no conversation")
 
-    Args:
-        result: RouterResult struct from C API.
+    content_bytes = content.encode("utf-8")
+    content_ptr = ctypes.c_char_p(content_bytes)
+    result = lib.talu_responses_append_message(
+        conversation_ptr,
+        1,
+        content_ptr,
+        len(content_bytes),
+    )
+    if result < 0:
+        _raise_generation_error_from_last(f"{context} failed: failed to append user message")
 
-    Returns
-    -------
-        Decoded text string.
-    """
+
+RunLoopCallbackType = ctypes.CFUNCTYPE(
+    None, ctypes.POINTER(CEvent), ctypes.c_size_t, ctypes.c_void_p
+)
+
+
+def router_generate_batch_final(
+    lib: Any,
+    chat_ptr: Any,
+    backend_handle: "TaluInferenceBackendHandle",
+    config: "RouterGenerateConfig | None",
+) -> dict[str, Any]:
+    """Run local final-only generation through the batch C API."""
+    batch_handle = lib.talu_batch_create(backend_handle, None)
+    if not batch_handle:
+        _raise_generation_error_from_last("Router.generate() failed: batch creation failed")
+
+    try:
+        request_id = lib.talu_batch_submit(
+            batch_handle,
+            chat_ptr,
+            ctypes.byref(config) if config else None,
+        )
+        if request_id == 0:
+            _raise_generation_error_from_last("Router.generate() failed: batch submit failed")
+
+        pending = ctypes.c_bool(False)
+
+        @RunLoopCallbackType
+        def _ignore_events(_events: Any, _count: int, _userdata: Any) -> None:
+            return None
+
+        rc = lib.talu_batch_run_loop_final_only(
+            batch_handle,
+            ctypes.byref(pending),
+            ctypes.cast(_ignore_events, ctypes.c_void_p),
+            None,
+        )
+        if rc != 0:
+            _raise_generation_error_from_last("Router.generate() failed: batch run loop failed")
+
+        result_ptr = lib.talu_batch_take_result(batch_handle, request_id)
+        if not result_ptr:
+            _raise_generation_error_from_last(
+                "Router.generate() failed: batch generation completed without a result"
+            )
+
+        try:
+            result = ctypes.cast(result_ptr, ctypes.POINTER(CBatchResult)).contents
+            if result.error_code != 0:
+                _raise_generation_error_from_last("Router.generate() failed")
+            text = batch_result_extract_text(result)
+            tool_calls = batch_result_extract_tool_calls(result)
+            return {
+                "text": text,
+                "token_count": result.completion_tokens,
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "prefill_ns": result.prefill_ns,
+                "generation_ns": result.generation_ns,
+                "ttft_ns": result.ttft_ns,
+                "finish_reason": result.finish_reason,
+                "tool_calls": tool_calls,
+            }
+        finally:
+            lib.talu_batch_result_free(result_ptr)
+    finally:
+        lib.talu_batch_destroy(batch_handle)
+
+
+def router_generate_batch_streaming(
+    lib: Any,
+    chat_ptr: Any,
+    backend_handle: "TaluInferenceBackendHandle",
+    config: "RouterGenerateConfig",
+    callback: Any,
+) -> dict[str, Any]:
+    """Run local streaming generation through the batch C API."""
+    batch_handle = lib.talu_batch_create(backend_handle, None)
+    if not batch_handle:
+        _raise_generation_error_from_last("Router.stream() failed: batch creation failed")
+
+    try:
+        request_id = lib.talu_batch_submit(batch_handle, chat_ptr, ctypes.byref(config))
+        if request_id == 0:
+            _raise_generation_error_from_last("Router.stream() failed: batch submit failed")
+
+        pending = ctypes.c_bool(False)
+        callback_stopped = False
+
+        @RunLoopCallbackType
+        def _on_events(events: Any, count: int, _userdata: Any) -> None:
+            nonlocal callback_stopped
+            if not events or count == 0 or callback_stopped:
+                return None
+
+            for idx in range(count):
+                event = events[idx]
+                if event.request_id != request_id:
+                    continue
+                if event.event_type != 0 or event.text_len == 0:
+                    continue
+
+                text = ctypes.string_at(event.text_ptr, event.text_len).decode(
+                    "utf-8", errors="replace"
+                )
+                keep_going = callback(
+                    text,
+                    event.item_type,
+                    event.content_type,
+                    event.tokens_generated,
+                    event.timestamp_ns,
+                )
+                if not keep_going:
+                    callback_stopped = True
+                    pending.value = True
+                    break
+            return None
+
+        rc = lib.talu_batch_run_loop(
+            batch_handle,
+            ctypes.byref(pending),
+            ctypes.cast(_on_events, ctypes.c_void_p),
+            None,
+        )
+        if rc != 0:
+            _raise_generation_error_from_last("Router.stream() failed: batch run loop failed")
+
+        if callback_stopped and lib.talu_batch_has_active(batch_handle):
+            drain_pending = ctypes.c_bool(False)
+
+            @RunLoopCallbackType
+            def _ignore_events(_events: Any, _count: int, _userdata: Any) -> None:
+                return None
+
+            rc = lib.talu_batch_run_loop_final_only(
+                batch_handle,
+                ctypes.byref(drain_pending),
+                ctypes.cast(_ignore_events, ctypes.c_void_p),
+                None,
+            )
+            if rc != 0:
+                _raise_generation_error_from_last(
+                    "Router.stream() failed: batch drain loop failed"
+                )
+
+        result_ptr = lib.talu_batch_take_result(batch_handle, request_id)
+        if not result_ptr:
+            _raise_generation_error_from_last(
+                "Router.stream() failed: batch generation completed without a result"
+            )
+
+        try:
+            result = ctypes.cast(result_ptr, ctypes.POINTER(CBatchResult)).contents
+            if result.error_code != 0:
+                _raise_generation_error_from_last("Router.stream() failed")
+            return {
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "prefill_ns": result.prefill_ns,
+                "generation_ns": result.generation_ns,
+                "ttft_ns": result.ttft_ns,
+                "finish_reason": result.finish_reason,
+            }
+        finally:
+            lib.talu_batch_result_free(result_ptr)
+    finally:
+        lib.talu_batch_destroy(batch_handle)
+
+
+def batch_result_extract_text(result: Any) -> str:
+    """Extract text from a CBatchResult struct."""
     if not result.text:
         return ""
     text_bytes = ctypes.cast(result.text, ctypes.c_char_p).value
     return text_bytes.decode("utf-8", errors="replace") if text_bytes else ""
 
 
-def router_result_extract_tool_calls(result: Any) -> list[dict[str, str]] | None:
-    """Extract tool calls from RouterResult struct.
-
-    Args:
-        result: RouterResult struct from C API.
-
-    Returns
-    -------
-        List of tool call dicts (id, name, arguments) or None.
-    """
+def batch_result_extract_tool_calls(result: Any) -> list[dict[str, str]] | None:
+    """Extract tool calls from a CBatchResult struct."""
     if not result.tool_calls or result.tool_call_count == 0:
         return None
 
+    tool_calls_ptr = ctypes.cast(result.tool_calls, ctypes.POINTER(CToolCallRef))
     calls = []
     for i in range(result.tool_call_count):
-        c_call = result.tool_calls[i]
+        c_call = tool_calls_ptr[i]
         calls.append(
             {
                 "id": _read_c_string_ptr(c_call.call_id) or "",
@@ -735,88 +881,6 @@ def router_result_extract_tool_calls(result: Any) -> list[dict[str, str]] | None
             }
         )
     return calls
-
-
-def router_result_free(lib: Any, result: Any) -> None:
-    """Free RouterResult memory.
-
-    Args:
-        lib: The loaded talu shared library.
-        result: RouterResult struct to free.
-    """
-    lib.talu_router_result_free(ctypes.byref(result))
-
-
-def build_router_content_parts(
-    parts: list[dict[str, Any]],
-) -> tuple["ctypes.Array", list[bytes]]:
-    """Build CContentPart array from Python content parts for router.
-
-    Args:
-        parts: List of content part dicts in Open Responses format.
-
-    Returns
-    -------
-        Tuple of (CContentPart array, list of data references to keep alive).
-    """
-    # Content type mapping (Open Responses format)
-    type_map = {
-        "input_text": 0,
-        "input_image": 1,
-        "input_audio": 2,
-        "input_video": 3,
-        "text": 0,
-        "image": 1,
-        "audio": 2,
-        "video": 3,
-    }
-
-    # Keep references to data alive
-    data_refs: list[bytes] = []
-
-    # Build array
-    arr_type = CContentPart * len(parts)
-    c_parts = arr_type()
-
-    for i, part in enumerate(parts):
-        part_type = part.get("type", "text")
-        content_type = type_map.get(part_type, 0)
-        c_parts[i].content_type = content_type
-
-        # Get data based on content type
-        if content_type == 0:  # text / input_text
-            data = part.get("text", "").encode("utf-8")
-        elif content_type == 1:  # image / input_image
-            data = part.get("image_url") or part.get("data", "")
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-        elif content_type == 2:  # audio / input_audio
-            data = part.get("audio_data") or part.get("data", "")
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-        elif content_type == 3:  # video / input_video
-            data = part.get("video_url") or part.get("data", "")
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-        else:
-            data = part.get("data", b"")
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-
-        data_refs.append(data)
-        c_parts[i].data_ptr = ctypes.cast(ctypes.c_char_p(data), ctypes.POINTER(ctypes.c_char))
-        c_parts[i].data_len = len(data)
-
-        # MIME type (for non-text content)
-        mime = part.get("mime")
-        if mime:
-            mime_bytes = mime.encode("utf-8")
-            data_refs.append(mime_bytes)
-            c_parts[i].mime_ptr = mime_bytes
-        else:
-            c_parts[i].mime_ptr = None
-
-    return c_parts, data_refs
 
 
 def router_embed(
@@ -890,75 +954,3 @@ def router_embed(
     lib.talu_router_embedding_free(out_embedding, dim)
 
     return embedding
-
-
-# =============================================================================
-# Streaming Callback API
-# =============================================================================
-
-# Callback type: fn(text_ptr, text_len, item_type, content_type, is_final, userdata) -> continue(1)/stop(0)
-StreamCallbackType = ctypes.CFUNCTYPE(
-    ctypes.c_uint8,                    # return: 1=continue, 0=stop
-    ctypes.POINTER(ctypes.c_char),     # text_ptr
-    ctypes.c_size_t,                   # text_len
-    ctypes.c_uint8,                    # item_type
-    ctypes.c_uint8,                    # content_type
-    ctypes.c_uint8,                    # is_final
-    ctypes.c_void_p,                   # userdata
-)
-
-
-def router_generate_streaming(
-    lib: Any,
-    chat_ptr: Any,
-    content_parts: "ctypes.Array",
-    parts_count: int,
-    backend_handle: "TaluInferenceBackendHandle",
-    config: "RouterGenerateConfig",
-    callback: Any,
-) -> Any:
-    """Call talu_router_generate_streaming C API.
-
-    Blocks until generation completes. The callback is invoked for each
-    token/segment during generation with (text, item_type, content_type).
-    The final invocation has is_final=1.
-
-    Args:
-        lib: The loaded talu shared library.
-        chat_ptr: Pointer to the chat handle.
-        content_parts: CContentPart array.
-        parts_count: Number of content parts.
-        backend_handle: Backend handle.
-        config: RouterGenerateConfig (must include stop_flag for cancellation).
-        callback: StreamCallbackType ctypes callback function.
-
-    Returns
-    -------
-        CGenerateResult struct from C API.
-    """
-    # Set up argtypes/restype if not already configured (the auto-generated
-    # _native.py maps the callback param as c_void_p).
-    from .._native import CGenerateResult
-
-    if not hasattr(lib.talu_router_generate_streaming, '_streaming_configured'):
-        lib.talu_router_generate_streaming.argtypes = [
-            ctypes.c_void_p,  # chat_handle
-            ctypes.c_void_p,  # parts
-            ctypes.c_size_t,  # num_parts
-            ctypes.c_void_p,  # backend
-            ctypes.c_void_p,  # config
-            ctypes.c_void_p,  # stream_cb (function pointer as void*)
-            ctypes.c_void_p,  # stream_cb_data
-        ]
-        lib.talu_router_generate_streaming.restype = CGenerateResult
-        lib.talu_router_generate_streaming._streaming_configured = True
-
-    return lib.talu_router_generate_streaming(
-        chat_ptr,
-        content_parts,
-        parts_count,
-        backend_handle,
-        ctypes.byref(config),
-        ctypes.cast(callback, ctypes.c_void_p),
-        None,  # userdata (unused — callback captures state via closure)
-    )

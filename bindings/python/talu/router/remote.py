@@ -1,7 +1,7 @@
-"""Remote inference utilities for OpenAI-compatible endpoints.
+"""Endpoint discovery utilities for OpenAI-compatible endpoints.
 
-This module provides utilities for working with remote OpenAI-compatible
-inference servers like vLLM, Ollama, llama.cpp server, etc.
+This module can inspect `/v1/models` on OpenAI-compatible servers. It does not
+mean Python Router generation can call those servers yet.
 """
 
 from __future__ import annotations

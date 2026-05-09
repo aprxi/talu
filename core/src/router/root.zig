@@ -25,9 +25,7 @@ pub const BackendUnion = spec.BackendUnion;
 
 // Primary exports
 pub const LocalEngine = local.LocalEngine;
-pub const GenerationResult = local.GenerationResult;
 pub const GenerateOptions = local.GenerateOptions;
-pub const TokenCallback = local.TokenCallback;
 pub const ToolCallRef = local.ToolCallRef;
 
 // Tool schema exports (for tool calling support)

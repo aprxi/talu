@@ -44,11 +44,11 @@ class AsyncChat(ChatBase):
 
     Separation of Concerns:
         - **AsyncChat** manages session state: conversation history, system prompt, templates
-        - **AsyncClient** manages infrastructure: model loading, GPU layers, API keys, threading
+        - **AsyncClient** manages infrastructure: model loading, GPU layers, threading
 
         For custom hardware or backend configuration, create an AsyncClient first::
 
-            async with AsyncClient("model", gpu_layers=20, api_key="...") as client:
+            async with AsyncClient("model", gpu_layers=20) as client:
                 chat = client.chat(system="You are helpful.")
 
     Architecture
@@ -63,7 +63,7 @@ class AsyncChat(ChatBase):
 
     Args:
         model: Model to load (HuggingFace ID or local path). Creates a default AsyncClient.
-            For custom configuration (GPU layers, API keys, etc.), use AsyncClient instead.
+            For custom configuration (GPU layers, etc.), use AsyncClient instead.
         client: Existing AsyncClient to use (for multi-user serving or custom config).
         config: Default GenerationConfig for this session.
         system: Optional system prompt.
@@ -79,11 +79,6 @@ class AsyncChat(ChatBase):
         >>> chat = AsyncChat("Qwen/Qwen3-0.6B", system="You are helpful.")
         >>> response = await chat("What is 2+2?")
         >>> print(response)
-
-    Example - Remote backend (use AsyncClient for backend config):
-        >>> async with AsyncClient("gpt-4", base_url="http://localhost:8080/v1", api_key="sk-...") as client:
-        ...     chat = client.chat()
-        ...     response = await chat("Hello!")
 
     Example - Multi-turn async conversation:
         >>> response = await chat("Hello!")

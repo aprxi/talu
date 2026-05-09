@@ -6,7 +6,9 @@
 
 use crate::capi::router::common;
 use crate::capi::router::common::skip_without_model;
+use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::AtomicBool;
 
 // =============================================================================
 // Null-safety (run unconditionally)
@@ -78,6 +80,42 @@ fn take_result_null_handle_returns_null() {
 #[test]
 fn result_free_null_is_noop() {
     unsafe { talu_sys::talu_batch_result_free(ptr::null_mut()) };
+}
+
+extern "C" fn count_final_events(
+    events: *const talu_sys::CEvent,
+    count: usize,
+    userdata: *mut c_void,
+) {
+    if events.is_null() || userdata.is_null() {
+        return;
+    }
+    let final_count = unsafe { &mut *(userdata as *mut usize) };
+    let slice = unsafe { std::slice::from_raw_parts(events, count) };
+    for event in slice {
+        if event.is_final != 0 {
+            *final_count += 1;
+        }
+        assert_ne!(
+            event.is_final, 0,
+            "final-only run loop should not emit token events"
+        );
+    }
+}
+
+#[test]
+fn run_loop_final_only_null_handle_returns_error() {
+    let pending = AtomicBool::new(false);
+    let mut final_count = 0usize;
+    let rc = unsafe {
+        talu_sys::talu_batch_run_loop_final_only(
+            ptr::null_mut(),
+            &pending as *const AtomicBool as *mut c_void,
+            count_final_events as *mut c_void,
+            &mut final_count as *mut usize as *mut c_void,
+        )
+    };
+    assert_eq!(rc, -1, "final-only run loop with null handle should fail");
 }
 
 // =============================================================================
@@ -219,6 +257,57 @@ fn submit_and_step_to_completion() {
         again.is_null(),
         "second take_result should return null (already taken)"
     );
+
+    unsafe { talu_sys::talu_chat_free(chat) };
+    unsafe { talu_sys::talu_batch_destroy(handle) };
+    unsafe { talu_sys::talu_backend_free(backend) };
+    unsafe { talu_sys::talu_config_free(canon) };
+}
+
+#[test]
+fn run_loop_final_only_completes_without_token_events() {
+    skip_without_model!();
+    let model = common::model_path().unwrap();
+    let (canon, backend) = common::local_backend(&model);
+
+    let handle = unsafe { talu_sys::talu_batch_create(backend, ptr::null()) };
+    assert!(!handle.is_null());
+
+    let chat = common::create_chat(None);
+    common::append_user_message(chat, "Say hello");
+
+    let config = talu_sys::CGenerateConfig {
+        max_tokens: 8,
+        ..talu_sys::CGenerateConfig::default()
+    };
+    let request_id = unsafe { talu_sys::talu_batch_submit(handle, chat, &config) };
+    assert!(request_id > 0, "submit should return non-zero request id");
+
+    let pending = AtomicBool::new(false);
+    let mut final_count = 0usize;
+    let rc = unsafe {
+        talu_sys::talu_batch_run_loop_final_only(
+            handle,
+            &pending as *const AtomicBool as *mut c_void,
+            count_final_events as *mut c_void,
+            &mut final_count as *mut usize as *mut c_void,
+        )
+    };
+    assert_eq!(rc, 0, "final-only run loop should succeed");
+    assert_eq!(final_count, 1, "should emit one terminal event");
+
+    let result_ptr = unsafe { talu_sys::talu_batch_take_result(handle, request_id) };
+    assert!(
+        !result_ptr.is_null(),
+        "take_result should return non-null for completed request"
+    );
+    let result = unsafe { &*result_ptr };
+    assert!(result.prompt_tokens > 0, "should report prompt tokens");
+    assert!(
+        result.completion_tokens > 0,
+        "should report completion tokens"
+    );
+    unsafe { talu_sys::talu_batch_result_free(result_ptr) };
 
     unsafe { talu_sys::talu_chat_free(chat) };
     unsafe { talu_sys::talu_batch_destroy(handle) };

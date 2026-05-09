@@ -1,9 +1,12 @@
 //! Safe wrappers for talu generation/inference routing.
 
+use crate::batch::{BatchHandle, EventType};
 use crate::error::error_from_last_or;
 use crate::responses::ResponsesView;
 use crate::{ChatHandle, GenerateResult, InferenceBackend, Result};
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 fn has_visible_text(text: &str) -> bool {
     text.chars().any(|ch| {
@@ -254,293 +257,6 @@ impl StreamResult {
     }
 }
 
-/// Holds C strings and raw parts for the duration of a generate call.
-struct ContentPartsHolder {
-    _strings: Vec<CString>,
-    _data: Vec<Vec<u8>>,
-    parts: Vec<talu_sys::GenerateContentPart>,
-}
-
-impl ContentPartsHolder {
-    fn new(content: &[ContentPart]) -> Result<Self> {
-        let mut strings = Vec::new();
-        let mut data_vecs = Vec::new();
-        let mut parts = Vec::with_capacity(content.len());
-
-        for part in content {
-            match part {
-                ContentPart::Text(text) => {
-                    let c_str = CString::new(text.as_str())?;
-                    let ptr = c_str.as_ptr() as *const u8;
-                    let len = text.len();
-                    strings.push(c_str);
-                    parts.push(talu_sys::GenerateContentPart {
-                        content_type: ContentType::Text as u8,
-                        data_ptr: ptr,
-                        data_len: len,
-                        mime_ptr: std::ptr::null(),
-                    });
-                }
-                ContentPart::ImageUrl { url, mime } => {
-                    let c_url = CString::new(url.as_str())?;
-                    let c_mime = mime
-                        .as_ref()
-                        .map(|m| CString::new(m.as_str()))
-                        .transpose()?;
-                    let url_ptr = c_url.as_ptr() as *const u8;
-                    let url_len = url.len();
-                    let mime_ptr = c_mime
-                        .as_ref()
-                        .map(|m| m.as_ptr())
-                        .unwrap_or(std::ptr::null());
-                    strings.push(c_url);
-                    if let Some(m) = c_mime {
-                        strings.push(m);
-                    }
-                    parts.push(talu_sys::GenerateContentPart {
-                        content_type: ContentType::ImageUrl as u8,
-                        data_ptr: url_ptr,
-                        data_len: url_len,
-                        mime_ptr,
-                    });
-                }
-                ContentPart::ImageBase64 { data, mime } => {
-                    let c_mime = CString::new(mime.as_str())?;
-                    let mime_ptr = c_mime.as_ptr();
-                    strings.push(c_mime);
-                    let data_clone = data.clone();
-                    let data_ptr = data_clone.as_ptr();
-                    let data_len = data_clone.len();
-                    data_vecs.push(data_clone);
-                    parts.push(talu_sys::GenerateContentPart {
-                        content_type: ContentType::ImageBase64 as u8,
-                        data_ptr,
-                        data_len,
-                        mime_ptr,
-                    });
-                }
-                ContentPart::AudioUrl { url, mime } => {
-                    let c_url = CString::new(url.as_str())?;
-                    let c_mime = mime
-                        .as_ref()
-                        .map(|m| CString::new(m.as_str()))
-                        .transpose()?;
-                    let url_ptr = c_url.as_ptr() as *const u8;
-                    let url_len = url.len();
-                    let mime_ptr = c_mime
-                        .as_ref()
-                        .map(|m| m.as_ptr())
-                        .unwrap_or(std::ptr::null());
-                    strings.push(c_url);
-                    if let Some(m) = c_mime {
-                        strings.push(m);
-                    }
-                    parts.push(talu_sys::GenerateContentPart {
-                        content_type: ContentType::AudioUrl as u8,
-                        data_ptr: url_ptr,
-                        data_len: url_len,
-                        mime_ptr,
-                    });
-                }
-                ContentPart::AudioBase64 { data, mime } => {
-                    let c_mime = CString::new(mime.as_str())?;
-                    let mime_ptr = c_mime.as_ptr();
-                    strings.push(c_mime);
-                    let data_clone = data.clone();
-                    let data_ptr = data_clone.as_ptr();
-                    let data_len = data_clone.len();
-                    data_vecs.push(data_clone);
-                    parts.push(talu_sys::GenerateContentPart {
-                        content_type: ContentType::AudioBase64 as u8,
-                        data_ptr,
-                        data_len,
-                        mime_ptr,
-                    });
-                }
-            }
-        }
-
-        Ok(Self {
-            _strings: strings,
-            _data: data_vecs,
-            parts,
-        })
-    }
-
-    fn as_ptr(&self) -> *const talu_sys::GenerateContentPart {
-        if self.parts.is_empty() {
-            std::ptr::null()
-        } else {
-            self.parts.as_ptr()
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.parts.len()
-    }
-}
-
-/// C trampoline for prefill progress callback.
-extern "C" fn prefill_progress_trampoline(completed: usize, total: usize, userdata: *mut c_void) {
-    if !userdata.is_null() {
-        // SAFETY: userdata points to a PrefillProgressCallback (Box<dyn Fn(usize,usize)>)
-        // that outlives this call (owned by the GenerateConfig passed to generate_stream).
-        let cb = unsafe { &*(userdata as *const PrefillProgressCallback) };
-        cb(completed, total);
-    }
-}
-
-/// Holds C strings for the GenerateConfig.
-struct ConfigHolder {
-    _template_override: Option<CString>,
-    _extra_context: Option<CString>,
-    _tools_json: Option<CString>,
-    _tool_choice: Option<CString>,
-    _extra_body: Option<CString>,
-    _stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    _vision_images: Vec<talu_sys::CGenerateVisionImage>,
-    _vision_pixels: Vec<Vec<f32>>,
-    config: talu_sys::CGenerateConfig,
-}
-
-impl ConfigHolder {
-    fn new(cfg: &GenerateConfig) -> Result<Self> {
-        let template_override = cfg
-            .template_override
-            .as_ref()
-            .map(|s| CString::new(s.as_str()))
-            .transpose()?;
-
-        let tools_json = cfg
-            .tools_json
-            .as_ref()
-            .map(|s| CString::new(s.as_str()))
-            .transpose()?;
-
-        let tool_choice = cfg
-            .tool_choice
-            .as_ref()
-            .map(|s| CString::new(s.as_str()))
-            .transpose()?;
-
-        let extra_body = cfg
-            .extra_body_json
-            .as_ref()
-            .map(|s| CString::new(s.as_str()))
-            .transpose()?;
-
-        let reasoning_effort = cfg
-            .reasoning_effort
-            .as_ref()
-            .map(|s| CString::new(s.as_str()))
-            .transpose()?;
-
-        let stop_flag = cfg.stop_flag.clone();
-
-        let mut vision_images = Vec::new();
-        let mut vision_pixels = Vec::new();
-
-        let mut c_config = talu_sys::CGenerateConfig::default();
-        c_config.max_tokens = cfg.max_tokens;
-        if let Some(mct) = cfg.max_completion_tokens {
-            c_config.max_completion_tokens = mct;
-        }
-        if let Some(mrt) = cfg.max_reasoning_tokens {
-            c_config.max_reasoning_tokens = mrt;
-        }
-        c_config.temperature = cfg.temperature;
-        c_config.top_k = cfg.top_k;
-        c_config.top_p = cfg.top_p;
-        c_config.min_p = cfg.min_p;
-        c_config.repetition_penalty = cfg.repetition_penalty;
-        c_config.presence_penalty = cfg.presence_penalty;
-        c_config.frequency_penalty = cfg.frequency_penalty;
-        c_config.seed = cfg.seed;
-        c_config.raw_output = if cfg.raw_output { 1usize } else { 0usize };
-        c_config.completions_mode = if cfg.completions_mode { 1usize } else { 0usize };
-
-        if let Some(ref tpl) = template_override {
-            c_config.template_override = tpl.as_ptr();
-        }
-
-        if let Some(ref tools) = tools_json {
-            c_config.tools_json = tools.as_ptr();
-        }
-
-        if let Some(ref choice) = tool_choice {
-            c_config.tool_choice = choice.as_ptr();
-        }
-
-        if let Some(ref extra) = extra_body {
-            c_config.extra_body_json = extra.as_ptr();
-        }
-
-        if let Some(ref effort) = reasoning_effort {
-            c_config.reasoning_effort = effort.as_ptr();
-        }
-
-        if let Some(ref flag) = stop_flag {
-            // SAFETY: We store a reference to the Arc's inner AtomicBool.
-            // The Arc is kept alive in _stop_flag for the duration of this struct.
-            c_config.stop_flag =
-                flag.as_ref() as *const std::sync::atomic::AtomicBool as *mut c_void;
-        }
-
-        // Prefill progress: pass pointer to the original config's callback.
-        // SAFETY: The GenerateConfig reference outlives both ConfigHolder and the C call.
-        if let Some(ref cb) = cfg.prefill_progress {
-            c_config.prefill_progress_fn = prefill_progress_trampoline as *mut c_void;
-            c_config.prefill_progress_data = cb as *const PrefillProgressCallback as *mut c_void;
-        }
-
-        if let Some(ref vision_prefill) = cfg.vision_prefill {
-            vision_pixels.reserve(vision_prefill.images.len());
-            vision_images.reserve(vision_prefill.images.len());
-            for img in &vision_prefill.images {
-                vision_pixels.push(img.pixels.clone());
-                let pixels = vision_pixels.last().expect("vision pixels just pushed");
-                vision_images.push(talu_sys::CGenerateVisionImage {
-                    pixels_ptr: if pixels.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        pixels.as_ptr()
-                    },
-                    pixel_count: pixels.len(),
-                    width: img.width,
-                    height: img.height,
-                    grid_temporal: img.grid_temporal,
-                    grid_height: img.grid_height,
-                    grid_width: img.grid_width,
-                    token_count: img.token_count,
-                });
-            }
-            c_config.external_vision_images = if vision_images.is_empty() {
-                std::ptr::null()
-            } else {
-                vision_images.as_ptr()
-            };
-            c_config.external_vision_image_count = vision_images.len();
-            c_config.external_vision_image_token_id = vision_prefill.image_token_id;
-        }
-
-        Ok(Self {
-            _template_override: template_override,
-            _extra_context: reasoning_effort,
-            _tools_json: tools_json,
-            _tool_choice: tool_choice,
-            _extra_body: extra_body,
-            _stop_flag: stop_flag,
-            _vision_images: vision_images,
-            _vision_pixels: vision_pixels,
-            config: c_config,
-        })
-    }
-
-    fn as_ptr(&self) -> *const talu_sys::CGenerateConfig {
-        &self.config
-    }
-}
-
 /// Generates text using the specified backend (non-streaming).
 pub fn generate(
     chat: &ChatHandle,
@@ -548,33 +264,104 @@ pub fn generate(
     backend: &InferenceBackend,
     config: &GenerateConfig,
 ) -> Result<GenerateResult> {
-    let parts_holder = ContentPartsHolder::new(content)?;
-    let config_holder = ConfigHolder::new(config)?;
-
-    // SAFETY: All pointers are valid. chat, backend are valid handles.
-    // parts_holder and config_holder keep the underlying data alive.
-    let result = unsafe {
-        talu_sys::talu_router_generate_with_backend(
-            chat.as_ptr(),
-            parts_holder.as_ptr(),
-            parts_holder.len(),
-            backend.as_ptr(),
-            config_holder.as_ptr(),
-        )
-    };
-
-    if result.error_code != 0 {
-        return Err(error_from_last_or("Generation failed"));
+    if config.vision_prefill.is_some() {
+        return Err(crate::Error::generic(
+            "local non-stream generation with prepared vision input is not supported by the batch scheduler yet",
+        ));
     }
 
-    Ok(GenerateResult::new(result))
+    append_batch_user_content(chat, content)?;
+
+    let batch = BatchHandle::new(backend, None)?;
+    let request_id = batch.submit(chat, config)?;
+    let pending = AtomicBool::new(false);
+    let mut saw_completion = false;
+
+    batch.run_loop_final_only(&pending, |event| {
+        if event.request_id == request_id && matches!(event.event_type, EventType::Completed) {
+            saw_completion = true;
+        }
+    })?;
+
+    let result = batch.take_result(request_id).ok_or_else(|| {
+        if saw_completion {
+            crate::Error::generic("batch generation completed without a result")
+        } else {
+            crate::Error::generic("batch generation ended before the request completed")
+        }
+    })?;
+
+    Ok(GenerateResult::from_batch(result))
 }
 
-/// Generates text using the specified backend with streaming via callback API.
+fn append_batch_user_content(chat: &ChatHandle, content: &[ContentPart]) -> Result<()> {
+    if content.is_empty() {
+        if chat.item_count() == 0 {
+            return Err(crate::Error::generic(
+                "generation requires either content or an existing conversation",
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut text = String::new();
+    for part in content {
+        match part {
+            ContentPart::Text(part_text) => text.push_str(part_text),
+            ContentPart::ImageUrl { .. } | ContentPart::ImageBase64 { .. } => {
+                return Err(crate::Error::generic(
+                    "local image generation is not supported by the batch scheduler yet",
+                ));
+            }
+            ContentPart::AudioUrl { .. } | ContentPart::AudioBase64 { .. } => {
+                return Err(crate::Error::generic(
+                    "local audio generation is not supported by the batch scheduler yet",
+                ));
+            }
+        }
+    }
+
+    if text.is_empty() {
+        return Err(crate::Error::generic("generation prompt is empty"));
+    }
+
+    chat.append_user_message(&text)
+}
+
+fn config_with_batch_stop_flag(
+    config: &GenerateConfig,
+    stop_flag: Arc<AtomicBool>,
+) -> GenerateConfig {
+    GenerateConfig {
+        max_tokens: config.max_tokens,
+        max_completion_tokens: config.max_completion_tokens,
+        max_reasoning_tokens: config.max_reasoning_tokens,
+        temperature: config.temperature,
+        top_k: config.top_k,
+        top_p: config.top_p,
+        min_p: config.min_p,
+        repetition_penalty: config.repetition_penalty,
+        presence_penalty: config.presence_penalty,
+        frequency_penalty: config.frequency_penalty,
+        seed: config.seed,
+        template_override: config.template_override.clone(),
+        tools_json: config.tools_json.clone(),
+        tool_choice: config.tool_choice.clone(),
+        extra_body_json: config.extra_body_json.clone(),
+        reasoning_effort: config.reasoning_effort.clone(),
+        stop_flag: Some(stop_flag),
+        raw_output: config.raw_output,
+        completions_mode: config.completions_mode,
+        prefill_progress: None,
+        vision_prefill: config.vision_prefill.clone(),
+    }
+}
+
+/// Generates text using the specified backend with streaming callbacks.
 ///
-/// Uses the Zig core's callback-based streaming: token decoding and reasoning-tag
-/// filtering happen Zig-side, with rich (text, item_type, content_type) callbacks
-/// delivered synchronously. Blocks until generation completes.
+/// Local streaming generation is driven through the batch scheduler. Text
+/// decoding, reasoning filtering, grammar constraints, and final stats all
+/// come from the same batch request lifecycle used by non-stream generation.
 pub fn generate_stream(
     chat: &ChatHandle,
     content: &[ContentPart],
@@ -582,104 +369,67 @@ pub fn generate_stream(
     config: &GenerateConfig,
     mut callback: StreamCallback,
 ) -> Result<StreamResult> {
-    let parts_holder = ContentPartsHolder::new(content)?;
-    let config_holder = ConfigHolder::new(config)?;
-
-    // State shared between the C callback and this function.
-    struct CallbackState<'a> {
-        callback: &'a mut StreamCallback,
-        emitted_visible: bool,
-        token_count: usize,
+    if config.vision_prefill.is_some() {
+        return Err(crate::Error::generic(
+            "local streaming generation with prepared vision input is not supported by the batch scheduler yet",
+        ));
     }
 
-    let mut state = CallbackState {
-        callback: &mut callback,
-        emitted_visible: false,
-        token_count: 0,
-    };
+    append_batch_user_content(chat, content)?;
 
-    // C-compatible callback that bridges to the Rust StreamCallback.
-    unsafe extern "C" fn stream_trampoline(
-        text_ptr: *const u8,
-        text_len: usize,
-        item_type: u8,
-        content_type: u8,
-        is_final: u8,
-        userdata: *mut c_void,
-    ) -> u8 {
-        let state = &mut *(userdata as *mut CallbackState);
+    let stop_flag = config
+        .stop_flag
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let batch_config = config_with_batch_stop_flag(config, stop_flag.clone());
+    let batch = BatchHandle::new(backend, None)?;
+    let request_id = batch.submit(chat, &batch_config)?;
+    let pending = AtomicBool::new(false);
+    let mut emitted_visible = false;
+    let mut callback_stopped = false;
 
-        if is_final != 0 || text_len == 0 {
-            return 1; // continue (final is just a signal)
+    batch.run_loop_borrowed(&pending, |event| {
+        if event.request_id != request_id || callback_stopped {
+            return;
         }
-
-        let text_bytes = std::slice::from_raw_parts(text_ptr, text_len);
-        let text = std::str::from_utf8(text_bytes).unwrap_or_else(|_| {
-            // Lossy fallback for non-UTF8 (byte-level tokenizers)
-            std::str::from_utf8(&text_bytes[..text_bytes.len().min(0)]).unwrap_or("")
-        });
-
-        // If we got valid text, use String::from_utf8_lossy for non-UTF8
-        let text_owned;
-        let text_ref = if text.is_empty() && text_len > 0 {
-            text_owned = String::from_utf8_lossy(text_bytes);
-            text_owned.as_ref()
-        } else {
-            text
-        };
-
-        if !state.emitted_visible && has_visible_text(text_ref) {
-            state.emitted_visible = true;
+        if !matches!(event.event_type, EventType::TextDelta) || event.text.is_empty() {
+            return;
         }
-        state.token_count += 1;
-
+        if !emitted_visible && has_visible_text(event.text) {
+            emitted_visible = true;
+        }
         let stream_token = StreamToken {
-            text: text_ref,
-            item_type: crate::responses::ItemType::from(item_type),
-            content_type: crate::responses::ContentType::from(content_type),
-            tokens_generated: state.token_count,
-            elapsed_ns: 0,
+            text: event.text,
+            item_type: event.item_type,
+            content_type: event.content_type,
+            tokens_generated: event.tokens_generated,
+            elapsed_ns: event.timestamp_ns.max(0) as u64,
         };
-
-        if (state.callback)(&stream_token) {
-            1 // continue
-        } else {
-            0 // stop
+        if !callback(&stream_token) {
+            callback_stopped = true;
+            stop_flag.store(true, Ordering::Release);
+            pending.store(true, Ordering::Release);
         }
+    })?;
+
+    if callback_stopped && batch.has_active() {
+        let drain_pending = AtomicBool::new(false);
+        batch.run_loop_final_only(&drain_pending, |_| {})?;
     }
 
-    // C callback function pointer type matching the Zig StreamCallback.
-    type CStreamCb = unsafe extern "C" fn(*const u8, usize, u8, u8, u8, *mut c_void) -> u8;
-    let cb_ptr: CStreamCb = stream_trampoline;
+    let result = batch
+        .take_result(request_id)
+        .ok_or_else(|| crate::Error::generic("batch stream completed without a result"))?;
 
-    // SAFETY: All pointers valid. The callback state lives on our stack frame
-    // and talu_router_generate_streaming blocks until complete.
-    let result = unsafe {
-        talu_sys::talu_router_generate_streaming(
-            chat.as_ptr(),
-            parts_holder.as_ptr(),
-            parts_holder.len(),
-            backend.as_ptr(),
-            config_holder.as_ptr(),
-            cb_ptr as *mut c_void,
-            &mut state as *mut CallbackState as *mut c_void,
-        )
-    };
-
-    if result.error_code != 0 {
-        return Err(error_from_last_or("Streaming generation failed"));
-    }
-
-    // If no visible text was streamed, try fallback from conversation.
-    if !state.emitted_visible {
+    if !callback_stopped && !emitted_visible {
         if let Ok(Some(text)) = chat.responses().last_assistant_message_text() {
             if has_visible_text(&text) {
                 let fallback = StreamToken {
                     text: text.as_str(),
                     item_type: crate::responses::ItemType::Message,
                     content_type: crate::responses::ContentType::OutputText,
-                    tokens_generated: 0,
-                    elapsed_ns: 0,
+                    tokens_generated: result.completion_tokens,
+                    elapsed_ns: result.generation_ns,
                 };
                 let _ = callback(&fallback);
             }
@@ -692,9 +442,7 @@ pub fn generate_stream(
         prefill_ns: result.prefill_ns,
         generation_ns: result.generation_ns,
         ttft_ns: result.ttft_ns,
-        finish_reason: crate::FinishReason::from(talu_sys::CFinishReason::from(
-            result.finish_reason,
-        )),
+        finish_reason: result.finish_reason,
     })
 }
 
@@ -748,4 +496,43 @@ pub fn stream_text(
 ) -> Result<StreamResult> {
     let content = vec![ContentPart::Text(text.to_string())];
     generate_stream(chat, &content, backend, config, callback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_batch_user_content_rejects_empty_conversation_without_content() {
+        let chat = ChatHandle::new(None).expect("chat should be created");
+        let err = append_batch_user_content(&chat, &[]).expect_err("empty input must fail");
+        assert!(
+            err.to_string().contains("requires either content"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn append_batch_user_content_rejects_image_content() {
+        let chat = ChatHandle::new(None).expect("chat should be created");
+        let content = [ContentPart::ImageUrl {
+            url: "data:image/png;base64,AAAA".to_string(),
+            mime: Some("image/png".to_string()),
+        }];
+        let err = append_batch_user_content(&chat, &content).expect_err("image input must fail");
+        assert!(
+            err.to_string().contains("image generation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn append_batch_user_content_appends_text_message() {
+        let chat = ChatHandle::new(None).expect("chat should be created");
+        let content = [ContentPart::Text("hello".to_string())];
+
+        append_batch_user_content(&chat, &content).expect("text append should succeed");
+
+        assert_eq!(chat.item_count(), 1);
+    }
 }

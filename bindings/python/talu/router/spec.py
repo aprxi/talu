@@ -48,7 +48,12 @@ class LocalBackend:
 
 @dataclass(frozen=True)
 class OpenAICompatibleBackend:
-    """Configuration for OpenAI-compatible API backend.
+    """Future configuration for Python OpenAI-compatible outbound routing.
+
+    The type is part of the routing API shape, but Python generation against
+    arbitrary remote OpenAI-compatible endpoints is not implemented yet. Talu's
+    Rust CLI server does support inbound OpenAI-compatible `/v1/chat/completions`
+    for local inference.
 
     Attributes
     ----------
@@ -57,33 +62,8 @@ class OpenAICompatibleBackend:
         org_id: Organization ID for multi-tenant APIs.
         timeout_ms: Request timeout in milliseconds (0 = default).
         max_retries: Maximum retry attempts for failed requests (0 = default).
-        extra_params: Additional parameters to include in API requests.
-            These are merged into the request body for OpenAI-compatible APIs.
-            Useful for provider-specific parameters not covered by GenerationConfig.
-
-            Example::
-
-                backend = OpenAICompatibleBackend(
-                    base_url="https://api.together.xyz/v1",
-                    api_key="...",
-                    extra_params={"repetition_penalty": 1.1}
-                )
-
-        headers: Custom HTTP headers to include in every request to this backend.
-            Useful for enterprise networking requirements like authentication proxies,
-            custom routing, or tracing headers.
-
-            Example::
-
-                backend = OpenAICompatibleBackend(
-                    base_url="https://internal-proxy.corp.example.com/llm/v1",
-                    api_key="...",
-                    headers={
-                        "X-Request-ID": "abc123",
-                        "X-Team-ID": "ml-team",
-                        "X-Proxy-Auth": "secret-token",
-                    }
-                )
+        extra_params: Future additional request-body parameters.
+        headers: Future custom HTTP headers.
     """
 
     base_url: str | None = None
@@ -120,7 +100,7 @@ class Capabilities:
 
 
 def _normalize_ref_prefix(ref: str, allow_mapping: bool) -> str:
-    """Normalize model reference prefixes (e.g., 'native::', 'openai::' -> 'openai://')."""
+    """Normalize model reference prefixes."""
     if ref.startswith("native::"):
         return ref[len("native::") :]
     if not allow_mapping:

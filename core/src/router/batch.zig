@@ -43,7 +43,6 @@ const ContentType = responses_mod.ContentType;
 
 const GenerateOptions = local_mod.GenerateOptions;
 const CGenerateConfig = capi_bridge.CGenerateConfig;
-const GenerateContentPart = capi_bridge.GenerateContentPart;
 const CFinishReason = capi_bridge.CFinishReason;
 const CToolCallRef = capi_bridge.CToolCallRef;
 
@@ -100,9 +99,9 @@ pub const BatchResult = struct {
     generation_ns: u64,
     ttft_ns: u64,
     finish_reason: CFinishReason,
-    /// Full generated text (owned, caller must free via freeResult).
+    /// Full generated text, owned by this result and released by deinit().
     text: ?[]u8,
-    /// Tool calls (owned, caller must free via freeResult).
+    /// Tool calls, owned by this result and released by deinit().
     tool_calls: ?[]CToolCallRef,
 
     pub fn deinit(self: *BatchResult) void {
@@ -133,7 +132,6 @@ const FilterState = enum { normal, reasoning };
 /// Per-request state for token processing.
 const RequestState = struct {
     // --- Decode context ---
-    decode_context_token: ?u32 = null,
     utf8_pending: [3]u8 = .{ 0, 0, 0 },
     utf8_pending_len: u8 = 0,
 
@@ -178,6 +176,8 @@ const RequestState = struct {
     owned_prompt_tokens: ?[]u32 = null,
     owned_eos_tokens: ?[]u32 = null,
     owned_thinking_end_tokens: ?[]u32 = null,
+    owned_stop_sequences: ?[][]u32 = null,
+    owned_logit_bias: ?[]sampler_mod.LogitBiasEntry = null,
 
     // --- Stop flag ---
     stop_flag: ?*const std.atomic.Value(bool) = null,
@@ -197,6 +197,11 @@ const RequestState = struct {
         if (self.owned_prompt_tokens) |t| allocator.free(t);
         if (self.owned_eos_tokens) |t| allocator.free(t);
         if (self.owned_thinking_end_tokens) |t| allocator.free(t);
+        if (self.owned_stop_sequences) |seqs| {
+            for (seqs) |seq| allocator.free(seq);
+            allocator.free(seqs);
+        }
+        if (self.owned_logit_bias) |bias| allocator.free(bias);
     }
 };
 
@@ -213,6 +218,7 @@ pub const BatchWrapper = struct {
     engine: *LocalEngine,
     requests: std.AutoHashMap(u64, *RequestState),
     completed_results: std.AutoHashMap(u64, *BatchResult),
+    event_text_buf: std.ArrayList(u8),
 
     pub fn init(engine: *LocalEngine, config: SchedulerConfig) !BatchWrapper {
         var scheduler = try engine.createScheduler(config);
@@ -223,6 +229,7 @@ pub const BatchWrapper = struct {
             .engine = engine,
             .requests = std.AutoHashMap(u64, *RequestState).init(allocator),
             .completed_results = std.AutoHashMap(u64, *BatchResult).init(allocator),
+            .event_text_buf = .empty,
         };
     }
 
@@ -243,6 +250,7 @@ pub const BatchWrapper = struct {
         }
         self.completed_results.deinit();
 
+        self.event_text_buf.deinit(allocator);
         self.scheduler.deinit();
     }
 
@@ -261,8 +269,24 @@ pub const BatchWrapper = struct {
         state.* = RequestState.init();
         errdefer state.deinit();
 
-        // Build GenerateOptions from C config.
-        const opts = capi_bridge.configToGenerateOptions(config);
+        // Build GenerateOptions from C config. Batch requests outlive this
+        // submit call, so any allocated option payloads are transferred into
+        // RequestState before the scheduler stores borrowed slices.
+        var built = try capi_bridge.buildOptions(allocator, config, self.engine);
+        defer built.deinit(allocator);
+        if (built.options.external_vision_input != null) {
+            error_context.setContext("batch generation does not support external vision prefill yet", .{});
+            return error.UnsupportedContentType;
+        }
+        if (built.stop_sequences.len > 0) {
+            state.owned_stop_sequences = built.stop_sequences;
+            built.stop_sequences = &.{};
+        }
+        if (built.logit_bias.len > 0) {
+            state.owned_logit_bias = built.logit_bias;
+            built.logit_bias = &.{};
+        }
+        const opts = built.options;
 
         // Check for raw output mode and completions mode.
         state.raw_output = opts.raw_output;
@@ -414,7 +438,7 @@ pub const BatchWrapper = struct {
         else
             base_max_tokens;
 
-        // Build sampling config (mirrors local.zig generateFromPrompt).
+        // Build sampling config from chat defaults plus request overrides.
         const temperature = opts.temperature orelse chat.temperature;
         const top_k = opts.top_k orelse chat.top_k;
         const top_p = opts.top_p orelse chat.top_p;
@@ -480,6 +504,7 @@ pub const BatchWrapper = struct {
         // Submit to scheduler.
         const request_id = try self.scheduler.submit(prompt_tokens, max_tokens, .{
             .eos_token_ids = self.engine.gen_config.eos_token_ids,
+            .stop_sequences = opts.stop_sequences,
             .sampling = sampling_config,
             .grammar_sampler = effective_grammar,
             .stop_flag = opts.stop_flag,
@@ -505,6 +530,11 @@ pub const BatchWrapper = struct {
     }
 
     fn stepImpl(self: *BatchWrapper, events_out: []BatchEvent, decode_text: bool) !usize {
+        if (decode_text) {
+            self.event_text_buf.clearRetainingCapacity();
+            try self.event_text_buf.ensureTotalCapacity(allocator, events_out.len * (MAX_TOKEN_LEN + 3));
+        }
+
         // Clear per-step delta buffers for all active requests.
         var req_iter = self.requests.valueIterator();
         while (req_iter.next()) |state_ptr| {
@@ -564,10 +594,9 @@ pub const BatchWrapper = struct {
             const token_types = classifyFromThinking(state, raw.in_thinking);
 
             if (decode_text) {
-                // Decode token to raw bytes via pre-computed table (zero-alloc O(1) lookup).
                 const decoded_raw: []const u8 = self.engine.tok.tokenBytes(raw.token) orelse "";
 
-                // UTF-8 assembly (same algorithm as capi_bridge.zig).
+                // Preserve incomplete multi-byte sequences until the next token.
                 var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
                 const pending_len: usize = state.utf8_pending_len;
                 @memcpy(combined_buf[0..pending_len], state.utf8_pending[0..pending_len]);
@@ -614,6 +643,12 @@ pub const BatchWrapper = struct {
                     try state.text_buf.appendSlice(allocator, valid);
                     const delta_base = state.delta_buf.items.len;
                     try state.delta_buf.appendSlice(allocator, valid);
+                    var event_text = state.delta_buf.items[delta_base..];
+                    if (raw.is_final) {
+                        const event_base = self.event_text_buf.items.len;
+                        try self.event_text_buf.appendSlice(allocator, event_text);
+                        event_text = self.event_text_buf.items[event_base..];
+                    }
 
                     if (event_count < events_out.len) {
                         const elapsed_ns: i128 = if (event_now_ns > state.start_ns)
@@ -626,7 +661,7 @@ pub const BatchWrapper = struct {
                             .item_type = token_types.item_type,
                             .content_type = token_types.content_type,
                             .is_final = false,
-                            .text = state.delta_buf.items[delta_base..],
+                            .text = event_text,
                             .token_id = raw.token,
                             .tokens_generated = state.engine_token_count,
                             .timestamp_ns = elapsed_ns,
@@ -823,9 +858,13 @@ pub const BatchWrapper = struct {
         }
     }
 
-    /// Run loop variant for non-streaming callers that don't need per-token
-    /// decoded text. Keeps event cadence for cancellation/command wakeups.
-    pub fn runLoopNoText(
+    /// Run non-streaming generation to terminal events only.
+    ///
+    /// Final-only callers do not need per-token callbacks; they read the
+    /// completed text and metadata through takeResult(). This loop keeps
+    /// token accounting and cancellation checks inside Zig and only crosses
+    /// the FFI boundary when a request finishes.
+    pub fn runLoopFinalOnly(
         self: *BatchWrapper,
         pending_flag: ?*const std.atomic.Value(bool),
         callback: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
@@ -840,30 +879,23 @@ pub const BatchWrapper = struct {
                 if (flag.load(.acquire)) break;
             }
 
+            const stopped_count = try self.cancelStoppedRequestsFinalOnly(&events_buf);
+            if (stopped_count > 0) {
+                const emit_count = self.copyEventsToC(events_buf[0..stopped_count], &c_events_buf, true);
+                if (emit_count > 0) callback(&c_events_buf, emit_count, callback_data);
+                continue;
+            }
+
             const count = try self.stepNoText(&events_buf);
             if (count == 0) continue;
 
-            const emit_count = @min(count, max_events);
-            for (events_buf[0..emit_count], 0..) |ev, i| {
-                c_events_buf[i] = .{
-                    .request_id = ev.request_id,
-                    .event_type = @intFromEnum(ev.event_type),
-                    .item_type = ev.item_type,
-                    .content_type = ev.content_type,
-                    .is_final = @intFromBool(ev.is_final),
-                    .text_ptr = if (ev.text.len > 0) ev.text.ptr else null,
-                    .text_len = ev.text.len,
-                    .token_id = ev.token_id,
-                    .tokens_generated = ev.tokens_generated,
-                    .timestamp_ns = @intCast(@min(ev.timestamp_ns, std.math.maxInt(i64))),
-                };
-            }
-            callback(&c_events_buf, emit_count, callback_data);
+            const emit_count = self.copyEventsToC(events_buf[0..count], &c_events_buf, true);
+            if (emit_count > 0) callback(&c_events_buf, emit_count, callback_data);
 
-            if (shouldHandoffSingleDecodeLoop(self.scheduler.activeCount(), self.scheduler.pendingCount(), events_buf[0..emit_count])) {
+            if (shouldHandoffSingleDecodeLoop(self.scheduler.activeCount(), self.scheduler.pendingCount(), events_buf[0..count])) {
                 const req_id = events_buf[0].request_id;
                 if (self.requests.get(req_id)) |state| {
-                    self.runDecodeLoopSingleNoText(
+                    self.runDecodeLoopSingleFinalOnly(
                         req_id,
                         state,
                         pending_flag,
@@ -880,6 +912,82 @@ pub const BatchWrapper = struct {
                 }
             }
         }
+    }
+
+    fn copyEventsToC(
+        self: *BatchWrapper,
+        events: []const BatchEvent,
+        c_events_buf: []CEvent,
+        final_only: bool,
+    ) usize {
+        _ = self;
+        var emit_count: usize = 0;
+        for (events) |ev| {
+            if (final_only and !ev.is_final) continue;
+            if (emit_count >= c_events_buf.len) break;
+            c_events_buf[emit_count] = .{
+                .request_id = ev.request_id,
+                .event_type = @intFromEnum(ev.event_type),
+                .item_type = ev.item_type,
+                .content_type = ev.content_type,
+                .is_final = @intFromBool(ev.is_final),
+                .text_ptr = if (ev.text.len > 0) ev.text.ptr else null,
+                .text_len = ev.text.len,
+                .token_id = ev.token_id,
+                .tokens_generated = ev.tokens_generated,
+                .timestamp_ns = @intCast(@min(ev.timestamp_ns, std.math.maxInt(i64))),
+            };
+            emit_count += 1;
+        }
+        return emit_count;
+    }
+
+    fn cancelStoppedRequestsFinalOnly(
+        self: *BatchWrapper,
+        events_out: []BatchEvent,
+    ) !usize {
+        var ids_buf: [64]u64 = undefined;
+        var id_count: usize = 0;
+
+        var iter = self.requests.iterator();
+        while (iter.next()) |entry| {
+            if (id_count >= ids_buf.len or id_count >= events_out.len) break;
+            const state = entry.value_ptr.*;
+            if (state.stop_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    ids_buf[id_count] = entry.key_ptr.*;
+                    id_count += 1;
+                }
+            }
+        }
+
+        var event_count: usize = 0;
+        for (ids_buf[0..id_count]) |request_id| {
+            const state = self.requests.get(request_id) orelse continue;
+            if (!self.scheduler.cancel(request_id)) continue;
+
+            const elapsed_ns: i128 = if (state.first_token_ns > state.start_ns)
+                state.first_token_ns - state.start_ns
+            else
+                0;
+            const tokens_generated = state.engine_token_count;
+            try self.completeRequest(request_id, state, .cancelled);
+
+            events_out[event_count] = .{
+                .request_id = request_id,
+                .event_type = .completed,
+                .item_type = @intFromEnum(ItemType.message),
+                .content_type = @intFromEnum(ContentType.output_text),
+                .is_final = true,
+                .text = "",
+                .token_id = 0,
+                .tokens_generated = tokens_generated,
+                .timestamp_ns = elapsed_ns,
+            };
+            event_count += 1;
+        }
+
+        return event_count;
     }
 
     fn shouldHandoffSingleDecodeLoop(
@@ -936,7 +1044,7 @@ pub const BatchWrapper = struct {
         }
     }
 
-    fn runDecodeLoopSingleNoText(
+    fn runDecodeLoopSingleFinalOnly(
         self: *BatchWrapper,
         request_id: u64,
         state: *RequestState,
@@ -945,19 +1053,45 @@ pub const BatchWrapper = struct {
         outer_cb_data: ?*anyopaque,
         c_event_buf: *CEvent,
     ) !void {
-        var ctx = DecodeLoopNoTextCtx{
+        var local_pending = std.atomic.Value(bool).init(false);
+        var ctx = DecodeLoopFinalOnlyCtx{
             .state = state,
-            .outer_cb = outer_cb,
-            .outer_cb_data = outer_cb_data,
-            .c_event_buf = c_event_buf,
+            .eos_token_ids = self.engine.gen_config.eos_token_ids,
+            .external_pending = pending_flag,
+            .local_pending = &local_pending,
         };
 
         try self.scheduler.runDecodeLoop(
             request_id,
-            pending_flag,
-            &decodeLoopTokenCbNoText,
+            &local_pending,
+            &decodeLoopTokenCbFinalOnly,
             @ptrCast(&ctx),
         );
+
+        if (ctx.stop_requested) {
+            if (self.scheduler.getState(request_id)) |request_state| {
+                if (request_state != .completed and request_state != .cancelled and request_state != .failed) {
+                    if (self.scheduler.cancel(request_id)) {
+                        const elapsed_ns: i128 = if (state.first_token_ns > state.start_ns)
+                            state.first_token_ns - state.start_ns
+                        else
+                            0;
+                        const tokens_generated = state.engine_token_count;
+                        try self.completeRequest(request_id, state, .cancelled);
+                        c_event_buf.* = std.mem.zeroes(CEvent);
+                        c_event_buf.request_id = request_id;
+                        c_event_buf.event_type = @intFromEnum(EventType.completed);
+                        c_event_buf.item_type = @intFromEnum(ItemType.message);
+                        c_event_buf.content_type = @intFromEnum(ContentType.output_text);
+                        c_event_buf.is_final = 1;
+                        c_event_buf.tokens_generated = tokens_generated;
+                        c_event_buf.timestamp_ns = @intCast(@min(elapsed_ns, std.math.maxInt(i64)));
+                        outer_cb(@ptrCast(c_event_buf), 1, outer_cb_data);
+                        return;
+                    }
+                }
+            }
+        }
 
         if (self.scheduler.getFinishReason(request_id)) |fr| {
             if (fr != .in_progress) {
@@ -984,11 +1118,12 @@ pub const BatchWrapper = struct {
         completed_event: ?CEvent = null,
     };
 
-    const DecodeLoopNoTextCtx = struct {
+    const DecodeLoopFinalOnlyCtx = struct {
         state: *RequestState,
-        outer_cb: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
-        outer_cb_data: ?*anyopaque,
-        c_event_buf: *CEvent,
+        eos_token_ids: []const u32,
+        external_pending: ?*const std.atomic.Value(bool),
+        local_pending: *std.atomic.Value(bool),
+        stop_requested: bool = false,
         completed_event: ?CEvent = null,
     };
 
@@ -1034,10 +1169,9 @@ pub const BatchWrapper = struct {
             state.first_token_ns = std.time.nanoTimestamp();
         }
 
-        // Decode token to raw bytes (zero-alloc table lookup).
         const decoded_raw: []const u8 = engine.tok.tokenBytes(token) orelse "";
 
-        // UTF-8 assembly.
+        // Preserve incomplete multi-byte sequences until the next token.
         var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
         const pending_len: usize = state.utf8_pending_len;
         @memcpy(combined_buf[0..pending_len], state.utf8_pending[0..pending_len]);
@@ -1114,17 +1248,29 @@ pub const BatchWrapper = struct {
         }
     }
 
-    fn decodeLoopTokenCbNoText(
+    fn decodeLoopTokenCbFinalOnly(
         req_id: u64,
         token: u32,
         is_final: bool,
         in_thinking: bool,
         data: ?*anyopaque,
     ) callconv(.c) void {
-        const ctx: *DecodeLoopNoTextCtx = @ptrCast(@alignCast(data));
+        const ctx: *DecodeLoopFinalOnlyCtx = @ptrCast(@alignCast(data));
         const state = ctx.state;
 
-        if (gen_config_mod.isEosToken(if (state.owned_eos_tokens) |tokens| tokens else &.{}, token)) {
+        if (ctx.external_pending) |flag| {
+            if (flag.load(.acquire)) {
+                ctx.local_pending.store(true, .release);
+            }
+        }
+        if (state.stop_flag) |flag| {
+            if (flag.load(.acquire)) {
+                ctx.stop_requested = true;
+                ctx.local_pending.store(true, .release);
+            }
+        }
+
+        if (gen_config_mod.isEosToken(ctx.eos_token_ids, token)) {
             if (is_final) {
                 var ev = std.mem.zeroes(CEvent);
                 ev.request_id = req_id;
@@ -1147,24 +1293,11 @@ pub const BatchWrapper = struct {
             state.first_token_ns = std.time.nanoTimestamp();
         }
 
-        const token_types = classifyFromThinking(state, in_thinking);
-        const now_ns = std.time.nanoTimestamp();
-        const elapsed_ns: i128 = if (now_ns > state.start_ns) now_ns - state.start_ns else 0;
-
-        ctx.c_event_buf.* = std.mem.zeroes(CEvent);
-        ctx.c_event_buf.request_id = req_id;
-        ctx.c_event_buf.event_type = @intFromEnum(EventType.text_delta);
-        ctx.c_event_buf.item_type = token_types.item_type;
-        ctx.c_event_buf.content_type = token_types.content_type;
-        ctx.c_event_buf.is_final = 0;
-        ctx.c_event_buf.text_ptr = null;
-        ctx.c_event_buf.text_len = 0;
-        ctx.c_event_buf.token_id = token;
-        ctx.c_event_buf.tokens_generated = state.engine_token_count;
-        ctx.c_event_buf.timestamp_ns = @intCast(@min(elapsed_ns, std.math.maxInt(i64)));
-        ctx.outer_cb(@ptrCast(ctx.c_event_buf), 1, ctx.outer_cb_data);
-
         if (is_final) {
+            const token_types = classifyFromThinking(state, in_thinking);
+            const now_ns = std.time.nanoTimestamp();
+            const elapsed_ns: i128 = if (now_ns > state.start_ns) now_ns - state.start_ns else 0;
+
             var ev = std.mem.zeroes(CEvent);
             ev.request_id = req_id;
             ev.event_type = @intFromEnum(EventType.completed);
@@ -1348,7 +1481,7 @@ const FilterResult = struct {
 };
 
 /// Classify a token using the scheduler's in_thinking flag.
-/// Single source of truth — matches capi_bridge.zig StreamingWrapper.
+/// The scheduler's state is the single source of truth.
 fn classifyFromThinking(
     state: *const RequestState,
     in_thinking: bool,
@@ -1415,8 +1548,8 @@ fn appendFilteredSegment(
 /// Run reasoning tag filter on decoded text. Updates state inline.
 /// Returns the text to emit (tag bytes are consumed, not emitted).
 ///
-/// Simplified from capi_bridge.zig filterAndPush: instead of pushing to
-/// a ring buffer, we return the filtered text. The caller accumulates.
+/// Returns filtered text segments instead of pushing them into an output
+/// transport; callers decide whether to stream or accumulate the result.
 fn filterReasoningTags(
     state: *RequestState,
     decoded: []const u8,
@@ -1532,9 +1665,7 @@ fn filterReasoningTags(
     };
 }
 
-/// Build effective template context (reasoning effort → enable_thinking).
-/// Same logic as local.zig buildEffectiveContext (duplicated to avoid
-/// making the private function public).
+/// Build effective template context from explicit JSON and generation options.
 fn buildEffectiveContext(alloc: std.mem.Allocator, opts: GenerateOptions) !?[]const u8 {
     const enable_thinking: bool = if (opts.max_reasoning_tokens) |mrt|
         mrt > 0

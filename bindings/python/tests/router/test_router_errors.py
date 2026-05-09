@@ -1,84 +1,22 @@
-"""
-Mock-based tests for Router error paths.
+"""Router generation error and batch handoff tests.
 
-These tests mock the C API layer to test Python error handling without
-requiring real models. This covers critical error paths that are otherwise
-only reachable during actual inference failures, ensuring proper exception
-mapping and resource cleanup.
+Maps to: talu/router/router.py
 """
 
 import ctypes
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from talu._native import RouterGenerateResult
 from talu.exceptions import GenerationError
 from talu.router import Router
-
-# =============================================================================
-# Fixtures
-# =============================================================================
-
-
-def _create_mock_result(
-    text: bytes | None = None,
-    token_count: int = 0,
-    prompt_tokens: int = 0,
-    completion_tokens: int = 0,
-    prefill_ns: int = 0,
-    generation_ns: int = 0,
-    error_code: int = 0,
-    finish_reason: int = 0,
-) -> RouterGenerateResult:
-    """Create a RouterGenerateResult with proper c_void_p handling for text.
-
-    The generated struct uses c_void_p for text field, so we need to
-    convert bytes to a pointer address.
-    """
-    result = RouterGenerateResult()
-    result.token_count = token_count
-    result.prompt_tokens = prompt_tokens
-    result.completion_tokens = completion_tokens
-    result.prefill_ns = prefill_ns
-    result.generation_ns = generation_ns
-    result.error_code = error_code
-    result.finish_reason = finish_reason
-    result.tool_calls = None
-    result.tool_call_count = 0
-
-    if text is not None:
-        # Create a ctypes buffer and get its address
-        text_buf = ctypes.create_string_buffer(text)
-        result._text_buffer = text_buf  # Keep reference alive
-        result.text = ctypes.addressof(text_buf)
-    else:
-        result.text = None
-
-    return result
+from talu.router import router as router_mod
 
 
 @pytest.fixture
 def mock_lib():
-    """Create a mock library with controllable return values."""
-    lib = MagicMock()
-    # Default: success result
-    lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-        text=b"Hello world",
-        token_count=2,
-        prefill_ns=1000000,
-        generation_ns=2000000,
-        error_code=0,
-    )
-    lib.talu_router_generate_streaming.return_value = _create_mock_result(
-        text=b"",
-        token_count=0,
-        prefill_ns=0,
-        generation_ns=0,
-        error_code=0,
-    )
-    lib.talu_router_result_free.return_value = None
-    return lib
+    """Create a mock native library."""
+    return MagicMock()
 
 
 @pytest.fixture
@@ -94,394 +32,164 @@ def router_with_mock_lib(mock_lib):
     """Create a Router with mocked native library."""
     router = Router(models=["test-model"])
     router._lib = mock_lib
-    # Mock backend handle creation - _get_or_create_backend returns a handle
     router._get_or_create_backend = MagicMock(return_value=ctypes.c_void_p(0xDEADBEEF))
     return router
 
 
-# =============================================================================
-# Generate Error Code Tests
-# =============================================================================
+@pytest.fixture
+def batch_helpers(monkeypatch):
+    append = MagicMock()
+    generate = MagicMock(
+        return_value={
+            "text": "Hello, I am an AI assistant.",
+            "token_count": 7,
+            "prompt_tokens": 3,
+            "completion_tokens": 7,
+            "prefill_ns": 1_000_000,
+            "generation_ns": 5_000_000,
+            "ttft_ns": 500_000,
+            "finish_reason": 0,
+            "tool_calls": None,
+        }
+    )
+    monkeypatch.setattr(router_mod._c, "router_append_user_message", append)
+    monkeypatch.setattr(router_mod._c, "router_generate_batch_final", generate)
+    return append, generate
 
 
-class TestGenerateErrorCodes:
-    """Tests for Router.generate() error code handling."""
-
-    def test_error_code_invalid_chat_handle(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -1 (invalid chat handle) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-1,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Invalid chat handle" in str(exc.value)
-            assert exc.value.code == "GENERATION_FAILED"
-
-    def test_error_code_invalid_user_message(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -2 (invalid user message) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-2,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Invalid user message" in str(exc.value)
-
-    def test_error_code_invalid_model(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -3 (invalid model) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-3,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Invalid model" in str(exc.value)
-
-    def test_error_code_engine_creation_failed(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -4 (engine creation failed) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-4,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Engine creation failed" in str(exc.value)
-
-    def test_error_code_add_message_failed(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -5 (failed to add user message) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-5,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Failed to add user message" in str(exc.value)
-
-    def test_error_code_generation_failed(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -6 (generation failed) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-6,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Generation failed" in str(exc.value)
-
-    def test_error_code_memory_allocation_failed(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -8 (memory allocation failed) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-8,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Memory allocation failed" in str(exc.value)
-
-    def test_error_code_external_api_not_supported(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code -10 (external API not supported) raises GenerationError."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-10,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "External API" in str(exc.value) or "not yet supported" in str(exc.value)
-
-    def test_error_code_unknown(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Unknown error code raises GenerationError with code in message."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-999,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "-999" in str(exc.value)
-
-    def test_zig_error_message_takes_precedence(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Zig error message is used when available."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=-6,
-        )
-
-        with patch(
-            "talu._bindings.get_last_error", return_value="Model file corrupted at offset 0x1234"
-        ):
-            with pytest.raises(GenerationError) as exc:
-                router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-            assert "Model file corrupted" in str(exc.value)
+@pytest.fixture
+def stream_helpers(monkeypatch):
+    append = MagicMock()
+    stream = MagicMock(
+        return_value={
+            "prompt_tokens": 3,
+            "completion_tokens": 7,
+            "prefill_ns": 1_000_000,
+            "generation_ns": 5_000_000,
+            "ttft_ns": 500_000,
+            "finish_reason": 0,
+        }
+    )
+    monkeypatch.setattr(router_mod._c, "router_append_user_message", append)
+    monkeypatch.setattr(router_mod._c, "router_generate_batch_streaming", stream)
+    return append, stream
 
 
-# =============================================================================
-# Stream Error Code Tests
-# =============================================================================
+def test_generate_success_returns_batch_result_dict(router_with_mock_lib, mock_chat, batch_helpers):
+    """Successful non-stream generation is backed by the batch helper."""
+    append, generate = batch_helpers
+
+    result = router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
+
+    append.assert_called_once_with(router_with_mock_lib._lib, mock_chat._chat_ptr, "Hello")
+    generate.assert_called_once()
+    assert result["text"] == "Hello, I am an AI assistant."
+    assert result["token_count"] == 7
+    assert result["prompt_tokens"] == 3
+    assert result["completion_tokens"] == 7
+    assert result["prefill_ns"] == 1_000_000
+    assert result["generation_ns"] == 5_000_000
+    assert result["ttft_ns"] == 500_000
+    assert result["finish_reason"] == "stop"
 
 
-class TestStreamErrorCodes:
-    """Tests for Router.stream() error code handling.
+def test_generate_text_parts_are_appended_as_one_user_message(
+    router_with_mock_lib, mock_chat, batch_helpers
+):
+    """Text-only content lists remain supported by final-only batch generation."""
+    append, _generate = batch_helpers
+    content = [
+        {"type": "text", "text": "Hello"},
+        {"type": "input_text", "text": " world"},
+    ]
 
-    Router.stream() uses the callback-based talu_router_generate_streaming C API.
-    """
+    result = router_with_mock_lib.generate(mock_chat, content, model="test-model")
 
-    def test_stream_generation_error_code(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error code from streaming generation raises GenerationError."""
-        mock_lib.talu_router_generate_streaming.return_value = _create_mock_result(
-            error_code=-6,
-        )
-
-        with patch("talu._bindings.get_last_error", return_value=None):
-            with pytest.raises(GenerationError) as exc:
-                list(router_with_mock_lib.stream(mock_chat, "Hello", model="test-model"))
-
-            assert "error code -6" in str(exc.value)
-
-    def test_stream_generation_error_with_zig_message(
-        self, router_with_mock_lib, mock_chat, mock_lib
-    ):
-        """Zig error message is surfaced when streaming generation fails."""
-        mock_lib.talu_router_generate_streaming.return_value = _create_mock_result(
-            error_code=-4,
-        )
-
-        with patch(
-            "talu._bindings.get_last_error", return_value="Failed to load model: file not found"
-        ):
-            with pytest.raises(GenerationError) as exc:
-                list(router_with_mock_lib.stream(mock_chat, "Hello", model="test-model"))
-
-            assert "Failed to load model" in str(exc.value)
+    append.assert_called_once_with(router_with_mock_lib._lib, mock_chat._chat_ptr, "Hello world")
+    assert result["text"]
 
 
-# =============================================================================
-# Success Path Tests (with mocks)
-# =============================================================================
+def test_generate_non_text_content_fails_before_batch_submit(
+    router_with_mock_lib, mock_chat, batch_helpers
+):
+    """Final-only local generation has no direct multimodal fallback."""
+    append, generate = batch_helpers
+    content = [
+        {"type": "text", "text": "Describe this:"},
+        {"type": "image", "data": "base64data", "mime": "image/png"},
+    ]
+
+    with pytest.raises(GenerationError, match="multimodal|unsupported content"):
+        router_with_mock_lib.generate(mock_chat, content, model="test-model")
+
+    append.assert_not_called()
+    generate.assert_not_called()
 
 
-class TestSuccessPathsMocked:
-    """Tests for successful generation with mocked C API."""
+def test_generate_batch_error_propagates(router_with_mock_lib, mock_chat, batch_helpers):
+    """Batch helper failures surface as GenerationError."""
+    _append, generate = batch_helpers
+    generate.side_effect = GenerationError("Router.generate() failed: batch submit failed")
 
-    def test_generate_success_returns_dict(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Successful generation returns result dict."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text=b"Hello, I am an AI assistant.",
-            token_count=7,
-            prefill_ns=1000000,
-            generation_ns=5000000,
-            error_code=0,
-        )
-
-        result = router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-        assert result["text"] == "Hello, I am an AI assistant."
-        assert result["token_count"] == 7
-        assert result["prefill_ns"] == 1000000
-        assert result["generation_ns"] == 5000000
-
-    def test_generate_frees_result(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Successful generation calls result_free."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text=b"Hello",
-            token_count=1,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
-
+    with pytest.raises(GenerationError, match="batch submit failed"):
         router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
 
-        mock_lib.talu_router_result_free.assert_called_once()
 
-    def test_generate_with_empty_text_result(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Generation with None text returns empty string."""
-        mock_lib.talu_router_generate_with_backend.return_value = RouterGenerateResult(
-            text=None,
-            token_count=0,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
+def test_stream_success_uses_batch_helper(router_with_mock_lib, mock_chat, stream_helpers):
+    """Streaming generation is backed by the batch helper."""
+    append, stream = stream_helpers
 
-        result = router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
+    def run_stream(_lib, _chat_ptr, _backend, _config, callback):
+        callback("Hi", 0, 0, 1, 123)
+        return {
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "prefill_ns": 1_000_000,
+            "generation_ns": 5_000_000,
+            "ttft_ns": 500_000,
+            "finish_reason": 0,
+        }
 
-        assert result["text"] == ""
+    stream.side_effect = run_stream
 
+    tokens = list(router_with_mock_lib.stream(mock_chat, "Hello", model="test-model"))
 
-# =============================================================================
-# Resource Cleanup Tests
-# =============================================================================
-
-
-class TestResourceCleanupOnError:
-    """Tests verifying resources are cleaned up even when errors occur."""
-
-    def test_result_free_called_on_success(self, router_with_mock_lib, mock_chat, mock_lib):
-        """talu_router_result_free is called after successful generation."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text=b"Hello",
-            token_count=1,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
-
-        router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-        assert mock_lib.talu_router_result_free.call_count == 1
-
-    def test_repeated_generate_calls_dont_leak(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Multiple generate calls each free their result."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text=b"Hello",
-            token_count=1,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
-
-        for _ in range(10):
-            router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-        assert mock_lib.talu_router_result_free.call_count == 10
+    append.assert_called_once_with(
+        router_with_mock_lib._lib,
+        mock_chat._chat_ptr,
+        "Hello",
+        context="Router.stream()",
+    )
+    stream.assert_called_once()
+    assert [token.text for token in tokens] == ["Hi"]
 
 
-# =============================================================================
-# Content Type Warning Tests
-# =============================================================================
+def test_stream_generation_batch_error_propagates(
+    router_with_mock_lib, mock_chat, stream_helpers
+):
+    """Batch helper failures surface from streaming generation."""
+    append, stream = stream_helpers
+    stream.side_effect = GenerationError("Router.stream() failed: batch submit failed")
+
+    with pytest.raises(GenerationError, match="batch submit failed"):
+        list(router_with_mock_lib.stream(mock_chat, "Hello", model="test-model"))
+
+    append.assert_called_once_with(
+        router_with_mock_lib._lib,
+        mock_chat._chat_ptr,
+        "Hello",
+        context="Router.stream()",
+    )
 
 
-class TestContentTypeWarnings:
-    """Tests for unsupported content type warnings."""
+def test_stream_generation_error_with_zig_message(
+    router_with_mock_lib, mock_chat, stream_helpers
+):
+    """Zig error message is surfaced when streaming generation fails."""
+    _append, stream = stream_helpers
+    stream.side_effect = GenerationError(
+        "Router.stream() failed: Failed to load model: file not found"
+    )
 
-    def test_multimodal_content_warns(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Multimodal content emits warning but proceeds."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text=b"I see an image",
-            token_count=4,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
-
-        # Multimodal content with image
-        content = [
-            {"type": "text", "text": "Describe this:"},
-            {"type": "image", "data": "base64data", "mime": "image/png"},
-        ]
-
-        with pytest.warns(UserWarning, match="not yet supported"):
-            router_with_mock_lib.generate(mock_chat, content, model="test-model")
-
-    def test_text_only_no_warning(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Text-only content does not warn."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text=b"Hello",
-            token_count=1,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
-
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            # Should not raise any warnings
-            router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-
-# =============================================================================
-# Edge Cases
-# =============================================================================
-
-
-class TestEdgeCases:
-    """Edge case tests for Router with mocked C API."""
-
-    def test_generate_with_unicode_result(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Generation handles Unicode in result text."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text="Hello 你好 🌍".encode(),
-            token_count=5,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
-
-        result = router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-        assert "你好" in result["text"]
-        assert "🌍" in result["text"]
-
-    def test_generate_with_large_token_count(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Generation handles large token counts."""
-        mock_lib.talu_router_generate_with_backend.return_value = _create_mock_result(
-            text=b"x" * 10000,
-            token_count=100000,
-            prefill_ns=0,
-            generation_ns=0,
-            error_code=0,
-        )
-
-        result = router_with_mock_lib.generate(mock_chat, "Hello", model="test-model")
-
-        assert result["token_count"] == 100000
-        assert len(result["text"]) == 10000
+    with pytest.raises(GenerationError, match="Failed to load model"):
+        list(router_with_mock_lib.stream(mock_chat, "Hello", model="test-model"))

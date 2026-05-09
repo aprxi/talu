@@ -1060,11 +1060,6 @@ mod tests {
     }
 
     #[test]
-    fn reject_shell_subcommand() {
-        assert!(parse(&["talu", "shell", "--model", "Qwen/Qwen3-0.6B", "pwd"]).is_err());
-    }
-
-    #[test]
     fn parse_eval_ppl_command() {
         let cli = parse(&[
             "talu",

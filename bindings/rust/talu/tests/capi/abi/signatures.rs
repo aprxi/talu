@@ -56,6 +56,10 @@ assert_fn_signature!(
     unsafe extern "C" fn(*mut c_void, *mut CBatchEvent, usize) -> usize
 );
 assert_fn_signature!(
+    talu_sys::talu_batch_run_loop_final_only,
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> c_int
+);
+assert_fn_signature!(
     talu_sys::talu_take_last_error,
     unsafe extern "C" fn(*mut u8, usize, *mut c_void) -> usize
 );

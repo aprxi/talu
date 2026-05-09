@@ -16,7 +16,7 @@ from talu._native import (
     CItem,
     CMessageItem,
 )
-from talu.chat.items import ConversationItems, _read_content_part
+from talu.chat.items import ConversationItems
 from talu.types import (
     ContentType,
     FunctionCallItem,
@@ -151,191 +151,192 @@ class TestConversationItems:
 
 
 # =============================================================================
-# _read_content_part Tests
+# ConversationItems Content Part Tests
 # =============================================================================
 
 
-class TestReadContentPart:
-    """Tests for _read_content_part function.
+class TestConversationItemsContentParts:
+    """Tests for content part decoding through the production ConversationItems path."""
 
-    These tests create CContentPart structs with proper ctypes memory management.
-    The key is to keep references to the string buffers alive while the struct is used.
-    """
-
-    def _make_c_part(
+    def _read_message_part(
         self,
         content_type: ContentType,
         data: bytes = b"",
         secondary: bytes = b"",
         tertiary: bytes = b"",
+        quaternary: bytes = b"",
         image_detail: int = 0,
-    ) -> tuple[CContentPart, list]:
-        """Helper to create a CContentPart with ctypes pointers.
-
-        Returns the part and a list of buffers that must be kept alive.
-        """
-        part = CContentPart()
-        part.content_type = content_type.value
-        part.image_detail = image_detail
-
-        # Keep references to prevent garbage collection
+    ):
+        mock_lib = Mock()
+        mock_lib.talu_responses_item_count.return_value = 1
         buffers = []
 
-        # Set primary data - use ctypes.POINTER(c_uint8) as per struct definition
-        if data:
-            data_buf = ctypes.create_string_buffer(data)
-            buffers.append(data_buf)
-            part.data_ptr = ctypes.cast(data_buf, ctypes.POINTER(ctypes.c_uint8))
-            part.data_len = len(data)
-        else:
-            part.data_ptr = None
-            part.data_len = 0
+        def set_part_bytes(part, prefix: str, value: bytes) -> None:
+            ptr_field = f"{prefix}_ptr"
+            len_field = f"{prefix}_len"
+            if value:
+                buf = ctypes.create_string_buffer(value)
+                buffers.append(buf)
+                setattr(part, ptr_field, ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)))
+                setattr(part, len_field, len(value))
+            else:
+                setattr(part, ptr_field, None)
+                setattr(part, len_field, 0)
 
-        # Set secondary data
-        if secondary:
-            sec_buf = ctypes.create_string_buffer(secondary)
-            buffers.append(sec_buf)
-            part.secondary_ptr = ctypes.cast(sec_buf, ctypes.POINTER(ctypes.c_uint8))
-            part.secondary_len = len(secondary)
-        else:
-            part.secondary_ptr = None
-            part.secondary_len = 0
+        def mock_get_item(_ptr, _idx, c_item_ref):
+            c_item = c_item_ref._obj
+            c_item.id = 1
+            c_item.item_type = ItemType.MESSAGE.value
+            c_item.status = ItemStatus.COMPLETED.value
+            c_item.created_at_ms = 1000
+            return 0
 
-        # Set tertiary data
-        if tertiary:
-            tert_buf = ctypes.create_string_buffer(tertiary)
-            buffers.append(tert_buf)
-            part.tertiary_ptr = ctypes.cast(tert_buf, ctypes.POINTER(ctypes.c_uint8))
-            part.tertiary_len = len(tertiary)
-        else:
-            part.tertiary_ptr = None
-            part.tertiary_len = 0
+        def mock_as_message(_ptr, _idx, c_msg_ref):
+            c_msg = c_msg_ref._obj
+            c_msg.role = MessageRole.USER.value
+            c_msg.raw_role_ptr = None
+            c_msg.content_count = 1
+            return 0
 
-        return part, buffers
+        def mock_get_content(_ptr, _idx, _part_idx, c_part_ref):
+            part = c_part_ref._obj
+            part.content_type = content_type.value
+            part.image_detail = image_detail
+            set_part_bytes(part, "data", data)
+            set_part_bytes(part, "secondary", secondary)
+            set_part_bytes(part, "tertiary", tertiary)
+            set_part_bytes(part, "quaternary", quaternary)
+            return 0
+
+        mock_lib.talu_responses_get_item.side_effect = mock_get_item
+        mock_lib.talu_responses_item_as_message.side_effect = mock_as_message
+        mock_lib.talu_responses_item_message_get_content.side_effect = mock_get_content
+
+        item = ConversationItems(mock_lib, 12345)[0]
+        assert isinstance(item, MessageItem)
+        assert len(item.content) == 1
+        return item.content[0]
 
     def test_input_text(self):
-        """_read_content_part for INPUT_TEXT."""
-        part, _ = self._make_c_part(ContentType.INPUT_TEXT, b"Hello")
-        result = _read_content_part(part)
+        """ConversationItems decodes INPUT_TEXT content."""
+        result = self._read_message_part(ContentType.INPUT_TEXT, b"Hello")
 
         assert isinstance(result, InputText)
         assert result.text == "Hello"
 
     def test_input_image(self):
-        """_read_content_part for INPUT_IMAGE."""
-        part, _ = self._make_c_part(
+        """ConversationItems decodes INPUT_IMAGE content."""
+        result = self._read_message_part(
             ContentType.INPUT_IMAGE, b"http://example.com/img.png", image_detail=2
         )
-        result = _read_content_part(part)
 
         assert isinstance(result, InputImage)
         assert result.image_url == "http://example.com/img.png"
         assert result.detail == ImageDetail.HIGH
 
     def test_input_audio(self):
-        """_read_content_part for INPUT_AUDIO."""
-        part, _ = self._make_c_part(ContentType.INPUT_AUDIO, b"audio_data")
-        result = _read_content_part(part)
+        """ConversationItems decodes INPUT_AUDIO content."""
+        result = self._read_message_part(ContentType.INPUT_AUDIO, b"audio_data")
 
         assert isinstance(result, InputAudio)
         assert result.audio_data == "audio_data"
 
     def test_input_video(self):
-        """_read_content_part for INPUT_VIDEO."""
-        part, _ = self._make_c_part(ContentType.INPUT_VIDEO, b"http://example.com/video.mp4")
-        result = _read_content_part(part)
+        """ConversationItems decodes INPUT_VIDEO content."""
+        result = self._read_message_part(ContentType.INPUT_VIDEO, b"http://example.com/video.mp4")
 
         assert isinstance(result, InputVideo)
         assert result.video_url == "http://example.com/video.mp4"
 
     def test_input_file(self):
-        """_read_content_part for INPUT_FILE."""
-        part, _ = self._make_c_part(
+        """ConversationItems decodes INPUT_FILE content."""
+        result = self._read_message_part(
             ContentType.INPUT_FILE, b"file_contents", secondary=b"filename.txt"
         )
-        result = _read_content_part(part)
 
         assert isinstance(result, InputFile)
         assert result.file_data == "file_contents"
         assert result.filename == "filename.txt"
 
     def test_input_file_no_secondary(self):
-        """_read_content_part for INPUT_FILE with no secondary data."""
-        part, _ = self._make_c_part(ContentType.INPUT_FILE, b"file_contents")
-        result = _read_content_part(part)
+        """ConversationItems decodes INPUT_FILE content with no filename."""
+        result = self._read_message_part(ContentType.INPUT_FILE, b"file_contents")
 
         assert isinstance(result, InputFile)
         assert result.file_data == "file_contents"
         assert result.filename is None
 
     def test_output_text_with_annotations_and_logprobs(self):
-        """_read_content_part for OUTPUT_TEXT with annotations and logprobs."""
+        """ConversationItems decodes OUTPUT_TEXT metadata."""
         annotations = b'[{"type": "citation"}]'
         logprobs = b'[{"token": "hi", "logprob": -0.5}]'
-        part, _ = self._make_c_part(
-            ContentType.OUTPUT_TEXT, b"Hello", secondary=annotations, tertiary=logprobs
+        code_blocks = (
+            b'[{"index": 0, "fence_start": 0, "fence_end": 20, '
+            b'"language_start": 3, "language_end": 9, "content_start": 10, '
+            b'"content_end": 19, "complete": true}]'
         )
-        result = _read_content_part(part)
+        result = self._read_message_part(
+            ContentType.OUTPUT_TEXT,
+            b"```python\nx = 1\n```",
+            secondary=annotations,
+            tertiary=logprobs,
+            quaternary=code_blocks,
+        )
 
         assert isinstance(result, OutputText)
-        assert result.text == "Hello"
+        assert result.text == "```python\nx = 1\n```"
         assert result.annotations == [{"type": "citation"}]
         assert result.logprobs == [{"token": "hi", "logprob": -0.5}]
+        assert result.code_blocks is not None
+        assert result.code_blocks[0].complete is True
 
     def test_output_text_invalid_json_annotations(self):
-        """_read_content_part for OUTPUT_TEXT with invalid JSON annotations."""
-        part, _ = self._make_c_part(ContentType.OUTPUT_TEXT, b"Hello", secondary=b"not json")
-        result = _read_content_part(part)
+        """ConversationItems ignores invalid OUTPUT_TEXT annotations JSON."""
+        result = self._read_message_part(ContentType.OUTPUT_TEXT, b"Hello", secondary=b"not json")
 
         assert isinstance(result, OutputText)
         assert result.text == "Hello"
         assert result.annotations is None
 
     def test_output_text_invalid_json_logprobs(self):
-        """_read_content_part for OUTPUT_TEXT with invalid JSON logprobs."""
-        part, _ = self._make_c_part(ContentType.OUTPUT_TEXT, b"Hello", tertiary=b"not json")
-        result = _read_content_part(part)
+        """ConversationItems ignores invalid OUTPUT_TEXT logprobs JSON."""
+        result = self._read_message_part(ContentType.OUTPUT_TEXT, b"Hello", tertiary=b"not json")
 
         assert isinstance(result, OutputText)
         assert result.text == "Hello"
         assert result.logprobs is None
 
     def test_refusal(self):
-        """_read_content_part for REFUSAL."""
-        part, _ = self._make_c_part(ContentType.REFUSAL, b"I cannot help with that")
-        result = _read_content_part(part)
+        """ConversationItems decodes REFUSAL content."""
+        result = self._read_message_part(ContentType.REFUSAL, b"I cannot help with that")
 
         assert isinstance(result, Refusal)
         assert result.refusal == "I cannot help with that"
 
     def test_text(self):
-        """_read_content_part for TEXT."""
-        part, _ = self._make_c_part(ContentType.TEXT, b"Plain text")
-        result = _read_content_part(part)
+        """ConversationItems decodes TEXT content."""
+        result = self._read_message_part(ContentType.TEXT, b"Plain text")
 
         assert isinstance(result, Text)
         assert result.text == "Plain text"
 
     def test_reasoning_text(self):
-        """_read_content_part for REASONING_TEXT."""
-        part, _ = self._make_c_part(ContentType.REASONING_TEXT, b"Chain of thought")
-        result = _read_content_part(part)
+        """ConversationItems decodes REASONING_TEXT content."""
+        result = self._read_message_part(ContentType.REASONING_TEXT, b"Chain of thought")
 
         assert isinstance(result, ReasoningText)
         assert result.text == "Chain of thought"
 
     def test_summary_text(self):
-        """_read_content_part for SUMMARY_TEXT."""
-        part, _ = self._make_c_part(ContentType.SUMMARY_TEXT, b"Summary")
-        result = _read_content_part(part)
+        """ConversationItems decodes SUMMARY_TEXT content."""
+        result = self._read_message_part(ContentType.SUMMARY_TEXT, b"Summary")
 
         assert isinstance(result, SummaryText)
         assert result.text == "Summary"
 
     def test_unknown_content_type(self):
-        """_read_content_part for UNKNOWN."""
-        part, _ = self._make_c_part(ContentType.UNKNOWN, b"raw_data", secondary=b"custom_type")
-        result = _read_content_part(part)
+        """ConversationItems decodes UNKNOWN content."""
+        result = self._read_message_part(ContentType.UNKNOWN, b"raw_data", secondary=b"custom_type")
 
         assert isinstance(result, UnknownContent)
         assert result.raw_data == "raw_data"

@@ -118,7 +118,6 @@ async fn handle_non_streaming(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_for_gen = stop_flag.clone();
 
-    let backend = state.backend.clone();
     let batch_scheduler = match state.batch_scheduler.lock() {
         Ok(guard) => guard.clone(),
         Err(e) => {
@@ -147,7 +146,8 @@ async fn handle_non_streaming(
                 Err(e) => return Err(anyhow!("vision prepare failed: {e}")),
             }
         };
-        let use_batch = batch_scheduler.is_some() && vision_prefill.is_none();
+        let has_vision_prefill = vision_prefill.is_some();
+        let use_batch = batch_scheduler.is_some() && !has_vision_prefill;
         cfg.vision_prefill = vision_prefill;
 
         // Generate. BatchResult.text is the raw model output (with <think>
@@ -231,27 +231,15 @@ async fn handle_non_streaming(
                 None => Err(anyhow!("batch generation completed without a result")),
             }
         } else {
-            let mut guard = backend.blocking_lock();
-            let be = guard
-                .backend
-                .as_mut()
-                .ok_or_else(|| anyhow!("no backend available"))?;
-            let result = talu::router::generate(&chat, &[], be, &cfg)
-                .map_err(|e| anyhow!("generation failed: {e}"))?;
-            Ok((
-                result
-                    .text()
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty()),
-                None,
-                result.prompt_tokens() as u64,
-                result.completion_tokens() as u64,
-                match result.finish_reason() {
-                    talu::FinishReason::Length => "length",
-                    talu::FinishReason::ToolCalls => "tool_calls",
-                    _ => "stop",
-                },
-            ))
+            if has_vision_prefill {
+                Err(anyhow!(
+                    "local non-stream chat completions with image input require batch vision support, which is not available yet"
+                ))
+            } else {
+                Err(anyhow!(
+                    "local non-stream chat completions require a batch scheduler, but none is available"
+                ))
+            }
         }
     })
     .await;
@@ -487,7 +475,7 @@ async fn handle_streaming(
                 return;
             }
         } else {
-            // Direct generate_stream path (no batch scheduler attached).
+            // Per-request batch-backed streaming helper when no shared scheduler is attached.
             let stop_flag_for_cb = stop_flag_for_gen.clone();
             let tx_for_cb = tx.clone();
             let id_for_cb = completion_id.clone();

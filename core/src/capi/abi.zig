@@ -36,11 +36,9 @@ comptime {
 pub const EXPECTED_SIZES = struct {
     // Router/generation structs
     pub const RouterGenerateConfig = 152; // Added external vision payload pointers.
-    pub const RouterGenerateResult = 80;
     pub const CToolCallRef = 24;
     pub const CLogitBiasEntry = 8;
     pub const CGenerateVisionImage = 48;
-    pub const GenerateContentPart = 32;
 
     // Conversation/Items structs (from responses.zig)
     pub const CItem = 24; // Fixed: was 40
@@ -77,11 +75,9 @@ fn assertSize(comptime name: []const u8, comptime T: type, comptime expected: us
 comptime {
     // Router/generation structs
     assertSize("RouterGenerateConfig", capi_bridge.CGenerateConfig, EXPECTED_SIZES.RouterGenerateConfig);
-    assertSize("RouterGenerateResult", capi_bridge.CGenerateResult, EXPECTED_SIZES.RouterGenerateResult);
     assertSize("CToolCallRef", capi_bridge.CToolCallRef, EXPECTED_SIZES.CToolCallRef);
     assertSize("CLogitBiasEntry", capi_bridge.CLogitBiasEntry, EXPECTED_SIZES.CLogitBiasEntry);
     assertSize("CGenerateVisionImage", capi_bridge.CGenerateVisionImage, EXPECTED_SIZES.CGenerateVisionImage);
-    assertSize("GenerateContentPart", capi_bridge.GenerateContentPart, EXPECTED_SIZES.GenerateContentPart);
 
     // Conversation/Items structs
     assertSize("CItem", responses.CItem, EXPECTED_SIZES.CItem);

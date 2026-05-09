@@ -31,9 +31,9 @@ Power User (explicit client):
     >>> response = chat("Hello!")
     >>> response = response.append("Tell me more")
 
-Multi-Model Routing (coming soon):
+Multi-Model Routing:
 
-    >>> client = Client(["Qwen/Qwen3-0.6B", "openai::gpt-4o"])
+    >>> client = Client(["Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B"])
     >>>
     >>> chat = client.chat()
     >>>
@@ -41,26 +41,21 @@ Multi-Model Routing (coming soon):
     >>> response = chat("Hello!")
     >>>
     >>> # Switch for one call
-    >>> response = chat("Hello!", model="openai::gpt-4o")
-    >>>
-    >>> # Fan-out to multiple models
-    >>> responses = chat("Hello!", model=["Qwen/Qwen3-0.6B", "openai::gpt-4o"])
+    >>> response = chat("Hello!", model="Qwen/Qwen3-4B")
 
 Model Backends:
 
-    The :: separator identifies the backend (who runs inference).
-    Bare model IDs use talu's native inference engine.
+    Python routing is currently local-model routing. Bare model IDs use
+    talu's native inference engine.
 
     Native backend (talu's inference engine):
     - "Qwen/Qwen3-0.6B" - Implicit native, model from HuggingFace
     - "native::Qwen/Qwen3-0.6B" - Explicit native backend
     - "native::./my-model" - Native backend, local directory
 
-    External API backends (coming soon):
-    - "openai::gpt-4o" - OpenAI API
-    - "anthropic::claude-3-sonnet" - Anthropic API
-    - "vllm::Qwen/Qwen3-0.6B" - vLLM server (endpoint configured separately)
-    - "ollama::llama3" - Ollama server
+    Talu also serves an OpenAI-compatible /v1/chat/completions endpoint from
+    the Rust CLI server. Python outbound remote endpoint routing is reserved
+    for future support.
 """
 
 from __future__ import annotations
@@ -184,9 +179,8 @@ class Client:
         Not thread-safe. Create one Client per thread, or use separate Chat
         instances per thread (Chat instances are independent).
 
-    Manages model connections and creates conversations. Supports single
-    models, multiple models for routing, and various backends (local,
-    OpenAI, Anthropic, vLLM, etc.).
+    Manages local model connections and creates conversations. Supports single
+    local models and multiple local models for routing.
 
     Note:
         Multiple Client instances for the same model share the underlying
@@ -195,9 +189,9 @@ class Client:
 
     Args:
         model: Model identifier(s). Can be:
-            - **str**: Simple model ID ("Qwen/Qwen3-0.6B", "openai::gpt-4o")
+            - **str**: Simple local model ID ("Qwen/Qwen3-0.6B")
             - **ModelSpec**: Structured config for advanced backend settings
-            - **list**: Multiple models for routing/fan-out (coming soon)
+            - **list**: Multiple local models for routing
         hooks: List of Hook instances for observability (metrics, logging, tracing).
             Hooks receive callbacks at generation start, first token (TTFT), and end.
         base_url: API endpoint URL. When provided, uses OpenAI-compatible backend.
@@ -222,23 +216,16 @@ class Client:
         >>> print(response)
         4
 
-    Example - Remote backend (Pythonic):
-        >>> client = Client("gpt-4", base_url="http://localhost:8080/v1", api_key="sk-...")
-        >>> response = client.ask("Hello!")
-
     Example - Local backend with GPU offload:
         >>> client = Client("Qwen/Qwen3-0.6B", gpu_layers=20, num_threads=4)
 
     Example - Advanced config via ModelSpec (power users):
         >>> from talu import Client
-        >>> from talu.router import ModelSpec, OpenAICompatibleBackend
+        >>> from talu.router import LocalBackend, ModelSpec
         >>>
         >>> spec = ModelSpec(
-        ...     ref="my-model",
-        ...     backend=OpenAICompatibleBackend(
-        ...         base_url="http://localhost:8080/v1",
-        ...         timeout_ms=5000
-        ...     )
+        ...     ref="Qwen/Qwen3-0.6B",
+        ...     backend=LocalBackend(gpu_layers=20)
         ... )
         >>> client = Client(spec)
 
@@ -792,7 +779,15 @@ class Client:
         self._check_closed()
         from talu.router import get_capabilities
 
-        model_input = model if model is not None else self.default_model
+        if isinstance(model, ModelSpec):
+            if isinstance(model.backend, OpenAICompatibleBackend):
+                self._router._raise_remote_route_not_implemented(model.ref)
+            model_input = model
+        else:
+            model_name = model if model is not None else self.default_model
+            if model_name in self._router.models:
+                self._router._raise_remote_route_not_implemented(model_name)
+            model_input = model_name
         return get_capabilities(model_input)
 
     def close(self) -> None:
@@ -843,9 +838,9 @@ class AsyncClient:
 
     Args:
         model: Model identifier(s). Can be:
-            - **str**: Simple model ID ("Qwen/Qwen3-0.6B", "openai::gpt-4o")
+            - **str**: Simple local model ID ("Qwen/Qwen3-0.6B")
             - **ModelSpec**: Structured config for advanced backend settings
-            - **list**: Multiple models for routing/fan-out (coming soon)
+            - **list**: Multiple local models for routing
         base_url: API endpoint URL. When provided, uses OpenAI-compatible backend.
         api_key: API key for remote backends. Falls back to environment
             variables (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.).
@@ -861,20 +856,13 @@ class AsyncClient:
         ...     response = await client.ask("What is 2+2?")
         ...     print(response)
 
-    Example - Remote backend (Pythonic):
-        >>> async with AsyncClient("gpt-4", base_url="http://localhost:8080/v1") as client:
-        ...     response = await client.ask("Hello!")
-
     Example - Advanced config via ModelSpec (power users):
         >>> from talu import AsyncClient
-        >>> from talu.router import ModelSpec, OpenAICompatibleBackend
+        >>> from talu.router import LocalBackend, ModelSpec
         >>>
         >>> spec = ModelSpec(
-        ...     ref="my-model",
-        ...     backend=OpenAICompatibleBackend(
-        ...         base_url="http://localhost:8080/v1",
-        ...         timeout_ms=5000
-        ...     )
+        ...     ref="Qwen/Qwen3-0.6B",
+        ...     backend=LocalBackend(gpu_layers=20)
         ... )
         >>> async with AsyncClient(spec) as client:
         ...     response = await client.ask("Hello!")
@@ -1245,7 +1233,15 @@ class AsyncClient:
         self._check_closed()
         from talu.router import get_capabilities
 
-        model_input = model if model is not None else self.default_model
+        if isinstance(model, ModelSpec):
+            if isinstance(model.backend, OpenAICompatibleBackend):
+                self._router._raise_remote_route_not_implemented(model.ref)
+            model_input = model
+        else:
+            model_name = model if model is not None else self.default_model
+            if model_name in self._router.models:
+                self._router._raise_remote_route_not_implemented(model_name)
+            model_input = model_name
         return get_capabilities(model_input)
 
     async def close(self) -> None:

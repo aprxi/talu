@@ -3,7 +3,7 @@ mod version_support;
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -20,7 +20,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TALU_VERSION_OVERRIDE");
     println!("cargo:rerun-if-env-changed=GITHUB_ACTIONS");
     if let Some(repo_root) = repo_root {
-        version_support::emit_git_rerun_hints(&repo_root.to_path_buf());
+        version_support::emit_git_rerun_hints(repo_root);
     }
     let version = env::var("TALU_VERSION_OVERRIDE")
         .ok()
@@ -33,10 +33,7 @@ fn main() {
                 .map(|path| {
                     let base_version = version_support::read_base_version(&path);
                     if let Some(repo_root) = &repo_root {
-                        version_support::local_compiled_version(
-                            &repo_root.to_path_buf(),
-                            &base_version,
-                        )
+                        version_support::local_compiled_version(repo_root, &base_version)
                     } else {
                         base_version
                     }
@@ -82,7 +79,7 @@ fn main() {
 /// Note: the library file may not exist yet when build.rs runs — the Zig
 /// build installs it after invoking cargo. The linker only needs it when
 /// the final binary links, by which point the file is in place.
-fn find_monorepo_lib(manifest_dir: &PathBuf) -> Option<PathBuf> {
+fn find_monorepo_lib(manifest_dir: &Path) -> Option<PathBuf> {
     // talu-sys -> rust -> bindings -> repo root
     let repo_root = manifest_dir.parent()?.parent()?.parent()?;
     if repo_root.join("build.zig").exists() {

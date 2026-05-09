@@ -7,20 +7,8 @@
 //! Other destinations (OpenAI, Anthropic, vLLM, etc.) will be added as
 //! separate modules in the router package.
 //!
-//! Example:
-//!     // Load model once (at server startup)
-//!     var engine = try LocalEngine.init(allocator, "path/to/model");
-//!     defer engine.deinit();
-//!
-//!     // Create lightweight chats per user
-//!     var user1 = Chat.init(allocator);
-//!     defer user1.deinit();
-//!     try user1.setSystem("You are helpful.");
-//!     try user1.append(.user, "Hello!");
-//!
-//!     // Generate response
-//!     const result = try engine.generate(&user1, .{});
-//!     defer result.deinit(allocator);
+//! Batch generation lives in `router/batch.zig`; LocalEngine owns model
+//! loading, tokenization, prompt rendering, and backend scheduler creation.
 
 const std = @import("std");
 const inference_bridge = @import("inference_bridge.zig");
@@ -46,11 +34,8 @@ const gen_config_mod = inference_bridge.generation_config;
 const preproc_mod = inference_bridge.preprocessor_config;
 const validate_mod = @import("validate_pkg");
 const error_context = @import("error_context_pkg");
-const ConstrainedSampler = validate_mod.sampler.ConstrainedSampler;
 const GrammarConfig = validate_mod.sampler.GrammarConfig;
 const tool_schema_mod = @import("tool_schema.zig");
-const reasoning_parser_mod = responses_mod.reasoning_parser;
-const commit_mod = @import("commit.zig");
 const chat_template = @import("../template/chat_template.zig");
 const template_mod = @import("../template/root.zig");
 const progress_mod = @import("progress_pkg");
@@ -69,17 +54,6 @@ pub const SchedulerTokenEvent = inference.TokenEvent;
 pub const SchedulerSubmitOptions = BackendScheduler.SubmitOptions;
 pub const SamplingStrategy = inference.SamplingStrategy;
 pub const SamplingConfig = inference.SamplingConfig;
-
-fn finishReasonToString(reason: FinishReason) [:0]const u8 {
-    return switch (reason) {
-        .eos_token => "stop",
-        .length => "length",
-        .stop_sequence => "stop_sequence",
-        .tool_calls => "tool_calls",
-        .content_filter => "content_filter",
-        .cancelled => "cancelled",
-    };
-}
 
 fn isRecoverableMetalInitError(err: anyerror) bool {
     return err == error.MoENotSupported or
@@ -117,49 +91,6 @@ pub const ToolCallRef = struct {
     arguments: []const u8,
 };
 
-/// Result from engine.generate().
-pub const GenerationResult = struct {
-    /// Generated text.
-    text: []const u8,
-
-    /// Generated token IDs.
-    tokens: []const u32,
-
-    /// Number of tokens in the prompt.
-    prompt_tokens: usize,
-
-    /// Number of tokens generated.
-    generated_tokens: usize,
-
-    /// Prefill time in nanoseconds.
-    prefill_ns: u64,
-
-    /// Decode time in nanoseconds.
-    decode_ns: u64,
-
-    /// Why generation stopped.
-    finish_reason: FinishReason = .eos_token,
-
-    /// Tool calls requested by the model (if finish_reason == .tool_calls).
-    /// Both the tool calls and the text have been committed to the Conversation
-    /// via commit.commitGenerationResult() before this result is returned.
-    tool_calls: ?[]const ToolCallRef = null,
-
-    /// Free the result's memory.
-    pub fn deinit(self: *const GenerationResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.text);
-        allocator.free(self.tokens);
-        if (self.tool_calls) |calls| {
-            for (calls) |call| {
-                allocator.free(call.call_id);
-                allocator.free(call.name);
-                allocator.free(call.arguments);
-            }
-            allocator.free(calls);
-        }
-    }
-};
-
 /// Generation options that override Chat defaults.
 pub const GenerateOptions = struct {
     /// Override chat's max_tokens (total hard ceiling: thinking + answer).
@@ -194,12 +125,6 @@ pub const GenerateOptions = struct {
 
     /// Additive frequency penalty (0.0 = disabled).
     frequency_penalty: ?f32 = null,
-
-    /// Optional callback for streaming output. Called after each token is sampled.
-    token_callback: ?TokenCallback = null,
-
-    /// User data passed to the token callback.
-    callback_data: ?*anyopaque = null,
 
     /// Stop sequences (already tokenized). Generation stops when any sequence matches.
     /// The stop sequence is NOT included in the output.
@@ -277,13 +202,6 @@ pub const GenerateOptions = struct {
     /// thinking_budget = 0.  max_tokens is the sole generation cap.
     completions_mode: bool = false,
 
-    /// Output flag: set to true by generateFromPrompt when the rendered prompt
-    /// ends with the reasoning tag (e.g. `<think>\n`), indicating that the
-    /// model's output starts inside a reasoning block.  Used by the streaming
-    /// iterator to set its filter state before the first token callback fires.
-    /// Callers that need this information should point it at a bool they own.
-    starts_in_reasoning_out: ?*bool = null,
-
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
 };
 
@@ -356,14 +274,10 @@ fn maxThinkingTokensForEffort(effort: ?[]const u8) usize {
     return 4096; // unknown → medium
 }
 
-/// Callback function type for streaming token output.
-pub const TokenCallback = inference_types.TokenCallback;
-
-/// Local inference engine for LLM generation.
+/// Local inference engine for model-backed routing.
 ///
-/// Loads a model and provides generation capabilities. One engine can
-/// serve many Chats efficiently. This is the local destination for the
-/// router - other destinations (OpenAI, Anthropic, etc.) are separate modules.
+/// Loads a model and provides tokenization, prompt rendering, backend state,
+/// and scheduler construction. Batch generation is the local execution path.
 pub const LocalEngine = struct {
     allocator: std.mem.Allocator,
 
@@ -988,536 +902,6 @@ pub const LocalEngine = struct {
         return self.backend.vocabSize();
     }
 
-    /// Generate a response for a chat.
-    ///
-    /// Uses the chat's settings by default, but parameters can be overridden.
-    /// The assistant's response is automatically added to the chat history.
-    ///
-    /// Template customization:
-    ///   - opts.template_override: Use a custom template string instead of model's template
-    ///   - opts.extra_context_json: Inject additional variables (tools, dates, etc.) into template
-    pub fn generate(self: *LocalEngine, chat: *Chat, opts: GenerateOptions) !GenerationResult {
-        // Format messages to JSON using protocol layer (single source of truth)
-        const messages_json = try protocol.completions.serialize(
-            self.allocator,
-            chat.conv,
-            .{ .image_content_type = .image },
-        );
-        defer self.allocator.free(messages_json);
-
-        // Build effective template context: merge explicit extra_context_json with
-        // reasoning-effort-derived variables (e.g. enable_thinking for Qwen3.5).
-        // In completions_mode without tools, disable thinking. With tools,
-        // keep thinking enabled — the model needs reasoning to decide tool use.
-        var completions_opts = opts;
-        if (opts.completions_mode and opts.tools_json == null) {
-            completions_opts.max_reasoning_tokens = 0;
-        }
-        const effective_context = buildEffectiveContext(self.allocator, completions_opts) catch |err| {
-            log.err("inference", "Failed to build template context", .{ .err = @errorName(err) }, @src());
-            return err;
-        };
-        defer if (effective_context) |ctx| self.allocator.free(ctx);
-
-        // Apply chat template with optional overrides
-        log.debug("inference", "Applying chat template", .{ .messages_len = messages_json.len }, @src());
-        const prompt = self.renderPromptWithCachedTemplate(
-            messages_json,
-            true, // add_generation_prompt
-            opts.template_override,
-            effective_context,
-        ) catch |err| {
-            // If no chat template or template render fails, fall back to just using the last user message
-            if (err == error.MissingChatTemplate or err == error.FileNotFound) {
-                log.warn("inference", "No chat template found, using raw input (equivalent to --no-chat)", .{});
-            } else if (err == error.EvalError) {
-                log.warn("inference", "Chat template failed to render, using raw input (equivalent to --no-chat)", .{});
-            } else {
-                return err;
-            }
-            // Simple fallback: use last user message as prompt
-            if (chat.len() > 0) {
-                const last_item = chat.get(chat.len() - 1);
-                if (last_item) |item| {
-                    if (item.asMessage()) |msg| {
-                        if (msg.role == .user) {
-                            return self.generateFromPrompt(chat, msg.getFirstText(), opts);
-                        }
-                    }
-                }
-            }
-            return err;
-        };
-        defer self.allocator.free(prompt);
-
-        log.debug("inference", "Chat template rendered", .{ .prompt_len = prompt.len }, @src());
-
-        return self.generateFromPrompt(chat, prompt, opts);
-    }
-
-    /// Internal: generate from a formatted prompt string.
-    /// Uses Scheduler for continuous batching when supported by backend.
-    fn generateFromPrompt(
-        self: *LocalEngine,
-        chat: *Chat,
-        prompt: []const u8,
-        opts: GenerateOptions,
-    ) !GenerationResult {
-        // Check whether the rendered prompt ends with the reasoning tag
-        // (e.g. `<think>\n`).  Publish via output flag so streaming callers
-        // (iterator) can set their filter state before the first token fires.
-        if (opts.starts_in_reasoning_out) |out| {
-            out.* = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
-        }
-
-        // Use chat settings with optional overrides.
-        // When max_completion_tokens is set without explicit max_tokens,
-        // auto-compute: max_tokens = thinking_budget + max_completion_tokens.
-        // Token budget hierarchy:
-        //   max_tokens          — hard cap on total generated tokens (never exceeded)
-        //   max_reasoning_tokens — budget for thinking (within max_tokens)
-        //   max_completion_tokens — budget for answer (within max_tokens)
-        //
-        // When max_tokens is set explicitly, it IS the hard cap. The reasoning
-        // and completion budgets operate within it, never additive.
-        // When max_tokens is NOT set, auto-compute from budgets.
-        const base_max_tokens = if (opts.max_completion_tokens != null and opts.max_tokens == null) blk: {
-            const raw_budget = if (opts.max_reasoning_tokens) |mrt|
-                mrt
-            else
-                maxThinkingTokensForEffort(opts.reasoning_effort);
-            break :blk raw_budget + opts.max_completion_tokens.?;
-        } else opts.max_tokens orelse chat.max_tokens;
-        const grammar_slack: usize = 64;
-
-        // If tools_json is provided (and tool_choice != "none"), mark tool generation.
-        // No constrained sampler — the model generates freely in its native
-        // tool call format (e.g. Qwen3.5 <tool_call> XML). Parsed after generation.
-        const use_tools = opts.tools_json != null and
-            (opts.tool_choice == null or !std.mem.eql(u8, opts.tool_choice.?, "none"));
-
-        const effective_grammar = chat.grammar_sampler;
-
-        // max_tokens is the hard generation limit — never exceeded.
-        const max_tokens = if (effective_grammar != null and base_max_tokens > 0)
-            base_max_tokens + grammar_slack
-        else
-            base_max_tokens;
-        const temperature = opts.temperature orelse chat.temperature;
-        const top_k = opts.top_k orelse chat.top_k;
-        const top_p = opts.top_p orelse chat.top_p;
-        const min_p = opts.min_p orelse chat.min_p;
-        const repetition_penalty = opts.repetition_penalty orelse chat.repetition_penalty;
-        const presence_penalty = opts.presence_penalty orelse 0.0;
-        const frequency_penalty = opts.frequency_penalty orelse 0.0;
-        // Build sampling config
-        var sampling_config = sampler.SamplingConfig{ .strategy = .greedy, .logit_bias = opts.logit_bias, .seed = opts.seed, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty };
-        if (temperature > 0 and (self.gen_config.do_sample or opts.temperature != null)) {
-            sampling_config = .{
-                .strategy = .top_k,
-                .temperature = temperature,
-                .top_k = top_k,
-                .top_p = top_p,
-                .min_p = min_p,
-                .repetition_penalty = repetition_penalty,
-                .presence_penalty = presence_penalty,
-                .frequency_penalty = frequency_penalty,
-                .logit_bias = opts.logit_bias,
-                .seed = opts.seed,
-            };
-        }
-
-        // Get BOS token ID
-        const bos_token_id: ?u32 = if (self.gen_config.bos_token_id) |id|
-            (if (self.gen_config.add_bos_token) id else null)
-        else if (self.model_config.bos_token_id) |id|
-            (if (self.gen_config.add_bos_token and id >= 0) @intCast(id) else null)
-        else
-            null;
-
-        // Install prefill progress callback and stop flag (cleared after generation)
-        self.backend.setPrefillProgress(opts.prefill_progress_fn, opts.prefill_progress_data);
-        defer self.backend.setPrefillProgress(null, null);
-        self.backend.setStopFlag(opts.stop_flag);
-        defer self.backend.setStopFlag(null);
-
-        log.debug("router", "Generation params", .{
-            .max_tokens = max_tokens,
-            .use_tools = @as(u8, @intFromBool(use_tools)),
-        }, @src());
-        return self.generateWithScheduler(
-            chat,
-            prompt,
-            max_tokens,
-            sampling_config,
-            bos_token_id,
-            opts,
-            effective_grammar,
-            use_tools,
-        ) catch |err| {
-            const err_ctx = error_context.consumeContext();
-            log.warn("inference", "LocalEngine generateWithScheduler failed", .{
-                .err = @errorName(err),
-                .context = if (err_ctx) |ctx| ctx else "",
-                .backend = switch (self.backend) {
-                    .cpu => "cpu",
-                    .metal => "metal",
-                    .cuda => "cuda",
-                },
-            });
-            return err;
-        };
-    }
-
-    /// Generate using Scheduler (continuous batching path).
-    fn generateWithScheduler(
-        self: *LocalEngine,
-        chat: *Chat,
-        prompt: []const u8,
-        max_tokens: usize,
-        sampling_config: sampler.SamplingConfig,
-        bos_token_id: ?u32,
-        opts: GenerateOptions,
-        grammar_sampler: ?*ConstrainedSampler,
-        is_tool_generation: bool,
-    ) !GenerationResult {
-        // Every logical generation run must start from a clean backend
-        // execution-thread state. Non-stream local generation executes on the
-        // caller thread, while streaming uses a dedicated worker thread; both
-        // must observe the same invariant instead of inheriting MLX thread-
-        // local caches or pooled temporaries from earlier work on that thread.
-        self.backend.teardownExecutionThreadState();
-        // After the run, clear transient execution-thread resources once
-        // scheduler teardown has finished.
-        defer self.backend.cleanupExecutionThreadState();
-
-        const SchedulerType = inference.scheduler.GenericScheduler(Backend);
-
-        const image_count = countInputImageParts(chat);
-        if (image_count > 0 and opts.external_vision_input == null) {
-            log.warn("router", "input_image requires externally prepared vision payload", .{
-                .images = image_count,
-            });
-            return error.UnsupportedContentType;
-        }
-
-        var external_token_counts: []usize = &.{};
-        defer if (external_token_counts.len > 0) self.allocator.free(external_token_counts);
-
-        const resolved_vision_prefill: ?*const vision_types.PrefillVisionInput = opts.external_vision_input;
-
-        const resolved_token_counts: []const usize = if (opts.external_vision_input) |external| blk: {
-            if (external.images.len == 0) break :blk &.{};
-            external_token_counts = try self.allocator.alloc(usize, external.images.len);
-            for (external.images, 0..) |img, i| external_token_counts[i] = img.token_count;
-            break :blk external_token_counts;
-        } else &.{};
-
-        // Tokenize prompt
-        log.debug("router", "Tokenizing prompt", .{ .prompt_bytes = prompt.len }, @src());
-        const encoded_tokens = try self.tok.encode(prompt);
-        defer self.allocator.free(encoded_tokens);
-
-        const vision_boundaries = if (resolved_vision_prefill != null) self.resolveVisionBoundaryTokens() else VisionBoundaryTokens{};
-        log.debug("router", "Expanding image pad tokens", .{
-            .encoded_len = encoded_tokens.len,
-            .has_vision = @as(u8, @intFromBool(resolved_vision_prefill != null)),
-        }, @src());
-        const prompt_tokens_no_bos = if (resolved_vision_prefill) |vp|
-            try expandImagePadTokens(
-                self.allocator,
-                encoded_tokens,
-                vp.image_token_id,
-                resolved_token_counts,
-                vision_boundaries,
-            )
-        else
-            try self.allocator.dupe(u32, encoded_tokens);
-        defer self.allocator.free(prompt_tokens_no_bos);
-
-        // Prepend BOS token if configured
-        var prepend_bos = bos_token_id != null;
-        if (prepend_bos and prompt_tokens_no_bos.len > 0 and prompt_tokens_no_bos[0] == bos_token_id.?) {
-            prepend_bos = false;
-        }
-
-        const prompt_tokens = if (prepend_bos) blk: {
-            const tokens = try self.allocator.alloc(u32, prompt_tokens_no_bos.len + 1);
-            tokens[0] = bos_token_id.?;
-            @memcpy(tokens[1..], prompt_tokens_no_bos);
-            break :blk tokens;
-        } else try self.allocator.dupe(u32, prompt_tokens_no_bos);
-        defer self.allocator.free(prompt_tokens);
-
-        const prompt_len = prompt_tokens.len;
-
-        log.debug("inference", "Tokenization complete", .{ .prompt_tokens = prompt_len }, @src());
-
-        // Create scheduler for this request
-        log.debug("router", "Creating scheduler", .{}, @src());
-        var scheduler = try SchedulerType.init(self.allocator, &self.backend, .{
-            .default_eos_token_ids = self.gen_config.eos_token_ids,
-            .default_sampling = sampling_config,
-            .tokenizer = inference.scheduler.TokenizerView.fromTokenizer(&self.tok),
-            .state_descriptors = self.scheduler_state_descriptors,
-        });
-        defer scheduler.deinit();
-
-        // Wrap token callback if provided (Scheduler uses different signature)
-        const CallbackWrapper = struct {
-            original_callback: ?inference_types.TokenCallback,
-            original_data: ?*anyopaque,
-
-            fn wrap(request_id: u64, token: u32, is_final: bool, in_thinking: bool, user_data: ?*anyopaque) void {
-                _ = request_id;
-                _ = is_final;
-                const wrapper: *@This() = @ptrCast(@alignCast(user_data));
-                if (wrapper.original_callback) |cb| {
-                    cb(token, in_thinking, wrapper.original_data);
-                }
-            }
-        };
-
-        var callback_wrapper = CallbackWrapper{
-            .original_callback = opts.token_callback,
-            .original_data = opts.callback_data,
-        };
-
-        const vision_input_ptr: ?*const anyopaque = if (resolved_vision_prefill) |vp|
-            @ptrCast(vp)
-        else
-            null;
-        log.debug("inference", "Scheduler request assembled", .{
-            .has_vision_input = @as(u8, @intFromBool(vision_input_ptr != null)),
-            .image_count = if (resolved_vision_prefill) |vp| vp.images.len else 0,
-        }, @src());
-
-        // Thinking budget: carved from max_tokens, never exceeds it.
-        // In completions_mode without tools, thinking is disabled. With tools,
-        // the model needs thinking to reason about tool use.
-        // When max_completion_tokens is set, use it as the answer reserve.
-        // Otherwise fall back to 25% heuristic (floor 256).
-        const thinking_budget = if (opts.completions_mode and opts.tools_json == null) @as(usize, 0) else blk: {
-            const raw_thinking_budget = if (opts.max_reasoning_tokens) |mrt|
-                mrt
-            else
-                maxThinkingTokensForEffort(opts.reasoning_effort);
-            const answer_reserve = if (opts.max_completion_tokens) |mct|
-                mct
-            else
-                @max(@as(usize, 256), max_tokens / 4);
-            break :blk if (raw_thinking_budget > 0)
-                @min(raw_thinking_budget, max_tokens -| answer_reserve)
-            else
-                @as(usize, 0);
-        };
-
-        // Tokenize thinking end sequence if thinking budget is active.
-        const thinking_end_tokens = if (thinking_budget > 0)
-            self.tok.encode("</think>\n\n") catch null
-        else
-            null;
-        defer if (thinking_end_tokens) |t| self.allocator.free(t);
-
-        // Generate synchronously
-        log.debug("router", "generateSync starting", .{
-            .prompt_tokens = prompt_tokens.len,
-            .max_tokens = max_tokens,
-            .thinking_budget = thinking_budget,
-        }, @src());
-        var result = scheduler.generateSync(prompt_tokens, max_tokens, .{
-            .eos_token_ids = self.gen_config.eos_token_ids,
-            .stop_sequences = opts.stop_sequences,
-            .callback = if (opts.token_callback != null) CallbackWrapper.wrap else null,
-            .callback_data = if (opts.token_callback != null) @ptrCast(&callback_wrapper) else null,
-            .sampling = sampling_config,
-            .grammar_sampler = grammar_sampler,
-            .stop_flag = opts.stop_flag,
-            .vision_input = vision_input_ptr,
-            .max_thinking_tokens = thinking_budget,
-            .thinking_end_tokens = if (thinking_end_tokens) |t| t else &.{},
-            .max_completion_tokens = opts.max_completion_tokens orelse 0,
-        }) catch |err| {
-            const err_ctx = error_context.consumeContext();
-            log.warn("inference", "Scheduler generation failed", .{
-                .err = @errorName(err),
-                .has_vision_input = @as(u8, @intFromBool(vision_input_ptr != null)),
-                .context = if (err_ctx) |ctx| ctx else "",
-            });
-            return err;
-        };
-        defer result.deinit(self.allocator);
-
-        var adjusted_prefill_ns = result.prefill_ns;
-        if (resolved_vision_prefill != null) {
-            const vision_encode_ns = self.backend.takeLastVisionEncodeNs();
-            if (vision_encode_ns > 0 and adjusted_prefill_ns > vision_encode_ns) {
-                adjusted_prefill_ns -= vision_encode_ns;
-            }
-        }
-
-        log.debug("router", "Scheduler token sample", .{
-            .count = result.tokens.len,
-            .t0 = if (result.tokens.len > 0) result.tokens[0] else @as(u32, std.math.maxInt(u32)),
-            .t1 = if (result.tokens.len > 1) result.tokens[1] else @as(u32, std.math.maxInt(u32)),
-            .t2 = if (result.tokens.len > 2) result.tokens[2] else @as(u32, std.math.maxInt(u32)),
-            .t3 = if (result.tokens.len > 3) result.tokens[3] else @as(u32, std.math.maxInt(u32)),
-        }, @src());
-
-        // Strip trailing EOS token if present
-        var tokens_to_decode = result.tokens;
-        if (tokens_to_decode.len > 0) {
-            for (self.gen_config.eos_token_ids) |eos_id| {
-                if (tokens_to_decode[tokens_to_decode.len - 1] == eos_id) {
-                    tokens_to_decode = tokens_to_decode[0 .. tokens_to_decode.len - 1];
-                    break;
-                }
-            }
-        }
-
-        const generated_text = try self.tok.decode(tokens_to_decode);
-
-        // Create owned copy of generated tokens
-        const owned_tokens = try self.allocator.dupe(u32, result.tokens);
-        errdefer self.allocator.free(owned_tokens);
-
-        // Try to parse tool calls from generated text (supports XML and JSON).
-        // If parsing fails, fall through to the normal text path.
-        if (is_tool_generation and generated_text.len > 0) tool_call_blk: {
-            const parsed_calls = tool_schema_mod.parseToolCallsFromText(self.allocator, generated_text) catch
-                break :tool_call_blk;
-            defer {
-                for (parsed_calls) |*pc| {
-                    var call = pc.*;
-                    call.deinit(self.allocator);
-                }
-                self.allocator.free(parsed_calls);
-            }
-            if (parsed_calls.len == 0) break :tool_call_blk;
-
-            // Generate call IDs and build commit inputs.
-            const tc_inputs = try self.allocator.alloc(commit_mod.ToolCallInput, parsed_calls.len);
-            defer self.allocator.free(tc_inputs);
-            var call_ids = try self.allocator.alloc([]u8, parsed_calls.len);
-            defer {
-                for (call_ids[0..parsed_calls.len]) |cid| self.allocator.free(cid);
-                self.allocator.free(call_ids);
-            }
-
-            for (parsed_calls, 0..) |pc, i| {
-                call_ids[i] = try tool_schema_mod.generateCallId(self.allocator);
-                tc_inputs[i] = .{
-                    .id = call_ids[i],
-                    .name = pc.name,
-                    .arguments = pc.arguments,
-                };
-            }
-
-            const finish_reason_str = finishReasonToString(.tool_calls);
-            try commit_mod.commitGenerationResult(self.allocator, chat, .{
-                .text = generated_text,
-                .tool_calls = tc_inputs,
-                .prompt_tokens = prompt_len,
-                .completion_tokens = result.tokens.len,
-                .prefill_ns = adjusted_prefill_ns,
-                .generation_ns = result.decode_ns,
-                .finish_reason = finish_reason_str,
-            });
-
-            // Build ToolCallRef array for the caller.
-            const tool_calls = try self.allocator.alloc(ToolCallRef, parsed_calls.len);
-            errdefer self.allocator.free(tool_calls);
-
-            const item_index = chat.conv.len() - 1;
-            for (parsed_calls, 0..) |pc, i| {
-                tool_calls[i] = ToolCallRef{
-                    .item_index = item_index,
-                    .call_id = try self.allocator.dupe(u8, call_ids[i]),
-                    .name = try self.allocator.dupe(u8, pc.name),
-                    .arguments = try self.allocator.dupe(u8, pc.arguments),
-                };
-            }
-
-            return GenerationResult{
-                .text = generated_text,
-                .tokens = owned_tokens,
-                .prompt_tokens = prompt_len,
-                .generated_tokens = result.tokens.len,
-                .prefill_ns = adjusted_prefill_ns,
-                .decode_ns = result.decode_ns,
-                .finish_reason = .tool_calls,
-                .tool_calls = tool_calls,
-            };
-        }
-
-        // Map scheduler finish reason to session finish reason (text path).
-        const finish_reason: FinishReason = switch (result.finish_reason) {
-            .in_progress => .eos_token, // Shouldn't happen for sync
-            .eos_token => .eos_token,
-            .length => .length,
-            .stop_sequence => .stop_sequence,
-            .cancelled => .cancelled,
-        };
-
-        // In completions_mode, skip reasoning separation and conversation commit —
-        // return the raw decoded text directly with max_tokens as the sole cap.
-        const result_text = if (opts.completions_mode) generated_text else blk: {
-            const finish_reason_str = finishReasonToString(finish_reason);
-
-            // Text path: commit reasoning + assistant message via shared path
-            const generation_json = try self.buildGenerationJson(chat, opts, max_tokens);
-            defer self.allocator.free(generation_json);
-
-            // Detect whether the rendered prompt ends with an opening reasoning
-            // tag (e.g. `<think>\n`).  When the template injects this as a
-            // generation prefix, the model's output starts inside the reasoning
-            // block (no opening `<think>` tag), so the parser must begin in
-            // reasoning state to correctly separate reasoning / response.
-            const starts_in_reasoning = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
-
-            try commit_mod.commitGenerationResult(self.allocator, chat, .{
-                .text = generated_text,
-                .prompt_tokens = prompt_len,
-                .completion_tokens = result.tokens.len,
-                .prefill_ns = adjusted_prefill_ns,
-                .generation_ns = result.decode_ns,
-                .finish_reason = finish_reason_str,
-                .reasoning_tag = opts.reasoning_tag,
-                .generation_json = generation_json,
-                .starts_in_reasoning = starts_in_reasoning,
-            });
-
-            // Return clean text (strip reasoning tags for caller)
-            var parser = try reasoning_parser_mod.ReasoningParser.initWithState(self.allocator, opts.reasoning_tag, starts_in_reasoning);
-            defer parser.deinit();
-            try parser.processChunk(generated_text);
-            const parsed = try parser.finalize();
-
-            break :blk if (opts.raw_output) generated_text else if (parsed.reasoning != null) inner: {
-                const duped = try self.allocator.dupe(u8, parsed.response orelse "");
-                self.allocator.free(generated_text);
-                break :inner duped;
-            } else generated_text;
-        };
-
-        log.debug("router", "Generation complete", .{
-            .prompt_tokens = prompt_len,
-            .generated_tokens = result.tokens.len,
-            .prefill_ns = adjusted_prefill_ns,
-            .decode_ns = result.decode_ns,
-        }, @src());
-
-        return GenerationResult{
-            .text = result_text,
-            .tokens = owned_tokens,
-            .prompt_tokens = prompt_len,
-            .generated_tokens = result.tokens.len,
-            .prefill_ns = adjusted_prefill_ns,
-            .decode_ns = result.decode_ns,
-            .finish_reason = finish_reason,
-        };
-    }
-
     const VisionBoundaryTokens = struct {
         start_token_id: ?u32 = null,
         end_token_id: ?u32 = null,
@@ -2031,52 +1415,6 @@ pub const LocalEngine = struct {
 // Unit Tests
 // ============================================================================
 
-test "GenerationResult.deinit frees allocated memory" {
-    const allocator = std.testing.allocator;
-
-    // Create owned slices that deinit should free
-    const text = try allocator.dupe(u8, "Hello, world!");
-    errdefer allocator.free(text);
-    const tokens = try allocator.dupe(u32, &[_]u32{ 1, 2, 3, 4, 5 });
-
-    const result = GenerationResult{
-        .text = text,
-        .tokens = tokens,
-        .prompt_tokens = 10,
-        .generated_tokens = 5,
-        .prefill_ns = 1000,
-        .decode_ns = 2000,
-    };
-
-    // deinit should free both allocations without leaking
-    result.deinit(allocator);
-}
-
-test "GenerationResult struct fields" {
-    const allocator = std.testing.allocator;
-
-    const text = try allocator.dupe(u8, "test output");
-    errdefer allocator.free(text);
-    const tokens = try allocator.dupe(u32, &[_]u32{ 100, 200, 300 });
-
-    const result = GenerationResult{
-        .text = text,
-        .tokens = tokens,
-        .prompt_tokens = 42,
-        .generated_tokens = 3,
-        .prefill_ns = 123456,
-        .decode_ns = 789012,
-    };
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqualStrings("test output", result.text);
-    try std.testing.expectEqualSlices(u32, &[_]u32{ 100, 200, 300 }, result.tokens);
-    try std.testing.expectEqual(@as(usize, 42), result.prompt_tokens);
-    try std.testing.expectEqual(@as(usize, 3), result.generated_tokens);
-    try std.testing.expectEqual(@as(u64, 123456), result.prefill_ns);
-    try std.testing.expectEqual(@as(u64, 789012), result.decode_ns);
-}
-
 test "GenerateOptions struct defaults" {
     const opts = GenerateOptions{};
 
@@ -2086,8 +1424,6 @@ test "GenerateOptions struct defaults" {
     try std.testing.expect(opts.top_p == null);
     try std.testing.expect(opts.min_p == null);
     try std.testing.expect(opts.repetition_penalty == null);
-    try std.testing.expect(opts.token_callback == null);
-    try std.testing.expect(opts.callback_data == null);
     try std.testing.expect(!opts.completions_mode);
 }
 
@@ -2115,56 +1451,6 @@ test "GenerateOptions struct overrides" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), opts.top_p.?, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), opts.min_p.?, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.1), opts.repetition_penalty.?, 0.001);
-}
-
-test "GenerateOptions struct callback" {
-    const TestCallback = struct {
-        fn callback(token_id: u32, _: bool, user_data: ?*anyopaque) void {
-            if (user_data) |ptr| {
-                const count: *usize = @ptrCast(@alignCast(ptr));
-                count.* += 1;
-                _ = token_id;
-            }
-        }
-    };
-
-    var call_count: usize = 0;
-    const opts = GenerateOptions{
-        .token_callback = TestCallback.callback,
-        .callback_data = @ptrCast(&call_count),
-    };
-
-    // Verify callback is set and callable
-    try std.testing.expect(opts.token_callback != null);
-    try std.testing.expect(opts.callback_data != null);
-
-    // Call the callback to verify it works
-    opts.token_callback.?(42, false, opts.callback_data);
-    try std.testing.expectEqual(@as(usize, 1), call_count);
-
-    opts.token_callback.?(43, false, opts.callback_data);
-    try std.testing.expectEqual(@as(usize, 2), call_count);
-}
-
-test "GenerationResult struct empty" {
-    const allocator = std.testing.allocator;
-
-    const text = try allocator.dupe(u8, "");
-    errdefer allocator.free(text);
-    const tokens = try allocator.alloc(u32, 0);
-
-    const result = GenerationResult{
-        .text = text,
-        .tokens = tokens,
-        .prompt_tokens = 0,
-        .generated_tokens = 0,
-        .prefill_ns = 0,
-        .decode_ns = 0,
-    };
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), result.text.len);
-    try std.testing.expectEqual(@as(usize, 0), result.tokens.len);
 }
 
 test "allocateTemporaryStateBindingsForDescriptors allocates aligned descriptor blocks" {

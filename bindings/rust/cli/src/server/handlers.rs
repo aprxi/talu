@@ -735,7 +735,8 @@ async fn generate_response(
             } else {
                 None
             };
-            let use_batch = batch_scheduler_for_task.is_some() && vision_prefill.is_none();
+            let has_vision_prefill = vision_prefill.is_some();
+            let use_batch = batch_scheduler_for_task.is_some() && !has_vision_prefill;
             cfg.vision_prefill = vision_prefill;
 
             log::debug!(target: "server::gen", "generating: model={} max_tokens={} temp={} top_p={} seed={}",
@@ -836,43 +837,15 @@ async fn generate_response(
                     batch_status, batch_incomplete_reason,
                 ))
             } else {
-                // --- Direct generation path (non-batch) ---
-                let mut backend = backend.blocking_lock();
-                let backend = backend
-                    .backend
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("no backend available"))?;
-
-                let result = talu::router::generate(&chat, &[], backend, &cfg)
-                    .map_err(|e| anyhow!("generation failed: {}", e))?;
-
-                let prompt_tokens = result.prompt_tokens();
-                let completion_tokens = result.completion_tokens();
-                let prefill_ns = result.prefill_ns();
-                let generation_ns = result.generation_ns();
-                let ttft_ns = result.ttft_ns();
-                log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
-                    prompt_tokens, completion_tokens);
-
-                let all_json = chat
-                    .to_responses_json(1)
-                    .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
-                let all_items: serde_json::Value =
-                    serde_json::from_str(&all_json).unwrap_or_else(|_| json!([]));
-                let output_items = if let Some(arr) = all_items.as_array() {
-                    serde_json::Value::Array(arr[pre_gen_count..].to_vec())
+                if has_vision_prefill {
+                    Err(anyhow!(
+                        "local non-stream responses with image input require batch vision support, which is not available yet"
+                    ))
                 } else {
-                    json!([])
-                };
-
-                let responses_json = all_json;
-                let model_info_json = build_model_info_json(backend);
-
-                Ok::<_, anyhow::Error>((
-                    output_items, prompt_tokens, completion_tokens,
-                    prefill_ns, generation_ns, ttft_ns, responses_json, model_info_json,
-                    "completed", None::<&str>,
-                ))
+                    Err(anyhow!(
+                        "local non-stream responses require a batch scheduler, but none is available"
+                    ))
+                }
             }
         })
         .await
@@ -1591,9 +1564,9 @@ async fn stream_response(
         .unwrap()
 }
 
-/// Run streaming generation via `talu::router::generate_stream` (callback API).
+/// Run streaming generation via the batch-backed Rust callback helper.
 ///
-/// Used when no batch scheduler is available.
+/// Used when no shared batch scheduler is attached.
 /// Local backends use [`run_batch_streaming_generation`] instead.
 fn run_streaming_generation(
     backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
@@ -1640,7 +1613,7 @@ fn run_streaming_generation(
 
     // Load input items into the conversation, resolving file references.
     // The Zig protocol parser stores input_image parts in conversation
-    // items; the generate function extracts them for the vision encoder.
+    // items; batch-backed generation extracts them for the vision encoder.
     if let Some(ref json) = input_json {
         log::trace!(target: "server::gen", "resolve_file_references(input, {} bytes)", json.len());
         let resolved = match file_storage_path.as_deref() {

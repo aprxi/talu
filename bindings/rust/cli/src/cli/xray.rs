@@ -210,7 +210,7 @@ fn load_reference_visible_text(reference_path: &Path) -> Result<String> {
 /// Get effective generation config for xray using the core-owned policy.
 ///
 /// This uses talu::model::resolve_effective_generation_config to ensure xray
-/// uses identical config resolution as normal inference (ask, shell, etc).
+/// uses identical config resolution as normal inference (ask, server, etc).
 fn xray_generate_config(
     model: &str,
     max_tokens: usize,
@@ -4692,7 +4692,7 @@ fn rms(values: &[f32]) -> f64 {
     (sum_sq / values.len() as f64).sqrt()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn find_first_checkpoint_diff(
     expected: &BTreeMap<String, Vec<f32>>,
     actual: &BTreeMap<String, Vec<f32>>,

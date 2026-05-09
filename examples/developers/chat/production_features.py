@@ -1,15 +1,14 @@
-"""Production Features - count_tokens, logit_bias, extra_body.
+"""Production Features - count_tokens and logit_bias.
 
 Primary API: talu.Chat, talu.GenerationConfig
 Scope: Single
 
 This example demonstrates production-ready features that enable real-world
-deployment scenarios like RAG pipelines, classification, and provider integration.
+deployment scenarios like RAG pipelines and classification.
 
 Key points:
 - count_tokens() provides accurate token counts including template overhead
 - logit_bias enables controlled generation for classification
-- extra_body is the "escape hatch" for provider-specific parameters
 
 Related:
     - examples/developers/chat/configuration.py (basic config)
@@ -173,109 +172,6 @@ def rag_generate(chat: Chat, context: str, query: str, max_context: int = 4096):
 # response = rag_generate(chat, context, "What is the main topic?")
 
 
-# =============================================================================
-# 5. A/B Testing with Different Providers
-# =============================================================================
-
-print("\n=== A/B Testing Pattern ===")
-
-# Base config for both providers
-base_config = GenerationConfig(
-    temperature=0.7,
-    max_tokens=200,
-    stop_sequences=["\n\n"],
-)
-
-# Provider A: vLLM with specific tuning
-provider_a = base_config | GenerationConfig(
-    extra_body={"best_of": 2, "presence_penalty": 0.5}
-)
-
-# Provider B: Together with different tuning
-provider_b = base_config | GenerationConfig(
-    extra_body={"repetition_penalty": 1.1}
-)
-
-print("A/B test configs:")
-print(f"  Provider A (vLLM): {provider_a.extra_body}")
-print(f"  Provider B (Together): {provider_b.extra_body}")
-
-# In production:
-# if random.random() < 0.5:
-#     response = chat_vllm.send(prompt, config=provider_a)
-# else:
-#     response = chat_together.send(prompt, config=provider_b)
-
-
-# =============================================================================
-# 6. Custom Headers for Enterprise Networking
-# =============================================================================
-
-print("\n=== Custom Headers for Enterprise ===")
-
-from talu.router import ModelSpec, OpenAICompatibleBackend
-
-# Enterprise pattern 1: Internal proxy with custom auth
-# Many enterprises route LLM traffic through internal proxies that require
-# custom headers for authentication, routing, or tracing.
-
-internal_proxy_backend = OpenAICompatibleBackend(
-    base_url="https://internal-llm-proxy.corp.example.com/v1",
-    api_key=None,  # Proxy handles authentication
-    headers={
-        "X-Proxy-Auth": "internal-service-token",
-        "X-Service-Name": "ml-pipeline",
-        "X-Team-ID": "data-science",
-        "X-Correlation-ID": "request-12345",  # For distributed tracing
-    },
-)
-
-print("Internal proxy config:")
-print(f"  base_url: {internal_proxy_backend.base_url}")
-print(f"  headers: {internal_proxy_backend.headers}")
-
-# Enterprise pattern 2: OpenAI with request tracing
-# Add custom headers alongside the standard OpenAI authentication.
-
-openai_with_tracing = OpenAICompatibleBackend(
-    base_url="https://api.openai.com/v1",
-    api_key="sk-...",  # Your OpenAI key
-    org_id="org-123",
-    headers={
-        "X-Request-ID": "trace-abc-123",
-        "X-Environment": "production",
-    },
-)
-
-print("\nOpenAI with tracing:")
-print(f"  api_key: {openai_with_tracing.api_key[:10]}...")
-print(f"  org_id: {openai_with_tracing.org_id}")
-print(f"  headers: {openai_with_tracing.headers}")
-
-# Enterprise pattern 3: AWS Bedrock-style auth via SigV4 headers
-# (Hypothetical - actual SigV4 signing would be done separately)
-
-bedrock_style = OpenAICompatibleBackend(
-    base_url="https://bedrock.us-east-1.amazonaws.com/v1",
-    headers={
-        "X-Amz-Target": "AmazonBedrock.Converse",
-        "X-Amz-Content-Sha256": "...",
-        "Authorization": "AWS4-HMAC-SHA256 Credential=...",
-    },
-)
-
-print("\nBedrock-style config:")
-print(f"  headers: {list(bedrock_style.headers.keys())}")
-
-# Using headers with Chat
-# spec = ModelSpec(
-#     ref="gpt-4o",
-#     backend=internal_proxy_backend,
-# )
-# chat = Chat(spec, system="You are a helpful assistant.")
-# response = chat.send("Hello!")
-
-
 """
 Topics covered:
 * generation.config
@@ -288,5 +184,4 @@ Topics covered:
 Related:
 * examples/developers/chat/configuration.py
 * examples/developers/chat/config_composition.py
-* examples/developers/chat/custom_endpoints.py
 """

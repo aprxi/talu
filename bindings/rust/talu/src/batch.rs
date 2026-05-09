@@ -54,6 +54,7 @@ use crate::error::error_from_last_or;
 use crate::responses::{ContentType, ItemType};
 use crate::router::GenerateConfig;
 use crate::{ChatHandle, FinishReason, InferenceBackend, Result};
+use std::borrow::Cow;
 use std::ffi::{c_void, CStr, CString};
 use std::sync::atomic::AtomicBool;
 
@@ -110,6 +111,32 @@ pub struct BatchEvent {
     pub is_final: bool,
     /// Decoded text delta (empty for completion events).
     pub text: String,
+    /// Raw token ID.
+    pub token_id: u32,
+    /// Cumulative tokens generated for this request.
+    pub tokens_generated: usize,
+    /// Timestamp in nanoseconds.
+    pub timestamp_ns: i64,
+}
+
+/// Borrowed event view used by hot streaming loops.
+///
+/// Text borrows from the C event buffer and is only valid for the duration of
+/// the callback invocation.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchEventRef<'a> {
+    /// Request ID that produced this event.
+    pub request_id: u64,
+    /// Event type (text delta, completed, error).
+    pub event_type: EventType,
+    /// Item type from the responses type system.
+    pub item_type: ItemType,
+    /// Content type from the responses type system.
+    pub content_type: ContentType,
+    /// Whether this is the final event for this request.
+    pub is_final: bool,
+    /// Decoded text delta (empty for completion events).
+    pub text: &'a str,
     /// Raw token ID.
     pub token_id: u32,
     /// Cumulative tokens generated for this request.
@@ -376,31 +403,41 @@ impl BatchHandle {
         pending_flag: &AtomicBool,
         mut callback: impl FnMut(&BatchEvent),
     ) -> Result<()> {
-        self.run_loop_impl(pending_flag, true, &mut callback)
+        self.run_loop_impl(pending_flag, &mut callback)
     }
 
-    /// Run a tight decode loop, skipping per-token text decoding.
+    /// Run a text-decoding loop with borrowed event text.
     ///
-    /// This is intended for non-streaming server routes that only need
-    /// completion/error signaling and will fetch final text from take_result().
-    pub fn run_loop_no_text(
+    /// This avoids allocating one Rust `String` per token for streaming
+    /// callers that consume events synchronously.
+    pub fn run_loop_borrowed(
+        &self,
+        pending_flag: &AtomicBool,
+        mut callback: impl FnMut(BatchEventRef<'_>),
+    ) -> Result<()> {
+        self.run_loop_borrowed_impl(pending_flag, &mut callback)
+    }
+
+    /// Run a non-streaming loop that emits only terminal events.
+    ///
+    /// The generated text and usage metadata are retrieved with take_result().
+    /// This avoids per-token Rust callbacks for final-only callers.
+    pub fn run_loop_final_only(
         &self,
         pending_flag: &AtomicBool,
         mut callback: impl FnMut(&BatchEvent),
     ) -> Result<()> {
-        self.run_loop_impl(pending_flag, false, &mut callback)
+        self.run_loop_final_only_impl(pending_flag, &mut callback)
     }
 
     fn run_loop_impl(
         &self,
         pending_flag: &AtomicBool,
-        decode_text: bool,
         callback: &mut dyn FnMut(&BatchEvent),
     ) -> Result<()> {
         // Trampoline: extern "C" fn that receives a *mut FnMut(&BatchEvent)
         // through callback_data, converts CEvents to BatchEvents, and invokes it.
         struct CallbackCtx<'a> {
-            decode_text: bool,
             callback: &'a mut dyn FnMut(&BatchEvent),
         }
 
@@ -415,7 +452,7 @@ impl BatchHandle {
             let ctx: &mut CallbackCtx<'_> = unsafe { &mut *(userdata as *mut CallbackCtx<'_>) };
             let c_events = unsafe { std::slice::from_raw_parts(events, count) };
             for c in c_events {
-                let text = if ctx.decode_text && !c.text_ptr.is_null() && c.text_len > 0 {
+                let text = if !c.text_ptr.is_null() && c.text_len > 0 {
                     let bytes = unsafe { std::slice::from_raw_parts(c.text_ptr, c.text_len) };
                     String::from_utf8_lossy(bytes).into_owned()
                 } else {
@@ -436,32 +473,140 @@ impl BatchHandle {
             }
         }
 
-        let mut ctx = CallbackCtx {
-            decode_text,
-            callback,
-        };
+        let mut ctx = CallbackCtx { callback };
         let cb_ptr: *mut c_void = &mut ctx as *mut CallbackCtx<'_> as *mut c_void;
 
         let rc = unsafe {
-            if decode_text {
-                talu_sys::talu_batch_run_loop(
-                    self.ptr,
-                    pending_flag as *const AtomicBool as *mut c_void,
-                    trampoline as *mut c_void,
-                    cb_ptr,
-                )
-            } else {
-                talu_sys::talu_batch_run_loop_no_text(
-                    self.ptr,
-                    pending_flag as *const AtomicBool as *mut c_void,
-                    trampoline as *mut c_void,
-                    cb_ptr,
-                )
-            }
+            talu_sys::talu_batch_run_loop(
+                self.ptr,
+                pending_flag as *const AtomicBool as *mut c_void,
+                trampoline as *mut c_void,
+                cb_ptr,
+            )
         };
 
         if rc != 0 {
             return Err(error_from_last_or("batch run_loop failed"));
+        }
+
+        Ok(())
+    }
+
+    fn run_loop_borrowed_impl(
+        &self,
+        pending_flag: &AtomicBool,
+        callback: &mut dyn FnMut(BatchEventRef<'_>),
+    ) -> Result<()> {
+        struct CallbackCtx<'a> {
+            callback: &'a mut dyn FnMut(BatchEventRef<'_>),
+        }
+
+        extern "C" fn trampoline(
+            events: *const talu_sys::CEvent,
+            count: usize,
+            userdata: *mut c_void,
+        ) {
+            if events.is_null() || count == 0 || userdata.is_null() {
+                return;
+            }
+            let ctx: &mut CallbackCtx<'_> = unsafe { &mut *(userdata as *mut CallbackCtx<'_>) };
+            let c_events = unsafe { std::slice::from_raw_parts(events, count) };
+            for c in c_events {
+                let text: Cow<'_, str> = if !c.text_ptr.is_null() && c.text_len > 0 {
+                    let bytes = unsafe { std::slice::from_raw_parts(c.text_ptr, c.text_len) };
+                    String::from_utf8_lossy(bytes)
+                } else {
+                    Cow::Borrowed("")
+                };
+                let event = BatchEventRef {
+                    request_id: c.request_id,
+                    event_type: EventType::from(c.event_type),
+                    item_type: ItemType::from(c.item_type),
+                    content_type: ContentType::from(c.content_type),
+                    is_final: c.is_final != 0,
+                    text: text.as_ref(),
+                    token_id: c.token_id,
+                    tokens_generated: c.tokens_generated,
+                    timestamp_ns: c.timestamp_ns,
+                };
+                (ctx.callback)(event);
+            }
+        }
+
+        let mut ctx = CallbackCtx { callback };
+        let cb_ptr: *mut c_void = &mut ctx as *mut CallbackCtx<'_> as *mut c_void;
+
+        let rc = unsafe {
+            talu_sys::talu_batch_run_loop(
+                self.ptr,
+                pending_flag as *const AtomicBool as *mut c_void,
+                trampoline as *mut c_void,
+                cb_ptr,
+            )
+        };
+
+        if rc != 0 {
+            return Err(error_from_last_or("batch run_loop failed"));
+        }
+
+        Ok(())
+    }
+
+    fn run_loop_final_only_impl(
+        &self,
+        pending_flag: &AtomicBool,
+        callback: &mut dyn FnMut(&BatchEvent),
+    ) -> Result<()> {
+        struct CallbackCtx<'a> {
+            callback: &'a mut dyn FnMut(&BatchEvent),
+        }
+
+        extern "C" fn trampoline(
+            events: *const talu_sys::CEvent,
+            count: usize,
+            userdata: *mut c_void,
+        ) {
+            if events.is_null() || count == 0 || userdata.is_null() {
+                return;
+            }
+            let ctx: &mut CallbackCtx<'_> = unsafe { &mut *(userdata as *mut CallbackCtx<'_>) };
+            let c_events = unsafe { std::slice::from_raw_parts(events, count) };
+            for c in c_events {
+                let text = if !c.text_ptr.is_null() && c.text_len > 0 {
+                    let bytes = unsafe { std::slice::from_raw_parts(c.text_ptr, c.text_len) };
+                    String::from_utf8_lossy(bytes).into_owned()
+                } else {
+                    String::new()
+                };
+                let event = BatchEvent {
+                    request_id: c.request_id,
+                    event_type: EventType::from(c.event_type),
+                    item_type: ItemType::from(c.item_type),
+                    content_type: ContentType::from(c.content_type),
+                    is_final: c.is_final != 0,
+                    text,
+                    token_id: c.token_id,
+                    tokens_generated: c.tokens_generated,
+                    timestamp_ns: c.timestamp_ns,
+                };
+                (ctx.callback)(&event);
+            }
+        }
+
+        let mut ctx = CallbackCtx { callback };
+        let cb_ptr: *mut c_void = &mut ctx as *mut CallbackCtx<'_> as *mut c_void;
+
+        let rc = unsafe {
+            talu_sys::talu_batch_run_loop_final_only(
+                self.ptr,
+                pending_flag as *const AtomicBool as *mut c_void,
+                trampoline as *mut c_void,
+                cb_ptr,
+            )
+        };
+
+        if rc != 0 {
+            return Err(error_from_last_or("batch run_loop_final_only failed"));
         }
 
         Ok(())

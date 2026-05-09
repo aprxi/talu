@@ -129,30 +129,6 @@ def _read_content_part_dict(part_dict: dict[str, Any]) -> ContentPart:
             return UnknownContent(raw_type=secondary, raw_data=data)
 
 
-def _read_content_part(part: _c.CContentPart) -> ContentPart:
-    """Read a CContentPart struct into a Python content part object.
-
-    This function is provided for backwards compatibility with tests.
-    The FFI layer now uses _read_content_part_dict with dicts from _bindings.
-
-    Args:
-        part: CContentPart struct from _native.
-
-    Returns
-    -------
-        The appropriate ContentPart subclass instance.
-    """
-    # Convert C struct to dict and delegate to _read_content_part_dict
-    part_dict = {
-        "content_type": part.content_type,
-        "data": _c.read_c_string(part.data_ptr, part.data_len),
-        "secondary": _c.read_c_string(part.secondary_ptr, part.secondary_len),
-        "tertiary": _c.read_c_string(part.tertiary_ptr, part.tertiary_len),
-        "image_detail": part.image_detail,
-    }
-    return _read_content_part_dict(part_dict)
-
-
 # =============================================================================
 # ConversationItems - Native Conversation C API backed Items
 # =============================================================================

@@ -457,7 +457,7 @@ pub trait ResponsesView: ResponsesRawHandle {
         item_index: usize,
         part_index: usize,
     ) -> Result<ContentPart> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_fco_get_part(
@@ -482,7 +482,7 @@ pub trait ResponsesView: ResponsesRawHandle {
         item_index: usize,
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_message_get_content(
@@ -507,7 +507,7 @@ pub trait ResponsesView: ResponsesRawHandle {
         item_index: usize,
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_content(
@@ -532,7 +532,7 @@ pub trait ResponsesView: ResponsesRawHandle {
         item_index: usize,
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_summary(
@@ -557,7 +557,7 @@ pub trait ResponsesView: ResponsesRawHandle {
         item_index: usize,
         part_index: usize,
     ) -> Result<ContentPartRef<'_>> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_fco_get_part(
@@ -648,7 +648,7 @@ pub trait ResponsesView: ResponsesRawHandle {
 
     /// Gets a content part from a message item.
     fn get_message_content(&self, item_index: usize, part_index: usize) -> Result<ContentPart> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_message_get_content(
@@ -677,7 +677,7 @@ pub trait ResponsesView: ResponsesRawHandle {
 
     /// Gets a content part from a reasoning item.
     fn get_reasoning_content(&self, item_index: usize, part_index: usize) -> Result<ContentPart> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_content(
@@ -706,7 +706,7 @@ pub trait ResponsesView: ResponsesRawHandle {
 
     /// Gets a summary part from a reasoning item.
     fn get_reasoning_summary(&self, item_index: usize, part_index: usize) -> Result<ContentPart> {
-        let mut c_part = talu_sys::CResponsesContentPart::default();
+        let mut c_part = talu_sys::CContentPart::default();
         // SAFETY: self.raw_responses_ptr() is a valid handle; c_part is a valid out-param (module invariant).
         let rc = unsafe {
             talu_sys::talu_responses_item_reasoning_get_summary(
@@ -1379,7 +1379,7 @@ fn is_text_content(content_type: ContentType) -> bool {
 }
 
 /// Helper to convert C content part to Rust.
-fn content_part_from_c(c_part: &talu_sys::CResponsesContentPart) -> ContentPart {
+fn content_part_from_c(c_part: &talu_sys::CContentPart) -> ContentPart {
     // SAFETY (all slice::from_raw_parts below): Non-null ptr with valid len
     // from C API, guarded by null/zero checks (module invariant).
     let data = if c_part.data_ptr.is_null() || c_part.data_len == 0 {
@@ -1423,7 +1423,7 @@ fn content_part_from_c(c_part: &talu_sys::CResponsesContentPart) -> ContentPart 
 }
 
 /// Helper to convert C content part to borrowed Rust view.
-fn content_part_ref_from_c<'a>(c_part: &talu_sys::CResponsesContentPart) -> ContentPartRef<'a> {
+fn content_part_ref_from_c<'a>(c_part: &talu_sys::CContentPart) -> ContentPartRef<'a> {
     // SAFETY (all slice::from_raw_parts below): Non-null ptr with valid len
     // from C API, guarded by null/zero checks. Data is owned by the
     // conversation handle and valid for its lifetime (module invariant).

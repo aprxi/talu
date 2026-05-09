@@ -243,32 +243,6 @@ pub fn delete(addr: SocketAddr, path: &str) -> HttpResponse {
     send_request(addr, "DELETE", path, &[], None)
 }
 
-/// PUT JSON to a path on the server.
-#[allow(dead_code)]
-pub fn put_json(addr: SocketAddr, path: &str, body: &serde_json::Value) -> HttpResponse {
-    let json = serde_json::to_string(body).expect("serialize json");
-    send_request(
-        addr,
-        "PUT",
-        path,
-        &[("Content-Type", "application/json")],
-        Some(&json),
-    )
-}
-
-/// DELETE with JSON body to a path on the server.
-#[allow(dead_code)]
-pub fn delete_json(addr: SocketAddr, path: &str, body: &serde_json::Value) -> HttpResponse {
-    let json = serde_json::to_string(body).expect("serialize json");
-    send_request(
-        addr,
-        "DELETE",
-        path,
-        &[("Content-Type", "application/json")],
-        Some(&json),
-    )
-}
-
 pub fn send_request(
     addr: SocketAddr,
     method: &str,

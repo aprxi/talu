@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import ctypes
 
-from talu._native import CGenerateResult, CToolCallRef
+from talu._native import CBatchResult, CToolCallRef
 from talu.router import _bindings as bindings
 
 
-def test_router_result_extract_tool_calls() -> None:
+def test_batch_result_extract_tool_calls() -> None:
     calls = (CToolCallRef * 2)()
 
     calls[0].item_index = 1
@@ -21,11 +21,11 @@ def test_router_result_extract_tool_calls() -> None:
     calls[1].name = b"get_weather"
     calls[1].arguments = b'{"location":"Paris"}'
 
-    result = CGenerateResult()
-    result.tool_calls = ctypes.cast(calls, ctypes.POINTER(CToolCallRef))
+    result = CBatchResult()
+    result.tool_calls = ctypes.cast(calls, ctypes.c_void_p)
     result.tool_call_count = 2
 
-    extracted = bindings.router_result_extract_tool_calls(result)
+    extracted = bindings.batch_result_extract_tool_calls(result)
 
     assert extracted == [
         {"id": "call_1", "name": "search", "arguments": '{"query":"zig"}'},
@@ -33,9 +33,9 @@ def test_router_result_extract_tool_calls() -> None:
     ]
 
 
-def test_router_result_extract_tool_calls_empty() -> None:
-    result = CGenerateResult()
+def test_batch_result_extract_tool_calls_empty() -> None:
+    result = CBatchResult()
     result.tool_calls = None
     result.tool_call_count = 0
 
-    assert bindings.router_result_extract_tool_calls(result) is None
+    assert bindings.batch_result_extract_tool_calls(result) is None

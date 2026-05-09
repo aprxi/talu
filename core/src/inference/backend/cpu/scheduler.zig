@@ -1805,6 +1805,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (!self.backend.supportsSchedulerBackendTopKDecodeRoute(&re.sampling_config))
                 return error.NotEligible;
 
+            if (try self.tryRunDecodeLoopTopKStreamingRoute(
+                re,
+                request_id,
+                per_token_cb,
+                cb_data,
+            )) {
+                return;
+            }
+
             var candidate_logits: [256]f32 = undefined;
             var candidate_ids: [256]u32 = undefined;
 
@@ -1919,6 +1928,90 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Exhausted max_tokens.
             self.completeRequest(re, .length);
             per_token_cb(request_id, 0, true, false, cb_data);
+        }
+
+        fn tryRunDecodeLoopTopKStreamingRoute(
+            self: *Self,
+            request_entry: *Request,
+            request_id: u64,
+            per_token_cb: *const fn (u64, u32, bool, bool, ?*anyopaque) callconv(.c) void,
+            cb_data: ?*anyopaque,
+        ) !bool {
+            const use_topk_streaming = comptime blk: {
+                if (!@hasDecl(BackendType, "decodeTopKStreaming")) break :blk false;
+                if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKStreamingRoute")) break :blk false;
+                break :blk true;
+            };
+            if (!use_topk_streaming) return false;
+            if (!self.backend.supportsSchedulerBackendTopKStreamingRoute(&request_entry.sampling_config)) return false;
+            if (xray.isTeacherForcingEnabled()) return false;
+            if (request_entry.state != .generating) return false;
+            const slot_index = request_entry.slot_index orelse return false;
+            if (slot_index != 0) return false;
+            if (request_entry.grammar_sampler != null) return false;
+            if (request_entry.capture_final_logits) return false;
+            if (request_entry.stop_sequences.len > 0) return false;
+            if (request_entry.max_thinking_tokens > 0) return false;
+            if (request_entry.max_completion_tokens_limit > 0) return false;
+            if (request_entry.generated_tokens.items.len == 0) return false;
+            if (request_entry.generated_tokens.items.len >= request_entry.max_tokens) return false;
+
+            const remaining_token_budget = request_entry.max_tokens - request_entry.generated_tokens.items.len;
+            const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);
+            defer self.allocator.free(generated_tail);
+
+            const StreamCbCtx = struct {
+                request_id: u64,
+                per_token_cb: *const fn (u64, u32, bool, bool, ?*anyopaque) callconv(.c) void,
+                cb_data: ?*anyopaque,
+                eos_token_ids: []const u32,
+                max_tail_tokens: usize,
+                emitted_tail_tokens: usize = 0,
+
+                fn onToken(token: u32, data: ?*anyopaque) void {
+                    const ctx: *@This() = @ptrCast(@alignCast(data));
+                    ctx.emitted_tail_tokens += 1;
+                    var is_final = ctx.emitted_tail_tokens >= ctx.max_tail_tokens;
+                    if (!is_final) {
+                        for (ctx.eos_token_ids) |eos_id| {
+                            if (token == eos_id) {
+                                is_final = true;
+                                break;
+                            }
+                        }
+                    }
+                    ctx.per_token_cb(ctx.request_id, token, is_final, false, ctx.cb_data);
+                }
+            };
+
+            var stream_cb_ctx = StreamCbCtx{
+                .request_id = request_id,
+                .per_token_cb = per_token_cb,
+                .cb_data = cb_data,
+                .eos_token_ids = request_entry.eos_token_ids,
+                .max_tail_tokens = remaining_token_budget,
+            };
+
+            const current_token = request_entry.generated_tokens.items[request_entry.generated_tokens.items.len - 1];
+            var decode_timer = std.time.Timer.start() catch unreachable;
+            const tail_count = try self.backend.decodeTopKStreaming(
+                current_token,
+                request_entry.generated_tokens.items.len + 1,
+                remaining_token_budget,
+                request_entry.eos_token_ids,
+                &request_entry.sampling_config,
+                generated_tail,
+                StreamCbCtx.onToken,
+                @ptrCast(&stream_cb_ctx),
+            );
+            request_entry.decode_ns += decode_timer.read();
+
+            try request_entry.generated_tokens.appendSlice(self.allocator, generated_tail[0..tail_count]);
+            request_entry.token_position += tail_count;
+
+            const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
+            self.completeRequest(request_entry, finish_reason);
+            return true;
         }
 
         /// Pop completed requests from the queue.
@@ -5079,6 +5172,63 @@ test "generateSync uses backend top-k streaming route for top_k sampling without
     try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
     try std.testing.expectEqualSlices(u32, &.{ 42, 44, 45, 46 }, result.tokens);
+}
+
+test "runDecodeLoop keeps slot-indexed requests off slot-zero streaming route" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .seed = 0,
+        },
+    });
+    defer scheduler.deinit();
+
+    const request_id = try scheduler.submit(&[_]u32{ 7, 8, 9 }, 4, .{
+        .sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .seed = 0,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+
+    _ = try scheduler.step();
+    const request_entry = scheduler.requests.get(request_id).?;
+    try std.testing.expectEqual(RequestState.generating, request_entry.state);
+    try std.testing.expectEqual(@as(usize, 1), request_entry.generated_tokens.items.len);
+
+    // The backend streaming route has no slot argument. If the scheduler-owned
+    // request is not in slot 0, the slot-aware candidate route must remain in
+    // control.
+    request_entry.slot_index = 1;
+
+    const CallbackData = struct {
+        token_count: usize = 0,
+        final_count: usize = 0,
+    };
+    var callback_data = CallbackData{};
+    const callback = struct {
+        fn cb(_: u64, _: u32, is_final: bool, _: bool, user_data: ?*anyopaque) callconv(.c) void {
+            const data: *CallbackData = @ptrCast(@alignCast(user_data.?));
+            data.token_count += 1;
+            if (is_final) data.final_count += 1;
+        }
+    }.cb;
+
+    try scheduler.runDecodeLoop(request_id, null, callback, &callback_data);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 3), backend.decode_top_k_calls);
+    try std.testing.expectEqual(@as(usize, 3), callback_data.token_count);
+    try std.testing.expectEqual(@as(usize, 1), callback_data.final_count);
+    try std.testing.expectEqual(FinishReason.length, scheduler.getFinishReason(request_id).?);
 }
 
 test "generateSync uses top-k candidate route with additive penalties" {

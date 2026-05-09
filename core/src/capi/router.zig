@@ -1,10 +1,10 @@
-//! Router C API - Generation, Streaming, Embeddings, and Backend Management
+//! Router C API - Embeddings, Backend Management, and Configuration
 //!
-//! C-callable functions for the Router subsystem. Routes generation requests
-//! to local inference backends.
+//! C-callable functions for backend lifecycle, embeddings, and model
+//! configuration. Local generation is served by the batch C API.
 //!
 //! Architecture:
-//!   - Generation: sync and callback-based streaming via InferenceBackend
+//!   - Local generation: batch scheduler API (`talu_batch_*`)
 //!   - Embeddings: text embedding extraction with configurable pooling
 //!   - Config: model spec validation, canonicalization, and backend creation
 //!   - Backend: lifecycle management for inference backends
@@ -34,13 +34,6 @@ const Chat = responses_mod.Chat;
 const capi_bridge = router_mod.capi_bridge;
 const completions_protocol = router_mod.protocol.completions;
 
-// =============================================================================
-// Generation Types
-// =============================================================================
-
-/// Result from generation.
-pub const RouterGenerateResult = capi_bridge.CGenerateResult;
-
 /// Logit bias entry for generation.
 pub const CLogitBiasEntry = capi_bridge.CLogitBiasEntry;
 
@@ -53,9 +46,6 @@ pub const CPoolingStrategy = enum(u8) {
     mean = 1,
     first = 2,
 };
-
-/// Content part for generation input.
-pub const GenerateContentPart = capi_bridge.GenerateContentPart;
 
 // =============================================================================
 // Chat Completions Request Validation API
@@ -402,116 +392,11 @@ pub const BackendCreateOptions = extern struct {
     }
 };
 
-// =============================================================================
-// Generation API
-// =============================================================================
-
-/// Frees a generation result returned by talu_router_generate_with_backend.
-///
-/// Passing null is a safe no-op.
-pub export fn talu_router_result_free(result: ?*RouterGenerateResult) callconv(.c) void {
-    const ptr = result orelse return;
-    capi_bridge.freeResult(allocator, ptr);
-}
-
 /// Closes all cached inference engines and frees their resources.
 ///
 /// Call this when shutting down or when memory needs to be reclaimed.
 pub export fn talu_router_close_all() callconv(.c) void {
     router_mod.closeAllEngines(allocator);
-}
-
-// =============================================================================
-// Spec-Based Generation API
-// =============================================================================
-
-/// Generates a response using a spec-based InferenceBackend.
-/// Caller must free the result via talu_router_result_free().
-pub export fn talu_router_generate_with_backend(
-    chat_handle: ?*ChatHandle,
-    parts: ?[*]const GenerateContentPart,
-    num_parts: usize,
-    backend: ?*TaluInferenceBackend,
-    config: ?*const RouterGenerateConfig,
-) callconv(.c) RouterGenerateResult {
-    capi_error.clearError();
-
-    const chat: *Chat = @ptrCast(@alignCast(chat_handle orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "chat_handle is null", .{});
-        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    }));
-    // Allow null parts with num_parts==0 for continuation calls (agent loop).
-    // When parts are null/empty, generateWithBackend continues from the
-    // existing conversation state without appending a new user message.
-    const empty_parts: [0]GenerateContentPart = .{};
-    const effective_parts: []const GenerateContentPart = if (parts) |p|
-        p[0..num_parts]
-    else if (num_parts == 0)
-        &empty_parts
-    else {
-        capi_error.setErrorWithCode(.invalid_argument, "parts is null but num_parts > 0", .{});
-        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    };
-    const backend_ptr: *spec_mod.InferenceBackend = @ptrCast(@alignCast(backend orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "backend is null", .{});
-        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    }));
-
-    const result = capi_bridge.generateWithBackend(allocator, chat, effective_parts, backend_ptr, config);
-    return capi_bridge.toCResult(allocator, result);
-}
-
-// =============================================================================
-// Streaming Callback API
-// =============================================================================
-
-/// Streaming callback type.
-/// Called per decoded text segment: (text_ptr, text_len, item_type, content_type, is_final, userdata).
-/// Return 1 to continue, 0 to stop generation.
-pub const StreamCallback = capi_bridge.StreamCallback;
-
-/// Generates a response with per-token streaming via callback.
-///
-/// The callback fires once per decoded text segment (after UTF-8 assembly and
-/// reasoning-tag filtering). Blocks until generation completes or callback
-/// returns 0. Returns the same result struct as talu_router_generate_with_backend.
-///
-pub export fn talu_router_generate_streaming(
-    chat_handle: ?*ChatHandle,
-    parts: ?[*]const GenerateContentPart,
-    num_parts: usize,
-    backend: ?*TaluInferenceBackend,
-    config: ?*const RouterGenerateConfig,
-    stream_cb: ?*anyopaque,
-    stream_cb_data: ?*anyopaque,
-) callconv(.c) RouterGenerateResult {
-    capi_error.clearError();
-
-    const chat: *Chat = @ptrCast(@alignCast(chat_handle orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "chat_handle is null", .{});
-        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    }));
-    const empty_parts: [0]GenerateContentPart = .{};
-    const effective_parts: []const GenerateContentPart = if (parts) |p|
-        p[0..num_parts]
-    else if (num_parts == 0)
-        &empty_parts
-    else {
-        capi_error.setErrorWithCode(.invalid_argument, "parts is null but num_parts > 0", .{});
-        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    };
-    const backend_ptr: *spec_mod.InferenceBackend = @ptrCast(@alignCast(backend orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "backend is null", .{});
-        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    }));
-    // Cast void pointer back to function pointer (Rust passes fn ptr as void*).
-    const cb: StreamCallback = @ptrCast(@alignCast(stream_cb orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "stream_cb is null", .{});
-        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    }));
-
-    const result = capi_bridge.generateStreamingWithBackend(allocator, chat, effective_parts, backend_ptr, config, cb, stream_cb_data);
-    return capi_bridge.toCResult(allocator, result);
 }
 
 // =============================================================================

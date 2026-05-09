@@ -29,7 +29,7 @@ body {
   background: var(--bg);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
-.shell {
+.admin-frame {
   max-width: 1180px;
   margin: 0 auto;
   padding: 1rem;
@@ -361,7 +361,7 @@ body.dark .field input {
 </style>
 </head>
 <body>
-<main class="shell">
+<main class="admin-frame">
   <header class="mast">
     <div class="brand">
       <h1>Talu</h1>
@@ -1135,7 +1135,7 @@ mod tests {
     use super::html;
 
     #[test]
-    fn html_contains_control_deck_shell() {
+    fn html_contains_control_deck_admin_frame() {
         let page = html();
         assert!(page.contains("<h1>Talu</h1>"));
         assert!(page.contains("data-panel=\"discovery\""));

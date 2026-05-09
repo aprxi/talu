@@ -136,8 +136,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
     // Check for type aliases (e.g., RemoteModelListResult -> CRemoteModelListResult)
     if (eql(zig_type, "RemoteModelListResult")) return "CRemoteModelListResult";
     if (eql(zig_type, "RemoteModelInfo")) return "CRemoteModelInfo";
-    // Router types are aliases to C types in capi_bridge.zig
-    if (eql(zig_type, "RouterGenerateResult")) return "CGenerateResult";
+    // Router config is an alias to CGenerateConfig in capi_bridge.zig.
     if (eql(zig_type, "RouterGenerateConfig")) return "CGenerateConfig";
 
     // Check for double-pointer output param pattern: ?*?*Type or *?*Type
@@ -150,7 +149,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         if (std.mem.startsWith(u8, inner, "const ")) {
             inner = inner[6..];
         }
-        // Strip module prefix (e.g. "router.CGenerateResult" -> "CGenerateResult")
+        // Strip module prefix (e.g. "router.CGenerateConfig" -> "CGenerateConfig")
         if (std.mem.lastIndexOfScalar(u8, inner, '.')) |dot| {
             inner = inner[dot + 1 ..];
         }
@@ -187,9 +186,6 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         if (eql(pointee, "RouterGenerateConfig")) {
             return if (is_const) "*const CGenerateConfig" else "*mut CGenerateConfig";
         }
-        if (eql(pointee, "RouterGenerateResult")) {
-            return if (is_const) "*const CGenerateResult" else "*mut CGenerateResult";
-        }
         // Check if it points to a known struct - need to return with pointer wrapper
         // We can't allocate, so use static strings for common types
         if (known_structs.contains(pointee)) {
@@ -201,9 +197,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "CReasoningItem")) return "*mut CReasoningItem";
             if (eql(pointee, "CItemReferenceItem")) return "*mut CItemReferenceItem";
             if (eql(pointee, "CContentPart")) return "*mut CContentPart";
-            if (eql(pointee, "CGenerateResult")) return "*mut CGenerateResult";
             if (eql(pointee, "CGenerateConfig")) return if (is_const) "*const CGenerateConfig" else "*mut CGenerateConfig";
-            if (eql(pointee, "GenerateContentPart")) return if (is_const) "*const GenerateContentPart" else "*mut GenerateContentPart";
             if (eql(pointee, "CProviderInfo")) return "*mut CProviderInfo";
             if (eql(pointee, "TaluModelSpec")) return "*mut TaluModelSpec";
             if (eql(pointee, "TaluCapabilities")) return "*mut TaluCapabilities";
@@ -322,9 +316,6 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         }
         if (known_structs.contains(elem_type)) {
             // Return pointer to struct with correct constness
-            if (eql(elem_type, "GenerateContentPart")) {
-                return if (is_const) "*const GenerateContentPart" else "*mut GenerateContentPart";
-            }
             if (eql(elem_type, "CLogitBiasEntry")) {
                 return if (is_const) "*const CLogitBiasEntry" else "*mut CLogitBiasEntry";
             }
@@ -549,7 +540,10 @@ pub fn main() !void {
         \\
         \\#![allow(dead_code)]
         \\#![allow(non_camel_case_types)]
+        \\#![allow(clippy::derivable_impls)]
+        \\#![allow(clippy::match_single_binding)]
         \\#![allow(clippy::missing_safety_doc)]
+        \\#![allow(clippy::not_unsafe_ptr_arg_deref)]
         \\
         \\use std::os::raw::{c_char, c_int, c_void};
         \\
@@ -860,9 +854,6 @@ pub fn main() !void {
         \\// Callback Types
         \\// =============================================================================
         \\
-        \\pub type RouterTokenCallback =
-        \\    Option<unsafe extern "C" fn(*const c_char, u32, *mut c_void) -> bool>;
-        \\
         \\/// Unified progress callback - receives structured progress updates from core.
         \\/// This is the new callback type used by all long-running operations.
         \\pub type CProgressCallback =
@@ -903,7 +894,7 @@ pub fn main() !void {
     if (hasType("CContentPart", &structs, &enums)) {
         try writer.writeAll(
             \\
-            \\/// Alias for CContentPart (legacy name used in some wrapper code)
+            \\/// Deprecated alias for older raw-binding callers; use CContentPart.
             \\pub type CResponsesContentPart = CContentPart;
             \\
         );

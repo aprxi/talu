@@ -28,8 +28,6 @@ use crate::tui_common::{
 
 struct ModelEntry {
     id: String,
-    #[allow(dead_code)]
-    source: CacheOrigin,
     size_str: String,
     date_str: String,
     type_str: String,
@@ -139,7 +137,6 @@ impl ModelSelector {
 
             let entry = ModelEntry {
                 id: m.id.clone(),
-                source: m.source,
                 size_str: format_size(size),
                 date_str: format_date(mtime),
                 type_str,

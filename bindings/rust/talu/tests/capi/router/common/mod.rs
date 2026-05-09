@@ -96,12 +96,3 @@ pub fn local_backend(model_path: &str) -> (*mut c_void, *mut c_void) {
     let backend = create_backend(canon);
     (canon, backend)
 }
-
-/// Error code constants (from core/src/capi/error_codes.zig).
-#[allow(dead_code)]
-pub mod error_codes {
-    pub const INVALID_ARGUMENT: i32 = 901;
-    pub const UNSUPPORTED_ABI_VERSION: i32 = 904;
-    pub const MODEL_NOT_FOUND: i32 = 100;
-    pub const IO_FILE_NOT_FOUND: i32 = 500;
-}
