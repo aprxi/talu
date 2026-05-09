@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const log = @import("log_pkg");
 
 const metal = if (builtin.os.tag == .macos) @import("../metal/root.zig") else struct {
     pub const device = struct {
@@ -43,13 +44,13 @@ fn initDevice() void {
 
     // Try to create Metal device
     global_device = Device.init() catch |err| {
-        std.log.warn("Metal acceleration failed to initialize: {}", .{err});
+        log.warn("compute", "Metal acceleration failed to initialize", .{ .err = @errorName(err) });
         return;
     };
 
     if (global_device) |dev| {
         var d = dev;
-        std.log.info("Metal acceleration enabled: {s}", .{d.name()});
+        log.info("compute", "Metal acceleration enabled", .{ .device = d.name() });
     }
 }
 

@@ -105,7 +105,6 @@ size_t g_wired_limit_previous = 0;
 bool g_wired_limit_active = false;
 std::mutex g_rng_mutex;
 size_t g_active_ctx_count = 0;
-thread_local size_t g_fused_lm_head_argmax_hits = 0;
 thread_local std::vector<array> g_decode_batch_logits_flat_scratch;
 thread_local std::vector<array> g_prefill_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_logits_flat_scratch;
@@ -200,13 +199,13 @@ struct mlx_ctx {
     array per_layer_projection_norm_w = array(0.0f); // [hpl]
     // Retained only in mmap-strict mode to keep zero-copy views alive.
     std::unordered_map<std::string, array> retained_weight_tensors;
+    mlx_init_diagnostics init_diagnostics{};
 
     std::vector<LayerWeights> layers;
     std::vector<KVCacheState> kv_cache;
     std::vector<LinearCacheState> linear_cache;
     int kv_reserve_tokens = 0;
     bool has_moe_layers = false;
-    bool profile_layers = false;
     bool stream_ready = false;
     uint32_t trace_decode_token = 1;
     bool xray_enabled = false;

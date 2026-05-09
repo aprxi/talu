@@ -525,9 +525,6 @@ bool run_ragged_prefill_group(
             const int32_t src_row = active_rows[row];
             if (prompt_lens[src_row] == stage_target_len) {
                 const float* row_logits = rows_ptr + row * static_cast<size_t>(logits_len);
-                if (logits_sanity_enabled()) {
-                    emit_logits_sanity("prefill_batch", src_row, row_logits, logits_len);
-                }
                 std::memcpy(
                     out_logits_ptrs[src_row],
                     row_logits,

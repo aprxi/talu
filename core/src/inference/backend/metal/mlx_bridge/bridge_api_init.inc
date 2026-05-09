@@ -37,20 +37,6 @@ static bool should_enable_nvfp4_mmap_strict(bool has_nvfp4_meta, bool has_groupe
 static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, int32_t seed, const mlx_model_flags* flags) {
     bool wired_limit_acquired = false;
     bool rng_entered = false;
-    const bool qmm_debug = []() {
-        if (const char* value = std::getenv("TALU_METAL_QMM_DEBUG")) {
-            return std::string(value) == "1";
-        }
-        return false;
-    }();
-    const bool nvfp4_debug = []() {
-        if (const char* value = std::getenv("TALU_METAL_NVFP4_DEBUG")) {
-            return std::string(value) == "1";
-        }
-        return false;
-    }();
-    const size_t qmm_attempts_before = g_qmm_attempts;
-    const size_t qmm_success_before = g_qmm_success;
     try {
         if (!metal::is_available()) {
             g_last_error = "Metal backend is not available";
@@ -72,9 +58,6 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         auto ctx = std::make_unique<mlx_ctx>();
         ctx->model_id = std::string(model_id);
         ctx->model_path = std::string(model_path);
-        if (const char* env = std::getenv("TALU_METAL_PROFILE_LAYERS")) {
-            ctx->profile_layers = std::string(env) == "1";
-        }
 
         // Cap Metal wired memory only when explicitly requested. Large local
         // models can exceed the recommended working-set ceiling during init.
@@ -1887,47 +1870,37 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     "nvfp4 mmap-strict mode detected dense fallback tensors during init"
                 );
             }
-            std::fprintf(
-                stderr,
-                "[mlx][nvfp4] model=%s nvfp4=%d gaffine=%d decode_qmm=%d lm_head_q=%d layers_q=%zu/%zu group=%d bits=%d per_layer=%d/%zu hpl=%d gelu=%d converted=%d mmap_strict=%d\n",
-                ctx->model_id.c_str(),
-                has_nvfp4_meta ? 1 : 0,
-                ctx->has_grouped_affine_meta ? 1 : 0,
-                ctx->fp8_decode_qmm_enabled ? 1 : 0,
-                ctx->lm_head_q_decode_enabled ? 1 : 0,
-                layer_q_count,
-                layer_q_total,
-                ctx->cfg.quant_group_size,
-                ctx->cfg.quant_bits,
-                ctx->per_layer_input_enabled ? 1 : 0,
-                layer_per_layer_count,
-                ctx->per_layer_hidden_size,
-                ctx->cfg.use_gelu ? 1 : 0,
-                converted_nvfp4_model ? 1 : 0,
-                nvfp4_mmap_required ? 1 : 0
-            );
-            if (ssm_qkvz_total > 0 || attn_qkv_total > 0) {
-                std::fprintf(
-                    stderr,
-                    "[mlx][qmm] ssm_qkvz=%zu/%zu ssm_ba=%zu/%zu ssm_out=%zu/%zu attn_qkv=%zu/%zu attn_o=%zu/%zu mlp=%zu/%zu dense_fallback=%.1fMB\n",
-                    ssm_qkvz_q, ssm_qkvz_total,
-                    ssm_ba_q, ssm_ba_total,
-                    ssm_out_q, ssm_out_total,
-                    attn_qkv_q, attn_qkv_total,
-                    attn_o_q, attn_o_total,
-                    mlp_q, mlp_total,
-                    static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0)
-                );
-            }
-            std::fprintf(
-                stderr,
-                "[mlx][qmm_strict] requested=%d active=%d required=%zu quantized=%zu missing=%zu\n",
-                strict_quantized_decode_requested ? 1 : 0,
-                strict_quantized_decode_active ? 1 : 0,
-                strict_required,
-                strict_quantized,
-                strict_missing.size()
-            );
+            ctx->init_diagnostics.has_nvfp4_meta = has_nvfp4_meta ? 1 : 0;
+            ctx->init_diagnostics.has_grouped_affine_meta = ctx->has_grouped_affine_meta ? 1 : 0;
+            ctx->init_diagnostics.decode_qmm_enabled = ctx->fp8_decode_qmm_enabled ? 1 : 0;
+            ctx->init_diagnostics.lm_head_quantized = ctx->lm_head_q_decode_enabled ? 1 : 0;
+            ctx->init_diagnostics.per_layer_input_enabled = ctx->per_layer_input_enabled ? 1 : 0;
+            ctx->init_diagnostics.use_gelu = ctx->cfg.use_gelu ? 1 : 0;
+            ctx->init_diagnostics.converted_nvfp4_model = converted_nvfp4_model ? 1 : 0;
+            ctx->init_diagnostics.nvfp4_mmap_required = nvfp4_mmap_required ? 1 : 0;
+            ctx->init_diagnostics.quant_group_size = static_cast<uint32_t>(ctx->cfg.quant_group_size);
+            ctx->init_diagnostics.quant_bits = static_cast<uint32_t>(ctx->cfg.quant_bits);
+            ctx->init_diagnostics.per_layer_hidden_size = static_cast<uint32_t>(ctx->per_layer_hidden_size);
+            ctx->init_diagnostics.layer_quantized_count = layer_q_count;
+            ctx->init_diagnostics.layer_total_count = layer_q_total;
+            ctx->init_diagnostics.ssm_qkvz_quantized = ssm_qkvz_q;
+            ctx->init_diagnostics.ssm_qkvz_total = ssm_qkvz_total;
+            ctx->init_diagnostics.ssm_ba_quantized = ssm_ba_q;
+            ctx->init_diagnostics.ssm_ba_total = ssm_ba_total;
+            ctx->init_diagnostics.ssm_out_quantized = ssm_out_q;
+            ctx->init_diagnostics.ssm_out_total = ssm_out_total;
+            ctx->init_diagnostics.attn_qkv_quantized = attn_qkv_q;
+            ctx->init_diagnostics.attn_qkv_total = attn_qkv_total;
+            ctx->init_diagnostics.attn_o_quantized = attn_o_q;
+            ctx->init_diagnostics.attn_o_total = attn_o_total;
+            ctx->init_diagnostics.mlp_quantized = mlp_q;
+            ctx->init_diagnostics.mlp_total = mlp_total;
+            ctx->init_diagnostics.strict_requested = strict_quantized_decode_requested ? 1 : 0;
+            ctx->init_diagnostics.strict_active = strict_quantized_decode_active ? 1 : 0;
+            ctx->init_diagnostics.strict_required = strict_required;
+            ctx->init_diagnostics.strict_quantized = strict_quantized;
+            ctx->init_diagnostics.strict_missing = strict_missing.size();
+            ctx->init_diagnostics.dense_fallback_bytes = dense_fallback_bytes;
             if (strict_quantized_decode_active && !strict_missing.empty()) {
                 std::string preview;
                 const size_t max_items = std::min<size_t>(strict_missing.size(), 8);
@@ -1964,15 +1937,6 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     );
                     throw std::runtime_error(msg);
                 }
-                if (ctx->has_grouped_affine_meta) {
-                    std::fprintf(
-                        stderr,
-                        "[mlx][WARNING] %.1fMB of weights fell back to dense (QMM capture miss). "
-                        "This increases memory usage and slows decode. "
-                        "Set TALU_METAL_STRICT_QUANTIZED_DECODE=1 to fail-fast.\n",
-                        static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0)
-                    );
-                }
             }
 
             // Verify lm_head is quantized in strict mode.
@@ -1992,7 +1956,6 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     "Dense embedding causes memory ballooning on constrained systems."
                 );
             }
-            std::fflush(stderr);
         }
 
         // Memory residency summary: total bytes retained in ctx arrays.
@@ -2064,29 +2027,10 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     layer_other_bytes += array_bytes(*a);
                 }
             }
-            std::fprintf(
-                stderr,
-                "[mlx][mem] ctx=%.1fMB layer_q=%.1fMB layer_dense=%.1fMB layer_other=%.1fMB total=%.1fMB\n",
-                static_cast<double>(ctx_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(layer_q_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(layer_dense_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(layer_other_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(ctx_bytes + layer_q_bytes + layer_dense_bytes + layer_other_bytes) / (1024.0 * 1024.0)
-            );
-            std::fflush(stderr);
-        }
-
-        if (qmm_debug) {
-            const size_t attempts_delta = g_qmm_attempts - qmm_attempts_before;
-            const size_t success_delta = g_qmm_success - qmm_success_before;
-            std::fprintf(
-                stderr,
-                "[mlx][qmm] model=%s decode_qmm=%d attempts=%zu success=%zu\n",
-                ctx->model_id.c_str(),
-                ctx->fp8_decode_qmm_enabled ? 1 : 0,
-                attempts_delta,
-                success_delta
-            );
+            ctx->init_diagnostics.ctx_bytes = ctx_bytes;
+            ctx->init_diagnostics.layer_quantized_bytes = layer_q_bytes;
+            ctx->init_diagnostics.layer_dense_bytes = layer_dense_bytes;
+            ctx->init_diagnostics.layer_other_bytes = layer_other_bytes;
         }
 
         if (nvfp4_mmap_required) {
@@ -2176,8 +2120,8 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         ctx->per_layer_embedding = source_ctx->per_layer_embedding;
         ctx->per_layer_projection_norm_w = source_ctx->per_layer_projection_norm_w;
         ctx->retained_weight_tensors = source_ctx->retained_weight_tensors;
+        ctx->init_diagnostics = source_ctx->init_diagnostics;
         ctx->layers = source_ctx->layers;
-        ctx->profile_layers = source_ctx->profile_layers;
 
         // Runtime state starts clean for the cloned context.
         ctx->kv_cache.resize(source_ctx->kv_cache.size());
@@ -2228,4 +2172,13 @@ int32_t mlx_reset(mlx_ctx* ctx) {
         g_last_error = "unknown error in mlx_reset";
         return 0;
     }
+}
+
+int32_t mlx_get_init_diagnostics(const mlx_ctx* ctx, mlx_init_diagnostics* out_diagnostics) {
+    if (!ctx || !out_diagnostics) {
+        g_last_error = "mlx_get_init_diagnostics: invalid arguments";
+        return 0;
+    }
+    *out_diagnostics = ctx->init_diagnostics;
+    return 1;
 }

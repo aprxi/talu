@@ -37,6 +37,44 @@ typedef struct mlx_prefill_vision_input {
     uint32_t image_token_id;
 } mlx_prefill_vision_input;
 
+typedef struct mlx_init_diagnostics {
+    uint8_t has_nvfp4_meta;
+    uint8_t has_grouped_affine_meta;
+    uint8_t decode_qmm_enabled;
+    uint8_t lm_head_quantized;
+    uint8_t per_layer_input_enabled;
+    uint8_t use_gelu;
+    uint8_t converted_nvfp4_model;
+    uint8_t nvfp4_mmap_required;
+    uint32_t quant_group_size;
+    uint32_t quant_bits;
+    uint32_t per_layer_hidden_size;
+    uint64_t layer_quantized_count;
+    uint64_t layer_total_count;
+    uint64_t ssm_qkvz_quantized;
+    uint64_t ssm_qkvz_total;
+    uint64_t ssm_ba_quantized;
+    uint64_t ssm_ba_total;
+    uint64_t ssm_out_quantized;
+    uint64_t ssm_out_total;
+    uint64_t attn_qkv_quantized;
+    uint64_t attn_qkv_total;
+    uint64_t attn_o_quantized;
+    uint64_t attn_o_total;
+    uint64_t mlp_quantized;
+    uint64_t mlp_total;
+    uint64_t strict_requested;
+    uint64_t strict_active;
+    uint64_t strict_required;
+    uint64_t strict_quantized;
+    uint64_t strict_missing;
+    uint64_t dense_fallback_bytes;
+    uint64_t ctx_bytes;
+    uint64_t layer_quantized_bytes;
+    uint64_t layer_dense_bytes;
+    uint64_t layer_other_bytes;
+} mlx_init_diagnostics;
+
 int32_t mlx_is_available(void);
 int32_t mlx_validate_config(const char* model_path);
 
@@ -45,6 +83,7 @@ mlx_ctx* mlx_create_with_flags(const char* model_id, const char* model_path, int
 mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed);
 void mlx_destroy(mlx_ctx* ctx);
 int32_t mlx_reset(mlx_ctx* ctx);
+int32_t mlx_get_init_diagnostics(const mlx_ctx* ctx, mlx_init_diagnostics* out_diagnostics);
 
 int32_t mlx_run(
     mlx_ctx* ctx,

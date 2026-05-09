@@ -58,19 +58,6 @@ int32_t mlx_decode_topk_stream(
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         if (decode_tokens == 0) return 1;
-        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
-        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
-        const bool topk_stream_profile = []() {
-            if (const char* raw = std::getenv("TALU_METAL_TOPK_STREAM_PROFILE")) {
-                return std::string(raw) == "1";
-            }
-            return false;
-        }();
-        uint64_t profile_forward_ns = 0;
-        uint64_t profile_penalty_ns = 0;
-        uint64_t profile_sample_ns = 0;
-        uint64_t profile_materialize_ns = 0;
-        uint64_t profile_total_ns = 0;
 
         const StreamSamplingConfig sampling_cfg{
             .temperature = temperature,
@@ -140,13 +127,11 @@ int32_t mlx_decode_topk_stream(
             const auto compiled_sample = (!use_fused_greedy_decode && !use_fused_topk_decode)
                 ? compiled_sampling_step(sampling_cfg)
                 : nullptr;
-            const auto total_t0 = std::chrono::steady_clock::now();
             while (produced < decode_tokens && !saw_eos) {
                 const int32_t remaining = decode_tokens - produced;
                 const int32_t chunk_target = std::min(effective_topk_chunk_size, remaining);
                 chunk_tokens.clear();
 
-                const auto t_build0 = std::chrono::steady_clock::now();
                 for (int32_t i = 0; i < chunk_target; ++i) {
                     array next_token = array(0, int32);
                     if (use_fused_greedy_decode) {
@@ -212,11 +197,7 @@ int32_t mlx_decode_topk_stream(
                     chunk_tokens.push_back(next_token);
                     current_token = next_token;
                 }
-                const auto t_build1 = std::chrono::steady_clock::now();
-
-                const auto t_materialize0 = std::chrono::steady_clock::now();
                 eval(chunk_tokens);
-                const auto t_materialize1 = std::chrono::steady_clock::now();
 
                 for (int32_t i = 0; i < chunk_target; ++i) {
                     const int32_t* token_ptr = chunk_tokens[static_cast<size_t>(i)].data<int32_t>();
@@ -232,21 +213,6 @@ int32_t mlx_decode_topk_stream(
                         break;
                     }
                 }
-
-                if (topk_stream_profile) {
-                    profile_forward_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
-                    );
-                    profile_materialize_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
-                    );
-                }
-            }
-            if (topk_stream_profile) {
-                const auto total_t1 = std::chrono::steady_clock::now();
-                profile_total_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
-                );
             }
         } else {
             // Penalized path.
@@ -298,14 +264,12 @@ int32_t mlx_decode_topk_stream(
                 std::vector<array> chunk_tokens;
                 chunk_tokens.reserve(static_cast<size_t>(effective_penalty_chunk_size));
 
-                const auto total_t0 = std::chrono::steady_clock::now();
                 bool saw_eos = false;
                 while (produced < decode_tokens && !saw_eos) {
                     const int32_t remaining = decode_tokens - produced;
                     const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
                     chunk_tokens.clear();
 
-                    const auto t_build0 = std::chrono::steady_clock::now();
                     for (int32_t i = 0; i < chunk_target; ++i) {
                         const array logits_last = last_token_logits(forward_logits(ctx, current_token));
                         const array sampling_logits = logits_last - presence_mask;
@@ -316,13 +280,9 @@ int32_t mlx_decode_topk_stream(
                         presence_mask = put_along_axis(presence_mask, token_idx, penalty_arr, -1);
                         current_token = next_token;
                     }
-                    const auto t_build1 = std::chrono::steady_clock::now();
-
-                    const auto t_materialize0 = std::chrono::steady_clock::now();
                     const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
                     const array chunk_flat = reshape(chunk_rows, {chunk_target}); // [chunk]
                     eval(chunk_flat);
-                    const auto t_materialize1 = std::chrono::steady_clock::now();
 
                     const int32_t* chunk_ptr = chunk_flat.data<int32_t>();
                     for (int32_t i = 0; i < chunk_target; ++i) {
@@ -335,22 +295,6 @@ int32_t mlx_decode_topk_stream(
                             break;
                         }
                     }
-
-                    if (topk_stream_profile) {
-                        profile_forward_ns += static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
-                        );
-                        profile_materialize_ns += static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
-                        );
-                    }
-                }
-
-                if (topk_stream_profile) {
-                    const auto total_t1 = std::chrono::steady_clock::now();
-                    profile_total_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
-                    );
                 }
             } else {
                 // General penalized path: keep token counts on-device and decode
@@ -373,14 +317,12 @@ int32_t mlx_decode_topk_stream(
                 std::vector<array> chunk_tokens;
                 chunk_tokens.reserve(static_cast<size_t>(effective_penalty_chunk_size));
 
-                const auto total_t0 = std::chrono::steady_clock::now();
                 bool saw_eos = false;
                 while (produced < decode_tokens && !saw_eos) {
                     const int32_t remaining = decode_tokens - produced;
                     const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
                     chunk_tokens.clear();
 
-                    const auto t_build0 = std::chrono::steady_clock::now();
                     for (int32_t i = 0; i < chunk_target; ++i) {
                         const array logits_last = last_token_logits(forward_logits(ctx, current_token));
                         const std::vector<array> sampled_outputs = (*penalized_sample_fn)({logits_last, token_counts});
@@ -392,13 +334,9 @@ int32_t mlx_decode_topk_stream(
                         chunk_tokens.push_back(next_token);
                         current_token = next_token;
                     }
-                    const auto t_build1 = std::chrono::steady_clock::now();
-
-                    const auto t_materialize0 = std::chrono::steady_clock::now();
                     const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
                     const array chunk_flat = reshape(chunk_rows, {chunk_target}); // [chunk]
                     eval(chunk_flat);
-                    const auto t_materialize1 = std::chrono::steady_clock::now();
 
                     const int32_t* chunk_ptr = chunk_flat.data<int32_t>();
                     for (int32_t i = 0; i < chunk_target; ++i) {
@@ -414,48 +352,8 @@ int32_t mlx_decode_topk_stream(
                             break;
                         }
                     }
-
-                    if (topk_stream_profile) {
-                        profile_forward_ns += static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
-                        );
-                        profile_materialize_ns += static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
-                        );
-                    }
-                }
-
-                if (topk_stream_profile) {
-                    const auto total_t1 = std::chrono::steady_clock::now();
-                    profile_total_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
-                    );
                 }
             }
-        }
-
-        if (topk_stream_profile) {
-            std::fprintf(
-                stderr,
-                "[mlx][topk_stream_profile] tokens=%zu total_ms=%.3f forward_ms=%.3f penalty_ms=%.3f sample_ms=%.3f materialize_ms=%.3f\n",
-                static_cast<size_t>(produced),
-                static_cast<double>(profile_total_ns) / 1e6,
-                static_cast<double>(profile_forward_ns) / 1e6,
-                static_cast<double>(profile_penalty_ns) / 1e6,
-                static_cast<double>(profile_sample_ns) / 1e6,
-                static_cast<double>(profile_materialize_ns) / 1e6
-            );
-        }
-        if (fused_lm_head_profile) {
-            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
-            std::fprintf(
-                stderr,
-                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=topk_stream top_k=%d temperature=%.4f\n",
-                (use_fused_greedy_decode || use_fused_topk_decode) ? "1" : "0",
-                fused_hits,
-                top_k,
-                static_cast<double>(temperature)
-            );
         }
         *out_generated_ids = generated_host.release();
         *out_generated_len = produced;
@@ -497,8 +395,6 @@ int32_t mlx_run(
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         const bool capture_tokens = capture_generated_tokens != 0;
-        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
-        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
 
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         std::vector<int32_t> captured_tokens;
@@ -595,16 +491,6 @@ int32_t mlx_run(
             *out_generated_ids = copied;
             *out_generated_len = static_cast<int32_t>(captured_tokens.size());
         }
-        if (fused_lm_head_profile) {
-            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
-            std::fprintf(
-                stderr,
-                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=run\n",
-                can_use_fused_lm_head_argmax(ctx) ? "1" : "0",
-                fused_hits
-            );
-        }
-
         *out_result = best;
         return 1;
     } catch (const std::exception& e) {

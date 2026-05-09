@@ -16,66 +16,8 @@ array linear_decode_maybe_quantized(
     const char* op_tag = nullptr,
     const array* prefill_rhs = nullptr
 ) {
-    const auto quant_compare_enabled = []() -> bool {
-        static const bool cached = env_truthy("TALU_METAL_QMM_COMPARE", false);
-        return cached;
-    };
-    const auto quant_compare_layer = []() -> int {
-        if (const char* raw = std::getenv("TALU_METAL_QMM_COMPARE_LAYER")) {
-            const int parsed = std::atoi(raw);
-            return parsed > 0 ? parsed - 1 : parsed;
-        }
-        return 0;
-    };
-    const auto quant_compare_op = []() -> std::string {
-        if (const char* raw = std::getenv("TALU_METAL_QMM_COMPARE_OP")) return std::string(raw);
-        return std::string();
-    };
-    const auto should_compare_quant = [&](bool q_path_active) -> bool {
-        if (!q_path_active || !quant_compare_enabled()) return false;
-        if (rhs.size() <= 1 || rhs.ndim() < 2) return false;
-        const int target_layer = quant_compare_layer();
-        if (target_layer >= 0) {
-            if (layer_idx < 0) return false;
-            if (layer_idx != target_layer) return false;
-        }
-        const std::string target_op = quant_compare_op();
-        if (target_op.empty()) return true;
-        if (op_tag == nullptr) return false;
-        return target_op == op_tag;
-    };
-    const auto emit_quant_compare = [&](const array& quant_out) {
-        const array quant_f32 = astype(quant_out, float32);
-        const array dense_f32 = astype(matmul(x, rhs), float32);
-        const array diff_f32 = abs(quant_f32 - dense_f32);
-        eval({quant_f32, dense_f32, diff_f32});
-        synchronize();
-        const float* diff_ptr = diff_f32.data<float>();
-        const size_t n = static_cast<size_t>(diff_f32.size());
-        if (diff_ptr == nullptr || n == 0) return;
-        double sum = 0.0;
-        float max_abs = 0.0f;
-        for (size_t i = 0; i < n; ++i) {
-            const float v = diff_ptr[i];
-            sum += static_cast<double>(v);
-            if (v > max_abs) max_abs = v;
-        }
-        const double mean_abs = sum / static_cast<double>(n);
-        std::fprintf(
-            stderr,
-            "[mlx][qmm_compare] layer=%d op=%s elems=%zu max_abs=%.6f mean_abs=%.6f q_dtype=%d rhs_dtype=%d x_shape=[%d,%d,%d]\n",
-            layer_idx,
-            op_tag ? op_tag : "(null)",
-            n,
-            static_cast<double>(max_abs),
-            mean_abs,
-            static_cast<int>(static_cast<Dtype::Val>(quant_out.dtype())),
-            static_cast<int>(static_cast<Dtype::Val>(rhs.dtype())),
-            x.ndim() > 0 ? x.shape(0) : 0,
-            x.ndim() > 1 ? x.shape(1) : 0,
-            x.ndim() > 2 ? x.shape(2) : 0
-        );
-    };
+    (void)layer_idx;
+    (void)op_tag;
 
     const bool is_prefill_shape = x.ndim() >= 3 && x.shape(1) > 1;
     if (is_prefill_shape && prefill_rhs != nullptr && prefill_rhs->size() > 1 && prefill_rhs->ndim() == 2) {
@@ -109,7 +51,6 @@ array linear_decode_maybe_quantized(
                 quant_bits,
                 "affine"
             );
-            if (should_compare_quant(true)) emit_quant_compare(out);
             return out;
         }
         if (nvfp4_ready) {
@@ -155,7 +96,6 @@ array linear_decode_maybe_quantized(
                 );
             }
             const array scaled_out = apply_nvfp4_post_scale(out, q_biases);
-            if (should_compare_quant(true)) emit_quant_compare(scaled_out);
             return scaled_out;
         }
         const array out = quantized_matmul(
@@ -168,7 +108,6 @@ array linear_decode_maybe_quantized(
             std::nullopt,
             "mxfp8"
         );
-        if (should_compare_quant(true)) emit_quant_compare(out);
         return out;
     }
     if (rhs.size() <= 1 || rhs.ndim() < 2) {

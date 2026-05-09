@@ -39,6 +39,15 @@ fn isRouterInferenceBridgePath(path: []const u8) bool {
     return std.mem.eql(u8, path, "core/src/router/inference_bridge.zig");
 }
 
+fn isCoreSourceFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".zig") or
+        std.mem.endsWith(u8, path, ".c") or
+        std.mem.endsWith(u8, path, ".cpp") or
+        std.mem.endsWith(u8, path, ".h") or
+        std.mem.endsWith(u8, path, ".hpp") or
+        std.mem.endsWith(u8, path, ".inc");
+}
+
 fn isConverterPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/converter/");
 }
@@ -314,6 +323,38 @@ fn checkRequiredPubConsts(
     return violations;
 }
 
+fn lintLoggingPolicy(file_path: []const u8, source: []const u8, emit: bool) usize {
+    var violations: usize = 0;
+    if (std.mem.endsWith(u8, file_path, ".zig")) {
+        if (std.mem.indexOf(u8, source, "std.log.") != null) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}: forbidden std.log usage; use core/src/log.zig\n", .{file_path});
+            }
+        }
+    }
+
+    const forbidden_c_stderr = [_][]const u8{
+        "std::fprintf(stderr",
+        "std::fflush(stderr",
+        "fprintf(stderr",
+        "fflush(stderr",
+    };
+    var found_c_stderr = false;
+    for (forbidden_c_stderr) |token| {
+        if (std.mem.indexOf(u8, source, token) != null) {
+            if (!found_c_stderr) {
+                violations += 1;
+                found_c_stderr = true;
+            }
+            if (emit) {
+                std.debug.print("{s}: forbidden direct stderr logging token `{s}`; use core logging boundary\n", .{ file_path, token });
+            }
+        }
+    }
+    return violations;
+}
+
 fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
     var violations: usize = 0;
 
@@ -444,7 +485,7 @@ fn lintTree(allocator: std.mem.Allocator, root_path: []const u8) !usize {
 
     while (try walker.next()) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (!isCoreSourceFile(entry.path)) continue;
 
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_path, entry.path });
         defer allocator.free(full_path);
@@ -452,7 +493,10 @@ fn lintTree(allocator: std.mem.Allocator, root_path: []const u8) !usize {
         const source = try std.fs.cwd().readFileAlloc(allocator, full_path, 32 * 1024 * 1024);
         defer allocator.free(source);
 
-        total_violations += try lintSource(allocator, full_path, source, true);
+        total_violations += lintLoggingPolicy(full_path, source, true);
+        if (std.mem.endsWith(u8, entry.path, ".zig")) {
+            total_violations += try lintSource(allocator, full_path, source, true);
+        }
     }
 
     return total_violations;
@@ -515,6 +559,30 @@ test "lintSource allows compute root import from inference" {
         \\const ok = @import("../../../compute/root.zig");
     ;
     try std.testing.expectEqual(@as(usize, 0), try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/engine.zig", src, false));
+}
+
+test "lintLoggingPolicy rejects std.log in Zig source" {
+    const src =
+        \\pub fn bad() void {
+        \\    std.log.warn("bad", .{});
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        lintLoggingPolicy("core/src/inference/bad.zig", src, false),
+    );
+}
+
+test "lintLoggingPolicy rejects direct C stderr logging" {
+    const src =
+        \\void bad(void) {
+        \\    std::fprintf(stderr, "bad\n");
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        lintLoggingPolicy("core/src/inference/backend/metal/mlx_bridge/bad.inc", src, false),
+    );
 }
 
 test "lintSource rejects models importing inference internals" {

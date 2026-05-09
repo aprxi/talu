@@ -36,9 +36,6 @@ int32_t mlx_decode_topk_candidates_batch(
     }
 
     try {
-        if (logits_sanity_enabled()) {
-            std::fprintf(stderr, "[mlx][logits_sanity] enter=mlx_decode_topk_candidates_batch batch=%d top_k=%d\n", batch_size, top_k);
-        }
         const int k = top_k;
         std::vector<mlx_ctx*> current_rows(static_cast<size_t>(batch_size));
         for (int32_t i = 0; i < batch_size; ++i) {
@@ -59,7 +56,6 @@ int32_t mlx_decode_topk_candidates_batch(
 
             const array token_arr(token_vec.data(), Shape{batch_size, 1}, int32);
             const array logits_last = last_token_logits(forward_logits(cached_fused_ctx, token_arr)); // [B,1,V]
-            emit_logits_sanity_rows("decode_topk_batch_cached", logits_last, nullptr, batch_size);
             if (logits_last.ndim() != 3) {
                 g_last_error = "mlx_decode_topk_candidates_batch: invalid cached fused logits rank";
                 return 0;
@@ -135,7 +131,6 @@ int32_t mlx_decode_topk_candidates_batch(
 
             const array token_arr(token_vec.data(), Shape{batch_size, 1}, int32);
             const array logits_last = last_token_logits(forward_logits(&fused_ctx_full_batch, token_arr)); // [B,1,V]
-            emit_logits_sanity_rows("decode_topk_batch_full", logits_last, nullptr, batch_size);
             if (logits_last.ndim() != 3) {
                 g_last_error = "mlx_decode_topk_candidates_batch: invalid full-batch fused logits rank";
                 return 0;
@@ -240,7 +235,6 @@ int32_t mlx_decode_topk_candidates_batch(
 
             const array token_arr(token_vec.data(), Shape{group_size, 1}, int32);
             const array logits_last = last_token_logits(forward_logits(fused_ctx, token_arr)); // [B,1,V]
-            emit_logits_sanity_rows("decode_topk_batch_group", logits_last, rows.data(), group_size);
             if (logits_last.ndim() != 3) {
                 g_last_error = "mlx_decode_topk_candidates_batch: invalid fused logits rank";
                 return 0;
@@ -345,7 +339,6 @@ int32_t mlx_decode_topk_candidates_batch(
             const int32_t token_scalar = tokens[i];
             const array token_arr(&token_scalar, Shape{1, 1}, int32);
             const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
-            emit_logits_sanity_rows("decode_topk_batch_fallback", logits_last, &i, 1);
             if (logits_last.ndim() != 3) {
                 g_last_error = "mlx_decode_topk_candidates_batch: invalid logits rank";
                 return 0;
@@ -445,19 +438,9 @@ int32_t mlx_decode_topk_candidates_with_sampling(
     }
 
     try {
-        if (logits_sanity_enabled()) {
-            std::fprintf(
-                stderr,
-                "[mlx][logits_sanity] enter=mlx_decode_topk_candidates_with_sampling token=%d top_k=%d context_len=%d\n",
-                token,
-                top_k,
-                context_len
-            );
-        }
         const int32_t token_scalar = token;
         const array token_arr(&token_scalar, Shape{1, 1}, int32);
         const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
-        emit_logits_sanity_rows("decode_topk_with_sampling_raw", logits_last, nullptr, 1);
         if (context_len == 0) {
             ctx->sampling_context_counts.clear();
             ctx->sampling_context_len = 0;
@@ -483,7 +466,6 @@ int32_t mlx_decode_topk_candidates_with_sampling(
             frequency_penalty,
             ctx->sampling_context_counts
         );
-        emit_logits_sanity_rows("decode_topk_with_sampling_penalized", penalized_logits, nullptr, 1);
 
         if (penalized_logits.ndim() != 3) {
             g_last_error = "mlx_decode_topk_candidates_with_sampling: invalid logits rank";
@@ -522,4 +504,3 @@ int32_t mlx_decode_topk_candidates_with_sampling(
         return 0;
     }
 }
-

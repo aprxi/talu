@@ -17,6 +17,7 @@ const dump_capture_mod = @import("dump/capture.zig");
 const dump_npz_mod = @import("dump/npz.zig");
 const core_dtype = @import("dtype_pkg");
 const handler_slot_mod = @import("handler_slot.zig");
+const log = @import("log_pkg");
 const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
 
 const TraceEmission = trace.TraceEmission;
@@ -299,16 +300,16 @@ pub const VerifyCapture = struct {
             if (enabled) return;
         }
         if (comptime builtin.is_test) {
-            std.log.warn("DIVERGENCE DETECTED: {}", .{err});
+            log.warn("inference", "xray divergence detected", .{ .err = @errorName(err) });
         } else {
-            std.log.err("DIVERGENCE DETECTED: {}", .{err});
+            log.err("inference", "xray divergence detected", .{ .err = @errorName(err) }, @src());
         }
         if (verifier.divergence_point) |div| {
             const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
             if (comptime builtin.is_test) {
-                std.log.warn("{s}", .{div.message[0..msg_len]});
+                log.warn("inference", div.message[0..msg_len], .{});
             } else {
-                std.log.err("{s}", .{div.message[0..msg_len]});
+                log.err("inference", div.message[0..msg_len], .{}, @src());
             }
         }
     }
@@ -334,7 +335,7 @@ pub const VerifyCapture = struct {
                     if (is_transcript_token_select) {
                         const token_id_ptr: *const u32 = @ptrCast(@alignCast(emission.tensor.ptr));
                         rec.recordToken(token_id_ptr.*) catch |err| {
-                            std.log.err("Failed to record generated token transcript: {}", .{err});
+                            log.err("inference", "failed to record generated token transcript", .{ .err = @errorName(err) }, @src());
                         };
                         rec.nextToken();
                     }
@@ -369,12 +370,12 @@ pub const VerifyCapture = struct {
         // stats paths here.
         const tensor_stats = stats_mod.compute(emission.tensor);
         if (emission.point == .attn_q_norm or emission.point == .attn_k_norm or emission.point == .attn_q_rope or emission.point == .attn_k_rope or emission.point == .attn_qk) {
-            std.log.err("XRAY probe point={s} layer={} pos={} token={}", .{
-                emission.point.name(),
-                emission.layer,
-                emission.position,
-                emission.token,
-            });
+            log.err("inference", "xray probe", .{
+                .point = emission.point.name(),
+                .layer = emission.layer,
+                .position = emission.position,
+                .token = emission.token,
+            }, @src());
         }
 
         switch (self.mode) {
@@ -382,7 +383,7 @@ pub const VerifyCapture = struct {
                 // Recording mode: feed stats to recorder
                 if (self.recorder) |rec| {
                     rec.recordEmission(emission, tensor_stats) catch |err| {
-                        std.log.err("Failed to record emission: {}", .{err});
+                        log.err("inference", "failed to record xray emission", .{ .err = @errorName(err) }, @src());
                     };
                 }
             },
@@ -398,7 +399,7 @@ pub const VerifyCapture = struct {
                             // Trigger panic dump if not already done
                             if (!self.panic_triggered and self.panic_dump_dir != null) {
                                 self.triggerPanicDump(emission, tensor_stats, &div) catch |dump_err| {
-                                    std.log.err("Failed to write panic dump: {}", .{dump_err});
+                                    log.err("inference", "failed to write xray panic dump", .{ .err = @errorName(dump_err) }, @src());
                                 };
                                 self.panic_triggered = true;
                             }
@@ -441,10 +442,10 @@ pub const VerifyCapture = struct {
         // Write NPZ with full tensor data
         // TODO: Integrate with npz writer
         if (!quiet) {
-            std.log.warn("Would write panic dump to: {s}", .{full_path});
-            std.log.warn("Expected RMS: {d:.6}, Actual RMS: {d:.6}", .{
-                divergence.expected.rms(),
-                actual_stats.rms(),
+            log.warn("inference", "would write xray panic dump", .{ .path = full_path });
+            log.warn("inference", "xray panic dump rms", .{
+                .expected_rms = divergence.expected.rms(),
+                .actual_rms = actual_stats.rms(),
             });
         }
     }
@@ -503,7 +504,7 @@ pub const VerifyCapture = struct {
                 emission.point.name(),
             },
         ) catch |err| {
-            std.log.warn("failed to build full tensor sidecar name: {}", .{err});
+            log.warn("inference", "failed to build full tensor sidecar name", .{ .err = @errorName(err) });
             return;
         };
 
@@ -514,7 +515,7 @@ pub const VerifyCapture = struct {
             shape_usize,
             emission.tensor.ndim,
         ) catch |err| {
-            std.log.warn("failed to capture full tensor sidecar emission: {}", .{err});
+            log.warn("inference", "failed to capture full tensor sidecar emission", .{ .err = @errorName(err) });
         };
         self.recording_full_index += 1;
     }

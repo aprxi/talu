@@ -13,23 +13,13 @@ int32_t mlx_prefill_first(
     }
 
     try {
-        if (logits_sanity_enabled()) {
-            std::fprintf(stderr, "[mlx][logits_sanity] enter=mlx_prefill_first prompt_len=%d\n", prompt_len);
-        }
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         reset_runtime_state(ctx);
         ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
         ctx->kv_reserve_tokens = resolve_kv_reserve_target_tokens(ctx, prompt_len, 0);
         const int full_prompt_threshold = resolve_prefill_full_prompt_threshold(ctx);
-        const auto select_first_token = [&](const array& seed_logits, const char* stage) -> array {
+        const auto select_first_token = [&](const array& seed_logits) -> array {
             const array logits_last = last_token_logits(seed_logits);
-            if (logits_sanity_enabled()) {
-                const int flat_size = static_cast<int>(logits_last.size());
-                const array logits_flat = reshape(astype(logits_last, float32), {flat_size});
-                eval(logits_flat);
-                synchronize();
-                emit_logits_sanity(stage, 0, logits_flat.data<float>(), flat_size);
-            }
             return next_token_greedy(logits_last);
         };
 
@@ -38,15 +28,15 @@ int32_t mlx_prefill_first(
             if (should_use_full_prompt_prefill(ctx, prompt_len, full_prompt_threshold)) {
                 const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
                 const array seed_logits = forward_logits(ctx, prompt_arr);
-                first_token = select_first_token(seed_logits, "prefill_first_full");
+                first_token = select_first_token(seed_logits);
             } else {
                 const array seed_logits = prefill_seed_logits_chunked(ctx, prompt_vec, prompt_len);
-                first_token = select_first_token(seed_logits, "prefill_first_chunked");
+                first_token = select_first_token(seed_logits);
             }
         } else {
             const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
             const array seed_logits = forward_logits(ctx, prompt_arr);
-            first_token = select_first_token(seed_logits, "prefill_first_single");
+            first_token = select_first_token(seed_logits);
         }
 
         eval(first_token);
@@ -77,9 +67,6 @@ int32_t mlx_prefill_logits(
     }
 
     try {
-        if (logits_sanity_enabled()) {
-            std::fprintf(stderr, "[mlx][logits_sanity] enter=mlx_prefill_logits prompt_len=%d logits_len=%d\n", prompt_len, logits_len);
-        }
         clear_fused_decode_ctx_cache();
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         reset_runtime_state(ctx);
@@ -149,9 +136,6 @@ int32_t mlx_prefill_logits(
 
         eval(first_logits_flat);
         synchronize();
-        if (logits_sanity_enabled()) {
-            emit_logits_sanity("prefill_single", 0, first_logits_flat.data<float>(), logits_len);
-        }
         std::memcpy(out_logits, first_logits_flat.data<float>(), static_cast<size_t>(logits_len) * sizeof(float));
         ctx->stream_ready = true;
         return 1;
@@ -347,9 +331,6 @@ int32_t mlx_prefill_logits_batch(
     if (batch_size == 1) {
         return mlx_prefill_logits(ctxs[0], prompt_ids_ptrs[0], prompt_lens[0], out_logits_ptrs[0], logits_len);
     }
-    if (logits_sanity_enabled()) {
-        std::fprintf(stderr, "[mlx][logits_sanity] enter=mlx_prefill_logits_batch batch=%d logits_len=%d\n", batch_size, logits_len);
-    }
 
     for (int32_t idx = 0; idx < batch_size; ++idx) {
         if (!ctxs[idx] || !prompt_ids_ptrs[idx] || prompt_lens[idx] <= 0 || !out_logits_ptrs[idx]) {
@@ -530,9 +511,6 @@ int32_t mlx_prefill_logits_batch(
                 const int32_t src_row = rows[static_cast<size_t>(row)];
                 const float* row_logits =
                     rows_ptr + static_cast<size_t>(row) * static_cast<size_t>(logits_len);
-                if (logits_sanity_enabled()) {
-                    emit_logits_sanity("prefill_batch_fused", src_row, row_logits, logits_len);
-                }
                 std::memcpy(
                     out_logits_ptrs[src_row],
                     row_logits,
@@ -610,9 +588,6 @@ int32_t mlx_prefill_logits_batch(
             }
             eval(first_logits_flat);
             synchronize();
-            if (logits_sanity_enabled()) {
-                emit_logits_sanity("prefill_batch_fallback", idx, first_logits_flat.data<float>(), logits_len);
-            }
             std::memcpy(
                 out_logits_ptrs[idx],
                 first_logits_flat.data<float>(),

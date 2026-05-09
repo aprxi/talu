@@ -37,7 +37,6 @@ static inline void gated_delta_reference_emit_once() {
     static thread_local bool emitted = false;
     if (emitted) return;
     emitted = true;
-    std::fprintf(stderr, "GDELTA_REFERENCE: enabled\n");
 }
 
 struct GatedDeltaReferenceStep {

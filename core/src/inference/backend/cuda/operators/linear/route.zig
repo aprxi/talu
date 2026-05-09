@@ -1179,7 +1179,7 @@ pub fn linearForwardRows(
                     out_dim,
                     in_dim,
                 ) catch |lt_err| {
-                    std.log.err("MXFP8 cuBLASLt failed: {s}", .{@errorName(lt_err)});
+                    log.err("inference", "MXFP8 cuBLASLt failed", .{ .err = @errorName(lt_err) }, @src());
                     break :mxfp8_lt;
                 };
                 return;

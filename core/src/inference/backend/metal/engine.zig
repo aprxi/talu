@@ -35,6 +35,44 @@ const MlxPrefillVisionInput = extern struct {
     image_token_id: u32,
 };
 
+const MlxInitDiagnostics = extern struct {
+    has_nvfp4_meta: u8 = 0,
+    has_grouped_affine_meta: u8 = 0,
+    decode_qmm_enabled: u8 = 0,
+    lm_head_quantized: u8 = 0,
+    per_layer_input_enabled: u8 = 0,
+    use_gelu: u8 = 0,
+    converted_nvfp4_model: u8 = 0,
+    nvfp4_mmap_required: u8 = 0,
+    quant_group_size: u32 = 0,
+    quant_bits: u32 = 0,
+    per_layer_hidden_size: u32 = 0,
+    layer_quantized_count: u64 = 0,
+    layer_total_count: u64 = 0,
+    ssm_qkvz_quantized: u64 = 0,
+    ssm_qkvz_total: u64 = 0,
+    ssm_ba_quantized: u64 = 0,
+    ssm_ba_total: u64 = 0,
+    ssm_out_quantized: u64 = 0,
+    ssm_out_total: u64 = 0,
+    attn_qkv_quantized: u64 = 0,
+    attn_qkv_total: u64 = 0,
+    attn_o_quantized: u64 = 0,
+    attn_o_total: u64 = 0,
+    mlp_quantized: u64 = 0,
+    mlp_total: u64 = 0,
+    strict_requested: u64 = 0,
+    strict_active: u64 = 0,
+    strict_required: u64 = 0,
+    strict_quantized: u64 = 0,
+    strict_missing: u64 = 0,
+    dense_fallback_bytes: u64 = 0,
+    ctx_bytes: u64 = 0,
+    layer_quantized_bytes: u64 = 0,
+    layer_dense_bytes: u64 = 0,
+    layer_other_bytes: u64 = 0,
+};
+
 extern fn mlx_is_available() c_int;
 extern fn mlx_validate_config(model_path: [*:0]const u8) c_int;
 extern fn mlx_create(model_id: [*:0]const u8, model_path: [*:0]const u8, seed: c_int) ?*mlx_ctx;
@@ -42,6 +80,7 @@ extern fn mlx_create_with_flags(model_id: [*:0]const u8, model_path: [*:0]const 
 extern fn mlx_clone(source_ctx: ?*mlx_ctx, seed: c_int) ?*mlx_ctx;
 extern fn mlx_destroy(ctx: ?*mlx_ctx) void;
 extern fn mlx_reset(ctx: ?*mlx_ctx) c_int;
+extern fn mlx_get_init_diagnostics(ctx: ?*const mlx_ctx, out_diagnostics: *MlxInitDiagnostics) c_int;
 extern fn mlx_last_error() ?[*:0]const u8;
 extern fn mlx_runtime_binary_dir() ?[*:0]const u8;
 
@@ -418,6 +457,66 @@ pub const MetalBackend = struct {
         }
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
+    }
+
+    fn megabytes(bytes: u64) f64 {
+        return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+    }
+
+    fn logMlxInitDiagnostics(ctx: *mlx_ctx) void {
+        var diagnostics = std.mem.zeroes(MlxInitDiagnostics);
+        if (mlx_get_init_diagnostics(ctx, &diagnostics) == 0) return;
+
+        log.info("inference", "metal quantization summary", .{
+            .has_nvfp4 = diagnostics.has_nvfp4_meta,
+            .has_grouped_affine = diagnostics.has_grouped_affine_meta,
+            .decode_qmm = diagnostics.decode_qmm_enabled,
+            .lm_head_q = diagnostics.lm_head_quantized,
+            .layers_q = diagnostics.layer_quantized_count,
+            .layers_total = diagnostics.layer_total_count,
+            .group = diagnostics.quant_group_size,
+            .bits = diagnostics.quant_bits,
+            .per_layer = diagnostics.per_layer_input_enabled,
+            .hpl = diagnostics.per_layer_hidden_size,
+            .gelu = diagnostics.use_gelu,
+            .converted_nvfp4 = diagnostics.converted_nvfp4_model,
+            .mmap_strict = diagnostics.nvfp4_mmap_required,
+        });
+        log.info("inference", "metal quantized decode coverage", .{
+            .ssm_qkvz_q = diagnostics.ssm_qkvz_quantized,
+            .ssm_qkvz_total = diagnostics.ssm_qkvz_total,
+            .ssm_ba_q = diagnostics.ssm_ba_quantized,
+            .ssm_ba_total = diagnostics.ssm_ba_total,
+            .ssm_out_q = diagnostics.ssm_out_quantized,
+            .ssm_out_total = diagnostics.ssm_out_total,
+            .attn_qkv_q = diagnostics.attn_qkv_quantized,
+            .attn_qkv_total = diagnostics.attn_qkv_total,
+            .attn_o_q = diagnostics.attn_o_quantized,
+            .attn_o_total = diagnostics.attn_o_total,
+            .mlp_q = diagnostics.mlp_quantized,
+            .mlp_total = diagnostics.mlp_total,
+            .dense_fallback_mb = megabytes(diagnostics.dense_fallback_bytes),
+        });
+        log.info("inference", "metal quantized decode strict policy", .{
+            .requested = diagnostics.strict_requested,
+            .active = diagnostics.strict_active,
+            .required = diagnostics.strict_required,
+            .quantized = diagnostics.strict_quantized,
+            .missing = diagnostics.strict_missing,
+        });
+        log.info("inference", "metal memory residency", .{
+            .ctx_mb = megabytes(diagnostics.ctx_bytes),
+            .layer_q_mb = megabytes(diagnostics.layer_quantized_bytes),
+            .layer_dense_mb = megabytes(diagnostics.layer_dense_bytes),
+            .layer_other_mb = megabytes(diagnostics.layer_other_bytes),
+            .total_mb = megabytes(diagnostics.ctx_bytes + diagnostics.layer_quantized_bytes + diagnostics.layer_dense_bytes + diagnostics.layer_other_bytes),
+        });
+        if (diagnostics.dense_fallback_bytes > 0) {
+            log.warn("inference", "metal dense fallback detected", .{
+                .dense_fallback_mb = megabytes(diagnostics.dense_fallback_bytes),
+                .strict_active = diagnostics.strict_active,
+            });
+        }
     }
 
     fn ensureMlxMetallibColocated(allocator: std.mem.Allocator) void {
@@ -974,6 +1073,7 @@ pub const MetalBackend = struct {
             });
             return error.InvalidArgument;
         };
+        logMlxInitDiagnostics(ctx);
 
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
         const d_model = std.math.cast(usize, loaded.config.d_model) orelse return error.InvalidArgument;

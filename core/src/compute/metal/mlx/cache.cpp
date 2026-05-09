@@ -6,7 +6,6 @@
 #include "model_state.h"
 #include "cache_utils.h"
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -45,15 +44,10 @@ bool unregister_cache(std::mutex& mu, std::unordered_set<void*>& live, void* ptr
 }
 
 [[noreturn]] void fail_cache_contract(const char* fn, const char* cache_kind, void* ptr, const char* reason) {
-    std::fprintf(
-        stderr,
-        "talu metal cache contract failure: fn=%s cache=%s ptr=%p reason=%s\n",
-        fn,
-        cache_kind,
-        ptr,
-        reason
-    );
-    std::fflush(stderr);
+    (void)fn;
+    (void)cache_kind;
+    (void)ptr;
+    (void)reason;
     std::abort();
 }
 } // namespace

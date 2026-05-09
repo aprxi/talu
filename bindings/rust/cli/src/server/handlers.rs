@@ -3347,6 +3347,7 @@ async fn load_backend_for_model(
 
     #[cfg(not(windows))]
     {
+        let _ = state;
         match tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model)).await
         {
             Ok(result) => result,
@@ -3384,6 +3385,7 @@ fn load_backend_for_model_with_progress_blocking(
 
     #[cfg(not(windows))]
     {
+        let _ = state;
         provider::create_backend_for_model_with_progress(&model, callback)
     }
 }

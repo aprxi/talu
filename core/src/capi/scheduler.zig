@@ -6,6 +6,7 @@ const spec_mod = @import("../router/spec.zig");
 const router_capi = @import("router.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
+const log = @import("log_pkg");
 
 const allocator = std.heap.c_allocator;
 
@@ -225,7 +226,7 @@ pub export fn talu_scheduler_score_tokens_nll(
 
     if (canUseFastTeacherForcedScoring(ctx_tokens.len, tgt_tokens.len, max_context)) {
         runDirectNllFast(engine, ctx_tokens, tgt_tokens, out_nll_ptr, out_count_ptr) catch |err| {
-            std.log.warn("fast NLL scoring unavailable ({s}); falling back to slow path", .{@errorName(err)});
+            log.warn("inference", "fast NLL scoring unavailable; falling back to slow path", .{ .err = @errorName(err) });
             out_nll_ptr.* = 0.0;
             out_count_ptr.* = 0;
         };
@@ -385,7 +386,7 @@ pub export fn talu_scheduler_score_tokens_joint(
             out_kld_ptr,
             out_count_ptr,
         ) catch |err| {
-            std.log.warn("fast joint scoring unavailable ({s}); falling back to slow path", .{@errorName(err)});
+            log.warn("inference", "fast joint scoring unavailable; falling back to slow path", .{ .err = @errorName(err) });
             out_reference_nll_ptr.* = 0.0;
             out_model_nll_ptr.* = 0.0;
             out_kld_ptr.* = 0.0;

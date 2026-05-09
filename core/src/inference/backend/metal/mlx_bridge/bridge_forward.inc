@@ -279,25 +279,11 @@ array forward_hidden_from_embeddings(
         );
     }
 
-    if (!ctx->profile_layers) {
-        const int n_layers = static_cast<int>(ctx->layers.size());
-        for (int i = 0; i < n_layers; ++i) {
-            hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame);
-            if (i < n_layers - 1) {
-                async_eval(hidden);
-            }
-        }
-    } else {
-        for (int i = 0; i < static_cast<int>(ctx->layers.size()); ++i) {
-            const auto t0 = std::chrono::steady_clock::now();
-            hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame);
-            eval(hidden);
-            synchronize();
-            const auto t1 = std::chrono::steady_clock::now();
-            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            const LayerWeights& lw = ctx->layers[static_cast<size_t>(i)];
-            const char* kind = lw.is_linear ? "linear" : (lw.is_shortconv ? "shortconv" : "full");
-            std::fprintf(stderr, "[mlx][layer %d][%s] %.3f ms\n", i, kind, ms);
+    const int n_layers = static_cast<int>(ctx->layers.size());
+    for (int i = 0; i < n_layers; ++i) {
+        hidden = run_layer(ctx, i, hidden, source_embeddings, input_ids, trace_frame);
+        if (i < n_layers - 1) {
+            async_eval(hidden);
         }
     }
 
@@ -520,7 +506,6 @@ array fused_lm_head_argmax_token(mlx_ctx* ctx, const array& input_ids) {
     }
 
     auto [candidate_logits, candidate_ids] = fused_lm_head_topk_candidate_arrays(ctx, input_ids, 1);
-    g_fused_lm_head_argmax_hits += 1;
     const array candidate_logits_3d = reshape(candidate_logits, {1, 1, candidate_logits.shape(0)});
     const array candidate_ids_3d = reshape(candidate_ids, {1, 1, candidate_ids.shape(0)});
     const array best_local = reshape(astype(argmax(candidate_logits_3d, -1), int32), {1, 1, 1});

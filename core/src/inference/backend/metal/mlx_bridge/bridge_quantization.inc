@@ -455,27 +455,6 @@ bool capture_native_nvfp4_quant(
     eval(packed_src);
     eval(scale_src);
 
-    if (env_truthy("TALU_METAL_NVFP4_DEBUG", false)) {
-        static int debug_prints = 0;
-        if (debug_prints < 8) {
-            std::fprintf(
-                stderr,
-                "[mlx][nvfp4_debug] key=%s packed_dtype=%d packed_shape=[%d,%d] scale_dtype=%d scale_shape=[%d,%d] scale_view_dtype=%d scale_view_shape=[%d,%d]\n",
-                weight_key.c_str(),
-                static_cast<int>(static_cast<Dtype::Val>(packed_src.dtype())),
-                packed_src.ndim() > 0 ? packed_src.shape(0) : -1,
-                packed_src.ndim() > 1 ? packed_src.shape(1) : -1,
-                static_cast<int>(static_cast<Dtype::Val>(raw_scale.dtype())),
-                raw_scale.ndim() > 0 ? raw_scale.shape(0) : -1,
-                raw_scale.ndim() > 1 ? raw_scale.shape(1) : -1,
-                static_cast<int>(static_cast<Dtype::Val>(scale_src.dtype())),
-                scale_src.ndim() > 0 ? scale_src.shape(0) : -1,
-                scale_src.ndim() > 1 ? scale_src.shape(1) : -1
-            );
-            debug_prints += 1;
-        }
-    }
-
     if (packed_src.ndim() != scale_src.ndim()) return false;
     if (!(packed_src.ndim() == 2 || packed_src.ndim() == 3)) return false;
     const int packed_byte_cols = packed_src.shape(packed_src.ndim() - 1);
