@@ -1,9 +1,9 @@
-const cpu_scheduler = @import("../cpu/scheduler.zig");
+const shared_scheduler = @import("../../scheduler.zig");
 
-pub const RequestState = cpu_scheduler.RequestState;
-pub const Request = cpu_scheduler.Request;
-pub const FinishReason = cpu_scheduler.FinishReason;
-pub const TokenEvent = cpu_scheduler.TokenEvent;
-pub const SchedulerConfig = cpu_scheduler.SchedulerConfig;
-pub const GenericScheduler = cpu_scheduler.GenericScheduler;
-pub const Scheduler = cpu_scheduler.Scheduler;
+pub const RequestState = shared_scheduler.RequestState;
+pub const Request = shared_scheduler.Request;
+pub const FinishReason = shared_scheduler.FinishReason;
+pub const TokenEvent = shared_scheduler.TokenEvent;
+pub const SchedulerConfig = shared_scheduler.SchedulerConfig;
+pub const GenericScheduler = shared_scheduler.GenericScheduler;
+pub const Scheduler = shared_scheduler.Scheduler;

@@ -54,7 +54,7 @@ pub const metal = if (has_metal) @import("metal/root.zig") else struct {
 pub const cuda = if (has_cuda) @import("cuda/root.zig") else struct {
     pub const BackendType = void;
 };
-const shared_scheduler = @import("cpu/scheduler.zig");
+const shared_scheduler = @import("../scheduler/contracts.zig");
 
 comptime {
     contract.assertBackendModuleLayout(cpu, "cpu");

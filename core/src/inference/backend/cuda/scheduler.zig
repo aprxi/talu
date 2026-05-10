@@ -4,7 +4,7 @@
 //! shared production scheduler instantiated for `CudaBackend`.
 
 const engine = @import("engine.zig");
-const shared_scheduler = @import("../cpu/scheduler.zig");
+const shared_scheduler = @import("../../scheduler.zig");
 
 pub const RequestState = shared_scheduler.RequestState;
 pub const Request = shared_scheduler.Request;
