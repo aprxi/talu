@@ -509,7 +509,7 @@ pub struct EffectiveGenConfigRequest {
 /// Resolved effective generation config after applying policy.
 ///
 /// This is the output of resolve_effective_generation_config.
-/// The policy matches core/src/router/local.zig sampling decision:
+/// The policy matches core/src/responses/local.zig sampling decision:
 /// - Sampling is enabled if: temperature > 0 AND (model.do_sample OR user provided override)
 /// - If not sampling, temperature is forced to 0.0 (greedy decoding)
 #[derive(Debug, Clone)]
@@ -542,7 +542,7 @@ pub struct EffectiveGenConfig {
 /// (CLI ask, xray, server) must use this function instead of implementing
 /// their own policy logic.
 ///
-/// The policy matches core/src/router/local.zig sampling decision:
+/// The policy matches core/src/responses/local.zig sampling decision:
 /// - Apply user overrides over model defaults (None means "use model default")
 /// - Sampling is enabled if: temperature > 0 AND (model.do_sample OR user provided temperature override)
 /// - If not sampling, temperature is forced to 0.0 (greedy decoding)

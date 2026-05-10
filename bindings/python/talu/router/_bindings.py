@@ -175,7 +175,7 @@ class StopFlag:
 class RouterGenerateConfig(CGenerateConfig):
     """Configuration for router generation (C struct).
 
-    Must match CGenerateConfig in core/src/router/capi_bridge.zig exactly.
+    Must match CGenerateConfig in core/src/responses/capi_bridge.zig exactly.
     """
 
     def __init__(

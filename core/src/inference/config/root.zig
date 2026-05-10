@@ -1,6 +1,6 @@
 //! Inference configuration surface.
 //!
-//! Owns generation-time configuration parsing used by router/session/tokenizer.
+//! Owns generation-time configuration parsing used by responses/session/tokenizer.
 
 const generation = @import("../../config/generation.zig");
 

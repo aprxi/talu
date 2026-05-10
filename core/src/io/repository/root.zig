@@ -7,15 +7,11 @@
 //! ```
 //! capi/router.zig
 //!     ↓
-//! router/root.zig (classifyModel)
-//!     │
-//!     ├─ Unsupported backend namespace (`foo::model`) → error
-//!     │
-//!     └─ Native (repository-based) → router/local.zig (LocalEngine.init)
-//!                                        ↓
-//!                                    io/repository/root.zig (resolveModelPath) ← YOU ARE HERE
-//!                                        ↓
-//!                                    io/repository/scheme.zig (parse storage scheme)
+//! responses/spec.zig or responses/local.zig
+//!     ↓
+//! io/repository/root.zig (resolveModelPath) ← YOU ARE HERE
+//!     ↓
+//! io/repository/scheme.zig (parse storage scheme)
 //! ```
 //!
 //! ## Responsibility

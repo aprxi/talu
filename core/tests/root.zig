@@ -16,12 +16,12 @@ const std = @import("std");
 // Struct Integration Tests
 // =============================================================================
 
-// router
-pub const router_local_engine = @import("router/local_engine_test.zig");
-pub const router_generation_result = @import("router/generation_result_test.zig");
-pub const router_canonical_spec = @import("router/canonical_spec_test.zig");
-pub const router_inference_backend = @import("router/inference_backend_test.zig");
-pub const router_parsed_tool_call = @import("router/parsed_tool_call_test.zig");
+// responses
+pub const responses_local_engine = @import("responses/local_engine_test.zig");
+pub const responses_generation_result = @import("responses/generation_result_test.zig");
+pub const responses_canonical_spec = @import("responses/canonical_spec_test.zig");
+pub const responses_inference_backend = @import("responses/inference_backend_test.zig");
+pub const responses_parsed_tool_call = @import("responses/parsed_tool_call_test.zig");
 
 // tokenizer
 pub const tokenizer = @import("tokenizer/root.zig");
@@ -72,8 +72,8 @@ pub const models_loaded_model = @import("models/loaded_model_test.zig");
 pub const models_loader = @import("models/loader/root.zig");
 pub const models_config_model_description = @import("models/config/model_description_test.zig");
 
-// responses (conversation / item / reasoning types)
-pub const responses = @import("responses/root.zig");
+// responses conversation state (conversation / item / reasoning types)
+pub const responses_conversation = @import("responses/conversation/root.zig");
 
 // train (training, fine-tuning, LoRA adapters)
 pub const train = @import("train/root.zig");

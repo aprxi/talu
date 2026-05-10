@@ -1,8 +1,8 @@
 //! Scheduler C API — scoring helpers for local inference backends.
 
 const std = @import("std");
-const local_mod = @import("../router/local.zig");
-const spec_mod = @import("../router/spec.zig");
+const local_mod = @import("../responses/local.zig");
+const spec_mod = @import("../responses/spec.zig");
 const router_capi = @import("router.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");

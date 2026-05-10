@@ -1,4 +1,4 @@
-//! Router C API - Embeddings, Backend Management, and Configuration
+//! Backend C API - Embeddings, Backend Management, and Configuration
 //!
 //! C-callable functions for backend lifecycle, embeddings, and model
 //! configuration. Local generation is served by the batch C API.
@@ -9,17 +9,17 @@
 //!   - Config: model spec validation, canonicalization, and backend creation
 //!   - Backend: lifecycle management for inference backends
 //!
-//! Maps to Python: talu/chat/_bindings.py (router/backend/config functions)
+//! Maps to Python: talu/router/_bindings.py (backend/config helpers)
 //!
 //! Thread safety: NOT thread-safe. All access must be from a single thread.
 
 const std = @import("std");
-const router_mod = @import("../router/root.zig");
-const spec_mod = @import("../router/spec.zig");
+const responses_mod = @import("../responses/root.zig");
+const spec_mod = @import("../responses/spec.zig");
 const capi_types = @import("types.zig");
 const progress_mod = @import("progress.zig");
 const responses_capi = @import("responses.zig");
-const responses_mod = @import("../responses/root.zig");
+const conversation_mod = @import("../responses/conversation/root.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -29,10 +29,11 @@ const error_codes = @import("error_codes.zig");
 
 // Types from other capi modules
 const ChatHandle = responses_capi.ChatHandle;
-const Chat = responses_mod.Chat;
+const Chat = conversation_mod.Chat;
 
-const capi_bridge = router_mod.capi_bridge;
-const completions_protocol = router_mod.protocol.completions;
+const capi_bridge = responses_mod.capi_bridge;
+const completions_protocol = responses_mod.protocol.chat_completions;
+const embeddings_mod = responses_mod.embeddings;
 
 /// Logit bias entry for generation.
 pub const CLogitBiasEntry = capi_bridge.CLogitBiasEntry;
@@ -284,7 +285,7 @@ pub export fn talu_completions_validate_request(
     };
     const messages_json = messages_ptr[0..messages_json_len];
 
-    const conv = responses_mod.Conversation.init(allocator) catch {
+    const conv = conversation_mod.Conversation.init(allocator) catch {
         capi_error.setErrorWithCode(.out_of_memory, "failed to allocate temporary conversation for validation", .{});
         return @intFromEnum(error_codes.ErrorCode.out_of_memory);
     };
@@ -396,7 +397,7 @@ pub const BackendCreateOptions = extern struct {
 ///
 /// Call this when shutting down or when memory needs to be reclaimed.
 pub export fn talu_router_close_all() callconv(.c) void {
-    router_mod.closeAllEngines(allocator);
+    responses_mod.closeAllEngines(allocator);
 }
 
 // =============================================================================
@@ -408,8 +409,8 @@ pub export fn talu_router_close_all() callconv(.c) void {
 /// Returns 0 if the model cannot be loaded or does not support embeddings.
 pub export fn talu_router_embedding_dim(model: ?[*:0]const u8) callconv(.c) usize {
     const model_id = std.mem.sliceTo(model orelse return 0, 0);
-    const engine = router_mod.getOrCreateEngine(allocator, model_id) catch return 0;
-    return engine.embeddingDim();
+    const engine = responses_mod.getOrCreateEngine(allocator, model_id) catch return 0;
+    return embeddings_mod.dimension(engine);
 }
 
 /// Extracts embeddings from text using the specified model.
@@ -437,26 +438,24 @@ pub export fn talu_router_embed(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }, 0);
 
-    const engine = router_mod.getOrCreateEngine(allocator, model_id) catch |err| {
+    const engine = responses_mod.getOrCreateEngine(allocator, model_id) catch |err| {
         capi_error.setError(err, "failed to load model", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-    const dim = engine.embeddingDim();
 
-    const buffer = allocator.alloc(f32, dim) catch {
-        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate embedding buffer", .{});
-        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    };
-    errdefer allocator.free(buffer);
-
-    engine.embed(text_input, @enumFromInt(@intFromEnum(pooling)), normalize, buffer) catch |err| {
-        allocator.free(buffer);
+    const result = embeddings_mod.extract(
+        allocator,
+        engine,
+        text_input,
+        @enumFromInt(@intFromEnum(pooling)),
+        normalize,
+    ) catch |err| {
         capi_error.setError(err, "embedding extraction failed", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
 
-    out_embedding.* = buffer.ptr;
-    out_dim.* = dim;
+    out_embedding.* = result.values.ptr;
+    out_dim.* = result.values.len;
     return 0;
 }
 

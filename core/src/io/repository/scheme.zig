@@ -1,7 +1,7 @@
 //! Scheme Parsing for Model Repositories
 //!
 //! Parses URIs to determine WHERE a repository-based model is stored.
-//! This is called by resolveModelPath() after the Router has determined
+//! This is called by resolveModelPath() after the response-serving layer has determined
 //! the model is repository-based (not an unsupported namespace target).
 //!
 //! ## Scope
@@ -10,7 +10,7 @@
 //!   - Local filesystem paths
 //!   - Bare model IDs (e.g., `org/model-name`) - default to HuggingFace Hub
 //!
-//! Unsupported namespace targets (`foo::model`) are rejected by router parsing
+//! Unsupported namespace targets (`foo::model`) are rejected by response-serving parsing
 //! before reaching this module.
 //!
 //! ## Supported Schemes

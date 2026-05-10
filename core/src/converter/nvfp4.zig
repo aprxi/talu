@@ -11,7 +11,7 @@ const grouped_affine = @import("grouped_affine.zig");
 const gaf_paths = @import("gaf_paths.zig");
 const convert = @import("root.zig");
 const calibration_capture = @import("calibration_capture.zig");
-const router_local = @import("../router/local.zig");
+const responses_local = @import("../responses/local.zig");
 const parallel = @import("compute_pkg").parallel;
 const compute = @import("compute_pkg");
 const json = @import("io_pkg").json;
@@ -1738,7 +1738,7 @@ fn klDivergenceFromLogitsWithScratch(
 
 fn buildNvfp4CanaryTokens(
     allocator: std.mem.Allocator,
-    engine: *router_local.LocalEngine,
+    engine: *responses_local.LocalEngine,
 ) !Nvfp4CanaryTokens {
     const canary_text =
         \\The assistant should preserve model behavior while quantizing efficiently.
@@ -1769,7 +1769,7 @@ fn captureNvfp4CanaryReference(
     model_path: []const u8,
     seed: u64,
 ) !Nvfp4CanaryReference {
-    var engine = try router_local.LocalEngine.initWithSeed(allocator, model_path, seed);
+    var engine = try responses_local.LocalEngine.initWithSeed(allocator, model_path, seed);
     defer engine.deinit();
 
     var tokens = try buildNvfp4CanaryTokens(allocator, &engine);
@@ -1827,7 +1827,7 @@ fn evaluateNvfp4CanaryCandidate(
     if (reference.logits.len != reference.scored_tokens * reference.vocab_size) return error.InvalidConfig;
     if (reference.token_nlls.len != reference.scored_tokens) return error.InvalidConfig;
 
-    var engine = try router_local.LocalEngine.initWithSeed(allocator, model_path, seed);
+    var engine = try responses_local.LocalEngine.initWithSeed(allocator, model_path, seed);
     defer engine.deinit();
 
     var scheduler = try engine.createScheduler(.{});

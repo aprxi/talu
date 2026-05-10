@@ -1,6 +1,6 @@
 //! Batch C API — Responses-Aware Continuous Batching
 //!
-//! Thin C API glue over router/batch.zig. Wraps the BatchWrapper as an
+//! Thin C API glue over responses/batch.zig. Wraps the BatchWrapper as an
 //! opaque handle (TaluBatch) and exposes submit/step/cancel/result functions.
 //!
 //! Lifecycle: create → (submit | cancel | step)* → destroy
@@ -9,14 +9,14 @@
 //! Thread safety: NOT thread-safe. Caller must serialize all calls.
 
 const std = @import("std");
-const batch_mod = @import("../router/batch.zig");
-const spec_mod = @import("../router/spec.zig");
-const local_mod = @import("../router/local.zig");
-const capi_bridge = @import("../router/capi_bridge.zig");
+const batch_mod = @import("../responses/batch.zig");
+const spec_mod = @import("../responses/spec.zig");
+const local_mod = @import("../responses/local.zig");
+const capi_bridge = @import("../responses/capi_bridge.zig");
 const router_capi = @import("router.zig");
 const capi_error = @import("error.zig");
 const responses_capi = @import("responses.zig");
-const responses_mod = @import("../responses/root.zig");
+const conversation_mod = @import("../responses/conversation/root.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -148,7 +148,7 @@ pub export fn talu_batch_submit(
         return 0;
     }));
 
-    const chat: *responses_mod.Chat = @ptrCast(@alignCast(chat_handle orelse {
+    const chat: *conversation_mod.Chat = @ptrCast(@alignCast(chat_handle orelse {
         capi_error.setErrorWithCode(.invalid_argument, "chat handle is null", .{});
         return 0;
     }));

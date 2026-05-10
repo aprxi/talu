@@ -16,19 +16,19 @@
 //! Thread safety: NOT thread-safe. All access must be from a single thread.
 
 const std = @import("std");
+const conversation_mod = @import("../responses/conversation/root.zig");
+const session_id_mod = conversation_mod.session_id;
 const responses_mod = @import("../responses/root.zig");
-const session_id_mod = responses_mod.session_id;
-const router_mod = @import("../router/root.zig");
-const Conversation = responses_mod.Conversation;
-const Item = responses_mod.Item;
-const ItemType = responses_mod.ItemType;
-const ItemStatus = responses_mod.ItemStatus;
-const MessageRole = responses_mod.MessageRole;
-const ContentType = responses_mod.ContentType;
-const ContentPart = responses_mod.ContentPart;
-const SerializationDirection = responses_mod.SerializationDirection;
-const completions_protocol = router_mod.protocol.completions;
-const responses_protocol = router_mod.protocol.responses;
+const Conversation = conversation_mod.Conversation;
+const Item = conversation_mod.Item;
+const ItemType = conversation_mod.ItemType;
+const ItemStatus = conversation_mod.ItemStatus;
+const MessageRole = conversation_mod.MessageRole;
+const ContentType = conversation_mod.ContentType;
+const ContentPart = conversation_mod.ContentPart;
+const SerializationDirection = conversation_mod.SerializationDirection;
+const completions_protocol = responses_mod.protocol.chat_completions;
+const responses_protocol = responses_mod.protocol.openai_responses;
 
 const allocator = std.heap.c_allocator;
 
@@ -842,7 +842,7 @@ pub export fn talu_responses_clear_keeping_system(
 /// This clears any existing items first.
 /// Returns 0 on success, non-zero error code on failure.
 ///
-/// Uses router/protocol/completions.zig for format conversion (One Correct Path).
+/// Uses responses/protocol/chat_completions.zig for format conversion (One Correct Path).
 pub export fn talu_responses_load_completions_json(
     handle: ?*ResponsesHandle,
     json: ?[*:0]const u8,
@@ -1441,7 +1441,7 @@ fn fillContentPart(part: *const ContentPart, out: *CContentPart) void {
 // Use talu_chat_* when you need sampling parameters.
 // Use talu_responses_* when you only need Item storage.
 
-const Chat = responses_mod.Chat;
+const Chat = conversation_mod.Chat;
 
 /// Opaque Chat handle for C API.
 /// Chat owns a Conversation and generation configuration.
@@ -1765,7 +1765,7 @@ pub export fn talu_chat_get_tool_choice(handle: ?*ChatHandle) callconv(.c) ?[*:0
 /// Returns allocated string that must be freed with talu_text_free.
 /// Returns null on error (check talu_last_error for details).
 ///
-/// Uses router/protocol/completions.zig for format conversion (One Correct Path).
+/// Uses responses/protocol/chat_completions.zig for format conversion (One Correct Path).
 pub export fn talu_chat_to_json(handle: ?*ChatHandle) callconv(.c) ?[*:0]u8 {
     capi_error.clearError();
     const chat_state: *Chat = @ptrCast(@alignCast(handle orelse {
@@ -1790,7 +1790,7 @@ pub export fn talu_chat_to_json(handle: ?*ChatHandle) callconv(.c) ?[*:0]u8 {
 /// Load messages from JSON (OpenAI Completions format).
 /// Returns 0 on success, non-zero error code on failure.
 ///
-/// Uses router/protocol/completions.zig for format conversion (One Correct Path).
+/// Uses responses/protocol/chat_completions.zig for format conversion (One Correct Path).
 pub export fn talu_chat_set_messages(handle: ?*ChatHandle, json: ?[*:0]const u8) callconv(.c) i32 {
     capi_error.clearError();
     const chat_state: *Chat = @ptrCast(@alignCast(handle orelse {
@@ -1872,7 +1872,7 @@ pub export fn talu_chat_count_tokens(
     }, 0);
 
     // Get or create engine for this model
-    const engine = router_mod.getOrCreateEngine(allocator, model_path) catch |err| {
+    const engine = responses_mod.getOrCreateEngine(allocator, model_path) catch |err| {
         capi_error.setError(err, "failed to load model for token counting", .{});
         return -@as(i64, @intFromEnum(error_codes.errorToCode(err)));
     };
@@ -1907,7 +1907,7 @@ pub export fn talu_chat_max_context_length(model: ?[*:0]const u8) callconv(.c) u
     }, 0);
 
     // Get or create engine for this model
-    const engine = router_mod.getOrCreateEngine(allocator, model_path) catch |err| {
+    const engine = responses_mod.getOrCreateEngine(allocator, model_path) catch |err| {
         capi_error.setError(err, "failed to load model for max context length", .{});
         return 0;
     };

@@ -1,6 +1,6 @@
 //! Inference - sampling, scheduling, loading, and backend execution.
 //!
-//! This module is the inference boundary used by router/bindings:
+//! This module is the inference boundary used by responses/bindings:
 //! - `types` - generation request/result types
 //! - `sampling` - token sampling policies
 //! - `scheduler` - continuous batching runtime

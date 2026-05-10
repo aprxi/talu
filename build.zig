@@ -300,7 +300,7 @@ fn mlxIncludeFingerprintFlag(b: *std.Build) []const u8 {
 }
 
 fn isAllowedInferenceBoundaryImport(rel_path: []const u8, import_path: []const u8) bool {
-    if (std.mem.eql(u8, rel_path, "router/inference_bridge.zig")) {
+    if (std.mem.eql(u8, rel_path, "responses/inference_bridge.zig")) {
         return std.mem.eql(u8, import_path, "inference_pkg");
     }
     if (std.mem.eql(u8, rel_path, "converter/calibration_capture.zig")) {

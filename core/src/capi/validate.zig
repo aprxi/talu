@@ -21,14 +21,14 @@ const validate_mod = @import("validate_pkg");
 const sampler_mod = validate_mod.sampler;
 const cache_mod = validate_mod.cache;
 const responses_capi = @import("responses.zig");
-const responses_mod = @import("../responses/root.zig");
+const conversation_mod = @import("../responses/conversation/root.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 
 const ConstrainedSampler = sampler_mod.ConstrainedSampler;
 const GrammarConfig = sampler_mod.GrammarConfig;
 const ChatHandle = responses_capi.ChatHandle;
-const Chat = responses_mod.Chat;
+const Chat = conversation_mod.Chat;
 const Validator = validate_mod.Validator;
 const Grammar = validate_mod.ast.Grammar;
 

@@ -14,7 +14,7 @@
 //! Both use LP64 data model with 8-byte pointers, so sizes are identical.
 
 const std = @import("std");
-const capi_bridge = @import("../router/capi_bridge.zig");
+const capi_bridge = @import("../responses/capi_bridge.zig");
 const responses = @import("responses.zig");
 const capi_types = @import("types.zig");
 const router = @import("router.zig");

@@ -5,7 +5,7 @@
 //
 // Primary APIs for talu/chat/:
 // - responses.zig: Chat/Session management (talu_chat_*), Item-based conversation (talu_responses_*)
-// - router.zig: Generation routing (talu_router_*), backend management (talu_backend_*), config (talu_config_*)
+// - router.zig: Public router C API symbols (talu_router_*), backend management (talu_backend_*), config (talu_config_*)
 //
 // Utility APIs:
 // - session.zig: Model resolution, chat templates, EOS tokens

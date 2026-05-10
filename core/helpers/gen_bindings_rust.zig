@@ -809,12 +809,11 @@ pub fn main() !void {
     var enums = std.StringHashMap(EnumInfo).init(allocator);
     defer enums.deinit();
 
-    // Directories to scan
-    // Scan capi, router, and converter directories.
+    // Directories to scan.
     // The converter module has complex enums (with methods) but the parser handles them.
     const scan_dirs = [_][]const u8{
         "core/src/capi",
-        "core/src/router",
+        "core/src/responses",
         "core/src/converter",
     };
 

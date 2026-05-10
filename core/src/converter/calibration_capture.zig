@@ -8,7 +8,7 @@ const build_options = @import("build_options");
 const dtype_mod = @import("dtype_pkg");
 const log = @import("log_pkg");
 const xray = @import("xray_pkg");
-const router_local = @import("../router/local.zig");
+const responses_local = @import("../responses/local.zig");
 const backend_root = @import("inference_pkg").backend;
 const progress_mod = @import("progress_pkg");
 const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
@@ -389,7 +389,7 @@ pub noinline fn captureFromInference(
     if (!xray_bridge_enabled) return cache;
     if (prompt_tokens.len == 0 or options.max_prompt_tokens == 0) return cache;
 
-    var engine = try router_local.LocalEngine.initWithSeedAndResolutionConfig(
+    var engine = try responses_local.LocalEngine.initWithSeedAndResolutionConfig(
         allocator,
         model_path,
         options.seed,

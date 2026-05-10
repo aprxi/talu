@@ -31,12 +31,12 @@ fn isModelsPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/models/");
 }
 
-fn isRouterPath(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, "core/src/router/");
+fn isResponsesPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/src/responses/");
 }
 
-fn isRouterInferenceBridgePath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "core/src/router/inference_bridge.zig");
+fn isResponsesInferenceBridgePath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/responses/inference_bridge.zig");
 }
 
 fn isCoreSourceFile(path: []const u8) bool {
@@ -164,10 +164,10 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
             }
         }
 
-        if (isRouterPath(file_path) and !isRouterInferenceBridgePath(file_path) and importTargetsInference(target)) {
+        if (isResponsesPath(file_path) and !isResponsesInferenceBridgePath(file_path) and importTargetsInference(target)) {
             violations += 1;
             if (emit) {
-                std.debug.print("{s}:{d}: router must import inference only via router/inference_bridge.zig: \"{s}\"\n", .{ file_path, line, target });
+                std.debug.print("{s}:{d}: responses must import inference only via responses/inference_bridge.zig: \"{s}\"\n", .{ file_path, line, target });
             }
         }
 
@@ -595,23 +595,23 @@ test "lintSource rejects models importing inference internals" {
     );
 }
 
-test "lintSource rejects router direct inference import" {
+test "lintSource rejects responses direct inference import" {
     const src =
         \\const bad = @import("../inference/root.zig");
     ;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try lintSource(std.testing.allocator, "core/src/router/local.zig", src, false),
+        try lintSource(std.testing.allocator, "core/src/responses/local.zig", src, false),
     );
 }
 
-test "lintSource allows router inference bridge import" {
+test "lintSource allows responses inference bridge import" {
     const src =
         \\const ok = @import("inference_bridge.zig");
     ;
     try std.testing.expectEqual(
         @as(usize, 0),
-        try lintSource(std.testing.allocator, "core/src/router/local.zig", src, false),
+        try lintSource(std.testing.allocator, "core/src/responses/local.zig", src, false),
     );
 }
 

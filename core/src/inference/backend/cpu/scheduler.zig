@@ -7086,7 +7086,7 @@ test "Scheduler step-scoped state blocks are zeroed at each step boundary" {
 test "Scheduler.step - thinking disabled with tool-generation flags" {
     // Regression: tools + max_reasoning_tokens=0 triggered "double free or
     // corruption (out)". This test reproduces the exact submission flags the
-    // router sends for that combination: thinking_budget=0,
+    // response serving sends for that combination: thinking_budget=0,
     // thinking_end_tokens=&.{}, max_completion_tokens set.
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);

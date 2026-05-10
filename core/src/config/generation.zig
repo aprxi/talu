@@ -6,7 +6,6 @@
 const std = @import("std");
 const json = @import("io_pkg").json;
 const template = @import("../template/root.zig");
-const responses_mod = @import("../responses/root.zig");
 const log = @import("log_pkg");
 
 // =============================================================================

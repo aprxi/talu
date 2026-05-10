@@ -15,7 +15,6 @@ pub const template = @import("template/root.zig");
 pub const io = @import("io_pkg");
 pub const inference = @import("inference_pkg");
 pub const responses = @import("responses/root.zig");
-pub const router = @import("router/root.zig");
 pub const generation_config = @import("config/generation.zig");
 pub const converter = @import("converter/root.zig");
 pub const compute = @import("compute_pkg");

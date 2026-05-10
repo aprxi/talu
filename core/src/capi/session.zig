@@ -1,7 +1,7 @@
 //! Utility C API
 //!
 //! Utility functions for model resolution, chat templates, and EOS tokens.
-//! For generation, use router.zig.
+//! For local generation, use the batch C API. Backend/config helpers live in router.zig.
 //! For tokenization, see tokenizer.zig.
 
 const std = @import("std");
@@ -55,7 +55,7 @@ pub const EffectiveGenConfigRequest = extern struct {
 /// Resolved effective generation config after applying policy.
 /// This is the output of talu_resolve_effective_generation_config.
 ///
-/// The policy matches core/src/router/local.zig sampling decision:
+/// The policy matches core/src/responses/local.zig sampling decision:
 /// - Sampling is enabled if: temperature > 0 AND (model.do_sample OR user provided override)
 /// - If not sampling, temperature is forced to 0.0 (greedy)
 ///
@@ -204,7 +204,7 @@ pub export fn talu_get_generation_config(
 /// (CLI ask, xray, server) must use this function instead of implementing
 /// their own policy logic.
 ///
-/// The policy matches core/src/router/local.zig sampling decision:
+/// The policy matches core/src/responses/local.zig sampling decision:
 /// - Apply user overrides over model defaults (sentinel -1.0 means "use model default")
 /// - Sampling is enabled if: temperature > 0 AND (model.do_sample OR user provided temperature override)
 /// - If not sampling, temperature is forced to 0.0 (greedy decoding)

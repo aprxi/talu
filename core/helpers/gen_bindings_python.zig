@@ -517,7 +517,7 @@ pub fn main() !void {
     // Directories to scan (walk recursively)
     const scan_dirs = [_][]const u8{
         "core/src/capi",
-        "core/src/router",
+        "core/src/responses",
     };
 
     // Individual core files whose types are re-exported by capi via aliases.
