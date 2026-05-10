@@ -1,4 +1,4 @@
-//! Integration tests for inference.config.GenerationConfig
+//! Integration tests for generation_config.GenerationConfig
 //!
 //! GenerationConfig contains generation parameters loaded from model directory.
 

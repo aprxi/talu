@@ -1,11 +1,11 @@
 //! Generation Configuration
 //!
 //! Unified loading of generation config, chat templates, and special tokens.
-//! This is the SINGLE source of truth - used by both CLI and C API.
+//! Shared by tokenizer setup, local responses, and C API session helpers.
 
 const std = @import("std");
 const json = @import("io_pkg").json;
-const template = @import("../template/root.zig");
+const template = @import("../../template/root.zig");
 const log = @import("log_pkg");
 
 // =============================================================================
@@ -507,7 +507,7 @@ pub fn addEosTokenId(allocator: std.mem.Allocator, cfg: *GenerationConfig, id: u
 }
 
 /// Tokenizer handle type for token lookups.
-pub const TokenizerHandle = @import("../tokenizer/root.zig").CTokenizer;
+pub const TokenizerHandle = @import("../../tokenizer/root.zig").CTokenizer;
 
 /// Add an EOS token from tokenizer vocabulary if not already in the list.
 /// Looks up the token text in the tokenizer's vocabulary and adds its ID.

@@ -60,9 +60,6 @@ pub const io_repository_bundle = @import("io/repository/bundle_test.zig");
 pub const io_repository_cached_model_list_c = @import("io/repository/cached_model_list_c_test.zig");
 pub const io_json = @import("io/json_test.zig");
 
-// inference
-pub const inference_config_generation = @import("inference/config/generation_config_test.zig");
-
 // converter (top-level, not in io/)
 pub const converter = @import("converter/root.zig");
 
@@ -71,6 +68,7 @@ pub const models = @import("models/root.zig");
 pub const models_loaded_model = @import("models/loaded_model_test.zig");
 pub const models_loader = @import("models/loader/root.zig");
 pub const models_config_model_description = @import("models/config/model_description_test.zig");
+pub const models_config_generation = @import("models/config/generation_config_test.zig");
 
 // responses conversation state (conversation / item / reasoning types)
 pub const responses_conversation = @import("responses/conversation/root.zig");

@@ -1,8 +1,9 @@
 //! Inference configuration surface.
 //!
-//! Owns generation-time configuration parsing used by responses/session/tokenizer.
+//! Re-exports model generation defaults used by local inference setup, and owns
+//! inference-specific preprocessor config parsing.
 
-const generation = @import("../../config/generation.zig");
+const generation = @import("../../models/config/generation.zig");
 
 pub const GenerationConfig = generation.GenerationConfig;
 pub const loadGenerationConfig = generation.loadGenerationConfig;

@@ -1362,6 +1362,12 @@ pub fn build(b: *std.Build) void {
         "registry",
         "compileLayerProgram",
         "plan",
+        "GenerationConfig",
+        "loadGenerationConfig",
+        "applyChatTemplate",
+        "getChatTemplateSource",
+        "isEosToken",
+        "addEosTokenId",
     });
     ut.addLazy("responses", b.path("core/src/lib_dev.zig"), &.{
         "TableAdapter",

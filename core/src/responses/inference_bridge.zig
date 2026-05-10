@@ -19,5 +19,5 @@ pub const SamplingStrategy = inference_abi.SamplingStrategy;
 pub const SamplingConfig = inference_abi.SamplingConfig;
 
 pub const backend = inference_abi.backend;
-pub const generation_config = @import("../config/generation.zig");
+pub const generation_config = @import("../models/config/generation.zig");
 pub const preprocessor_config = inference_abi.preprocessor_config;

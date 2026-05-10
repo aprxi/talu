@@ -5,7 +5,7 @@
 //! For tokenization, see tokenizer.zig.
 
 const std = @import("std");
-const gen_config_mod = @import("../config/generation.zig");
+const gen_config_mod = @import("../models/config/generation.zig");
 const cfg_root = @import("models_pkg").config;
 const repository = @import("io_pkg").repository.root;
 const capi_error = @import("error.zig");
