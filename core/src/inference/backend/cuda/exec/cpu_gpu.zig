@@ -10,7 +10,6 @@ const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 const bridge = @import("../../../bridge/root.zig");
-const orchestrator = @import("../../../bridge/orchestrator.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 // --- Shared types from engine_types.zig ---
@@ -399,20 +398,6 @@ pub fn runCpuGpuWithPipelineRuntime(
 
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
     };
-    const Transfer = struct {
-        metadata: bridge.TensorFrameMetadata,
-        host_staging: ?[]align(64) u8,
-
-        pub fn transfer(transfer_ctx: *@This(), src: *Stage0, dst: *Stage1, byte_count: usize) anyerror!void {
-            try bridge.validateActivationFrameByteCount(&transfer_ctx.metadata, @intCast(byte_count));
-            const staging = transfer_ctx.host_staging orelse return error.PipelineTransferNotInitialized;
-            if (byte_count > staging.len) return error.PipelineTransferBufferTooSmall;
-            try src.downloadActivation(staging[0..byte_count], byte_count);
-            try dst.uploadActivation(staging[0..byte_count], byte_count);
-        }
-
-        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
-    };
     var ctx = stage_adapters.DecodeContext{
         .token = token,
         .position = position,
@@ -425,19 +410,16 @@ pub fn runCpuGpuWithPipelineRuntime(
         .trace_pos_offset = trace_pos_offset,
     };
     const activation_metadata = try buildCpuGpuActivationFrame(self, &ctx);
-    try orchestrator.executeTwoStageForward(
+    try bridge.executeLocalDecodeHandoff(
         Stage0,
         Stage1,
-        Transfer,
         .{ .backend = cpu_stage0_backend, .gpu_backend = self, .ctx = &ctx },
         .{ .backend = self, .ctx = &ctx },
-        self.split_layer,
-        self.split_layer + self.block_runtime.blocks.len,
-        &.{},
-        &.{},
-        activation_byte_count,
-        null,
-        .{ .metadata = activation_metadata, .host_staging = self.pipeline_host_staging },
+        .{
+            .metadata = activation_metadata,
+            .activation_byte_count = activation_byte_count,
+            .host_staging = self.pipeline_host_staging,
+        },
     );
 }
 

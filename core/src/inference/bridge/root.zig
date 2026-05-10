@@ -18,6 +18,7 @@ pub const BoundaryNegotiationResult = pipeline.BoundaryNegotiationResult;
 pub const negotiateBoundaryContract = pipeline.negotiateBoundaryContract;
 
 pub const ActivationFrameArgs = tensor_frame.ActivationFrameArgs;
+pub const LocalDecodeHandoffConfig = orchestrator.LocalDecodeHandoffConfig;
 pub const PipelineRuntime = pipeline.PipelineRuntime;
 pub const PipelineRuntime3 = pipeline.PipelineRuntime3;
 pub const StageBackend = tensor_frame.StageBackend;
@@ -37,6 +38,7 @@ pub const activationFrameFromBoundary = tensor_frame.activationFrameFromBoundary
 pub const dtypeByteSize = tensor_frame.dtypeByteSize;
 pub const executeTwoStageForward = orchestrator.executeTwoStageForward;
 pub const executeThreeStageForward = orchestrator.executeThreeStageForward;
+pub const executeLocalDecodeHandoff = orchestrator.executeLocalDecodeHandoff;
 pub const tensor_frame_contract_version = tensor_frame.tensor_frame_contract_version;
 pub const validateActivationFrameByteCount = tensor_frame.validateActivationFrameByteCount;
 pub const validateStageBoundary = tensor_frame.validateStageBoundary;

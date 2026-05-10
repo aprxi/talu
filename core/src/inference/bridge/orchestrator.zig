@@ -5,6 +5,15 @@
 
 const std = @import("std");
 const pipeline = @import("pipeline.zig");
+const tensor_frame = @import("tensor_frame.zig");
+
+pub const LocalDecodeHandoffConfig = struct {
+    metadata: tensor_frame.TensorFrameMetadata,
+    activation_byte_count: usize,
+    host_staging: ?[]align(64) u8,
+    stage0_input: []const u8 = &.{},
+    stage1_input: []const u8 = &.{},
+};
 
 pub fn executeTwoStageForward(
     comptime Stage0Type: type,
@@ -30,6 +39,51 @@ pub fn executeTwoStageForward(
         .custom_transfer = custom_transfer,
     };
     try runtime.executeForward(stage0_input, stage1_input, activation_byte_count);
+}
+
+pub fn executeLocalDecodeHandoff(
+    comptime Stage0Type: type,
+    comptime Stage1Type: type,
+    stage0: Stage0Type,
+    stage1: Stage1Type,
+    config: LocalDecodeHandoffConfig,
+) !void {
+    try config.metadata.validate();
+    if (config.metadata.role != .activation) return error.InvalidStageBoundary;
+    if (config.metadata.boundary.producer_layer_start != 0) return error.InvalidLayerRange;
+
+    const split_layer: usize = config.metadata.boundary.consumer_layer_start;
+    const total_layers: usize = config.metadata.boundary.consumer_layer_end;
+
+    const Transfer = struct {
+        metadata: tensor_frame.TensorFrameMetadata,
+        host_staging: ?[]align(64) u8,
+
+        pub fn transfer(transfer_ctx: *@This(), src: *Stage0Type, dst: *Stage1Type, byte_count: usize) anyerror!void {
+            try tensor_frame.validateActivationFrameByteCount(&transfer_ctx.metadata, @intCast(byte_count));
+            const staging = transfer_ctx.host_staging orelse return error.PipelineTransferNotInitialized;
+            if (byte_count > staging.len) return error.PipelineTransferBufferTooSmall;
+            try src.downloadActivation(staging[0..byte_count], byte_count);
+            try dst.uploadActivation(staging[0..byte_count], byte_count);
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+
+    try executeTwoStageForward(
+        Stage0Type,
+        Stage1Type,
+        Transfer,
+        stage0,
+        stage1,
+        split_layer,
+        total_layers,
+        config.stage0_input,
+        config.stage1_input,
+        config.activation_byte_count,
+        null,
+        .{ .metadata = config.metadata, .host_staging = config.host_staging },
+    );
 }
 
 pub fn executeThreeStageForward(
@@ -138,6 +192,133 @@ test "executeTwoStageForward runs both stages via custom transfer" {
     try std.testing.expectEqual(TestLog.Kind.sync, log.entries[1].kind);
     try std.testing.expectEqual(TestLog.Kind.transfer, log.entries[2].kind);
     try std.testing.expectEqual(TestLog.Kind.execute, log.entries[3].kind);
+}
+
+test "executeLocalDecodeHandoff runs stages through metadata validated transfer" {
+    var log = TestLog{};
+    var staging: [64]u8 align(64) = undefined;
+    const metadata = try tensor_frame.activationHandoffFrame(.{
+        .frame_id = 1,
+        .graph_id = 2,
+        .request_id = 3,
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+        .dtype = .f32,
+        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
+        .device = .{ .cuda = 0 },
+        .sequence_start = 7,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = 0,
+    });
+
+    try executeLocalDecodeHandoff(
+        MockStage,
+        MockStage,
+        .{ .id = 0, .log = &log },
+        .{ .id = 1, .log = &log },
+        .{
+            .metadata = metadata,
+            .activation_byte_count = 32,
+            .host_staging = staging[0..],
+        },
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), log.count);
+    try std.testing.expectEqual(TestLog.Kind.execute, log.entries[0].kind);
+    try std.testing.expectEqual(@as(usize, 2), log.entries[0].arg);
+    try std.testing.expectEqual(TestLog.Kind.sync, log.entries[1].kind);
+    try std.testing.expectEqual(TestLog.Kind.download, log.entries[2].kind);
+    try std.testing.expectEqual(@as(usize, 32), log.entries[2].arg);
+    try std.testing.expectEqual(TestLog.Kind.upload, log.entries[3].kind);
+    try std.testing.expectEqual(@as(usize, 33), log.entries[3].arg);
+    try std.testing.expectEqual(TestLog.Kind.execute, log.entries[4].kind);
+    try std.testing.expectEqual(@as(usize, 5), log.entries[4].arg);
+}
+
+test "executeLocalDecodeHandoff rejects stale byte count before transfer" {
+    var log = TestLog{};
+    var staging: [64]u8 align(64) = undefined;
+    const metadata = try tensor_frame.activationHandoffFrame(.{
+        .frame_id = 1,
+        .graph_id = 2,
+        .request_id = 3,
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+        .dtype = .f32,
+        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
+        .device = .{ .cuda = 0 },
+        .sequence_start = 7,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = 0,
+    });
+
+    try std.testing.expectError(
+        error.InvalidTensorByteCount,
+        executeLocalDecodeHandoff(
+            MockStage,
+            MockStage,
+            .{ .id = 0, .log = &log },
+            .{ .id = 1, .log = &log },
+            .{
+                .metadata = metadata,
+                .activation_byte_count = 36,
+                .host_staging = staging[0..],
+            },
+        ),
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), log.count);
+    try std.testing.expectEqual(TestLog.Kind.execute, log.entries[0].kind);
+    try std.testing.expectEqual(TestLog.Kind.sync, log.entries[1].kind);
+}
+
+test "executeLocalDecodeHandoff rejects unsupported producer layer start" {
+    var log = TestLog{};
+    var staging: [64]u8 align(64) = undefined;
+    const metadata = try tensor_frame.activationHandoffFrame(.{
+        .frame_id = 1,
+        .graph_id = 2,
+        .request_id = 3,
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 1,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+        .dtype = .f32,
+        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
+        .device = .{ .cuda = 0 },
+        .sequence_start = 7,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = 0,
+    });
+
+    try std.testing.expectError(
+        error.InvalidLayerRange,
+        executeLocalDecodeHandoff(
+            MockStage,
+            MockStage,
+            .{ .id = 0, .log = &log },
+            .{ .id = 1, .log = &log },
+            .{
+                .metadata = metadata,
+                .activation_byte_count = 32,
+                .host_staging = staging[0..],
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), log.count);
 }
 
 test "executeThreeStageForward runs all stages through both transfers" {
