@@ -9,9 +9,9 @@
 const std = @import("std");
 const json = @import("io_pkg").json;
 const log = @import("log_pkg");
-const tensor_mod = @import("tensor_pkg");
+const tensor_mod = @import("compute_pkg").tensor;
 const safetensors = @import("io_pkg").safetensors.root;
-const dtype_mod = @import("dtype_pkg");
+const dtype_mod = @import("compute_pkg").dtype;
 const op_types = @import("models_pkg").op_types;
 const models_registry = @import("models_pkg").registry;
 

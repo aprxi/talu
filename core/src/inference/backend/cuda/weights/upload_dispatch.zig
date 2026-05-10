@@ -15,11 +15,10 @@ const uploadLinearWeightNvfp4 = nvfp4.uploadLinearWeightNvfp4;
 const uploadLinearWeightFp8 = fp8.uploadLinearWeightFp8;
 const uploadLinearWeightBf16AsFp8 = fp8.uploadLinearWeightBf16AsFp8;
 
-
 const std = @import("std");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const load_transforms = @import("models_pkg").load.transforms;
 const models = @import("models_pkg");
@@ -103,7 +102,6 @@ pub fn uploadLinearWeight(
     return uploadLinearWeightDense(device, allocator, src, input_dim);
 }
 
-
 pub fn uploadLinearWeightWithContext(
     device: *compute.cuda.Device,
     allocator: std.mem.Allocator,
@@ -136,7 +134,6 @@ pub fn uploadLinearWeightWithContext(
         return err;
     };
 }
-
 
 pub fn uploadVectorTensor(
     device: *compute.cuda.Device,
@@ -173,4 +170,3 @@ pub fn allocZeroedF32Buffer(
     try buffer.upload(device, std.mem.sliceAsBytes(zeros));
     return buffer;
 }
-

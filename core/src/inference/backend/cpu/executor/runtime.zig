@@ -10,7 +10,7 @@ const log = @import("log_pkg");
 const runtime_contract = @import("runtime_contract_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const Tensor = tensor.Tensor;
 
 const attn = @import("../kernels/attention.zig");

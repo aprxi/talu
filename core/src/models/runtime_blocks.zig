@@ -4,7 +4,7 @@
 //! It intentionally stays data-only and does not depend on inference executors.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const graph_types = @import("op_types.zig");
 const transforms = @import("load/transforms.zig");
 
@@ -1158,9 +1158,9 @@ test "blockWeightsFromMap attention_mlp preserves NVFP4 metadata for fused 3D Mo
     var ln1_data = [_]f32{ 1, 1, 1, 1 };
     var ln2_data = [_]f32{ 1, 1, 1, 1 };
     var q_data = [_]f32{
-        1, 2, 3, 4,
-        5, 6, 7, 8,
-        9, 10, 11, 12,
+        1,  2,  3,  4,
+        5,  6,  7,  8,
+        9,  10, 11, 12,
         13, 14, 15, 16,
     };
     var k_data = q_data;

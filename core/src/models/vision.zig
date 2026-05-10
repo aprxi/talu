@@ -4,7 +4,7 @@
 //! runtime code so backend vision execution stays model-agnostic.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
 const registry = @import("registry.zig");

@@ -6,7 +6,7 @@ pub const supported = true;
 
 const std = @import("std");
 const build_options = @import("build_options");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const mxfp4 = compute.cpu.mxfp4;
@@ -16,7 +16,7 @@ const cpu_matvec = compute.cpu.linalg.matvec;
 const cpu_normalization = compute.cpu.normalization;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_topk = compute.cpu.topk;
-const dtype_mod = @import("dtype_pkg");
+const dtype_mod = @import("compute_pkg").dtype;
 const inspect = @import("xray_pkg");
 const trace = inspect.trace;
 const dump = if (build_options.dump_tensors) @import("xray_pkg").dump.capture else struct {
@@ -398,7 +398,10 @@ pub const MoEFFN = struct {
                     if (val > best_val) {
                         var already = false;
                         for (selected_indices[0..k]) |prev| {
-                            if (prev == @as(u32, @intCast(i))) { already = true; break; }
+                            if (prev == @as(u32, @intCast(i))) {
+                                already = true;
+                                break;
+                            }
                         }
                         if (!already) {
                             best_val = val;

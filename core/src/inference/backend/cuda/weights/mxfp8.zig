@@ -1,10 +1,9 @@
 //! MXFP8 weight helpers for the CUDA inference backend.
 
-
 const std = @import("std");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const load_transforms = @import("models_pkg").load.transforms;
 const models = @import("models_pkg");

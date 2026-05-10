@@ -6,8 +6,8 @@
 
 const std = @import("std");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const models = @import("models_pkg");
 const layer_ops = models.layer_ops;
 const opcode_map = models.plan.opcode_map;

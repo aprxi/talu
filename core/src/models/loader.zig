@@ -4,7 +4,7 @@
 //! metadata from `core/src/models/*`.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const op_types = @import("op_types.zig");
 const cfg_loader = @import("config/root.zig");
 const weights_impl = @import("load/weights.zig");

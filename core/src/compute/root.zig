@@ -26,10 +26,10 @@
 pub const device = @import("device.zig");
 
 /// Canonical numeric and quantized data type definitions.
-pub const dtype = @import("dtype_pkg");
+pub const dtype = @import("dtype.zig");
 
 /// Tensor descriptors, owned tensor storage, and DLPack interop.
-pub const tensor = @import("tensor_pkg");
+pub const tensor = @import("tensor.zig");
 
 /// Thread pool and parallel execution.
 pub const parallel = @import("parallel.zig");

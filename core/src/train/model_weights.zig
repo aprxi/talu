@@ -11,7 +11,7 @@
 //!   - lm_head:     [vocab_size, d_model]
 
 const std = @import("std");
-const tensor_mod = @import("tensor_pkg");
+const tensor_mod = @import("compute_pkg").tensor;
 const model_config = @import("model_config.zig");
 const grad_mod = @import("grad.zig");
 

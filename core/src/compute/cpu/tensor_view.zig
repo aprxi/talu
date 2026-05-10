@@ -6,7 +6,7 @@
 //! CPU compute modules use this interface for stride-aware views.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("../tensor.zig");
 
 /// Maximum dimensions supported (matches DLPack)
 pub const MAX_NDIM: usize = 8;

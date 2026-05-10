@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const DType = @import("dtype_pkg").DType;
+const DType = @import("compute_pkg").dtype.DType;
 
 pub const RegisterBufferSpec = struct {
     /// Buffer size hint. Set to 0 to exempt a register from physical allocation

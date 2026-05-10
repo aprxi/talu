@@ -13,7 +13,7 @@
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_layout = compute.cpu.layout;

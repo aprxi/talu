@@ -18,7 +18,7 @@
 //! - Multiple exports from the same TokenArray are safe
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const compute = @import("compute_pkg");
 const padding = compute.cpu.memory.padding;
 const capi_error = @import("error.zig");

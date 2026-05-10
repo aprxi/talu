@@ -5,7 +5,7 @@
 //! but gradients and optimizer state are always f32.
 
 const std = @import("std");
-const tensor_mod = @import("tensor_pkg");
+const tensor_mod = @import("compute_pkg").tensor;
 
 const Tensor = tensor_mod.Tensor;
 const OwnedTensor = tensor_mod.OwnedTensor;

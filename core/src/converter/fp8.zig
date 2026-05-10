@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const log = @import("log_pkg");
-const tensor = @import("tensor_pkg");
-const dtype_mod = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype_mod = @import("compute_pkg").dtype;
 const safetensors = @import("io_pkg").safetensors.root;
 const repository = @import("io_pkg").repository.root;
 const gaf_paths = @import("gaf_paths.zig");

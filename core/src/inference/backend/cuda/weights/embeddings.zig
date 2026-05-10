@@ -6,11 +6,10 @@ const freeOwnedTensorView = host.freeOwnedTensorView;
 const decodeGaffineRow = gaffine_utils.decodeGaffineRow;
 const gaffineValueAt = gaffine_utils.gaffineValueAt;
 
-
 const std = @import("std");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const load_transforms = @import("models_pkg").load.transforms;
 const models = @import("models_pkg");
@@ -69,7 +68,6 @@ pub fn populatePrefillHiddenFromTokens(
         }
     }
 }
-
 
 pub fn tryUploadEmbeddingLookup(
     device: *compute.cuda.Device,
@@ -184,7 +182,6 @@ pub fn tryUploadEmbeddingLookup(
         .buffer = buffer,
     };
 }
-
 
 pub fn canUseModelEmbeddings(loaded: *const LoadedModel, d_model: usize) bool {
     if (d_model == 0) return false;
@@ -306,7 +303,6 @@ pub fn tryPopulateHiddenFromToken(
         else => return false,
     }
 }
-
 
 pub fn tryPopulateFinalNormWeight(loaded: *const LoadedModel, out: []f32) bool {
     if (loaded.ln_final) |ln_final| {

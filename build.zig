@@ -353,11 +353,9 @@ const Pcre2 = pcre2_port.Pcre2;
 const CorePackages = struct {
     env_pkg: *std.Build.Module,
     models_pkg: *std.Build.Module,
-    tensor_pkg: *std.Build.Module,
     compute_pkg: *std.Build.Module,
     log_pkg: *std.Build.Module,
     io_pkg: *std.Build.Module,
-    dtype_pkg: *std.Build.Module,
     xray_pkg: *std.Build.Module,
     runtime_contract_pkg: *std.Build.Module,
     progress_pkg: *std.Build.Module,
@@ -378,12 +376,6 @@ const CorePackages = struct {
                 .optimize = optimize,
                 .link_libc = true,
             }),
-            .tensor_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/compute/tensor.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
             .compute_pkg = b.createModule(.{
                 .root_source_file = b.path("core/src/compute/root.zig"),
                 .target = target,
@@ -398,12 +390,6 @@ const CorePackages = struct {
             }),
             .io_pkg = b.createModule(.{
                 .root_source_file = b.path("core/src/io/root.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-            .dtype_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/compute/dtype.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
@@ -445,11 +431,9 @@ const CorePackages = struct {
 fn addCorePackageImports(mod: *std.Build.Module, pkgs: *const CorePackages) void {
     mod.addImport("env_pkg", pkgs.env_pkg);
     mod.addImport("models_pkg", pkgs.models_pkg);
-    if (mod != pkgs.tensor_pkg) mod.addImport("tensor_pkg", pkgs.tensor_pkg);
     mod.addImport("compute_pkg", pkgs.compute_pkg);
     if (mod != pkgs.log_pkg) mod.addImport("log_pkg", pkgs.log_pkg);
     if (mod != pkgs.io_pkg) mod.addImport("io_pkg", pkgs.io_pkg);
-    if (mod != pkgs.dtype_pkg) mod.addImport("dtype_pkg", pkgs.dtype_pkg);
     mod.addImport("xray_pkg", pkgs.xray_pkg);
     if (mod != pkgs.runtime_contract_pkg) mod.addImport("runtime_contract_pkg", pkgs.runtime_contract_pkg);
     if (mod != pkgs.progress_pkg) mod.addImport("progress_pkg", pkgs.progress_pkg);
@@ -459,11 +443,9 @@ fn addCorePackageImports(mod: *std.Build.Module, pkgs: *const CorePackages) void
 
 fn wireCorePackageImports(pkgs: *const CorePackages) void {
     addCorePackageImports(pkgs.models_pkg, pkgs);
-    addCorePackageImports(pkgs.tensor_pkg, pkgs);
     addCorePackageImports(pkgs.compute_pkg, pkgs);
     addCorePackageImports(pkgs.log_pkg, pkgs);
     addCorePackageImports(pkgs.io_pkg, pkgs);
-    addCorePackageImports(pkgs.dtype_pkg, pkgs);
     addCorePackageImports(pkgs.xray_pkg, pkgs);
     addCorePackageImports(pkgs.runtime_contract_pkg, pkgs);
     addCorePackageImports(pkgs.progress_pkg, pkgs);
@@ -480,11 +462,9 @@ fn addCorePackageBuildImportsAndDeps(
 ) void {
     const modules = [_]*std.Build.Module{
         pkgs.models_pkg,
-        pkgs.tensor_pkg,
         pkgs.compute_pkg,
         pkgs.log_pkg,
         pkgs.io_pkg,
-        pkgs.dtype_pkg,
         pkgs.xray_pkg,
         pkgs.runtime_contract_pkg,
         pkgs.progress_pkg,

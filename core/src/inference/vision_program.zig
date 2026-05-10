@@ -321,7 +321,7 @@ test "compileVisionStagePlans accepts register-level mismatched handoff when dty
 }
 
 test "validateVisionStageHandoff rejects mismatched dtype" {
-    const DType = @import("dtype_pkg").DType;
+    const DType = @import("compute_pkg").dtype.DType;
     const reg0 = runtime_contract.registerFromIndex(0);
     const reg1 = runtime_contract.registerFromIndex(1);
 

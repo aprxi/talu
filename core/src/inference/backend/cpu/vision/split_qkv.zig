@@ -10,7 +10,7 @@
 //! before text prefill.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const models = @import("models_pkg");
 const layer_ops = @import("models_pkg").layer_ops;
 const opcode_map = @import("models_pkg").plan.opcode_map;

@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 const attention_mod = @import("../../attention_path.zig");
@@ -459,7 +459,6 @@ const engine_forward = @import("../../exec/common.zig");
 const engine_weights = @import("../../weights/root.zig");
 const bufferSlice = engine_weights.bufferSlice;
 const resizeScratchBuffer = engine_weights.resizeScratchBuffer;
-
 
 /// Ensure the attention scores workspace is large enough for GEMM-based
 /// prefill attention.  Layout: [kv_groups * q_rows * seq_len] f32.

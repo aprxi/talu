@@ -8,8 +8,8 @@
 //! containers (`TransformerBlock`) that the engine references.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;

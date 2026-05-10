@@ -6,7 +6,7 @@
 //! so a single LoRA config works for Llama, Qwen, Gemma, Granite, etc.
 
 const std = @import("std");
-const tensor_mod = @import("tensor_pkg");
+const tensor_mod = @import("compute_pkg").tensor;
 const op_types = @import("models_pkg").op_types;
 
 const Tensor = tensor_mod.Tensor;

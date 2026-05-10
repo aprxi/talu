@@ -13,7 +13,7 @@
 //! for a given model family.
 
 const std = @import("std");
-const dtype_mod = @import("dtype_pkg");
+const dtype_mod = @import("compute_pkg").dtype;
 const kernel_info = @import("kernel_info.zig");
 const models_registry = @import("models_pkg").registry;
 

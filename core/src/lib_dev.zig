@@ -17,7 +17,7 @@ pub const responses = @import("responses/root.zig");
 pub const generation_config = @import("models/config/generation.zig");
 pub const converter = @import("converter/root.zig");
 pub const compute = @import("compute_pkg");
-pub const tensor = @import("tensor_pkg");
+pub const tensor = @import("compute_pkg").tensor;
 pub const xray = @import("xray_pkg");
 pub const validate = @import("validate_pkg");
 pub const dump = @import("xray_pkg").dump.root;
@@ -28,14 +28,14 @@ pub const models = struct {
 };
 
 pub const core = struct {
-    pub const tensor = @import("tensor_pkg");
-    pub const dtype = @import("dtype_pkg");
+    pub const tensor = @import("compute_pkg").tensor;
+    pub const dtype = @import("compute_pkg").dtype;
     pub const compute = @import("compute_pkg");
     pub const validate = @import("validate_pkg");
 
-    pub const Tensor = @import("tensor_pkg").Tensor;
-    pub const OwnedTensor = @import("tensor_pkg").OwnedTensor;
-    pub const DType = @import("dtype_pkg").DType;
+    pub const Tensor = @import("compute_pkg").tensor.Tensor;
+    pub const OwnedTensor = @import("compute_pkg").tensor.OwnedTensor;
+    pub const DType = @import("compute_pkg").dtype.DType;
     pub const Device = @import("compute_pkg").Device;
     pub const DeviceType = @import("compute_pkg").DeviceType;
 };

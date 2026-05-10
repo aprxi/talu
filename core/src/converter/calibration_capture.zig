@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const dtype_mod = @import("dtype_pkg");
+const dtype_mod = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const xray = @import("xray_pkg");
 const responses_local = @import("../responses/local.zig");

@@ -5,10 +5,10 @@
 
 const std = @import("std");
 const log = @import("log_pkg");
-const tensor_mod = @import("tensor_pkg");
+const tensor_mod = @import("compute_pkg").tensor;
 const Tensor = tensor_mod.Tensor;
 const models = @import("models_pkg");
-const dtype_mod = @import("dtype_pkg");
+const dtype_mod = @import("compute_pkg").dtype;
 const compute = @import("compute_pkg");
 const mlx_graph = compute.metal.graph;
 const runtime_graph = @import("../runtime_graph.zig");

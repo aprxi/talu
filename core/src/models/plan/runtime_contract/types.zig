@@ -3,7 +3,7 @@
 //! This module contains backend-agnostic plan/execution ABI types.
 
 const std = @import("std");
-const dtype = @import("dtype_pkg");
+const dtype = @import("compute_pkg").dtype;
 const op_types = @import("models_pkg").op_types;
 const layer_ops = @import("models_pkg").layer_ops;
 const opcode_map = @import("models_pkg").plan.opcode_map;

@@ -9,7 +9,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const trace = @import("xray_pkg").trace;
-const dtype_mod = @import("dtype_pkg");
+const dtype_mod = @import("compute_pkg").dtype;
 
 pub const DumpEnabled = build_options.dump_tensors;
 

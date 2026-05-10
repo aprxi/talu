@@ -20,7 +20,7 @@
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const Tensor = tensor.Tensor;
 const log = @import("log_pkg");
 const compute = @import("compute_pkg");

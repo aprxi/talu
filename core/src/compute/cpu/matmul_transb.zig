@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const parallel = @import("compute_pkg").parallel;
-const tensor_mod = @import("tensor_pkg");
+const tensor_mod = @import("../tensor.zig");
 const simd = @import("simd/arch/root.zig");
 const matmul_primitives = @import("matmul_primitives.zig");
 

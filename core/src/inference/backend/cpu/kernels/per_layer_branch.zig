@@ -14,8 +14,8 @@ const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_activation = compute.cpu.activation;
 const cpu_common = compute.cpu.common;
-const tensor_mod = @import("tensor_pkg");
-const dtype_mod = @import("dtype_pkg");
+const tensor_mod = @import("compute_pkg").tensor;
+const dtype_mod = @import("compute_pkg").dtype;
 const norm_kernel = @import("norm.zig");
 const trace = @import("xray_pkg").trace;
 

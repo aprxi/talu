@@ -26,7 +26,7 @@
 //! 6. Residual add (hidden += ffn_out * residual_multiplier)
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const Tensor = tensor.Tensor;
 const OwnedTensor = tensor.OwnedTensor;
 const compute = @import("compute_pkg");

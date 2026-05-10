@@ -3,9 +3,9 @@
 //! Shared routines for orienting weights, dequantizing, and fusing projections.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const config_types = @import("../config/types.zig");
-const dtype = @import("dtype_pkg");
+const dtype = @import("compute_pkg").dtype;
 const st_loader = @import("io_pkg").safetensors.root;
 const log = @import("log_pkg");
 const op_types = @import("models_pkg").op_types;

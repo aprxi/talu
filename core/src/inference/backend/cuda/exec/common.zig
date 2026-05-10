@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 const staged_orchestrator = @import("../../staged_orchestrator.zig");
@@ -2576,151 +2576,151 @@ fn computeGpuPrototypeLogitsWithLayerLimit(
 
         var final_hidden = input_row;
 
-    if (@import("env_pkg").getenv("TALU_DUMP_HIDDEN") != null) {
-        log.warn("inference", "GPU_LOOP_ENTRY", .{
-            .layer_limit = layer_limit,
-            .split_layer = self.split_layer,
-            .blocks_len = self.block_runtime.blocks.len,
-            .use_preloaded = use_preloaded_input,
-            .d_model = self.d_model,
-        });
-    }
-
-    var layer_idx: usize = 0;
-    while (layer_idx < layer_limit) : (layer_idx += 1) {
-        const layer = &self.block_runtime.blocks[layer_idx];
-        const attention_kernels: AttentionKernelSet = switch (self.kv_cache_dtype) {
-            .f16 => .{
-                .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-                .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-                .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
-                .attn_fused_prefill_heads_f16_kv_function = self.attn_fused_prefill_heads_f16_kv_function,
-                .attn_fused_prefill_heads_f16_kv_gqa_function = self.attn_fused_prefill_heads_f16_kv_gqa_function,
-                .softmax_rows_function = softmax_rows_function,
-                .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
-            },
-            .i8 => .{
-                .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
-                .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
-                .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
-                .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
-                .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
-                .softmax_rows_function = softmax_rows_function,
-                .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
-            },
-            .fp8 => .{
-                .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
-                .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
-                .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
-                .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
-                .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
-                .softmax_rows_function = softmax_rows_function,
-                .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
-            },
-        };
-        final_hidden = self.tryExecuteLayerProgram(
-            layer,
-            slot_index,
-            layer_idx,
-            d_model_u32,
-            head_dim_u32,
-            rope_dim_u32,
-            n_heads_u32,
-            n_kv_heads_u32,
-            1,
-            seq_len_u32,
-            trace_seq_len_u32,
-            trace_pos_offset,
-            position,
-            position_u32,
-            global_rope_theta,
-            local_rope_theta,
-            rope_function,
-            copy_function,
-            cast_f32_to_f16_function,
-            kv_write_f16_function,
-            rope_store_f16_function,
-            shortconv_step_function,
-            attention_kernels,
-            &batch_info,
-        ) catch |err| {
-            log.warn("inference", "CUDA decode layer dispatch failed", .{
-                .layer = layer_idx,
-                .slot = slot_index,
-                .position = position,
-                .seq_len = seq_len_u32,
-                .batched_attn_max_seq = self.runtime_buffers.batched_attn_max_seq_len,
-                .kv_dtype = @tagName(self.kv_cache_dtype),
-                .reason = @errorName(err),
+        if (@import("env_pkg").getenv("TALU_DUMP_HIDDEN") != null) {
+            log.warn("inference", "GPU_LOOP_ENTRY", .{
+                .layer_limit = layer_limit,
+                .split_layer = self.split_layer,
+                .blocks_len = self.block_runtime.blocks.len,
+                .use_preloaded = use_preloaded_input,
+                .d_model = self.d_model,
             });
-            return err;
-        };
-        if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
-        if (layer.gated_delta_binding != null) batch_info.gd_layer_index += 1;
-        if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
-        dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_layer", self.d_model, 1);
-        if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
-            if (per_layer_source_embeddings_opt) |*per_layer_source_embeddings| {
-                try per_layer_branch_feature.applyPerLayerBranch(
-                    self,
-                    layer_idx,
-                    gemma_token_id_single[0..],
-                    per_layer_source_embeddings,
-                    &self.runtime_buffers.input_dev,
-                );
-                final_hidden = self.runtime_buffers.input_dev;
-                dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_ple", self.d_model, 1);
-            } else if (per_layer_branch_feature.hasStandaloneLayerScalars(self)) {
-                try per_layer_branch_feature.applyStandaloneLayerScalar(self, layer_idx, &self.runtime_buffers.input_dev, 1);
-            }
         }
-        // Deepstack: per-request feature vector addition between layer program
-        // dispatches. Operates outside the per-instruction adapter table — same
-        // pattern as embedding lookup and final logit projection.
-        if (deepstack_layer_features_opt) |deepstack_layer_features| {
-            if (deepstack_feature_index_opt) |deepstack_feature_index| {
-                if (layer_idx < deepstack_layer_features.len) {
-                    const layer_features = deepstack_layer_features[layer_idx];
-                    const feature_rows = std.math.divExact(usize, layer_features.len, self.d_model) catch {
-                        log.warn("inference", "CUDA deepstack add skipped: invalid layer feature stride", .{
-                            .layer_index = layer_idx,
-                            .feature_len = layer_features.len,
-                            .d_model = self.d_model,
-                        });
-                        continue;
-                    };
-                    if (deepstack_feature_index >= feature_rows) {
-                        log.warn("inference", "CUDA deepstack add skipped: feature row index out of range", .{
-                            .layer_index = layer_idx,
-                            .feature_index = deepstack_feature_index,
-                            .feature_rows = feature_rows,
-                        });
-                        continue;
-                    }
-                    const row_start = std.math.mul(usize, deepstack_feature_index, self.d_model) catch {
-                        log.warn("inference", "CUDA deepstack add skipped: row offset overflow", .{
-                            .layer_index = layer_idx,
-                            .feature_index = deepstack_feature_index,
-                            .d_model = self.d_model,
-                        });
-                        continue;
-                    };
-                    const feature_row = layer_features[row_start .. row_start + self.d_model];
-                    try self.runtime_buffers.deepstack_add_dev.upload(&self.device, std.mem.sliceAsBytes(feature_row));
-                    try compute.cuda.vector_add.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        vector_add_function,
+
+        var layer_idx: usize = 0;
+        while (layer_idx < layer_limit) : (layer_idx += 1) {
+            const layer = &self.block_runtime.blocks[layer_idx];
+            const attention_kernels: AttentionKernelSet = switch (self.kv_cache_dtype) {
+                .f16 => .{
+                    .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+                    .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+                    .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
+                    .attn_fused_prefill_heads_f16_kv_function = self.attn_fused_prefill_heads_f16_kv_function,
+                    .attn_fused_prefill_heads_f16_kv_gqa_function = self.attn_fused_prefill_heads_f16_kv_gqa_function,
+                    .softmax_rows_function = softmax_rows_function,
+                    .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+                },
+                .i8 => .{
+                    .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
+                    .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
+                    .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+                    .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
+                    .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
+                    .softmax_rows_function = softmax_rows_function,
+                    .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+                },
+                .fp8 => .{
+                    .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
+                    .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
+                    .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
+                    .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
+                    .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
+                    .softmax_rows_function = softmax_rows_function,
+                    .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+                },
+            };
+            final_hidden = self.tryExecuteLayerProgram(
+                layer,
+                slot_index,
+                layer_idx,
+                d_model_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                n_heads_u32,
+                n_kv_heads_u32,
+                1,
+                seq_len_u32,
+                trace_seq_len_u32,
+                trace_pos_offset,
+                position,
+                position_u32,
+                global_rope_theta,
+                local_rope_theta,
+                rope_function,
+                copy_function,
+                cast_f32_to_f16_function,
+                kv_write_f16_function,
+                rope_store_f16_function,
+                shortconv_step_function,
+                attention_kernels,
+                &batch_info,
+            ) catch |err| {
+                log.warn("inference", "CUDA decode layer dispatch failed", .{
+                    .layer = layer_idx,
+                    .slot = slot_index,
+                    .position = position,
+                    .seq_len = seq_len_u32,
+                    .batched_attn_max_seq = self.runtime_buffers.batched_attn_max_seq_len,
+                    .kv_dtype = @tagName(self.kv_cache_dtype),
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
+            if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
+            if (layer.gated_delta_binding != null) batch_info.gd_layer_index += 1;
+            if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
+            dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_layer", self.d_model, 1);
+            if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
+                if (per_layer_source_embeddings_opt) |*per_layer_source_embeddings| {
+                    try per_layer_branch_feature.applyPerLayerBranch(
+                        self,
+                        layer_idx,
+                        gemma_token_id_single[0..],
+                        per_layer_source_embeddings,
                         &self.runtime_buffers.input_dev,
-                        &self.runtime_buffers.deepstack_add_dev,
-                        &self.runtime_buffers.input_dev,
-                        d_model_u32,
                     );
                     final_hidden = self.runtime_buffers.input_dev;
+                    dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_ple", self.d_model, 1);
+                } else if (per_layer_branch_feature.hasStandaloneLayerScalars(self)) {
+                    try per_layer_branch_feature.applyStandaloneLayerScalar(self, layer_idx, &self.runtime_buffers.input_dev, 1);
+                }
+            }
+            // Deepstack: per-request feature vector addition between layer program
+            // dispatches. Operates outside the per-instruction adapter table — same
+            // pattern as embedding lookup and final logit projection.
+            if (deepstack_layer_features_opt) |deepstack_layer_features| {
+                if (deepstack_feature_index_opt) |deepstack_feature_index| {
+                    if (layer_idx < deepstack_layer_features.len) {
+                        const layer_features = deepstack_layer_features[layer_idx];
+                        const feature_rows = std.math.divExact(usize, layer_features.len, self.d_model) catch {
+                            log.warn("inference", "CUDA deepstack add skipped: invalid layer feature stride", .{
+                                .layer_index = layer_idx,
+                                .feature_len = layer_features.len,
+                                .d_model = self.d_model,
+                            });
+                            continue;
+                        };
+                        if (deepstack_feature_index >= feature_rows) {
+                            log.warn("inference", "CUDA deepstack add skipped: feature row index out of range", .{
+                                .layer_index = layer_idx,
+                                .feature_index = deepstack_feature_index,
+                                .feature_rows = feature_rows,
+                            });
+                            continue;
+                        }
+                        const row_start = std.math.mul(usize, deepstack_feature_index, self.d_model) catch {
+                            log.warn("inference", "CUDA deepstack add skipped: row offset overflow", .{
+                                .layer_index = layer_idx,
+                                .feature_index = deepstack_feature_index,
+                                .d_model = self.d_model,
+                            });
+                            continue;
+                        };
+                        const feature_row = layer_features[row_start .. row_start + self.d_model];
+                        try self.runtime_buffers.deepstack_add_dev.upload(&self.device, std.mem.sliceAsBytes(feature_row));
+                        try compute.cuda.vector_add.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            vector_add_function,
+                            &self.runtime_buffers.input_dev,
+                            &self.runtime_buffers.deepstack_add_dev,
+                            &self.runtime_buffers.input_dev,
+                            d_model_u32,
+                        );
+                        final_hidden = self.runtime_buffers.input_dev;
+                    }
                 }
             }
         }
-    }
 
         // Sync block_runtime with slot_kv_states after the batched mixer may
         // have updated GD state (conv_ring_head) directly in slot_kv_states,

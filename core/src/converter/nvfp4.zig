@@ -20,8 +20,8 @@ const safetensors = @import("io_pkg").safetensors.root;
 const config_loader = @import("models_pkg").config;
 const models_registry = @import("models_pkg").registry;
 const op_types = @import("models_pkg").op_types;
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 
 const nvfp4_group_size: usize = 16;
 const global_scale_sample_limit: usize = 8192;

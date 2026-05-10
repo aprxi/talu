@@ -3,8 +3,8 @@
 const std = @import("std");
 const models = @import("models_pkg");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const st_loader = @import("io_pkg").safetensors.root;
 

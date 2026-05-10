@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const compute = @import("compute_pkg");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 const staged_orchestrator = @import("../../staged_orchestrator.zig");

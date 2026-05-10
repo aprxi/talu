@@ -5,9 +5,9 @@
 //! components (QKV, gate/up projections).
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const config_types = @import("../config/types.zig");
-const dtype = @import("dtype_pkg");
+const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const progress_mod = @import("progress_pkg");
 const runtime_blocks = @import("models_pkg").runtime_blocks;

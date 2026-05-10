@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const tensor = @import("tensor_pkg");
-const dtype = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype = @import("compute_pkg").dtype;
 const json = @import("../json/root.zig");
 const mmap_policy = @import("compute_pkg").mmap_policy;
 const windows_c = if (builtin.os.tag == .windows) @cImport({
@@ -368,7 +368,6 @@ pub const SafeTensors = struct {
 
         return safetensors;
     }
-
 };
 
 /// Parse SafeTensors dtype string to internal DType.
@@ -639,10 +638,10 @@ fn createMockSafeTensorsFile(allocator: std.mem.Allocator, header_json: []const 
     std.mem.writeInt(u64, buffer[0..8], @intCast(header_len), .little);
 
     // Write JSON header
-    @memcpy(buffer[8..8 + header_len], header_json);
+    @memcpy(buffer[8 .. 8 + header_len], header_json);
 
     // Write tensor data
-    @memcpy(buffer[8 + header_len..], tensor_data);
+    @memcpy(buffer[8 + header_len ..], tensor_data);
 
     return buffer;
 }
@@ -653,12 +652,12 @@ test "SafeTensors: load valid file with single tensor" {
 
     // Create a simple F32 tensor with shape [2, 3]
     const tensor_data = [_]u8{
-        0, 0, 0, 0,  // 0.0
-        0, 0, 128, 63,  // 1.0
-        0, 0, 0, 64,  // 2.0
-        0, 0, 64, 64,  // 3.0
-        0, 0, 128, 64,  // 4.0
-        0, 0, 160, 64,  // 5.0
+        0, 0, 0, 0, // 0.0
+        0, 0, 128, 63, // 1.0
+        0, 0, 0, 64, // 2.0
+        0, 0, 64, 64, // 3.0
+        0, 0, 128, 64, // 4.0
+        0, 0, 160, 64, // 5.0
     };
 
     const header =
@@ -703,9 +702,9 @@ test "SafeTensors: load file with multiple tensors" {
 
     // Create two tensors
     const tensor_data = [_]u8{
-        0, 0, 128, 63,  // weight1: [1.0]
-        0, 0, 0, 64,  // weight2: [2.0]
-        0, 0, 64, 64,  // [3.0]
+        0, 0, 128, 63, // weight1: [1.0]
+        0, 0, 0, 64, // weight2: [2.0]
+        0, 0, 64, 64, // [3.0]
     };
 
     const header =
@@ -746,7 +745,7 @@ test "SafeTensors: getTensor with dtype validation" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const tensor_data = [_]u8{0, 0, 128, 63}; // 1.0 in F32
+    const tensor_data = [_]u8{ 0, 0, 128, 63 }; // 1.0 in F32
     const header =
         \\{"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     ;
@@ -781,7 +780,7 @@ test "SafeTensors: getTensor zero-initializes optional quantization metadata" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const tensor_data = [_]u8{0, 0, 128, 63}; // 1.0 in F32
+    const tensor_data = [_]u8{ 0, 0, 128, 63 }; // 1.0 in F32
     const header =
         \\{"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     ;
@@ -812,7 +811,7 @@ test "SafeTensors: getTensor for nonexistent tensor" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const tensor_data = [_]u8{0, 0, 128, 63};
+    const tensor_data = [_]u8{ 0, 0, 128, 63 };
     const header =
         \\{"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     ;
@@ -841,9 +840,9 @@ test "SafeTensors: load file with different dtypes" {
 
     // Create tensors with different dtypes
     const tensor_data = [_]u8{
-        0, 0, 128, 63,  // f32_weight: 1.0 (F32, 4 bytes)
-        0, 60,          // f16_weight: 1.0 (F16, 2 bytes)
-        42,             // i8_weight: 42 (I8, 1 byte)
+        0, 0, 128, 63, // f32_weight: 1.0 (F32, 4 bytes)
+        0, 60, // f16_weight: 1.0 (F16, 2 bytes)
+        42, // i8_weight: 42 (I8, 1 byte)
     };
 
     const header =
@@ -1002,7 +1001,7 @@ test "SafeTensors: tryGetBytes helper" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const tensor_data = [_]u8{1, 2, 3, 4, 5, 6, 7, 8};
+    const tensor_data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const header =
         \\{"model.weight": {"dtype": "I8", "shape": [4], "data_offsets": [0, 4]},
         \\ "model.bias": {"dtype": "I8", "shape": [4], "data_offsets": [4, 8]}}
@@ -1042,7 +1041,7 @@ test "SafeTensors: invalid file - too small" {
     const allocator = testing.allocator;
 
     // Create a file that's less than 8 bytes (minimum for header length)
-    const small_data = [_]u8{1, 2, 3};
+    const small_data = [_]u8{ 1, 2, 3 };
 
     const tmp_dir = testing.tmpDir(.{});
     var tmp_file = try tmp_dir.dir.createFile("test.safetensors", .{ .read = true });
@@ -1123,7 +1122,7 @@ test "SafeTensors: skip invalid tensor entries" {
 
     // Mix of valid and invalid tensor entries
     // Invalid entries should be silently skipped
-    const tensor_data = [_]u8{0, 0, 128, 63}; // 4 bytes for valid tensor
+    const tensor_data = [_]u8{ 0, 0, 128, 63 }; // 4 bytes for valid tensor
     const header =
         \\{"valid": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
         \\ "missing_dtype": {"shape": [1], "data_offsets": [0, 4]},
@@ -1160,7 +1159,7 @@ test "SafeTensors: skip tensor with out-of-bounds offsets" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const tensor_data = [_]u8{0, 0, 128, 63}; // Only 4 bytes of data
+    const tensor_data = [_]u8{ 0, 0, 128, 63 }; // Only 4 bytes of data
     const header =
         \\{"valid": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
         \\ "out_of_bounds": {"dtype": "F32", "shape": [10], "data_offsets": [0, 1000]},
@@ -1221,8 +1220,8 @@ test "SafeTensors.deinit: properly cleans up resources" {
     const allocator = testing.allocator;
 
     const tensor_data = [_]u8{
-        0, 0, 128, 63,  // weight1: [1.0]
-        0, 0, 0, 64,    // weight2: [2.0]
+        0, 0, 128, 63, // weight1: [1.0]
+        0, 0, 0, 64, // weight2: [2.0]
     };
 
     const header =
@@ -1258,8 +1257,8 @@ test "SafeTensors.hasTensor: returns true for existing tensors" {
     const allocator = testing.allocator;
 
     const tensor_data = [_]u8{
-        0, 0, 128, 63,  // model.weight: [1.0]
-        0, 0, 0, 64,    // model.bias: [2.0]
+        0, 0, 128, 63, // model.weight: [1.0]
+        0, 0, 0, 64, // model.bias: [2.0]
     };
 
     const header =
@@ -1291,7 +1290,7 @@ test "SafeTensors.hasTensor: returns false for nonexistent tensors" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const tensor_data = [_]u8{0, 0, 128, 63};
+    const tensor_data = [_]u8{ 0, 0, 128, 63 };
     const header =
         \\{"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     ;
@@ -1322,7 +1321,7 @@ test "SafeTensors.hasTensor: case sensitive and exact match" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const tensor_data = [_]u8{0, 0, 128, 63};
+    const tensor_data = [_]u8{ 0, 0, 128, 63 };
     const header =
         \\{"MyTensor": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     ;
@@ -1409,7 +1408,7 @@ test "SafeTensors.tensorCount: matches actual loaded tensors" {
     const allocator = testing.allocator;
 
     // Create file with mix of valid and invalid entries
-    const tensor_data = [_]u8{0, 0, 128, 63, 0, 0, 0, 64};
+    const tensor_data = [_]u8{ 0, 0, 128, 63, 0, 0, 0, 64 };
     const header =
         \\{"valid1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
         \\ "valid2": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]},

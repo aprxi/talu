@@ -4,7 +4,7 @@
 //! applies transforms/layout handling without model-specific hardcoding.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const config_types = @import("../config/types.zig");
 const st_loader = @import("io_pkg").safetensors.root;
 const model_types = @import("models_pkg").op_types;

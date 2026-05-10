@@ -8,7 +8,7 @@ pub const supported = true;
 
 const std = @import("std");
 const build_options = @import("build_options");
-const tensor = @import("tensor_pkg");
+const tensor = @import("compute_pkg").tensor;
 const compute = @import("compute_pkg");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_activation = compute.cpu.activation;

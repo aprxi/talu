@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const compute = @import("compute_pkg");
-const dtype = @import("dtype_pkg");
+const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 
 const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
@@ -270,8 +270,8 @@ pub fn probeGaffineU4SequenceRowsSupport(backend: anytype) !bool {
     // Row0(1.0) × W0(nibble=1): 32 × 1 = 32,  × W1(nibble=2): 32 × 2 = 64
     // Row1(2.0) × W0(nibble=1): 32 × 2 = 64,  × W1(nibble=2): 32 × 4 = 128
     const expected = [_]f32{
-        32.0,  64.0,
-        64.0,  128.0,
+        32.0, 64.0,
+        64.0, 128.0,
     };
     var actual = [_]f32{0.0} ** (out_dim * batch_rows);
 
@@ -357,8 +357,8 @@ pub fn probeGaffineU4SequenceFusedQkvSupport(backend: anytype) !bool {
     };
     // Q: dequant = nibble. Same as basic probe.
     const expected_q = [_]f32{
-        32.0,  64.0,
-        64.0,  128.0,
+        32.0, 64.0,
+        64.0, 128.0,
     };
     // K: dequant = 2×nibble. Row0×W0: 32×2=64, Row0×W1: 32×4=128, ...
     const expected_k = [_]f32{
@@ -494,8 +494,8 @@ pub fn probeGaffineU4SequenceFusedGateUpSupport(backend: anytype) !bool {
     };
     // Gate: dequant = nibble. Same as basic probe.
     const expected_gate = [_]f32{
-        32.0,  64.0,
-        64.0,  128.0,
+        32.0, 64.0,
+        64.0, 128.0,
     };
     // Up: dequant = 2×nibble+1. Row0×W0: 32×3=96, Row0×W1: 32×5=160, ...
     const expected_up = [_]f32{

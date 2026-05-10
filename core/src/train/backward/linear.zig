@@ -9,7 +9,7 @@
 //! Uses SIMD-optimized matmul primitives from compute/cpu.
 
 const std = @import("std");
-const tensor_mod = @import("tensor_pkg");
+const tensor_mod = @import("compute_pkg").tensor;
 const compute = @import("compute_pkg");
 
 const Tensor = tensor_mod.Tensor;

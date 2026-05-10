@@ -1,8 +1,8 @@
 //! Shared tensor conversion helpers for inference vision runtimes.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
-const dtype_mod = @import("dtype_pkg");
+const tensor = @import("compute_pkg").tensor;
+const dtype_mod = @import("compute_pkg").dtype;
 
 const Tensor = tensor.Tensor;
 

@@ -10,7 +10,7 @@
 //! operations. This can be printed for debugging or used for optimization.
 
 const std = @import("std");
-const dtype_mod = @import("dtype_pkg");
+const dtype_mod = @import("compute_pkg").dtype;
 const DType = dtype_mod.DType;
 
 /// Represents a single computational kernel operation
