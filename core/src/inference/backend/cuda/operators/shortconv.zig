@@ -16,7 +16,7 @@ const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../runtime/_types_impl.zig");
+const engine_types = @import("../runtime/root.zig");
 const LayerAttentionExecConfig = engine_types.LayerAttentionExecConfig;
 const LayerAttentionRuntime = engine_types.LayerAttentionRuntime;
 const LinearWeight = engine_types.LinearWeight;

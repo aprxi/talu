@@ -12,6 +12,7 @@ pub const sampling = @import("sampling.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const vision_types = @import("vision_types.zig");
 pub const runtime_contract = @import("runtime_contract_pkg");
+pub const bridge = @import("bridge/root.zig");
 
 /// Generation request/response types.
 pub const types = struct {

@@ -79,7 +79,7 @@ void stable_sort_topk_pairs(float* logits, int32_t* ids, int count) {
     std::memcpy(ids, ids_sorted.data(), static_cast<size_t>(count) * sizeof(int32_t));
 }
 array apply_top_p_filter(const array& logits, float top_p);
-bool env_truthy(const char* name, bool fallback);
+bool env_truthy(const char* name, bool default_value);
 
 std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates(int k) {
     static std::unordered_map<int, std::shared_ptr<const CompiledTopKFn>> cache;

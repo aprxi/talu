@@ -247,64 +247,11 @@ int32_t mlx_decode_logits_batch(
             }
         }
 
-        std::vector<int32_t> fallback_rows;
-        fallback_rows.reserve(static_cast<size_t>(batch_size));
         for (int32_t i = 0; i < batch_size; ++i) {
             if (decode_done[static_cast<size_t>(i)] == 0) {
-                fallback_rows.push_back(i);
-            }
-        }
-        if (fallback_rows.empty()) {
-            return 1;
-        }
-
-        auto& next_logits_flat_batch = g_decode_batch_logits_flat_scratch;
-        next_logits_flat_batch.clear();
-        if (next_logits_flat_batch.capacity() < fallback_rows.size()) {
-            next_logits_flat_batch.reserve(fallback_rows.size());
-        }
-
-        for (int32_t i : fallback_rows) {
-            mlx_ctx* ctx = ctxs[i];
-            const int32_t token_scalar = tokens[i];
-            const array token_arr(&token_scalar, Shape{1, 1}, int32);
-            const bool decode_trace_enabled = ctx->xray_enabled &&
-                (xray_should_emit(XRAY_POINT_LAYER_INPUT, 0, 1) ||
-                    xray_should_emit(XRAY_POINT_ATTN_OUT, 0, 1) ||
-                    xray_should_emit(XRAY_POINT_BLOCK_OUT, 0, 1) ||
-                    xray_should_emit(XRAY_POINT_FINAL_NORM, XRAY_GLOBAL_LAYER, 1) ||
-                    xray_should_emit(XRAY_POINT_LM_HEAD, XRAY_GLOBAL_LAYER, 0));
-            const TraceFrame trace_frame{
-                .token = ctx->trace_decode_token,
-                .layer_position = 1,
-                .emit_embed = false,
-            };
-            const array logits = decode_trace_enabled
-                ? forward_logits(ctx, token_arr, &trace_frame)
-                : forward_logits(ctx, token_arr);
-            const array next_logits = last_token_logits(logits);
-            const int flat_size = static_cast<int>(next_logits.size());
-            const array next_logits_flat = reshape(astype(next_logits, float32), {flat_size});
-            if (static_cast<int32_t>(next_logits_flat.size()) != logits_len) {
-                g_last_error = "mlx_decode_logits_batch: logits length mismatch";
+                g_last_error = "mlx_decode_logits_batch: fused decode did not cover every row";
                 return 0;
             }
-            next_logits_flat_batch.push_back(next_logits_flat);
-        }
-
-        if (!next_logits_flat_batch.empty()) {
-            eval(next_logits_flat_batch);
-            synchronize();
-        }
-        const size_t bytes = static_cast<size_t>(logits_len) * sizeof(float);
-        for (size_t row_idx = 0; row_idx < fallback_rows.size(); ++row_idx) {
-            const int32_t i = fallback_rows[row_idx];
-            std::memcpy(
-                out_logits_ptrs[i],
-                next_logits_flat_batch[row_idx].data<float>(),
-                bytes
-            );
-            ctxs[i]->trace_decode_token += 1;
         }
         return 1;
     } catch (const std::exception& e) {

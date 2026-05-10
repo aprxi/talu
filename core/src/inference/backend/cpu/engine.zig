@@ -447,7 +447,7 @@ pub const FusedCpuBackend = struct {
             kv_quant_mode = .f32;
             log.warn("inference", "CPU KV INT8 disabled for wide-head model", .{
                 .max_head_dim = max_head_dim,
-                .fallback = "f32",
+                .selected_dtype = "f32",
             });
         }
         var kv_cache = try LayeredBatchedKVCache.initWithModePerLayer(

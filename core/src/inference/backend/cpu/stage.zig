@@ -6,7 +6,7 @@
 //! so transfer methods can address per-slot activations deterministically.
 
 const std = @import("std");
-const pipeline = @import("../pipeline.zig");
+const pipeline = @import("../../bridge/pipeline.zig");
 const FusedCpuBackend = @import("engine.zig").FusedCpuBackend;
 
 pub const CpuStage = struct {

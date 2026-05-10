@@ -8,7 +8,7 @@ const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../../runtime/_types_impl.zig");
+const engine_types = @import("../../runtime/root.zig");
 const BlockRuntimeLayer = engine_types.BlockRuntimeLayer;
 const LayerAttentionRuntime = engine_types.LayerAttentionRuntime;
 const LinearWeight = engine_types.LinearWeight;

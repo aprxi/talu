@@ -30,12 +30,10 @@ pub const sampling = @import("sampling.zig");
 pub const selftest = @import("selftest.zig");
 pub const smoke_checks = selftest;
 
-pub const runtime = @import("runtime/root.zig");
 pub const exec = @import("exec/root.zig");
 pub const program = @import("program/root.zig");
 pub const operators = @import("operators/root.zig");
 pub const weights = @import("weights/root.zig");
-pub const engine_parts = @import("engine/root.zig");
 pub const per_layer_branch = @import("per_layer_branch.zig");
 
 pub const primitive_capabilities = compute.cuda.capabilities.support;

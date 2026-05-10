@@ -263,7 +263,7 @@ int32_t mlx_test_rmsnorm_gated_kernel_matches_reference(void) {
         const array per_head_weight_flat = reshape(per_head_weight, {Hv * Dv});
 
         const array actual_shared = rmsnorm_gated(hidden, gate, shared_weight, eps);
-        const array expected_shared = rmsnorm_gated_fallback(hidden, gate, shared_weight, eps);
+        const array expected_shared = rmsnorm_gated_graph(hidden, gate, shared_weight, eps);
 
         const array hidden_f32 = astype(hidden, float32);
         const array gate_f32 = astype(gate, float32);
@@ -758,7 +758,7 @@ int32_t mlx_test_nvfp4_mmap_strict_policy(void) {
     return 1;
 }
 
-int32_t mlx_test_dense_lm_head_lhs_fallback(void) {
+int32_t mlx_test_dense_lm_head_lhs_primary(void) {
     try {
         constexpr int hidden = 8;
         constexpr int vocab = 6;
@@ -788,11 +788,11 @@ int32_t mlx_test_dense_lm_head_lhs_fallback(void) {
         synchronize();
         const float* diff_ptr = diff.data<float>();
         if (!diff_ptr) {
-            g_last_error = "mlx_test_dense_lm_head_lhs_fallback: failed to materialize diff";
+            g_last_error = "mlx_test_dense_lm_head_lhs_primary: failed to materialize diff";
             return 0;
         }
         if (diff_ptr[0] > 1e-6f) {
-            g_last_error = "mlx_test_dense_lm_head_lhs_fallback: fallback output mismatch";
+            g_last_error = "mlx_test_dense_lm_head_lhs_primary: dense output mismatch";
             return 0;
         }
         return 1;
@@ -800,7 +800,7 @@ int32_t mlx_test_dense_lm_head_lhs_fallback(void) {
         g_last_error = e.what();
         return 0;
     } catch (...) {
-        g_last_error = "unknown error in mlx_test_dense_lm_head_lhs_fallback";
+        g_last_error = "unknown error in mlx_test_dense_lm_head_lhs_primary";
         return 0;
     }
 }

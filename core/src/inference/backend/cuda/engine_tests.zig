@@ -21,7 +21,7 @@ const engine = @import("engine.zig");
 const CudaBackend = engine.CudaBackend;
 
 // --- Types from engine_types.zig ---
-const engine_types = @import("runtime/_types_impl.zig");
+const engine_types = @import("runtime/root.zig");
 const DeviceTensor = engine_types.DeviceTensor;
 const LinearWeight = engine_types.LinearWeight;
 const U16LinearWeight = engine_types.U16LinearWeight;
@@ -388,7 +388,7 @@ test "required_kernels keeps heads-based attention path canonical" {
         compute.cuda.attn_weighted_sum_heads_f16_kv.op_name,
         compute.cuda.softmax_rows.op_name,
     };
-    const removed_ops = [_][]const u8{
+    const disallowed_ops = [_][]const u8{
         "attn_scores_f32",
         "attn_scores_f16_kv",
         "attn_weighted_sum_f32",
@@ -407,7 +407,7 @@ test "required_kernels keeps heads-based attention path canonical" {
         try std.testing.expect(found);
     }
 
-    for (removed_ops) |op| {
+    for (disallowed_ops) |op| {
         for (required_kernels) |entry| {
             try std.testing.expect(!std.mem.eql(u8, entry.op_name, op));
         }

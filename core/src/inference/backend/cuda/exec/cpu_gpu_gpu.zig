@@ -9,11 +9,11 @@ const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
-const staged_orchestrator = @import("../../staged_orchestrator.zig");
+const orchestrator = @import("../../../bridge/orchestrator.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../runtime/_types_impl.zig");
+const engine_types = @import("../runtime/root.zig");
 const BatchDecodeInfo = engine_types.BatchDecodeInfo;
 const KvCacheDtype = engine_types.KvCacheDtype;
 const enable_dispatch_observability = engine_types.enable_dispatch_observability;
@@ -509,7 +509,7 @@ pub fn runCpuGpuGpuWithPipelineRuntime(
         .trace_seq_len_u32 = trace_seq_len_u32,
         .trace_pos_offset = trace_pos_offset,
     };
-    try staged_orchestrator.executeThreeStageForward(
+    try orchestrator.executeThreeStageForward(
         Stage0,
         Stage1,
         Stage2,

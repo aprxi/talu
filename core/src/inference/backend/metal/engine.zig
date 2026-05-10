@@ -65,7 +65,7 @@ const MlxInitDiagnostics = extern struct {
     strict_required: u64 = 0,
     strict_quantized: u64 = 0,
     strict_missing: u64 = 0,
-    dense_fallback_bytes: u64 = 0,
+    dense_decode_bytes: u64 = 0,
     ctx_bytes: u64 = 0,
     layer_quantized_bytes: u64 = 0,
     layer_dense_bytes: u64 = 0,
@@ -494,7 +494,7 @@ pub const MetalBackend = struct {
             .attn_o_total = diagnostics.attn_o_total,
             .mlp_q = diagnostics.mlp_quantized,
             .mlp_total = diagnostics.mlp_total,
-            .dense_fallback_mb = megabytes(diagnostics.dense_fallback_bytes),
+            .dense_decode_mb = megabytes(diagnostics.dense_decode_bytes),
         });
         log.info("inference", "metal quantized decode strict policy", .{
             .requested = diagnostics.strict_requested,
@@ -510,9 +510,9 @@ pub const MetalBackend = struct {
             .layer_other_mb = megabytes(diagnostics.layer_other_bytes),
             .total_mb = megabytes(diagnostics.ctx_bytes + diagnostics.layer_quantized_bytes + diagnostics.layer_dense_bytes + diagnostics.layer_other_bytes),
         });
-        if (diagnostics.dense_fallback_bytes > 0) {
-            log.warn("inference", "metal dense fallback detected", .{
-                .dense_fallback_mb = megabytes(diagnostics.dense_fallback_bytes),
+        if (diagnostics.dense_decode_bytes > 0) {
+            log.warn("inference", "metal dense decode tensors detected", .{
+                .dense_decode_mb = megabytes(diagnostics.dense_decode_bytes),
                 .strict_active = diagnostics.strict_active,
             });
         }
@@ -563,8 +563,8 @@ pub const MetalBackend = struct {
         _ = allocator;
     }
 
-    fn envTruthy(name: []const u8, fallback: bool) bool {
-        const raw = @import("env_pkg").getenv(name) orelse return fallback;
+    fn envTruthy(name: []const u8, default_value: bool) bool {
+        const raw = @import("env_pkg").getenv(name) orelse return default_value;
         if (raw.len == 0) return true;
         if (std.mem.eql(u8, raw, "0")) return false;
         if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
@@ -1295,7 +1295,14 @@ pub const MetalBackend = struct {
         output_tokens: []u32,
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
+        decode_ns_out: ?*u64,
     ) !usize {
+        var measured_decode_ns: u64 = 0;
+        if (decode_ns_out) |out| out.* = 0;
+        defer {
+            if (decode_ns_out) |out| out.* = measured_decode_ns;
+        }
+
         if (!self.slot_in_use[0]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(0);
 
@@ -1311,7 +1318,9 @@ pub const MetalBackend = struct {
             const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
             defer self.allocator.free(logits_buf);
             while (produced < budget) {
+                var decode_timer = std.time.Timer.start() catch unreachable;
                 try self.decodeLogits(ctx, current_token, logits_buf);
+                measured_decode_ns +|= decode_timer.read();
                 applySamplingMutationsToLogits(logits_buf[0..self.vocab_size], sampling_config);
                 const candidate_count = @min(sampling_config.top_k, self.vocab_size);
                 const candidate_logits = try self.allocator.alloc(f32, candidate_count);
@@ -1336,6 +1345,7 @@ pub const MetalBackend = struct {
             return produced;
         }
 
+        var decode_timer = std.time.Timer.start() catch unreachable;
         const produced = try self.decodeTopKStream(
             ctx,
             first_token,
@@ -1344,6 +1354,7 @@ pub const MetalBackend = struct {
             sampling_config,
             output_tokens,
         );
+        measured_decode_ns +|= decode_timer.read();
         self.slot_positions[0] = start_position + produced;
         return produced;
     }
@@ -1669,18 +1680,13 @@ pub const MetalBackend = struct {
                     valid_count += 1;
                 }
                 if (valid_count == 0) {
-                    // Keep the decode loop alive even if the backend reports
-                    // only invalid IDs for this row. Reuse the previous token
-                    // as a conservative fallback candidate.
-                    row_ids[0] = request_entry.token;
-                    valid_count = 1;
-                    log.warn("inference", "metal decode_topk_candidates_batch produced no valid candidate ids; using fallback token", .{
+                    log.err("inference", "metal decode_topk_candidates_batch produced no valid candidate ids", .{
                         .row = row_idx,
                         .slot = request_entry.slot_index,
                         .reported_count = count,
                         .top_k = top_k,
-                        .fallback_token = request_entry.token,
-                    });
+                    }, @src());
+                    return error.InvalidState;
                 } else if (invalid_count > 0) {
                     log.debug("inference", "metal decode_topk_candidates_batch dropped invalid candidate ids", .{
                         .row = row_idx,

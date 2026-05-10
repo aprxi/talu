@@ -39,7 +39,7 @@ const layerProgramExecutionState = CudaBackend.layerProgramExecutionState;
 const layer_program_adapter_capabilities = CudaBackend.layer_program_adapter_capabilities;
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../runtime/_types_impl.zig");
+const engine_types = @import("../runtime/root.zig");
 const DeviceTensor = engine_types.DeviceTensor;
 const LinearWeight = engine_types.LinearWeight;
 const BlockRuntimeLayer = engine_types.BlockRuntimeLayer;

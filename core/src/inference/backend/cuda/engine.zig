@@ -44,7 +44,7 @@ const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 
 // --- Re-exported types from engine_types.zig ---
-const engine_types = @import("runtime/_types_impl.zig");
+const engine_types = @import("runtime/root.zig");
 const prototype_eps = engine_types.prototype_eps;
 const initial_kv_cache_tokens = engine_types.initial_kv_cache_tokens;
 const KvCacheDtype = engine_types.KvCacheDtype;
@@ -545,6 +545,9 @@ pub const CudaBackend = struct {
     phase_linear_stop_event: ?compute.cuda.EventHandle = null,
     phase_attention_start_event: ?compute.cuda.EventHandle = null,
     phase_attention_stop_event: ?compute.cuda.EventHandle = null,
+    decode_metric_start_event: ?compute.cuda.EventHandle = null,
+    decode_metric_stop_event: ?compute.cuda.EventHandle = null,
+    last_decode_compute_ns: u64 = 0,
     layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     layer_program_slot_buffers: []compute.cuda.Buffer = &.{},
@@ -809,7 +812,7 @@ pub const CudaBackend = struct {
             const capability = backend.device.computeCapability() catch |err| {
                 log.warn("inference", "CUDA disabling fp8 KV cache after capability query failed", .{
                     .reason = @errorName(err),
-                    .fallback = @tagName(KvCacheDtype.i8),
+                    .selected_dtype = @tagName(KvCacheDtype.i8),
                 });
                 backend.kv_cache_dtype = .i8;
                 break :kv_dtype_guard;
@@ -818,7 +821,7 @@ pub const CudaBackend = struct {
                 log.warn("inference", "CUDA disabling fp8 KV cache on unsupported GPU", .{
                     .major = capability.major,
                     .minor = capability.minor,
-                    .fallback = @tagName(KvCacheDtype.i8),
+                    .selected_dtype = @tagName(KvCacheDtype.i8),
                 });
                 backend.kv_cache_dtype = .i8;
             }
@@ -1168,48 +1171,84 @@ pub const CudaBackend = struct {
         }
 
         if (loaded.original_weight_dtype == .grouped_affine_u4) {
-            backend.gaffine_sequence_rows_supported = smoke_checks.probeGaffineU4SequenceRowsSupport(&backend) catch false;
+            backend.gaffine_sequence_rows_supported = smoke_checks.probeGaffineU4SequenceRowsSupport(&backend) catch |err| {
+                log.err("inference", "CUDA gaffine batch-rows linear probe failed", .{
+                    .reason = @errorName(err),
+                }, @src());
+                return err;
+            };
             if (!backend.gaffine_sequence_rows_supported) {
-                log.warn("inference", "CUDA gaffine batch-rows linear degraded mode active (multi-row parity probe failed)", .{
+                log.err("inference", "CUDA gaffine batch-rows linear probe rejected model route", .{
                     .reason = "gaffine_batch_rows_probe_failed",
-                });
-            } else {
-                backend.gaffine_sequence_fused_qkv_supported = smoke_checks.probeGaffineU4SequenceFusedQkvSupport(&backend) catch false;
-                if (!backend.gaffine_sequence_fused_qkv_supported) {
-                    log.warn("inference", "CUDA gaffine batch-rows unfused QKV degraded mode active (multi-row fused parity probe failed)", .{
-                        .reason = "gaffine_batch_rows_fused_qkv_probe_failed",
-                    });
-                }
+                }, @src());
+                return error.UnsupportedModel;
+            }
 
-                backend.gaffine_sequence_fused_gate_up_supported = smoke_checks.probeGaffineU4SequenceFusedGateUpSupport(&backend) catch false;
-                if (!backend.gaffine_sequence_fused_gate_up_supported) {
-                    log.warn("inference", "CUDA gaffine batch-rows unfused gate/up degraded mode active (multi-row fused parity probe failed)", .{
-                        .reason = "gaffine_batch_rows_fused_gate_up_probe_failed",
-                    });
-                }
+            backend.gaffine_sequence_fused_qkv_supported = smoke_checks.probeGaffineU4SequenceFusedQkvSupport(&backend) catch |err| {
+                log.err("inference", "CUDA gaffine batch-rows fused QKV probe failed", .{
+                    .reason = @errorName(err),
+                }, @src());
+                return err;
+            };
+            if (!backend.gaffine_sequence_fused_qkv_supported) {
+                log.err("inference", "CUDA gaffine batch-rows fused QKV probe rejected model route", .{
+                    .reason = "gaffine_batch_rows_fused_qkv_probe_failed",
+                }, @src());
+                return error.UnsupportedModel;
+            }
+
+            backend.gaffine_sequence_fused_gate_up_supported = smoke_checks.probeGaffineU4SequenceFusedGateUpSupport(&backend) catch |err| {
+                log.err("inference", "CUDA gaffine batch-rows fused gate/up probe failed", .{
+                    .reason = @errorName(err),
+                }, @src());
+                return err;
+            };
+            if (!backend.gaffine_sequence_fused_gate_up_supported) {
+                log.err("inference", "CUDA gaffine batch-rows fused gate/up probe rejected model route", .{
+                    .reason = "gaffine_batch_rows_fused_gate_up_probe_failed",
+                }, @src());
+                return error.UnsupportedModel;
             }
         }
 
         if (backend.modelHasNvfp4Weights()) {
-            backend.nvfp4_sequence_rows_supported = smoke_checks.probeNvfp4SequenceRowsSupport(&backend) catch false;
+            backend.nvfp4_sequence_rows_supported = smoke_checks.probeNvfp4SequenceRowsSupport(&backend) catch |err| {
+                log.err("inference", "CUDA NVFP4 batch-rows linear probe failed", .{
+                    .reason = @errorName(err),
+                }, @src());
+                return err;
+            };
             if (!backend.nvfp4_sequence_rows_supported) {
-                log.warn("inference", "CUDA NVFP4 batch-rows linear degraded mode active (multi-row parity probe failed)", .{
+                log.err("inference", "CUDA NVFP4 batch-rows linear probe rejected model route", .{
                     .reason = "nvfp4_batch_rows_probe_failed",
-                });
-            } else {
-                backend.nvfp4_sequence_fused_qkv_supported = smoke_checks.probeNvfp4SequenceFusedQkvSupport(&backend) catch false;
-                if (!backend.nvfp4_sequence_fused_qkv_supported) {
-                    log.warn("inference", "CUDA NVFP4 batch-rows unfused QKV degraded mode active (multi-row fused parity probe failed)", .{
-                        .reason = "nvfp4_batch_rows_fused_qkv_probe_failed",
-                    });
-                }
+                }, @src());
+                return error.UnsupportedModel;
+            }
 
-                backend.nvfp4_sequence_fused_gate_up_supported = smoke_checks.probeNvfp4SequenceFusedGateUpSupport(&backend) catch false;
-                if (!backend.nvfp4_sequence_fused_gate_up_supported) {
-                    log.warn("inference", "CUDA NVFP4 batch-rows unfused gate/up degraded mode active (multi-row fused parity probe failed)", .{
-                        .reason = "nvfp4_batch_rows_fused_gate_up_probe_failed",
-                    });
-                }
+            backend.nvfp4_sequence_fused_qkv_supported = smoke_checks.probeNvfp4SequenceFusedQkvSupport(&backend) catch |err| {
+                log.err("inference", "CUDA NVFP4 batch-rows fused QKV probe failed", .{
+                    .reason = @errorName(err),
+                }, @src());
+                return err;
+            };
+            if (!backend.nvfp4_sequence_fused_qkv_supported) {
+                log.err("inference", "CUDA NVFP4 batch-rows fused QKV probe rejected model route", .{
+                    .reason = "nvfp4_batch_rows_fused_qkv_probe_failed",
+                }, @src());
+                return error.UnsupportedModel;
+            }
+
+            backend.nvfp4_sequence_fused_gate_up_supported = smoke_checks.probeNvfp4SequenceFusedGateUpSupport(&backend) catch |err| {
+                log.err("inference", "CUDA NVFP4 batch-rows fused gate/up probe failed", .{
+                    .reason = @errorName(err),
+                }, @src());
+                return err;
+            };
+            if (!backend.nvfp4_sequence_fused_gate_up_supported) {
+                log.err("inference", "CUDA NVFP4 batch-rows fused gate/up probe rejected model route", .{
+                    .reason = "nvfp4_batch_rows_fused_gate_up_probe_failed",
+                }, @src());
+                return error.UnsupportedModel;
             }
         }
 
@@ -1827,6 +1866,14 @@ pub const CudaBackend = struct {
         if (self.phase_attention_stop_event) |event| {
             self.device.destroyEvent(event);
             self.phase_attention_stop_event = null;
+        }
+        if (self.decode_metric_start_event) |event| {
+            self.device.destroyEvent(event);
+            self.decode_metric_start_event = null;
+        }
+        if (self.decode_metric_stop_event) |event| {
+            self.device.destroyEvent(event);
+            self.decode_metric_stop_event = null;
         }
         self.block_runtime.deinit(self.allocator, &self.device);
         self.runtime_buffers.deinit(self.allocator, &self.device);
@@ -2567,6 +2614,7 @@ pub const CudaBackend = struct {
         output_tokens: []u32,
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
+        decode_ns_out: ?*u64,
     ) !usize {
         try self.ensureSlotStateBlocksBoundForScheduler(0);
         return decode_mod.decodeTopKStreaming(
@@ -2579,6 +2627,7 @@ pub const CudaBackend = struct {
             output_tokens,
             callback,
             callback_data,
+            decode_ns_out,
         );
     }
 
@@ -2722,6 +2771,64 @@ pub const CudaBackend = struct {
         sampling_config: *const sampling_mod.SamplingConfig,
     ) bool {
         return supportsCudaTopKCandidateRoute(self, sampling_config);
+    }
+
+    fn ensureDecodeMetricEvents(self: *CudaBackend) bool {
+        if (self.topology_mode != .single) return false;
+        if (!self.device.supportsEventTiming()) return false;
+        if (self.decode_metric_start_event != null and self.decode_metric_stop_event != null) return true;
+
+        if (self.decode_metric_start_event == null) {
+            self.decode_metric_start_event = self.device.createTimingEvent() catch null;
+        }
+        if (self.decode_metric_stop_event == null) {
+            self.decode_metric_stop_event = self.device.createTimingEvent() catch null;
+        }
+        if (self.decode_metric_start_event != null and self.decode_metric_stop_event != null) return true;
+
+        if (self.decode_metric_start_event) |event| self.device.destroyEvent(event);
+        if (self.decode_metric_stop_event) |event| self.device.destroyEvent(event);
+        self.decode_metric_start_event = null;
+        self.decode_metric_stop_event = null;
+        return false;
+    }
+
+    fn beginDecodeMetric(self: *CudaBackend) bool {
+        self.last_decode_compute_ns = 0;
+        if (!self.ensureDecodeMetricEvents()) return false;
+        const start_event = self.decode_metric_start_event orelse return false;
+        self.device.recordEvent(start_event, self.compute_stream) catch return false;
+        return true;
+    }
+
+    fn endDecodeMetric(self: *CudaBackend, active: bool) bool {
+        if (!active) return false;
+        const stop_event = self.decode_metric_stop_event orelse return false;
+        self.device.recordEvent(stop_event, self.compute_stream) catch return false;
+        return true;
+    }
+
+    fn finishDecodeMetric(self: *CudaBackend, active: bool, host_elapsed_ns: u64) void {
+        if (active) {
+            const start_event = self.decode_metric_start_event orelse {
+                self.last_decode_compute_ns = host_elapsed_ns;
+                return;
+            };
+            const stop_event = self.decode_metric_stop_event orelse {
+                self.last_decode_compute_ns = host_elapsed_ns;
+                return;
+            };
+            const elapsed_ns = self.device.elapsedEventNs(start_event, stop_event) catch 0;
+            if (elapsed_ns > 0) {
+                self.last_decode_compute_ns = elapsed_ns;
+                return;
+            }
+        }
+        self.last_decode_compute_ns = host_elapsed_ns;
+    }
+
+    pub fn lastDecodeComputeNs(self: *const CudaBackend) ?u64 {
+        return if (self.last_decode_compute_ns > 0) self.last_decode_compute_ns else null;
     }
 
     pub fn incrementDecodeMetadataInPlace(
@@ -3036,6 +3143,8 @@ pub const CudaBackend = struct {
         var tokens_buf = [_]u32{token};
         var slot_indices_buf = [_]usize{slot_index};
         var positions_buf = [_]usize{effective_position};
+        var wall_timer = std.time.Timer.start() catch unreachable;
+        const metric_active = self.beginDecodeMetric();
         self.computeBatchedDecodeLogitsDeviceOnly(
             tokens_buf[0..],
             slot_indices_buf[0..],
@@ -3052,11 +3161,13 @@ pub const CudaBackend = struct {
             });
             return err;
         };
+        const metric_completed = self.endDecodeMetric(metric_active);
         self.slot_positions[slot_index] = raw_position + 1;
 
         if (top_k == 1) {
             candidate_ids_out[0] = try self.selectNextTokenFromDeviceLogitsImpl();
             candidate_logits_out[0] = 0.0;
+            self.finishDecodeMetric(metric_completed, wall_timer.read());
             return 1;
         }
 
@@ -3073,6 +3184,7 @@ pub const CudaBackend = struct {
             candidate_ids_out[0..top_k],
             counts[0..],
         );
+        self.finishDecodeMetric(metric_completed, wall_timer.read());
         return counts[0];
     }
 
@@ -3675,7 +3787,7 @@ pub const CudaBackend = struct {
     fn mergeNvfp4RouteCounters(primary: Nvfp4RouteCounters, secondary: Nvfp4RouteCounters) Nvfp4RouteCounters {
         return .{
             .native_cublaslt = saturatingAddU64(primary.native_cublaslt, secondary.native_cublaslt),
-            .bf16_fallback = saturatingAddU64(primary.bf16_fallback, secondary.bf16_fallback),
+            .bf16_dense_route = saturatingAddU64(primary.bf16_dense_route, secondary.bf16_dense_route),
             .small_rows_nvfp4_matvec = saturatingAddU64(primary.small_rows_nvfp4_matvec, secondary.small_rows_nvfp4_matvec),
             .small_rows_i8_matvec = saturatingAddU64(primary.small_rows_i8_matvec, secondary.small_rows_i8_matvec),
             .fused_qkv_custom = saturatingAddU64(primary.fused_qkv_custom, secondary.fused_qkv_custom),
@@ -3777,7 +3889,7 @@ pub const CudaBackend = struct {
             .mode = mode,
             .tokens = token_count,
             .native_cublaslt = route_delta.native_cublaslt,
-            .bf16_fallback = route_delta.bf16_fallback,
+            .bf16_dense_route = route_delta.bf16_dense_route,
             .small_rows_nvfp4_matvec = route_delta.small_rows_nvfp4_matvec,
             .small_rows_i8_matvec = route_delta.small_rows_i8_matvec,
             .fused_qkv_custom = route_delta.fused_qkv_custom,
@@ -4297,8 +4409,8 @@ pub const CudaBackend = struct {
         );
         const layer = try engine_layer_program.requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
         const trace_enabled = trace.isEnabled();
-        const emits_traced_inside_cpu_fallback = if (trace_enabled) if (layer.instructionAttentionRef(exec_ctx.op_index)) |cfg| blk: {
-            // Query-gated attention currently runs through the traced CPU fallback inside
+        const emits_traced_inside_cpu_route = if (trace_enabled) if (layer.instructionAttentionRef(exec_ctx.op_index)) |cfg| blk: {
+            // Query-gated attention currently runs through the traced CPU route inside
             // the CUDA backend. Skipping the wrapper emit here avoids duplicate attn.q/out
             // rows with one synthetic metadata record and one real host-backed record.
             if (!cfg.query_gate) {
@@ -4316,7 +4428,7 @@ pub const CudaBackend = struct {
         try engine_layer_program.layerProgramAttentionAdapter(exec_ctx.backend, layer, insn, registers, state_blocks, exec_ctx);
         const io = try engine_layer_program.instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
-        if (trace_enabled and !emits_traced_inside_cpu_fallback) {
+        if (trace_enabled and !emits_traced_inside_cpu_route) {
             engine_layer_program.emitLayerProgramTracePoint(
                 exec_ctx,
                 .attn_out,

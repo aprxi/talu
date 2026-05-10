@@ -124,7 +124,7 @@ array silu(const array& x) {
     return x * sigmoid(x);
 }
 
-array rmsnorm_gated_fallback(const array& hidden_states, const array& gate, const array& weight, float eps) {
+array rmsnorm_gated_graph(const array& hidden_states, const array& gate, const array& weight, float eps) {
     const array normed = fast::rms_norm(hidden_states, std::optional<array>(weight), eps);
     const array mixed_f32 = silu(astype(gate, float32)) * astype(normed, float32);
     return astype(mixed_f32, hidden_states.dtype());
@@ -439,7 +439,7 @@ static inline bool can_use_fused_conv1d_decode_silu(
     if (batch != 1 || kernel_size <= 1) return false;
     // MLX Metal bfloat path fails to compile this custom kernel on some hosts.
     // Keep the fused path for float16 and route all other dtypes through the
-    // existing graph fallback.
+    // existing graph route.
     return token_input.dtype() == float16 && cache_state.dtype() == float16;
 }
 
@@ -696,7 +696,7 @@ array take_time_3d(const array& a, int t) {
     return reshape(slice(a, {0, t, 0}, {b, t + 1, h}), {b, h});
 }
 
-std::pair<array, array> gated_delta_update_fallback(
+std::pair<array, array> gated_delta_update_graph(
     const array& q,
     const array& k,
     const array& v,
@@ -1047,7 +1047,7 @@ std::pair<array, array> gated_delta_update(
     if (metal::is_available() && default_device() == Device::gpu && q.shape(3) % 32 == 0) {
         return gated_delta_update_kernel(q, k, v, a, b, A_exp_f32, dt_bias, state_opt);
     }
-    return gated_delta_update_fallback(q, k, v, a, b, A_exp_f32, dt_bias, state_opt);
+    return gated_delta_update_graph(q, k, v, a, b, A_exp_f32, dt_bias, state_opt);
 }
 
 array rmsnorm_gated(const array& hidden_states, const array& gate, const array& weight, float eps) {
@@ -1061,7 +1061,7 @@ array rmsnorm_gated(const array& hidden_states, const array& gate, const array& 
         hidden_states.shape(2) == gate.shape(2) &&
         hidden_states.shape(3) == gate.shape(3);
     if (!can_use_kernel) {
-        return rmsnorm_gated_fallback(hidden_states, gate, weight, eps);
+        return rmsnorm_gated_graph(hidden_states, gate, weight, eps);
     }
 
     const int B = hidden_states.shape(0);
@@ -1069,7 +1069,7 @@ array rmsnorm_gated(const array& hidden_states, const array& gate, const array& 
     const int Hv = hidden_states.shape(2);
     const int Dv = hidden_states.shape(3);
     if (B <= 0 || S <= 0 || Hv <= 0 || Dv <= 0) {
-        return rmsnorm_gated_fallback(hidden_states, gate, weight, eps);
+        return rmsnorm_gated_graph(hidden_states, gate, weight, eps);
     }
 
     bool per_head_weight = false;
@@ -1081,12 +1081,12 @@ array rmsnorm_gated(const array& hidden_states, const array& gate, const array& 
             per_head_weight = true;
             weight_use = reshape(weight, {Hv, Dv});
         } else {
-            return rmsnorm_gated_fallback(hidden_states, gate, weight, eps);
+            return rmsnorm_gated_graph(hidden_states, gate, weight, eps);
         }
     } else if (weight.ndim() == 2 && weight.shape(0) == Hv && weight.shape(1) == Dv) {
         per_head_weight = true;
     } else {
-        return rmsnorm_gated_fallback(hidden_states, gate, weight, eps);
+        return rmsnorm_gated_graph(hidden_states, gate, weight, eps);
     }
 
     const int rows = B * S * Hv;

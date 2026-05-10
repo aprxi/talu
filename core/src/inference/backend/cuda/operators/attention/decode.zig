@@ -16,7 +16,7 @@ const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../../runtime/_types_impl.zig");
+const engine_types = @import("../../runtime/root.zig");
 const LayerAttentionExecConfig = engine_types.LayerAttentionExecConfig;
 const LayerAttentionRuntime = engine_types.LayerAttentionRuntime;
 const LinearWeight = engine_types.LinearWeight;
@@ -612,7 +612,7 @@ pub fn runBatchedDecodeAttentionMixer(
     };
     // On Blackwell SM120, low-bit decode has shown better end-to-end latency
     // with pointer-table separate decode than fused ptrs at rows==1.
-    // Keep fused ptrs available as fallback, but do not prefer it by default.
+    // Keep fused ptrs available as an explicit alternate route, but do not prefer it by default.
     const prefer_batched_fused_decode = switch (self.kv_cache_dtype) {
         .i8, .fp8 => false,
         .f16 => false,
@@ -622,7 +622,7 @@ pub fn runBatchedDecodeAttentionMixer(
     const use_batched_separate_decode_path = use_batched_separate_decode_attention and
         !use_batched_fused_decode_path;
     // Low-bit GEMM bridge dequantizes KV to f16 each decode step, so prefer it
-    // only as a strict fallback when native low-bit decode kernels are absent.
+    // only when native low-bit decode kernels are absent.
     const use_lowbit_gemm_decode_path = can_lowbit_gemm_decode and n_rows == 1 and
         !use_flash_decode and !use_batched_separate_decode_path and !use_batched_fused_decode_path;
     if (@import("env_pkg").getenv("TALU_CUDA_LOG_DECODE_PATH") != null) {
@@ -635,7 +635,7 @@ pub fn runBatchedDecodeAttentionMixer(
         else if (use_batched_separate_decode_path)
             "separate_ptrs"
         else
-            "fallback_row";
+            "row_loop";
         const route_id: u32 = if (use_lowbit_gemm_decode_path)
             5
         else if (use_flash_decode)
@@ -740,7 +740,7 @@ pub fn runBatchedDecodeAttentionMixer(
     }
 
     // Flash decode preferred (GQA-aware, fewest KV reads), then batched
-    // separate (graph-compatible), then fused fallback.
+    // separate (graph-compatible), then fused.
     const use_batched_decode_attention = use_lowbit_gemm_decode_path or use_flash_decode or use_batched_separate_decode_path or use_batched_fused_decode_path;
     const can_skip_row_decode_prep = shared_source_slot_kv_index == null and use_batched_kv_write and use_batched_decode_attention;
     if (!can_skip_row_decode_prep) {
@@ -1380,7 +1380,7 @@ pub fn runBatchedDecodeAttentionMixer(
         };
         recordDecodeAttentionPhase(self, decode_path, decode_attention_start_ns, cfg.is_causal);
     } else if (use_batched_fused_decode_path) {
-        // Fused path fallback: single kernel does RoPE + scores + softmax +
+        // Fused path: single kernel does RoPE + scores + softmax +
         // weighted_sum + optional gate fusion.
         const gate_proj: ?*const compute.cuda.Buffer = if (cfg.query_gate) &q_projection_stage else null;
         const gate_proj_stride: u32 = if (cfg.query_gate) @intCast(cfg.q_projection_dim) else 0;

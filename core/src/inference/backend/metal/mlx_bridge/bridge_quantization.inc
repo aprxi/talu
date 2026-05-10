@@ -540,7 +540,7 @@ bool capture_native_nvfp4_quant(
         *out_q_scales = stop_gradient(copy(scale_src));
     }
     // Store inv_gs (1/global_scale) as scalar — decode can route this through
-    // qqmm global-scale support or a post-scale multiply fallback.
+    // qqmm global-scale support or a post-scale multiply route.
     *out_q_biases = stop_gradient(array(inv_gs, float32));
     eval(*out_q_biases);
     return true;

@@ -317,7 +317,7 @@ bool prepare_fused_decode_ctx(
     mlx_ctx* fused_ctx,
     int32_t* out_common_offset
 ) {
-    if (!ctxs || batch_size <= 1 || !fused_ctx || !out_common_offset) return false;
+    if (!ctxs || batch_size <= 0 || !fused_ctx || !out_common_offset) return false;
     mlx_ctx* first = ctxs[0];
     if (!first) return false;
     if (first->xray_enabled) return false;

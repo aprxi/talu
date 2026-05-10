@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const compute = @import("compute_pkg");
-const pipeline = @import("../pipeline.zig");
+const pipeline = @import("../../bridge/pipeline.zig");
 
 /// Wrapper around a CudaBackend pointer that satisfies the pipeline stage contract.
 /// Each stage corresponds to one CudaBackend instance operating on a disjoint
@@ -129,7 +129,7 @@ pub const CudaP2PTransfer = struct {
             try dev1.enablePeerAccess(dev0);
             return .{ .mode = .peer_to_peer, .host_staging = null };
         }
-        // Host-staged fallback: allocate a pinned buffer for activation transfer.
+        // Host-staged transfer: allocate a pinned buffer for activation transfer.
         const staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), max_transfer_bytes);
         return .{ .mode = .host_staged, .host_staging = staging };
     }

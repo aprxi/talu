@@ -720,7 +720,7 @@ array run_linear_attention_layer_reference(mlx_ctx* ctx, int layer_idx, const ar
             "linear_attn.conv1d"
         );
         conv_out = step_out;
-        // The fused Metal kernel already applied SiLU. The fallback path did not.
+        // The fused Metal kernel already applied SiLU. The graph route did not.
         conv_silu_fused = use_fused_silu;
         if (next_state.has_value()) {
             cache.conv_state = *next_state;

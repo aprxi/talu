@@ -537,64 +537,11 @@ int32_t mlx_prefill_logits_batch(
             }
         }
 
-        std::vector<int32_t> fallback_rows;
-        fallback_rows.reserve(static_cast<size_t>(batch_size));
         for (int32_t idx = 0; idx < batch_size; ++idx) {
             if (prefill_done[static_cast<size_t>(idx)] == 0) {
-                fallback_rows.push_back(idx);
-            }
-        }
-        if (fallback_rows.empty()) {
-            return 1;
-        }
-
-        std::vector<std::vector<int32_t>> prompt_storage;
-        if (prompt_storage.capacity() < fallback_rows.size()) {
-            prompt_storage.reserve(fallback_rows.size());
-        }
-
-        for (int32_t idx : fallback_rows) {
-            mlx_ctx* ctx = ctxs[idx];
-            const int32_t* prompt_ids = prompt_ids_ptrs[idx];
-            const int32_t prompt_len = prompt_lens[idx];
-            prompt_storage.emplace_back(prompt_ids, prompt_ids + prompt_len);
-            const std::vector<int32_t>& prompt_vec = prompt_storage.back();
-
-            reset_runtime_state(ctx);
-            ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
-            ctx->kv_reserve_tokens = resolve_kv_reserve_target_tokens(ctx, prompt_len, 0);
-
-            array first_logits = array(0.0f);
-            if (prompt_len > 1) {
-                if (prompt_len <= full_prompt_threshold) {
-                    const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
-                    const array seed_logits = forward_logits(ctx, prompt_arr);
-                    first_logits = last_token_logits(seed_logits);
-                } else {
-                    const array seed_logits = prefill_seed_logits_chunked(ctx, prompt_vec, prompt_len);
-                    first_logits = last_token_logits(seed_logits);
-                }
-            } else {
-                const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
-                const array seed_logits = forward_logits(ctx, prompt_arr);
-                first_logits = last_token_logits(seed_logits);
-            }
-
-            const int flat_size = static_cast<int>(first_logits.size());
-            const array first_logits_flat = reshape(astype(first_logits, float32), {flat_size});
-            if (static_cast<int32_t>(first_logits_flat.size()) != logits_len) {
-                g_last_error = "mlx_prefill_logits_batch: logits length mismatch";
+                g_last_error = "mlx_prefill_logits_batch: fused prefill did not cover every row";
                 return 0;
             }
-            eval(first_logits_flat);
-            synchronize();
-            std::memcpy(
-                out_logits_ptrs[idx],
-                first_logits_flat.data<float>(),
-                static_cast<size_t>(logits_len) * sizeof(float)
-            );
-            ctxs[idx]->stream_ready = true;
-            ctxs[idx]->trace_decode_token = 1;
         }
         return 1;
     } catch (const std::exception& e) {

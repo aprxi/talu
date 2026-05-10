@@ -23,7 +23,7 @@ inline fn ue8m0ToScale(e8m0: u8) f32 {
 }
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../runtime/_types_impl.zig");
+const engine_types = @import("../runtime/root.zig");
 const KvCacheDtype = engine_types.KvCacheDtype;
 const gaffine_scales_dtype_f16 = engine_types.gaffine_scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = engine_types.gaffine_scales_dtype_bf16;

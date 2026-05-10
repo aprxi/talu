@@ -298,18 +298,6 @@ test "gatherEmbeddings bf16 dtype" {
     }
 }
 
-test "gatherEmbeddings gaffine_u4 scale bias" {
-    // Grouped affine quantization requires complex setup with custom data buffers
-    // Skipping for now to focus on standard formats
-    // TODO: Add grouped_affine tests with proper buffer allocation lint:ignore no-todo
-}
-
-test "gatherEmbeddings gaffine_u8" {
-    // Grouped affine quantization requires complex setup with custom data buffers
-    // Skipping for now to focus on standard formats
-    // TODO: Add grouped_affine tests with proper buffer allocation lint:ignore no-todo
-}
-
 test "EmbeddingLookup.forward delegates to gatherEmbeddings" {
     const allocator = std.testing.allocator;
 

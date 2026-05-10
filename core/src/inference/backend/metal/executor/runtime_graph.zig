@@ -1,4 +1,4 @@
-//! Inference-owned runtime state wrappers for Metal MLX execution.
+//! Metal executor runtime state wrappers for MLX execution.
 //!
 //! Compute owns primitive array/lazy graph operations. Inference owns cache
 //! state containers and runtime decode state lifecycles.

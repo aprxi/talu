@@ -1337,15 +1337,11 @@ pub const BatchWrapper = struct {
         state: *RequestState,
         finish_reason: CFinishReason,
     ) !void {
-        const now = std.time.nanoTimestamp();
         const ttft_ns: u64 = if (state.first_token_ns > 0)
             @intCast(state.first_token_ns - state.start_ns)
         else
             0;
-        const generation_ns: u64 = if (state.first_token_ns > 0)
-            @intCast(now - state.first_token_ns)
-        else
-            0;
+        const generation_ns: u64 = self.scheduler.getDecodeNs(request_id) orelse 0;
         // Use the scheduler's per-request prefill timing (measures only the
         // actual prefill computation) instead of TTFT, which also includes
         // model loading and queue wait time.

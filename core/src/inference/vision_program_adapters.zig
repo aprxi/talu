@@ -294,12 +294,12 @@ pub fn runVisionProgram(
             register_workspace.instruction_handles[handle_idx] = register_workspace.handleForRegister(reg);
             handle_idx += 1;
         }
-        const fallback_handle = runtime_contract.TensorHandle{
+        const missing_weight_handle = runtime_contract.TensorHandle{
             .register = runtime_contract.registerFromIndex(0),
             .ptr = @ptrCast(@constCast(&missing_register_storage_byte)),
         };
         for (insn.weights) |_| {
-            register_workspace.instruction_handles[handle_idx] = fallback_handle;
+            register_workspace.instruction_handles[handle_idx] = missing_weight_handle;
             handle_idx += 1;
         }
 
@@ -390,12 +390,12 @@ pub fn runScatterProgram(
             register_workspace.instruction_handles[handle_idx] = handle;
             handle_idx += 1;
         }
-        const fallback_handle = runtime_contract.TensorHandle{
+        const missing_weight_handle = runtime_contract.TensorHandle{
             .register = runtime_contract.registerFromIndex(0),
             .ptr = @ptrCast(@constCast(&missing_register_storage_byte)),
         };
         for (insn.weights) |_| {
-            register_workspace.instruction_handles[handle_idx] = fallback_handle;
+            register_workspace.instruction_handles[handle_idx] = missing_weight_handle;
             handle_idx += 1;
         }
         var rt_ctx = runtime_contract.ExecutionContext{

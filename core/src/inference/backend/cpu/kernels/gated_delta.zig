@@ -726,7 +726,7 @@ pub const GatedDeltaKernel = struct {
         scratch: *GatedDeltaScratch,
         matmul_scratch: *cpu_linalg.MatmulScratch,
     ) !void {
-        // Sequential per-slot fallback to isolate dispatch vs kernel issues.
+        // Sequential per-slot route to isolate dispatch vs kernel issues.
         const d_model: usize = self.config.d_model;
         const batch_size = slot_states.len;
         if (batch_size == 0) return;

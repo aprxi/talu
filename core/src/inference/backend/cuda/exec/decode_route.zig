@@ -9,14 +9,13 @@ const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
-const staged_orchestrator = @import("../../staged_orchestrator.zig");
+const orchestrator = @import("../../../bridge/orchestrator.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../runtime/_types_impl.zig");
+const engine_types = @import("../runtime/root.zig");
 const BatchDecodeInfo = engine_types.BatchDecodeInfo;
 const KvCacheDtype = engine_types.KvCacheDtype;
-const enable_dispatch_observability = engine_types.enable_dispatch_observability;
 const enable_device_embedding_lookup = engine_types.enable_device_embedding_lookup;
 const AttentionKernelSet = engine_types.AttentionKernelSet;
 
@@ -41,6 +40,16 @@ fn topologyModeTag(self: anytype) ?[]const u8 {
 fn topologyModeIs(self: anytype, comptime expected: []const u8) bool {
     const tag = topologyModeTag(self) orelse return false;
     return std.mem.eql(u8, tag, expected);
+}
+
+fn rejectUnsupportedStagedBatchedDecodeRoute(topology_tag: ?[]const u8) !void {
+    const tag = topology_tag orelse return;
+    if (std.mem.eql(u8, tag, "pipeline2") or
+        std.mem.eql(u8, tag, "cpu_gpu") or
+        std.mem.eql(u8, tag, "cpu_gpu_gpu"))
+    {
+        return error.UnsupportedModel;
+    }
 }
 
 /// Resolve staged prefill chunk rows for a specific request length.
@@ -588,9 +597,8 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     }
 
     // Build BatchDecodeInfo for the single-token decode step. This routes
-    // attention through the proven batched decode path (batched separate or
-    // flash decode) instead of the legacy runAttentionMixerStep path which
-    // has double-RoPE and dead-code bugs.
+    // attention through the batched decode path (batched separate or flash
+    // decode), which is the canonical single-token route.
     const slot_indices_single = [_]usize{slot_index};
     const positions_single = [_]usize{position};
     self.runtime_buffers.decode_seq_lens_host[0] = seq_len_u32;
@@ -1334,30 +1342,27 @@ fn computeBatchedDecodeLogitsWithMode(
     output_mode: BatchedDecodeOutputMode,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    const force_prototype = @import("env_pkg").getenv("TALU_FORCE_PROTOTYPE") != null;
-    if (!force_prototype and
-        topologyModeIs(self, "pipeline2") and
+    if (topologyModeIs(self, "pipeline2") and
         comptime @hasField(SelfType, "device") and
             @hasDecl(SelfType, "pipelineStage1") and
             @hasDecl(SelfType, "transferPipelineActivation"))
     {
         return computeBatchedDecodePipeline2WithMode(self, tokens, slot_indices, positions, output_mode);
     }
-    if (!force_prototype and
-        topologyModeIs(self, "cpu_gpu") and
+    if (topologyModeIs(self, "cpu_gpu") and
         comptime @hasField(SelfType, "device") and
             @hasDecl(SelfType, "pipelineCpuStage0"))
     {
         return computeBatchedDecodeCpuGpuWithMode(self, tokens, slot_indices, positions, output_mode);
     }
-    if (!force_prototype and
-        topologyModeIs(self, "cpu_gpu_gpu") and
+    if (topologyModeIs(self, "cpu_gpu_gpu") and
         comptime @hasField(SelfType, "device") and
             @hasDecl(SelfType, "pipelineCpuStage0") and
             @hasDecl(SelfType, "pipelineStage1"))
     {
         return computeBatchedDecodeCpuGpuGpuWithMode(self, tokens, slot_indices, positions, output_mode);
     }
+    try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
     return computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{});
 }
 
@@ -1387,78 +1392,9 @@ fn computeBatchedDecodeLogitsWithPlan(
         false;
     const n_usize = tokens.len;
     if (n_usize == 0) return;
+    if (!plan.bypass_topology_prototype) try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
-    const force_prototype = @import("env_pkg").getenv("TALU_FORCE_PROTOTYPE") != null;
-    if (!plan.bypass_topology_prototype and
-        (force_prototype or topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")))
-    {
-        if (enable_dispatch_observability) {
-            log.warn("inference", "CUDA decode using sequential fallback route", .{
-                .mode = topologyModeTag(self) orelse "unknown",
-                .forced = @as(u8, @intFromBool(force_prototype)),
-                .batch_rows = n_usize,
-            });
-        }
-        const emit_host_logits = output_mode == .host_logits;
-        for (0..n_usize) |i| {
-            self.activateKvSlot(slot_indices[i]);
-            const logits_target: ?[]f32 = if (emit_host_logits) blk: {
-                if (comptime !@hasDecl(SelfType, "slotLogits")) return error.InvalidTopologyConfig;
-                break :blk self.slotLogits(slot_indices[i]);
-            } else null;
-            try computeGpuPrototypeLogitsWithLayerLimit(
-                self,
-                tokens[i],
-                positions[i],
-                slot_indices[i],
-                logits_target,
-                self.block_runtime.blocks.len,
-                true,
-                emit_host_logits,
-                true,
-                1,
-                positions[i],
-                null,
-                null,
-                null,
-                false,
-            );
-            if (!emit_host_logits) continue;
-            // Sync batch host buffer: the decode loop reads logits via
-            // batchedHostLogitsRow() which returns projected_logits_batch_host.
-            // Copy from slotLogits (the authoritative source after the prototype
-            // call). For pipeline2, self.runtime_buffers.projected_logits_host is
-            // stale because the logit projection runs on pipeline_backend1, not self.
-            // slotLogits already has post-processing applied (line ~2599), so we
-            // must NOT re-apply applyHostLogitsPostProcess here.
-            if (comptime @hasField(SelfType, "runtime_buffers") and @hasDecl(SelfType, "slotLogits")) {
-                const vocab = self.runtime_buffers.projected_vocab;
-                const row_start = std.math.mul(usize, i, vocab) catch continue;
-                const row_end = std.math.add(usize, row_start, vocab) catch continue;
-                if (row_end <= self.runtime_buffers.projected_logits_batch_host.len) {
-                    const slot_logits = self.slotLogits(slot_indices[i]);
-                    @memcpy(
-                        self.runtime_buffers.projected_logits_batch_host[row_start..row_end],
-                        slot_logits[0..vocab],
-                    );
-                }
-            }
-        }
-        if (decode_summary_enabled and comptime @hasDecl(SelfType, "logNvfp4RouteSummaryImpl") and
-            @hasDecl(SelfType, "logPhaseBudgetSummaryImpl"))
-        {
-            const decode_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - decode_start_ns);
-            const mode_label = plan.summary_label_override orelse switch (output_mode) {
-                .host_logits => "decode_fallback_sequential",
-                .device_only => "decode_device_only_fallback_sequential",
-            };
-            logDecodeInventoryOnce(self, mode_label, n_usize, n_usize);
-            self.logNvfp4RouteSummaryImpl(mode_label, n_usize);
-            self.logPhaseBudgetSummaryImpl(mode_label, n_usize, decode_elapsed_ns);
-        }
-        return;
-    }
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
     const previous_launch_phase = self.device.setLaunchPhase(.decode);
     defer _ = self.device.setLaunchPhase(previous_launch_phase);
@@ -2072,4 +2008,16 @@ pub fn computeBatchedDecodeLogitsDeviceOnly(
     positions: []const usize,
 ) !void {
     return computeBatchedDecodeLogitsWithMode(self, tokens, slot_indices, positions, .device_only);
+}
+
+test "rejectUnsupportedStagedBatchedDecodeRoute rejects staged batch route" {
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        rejectUnsupportedStagedBatchedDecodeRoute("cpu_gpu"),
+    );
+}
+
+test "rejectUnsupportedStagedBatchedDecodeRoute allows single-device tag" {
+    try rejectUnsupportedStagedBatchedDecodeRoute("single");
+    try rejectUnsupportedStagedBatchedDecodeRoute(null);
 }

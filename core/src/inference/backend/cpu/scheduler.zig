@@ -1008,8 +1008,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (comptime @hasDecl(BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute")) {
                 return self.backend.shouldUseSchedulerBatchedTopKDecodeRoute(plan);
             }
-            // Legacy fallback for backends that have not yet implemented
-            // backend-owned route planning.
+            // Default planner for backends without backend-owned route planning.
             if (plan.decode_batch_size < 2) return false;
             const supports_topk = if (comptime @hasDecl(BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
                 self.backend.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config)
@@ -1018,6 +1017,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             else
                 false;
             return supports_topk;
+        }
+
+        fn backendDecodeMetricNs(self: *Self, host_elapsed_ns: u64) u64 {
+            if (comptime @hasDecl(BackendType, "lastDecodeComputeNs")) {
+                return self.backend.lastDecodeComputeNs() orelse host_elapsed_ns;
+            }
+            return host_elapsed_ns;
         }
 
         /// Apply repetition, presence, frequency penalties and logit bias to
@@ -1156,7 +1162,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 self.decode_candidate_counts[0..decode_batch_size],
             );
             const decode_step_ns = decode_timer.read();
-            self.addDecodeTimeToGeneratingRequests(decode_step_ns);
+            self.addDecodeTimeToGeneratingRequests(if (decode_batch_size == 1)
+                self.backendDecodeMetricNs(decode_step_ns)
+            else
+                decode_step_ns);
 
             // Don't clear step_events — prefill first-token events were
             // already appended by runPrefills() and must be preserved.
@@ -1645,7 +1654,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 candidate_logits_buf[0..top_k],
                 candidate_ids_buf[0..top_k],
             );
-            request_entry.decode_ns += decode_timer.read();
+            request_entry.decode_ns += self.backendDecodeMetricNs(decode_timer.read());
 
             // Sample from the K candidates (penalties applied to K entries only).
             var sample_cfg = request_entry.sampling_config;
@@ -1829,6 +1838,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 else
                     return error.InvalidArgument;
 
+                var decode_timer = std.time.Timer.start() catch unreachable;
                 const count = try self.backend.decodeTopKCandidates(
                     slot,
                     last_token,
@@ -1836,6 +1846,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     candidate_logits[0..top_k],
                     candidate_ids[0..top_k],
                 );
+                re.decode_ns += self.backendDecodeMetricNs(decode_timer.read());
                 if (count == 0) return error.InvalidArgument;
 
                 // Thinking budget enforcement.
@@ -1993,7 +2004,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             };
 
             const current_token = request_entry.generated_tokens.items[request_entry.generated_tokens.items.len - 1];
-            var decode_timer = std.time.Timer.start() catch unreachable;
+            var backend_decode_ns: u64 = 0;
             const tail_count = try self.backend.decodeTopKStreaming(
                 current_token,
                 request_entry.generated_tokens.items.len + 1,
@@ -2003,8 +2014,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 generated_tail,
                 StreamCbCtx.onToken,
                 @ptrCast(&stream_cb_ctx),
+                &backend_decode_ns,
             );
-            request_entry.decode_ns += decode_timer.read();
+            request_entry.decode_ns += backend_decode_ns;
 
             try request_entry.generated_tokens.appendSlice(self.allocator, generated_tail[0..tail_count]);
             request_entry.token_position += tail_count;
@@ -2048,6 +2060,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         pub fn getPrefillNs(self: *const Self, request_id: u64) ?u64 {
             const request_entry = self.requests.get(request_id) orelse return null;
             return request_entry.prefill_ns;
+        }
+
+        /// Get accumulated scheduler decode time in nanoseconds for a request.
+        pub fn getDecodeNs(self: *const Self, request_id: u64) ?u64 {
+            const request_entry = self.requests.get(request_id) orelse return null;
+            return request_entry.decode_ns;
         }
 
         /// Synchronous single-request generation.
@@ -2733,7 +2751,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);
             defer self.allocator.free(generated_tail);
 
-            var decode_timer = std.time.Timer.start() catch unreachable;
             if (generationShouldStop(submit_config.stop_flag)) {
                 return .{
                     .tokens = try generated.toOwnedSlice(self.allocator),
@@ -2757,6 +2774,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 backend_stream_cb_data = @ptrCast(&stream_cb_ctx.?);
             }
 
+            var backend_decode_ns: u64 = 0;
             const tail_count = try self.backend.decodeTopKStreaming(
                 current_token,
                 generated.items.len + 1,
@@ -2766,16 +2784,16 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 generated_tail,
                 backend_stream_cb,
                 backend_stream_cb_data,
+                &backend_decode_ns,
             );
             try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
-            const decode_ns = decode_timer.read();
 
             const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
             return .{
                 .tokens = try generated.toOwnedSlice(self.allocator),
                 .finish_reason = finish_reason,
                 .prefill_ns = prefill_ns,
-                .decode_ns = decode_ns,
+                .decode_ns = backend_decode_ns,
             };
         }
 
@@ -4908,10 +4926,12 @@ const MockStreamingBackend = struct {
         output_tokens: []u32,
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
+        decode_ns_out: ?*u64,
     ) !usize {
         _ = eos_token_ids;
         _ = sampling_config;
         self.decode_top_k_streaming_calls += 1;
+        if (decode_ns_out) |out| out.* = @intCast(max_tokens);
         for (output_tokens[0..max_tokens], 0..) |*out_token, idx| {
             out_token.* = first_token + @as(u32, @intCast(start_position + idx));
             if (callback) |cb| cb(out_token.*, callback_data);
@@ -5171,6 +5191,7 @@ test "generateSync uses backend top-k streaming route for top_k sampling without
     try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
     try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
+    try std.testing.expectEqual(@as(u64, 3), result.decode_ns);
     try std.testing.expectEqualSlices(u32, &.{ 42, 44, 45, 46 }, result.tokens);
 }
 
@@ -5229,6 +5250,71 @@ test "runDecodeLoop keeps slot-indexed requests off slot-zero streaming route" {
     try std.testing.expectEqual(@as(usize, 3), callback_data.token_count);
     try std.testing.expectEqual(@as(usize, 1), callback_data.final_count);
     try std.testing.expectEqual(FinishReason.length, scheduler.getFinishReason(request_id).?);
+}
+
+test "runDecodeLoop top-k streaming records backend decode time only" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .seed = 0,
+        },
+    });
+    defer scheduler.deinit();
+
+    const request_id = try scheduler.submit(&[_]u32{ 7, 8, 9 }, 4, .{
+        .sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .seed = 0,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+
+    _ = try scheduler.step();
+
+    const CallbackData = struct {
+        token_count: usize = 0,
+        final_count: usize = 0,
+    };
+    var callback_data = CallbackData{};
+    const callback = struct {
+        fn cb(_: u64, _: u32, is_final: bool, _: bool, user_data: ?*anyopaque) callconv(.c) void {
+            const data: *CallbackData = @ptrCast(@alignCast(user_data.?));
+            data.token_count += 1;
+            if (is_final) data.final_count += 1;
+        }
+    }.cb;
+
+    try scheduler.runDecodeLoop(request_id, null, callback, &callback_data);
+
+    try std.testing.expectEqual(@as(usize, 1), backend.decode_top_k_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_calls);
+    try std.testing.expectEqual(@as(usize, 3), callback_data.token_count);
+    try std.testing.expectEqual(@as(usize, 1), callback_data.final_count);
+    try std.testing.expectEqual(@as(?u64, 3), scheduler.getDecodeNs(request_id));
+}
+
+test "getDecodeNs returns accumulated request decode time" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{});
+    defer scheduler.deinit();
+
+    const request_id = try scheduler.submit(&[_]u32{ 1, 2, 3 }, 4, null);
+    const request_entry = scheduler.requests.get(request_id).?;
+    request_entry.decode_ns = 1234;
+
+    try std.testing.expectEqual(@as(?u64, 1234), scheduler.getDecodeNs(request_id));
+    try std.testing.expectEqual(@as(?u64, null), scheduler.getDecodeNs(request_id + 1));
 }
 
 test "generateSync uses top-k candidate route with additive penalties" {

@@ -17,6 +17,17 @@ fn isInferencePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/inference/");
 }
 
+fn isInferenceProductionSourcePath(path: []const u8) bool {
+    if (!isInferencePath(path)) return false;
+    if (!isCoreSourceFile(path)) return false;
+    if (std.mem.endsWith(u8, path, "_test.zig")) return false;
+    if (std.mem.endsWith(u8, path, "_tests.zig")) return false;
+    if (std.mem.indexOf(u8, path, "/testdata/") != null) return false;
+    if (std.mem.indexOf(u8, path, "/bridge_tests_") != null) return false;
+    if (std.mem.endsWith(u8, path, "/bridge_config_test.cpp")) return false;
+    return true;
+}
+
 fn isInferenceBackendPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/inference/backend/");
 }
@@ -299,6 +310,57 @@ fn freeNameSet(allocator: std.mem.Allocator, set: *std.StringHashMap(void)) void
     set.deinit();
 }
 
+const BackendParityGap = enum {
+    metal_executor,
+    cpu_executor,
+    metal_kernel,
+    cpu_kernel,
+};
+
+fn stringIn(name: []const u8, allowed: []const []const u8) bool {
+    for (allowed) |item| {
+        if (std.mem.eql(u8, name, item)) return true;
+    }
+    return false;
+}
+
+fn isAllowedBackendParityGap(gap: BackendParityGap, name: []const u8) bool {
+    const metal_executor_gaps = [_][]const u8{
+        "block.zig",
+        "model.zig",
+        "runtime.zig",
+    };
+    const cpu_executor_gaps = [_][]const u8{
+        "runtime_graph.zig",
+    };
+    const metal_kernel_gaps = [_][]const u8{
+        "attention.zig",
+        "describe_fmt.zig",
+        "embedding.zig",
+        "ffn.zig",
+        "gated_delta.zig",
+        "kv_cache.zig",
+        "mamba.zig",
+        "mla_attention.zig",
+        "moe.zig",
+        "norm.zig",
+        "per_layer_branch.zig",
+        "rope.zig",
+        "shortconv.zig",
+        "weights.zig",
+    };
+
+    // Metal currently owns execution through the runtime graph and MLX bridge,
+    // so these named gaps are classified asymmetries rather than silent drift.
+    // New CPU/Metal file drift still fails closed until it is classified here.
+    return switch (gap) {
+        .metal_executor => stringIn(name, &metal_executor_gaps),
+        .cpu_executor => stringIn(name, &cpu_executor_gaps),
+        .metal_kernel => stringIn(name, &metal_kernel_gaps),
+        .cpu_kernel => false,
+    };
+}
+
 fn sourceHasPubConst(source: []const u8, name: []const u8) bool {
     var buf: [128]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "pub const {s}", .{name}) catch return false;
@@ -355,6 +417,27 @@ fn lintLoggingPolicy(file_path: []const u8, source: []const u8, emit: bool) usiz
     return violations;
 }
 
+fn lintInferenceProductionLexicon(file_path: []const u8, source: []const u8, emit: bool) usize {
+    if (!isInferenceProductionSourcePath(file_path)) return 0;
+    const forbidden = [_][]const u8{ "fallback", "degraded", "legacy" };
+    var violations: usize = 0;
+    for (forbidden) |token| {
+        var search_start: usize = 0;
+        while (std.mem.indexOfPos(u8, source, search_start, token)) |offset| {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}:{d}: forbidden inference production token: \"{s}\"\n", .{
+                    file_path,
+                    lineNumberForOffset(source, offset),
+                    token,
+                });
+            }
+            search_start = offset + token.len;
+        }
+    }
+    return violations;
+}
+
 fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
     var violations: usize = 0;
 
@@ -375,6 +458,7 @@ fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
     var it_exec_cpu = exec_cpu_set.iterator();
     while (it_exec_cpu.next()) |entry| {
         if (!exec_metal_set.contains(entry.key_ptr.*)) {
+            if (isAllowedBackendParityGap(.metal_executor, entry.key_ptr.*)) continue;
             violations += 1;
             if (emit) {
                 std.debug.print("backend parity: missing metal executor file `{s}`\n", .{entry.key_ptr.*});
@@ -384,6 +468,7 @@ fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
     var it_exec_metal = exec_metal_set.iterator();
     while (it_exec_metal.next()) |entry| {
         if (!exec_cpu_set.contains(entry.key_ptr.*)) {
+            if (isAllowedBackendParityGap(.cpu_executor, entry.key_ptr.*)) continue;
             violations += 1;
             if (emit) {
                 std.debug.print("backend parity: missing cpu executor file `{s}`\n", .{entry.key_ptr.*});
@@ -394,6 +479,7 @@ fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
     var it_kern_cpu = kern_cpu_set.iterator();
     while (it_kern_cpu.next()) |entry| {
         if (!kern_metal_set.contains(entry.key_ptr.*)) {
+            if (isAllowedBackendParityGap(.metal_kernel, entry.key_ptr.*)) continue;
             violations += 1;
             if (emit) {
                 std.debug.print("backend parity: missing metal kernel file `{s}`\n", .{entry.key_ptr.*});
@@ -403,6 +489,7 @@ fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
     var it_kern_metal = kern_metal_set.iterator();
     while (it_kern_metal.next()) |entry| {
         if (!kern_cpu_set.contains(entry.key_ptr.*)) {
+            if (isAllowedBackendParityGap(.cpu_kernel, entry.key_ptr.*)) continue;
             violations += 1;
             if (emit) {
                 std.debug.print("backend parity: missing cpu kernel file `{s}`\n", .{entry.key_ptr.*});
@@ -494,6 +581,7 @@ fn lintTree(allocator: std.mem.Allocator, root_path: []const u8) !usize {
         defer allocator.free(source);
 
         total_violations += lintLoggingPolicy(full_path, source, true);
+        total_violations += lintInferenceProductionLexicon(full_path, source, true);
         if (std.mem.endsWith(u8, entry.path, ".zig")) {
             total_violations += try lintSource(allocator, full_path, source, true);
         }
@@ -582,6 +670,30 @@ test "lintLoggingPolicy rejects direct C stderr logging" {
     try std.testing.expectEqual(
         @as(usize, 1),
         lintLoggingPolicy("core/src/inference/backend/metal/mlx_bridge/bad.inc", src, false),
+    );
+}
+
+test "lintInferenceProductionLexicon rejects hidden-route tokens" {
+    const src =
+        \\const a = "fallback";
+        \\const b = "degraded";
+        \\const c = "legacy";
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        lintInferenceProductionLexicon("core/src/inference/backend/cuda/route.zig", src, false),
+    );
+}
+
+test "lintInferenceProductionLexicon allows test source paths" {
+    const src =
+        \\const a = "fallback";
+        \\const b = "degraded";
+        \\const c = "legacy";
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        lintInferenceProductionLexicon("core/src/inference/backend/cuda/route_test.zig", src, false),
     );
 }
 
@@ -707,6 +819,20 @@ test "lintSource rejects transitional compute symbol in inference" {
         @as(usize, 1),
         try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/executor/block.zig", src, false),
     );
+}
+
+test "isAllowedBackendParityGap allows classified metal executor asymmetry" {
+    try std.testing.expect(isAllowedBackendParityGap(.metal_executor, "runtime.zig"));
+    try std.testing.expect(!isAllowedBackendParityGap(.metal_executor, "new_runtime.zig"));
+}
+
+test "isAllowedBackendParityGap allows classified metal kernel asymmetry" {
+    try std.testing.expect(isAllowedBackendParityGap(.metal_kernel, "embedding.zig"));
+    try std.testing.expect(!isAllowedBackendParityGap(.metal_kernel, "new_kernel.zig"));
+}
+
+test "isAllowedBackendParityGap keeps metal-only kernels strict" {
+    try std.testing.expect(!isAllowedBackendParityGap(.cpu_kernel, "runtime_graph.zig"));
 }
 
 test "backend cpu/metal parity checks pass" {

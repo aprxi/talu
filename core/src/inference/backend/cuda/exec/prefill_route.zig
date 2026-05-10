@@ -9,11 +9,11 @@ const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
-const staged_orchestrator = @import("../../staged_orchestrator.zig");
+const orchestrator = @import("../../../bridge/orchestrator.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../runtime/_types_impl.zig");
+const engine_types = @import("../runtime/root.zig");
 const BatchDecodeInfo = engine_types.BatchDecodeInfo;
 const KvCacheDtype = engine_types.KvCacheDtype;
 const enable_dispatch_observability = engine_types.enable_dispatch_observability;
@@ -43,10 +43,19 @@ fn topologyModeIs(self: anytype, comptime expected: []const u8) bool {
     return std.mem.eql(u8, tag, expected);
 }
 
+fn rejectUnsupportedStagedPrefillRoute(topology_tag: ?[]const u8) !void {
+    const tag = topology_tag orelse return;
+    if (std.mem.eql(u8, tag, "pipeline2") or
+        std.mem.eql(u8, tag, "cpu_gpu") or
+        std.mem.eql(u8, tag, "cpu_gpu_gpu"))
+    {
+        return error.UnsupportedModel;
+    }
+}
+
 /// Resolve staged prefill chunk rows for a specific request length.
 /// Keeps explicit env override behavior unchanged.
 const common = @import("common.zig");
-const decode_route = @import("decode_route.zig");
 const kv_capacity = @import("kv_capacity.zig");
 const resets = @import("resets.zig");
 const cpu_gpu = @import("cpu_gpu.zig");
@@ -65,7 +74,6 @@ const runCpuGpuGpuWithPipelineRuntime = cpu_gpu_gpu.runCpuGpuGpuWithPipelineRunt
 const computeBatchedPrefillPipeline2 = pipeline2.computeBatchedPrefillPipeline2;
 const computeBatchedPrefillCpuGpu = cpu_gpu.computeBatchedPrefillCpuGpu;
 const computeBatchedPrefillCpuGpuGpu = cpu_gpu_gpu.computeBatchedPrefillCpuGpuGpu;
-const computeGpuPrototypeLogitsWithLayerLimit = decode_route.computeGpuPrototypeLogitsWithLayerLimit;
 const ensureKvCapacity = kv_capacity.ensureKvCapacity;
 const resetShortConvStates = resets.resetShortConvStates;
 const resetGatedDeltaStates = resets.resetGatedDeltaStates;
@@ -135,7 +143,6 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
         }
     }
 
-    // Multi-stage topologies without batched prefill: token-by-token fallback.
     if ((topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) and
         layer_limit == self.block_runtime.blocks.len)
     {
@@ -143,29 +150,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         if (logits_out.len != self.vocab_size) return error.InvalidArgument;
         if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-
-        var token_index: usize = 0;
-        while (token_index < tokens.len) : (token_index += 1) {
-            const should_download = token_index + 1 == tokens.len;
-            try computeGpuPrototypeLogitsWithLayerLimit(
-                self,
-                tokens[token_index],
-                token_index,
-                slot_index,
-                if (should_download) logits_out else null,
-                layer_limit,
-                true,
-                should_download,
-                true,
-                @intCast(token_index + 1),
-                token_index,
-                null,
-                null,
-                null,
-                false,
-            );
-        }
-        return;
+        return rejectUnsupportedStagedPrefillRoute(topologyModeTag(self));
     }
 
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
@@ -540,4 +525,16 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
 
         pos_base += rows;
     }
+}
+
+test "rejectUnsupportedStagedPrefillRoute rejects staged prefill route" {
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        rejectUnsupportedStagedPrefillRoute("pipeline2"),
+    );
+}
+
+test "rejectUnsupportedStagedPrefillRoute allows single-device tag" {
+    try rejectUnsupportedStagedPrefillRoute("single");
+    try rejectUnsupportedStagedPrefillRoute(null);
 }

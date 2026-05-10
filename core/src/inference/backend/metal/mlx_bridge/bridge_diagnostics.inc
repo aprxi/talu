@@ -118,21 +118,21 @@ bool has_nvfp4_quant_metadata(const std::unordered_map<std::string, array>& tens
     return false;
 }
 
-bool env_truthy(const char* name, bool fallback) {
+bool env_truthy(const char* name, bool default_value) {
     const char* raw = std::getenv(name);
-    if (!raw) return fallback;
+    if (!raw) return default_value;
     return std::string(raw) == "1";
 }
 
-int env_positive_int(const char* name, int fallback) {
+int env_positive_int(const char* name, int default_value) {
     const char* raw = std::getenv(name);
-    if (!raw) return fallback;
+    if (!raw) return default_value;
     try {
         const int parsed = std::stoi(raw);
         if (parsed > 0) return parsed;
     } catch (...) {
     }
-    return fallback;
+    return default_value;
 }
 
 int resolve_prefill_chunk_size(const mlx_ctx* ctx = nullptr) {

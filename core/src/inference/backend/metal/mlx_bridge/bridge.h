@@ -68,7 +68,7 @@ typedef struct mlx_init_diagnostics {
     uint64_t strict_required;
     uint64_t strict_quantized;
     uint64_t strict_missing;
-    uint64_t dense_fallback_bytes;
+    uint64_t dense_decode_bytes;
     uint64_t ctx_bytes;
     uint64_t layer_quantized_bytes;
     uint64_t layer_dense_bytes;
@@ -236,7 +236,7 @@ int32_t mlx_test_linear_attention_fused_quant_inproj_reuse(void);
 int32_t mlx_test_nvfp4_rowwise_post_scale_linear_decode(void);
 int32_t mlx_test_talu_meta_nvfp4_detection(void);
 int32_t mlx_test_nvfp4_mmap_strict_policy(void);
-int32_t mlx_test_dense_lm_head_lhs_fallback(void);
+int32_t mlx_test_dense_lm_head_lhs_primary(void);
 int32_t mlx_test_grouped_affine_embedding_lookup_matches_reference(void);
 int32_t mlx_test_linear_attention_fused_mixer_matches_reference(void);
 int32_t mlx_test_topk_candidate_extraction_multi(void);

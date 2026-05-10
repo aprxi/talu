@@ -110,7 +110,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
         if (nvfp4_only_checkpoint && !ctx->fp8_decode_qmm_enabled) {
             throw std::runtime_error(
                 "nvfp4-only checkpoint requires TALU_METAL_FP8_DECODE_QMM=1 "
-                "(decode fallback paths are disabled for nvfp4-only checkpoints)"
+                "(decode dense paths are disabled for nvfp4-only checkpoints)"
             );
         }
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
@@ -274,7 +274,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 throw std::runtime_error("missing lm_head weight (tie_word_embeddings=false)");
             }
             // Defer loading the dense weight: for large quantized checkpoints (TQ4, FP8, NVFP4)
-            // the QMM path below avoids the full dequantize. Load dense only as a fallback.
+            // the QMM path below avoids the full dequantize. Load dense only when required.
         }
         const std::string lm_head_rhs_key = lm_head_key + "_rhs";
         const bool has_lm_head_rhs_companion = has_tensor(tensors, lm_head_rhs_key);
@@ -365,7 +365,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             }
 
             if (nvfp4_mmap_required && !ctx->lm_head_q_decode_enabled && !loaded_rhs_companion) {
-                // Strict mmap fallback: keep dense [vocab,hidden] mmap view and
+                // Strict mmap dense route: keep dense [vocab,hidden] mmap view and
                 // transpose lazily at matmul time. This avoids any materialized
                 // dense companion copy while supporting lm_head_q=off.
                 if (has_tensor(tensors, lm_head_key)) {
@@ -391,7 +391,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 // Companion is already [hidden, vocab] and mmap-backed.
                 // Avoid transpose/copy in strict mode.
             } else if (loaded_dense_lhs) {
-                // Dense lhs fallback is mmap-backed and used via lazy transpose
+                // Dense lhs primary is mmap-backed and used via lazy transpose
                 // in forward matmul to preserve strict mmap semantics.
             } else {
             // Need dense weight for lm_head RHS. Ensure we have loaded a real
@@ -990,7 +990,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                                 );
                             }
                             // Native split-NVFP4 capture is preferred, but if any split
-                            // projection misses we still allow fallback quantized capture
+                            // projection misses we still allow secondary quantized capture
                             // to avoid dense in-proj residency and decode regressions.
                             allow_split_affine_qmm = true;
                         }
@@ -1758,11 +1758,9 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             size_t attn_qkv_q = 0, attn_qkv_total = 0;
             size_t attn_o_q = 0, attn_o_total = 0;
             size_t mlp_q = 0, mlp_total = 0;
-            size_t dense_fallback_bytes = 0;
+            size_t dense_decode_bytes = 0;
             const bool quantized_checkpoint =
                 has_mxfp8_meta || ctx->has_grouped_affine_meta || has_nvfp4_meta;
-            const bool nvfp4_only_quantized_checkpoint =
-                has_nvfp4_meta && !ctx->has_grouped_affine_meta && !has_mxfp8_meta;
             const bool strict_quantized_decode_requested =
                 env_truthy("TALU_METAL_STRICT_QUANTIZED_DECODE", false);
             const bool strict_quantized_decode_active =
@@ -1778,7 +1776,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             strict_missing.reserve(64);
             auto count_dense = [&](const array& rhs) {
                 if (rhs.size() > 1 && rhs.ndim() == 2) {
-                    dense_fallback_bytes += static_cast<size_t>(rhs.size()) * rhs.itemsize();
+                    dense_decode_bytes += static_cast<size_t>(rhs.size()) * rhs.itemsize();
                 }
             };
             auto record_strict = [&](bool required, bool is_quantized, const std::string& name) {
@@ -1865,10 +1863,28 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     record_strict(true, lw.mlp_down_has_q, "layer" + std::to_string(layer_idx) + ".mlp_down");
                 }
             }
-            if (nvfp4_mmap_required && dense_fallback_bytes > 0) {
+            if (nvfp4_mmap_required && dense_decode_bytes > 0) {
                 throw std::runtime_error(
-                    "nvfp4 mmap-strict mode detected dense fallback tensors during init"
+                    "nvfp4 mmap-strict mode detected dense decode tensors during init"
                 );
+            }
+            if (quantized_checkpoint && dense_decode_bytes > 0) {
+                char msg[512];
+                std::snprintf(
+                    msg, sizeof(msg),
+                    "quantized checkpoint detected %.1fMB dense decode tensors during init "
+                    "(ssm_qkvz=%zu/%zu ssm_ba=%zu/%zu ssm_out=%zu/%zu "
+                    "attn_qkv=%zu/%zu attn_o=%zu/%zu mlp=%zu/%zu). "
+                    "All decode projections must use quantized matmul.",
+                    static_cast<double>(dense_decode_bytes) / (1024.0 * 1024.0),
+                    ssm_qkvz_q, ssm_qkvz_total,
+                    ssm_ba_q, ssm_ba_total,
+                    ssm_out_q, ssm_out_total,
+                    attn_qkv_q, attn_qkv_total,
+                    attn_o_q, attn_o_total,
+                    mlp_q, mlp_total
+                );
+                throw std::runtime_error(msg);
             }
             ctx->init_diagnostics.has_nvfp4_meta = has_nvfp4_meta ? 1 : 0;
             ctx->init_diagnostics.has_grouped_affine_meta = ctx->has_grouped_affine_meta ? 1 : 0;
@@ -1900,7 +1916,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
             ctx->init_diagnostics.strict_required = strict_required;
             ctx->init_diagnostics.strict_quantized = strict_quantized;
             ctx->init_diagnostics.strict_missing = strict_missing.size();
-            ctx->init_diagnostics.dense_fallback_bytes = dense_fallback_bytes;
+            ctx->init_diagnostics.dense_decode_bytes = dense_decode_bytes;
             if (strict_quantized_decode_active && !strict_missing.empty()) {
                 std::string preview;
                 const size_t max_items = std::min<size_t>(strict_missing.size(), 8);
@@ -1915,30 +1931,6 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     "TALU_METAL_STRICT_QUANTIZED_DECODE: missing quantized decode projections: " + preview
                 );
             }
-            // Strict quantized decode mode: treat dense fallback as fatal.
-            // Prevents silent memory ballooning and bandwidth loss from bf16
-            // dequantized weights on memory-constrained systems (24GB).
-            if (dense_fallback_bytes > 0) {
-                if (strict_quantized_decode_active) {
-                    char msg[512];
-                    std::snprintf(
-                        msg, sizeof(msg),
-                        "TALU_METAL_STRICT_QUANTIZED_DECODE: %.1fMB dense fallback detected "
-                        "(ssm_qkvz=%zu/%zu ssm_ba=%zu/%zu ssm_out=%zu/%zu "
-                        "attn_qkv=%zu/%zu attn_o=%zu/%zu mlp=%zu/%zu). "
-                        "All decode projections must use quantized matmul in strict mode.",
-                        static_cast<double>(dense_fallback_bytes) / (1024.0 * 1024.0),
-                        ssm_qkvz_q, ssm_qkvz_total,
-                        ssm_ba_q, ssm_ba_total,
-                        ssm_out_q, ssm_out_total,
-                        attn_qkv_q, attn_qkv_total,
-                        attn_o_q, attn_o_total,
-                        mlp_q, mlp_total
-                    );
-                    throw std::runtime_error(msg);
-                }
-            }
-
             // Verify lm_head is quantized in strict mode.
             if (strict_quantized_decode_active && !ctx->lm_head_q_decode_enabled)
             {
@@ -2003,7 +1995,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                 }) {
                     layer_q_bytes += array_bytes(*a);
                 }
-                // Dense RHS fallbacks.
+                // Dense RHS tensors.
                 for (const auto* a : {
                     &lw.mlp_gate_rhs, &lw.mlp_up_rhs, &lw.mlp_down_rhs, &lw.mlp_gate_up_rhs,
                     &lw.attn_q_rhs, &lw.attn_k_rhs, &lw.attn_v_rhs, &lw.attn_qkv_rhs, &lw.attn_o_rhs,

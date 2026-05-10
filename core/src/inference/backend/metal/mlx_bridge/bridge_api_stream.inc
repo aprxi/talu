@@ -307,91 +307,11 @@ int32_t mlx_decode_topk_candidates_batch(
             }
         }
 
-        std::vector<int32_t> fallback_rows;
-        fallback_rows.reserve(static_cast<size_t>(batch_size));
         for (int32_t i = 0; i < batch_size; ++i) {
             if (decode_done[static_cast<size_t>(i)] == 0) {
-                fallback_rows.push_back(i);
-            }
-        }
-        if (fallback_rows.empty()) {
-            return 1;
-        }
-
-        auto topk_fn = compiled_topk_candidates(k);
-
-        auto& logits_flat_batch = g_decode_topk_batch_logits_flat_scratch;
-        auto& ids_flat_batch = g_decode_topk_batch_ids_flat_scratch;
-        logits_flat_batch.clear();
-        ids_flat_batch.clear();
-        if (logits_flat_batch.capacity() < fallback_rows.size()) {
-            logits_flat_batch.reserve(fallback_rows.size());
-        }
-        if (ids_flat_batch.capacity() < fallback_rows.size()) {
-            ids_flat_batch.reserve(fallback_rows.size());
-        }
-
-        std::vector<array> eval_targets;
-        eval_targets.reserve(fallback_rows.size() * 2);
-
-        for (int32_t i : fallback_rows) {
-            mlx_ctx* ctx = ctxs[i];
-            const int32_t token_scalar = tokens[i];
-            const array token_arr(&token_scalar, Shape{1, 1}, int32);
-            const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
-            if (logits_last.ndim() != 3) {
-                g_last_error = "mlx_decode_topk_candidates_batch: invalid logits rank";
+                g_last_error = "mlx_decode_topk_candidates_batch: fused decode did not cover every row";
                 return 0;
             }
-            const int vocab = logits_last.shape(2);
-            if (vocab <= 0 || vocab < k) {
-                g_last_error = "mlx_decode_topk_candidates_batch: invalid vocab size";
-                return 0;
-            }
-
-            if (k == 1) {
-                const array top_id = reshape(astype(argmax(logits_last, -1), int32), {1});
-                ids_flat_batch.push_back(top_id);
-                eval_targets.push_back(ids_flat_batch.back());
-            } else {
-                const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
-                if (topk_outputs.size() != 2) {
-                    g_last_error = "mlx_decode_topk_candidates_batch: invalid compiled output";
-                    return 0;
-                }
-
-                logits_flat_batch.push_back(astype(topk_outputs[0], float32));
-                ids_flat_batch.push_back(astype(topk_outputs[1], int32));
-                eval_targets.push_back(logits_flat_batch.back());
-                eval_targets.push_back(ids_flat_batch.back());
-            }
-        }
-        if (!eval_targets.empty()) {
-            eval(eval_targets);
-            synchronize();
-        }
-
-        for (size_t row_idx = 0; row_idx < fallback_rows.size(); ++row_idx) {
-            const int32_t i = fallback_rows[row_idx];
-            if (k == 1) {
-                out_candidate_ids_ptrs[i][0] = ids_flat_batch[row_idx].data<int32_t>()[0];
-                out_candidate_logits_ptrs[i][0] = 0.0f;
-                out_candidate_counts[i] = 1;
-            } else {
-                std::memcpy(
-                    out_candidate_logits_ptrs[i],
-                    logits_flat_batch[row_idx].data<float>(),
-                    static_cast<size_t>(k) * sizeof(float)
-                );
-                std::memcpy(
-                    out_candidate_ids_ptrs[i],
-                    ids_flat_batch[row_idx].data<int32_t>(),
-                    static_cast<size_t>(k) * sizeof(int32_t)
-                );
-                stable_sort_topk_pairs(out_candidate_logits_ptrs[i], out_candidate_ids_ptrs[i], k);
-                out_candidate_counts[i] = k;
-            }
-            ctxs[i]->trace_decode_token += 1;
         }
         return 1;
     } catch (const std::exception& e) {

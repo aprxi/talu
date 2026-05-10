@@ -879,7 +879,7 @@ pub fn build(b: *std.Build) void {
     // Internal inference library (inference + models + compute)
     // ==========================================================================
     const inference_mod = b.createModule(.{
-        .root_source_file = b.path("core/src/inference/boundary.zig"),
+        .root_source_file = b.path("core/src/inference/abi.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,

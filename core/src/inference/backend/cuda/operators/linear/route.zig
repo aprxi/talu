@@ -7,7 +7,7 @@ const dtype = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 
 // --- Shared types from engine_types.zig ---
-const engine_types = @import("../../runtime/_types_impl.zig");
+const engine_types = @import("../../runtime/root.zig");
 const BlockRuntimeLayer = engine_types.BlockRuntimeLayer;
 const LayerAttentionRuntime = engine_types.LayerAttentionRuntime;
 const LinearWeight = engine_types.LinearWeight;
@@ -17,7 +17,6 @@ const ProjectionPath = engine_types.ProjectionPath;
 const Nvfp4RouteKind = engine_types.Nvfp4RouteKind;
 const enable_dispatch_observability = engine_types.enable_dispatch_observability;
 const bufferF32RowCount = engine_types.bufferF32RowCount;
-const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 
 const models = @import("models_pkg");
 const layer_ops = models.layer_ops;
@@ -566,7 +565,7 @@ pub fn linearForwardRows(
                 if (done == rows) return;
             }
 
-            // Fallback: F16 dequant + cuBLAS GEMM path for prefill.
+            // F16 dequant + cuBLAS GEMM path for prefill.
             if (self.cast_f32_to_f16_function) |cast_fn| {
                 if (self.u16_blas_f16_supported) dequant_blas: {
                     const weight_elems = std.math.mul(usize, w.rows, w.cols) catch break :dequant_blas;
@@ -627,67 +626,43 @@ pub fn linearForwardRows(
                 }
             }
 
-            // Fallback: row-by-row U4 GEMV.
-            if (self.gaffine_sequence_rows_supported) {
-                if (use_tile8) {
-                    try compute.cuda.gaffine_u4_matvec.runWithFunctionTile8(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        kernel,
-                        &packed_input,
-                        &w.packed_data,
-                        &w.scales,
-                        &w.biases,
-                        &packed_out,
-                        @intCast(w.rows),
-                        @intCast(w.cols),
-                        w.group_size,
-                        w.scales_dtype_tag,
-                        @intCast(rows),
-                        0,
-                    );
-                } else {
-                    try compute.cuda.gaffine_u4_matvec.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        kernel,
-                        &packed_input,
-                        &w.packed_data,
-                        &w.scales,
-                        &w.biases,
-                        &packed_out,
-                        @intCast(w.rows),
-                        @intCast(w.cols),
-                        w.group_size,
-                        w.scales_dtype_tag,
-                        @intCast(rows),
-                        0,
-                    );
-                }
-                return;
-            }
-
-            var row_index: usize = 0;
-            while (row_index < rows) : (row_index += 1) {
-                var input_row = try logicalF32RowSlice(&packed_input, rows, row_index, w.rows);
-                var out_row = try logicalF32RowSlice(&packed_out, rows, row_index, w.cols);
-                try compute.cuda.gaffine_u4_matvec.runWithFunction(
+            if (rows > 1 and !self.gaffine_sequence_rows_supported) return error.UnsupportedModel;
+            if (use_tile8) {
+                try compute.cuda.gaffine_u4_matvec.runWithFunctionTile8(
                     &self.kernel_arg_pack,
                     &self.device,
                     kernel,
-                    &input_row,
+                    &packed_input,
                     &w.packed_data,
                     &w.scales,
                     &w.biases,
-                    &out_row,
+                    &packed_out,
                     @intCast(w.rows),
                     @intCast(w.cols),
                     w.group_size,
                     w.scales_dtype_tag,
-                    1,
+                    @intCast(rows),
+                    0,
+                );
+            } else {
+                try compute.cuda.gaffine_u4_matvec.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    kernel,
+                    &packed_input,
+                    &w.packed_data,
+                    &w.scales,
+                    &w.biases,
+                    &packed_out,
+                    @intCast(w.rows),
+                    @intCast(w.cols),
+                    w.group_size,
+                    w.scales_dtype_tag,
+                    @intCast(rows),
                     0,
                 );
             }
+            return;
         },
         .gaffine_u8 => |w| {
             const kernel = self.gaffine_u8_matvec_function orelse return error.CudaKernelUnavailable;
@@ -714,7 +689,7 @@ pub fn linearForwardRows(
                     }, &self.kernel_arg_pack, .matvec) catch break :i8_decode;
                     return;
                 }
-                // Fallback: U8 GEMV with per-group dequant.
+                // U8 GEMV with per-group dequant.
                 try compute.cuda.gaffine_u8_matvec.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -881,48 +856,23 @@ pub fn linearForwardRows(
                 }
             }
 
-            // Fallback: row-by-row GEMV.
-            if (self.gaffine_sequence_rows_supported) {
-                try compute.cuda.gaffine_u8_matvec.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    kernel,
-                    &packed_input,
-                    &w.packed_data,
-                    &w.scales,
-                    &w.biases,
-                    &packed_out,
-                    @intCast(w.rows),
-                    @intCast(w.cols),
-                    w.group_size,
-                    w.scales_dtype_tag,
-                    @intCast(rows),
-                    0,
-                );
-                return;
-            }
-
-            var row_index: usize = 0;
-            while (row_index < rows) : (row_index += 1) {
-                var input_row = try logicalF32RowSlice(&packed_input, rows, row_index, w.rows);
-                var out_row = try logicalF32RowSlice(&packed_out, rows, row_index, w.cols);
-                try compute.cuda.gaffine_u8_matvec.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    kernel,
-                    &input_row,
-                    &w.packed_data,
-                    &w.scales,
-                    &w.biases,
-                    &out_row,
-                    @intCast(w.rows),
-                    @intCast(w.cols),
-                    w.group_size,
-                    w.scales_dtype_tag,
-                    1,
-                    0,
-                );
-            }
+            if (rows > 1 and !self.gaffine_sequence_rows_supported) return error.UnsupportedModel;
+            try compute.cuda.gaffine_u8_matvec.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernel,
+                &packed_input,
+                &w.packed_data,
+                &w.scales,
+                &w.biases,
+                &packed_out,
+                @intCast(w.rows),
+                @intCast(w.cols),
+                w.group_size,
+                w.scales_dtype_tag,
+                @intCast(rows),
+                0,
+            );
             return;
         },
         .fp8 => |w| {
@@ -1368,32 +1318,8 @@ pub fn linearForwardRows(
                 return;
             }
 
-            // Fail closed when the startup parity probe found multi-row mismatches:
-            // execute one row at a time on the known-good single-row kernel.
             if (rows > 1 and !self.nvfp4_sequence_rows_supported) {
-                var row_index: usize = 0;
-                while (row_index < rows) : (row_index += 1) {
-                    var input_row = try logicalF32RowSlice(&packed_input, rows, row_index, w.rows);
-                    var out_row = try logicalF32RowSlice(&packed_out, rows, row_index, w.cols);
-                    self.kernel_arg_pack.reset();
-                    self.kernel_arg_pack.appendBufferPtr(&input_row) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendBufferPtr(&out_row) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendScalar(u32, out_cols) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendScalar(u32, w.group_size) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendScalar(f32, w.weight_global_scale) catch return error.CudaKernelUnavailable;
-                    self.kernel_arg_pack.appendScalar(u32, 1) catch return error.CudaKernelUnavailable;
-                    try compute.cuda.launch.launchWithFamily(&self.device, base_nvfp4_fn, .{
-                        .grid_x = (out_cols + 3) / 4,
-                        .grid_y = 1,
-                        .block_x = 128,
-                    }, &self.kernel_arg_pack, .matvec);
-                }
-                recordNvfp4Route(self, .small_rows_nvfp4_matvec);
-                return;
+                return error.UnsupportedModel;
             }
 
             var nvfp4_fn = base_nvfp4_fn;

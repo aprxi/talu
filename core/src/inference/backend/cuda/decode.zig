@@ -324,9 +324,16 @@ pub fn decodeTopKStreaming(
     output_tokens: []u32,
     callback: ?*const fn (u32, ?*anyopaque) void,
     callback_data: ?*anyopaque,
+    decode_ns_out: ?*u64,
 ) !usize {
     const prev_backend = trace.setBackendContext(.cuda);
     defer _ = trace.setBackendContext(prev_backend);
+    var measured_decode_ns: u64 = 0;
+    if (decode_ns_out) |out| out.* = 0;
+    defer {
+        if (decode_ns_out) |out| out.* = measured_decode_ns;
+    }
+
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
         try self.ensureSlotStateBlocksBoundForScheduler(0);
@@ -364,6 +371,7 @@ pub fn decodeTopKStreaming(
     var generated: usize = 0;
     var current_token: u32 = first_token;
     while (generated < budget) {
+        var decode_timer = std.time.Timer.start() catch unreachable;
         const candidate_count = try self.decodeTopKCandidates(
             0,
             current_token,
@@ -371,6 +379,12 @@ pub fn decodeTopKStreaming(
             candidate_logits,
             candidate_ids,
         );
+        const host_decode_ns = decode_timer.read();
+        const decode_step_ns = if (comptime @hasDecl(SelfType, "lastDecodeComputeNs"))
+            self.lastDecodeComputeNs() orelse host_decode_ns
+        else
+            host_decode_ns;
+        measured_decode_ns +|= decode_step_ns;
         if (candidate_count == 0) return error.InvalidArgument;
 
         var next_token: u32 = candidate_ids[0];
