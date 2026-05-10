@@ -9,7 +9,6 @@ pub const capi = prod.capi;
 pub const ABI_VERSION = prod.ABI_VERSION;
 pub const talu_get_abi_version = prod.talu_get_abi_version;
 
-pub const core = @import("root.zig");
 pub const tokenizer = @import("tokenizer/root.zig");
 pub const template = @import("template/root.zig");
 pub const io = @import("io_pkg");
@@ -26,4 +25,17 @@ pub const train = @import("train/root.zig");
 
 pub const models = struct {
     pub const dispatcher = @import("models_pkg");
+};
+
+pub const core = struct {
+    pub const tensor = @import("tensor_pkg");
+    pub const dtype = @import("dtype_pkg");
+    pub const compute = @import("compute_pkg");
+    pub const validate = @import("validate_pkg");
+
+    pub const Tensor = @import("tensor_pkg").Tensor;
+    pub const OwnedTensor = @import("tensor_pkg").OwnedTensor;
+    pub const DType = @import("dtype_pkg").DType;
+    pub const Device = @import("compute_pkg").Device;
+    pub const DeviceType = @import("compute_pkg").DeviceType;
 };

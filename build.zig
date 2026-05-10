@@ -403,7 +403,7 @@ const CorePackages = struct {
                 .link_libc = true,
             }),
             .tensor_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/tensor.zig"),
+                .root_source_file = b.path("core/src/compute/tensor.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
@@ -427,7 +427,7 @@ const CorePackages = struct {
                 .link_libc = true,
             }),
             .dtype_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/dtype.zig"),
+                .root_source_file = b.path("core/src/compute/dtype.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
@@ -1392,6 +1392,11 @@ pub fn build(b: *std.Build) void {
         "validateArgs",
         "mmap",
         "compute",
+        "DType",
+        "bf16",
+        "fp16",
+        "fp8",
+        "dequantize",
     });
     // The inference subtree imports shared modules via `../../..` paths.
     // Building tests from `core/src/inference/root.zig` as module root trips

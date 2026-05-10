@@ -396,7 +396,7 @@ class Inspector:
             )
 
         # DType mapping: Zig DType enum values to numpy dtypes
-        # See core/src/dtype.zig for enum values
+        # See core/src/compute/dtype.zig for enum values
         dtype_map = {
             0: np.float32,  # f32
             1: np.float64,  # f64

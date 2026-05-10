@@ -202,105 +202,10 @@ pub inline fn fp16x8ToF32(fp16_bits: @Vector(8, u16)) @Vector(8, f32) {
     return @floatCast(h_f16);
 }
 
-/// Vectorized FP16 to F32 conversion.
-/// Uses hardware vcvtph2ps instruction on x86 with F16C (part of AVX2).
-/// Falls back to bit manipulation on other platforms.
-///
-/// F16 format: 1 sign + 5 exp (bias 15) + 10 mantissa
-/// F32 format: 1 sign + 8 exp (bias 127) + 23 mantissa
+/// Vectorized FP16 bit-pattern to F32 conversion.
 pub inline fn fp16x8ToF32Bits(comptime VEC: comptime_int, h: @Vector(VEC, u16)) @Vector(VEC, f32) {
-    const simd = @import("compute_pkg").cpu.simd.arch;
-
-    // For 8-element vectors on x86 with F16C, use hardware instruction
-    if (comptime VEC == 8) {
-        return simd.cvtph2ps(h);
-    }
-
-    // For other vector widths, process in 8-element chunks or use portable fallback
-    if (comptime VEC > 8 and VEC % 8 == 0) {
-        var result: @Vector(VEC, f32) = undefined; // filled element-by-element in comptime loop below
-        comptime var i: usize = 0;
-        inline while (i < VEC) : (i += 8) {
-            const chunk: @Vector(8, u16) = @shuffle(u16, h, undefined, blk: {
-                var indices: [8]i32 = undefined;
-                for (0..8) |j| indices[j] = @intCast(i + j);
-                break :blk indices;
-            });
-            const converted = simd.cvtph2ps(chunk);
-            inline for (0..8) |j| {
-                result[i + j] = converted[j];
-            }
-        }
-        return result;
-    }
-
-    // Portable fallback for non-8 vector widths
-    return fp16ToF32Portable(VEC, h);
-}
-
-/// Portable FP16 to F32 conversion via bit manipulation.
-/// Used as fallback when hardware F16C is not available.
-fn fp16ToF32Portable(comptime VEC: comptime_int, h: @Vector(VEC, u16)) @Vector(VEC, f32) {
-    const V32 = @Vector(VEC, u32);
-
-    // Extend to 32-bit for manipulation
-    const h32: V32 = h;
-
-    // Extract components
-    const sign: V32 = (h32 >> @splat(15)) << @splat(31);
-    const exp: V32 = (h32 >> @splat(10)) & @as(V32, @splat(0x1F));
-    const mant: V32 = h32 & @as(V32, @splat(0x3FF));
-
-    // Check for special cases using masks
-    const exp_zero: @Vector(VEC, bool) = exp == @as(V32, @splat(0));
-    const exp_max: @Vector(VEC, bool) = exp == @as(V32, @splat(0x1F));
-    const mant_zero: @Vector(VEC, bool) = mant == @as(V32, @splat(0));
-
-    // Normal case: rebias exponent (15 -> 127, add 112) and shift mantissa
-    const normal_exp: V32 = (exp + @as(V32, @splat(112))) << @splat(23);
-    const normal_mant: V32 = mant << @splat(13);
-    const normal_result: V32 = sign | normal_exp | normal_mant;
-
-    // Zero case: just the sign bit
-    const zero_result: V32 = sign;
-
-    // Infinity case: F32 infinity exponent (0xFF << 23)
-    const inf_result: V32 = sign | @as(V32, @splat(0x7F800000));
-
-    // NaN case: F32 NaN (exponent all 1s, mantissa non-zero, preserve mantissa bits)
-    const nan_result: V32 = sign | @as(V32, @splat(0x7F800000)) | (mant << @splat(13));
-
-    // Subnormal case: needs normalization
-    // F16 subnormal: value = 2^-14 * (mant/1024) = 2^-24 * mant
-    // We use the multiplication approach which is still faster than full floatCast
-    const subnorm_scale: @Vector(VEC, f32) = @splat(5.9604644775390625e-8); // 2^-24
-    const mant_f32: @Vector(VEC, f32) = @floatFromInt(mant);
-    const subnorm_unsigned: @Vector(VEC, f32) = mant_f32 * subnorm_scale;
-    // Apply sign (negate if sign bit set)
-    const sign_mask: @Vector(VEC, bool) = (h32 >> @splat(15)) != @as(V32, @splat(0));
-    const subnorm_result: @Vector(VEC, f32) = @select(f32, sign_mask, -subnorm_unsigned, subnorm_unsigned);
-
-    // Build result by selecting based on conditions
-    // Priority: zero > subnormal > inf > nan > normal
-    var result: V32 = normal_result;
-
-    // Apply infinity (exp == 31, mant == 0)
-    const is_inf = @select(bool, mant_zero, exp_max, @as(@Vector(VEC, bool), @splat(false)));
-    result = @select(u32, is_inf, inf_result, result);
-
-    // Apply NaN (exp == 31, mant != 0)
-    const is_nan = @select(bool, exp_max, @select(bool, mant_zero, @as(@Vector(VEC, bool), @splat(false)), @as(@Vector(VEC, bool), @splat(true))), @as(@Vector(VEC, bool), @splat(false)));
-    result = @select(u32, is_nan, nan_result, result);
-
-    // Apply subnormal (exp == 0, mant != 0) - need to use f32 result
-    const is_subnorm = @select(bool, exp_zero, @select(bool, mant_zero, @as(@Vector(VEC, bool), @splat(false)), @as(@Vector(VEC, bool), @splat(true))), @as(@Vector(VEC, bool), @splat(false)));
-    const result_f32: @Vector(VEC, f32) = @bitCast(result);
-    const with_subnorm: @Vector(VEC, f32) = @select(f32, is_subnorm, subnorm_result, result_f32);
-
-    // Apply zero (exp == 0, mant == 0)
-    const is_zero = @select(bool, exp_zero, mant_zero, @as(@Vector(VEC, bool), @splat(false)));
-    const zero_f32: @Vector(VEC, f32) = @bitCast(zero_result);
-    return @select(f32, is_zero, zero_f32, with_subnorm);
+    const as_f16: @Vector(VEC, f16) = @bitCast(h);
+    return @floatCast(as_f16);
 }
 
 /// Convert BFloat16 to Float32.

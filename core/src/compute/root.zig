@@ -6,6 +6,8 @@
 //! ## Public API
 //!
 //! - `device` - Device type definitions (CPU, CUDA, Metal)
+//! - `dtype` - canonical numeric and quantized data type definitions
+//! - `tensor` - tensor descriptors, owned tensor storage, and DLPack interop
 //! - `parallel` - Thread pool and parallel execution
 //! - `dlpack` - DLPack tensor exchange protocol types
 //! - `mmap_policy` - file mapping policy helpers
@@ -23,6 +25,12 @@
 /// Device type definitions (DLPack-compatible).
 pub const device = @import("device.zig");
 
+/// Canonical numeric and quantized data type definitions.
+pub const dtype = @import("dtype_pkg");
+
+/// Tensor descriptors, owned tensor storage, and DLPack interop.
+pub const tensor = @import("tensor_pkg");
+
 /// Thread pool and parallel execution.
 pub const parallel = @import("parallel.zig");
 
@@ -35,6 +43,9 @@ pub const mmap_policy = @import("mmap_policy.zig");
 // Re-export commonly used types
 pub const Device = device.Device;
 pub const DeviceType = device.DeviceType;
+pub const DType = dtype.DType;
+pub const Tensor = tensor.Tensor;
+pub const OwnedTensor = tensor.OwnedTensor;
 pub const ThreadPool = parallel.ThreadPool;
 
 // Re-export DLPack types for external interop
