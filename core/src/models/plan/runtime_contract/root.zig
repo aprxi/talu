@@ -1,4 +1,4 @@
-//! Generic inference runtime contract root.
+//! Model plan runtime contract root.
 
 pub const types = @import("types.zig");
 pub const allocator = @import("allocator.zig");

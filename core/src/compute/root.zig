@@ -6,7 +6,7 @@
 //! ## Public API
 //!
 //! - `device` - Device type definitions (CPU, CUDA, Metal)
-//! - `parallel` - Thread pool and parallel execution (shared system primitive)
+//! - `parallel` - Thread pool and parallel execution
 //! - `dlpack` - DLPack tensor exchange protocol types
 //! - `mmap_policy` - file mapping policy helpers
 //!
@@ -24,7 +24,7 @@
 pub const device = @import("device.zig");
 
 /// Thread pool and parallel execution.
-pub const parallel = @import("../system/parallel.zig");
+pub const parallel = @import("parallel.zig");
 
 /// DLPack tensor exchange protocol types.
 pub const dlpack = @import("dlpack.zig");

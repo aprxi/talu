@@ -439,7 +439,7 @@ const CorePackages = struct {
                 .link_libc = true,
             }),
             .runtime_contract_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/runtime_contract/root.zig"),
+                .root_source_file = b.path("core/src/models/plan/runtime_contract/root.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
