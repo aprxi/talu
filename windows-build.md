@@ -18,7 +18,7 @@ This file records the generic steps and code changes needed to make `talu` build
 
 1. Use Zig `0.15.2` instead of Zig `0.16.x`.
 2. Make sure `make` runs recipes through a POSIX shell on Windows.
-3. Ensure `cmake.exe` can be discovered from PATH or a standard Visual Studio install.
+3. Ensure `cmake.exe` is on PATH, or pass an explicit path with `CMAKE=/path/to/cmake`.
 4. Build third-party dependencies with Windows archive names:
    - `deps/mbedtls/build/library/Release/*.lib`
    - `deps/curl/build/lib/Release/libcurl.lib`
@@ -40,7 +40,7 @@ This file records the generic steps and code changes needed to make `talu` build
   - MSVC ABI preference on Windows
 - Added Windows `Makefile` handling:
   - use Git for Windows `sh.exe` through PATH
-  - locate `cmake.exe`
+  - use `CMAKE`/PATH for `cmake.exe`
   - use repo-local temp storage instead of `/tmp`
   - clean the generated Windows Python DLL
 - Added Windows CUDA robustness fixes:

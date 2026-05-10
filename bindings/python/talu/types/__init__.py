@@ -2,7 +2,8 @@
 Open Responses data model.
 
 This module provides the data definitions for conversation history and storage
-records. It is the Python equivalent of Zig's ``core/src/responses/`` module.
+records. It is the Python equivalent of Zig's
+``core/src/router/conversation/`` module.
 
 The types here define the "shape" of conversations and portable item records
 used by ``talu.chat`` serialization APIs.

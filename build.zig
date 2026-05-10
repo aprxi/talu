@@ -371,12 +371,8 @@ fn validateInferenceBoundaryImports(b: *std.Build) void {
 // =============================================================================
 
 const pcre2_port = @import("ports/pcre2/build.zig");
-const miniz_port = @import("ports/miniz/build.zig");
-const sqlite_port = @import("ports/sqlite/build.zig");
 
 const Pcre2 = pcre2_port.Pcre2;
-const Miniz = miniz_port.Miniz;
-const Sqlite3 = sqlite_port.Sqlite3;
 
 const CorePackages = struct {
     env_pkg: *std.Build.Module,
@@ -505,8 +501,6 @@ fn addCorePackageBuildImportsAndDeps(
     build_options_mod: *std.Build.Module,
     cacert_mod: *std.Build.Module,
     pcre2: Pcre2,
-    miniz: Miniz,
-    sqlite3: Sqlite3,
 ) void {
     const modules = [_]*std.Build.Module{
         pkgs.models_pkg,
@@ -523,7 +517,7 @@ fn addCorePackageBuildImportsAndDeps(
     };
     inline for (modules) |mod| {
         mod.addImport("build_options", build_options_mod);
-        addCDependencies(b, mod, cacert_mod, pcre2, miniz, sqlite3);
+        addCDependencies(b, mod, cacert_mod, pcre2);
     }
 }
 
@@ -536,8 +530,6 @@ fn addCDependencies(
     mod: *std.Build.Module,
     cacert_mod: *std.Build.Module,
     pcre2: Pcre2,
-    miniz: Miniz,
-    sqlite3: Sqlite3,
 ) void {
     mod.addIncludePath(b.path("src/text"));
     mod.addIncludePath(b.path("include"));
@@ -545,8 +537,6 @@ fn addCDependencies(
     mod.addIncludePath(pcre2.include_dir);
     mod.addIncludePath(b.path("deps/pcre2/src"));
     mod.addIncludePath(b.path("deps/curl/include"));
-    mod.addIncludePath(miniz.include_dir);
-    mod.addIncludePath(sqlite3.include_dir);
 
     // Mozilla CA certificates bundle for HTTPS - generated during `make deps`
     mod.addImport("cacert", cacert_mod);
@@ -556,14 +546,10 @@ fn linkCDependencies(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
     pcre2: Pcre2,
-    miniz: Miniz,
-    sqlite3: Sqlite3,
     comptime skip_external_archives: bool,
 ) void {
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
-    artifact.linkLibrary(miniz.lib);
-    artifact.linkLibrary(sqlite3.lib);
     const target_os = artifact.rootModuleTarget().os.tag;
 
     // For static libraries, skip external .a archives to avoid nested archive warnings.
@@ -616,13 +602,9 @@ fn linkExternalArchives(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
     pcre2: Pcre2,
-    miniz: Miniz,
-    sqlite3: Sqlite3,
 ) void {
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
-    artifact.linkLibrary(miniz.lib);
-    artifact.linkLibrary(sqlite3.lib);
     const target_os = artifact.rootModuleTarget().os.tag;
 
     artifact.addObjectFile(b.path(curlArchivePath(target_os)));
@@ -663,8 +645,6 @@ const UnitTestCfg = struct {
     cacert_mod: *std.Build.Module,
     core_pkgs: *const CorePackages,
     pcre2: Pcre2,
-    miniz: Miniz,
-    sqlite3: Sqlite3,
 
     fn addLazy(
         self: UnitTestCfg,
@@ -682,13 +662,13 @@ const UnitTestCfg = struct {
         mod.addImport("inference_pkg", self.inference_pkg_mod);
         addCorePackageImports(mod, self.core_pkgs);
         mod.addOptions("build_options", self.build_options);
-        addCDependencies(self.b, mod, self.cacert_mod, self.pcre2, self.miniz, self.sqlite3);
+        addCDependencies(self.b, mod, self.cacert_mod, self.pcre2);
 
         const test_artifact = self.b.addTest(.{
             .root_module = mod,
             .filters = filters,
         });
-        linkCDependencies(self.b, test_artifact, self.pcre2, self.miniz, self.sqlite3, false);
+        linkCDependencies(self.b, test_artifact, self.pcre2, false);
         const run = self.b.addRunArtifact(test_artifact);
         const step = self.b.step("test-" ++ name, "Run " ++ name ++ " unit tests");
         step.dependOn(&run.step);
@@ -946,8 +926,6 @@ pub fn build(b: *std.Build) void {
 
     // Build dependencies
     const pcre2 = pcre2_port.add(b, target, optimize);
-    const miniz = miniz_port.add(b, target, optimize);
-    const sqlite3 = sqlite_port.add(b, target, optimize);
     var core_pkgs = CorePackages.init(b, target, optimize);
     wireCorePackageImports(&core_pkgs);
     core_pkgs.compute_pkg.addImport("cuda_assets", cuda_assets_mod);
@@ -957,12 +935,10 @@ pub fn build(b: *std.Build) void {
         build_options_mod,
         cacert_mod,
         pcre2,
-        miniz,
-        sqlite3,
     );
     addCorePackageImports(inference_pkg_mod, &core_pkgs);
     inference_pkg_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, inference_pkg_mod, cacert_mod, pcre2, miniz, sqlite3);
+    addCDependencies(b, inference_pkg_mod, cacert_mod, pcre2);
 
     // ==========================================================================
     // Internal inference library (inference + models + compute)
@@ -977,7 +953,7 @@ pub fn build(b: *std.Build) void {
     inference_mod.addImport("inference_pkg", inference_pkg_mod);
     addCorePackageImports(inference_mod, &core_pkgs);
     inference_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, inference_mod, cacert_mod, pcre2, miniz, sqlite3);
+    addCDependencies(b, inference_mod, cacert_mod, pcre2);
 
     const inference_lib = b.addLibrary(.{
         .linkage = .static,
@@ -989,7 +965,7 @@ pub fn build(b: *std.Build) void {
     }
     // Keep this archive self-contained for internal linking; external archives
     // are linked by final binaries/shared libs.
-    linkCDependencies(b, inference_lib, pcre2, miniz, sqlite3, true);
+    linkCDependencies(b, inference_lib, pcre2, true);
     addMetalSupport(b, inference_mod, inference_lib, enable_metal);
 
     const inference_step = b.step("inference", "Build internal inference library (inference + models + compute)");
@@ -1008,7 +984,7 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("inference_pkg", inference_pkg_mod);
     addCorePackageImports(lib_mod, &core_pkgs);
     lib_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, lib_mod, cacert_mod, pcre2, miniz, sqlite3);
+    addCDependencies(b, lib_mod, cacert_mod, pcre2);
 
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
@@ -1018,7 +994,7 @@ pub fn build(b: *std.Build) void {
     if (enable_cuda) {
         if (cuda_kernel_assets_step) |step| lib.step.dependOn(step);
     }
-    linkCDependencies(b, lib, pcre2, miniz, sqlite3, false);
+    linkCDependencies(b, lib, pcre2, false);
     addMetalSupport(b, lib_mod, lib, enable_metal);
 
     const install_lib = b.addInstallArtifact(lib, .{});
@@ -1077,7 +1053,7 @@ pub fn build(b: *std.Build) void {
     addCorePackageImports(static_lib_mod, &core_pkgs);
 
     static_lib_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, static_lib_mod, cacert_mod, pcre2, miniz, sqlite3);
+    addCDependencies(b, static_lib_mod, cacert_mod, pcre2);
 
     const static_lib = b.addLibrary(.{
         .linkage = .static,
@@ -1088,7 +1064,7 @@ pub fn build(b: *std.Build) void {
         if (cuda_kernel_assets_step) |step| static_lib.step.dependOn(step);
     }
     // Skip external .a archives for static lib - they'll be linked by the final executable
-    linkCDependencies(b, static_lib, pcre2, miniz, sqlite3, true);
+    linkCDependencies(b, static_lib, pcre2, true);
     addMetalSupport(b, static_lib_mod, static_lib, enable_metal);
 
     const static_step = b.step("static", "Build static library");
@@ -1125,7 +1101,7 @@ pub fn build(b: *std.Build) void {
         // (shared + static) in the release path.
         exe.linkLibrary(lib);
         // Link all deps including external .a archives (curl, mbedtls)
-        linkCDependencies(b, exe, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, exe, pcre2, false);
 
         // Link platform-specific runtime libraries for Rust CLI
         const cli_target_os = exe.rootModuleTarget().os.tag;
@@ -1258,7 +1234,7 @@ pub fn build(b: *std.Build) void {
         dump_lib_mod.addImport("inference_pkg", inference_pkg_mod);
         addCorePackageImports(dump_lib_mod, &core_pkgs);
         dump_lib_mod.addOptions("build_options", dump_build_options);
-        addCDependencies(b, dump_lib_mod, cacert_mod, pcre2, miniz, sqlite3);
+        addCDependencies(b, dump_lib_mod, cacert_mod, pcre2);
 
         const dump_static_lib = b.addLibrary(.{
             .linkage = .static,
@@ -1269,7 +1245,7 @@ pub fn build(b: *std.Build) void {
             if (cuda_kernel_assets_step) |step| dump_static_lib.step.dependOn(step);
         }
         // Add C sources to static lib with skip_external_archives=true (matches main build pattern)
-        linkCDependencies(b, dump_static_lib, pcre2, miniz, sqlite3, true);
+        linkCDependencies(b, dump_static_lib, pcre2, true);
         addMetalSupport(b, dump_lib_mod, dump_static_lib, enable_metal);
 
         // Dump CLI executable - only links static lib and external archives (no C sources)
@@ -1290,7 +1266,7 @@ pub fn build(b: *std.Build) void {
         }
         dump_exe.linkLibrary(dump_static_lib);
         // Only link external archives - C sources are in the static lib
-        linkExternalArchives(b, dump_exe, pcre2, miniz, sqlite3);
+        linkExternalArchives(b, dump_exe, pcre2);
         addMetalSupport(b, dump_cli_mod, dump_exe, enable_metal);
 
         dump_step.dependOn(&b.addInstallArtifact(dump_exe, .{}).step);
@@ -1355,8 +1331,6 @@ pub fn build(b: *std.Build) void {
         .cacert_mod = cacert_mod,
         .core_pkgs = &core_pkgs,
         .pcre2 = pcre2,
-        .miniz = miniz,
-        .sqlite3 = sqlite3,
     };
     ut.addLazy("tokenizer", b.path("core/src/lib_dev.zig"), &.{
         "wordpiece",
@@ -1487,7 +1461,7 @@ pub fn build(b: *std.Build) void {
     integration_main_mod.addImport("inference_pkg", inference_pkg_mod);
     addCorePackageImports(integration_main_mod, &core_pkgs);
     integration_main_mod.addOptions("build_options", integration_build_options);
-    addCDependencies(b, integration_main_mod, cacert_mod, pcre2, miniz, sqlite3);
+    addCDependencies(b, integration_main_mod, cacert_mod, pcre2);
 
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("core/tests/root.zig"),
@@ -1501,7 +1475,7 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{
         .root_module = integration_test_mod,
     });
-    linkCDependencies(b, integration_tests, pcre2, miniz, sqlite3, false);
+    linkCDependencies(b, integration_tests, pcre2, false);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run integration tests");
@@ -1532,7 +1506,7 @@ pub fn build(b: *std.Build) void {
         integration_metal_main_mod.addImport("inference_pkg", inference_pkg_mod);
         addCorePackageImports(integration_metal_main_mod, &core_pkgs);
         integration_metal_main_mod.addOptions("build_options", integration_metal_build_options);
-        addCDependencies(b, integration_metal_main_mod, cacert_mod, pcre2, miniz, sqlite3);
+        addCDependencies(b, integration_metal_main_mod, cacert_mod, pcre2);
 
         const integration_metal_test_mod = b.createModule(.{
             .root_source_file = b.path("core/tests/inference/backend/metal/root.zig"),
@@ -1547,7 +1521,7 @@ pub fn build(b: *std.Build) void {
             .name = "test-integration-inference-metal",
             .root_module = integration_metal_test_mod,
         });
-        linkCDependencies(b, integration_metal_tests, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, integration_metal_tests, pcre2, false);
         addMetalSupport(b, integration_metal_main_mod, integration_metal_tests, true);
         const install_integration_metal_tests = b.addInstallArtifact(integration_metal_tests, .{});
 
@@ -1588,7 +1562,7 @@ pub fn build(b: *std.Build) void {
             .name = "models_report",
             .root_module = models_report_mod,
         });
-        linkCDependencies(b, models_report_exe, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, models_report_exe, pcre2, false);
         const run_models_report = b.addRunArtifact(models_report_exe);
         if (b.args) |args| {
             for (args) |arg| run_models_report.addArg(arg);
@@ -1735,7 +1709,7 @@ pub fn build(b: *std.Build) void {
             .name = "perf_sanity",
             .root_module = perf_exe_mod,
         });
-        linkCDependencies(b, perf_exe, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, perf_exe, pcre2, false);
         addMetalCoreSupport(b, perf_exe_mod, perf_exe, enable_metal);
         b.installArtifact(perf_exe);
 
@@ -1767,7 +1741,7 @@ pub fn build(b: *std.Build) void {
         const perf_tests = b.addTest(.{
             .root_module = perf_test_mod,
         });
-        linkCDependencies(b, perf_tests, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, perf_tests, pcre2, false);
         const run_perf_tests = b.addRunArtifact(perf_tests);
         const perf_test_step = b.step("test-perf-sanity", "Run perf/lifecycle sanity tests");
         perf_test_step.dependOn(&run_perf_tests.step);
@@ -1796,7 +1770,7 @@ pub fn build(b: *std.Build) void {
             .name = "bench-cpu-compute",
             .root_module = bench_cpu_compute_mod,
         });
-        linkCDependencies(b, bench_cpu_compute_exe, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, bench_cpu_compute_exe, pcre2, false);
         addMetalSupport(b, bench_cpu_compute_mod, bench_cpu_compute_exe, enable_metal);
         b.installArtifact(bench_cpu_compute_exe);
 
@@ -1876,7 +1850,7 @@ pub fn build(b: *std.Build) void {
         if (enable_cuda) {
             if (cuda_kernel_assets_step) |step| bench_cuda_compute_exe.step.dependOn(step);
         }
-        linkCDependencies(b, bench_cuda_compute_exe, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, bench_cuda_compute_exe, pcre2, false);
         b.installArtifact(bench_cuda_compute_exe);
 
         const run_bench_cuda_compute = b.addRunArtifact(bench_cuda_compute_exe);
@@ -1910,7 +1884,7 @@ pub fn build(b: *std.Build) void {
             .name = "bench-tokenizer",
             .root_module = bench_tokenizer_mod,
         });
-        linkCDependencies(b, bench_tokenizer_exe, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, bench_tokenizer_exe, pcre2, false);
         b.installArtifact(bench_tokenizer_exe);
 
         const run_bench_tokenizer = b.addRunArtifact(bench_tokenizer_exe);
@@ -1944,7 +1918,7 @@ pub fn build(b: *std.Build) void {
             .name = "bench-train",
             .root_module = bench_train_mod,
         });
-        linkCDependencies(b, bench_train_exe, pcre2, miniz, sqlite3, false);
+        linkCDependencies(b, bench_train_exe, pcre2, false);
         b.installArtifact(bench_train_exe);
 
         const run_bench_train = b.addRunArtifact(bench_train_exe);

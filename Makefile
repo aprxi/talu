@@ -3,11 +3,9 @@
 WINDOWS := $(filter Windows_NT,$(OS))
 CURDIR_POSIX := $(subst \,/,$(CURDIR))
 WINDOWS_GIT_ROOT_NATIVE := $(ProgramFiles)\Git
-WINDOWS_CMAKE_EXE :=
 WINDOWS_LOCAL_ZIG := $(CURDIR_POSIX)/.tools/zig-x86_64-windows-0.15.2/zig.exe
 
 ifeq ($(WINDOWS),Windows_NT)
-WINDOWS_CMAKE_EXE := $(strip $(shell powershell -NoProfile -ExecutionPolicy Bypass -File "$(CURDIR)\ports\windows\find-cmake.ps1"))
 export PATH := $(WINDOWS_GIT_ROOT_NATIVE)\usr\bin;$(WINDOWS_GIT_ROOT_NATIVE)\bin;$(WINDOWS_GIT_ROOT_NATIVE)\cmd;$(PATH)
 SHELL := sh.exe
 UNAME_S := Windows
@@ -20,7 +18,6 @@ endif
 ZIG ?= zig
 CMAKE ?= cmake
 BUILD_JOBS := $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
-SQLITE_TMP_DIR := $(if $(WINDOWS),$(CURDIR_POSIX)/.zig-cache/sqlite-dl,/tmp/sqlite-dl)
 
 ifeq ($(WINDOWS),Windows_NT)
 ifneq ($(wildcard $(WINDOWS_LOCAL_ZIG)),)
@@ -40,9 +37,6 @@ ifeq ($(WINDOWS),Windows_NT)
 	SED_INPLACE := sed -i
 	MBEDTLS_ARCHIVE := deps/mbedtls/build/library/Release/mbedtls.lib
 	CURL_ARCHIVE := deps/curl/build/lib/Release/libcurl.lib
-	ifneq ($(WINDOWS_CMAKE_EXE),)
-		CMAKE := $(WINDOWS_CMAKE_EXE)
-	endif
 else ifeq ($(UNAME_S),Darwin)
 	LIB_EXT := dylib
 	PYTHON_LIB_NAME := libtalu.dylib
@@ -106,16 +100,6 @@ deps: check-zig-version
 	@test -f deps/pcre2/deps/sljit/sljit_src/sljitLir.c || (rm -rf deps/pcre2 && git clone --branch pcre2-10.47 --depth 1 --recurse-submodules https://github.com/PCRE2Project/pcre2.git deps/pcre2)
 	@test -d deps/curl || git clone --branch curl-8_17_0 --depth 1 https://github.com/curl/curl.git deps/curl
 	@test -d deps/mbedtls || (git clone --branch v3.6.2 --depth 1 --recurse-submodules https://github.com/Mbed-TLS/mbedtls.git deps/mbedtls)
-	@test -d deps/miniz || git clone --branch 3.1.1 --depth 1 https://github.com/richgel999/miniz.git deps/miniz
-	@test -f deps/miniz/miniz_export.h || printf '#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n' > deps/miniz/miniz_export.h
-	@test -d deps/sqlite || (mkdir -p "$(SQLITE_TMP_DIR)" && \
-		curl -sL "https://sqlite.org/2026/sqlite-amalgamation-3510200.zip" \
-		-o "$(SQLITE_TMP_DIR)/sqlite.zip" && \
-		unzip -qo "$(SQLITE_TMP_DIR)/sqlite.zip" -d "$(SQLITE_TMP_DIR)" && \
-		mkdir -p deps/sqlite && \
-		cp "$(SQLITE_TMP_DIR)"/sqlite-amalgamation-*/sqlite3.c \
-		   "$(SQLITE_TMP_DIR)"/sqlite-amalgamation-*/sqlite3.h deps/sqlite/ && \
-		rm -rf "$(SQLITE_TMP_DIR)")
 	@test -f deps/cacert.pem || curl -sL https://curl.se/ca/cacert.pem -o deps/cacert.pem
 	@printf '%s\n%s\n' '//! Mozilla CA certificates - auto-generated, do not edit' 'pub const data = @embedFile("cacert.pem");' > deps/cacert.zig
 	@test -f $(MBEDTLS_ARCHIVE) || $(MAKE) mbedtls-build
