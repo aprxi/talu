@@ -1,24 +1,7 @@
-//! FFI Conversion Utilities
+//! C API FFI conversion utilities.
 //!
-//! Core logic for converting between Zig types and C-compatible types.
-//! The capi/ layer should delegate to these functions rather than implementing
-//! conversion logic inline.
-//!
-//! ## Design Principle
-//!
-//! The capi/ functions are thin wrappers - they only do argument validation,
-//! conversion, and error mapping. Any logic involving loops, complex allocations,
-//! or multi-step conversions belongs here in helpers/ffi.zig instead.
-//!
-//! ## Usage
-//!
-//! ```zig
-//! const ffi = @import("helpers/ffi.zig");
-//!
-//! // Convert Zig string slice to C string list
-//! const list = try ffi.StringList.fromSlices(allocator, strings);
-//! defer list.deinit(allocator);
-//! ```
+//! Shared ownership/lifetime helpers for C-facing modules. Domain modules should
+//! not import this file.
 
 const std = @import("std");
 
@@ -73,75 +56,8 @@ pub const StringList = struct {
 };
 
 // =============================================================================
-// C Callback Adapters
-// =============================================================================
-
-/// C callback type for getting token info by ID.
-/// Returns pointer to token bytes and sets out_len to the length.
-/// Returns null if token ID is invalid.
-pub const TokenInfoCallback = *const fn (
-    token_id: u32,
-    out_len: *usize,
-    ctx: ?*anyopaque,
-) callconv(.c) ?[*]const u8;
-
-// =============================================================================
-// JSON Utilities
-// =============================================================================
-
-/// Builds a JSON array of strings from multiple slices.
-/// Returns a null-terminated string like `["a","b","c"]`.
-/// Caller owns the result.
-pub fn buildJsonStringArray(alloc: std.mem.Allocator, slices: []const []const []const u8) ![:0]u8 {
-    var buffer = std.ArrayListUnmanaged(u8){};
-    errdefer buffer.deinit(alloc);
-
-    try buffer.append(alloc, '[');
-
-    var is_first = true;
-    for (slices) |slice| {
-        for (slice) |s| {
-            if (!is_first) try buffer.append(alloc, ',');
-            try buffer.append(alloc, '"');
-            try buffer.appendSlice(alloc, s);
-            try buffer.append(alloc, '"');
-            is_first = false;
-        }
-    }
-
-    try buffer.append(alloc, ']');
-
-    // Allocate with null terminator
-    const result = try alloc.allocSentinel(u8, buffer.items.len, 0);
-    @memcpy(result, buffer.items);
-    buffer.deinit(alloc);
-    return result;
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
-
-test "buildJsonStringArray creates valid JSON" {
-    const alloc = std.testing.allocator;
-    const slice1 = &[_][]const u8{ "a", "b" };
-    const slice2 = &[_][]const u8{"c"};
-
-    const result = try buildJsonStringArray(alloc, &.{ slice1, slice2 });
-    defer alloc.free(result);
-
-    try std.testing.expectEqualStrings("[\"a\",\"b\",\"c\"]", result);
-}
-
-test "buildJsonStringArray handles empty input" {
-    const alloc = std.testing.allocator;
-    const empty: []const []const u8 = &.{};
-
-    const result = try buildJsonStringArray(alloc, &.{empty});
-    defer alloc.free(result);
-
-    try std.testing.expectEqualStrings("[]", result);
-}
 
 test "StringList.fromSlices creates valid list" {
     const allocator = std.testing.allocator;

@@ -49,7 +49,7 @@ When this document says "public" without qualification, it means **API-public**.
 
 | Logic type | Target module |
 |------------|---------------|
-| Generic FFI conversions | `src/helpers/ffi.zig` |
+| Generic FFI conversions | `src/capi/ffi.zig` |
 | Domain-specific FFI types | The relevant domain module |
 | Domain logic | The relevant `src/` domain module |
 | Path operations | `src/io/` modules |

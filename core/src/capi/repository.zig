@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const repository = @import("io_pkg").repository.root;
-const ffi = @import("../helpers/ffi.zig");
+const ffi = @import("ffi.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const progress_api = @import("progress.zig");
@@ -633,7 +633,10 @@ pub export fn talu_repo_list(
     }
 
     const list = allocator.create(StringList) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    list.* = ffi.StringList.fromSlices(allocator, files) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    list.* = ffi.StringList.fromSlices(allocator, files) catch {
+        allocator.destroy(list);
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
     out.* = list;
     return 0;
 }
@@ -676,7 +679,10 @@ pub export fn talu_repo_search(
     }
 
     const list = allocator.create(StringList) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    list.* = ffi.StringList.fromSlices(allocator, results) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    list.* = ffi.StringList.fromSlices(allocator, results) catch {
+        allocator.destroy(list);
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
     out.* = list;
     return 0;
 }
@@ -858,7 +864,6 @@ pub export fn talu_repo_string_list_get(list: ?*const StringList, idx: usize, ou
 /// Safe to call with null (no-op).
 pub export fn talu_repo_string_list_free(list: ?*StringList) callconv(.c) void {
     const l = list orelse return;
-    for (l.items) |item| allocator.free(item);
-    allocator.free(l.items);
+    l.deinit(allocator);
     allocator.destroy(l);
 }
