@@ -186,7 +186,7 @@ pub fn initCpuRuntimeRopeHandles(self: anytype) !void {
     }
 }
 
-pub fn assignCpuRuntimeRopeToAttentionFallbacks(self: anytype) void {
+pub fn assignCpuRuntimeRopeToAttentionCpuKernels(self: anytype) void {
     for (self.block_runtime.blocks) |*layer| {
         const block = layer.attention_binding orelse continue;
         if (block.cpu_kernel) |*kernel| {
@@ -544,20 +544,20 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     }.run;
 
     // Helper to create I8 cache for a single gaffine_u8 weight.
-    // Prefers fused U8→I8 kernel (no F16 intermediate), falls back to F16→I8.
+    // Prefers fused U8->I8 kernel (no F16 intermediate); otherwise uses F16->I8.
     const dequantU8Weight = struct {
         fn run(
             backend: *CudaBackend,
             w: *GaffineU8LinearWeight,
             bytes_out: *usize,
         ) void {
-            // Try fused U8→I8 path (no F16 intermediate, saves ~50% VRAM).
+            // Try fused U8->I8 path (no F16 intermediate, saves ~50% VRAM).
             if (backend.gaffine_u8_to_i8_function) |fused_fn| {
                 launchFusedToI8(backend, fused_fn, w, bytes_out);
                 return;
             }
 
-            // Fallback: dequant to F16 cache (for F16 GEMM path).
+            // Secondary path: dequant to F16 cache for the F16 GEMM route.
             const dequant_f16_fn = backend.gaffine_u8_dequant_f16_function orelse return;
             const weight_elems = std.math.mul(usize, w.rows, w.cols) catch return;
             if (weight_elems == 0) return;

@@ -241,7 +241,7 @@ std::string detect_text_prefix(const std::unordered_map<std::string, array>& ten
         return "model.";
     }
 
-    // Fallback for converted checkpoints that wrap text tensors under repeated
+    // Alias path for converted checkpoints that wrap text tensors under repeated
     // namespaces (for example model.language_model.language_model.*).
     const std::string embed_suffix = "embed_tokens.weight";
     std::string best_prefix;

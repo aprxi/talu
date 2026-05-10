@@ -990,7 +990,7 @@ pub fn initRange(
 
                 // CPU matmul dispatchers for the GatedDeltaKernel struct. The CUDA engine
                 // never calls these (GPU handles all matmul), but the struct requires them.
-                // Fall back to matmulF32 for dtypes without a CPU kernel (e.g. FP8).
+                // Use matmulF32 for dtypes without a CPU kernel (e.g. FP8).
                 const in_proj_fn = (compute.cpu.linalg.matmulKernel(gated_delta.weights.in_proj.dtype) catch
                     compute.cpu.linalg.DispatchedKernel{ .func = compute.cpu.linalg.matmulF32, .name = "matmulF32" }).func;
                 const out_proj_fn = (compute.cpu.linalg.matmulKernel(gated_delta.weights.out_proj.dtype) catch

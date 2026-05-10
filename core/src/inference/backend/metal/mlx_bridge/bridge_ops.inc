@@ -334,7 +334,7 @@ array moe_expert_compute_decode(
         return reshape(sum(partials, 0), x.shape());
     }
 
-    // Fallback: gather_qmm path.
+    // Gather-qmm path.
     const auto x_expanded = expand_dims(x, {-2, -3});
 
     auto gate_up_out = gather_qmm(
@@ -511,7 +511,7 @@ std::pair<array, std::optional<array>> depthwise_conv1d_decode_step(
         return {conv_out, next_state};
     }
 
-    // Fallback for batch > 1 or kernel_size == 1.
+    // Path for batch > 1 or kernel_size == 1.
     const array prev_weights = slice(decode_weight, {0, 0, 0}, {1, kernel_size - 1, conv_dim});
     const array curr_weight = slice(decode_weight, {0, kernel_size - 1, 0}, {1, kernel_size, conv_dim});
     const array prev_term = sum(cache_state * prev_weights, 1);

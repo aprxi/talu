@@ -199,16 +199,23 @@ fn parseSelectionToken(raw: []const u8) ?Selection {
     return null;
 }
 
-fn selectionOverrideFromEnv(allocator: std.mem.Allocator) ?Selection {
-    const raw = std.process.getEnvVarOwned(allocator, "BACKEND") catch return null;
+fn parseSelectionOverrideToken(raw: []const u8) !Selection {
+    return parseSelectionToken(raw) orelse error.InvalidArgument;
+}
+
+fn selectionOverrideFromEnv(allocator: std.mem.Allocator) !?Selection {
+    const raw = std.process.getEnvVarOwned(allocator, "BACKEND") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
     defer allocator.free(raw);
-    const parsed = parseSelectionToken(raw);
-    if (parsed == null) {
-        log.warn("inference", "Ignoring invalid BACKEND override", .{
+    const parsed = parseSelectionOverrideToken(raw) catch |err| {
+        log.err("inference", "Invalid BACKEND override", .{
             .value = std.mem.trim(u8, raw, " \t\r\n"),
             .supported = "auto|cpu|metal|cuda",
-        });
-    }
+        }, @src());
+        return err;
+    };
     return parsed;
 }
 
@@ -338,7 +345,7 @@ pub const Backend = union(enum) {
         progress: progress_mod.Context,
     ) !Backend {
         const env_override = if (init_options.selection == .auto)
-            selectionOverrideFromEnv(allocator)
+            try selectionOverrideFromEnv(allocator)
         else
             null;
         const selected = if (init_options.selection == .auto)
@@ -933,7 +940,7 @@ pub const Backend = union(enum) {
         }
     }
 
-    /// Set prefill progress callback. Backends that don't support it ignore silently.
+    /// Set prefill progress callback when the backend exposes prefill progress.
     pub fn setPrefillProgress(
         self: *Backend,
         progress_fn: ?PrefillProgressFn,
@@ -1010,9 +1017,8 @@ fn getMetalUnsupportedReason(
 
 fn runtimeHasMetalUnsupportedFeatures(runtime: *const models.config.ModelRuntime) bool {
     // Do not hard-reject runtime topologies during backend selection.
-    // Auto mode should attempt Metal and fall back only on concrete backend
-    // initialization failures. This keeps backend choice aligned with actual
-    // backend capabilities as they evolve.
+    // Auto mode should let Metal initialization make the concrete capability
+    // decision so backend choice stays aligned with backend capabilities.
     _ = runtime;
     return false;
 }
@@ -1153,16 +1159,14 @@ fn initCuda(
         log.info("inference", "CUDA runtime unavailable", .{ .reason = cudaProbeName(probe) });
         return error.CudaUnavailable;
     }
-    var topology = resolveCudaTopology(allocator, topology_override);
-    const has_explicit_topology_env = blk: {
-        const v = std.process.getEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY") catch break :blk false;
-        allocator.free(v);
-        break :blk true;
+    var topology = try resolveCudaTopology(allocator, topology_override);
+    const has_explicit_topology_env = std.process.hasEnvVar(allocator, "TALU_CUDA_TOPOLOGY") catch |err| {
+        log.err("inference", "Failed to query TALU_CUDA_TOPOLOGY", .{ .err = @errorName(err) }, @src());
+        return err;
     };
-    const has_explicit_cpu_layers_env = blk: {
-        const v = std.process.getEnvVarOwned(allocator, "TALU_CPU_LAYERS") catch break :blk false;
-        allocator.free(v);
-        break :blk true;
+    const has_explicit_cpu_layers_env = std.process.hasEnvVar(allocator, "TALU_CPU_LAYERS") catch |err| {
+        log.err("inference", "Failed to query TALU_CPU_LAYERS", .{ .err = @errorName(err) }, @src());
+        return err;
     };
 
     // Topology resolution priority:
@@ -1172,7 +1176,7 @@ fn initCuda(
     //   4. Auto-detection (probe GPU memory, estimate model size)
     if (topology_override == null and topology.mode == .single) {
         if (!has_explicit_topology_env) {
-            if (resolveCpuLayersTopology(allocator, loaded, topology)) |from_layers| {
+            if (try resolveCpuLayersTopology(allocator, loaded)) |from_layers| {
                 topology = from_layers;
             } else if (autoDetectTopologyForModel(allocator, loaded)) |detected| {
                 topology = detected;
@@ -1496,6 +1500,11 @@ test "parseSelectionToken rejects unsupported values" {
     try std.testing.expectEqual(@as(?Selection, null), parseSelectionToken(""));
     try std.testing.expectEqual(@as(?Selection, null), parseSelectionToken("  "));
     try std.testing.expectEqual(@as(?Selection, null), parseSelectionToken("rocm"));
+}
+
+test "parseSelectionOverrideToken rejects invalid BACKEND override" {
+    try std.testing.expectError(error.InvalidArgument, parseSelectionOverrideToken(""));
+    try std.testing.expectError(error.InvalidArgument, parseSelectionOverrideToken("rocm"));
 }
 
 test "optionalSelectionName returns tag or unset" {

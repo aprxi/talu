@@ -146,9 +146,9 @@ pub fn validateCudaTopologyConfig(
     }
 }
 
-fn parseCudaTopologyMode(raw: []const u8) ?CudaTopologyMode {
+fn parseCudaTopologyMode(raw: []const u8) !CudaTopologyMode {
     const token = std.mem.trim(u8, raw, " \t\r\n");
-    if (token.len == 0) return null;
+    if (token.len == 0) return error.InvalidTopologyConfig;
     if (std.ascii.eqlIgnoreCase(token, "single")) return .single;
     if (std.ascii.eqlIgnoreCase(token, "pipeline2")) return .pipeline2;
     if (std.ascii.eqlIgnoreCase(token, "pipeline_2")) return .pipeline2;
@@ -159,25 +159,32 @@ fn parseCudaTopologyMode(raw: []const u8) ?CudaTopologyMode {
     if (std.ascii.eqlIgnoreCase(token, "cpu_gpu_gpu")) return .cpu_gpu_gpu;
     if (std.ascii.eqlIgnoreCase(token, "cpu+gpu+gpu")) return .cpu_gpu_gpu;
     if (std.ascii.eqlIgnoreCase(token, "pipeline_cpu_gpu_gpu")) return .cpu_gpu_gpu;
-    return null;
+    return error.InvalidTopologyConfig;
 }
 
-fn parseTwoDeviceOrdinals(raw: []const u8) ?[2]usize {
+fn parseTwoDeviceOrdinals(raw: []const u8) ![2]usize {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return null;
+    if (trimmed.len == 0) return error.InvalidTopologyConfig;
     var iter = std.mem.splitScalar(u8, trimmed, ',');
-    const left_raw = iter.next() orelse return null;
-    const right_raw = iter.next() orelse return null;
-    if (iter.next() != null) return null;
-    const left = std.fmt.parseUnsigned(usize, std.mem.trim(u8, left_raw, " \t\r\n"), 10) catch return null;
-    const right = std.fmt.parseUnsigned(usize, std.mem.trim(u8, right_raw, " \t\r\n"), 10) catch return null;
+    const left_raw = iter.next() orelse return error.InvalidTopologyConfig;
+    const right_raw = iter.next() orelse return error.InvalidTopologyConfig;
+    if (iter.next() != null) return error.InvalidTopologyConfig;
+    const left = std.fmt.parseUnsigned(usize, std.mem.trim(u8, left_raw, " \t\r\n"), 10) catch return error.InvalidTopologyConfig;
+    const right = std.fmt.parseUnsigned(usize, std.mem.trim(u8, right_raw, " \t\r\n"), 10) catch return error.InvalidTopologyConfig;
     return .{ left, right };
+}
+
+fn getOptionalEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => err,
+    };
 }
 
 pub fn resolveCudaTopology(
     allocator: std.mem.Allocator,
     topology_override: ?CudaTopologyConfig,
-) CudaTopology {
+) !CudaTopology {
     var topology = CudaTopology{};
     if (topology_override) |cfg| {
         topology.mode = cfg.mode;
@@ -187,36 +194,34 @@ pub fn resolveCudaTopology(
         return topology;
     }
 
-    const mode_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY") catch null;
+    const mode_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY");
     if (mode_raw) |value| {
         defer allocator.free(value);
-        if (parseCudaTopologyMode(value)) |mode| {
-            topology.mode = mode;
-        } else {
-            log.warn("inference", "Invalid TALU_CUDA_TOPOLOGY; using single", .{ .value = value });
-        }
+        topology.mode = parseCudaTopologyMode(value) catch |err| {
+            log.err("inference", "Invalid TALU_CUDA_TOPOLOGY", .{ .value = value }, @src());
+            return err;
+        };
     }
 
-    const devices_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_STAGE_DEVICES") catch null;
+    const devices_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_STAGE_DEVICES");
     if (devices_raw) |value| {
         defer allocator.free(value);
-        if (parseTwoDeviceOrdinals(value)) |ordinals| {
-            topology.stage_device_ordinals = ordinals;
-        } else {
-            log.warn("inference", "Invalid TALU_CUDA_STAGE_DEVICES; expected '<gpu0>,<gpu1>'", .{ .value = value });
-        }
+        topology.stage_device_ordinals = parseTwoDeviceOrdinals(value) catch |err| {
+            log.err("inference", "Invalid TALU_CUDA_STAGE_DEVICES; expected '<gpu0>,<gpu1>'", .{ .value = value }, @src());
+            return err;
+        };
     }
 
-    const single_device_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_DEVICE") catch null;
+    const single_device_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_DEVICE");
     if (single_device_raw) |value| {
         defer allocator.free(value);
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-            log.warn("inference", "Invalid TALU_CUDA_DEVICE; keeping topology primary device", .{
+            log.err("inference", "Invalid TALU_CUDA_DEVICE", .{
                 .value = trimmed,
                 .current = topology.primaryDeviceOrdinal(),
-            });
-            return topology;
+            }, @src());
+            return error.InvalidTopologyConfig;
         };
         if (topology.mode == .cpu_gpu_gpu) {
             topology.stage_device_ordinals[1] = parsed;
@@ -225,28 +230,28 @@ pub fn resolveCudaTopology(
         }
     }
 
-    const split_layer_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER") catch null;
+    const split_layer_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER");
     if (split_layer_raw) |value| {
         defer allocator.free(value);
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-            log.warn("inference", "Invalid TALU_CUDA_SPLIT_LAYER; using default split", .{
+            log.err("inference", "Invalid TALU_CUDA_SPLIT_LAYER", .{
                 .value = trimmed,
-            });
-            return topology;
+            }, @src());
+            return error.InvalidTopologyConfig;
         };
         topology.split_layer = parsed;
     }
 
-    const split_layer_stage2_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER_STAGE2") catch null;
+    const split_layer_stage2_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER_STAGE2");
     if (split_layer_stage2_raw) |value| {
         defer allocator.free(value);
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-            log.warn("inference", "Invalid TALU_CUDA_SPLIT_LAYER_STAGE2; using default split", .{
+            log.err("inference", "Invalid TALU_CUDA_SPLIT_LAYER_STAGE2", .{
                 .value = trimmed,
-            });
-            return topology;
+            }, @src());
+            return error.InvalidTopologyConfig;
         };
         topology.split_layer_stage2 = parsed;
     }
@@ -779,43 +784,49 @@ fn topologyFromCpuLayers(
 pub fn resolveCpuLayersTopology(
     allocator: std.mem.Allocator,
     loaded: *const LoadedModel,
-    current: CudaTopology,
-) ?CudaTopology {
-    const raw = std.process.getEnvVarOwned(allocator, "TALU_CPU_LAYERS") catch return null;
+) !?CudaTopology {
+    const raw = (try getOptionalEnvVarOwned(allocator, "TALU_CPU_LAYERS")) orelse return null;
     defer allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const cpu_layers_i = std.fmt.parseInt(i32, trimmed, 10) catch {
-        log.warn("inference", "Invalid TALU_CPU_LAYERS; ignoring", .{ .value = trimmed });
-        return null;
+        log.err("inference", "Invalid TALU_CPU_LAYERS", .{ .value = trimmed }, @src());
+        return error.InvalidTopologyConfig;
     };
 
     const total_layers = loaded.blocks.len;
-    if (total_layers < 2) return null;
-    if (cpu_layers_i <= 0) return null;
-
-    // CUDA backend requires at least 1 GPU layer. Clamp if needed.
-    const cpu_layers: usize = if (cpu_layers_i >= @as(i32, @intCast(total_layers))) blk: {
-        const clamped = total_layers - 1;
-        log.warn("inference", "TALU_CPU_LAYERS clamped: CUDA backend requires at least 1 GPU layer", .{
-            .requested = cpu_layers_i,
-            .clamped = clamped,
+    if (total_layers < 2) {
+        log.err("inference", "TALU_CPU_LAYERS requires at least two decoder layers", .{
             .total_layers = total_layers,
-        });
-        break :blk clamped;
-    } else @intCast(cpu_layers_i);
+        }, @src());
+        return error.InvalidTopologyConfig;
+    }
+    if (cpu_layers_i < 0) {
+        log.err("inference", "Invalid TALU_CPU_LAYERS", .{ .value = trimmed }, @src());
+        return error.InvalidTopologyConfig;
+    }
+    if (cpu_layers_i == 0) return null;
+
+    if (cpu_layers_i >= @as(i32, @intCast(total_layers))) {
+        log.err("inference", "TALU_CPU_LAYERS leaves no layer for CUDA", .{
+            .requested = cpu_layers_i,
+            .total_layers = total_layers,
+        }, @src());
+        return error.InvalidTopologyConfig;
+    }
+    const cpu_layers: usize = @intCast(cpu_layers_i);
 
     // Query GPU count and memory.
     const device_count = if (has_cuda)
         compute.cuda.Device.deviceCount() catch |err| {
-            log.warn("inference", "TALU_CPU_LAYERS: failed to query device count", .{
+            log.err("inference", "TALU_CPU_LAYERS: failed to query device count", .{
                 .err = @errorName(err),
-            });
-            return null;
+            }, @src());
+            return error.CudaUnavailable;
         }
     else
-        return null;
+        return error.CudaNotEnabled;
 
-    if (device_count == 0) return null;
+    if (device_count == 0) return error.CudaUnavailable;
 
     // Build model params for model-aware GPU layer splitting.
     const model_max_seq: usize = @intCast(@max(@as(i32, 1), loaded.config.max_seq_len));
@@ -830,22 +841,26 @@ pub fn resolveCpuLayersTopology(
     };
 
     const gpu_infos = probeGpuTotalMemory(allocator, device_count) catch |err| {
-        log.warn("inference", "TALU_CPU_LAYERS: failed to probe GPU memory", .{
+        log.err("inference", "TALU_CPU_LAYERS: failed to probe GPU memory", .{
             .err = @errorName(err),
-        });
-        // Fallback: assume 1 GPU with unknown memory.
-        return topologyFromCpuLayers(cpu_layers, total_layers, &.{
-            .{ .ordinal = current.stage_device_ordinals[0], .free = 0, .total = 0 },
-        }, null);
+        }, @src());
+        return error.InvalidTopologyConfig;
     };
     defer allocator.free(gpu_infos);
 
-    var result = topologyFromCpuLayers(cpu_layers, total_layers, gpu_infos, p) orelse return null;
+    var result = topologyFromCpuLayers(cpu_layers, total_layers, gpu_infos, p) orelse {
+        log.err("inference", "TALU_CPU_LAYERS produced an invalid topology", .{
+            .cpu_layers = cpu_layers,
+            .total_layers = total_layers,
+            .device_count = device_count,
+        }, @src());
+        return error.InvalidTopologyConfig;
+    };
 
     // cpu_gpu_gpu splits GPU layers across 2 devices which requires KV shared
     // source layers to be strictly above cpu_layers (room for GPU1 stage).
-    // When sources fall in CPU range, fall back to cpu_gpu (single GPU) where
-    // cross-device KV replication handles it.
+    // When sources are in the CPU range, use cpu_gpu so cross-device KV
+    // replication handles them.
     if (result.mode == .cpu_gpu_gpu) {
         if (minKvSharedSourceLayer(loaded.config)) |min_src| {
             if (cpu_layers >= min_src) {
@@ -938,31 +953,31 @@ test "loadedModelHasPackedNvfp4Weights detects packed tensors in layer maps" {
 }
 
 test "parseCudaTopologyMode parses supported modes" {
-    try std.testing.expectEqual(CudaTopologyMode.single, parseCudaTopologyMode("single").?);
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline2").?);
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline_2way").?);
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, parseCudaTopologyMode("cpu_gpu").?);
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, parseCudaTopologyMode("cpu+gpu").?);
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, parseCudaTopologyMode("cpu_gpu_gpu").?);
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, parseCudaTopologyMode("cpu+gpu+gpu").?);
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, parseCudaTopologyMode("pipeline_cpu_gpu_gpu").?);
+    try std.testing.expectEqual(CudaTopologyMode.single, try parseCudaTopologyMode("single"));
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, try parseCudaTopologyMode("pipeline2"));
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, try parseCudaTopologyMode("pipeline_2way"));
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, try parseCudaTopologyMode("cpu_gpu"));
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, try parseCudaTopologyMode("cpu+gpu"));
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, try parseCudaTopologyMode("cpu_gpu_gpu"));
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, try parseCudaTopologyMode("cpu+gpu+gpu"));
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, try parseCudaTopologyMode("pipeline_cpu_gpu_gpu"));
 }
 
 test "parseCudaTopologyMode rejects unsupported modes" {
-    try std.testing.expectEqual(@as(?CudaTopologyMode, null), parseCudaTopologyMode(""));
-    try std.testing.expectEqual(@as(?CudaTopologyMode, null), parseCudaTopologyMode("mesh"));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseCudaTopologyMode(""));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseCudaTopologyMode("mesh"));
 }
 
 test "parseTwoDeviceOrdinals parses gpu pairs" {
-    try std.testing.expectEqualDeep(@as([2]usize, .{ 0, 1 }), parseTwoDeviceOrdinals("0,1").?);
-    try std.testing.expectEqualDeep(@as([2]usize, .{ 3, 9 }), parseTwoDeviceOrdinals(" 3 , 9 ").?);
-    try std.testing.expectEqual(@as(?[2]usize, null), parseTwoDeviceOrdinals("0"));
-    try std.testing.expectEqual(@as(?[2]usize, null), parseTwoDeviceOrdinals("a,1"));
-    try std.testing.expectEqual(@as(?[2]usize, null), parseTwoDeviceOrdinals("0,1,2"));
+    try std.testing.expectEqualDeep(@as([2]usize, .{ 0, 1 }), try parseTwoDeviceOrdinals("0,1"));
+    try std.testing.expectEqualDeep(@as([2]usize, .{ 3, 9 }), try parseTwoDeviceOrdinals(" 3 , 9 "));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseTwoDeviceOrdinals("0"));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseTwoDeviceOrdinals("a,1"));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseTwoDeviceOrdinals("0,1,2"));
 }
 
 test "resolveCudaTopology honors explicit override" {
-    const topology = resolveCudaTopology(std.testing.allocator, .{
+    const topology = try resolveCudaTopology(std.testing.allocator, .{
         .mode = .pipeline2,
         .stage_device_ordinals = .{ 4, 5 },
         .split_layer = 7,

@@ -680,7 +680,7 @@ pub const MetalBackend = struct {
             if (self.slot_ctxs[0]) |base_ctx| {
                 created = mlx_clone(base_ctx, self.seed);
                 if (created == null) {
-                    log.warn("inference", "metal mlx_clone failed; falling back to mlx_create", .{
+                    log.warn("inference", "metal mlx_clone failed; creating mlx context", .{
                         .mlx_error = resolveLastError(),
                         .slot = slot_index,
                     });

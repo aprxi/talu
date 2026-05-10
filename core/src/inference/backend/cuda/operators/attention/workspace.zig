@@ -150,7 +150,7 @@ fn applyPrefillRopeRows(
         }
     }
 
-    // Fallback for non-standard row stride layouts.
+    // Scalar row path for non-standard row stride layouts.
     const q_row_bytes_rope = std.math.mul(usize, row_stride_elems, @sizeOf(f32)) catch return error.InvalidArgument;
     var rope_row_idx: usize = 0;
     while (rope_row_idx < stage_rows) : (rope_row_idx += 1) {
@@ -498,7 +498,7 @@ pub fn ensureAttnU16Workspace(self: anytype, required_bytes: usize) !compute.cud
     };
 }
 
-pub fn attentionFallbackUsesCache(seq_len: usize) bool {
+pub fn attentionSeparateDecodeUsesCache(seq_len: usize) bool {
     return seq_len == 1;
 }
 

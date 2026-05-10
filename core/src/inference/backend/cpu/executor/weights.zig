@@ -178,7 +178,7 @@ fn inferAttentionShape(config: ModelConfig, weights: AttentionMlpWeights) Attent
         if (q_out_opt) |q_out| {
             if (projectedOutDim(&qkv_proj, d_model)) |qkv_out| {
                 // For gated attention, Q carries both q and gate (2x output dim).
-                // Try the gated interpretation first; fall back to non-gated.
+                // Try the gated interpretation first; use non-gated if needed.
                 const q_out_gated = q_out * 2;
                 const effective_q_out = if (qkv_out >= q_out_gated and
                     (qkv_out - q_out_gated) % 2 == 0)

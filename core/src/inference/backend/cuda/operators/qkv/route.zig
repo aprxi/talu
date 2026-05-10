@@ -138,7 +138,7 @@ pub fn runQkvProjection(
     if (!prefer_nvfp4_lt_fused and allow_fused_qkv and !prefer_i8_concat and q_out_dest.size >= q_bytes) {
         const fused_ok = tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest) catch |err| blk: {
             if (err == error.CudaKernelLaunchFailed) {
-                log.warn("inference", "CUDA fused QKV launch failed; falling back to unfused projections", .{
+                log.warn("inference", "CUDA fused QKV launch failed; using unfused projections", .{
                     .rows = rows,
                     .q_dim = q_proj.cols(),
                     .k_dim = k_proj.cols(),
@@ -258,7 +258,7 @@ pub fn runQkvProjection(
     }
 
     // If concat-I8 path is unavailable/failed, retry fused QKV kernel before
-    // falling back to three separate projections.
+    // using three separate projections.
     if (allow_fused_qkv and q_out_dest.size >= q_bytes) {
         const fused_ok_retry = tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest) catch |err| blk: {
             if (err == error.CudaKernelLaunchFailed) {

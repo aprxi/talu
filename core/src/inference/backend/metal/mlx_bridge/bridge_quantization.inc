@@ -995,7 +995,7 @@ void maybe_quantize_mxfp8_matrix(
             g_qmm_success += 1;
             return;
         }
-        // Pure NVFP4 keys must never silently fall back to another quant mode.
+        // Pure NVFP4 keys must never use another quant mode without an explicit error.
         *out_has_q = false;
         return;
     }

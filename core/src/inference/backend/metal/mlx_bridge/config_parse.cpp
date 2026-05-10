@@ -229,7 +229,7 @@ ParsedModelConfig parse_model_config(const std::string& model_path, const mlx_mo
         parsed.cfg = cfg;
         parsed.allow_norm_shift = flags->allow_norm_shift != 0;
     } else {
-        // Fallback: regex-based model family detection for standalone bridge use.
+        // Regex-based model family detection for standalone bridge use.
         const std::regex lfm2_re("\\\"model_type\\\"\\s*:\\s*\\\"lfm2(?:_vl|_5)?\\\"");
         const bool is_lfm2_family = std::regex_search(config_text, lfm2_re) || std::regex_search(text_cfg, lfm2_re);
         const std::regex gemma4_re("\\\"model_type\\\"\\s*:\\s*\\\"gemma4(?:_text)?\\\"");

@@ -551,7 +551,7 @@ fn initCpuRuntimeRopeHandles(self: anytype) !void {
     }
 }
 
-fn assignCpuRuntimeRopeToAttentionFallbacks(self: anytype) void {
+fn assignCpuRuntimeRopeToAttentionCpuKernels(self: anytype) void {
     for (self.block_runtime.blocks) |*layer| {
         const block = layer.attention_binding orelse continue;
         if (block.cpu_kernel) |*kernel| {
@@ -1645,7 +1645,7 @@ fn runAttentionContext(
                         theta,
                     ) catch |err| {
                         if (err == error.CudaKernelLaunchFailed) {
-                            log.warn("inference", "CUDA attention fused_heads_i8_kv launch failed; falling back to separate i8 attention", .{
+                            log.warn("inference", "CUDA attention fused_heads_i8_kv launch failed; using separate i8 attention path", .{
                                 .seq_len = effective_seq_len_u32,
                                 .head_dim = head_dim_u32,
                                 .kv_dim = kv_dim_u32,
@@ -2186,7 +2186,7 @@ fn warmupDequantF16Cache(self: anytype) !void {
                 return;
             }
 
-            // Fallback: dequant to F16 cache (for F16 GEMM path).
+            // Secondary path: dequant to F16 cache for the F16 GEMM route.
             const dequant_f16_fn = backend.gaffine_u8_dequant_f16_function orelse return;
             const weight_elems = std.math.mul(usize, w.rows, w.cols) catch return;
             if (weight_elems == 0) return;

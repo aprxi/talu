@@ -419,11 +419,11 @@ fn lintLoggingPolicy(file_path: []const u8, source: []const u8, emit: bool) usiz
 
 fn lintInferenceProductionLexicon(file_path: []const u8, source: []const u8, emit: bool) usize {
     if (!isInferenceProductionSourcePath(file_path)) return 0;
-    const forbidden = [_][]const u8{ "fallback", "degraded", "legacy" };
+    const forbidden = [_][]const u8{ "fallback", "fall back", "falling back", "degraded", "legacy" };
     var violations: usize = 0;
     for (forbidden) |token| {
         var search_start: usize = 0;
-        while (std.mem.indexOfPos(u8, source, search_start, token)) |offset| {
+        while (indexOfIgnoreCase(source, token, search_start)) |offset| {
             violations += 1;
             if (emit) {
                 std.debug.print("{s}:{d}: forbidden inference production token: \"{s}\"\n", .{
@@ -436,6 +436,15 @@ fn lintInferenceProductionLexicon(file_path: []const u8, source: []const u8, emi
         }
     }
     return violations;
+}
+
+fn indexOfIgnoreCase(source: []const u8, token: []const u8, start: usize) ?usize {
+    if (token.len == 0 or start >= source.len) return null;
+    var offset = start;
+    while (offset + token.len <= source.len) : (offset += 1) {
+        if (std.ascii.eqlIgnoreCase(source[offset .. offset + token.len], token)) return offset;
+    }
+    return null;
 }
 
 fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
@@ -675,12 +684,14 @@ test "lintLoggingPolicy rejects direct C stderr logging" {
 
 test "lintInferenceProductionLexicon rejects hidden-route tokens" {
     const src =
-        \\const a = "fallback";
-        \\const b = "degraded";
-        \\const c = "legacy";
+        \\const a = "Fallback";
+        \\const b = "fall back";
+        \\const c = "falling back";
+        \\const d = "degraded";
+        \\const e = "legacy";
     ;
     try std.testing.expectEqual(
-        @as(usize, 3),
+        @as(usize, 5),
         lintInferenceProductionLexicon("core/src/inference/backend/cuda/route.zig", src, false),
     );
 }

@@ -758,7 +758,7 @@ test "GatedDeltaState.init symmetric heads defaults n_key_heads to n_heads" {
         .d_conv = 4,
         .n_heads = 16,
         .d_head = 128,
-        // n_key_heads defaults to 0, should fall back to n_heads=16
+        // n_key_heads defaults to 0, so use n_heads=16.
     };
     var state = try GatedDeltaState.init(std.testing.allocator, 1, cfg);
     defer state.deinit();

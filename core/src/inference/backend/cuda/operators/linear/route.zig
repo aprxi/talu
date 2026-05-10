@@ -1135,7 +1135,7 @@ pub fn linearForwardRows(
                 return;
             }
 
-            // Fallback: dequant MXFP8→BF16, then cuBLAS BF16 GEMM.
+            // Secondary path: dequant MXFP8->BF16, then cuBLAS BF16 GEMM.
             if (self.mxfp8_dequant_to_bf16_function) |dequant_fn| {
                 if (self.cast_f32_to_bf16_function) |cast_fn| {
                     if (self.u16_blas_bf16_supported) mxfp8_dequant_blas: {

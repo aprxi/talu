@@ -154,7 +154,7 @@ fn applyPrefillRopeRows(
         }
     }
 
-    // Fallback for non-standard row stride layouts.
+    // Scalar row path for non-standard row stride layouts.
     const q_row_bytes_rope = std.math.mul(usize, row_stride_elems, @sizeOf(f32)) catch return error.InvalidArgument;
     var rope_row_idx: usize = 0;
     while (rope_row_idx < stage_rows) : (rope_row_idx += 1) {
@@ -1676,7 +1676,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                             layer_rope_theta,
                         ) catch |err| {
                             if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
-                                log.warn("inference", "CUDA fused prefill i8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                log.warn("inference", "CUDA fused prefill i8 GQA launch failed; using non-GQA fused prefill path", .{
                                     .q_rows = stage_rows,
                                     .seq_len = seq_len_u32,
                                     .head_dim = head_dim_u32,
@@ -1832,7 +1832,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                             layer_rope_theta,
                         ) catch |err| {
                             if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
-                                log.warn("inference", "CUDA fused prefill fp8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                log.warn("inference", "CUDA fused prefill fp8 GQA launch failed; using non-GQA fused prefill path", .{
                                     .q_rows = stage_rows,
                                     .seq_len = seq_len_u32,
                                     .head_dim = head_dim_u32,
@@ -2655,7 +2655,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                             layer_rope_theta,
                         ) catch |err| {
                             if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
-                                log.warn("inference", "CUDA fused prefill i8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                log.warn("inference", "CUDA fused prefill i8 GQA launch failed; using non-GQA fused prefill path", .{
                                     .q_rows = stage_rows,
                                     .seq_len = seq_len_u32,
                                     .head_dim = head_dim_u32,
@@ -2809,7 +2809,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                             layer_rope_theta,
                         ) catch |err| {
                             if (err == error.CudaKernelLaunchFailed or err == error.InvalidArgument) {
-                                log.warn("inference", "CUDA fused prefill fp8 GQA launch failed; falling back to non-GQA fused prefill", .{
+                                log.warn("inference", "CUDA fused prefill fp8 GQA launch failed; using non-GQA fused prefill path", .{
                                     .q_rows = stage_rows,
                                     .seq_len = seq_len_u32,
                                     .head_dim = head_dim_u32,

@@ -165,25 +165,24 @@ pub fn transferPipelineActivationStage12MultiRow(self: anytype, src: anytype, to
     if (total_bytes == 0) return;
 
     if (self.device.canAccessPeer(&src.device)) {
-        // Best effort: peer access can already be enabled or unavailable at runtime.
+        // Peer access may already be enabled; the peer copy below is authoritative.
         self.device.enablePeerAccess(&src.device) catch {};
         src.device.enablePeerAccess(&self.device) catch {};
-        if (src.device.memcpyPeerAsync(
+        const peer_copy_started = if (src.device.memcpyPeerAsync(
             self.runtime_buffers.input_dev.pointer,
             self.device.context,
             src.runtime_buffers.input_dev.pointer,
             src.device.context,
             total_bytes,
             src.compute_stream,
-        )) {
+        )) true else |_| false;
+        if (peer_copy_started) {
             if (src.compute_stream) |stream| {
                 try src.device.synchronizeStream(stream);
             } else {
                 try src.device.synchronize();
             }
             return;
-        } else |_| {
-            // Fall through to host-staged transfer.
         }
     }
 

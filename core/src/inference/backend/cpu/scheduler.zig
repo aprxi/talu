@@ -1573,7 +1573,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// The loop runs until the request completes, pending_flag is set,
         /// or an error occurs. On completion, the request is moved to the
         /// completed queue. Returns error.NotEligible if the request doesn't
-        /// qualify (caller should fall back to the step-based loop).
+        /// qualify (caller should use the step-based loop).
         pub fn runDecodeLoop(
             self: *Self,
             request_id: u64,

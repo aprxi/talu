@@ -175,7 +175,7 @@ bool should_use_full_prompt_prefill(const mlx_ctx* ctx, int32_t prompt_len, int 
 int resolve_prefill_batch_full_prompt_threshold() {
     // Batched eval traffic commonly uses ~120-200 token prompts. A higher
     // batch-only threshold keeps these requests on fused prefill paths instead
-    // of falling back to per-row serial prefill.
+    // of running per-row serial prefill.
     return env_positive_int(
         "TALU_METAL_PREFILL_BATCH_FULL_PROMPT_THRESHOLD",
         env_positive_int("TALU_METAL_PREFILL_FULL_PROMPT_THRESHOLD", 512)

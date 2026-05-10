@@ -920,7 +920,7 @@ pub const CudaBackend = struct {
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
         // A10 invariant: BlockRuntime must hold exactly the requested layer count.
         std.debug.assert(backend.block_runtime.blocks.len == layer_range.end - layer_range.start);
-        engine_layer_program.assignCpuRuntimeRopeToAttentionFallbacks(&backend);
+        engine_layer_program.assignCpuRuntimeRopeToAttentionCpuKernels(&backend);
         try backend.initSlotKvStates();
         errdefer backend.deinitSlotKvStates();
         for (backend.block_runtime.blocks) |*layer| {
@@ -1963,7 +1963,7 @@ pub const CudaBackend = struct {
                         dst.compute_stream,
                     );
                 } else {
-                    // Fallback: blocking sync (no event support).
+                    // Blocking sync path when event support is unavailable.
                     try self.device.memcpyPeerAsync(
                         dst.runtime_buffers.input_dev.pointer,
                         dst.device.context,

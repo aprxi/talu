@@ -294,7 +294,7 @@ pub const ShortConvKernel = struct {
                     d_conv,
                 );
             } else {
-                // Fallback: channel-major weights with strided access
+                // Channel-major weights with strided access.
                 cpu_conv1d.runChannelMajor(
                     B_gate,
                     x_proj,

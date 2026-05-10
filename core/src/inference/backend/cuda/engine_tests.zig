@@ -1730,10 +1730,10 @@ test "logicalF32RowSlice uses widened row stride for staged slot buffers" {
     try std.testing.expectEqual(@as(usize, logical_row_bytes), row1.size);
 }
 
-test "attentionFallbackUsesCache uses decode mode only for single-row execution" {
-    try std.testing.expect(engine_mixers.attentionFallbackUsesCache(1));
-    try std.testing.expect(!engine_mixers.attentionFallbackUsesCache(2));
-    try std.testing.expect(!engine_mixers.attentionFallbackUsesCache(15));
+test "attentionSeparateDecodeUsesCache uses decode mode only for single-row execution" {
+    try std.testing.expect(engine_mixers.attentionSeparateDecodeUsesCache(1));
+    try std.testing.expect(!engine_mixers.attentionSeparateDecodeUsesCache(2));
+    try std.testing.expect(!engine_mixers.attentionSeparateDecodeUsesCache(15));
 }
 
 test "computeBatchedDecodeLogits routes pipeline2 decode per request through single-token path" {

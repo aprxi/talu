@@ -557,7 +557,7 @@ pub fn runAttentionContext(
                         theta,
                     ) catch |err| {
                         if (err == error.CudaKernelLaunchFailed) {
-                            log.warn("inference", "CUDA attention fused_heads_i8_kv launch failed; falling back to separate i8 attention", .{
+                            log.warn("inference", "CUDA attention fused_heads_i8_kv launch failed; using separate i8 attention path", .{
                                 .seq_len = effective_seq_len_u32,
                                 .head_dim = head_dim_u32,
                                 .kv_dim = kv_dim_u32,

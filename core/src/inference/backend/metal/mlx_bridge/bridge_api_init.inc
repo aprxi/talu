@@ -800,7 +800,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     }
                 }
 
-                // Fallback: separate gate + up tensors, combined at runtime.
+                // Separate gate + up tensors, combined at runtime.
                 if (!lw.mlp_gate_up_has_q && lw.mlp_gate_up_rhs.size() <= 1) {
                     const std::string mlp_gate_key = has_tensor(tensors, p + "mlp.gate_proj.weight")
                         ? p + "mlp.gate_proj.weight"
@@ -1538,7 +1538,7 @@ static mlx_ctx* mlx_create_impl(const char* model_id, const char* model_path, in
                     }
                 }
 
-                // Fallback: separate Q/K/V tensors, combined at runtime.
+                // Separate Q/K/V tensors, combined at runtime.
                 if (!lw.attn_qkv_has_q && lw.attn_qkv_rhs.size() <= 1) {
                     const std::string q_proj_key = p + "self_attn.q_proj.weight";
                     const std::string k_proj_key = p + "self_attn.k_proj.weight";
