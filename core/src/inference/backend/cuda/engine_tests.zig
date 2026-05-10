@@ -13,6 +13,7 @@ const layer_ops = models.layer_ops;
 const opcode_map = models.plan.opcode_map;
 const plan_compiler = models.plan.compiler;
 const runtime_contract = @import("runtime_contract_pkg");
+const bridge = @import("../../bridge/root.zig");
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 
@@ -69,6 +70,12 @@ const engine_ops = @import("operators/root.zig");
 const engine_mixers = @import("operators/root.zig");
 const engine_forward = @import("exec/root.zig");
 const resolveStagedPrefillChunkRows = engine_forward.resolveStagedPrefillChunkRows;
+
+const MockCudaDevice = struct {
+    pub fn ordinal(_: *const @This()) u16 {
+        return 0;
+    }
+};
 
 test "resolveDenseInOutLayout keeps [in,out] orientation" {
     const layout = try resolveDenseInOutLayout(128, 256, 128);
@@ -2678,7 +2685,10 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
         max_batch_size: usize = slot_count,
         block_runtime: BlockRuntimeMock = .{},
         pipeline_host_staging: ?[]align(64) u8 = null,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
         cpu_stage0: ?*CpuStage0Mock = null,
+        device: MockCudaDevice = .{},
         preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
         slot_in_use: [slot_count]bool = [_]bool{true} ** slot_count,
         slot_positions: [slot_count]usize = [_]usize{0} ** slot_count,
@@ -2884,6 +2894,9 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
         block_runtime: BlockRuntimeMock = .{},
         cpu_stage0: ?*CpuStage0Mock = null,
         pipeline_host_staging: ?[]align(64) u8 = null,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        device: MockCudaDevice = .{},
         preloaded: [d_model]f32 = [_]f32{0.0} ** d_model,
 
         pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
@@ -3059,6 +3072,9 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
         block_runtime: BlockRuntimeMock = .{},
         cpu_stage0: ?*CpuStage0Mock = null,
         pipeline_host_staging: ?[]align(64) u8 = null,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        device: MockCudaDevice = .{},
         preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
 
         pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {

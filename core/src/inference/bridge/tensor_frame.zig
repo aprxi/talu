@@ -206,6 +206,29 @@ pub const ActivationFrameArgs = struct {
     checksum: ?u64 = null,
 };
 
+pub const ActivationHandoffFrameArgs = struct {
+    frame_id: u64,
+    graph_id: u64,
+    request_id: u64,
+    source: StageEndpoint,
+    target: StageEndpoint,
+    producer_layer_start: u32,
+    producer_layer_end: u32,
+    consumer_layer_start: u32,
+    consumer_layer_end: u32,
+    dtype: TensorFrameDType,
+    layout: TensorFrameLayout = .row_major,
+    shape: TensorFrameShape,
+    device: TensorFrameDevice,
+    sequence_start: u32,
+    sequence_len: u32,
+    batch_size: u32,
+    slot_index: ?u32 = null,
+    ownership: TensorFrameOwnership = .borrowed_until_next_stage_call,
+    lifetime: TensorFrameLifetime = .step_scoped,
+    checksum: ?u64 = null,
+};
+
 pub fn activationFrameFromBoundary(args: ActivationFrameArgs) TensorFrameValidationError!TensorFrameMetadata {
     const metadata = TensorFrameMetadata{
         .frame_id = args.frame_id,
@@ -226,6 +249,38 @@ pub fn activationFrameFromBoundary(args: ActivationFrameArgs) TensorFrameValidat
     };
     try metadata.validate();
     return metadata;
+}
+
+pub fn activationHandoffFrame(args: ActivationHandoffFrameArgs) TensorFrameValidationError!TensorFrameMetadata {
+    return activationFrameFromBoundary(.{
+        .frame_id = args.frame_id,
+        .graph_id = args.graph_id,
+        .request_id = args.request_id,
+        .boundary = .{
+            .source = args.source,
+            .target = args.target,
+            .producer_layer_start = args.producer_layer_start,
+            .producer_layer_end = args.producer_layer_end,
+            .consumer_layer_start = args.consumer_layer_start,
+            .consumer_layer_end = args.consumer_layer_end,
+            .dtype = args.dtype,
+            .layout = args.layout,
+        },
+        .shape = args.shape,
+        .device = args.device,
+        .sequence_start = args.sequence_start,
+        .sequence_len = args.sequence_len,
+        .batch_size = args.batch_size,
+        .slot_index = args.slot_index,
+        .ownership = args.ownership,
+        .lifetime = args.lifetime,
+        .checksum = args.checksum,
+    });
+}
+
+pub fn validateActivationFrameByteCount(metadata: *const TensorFrameMetadata, byte_count: u64) TensorFrameValidationError!void {
+    try metadata.validate();
+    if (byte_count == 0 or byte_count != metadata.byte_count) return error.InvalidTensorByteCount;
 }
 
 test "dtypeByteSize returns transfer element sizes" {
@@ -375,4 +430,79 @@ test "activationFrameFromBoundary rejects zero batch" {
         .sequence_len = 1,
         .batch_size = 0,
     }));
+}
+
+test "activationHandoffFrame builds cpu cuda activation metadata" {
+    const shape = try TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 });
+    const metadata = try activationHandoffFrame(.{
+        .frame_id = 0x0000_0002_0000_0009,
+        .graph_id = 0x0000_0003_0000_0005,
+        .request_id = 0x0000_0002_0000_007b,
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 0,
+        .producer_layer_end = 3,
+        .consumer_layer_start = 3,
+        .consumer_layer_end = 5,
+        .dtype = .f32,
+        .shape = shape,
+        .device = .{ .cuda = 0 },
+        .sequence_start = 9,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = 2,
+    });
+
+    try metadata.validate();
+    try std.testing.expectEqual(TensorFrameRole.activation, metadata.role);
+    try std.testing.expectEqual(@as(u64, 32), metadata.byte_count);
+    try std.testing.expectEqual(@as(u32, 9), metadata.sequence_start);
+    try std.testing.expectEqual(@as(?u32, 2), metadata.slot_index);
+}
+
+test "activationHandoffFrame rejects invalid boundary" {
+    const shape = try TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 });
+    try std.testing.expectError(error.InvalidLayerRange, activationHandoffFrame(.{
+        .frame_id = 1,
+        .graph_id = 2,
+        .request_id = 3,
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 0,
+        .producer_layer_end = 3,
+        .consumer_layer_start = 4,
+        .consumer_layer_end = 5,
+        .dtype = .f32,
+        .shape = shape,
+        .device = .{ .cuda = 0 },
+        .sequence_start = 9,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = 2,
+    }));
+}
+
+test "validateActivationFrameByteCount rejects stale byte count" {
+    const shape = try TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 });
+    const metadata = try activationHandoffFrame(.{
+        .frame_id = 1,
+        .graph_id = 2,
+        .request_id = 3,
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 0,
+        .producer_layer_end = 3,
+        .consumer_layer_start = 3,
+        .consumer_layer_end = 5,
+        .dtype = .f32,
+        .shape = shape,
+        .device = .{ .cuda = 0 },
+        .sequence_start = 9,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = 2,
+    });
+
+    try validateActivationFrameByteCount(&metadata, metadata.byte_count);
+    try std.testing.expectError(error.InvalidTensorByteCount, validateActivationFrameByteCount(&metadata, metadata.byte_count + 4));
 }

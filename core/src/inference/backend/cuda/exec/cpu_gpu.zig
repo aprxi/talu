@@ -9,6 +9,7 @@ const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
+const bridge = @import("../../../bridge/root.zig");
 const orchestrator = @import("../../../bridge/orchestrator.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
@@ -63,6 +64,63 @@ const resetGatedDeltaStates = resets.resetGatedDeltaStates;
 const resetAttentionCpuStates = resets.resetAttentionCpuStates;
 const ensureGatedDeltaHostStageCapacity = resets.ensureGatedDeltaHostStageCapacity;
 const executeDecodeWithLayerLimit = decode_route.executeDecodeWithLayerLimit;
+
+fn u32FromUsize(value: usize, comptime err: anyerror) !u32 {
+    return std.math.cast(u32, value) orelse return err;
+}
+
+fn cpuGpuFrameId(slot_index: u32, position: u32) u64 {
+    return (@as(u64, slot_index) << 32) | @as(u64, position);
+}
+
+fn cpuGpuGraphId(split_layer: u32, total_layers: u32) u64 {
+    return (@as(u64, split_layer) << 32) | @as(u64, total_layers);
+}
+
+fn cpuGpuRequestId(slot_index: u32, token: u32) u64 {
+    return (@as(u64, slot_index) << 32) | @as(u64, token);
+}
+
+fn cpuGpuActivationDevice(self: anytype) !bridge.TensorFrameDevice {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasField(SelfType, "device")) return error.InvalidTopologyConfig;
+    return .{ .cuda = self.device.ordinal() };
+}
+
+fn buildCpuGpuActivationFrame(
+    self: anytype,
+    ctx: *const stage_adapters.DecodeContext,
+) !bridge.TensorFrameMetadata {
+    const slot_index_u32 = try u32FromUsize(ctx.slot_index, error.InvalidArgument);
+    const position_u32 = try u32FromUsize(ctx.position, error.InvalidSequenceRange);
+    const split_layer_u32 = try u32FromUsize(self.split_layer, error.InvalidLayerRange);
+    const total_layers = self.split_layer + self.block_runtime.blocks.len;
+    const total_layers_u32 = try u32FromUsize(total_layers, error.InvalidLayerRange);
+    const d_model_u64 = std.math.cast(u64, self.d_model) orelse return error.InvalidTensorShape;
+    const shape = try bridge.TensorFrameShape.contiguous(3, .{ 1, 1, d_model_u64, 0 });
+
+    return bridge.activationHandoffFrame(.{
+        .frame_id = cpuGpuFrameId(slot_index_u32, position_u32),
+        .graph_id = cpuGpuGraphId(split_layer_u32, total_layers_u32),
+        .request_id = cpuGpuRequestId(slot_index_u32, ctx.token),
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 0,
+        .producer_layer_end = split_layer_u32,
+        .consumer_layer_start = split_layer_u32,
+        .consumer_layer_end = total_layers_u32,
+        .dtype = self.pipeline_boundary_dtype,
+        .layout = self.pipeline_boundary_layout,
+        .shape = shape,
+        .device = try cpuGpuActivationDevice(self),
+        .sequence_start = position_u32,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = slot_index_u32,
+        .ownership = .borrowed_until_next_stage_call,
+        .lifetime = .step_scoped,
+    });
+}
 
 pub fn computeBatchedPrefillCpuGpu(
     self: anytype,
@@ -340,6 +398,20 @@ pub fn runCpuGpuWithPipelineRuntime(
 
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
     };
+    const Transfer = struct {
+        metadata: bridge.TensorFrameMetadata,
+        host_staging: ?[]align(64) u8,
+
+        pub fn transfer(transfer_ctx: *@This(), src: *Stage0, dst: *Stage1, byte_count: usize) anyerror!void {
+            try bridge.validateActivationFrameByteCount(&transfer_ctx.metadata, @intCast(byte_count));
+            const staging = transfer_ctx.host_staging orelse return error.PipelineTransferNotInitialized;
+            if (byte_count > staging.len) return error.PipelineTransferBufferTooSmall;
+            try src.downloadActivation(staging[0..byte_count], byte_count);
+            try dst.uploadActivation(staging[0..byte_count], byte_count);
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
     var ctx = stage_adapters.DecodeContext{
         .token = token,
         .position = position,
@@ -351,10 +423,11 @@ pub fn runCpuGpuWithPipelineRuntime(
         .trace_seq_len_u32 = trace_seq_len_u32,
         .trace_pos_offset = trace_pos_offset,
     };
+    const activation_metadata = try buildCpuGpuActivationFrame(self, &ctx);
     try orchestrator.executeTwoStageForward(
         Stage0,
         Stage1,
-        null,
+        Transfer,
         .{ .backend = cpu_stage0_backend, .gpu_backend = self, .ctx = &ctx },
         .{ .backend = self, .ctx = &ctx },
         self.split_layer,
@@ -362,7 +435,199 @@ pub fn runCpuGpuWithPipelineRuntime(
         &.{},
         &.{},
         activation_byte_count,
-        self.pipeline_host_staging,
-        {},
+        null,
+        .{ .metadata = activation_metadata, .host_staging = self.pipeline_host_staging },
     );
+}
+
+test "buildCpuGpuActivationFrame describes cpu cuda decode handoff" {
+    const MockCudaDevice = struct {
+        pub fn ordinal(_: *const @This()) u16 {
+            return 0;
+        }
+    };
+
+    const MockBackend = struct {
+        const BlockRuntimeMock = struct {
+            blocks: []const u8 = &.{},
+        };
+
+        split_layer: usize = 3,
+        d_model: usize = 8,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        block_runtime: BlockRuntimeMock = .{},
+        device: MockCudaDevice = .{},
+    };
+
+    var backend = MockBackend{
+        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+    };
+    const ctx = stage_adapters.DecodeContext{
+        .token = 123,
+        .position = 9,
+        .slot_index = 2,
+        .logits_out_opt = null,
+        .compute_logits = false,
+        .download_logits = false,
+        .ensure_kv_capacity = true,
+        .trace_seq_len_u32 = 10,
+        .trace_pos_offset = 9,
+    };
+
+    const metadata = try buildCpuGpuActivationFrame(&backend, &ctx);
+    try std.testing.expectEqual(bridge.TensorFrameRole.activation, metadata.role);
+    try std.testing.expectEqual(@as(u64, 32), metadata.byte_count);
+    try std.testing.expectEqual(@as(u64, 0x0000_0002_0000_0009), metadata.frame_id);
+    try std.testing.expectEqual(@as(u64, 0x0000_0003_0000_0005), metadata.graph_id);
+    try std.testing.expectEqual(@as(u64, 0x0000_0002_0000_007b), metadata.request_id);
+    try std.testing.expectEqual(@as(u32, 9), metadata.sequence_start);
+    try std.testing.expectEqual(@as(u32, 1), metadata.sequence_len);
+    try std.testing.expectEqual(@as(?u32, 2), metadata.slot_index);
+}
+
+test "runCpuGpuWithPipelineRuntime rejects stale activation byte count before transfer" {
+    const d_model: usize = 4;
+
+    const MockCudaDevice = struct {
+        pub fn ordinal(_: *const @This()) u16 {
+            return 0;
+        }
+    };
+
+    const TraceState = struct {
+        stage0_execute_calls: usize = 0,
+        stage0_slot_bytes_calls: usize = 0,
+        stage1_upload_calls: usize = 0,
+        stage1_execute_calls: usize = 0,
+    };
+
+    const CpuStage0Mock = struct {
+        trace_state: *TraceState,
+        activation: [d_model]f32 = [_]f32{0.0} ** d_model,
+
+        pub fn executeDecodeLayerRange(
+            self: *@This(),
+            token: u32,
+            position: usize,
+            slot_index: usize,
+            logits_out_opt: ?[]f32,
+            layer_start: usize,
+            layer_end: usize,
+            compute_logits: bool,
+            download_logits: bool,
+            ensure_kv_capacity: bool,
+            use_preloaded_input: bool,
+        ) !void {
+            _ = token;
+            _ = position;
+            _ = slot_index;
+            _ = logits_out_opt;
+            _ = layer_start;
+            _ = layer_end;
+            _ = compute_logits;
+            _ = download_logits;
+            _ = ensure_kv_capacity;
+            _ = use_preloaded_input;
+            self.trace_state.stage0_execute_calls += 1;
+            @memset(self.activation[0..], 1.0);
+        }
+
+        pub fn slotActivationBytes(self: *@This(), _: usize) []const u8 {
+            self.trace_state.stage0_slot_bytes_calls += 1;
+            return std.mem.sliceAsBytes(self.activation[0..]);
+        }
+    };
+
+    const Stage1Mock = struct {
+        const BlockRuntimeMock = struct {
+            blocks: []const u8 = &.{},
+        };
+
+        trace_state: *TraceState,
+        split_layer: usize = 2,
+        d_model: usize = d_model,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        pipeline_host_staging: ?[]align(64) u8 = null,
+        block_runtime: BlockRuntimeMock = .{},
+        device: MockCudaDevice = .{},
+
+        pub fn uploadPipelineActivationFromHost(
+            self: *@This(),
+            slot_index: usize,
+            host_buf: []const u8,
+            byte_count: usize,
+        ) !void {
+            _ = slot_index;
+            _ = host_buf;
+            _ = byte_count;
+            self.trace_state.stage1_upload_calls += 1;
+        }
+
+        pub fn executeDecodeWithLayerLimitTestHook(
+            self: *@This(),
+            token: u32,
+            position: usize,
+            slot_index: usize,
+            logits_out_opt: ?[]f32,
+            layer_limit: usize,
+            compute_logits: bool,
+            download_logits: bool,
+            ensure_kv_capacity: bool,
+            trace_seq_len_u32: u32,
+            trace_pos_offset: usize,
+            hidden_override: ?[]const f32,
+            deepstack_layer_features_opt: ?[]const []const f32,
+            deepstack_feature_index_opt: ?usize,
+            use_preloaded_input: bool,
+        ) !void {
+            _ = token;
+            _ = position;
+            _ = slot_index;
+            _ = logits_out_opt;
+            _ = layer_limit;
+            _ = compute_logits;
+            _ = download_logits;
+            _ = ensure_kv_capacity;
+            _ = trace_seq_len_u32;
+            _ = trace_pos_offset;
+            _ = hidden_override;
+            _ = deepstack_layer_features_opt;
+            _ = deepstack_feature_index_opt;
+            _ = use_preloaded_input;
+            self.trace_state.stage1_execute_calls += 1;
+        }
+    };
+
+    var trace_state = TraceState{};
+    var cpu_stage0 = CpuStage0Mock{ .trace_state = &trace_state };
+    var staging: [d_model * @sizeOf(f32) + 8]u8 align(64) = undefined;
+    var stage1 = Stage1Mock{
+        .trace_state = &trace_state,
+        .pipeline_host_staging = staging[0..],
+        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+    };
+
+    try std.testing.expectError(
+        error.InvalidTensorByteCount,
+        runCpuGpuWithPipelineRuntime(
+            &stage1,
+            &cpu_stage0,
+            7,
+            5,
+            0,
+            null,
+            false,
+            false,
+            true,
+            6,
+            5,
+            d_model * @sizeOf(f32) + 4,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), trace_state.stage0_execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace_state.stage0_slot_bytes_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace_state.stage1_upload_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace_state.stage1_execute_calls);
 }
