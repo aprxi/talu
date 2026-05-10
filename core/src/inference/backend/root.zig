@@ -41,7 +41,7 @@ const progress_mod = @import("progress_pkg");
 const tensor = @import("tensor_pkg");
 const compute = @import("compute_pkg");
 const runtime_contract = @import("runtime_contract_pkg");
-const ModelConfig = tensor.ModelConfig;
+const ModelConfig = models.config.ModelConfig;
 const dtype_mod = @import("dtype_pkg");
 const DType = dtype_mod.DType;
 const LoadedModel = models.LoadedModel;
@@ -1833,7 +1833,7 @@ pub const Backend = union(enum) {
 
 fn isMetalSupported(
     config: *const ModelConfig,
-    runtime: *const tensor.ModelRuntime,
+    runtime: *const models.config.ModelRuntime,
     weight_dtype: DType,
     has_unsupported_runtime_features: bool,
 ) bool {
@@ -1850,7 +1850,7 @@ fn isMetalSupported(
 
 fn getMetalUnsupportedReason(
     config: *const ModelConfig,
-    runtime: *const tensor.ModelRuntime,
+    runtime: *const models.config.ModelRuntime,
     weight_dtype: DType,
     has_unsupported_runtime_features: bool,
 ) []const u8 {
@@ -1871,7 +1871,7 @@ fn getMetalUnsupportedReason(
     return "Unknown Metal incompatibility";
 }
 
-fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool {
+fn runtimeHasMetalUnsupportedFeatures(runtime: *const models.config.ModelRuntime) bool {
     // Do not hard-reject runtime topologies during backend selection.
     // Auto mode should attempt Metal and fall back only on concrete backend
     // initialization failures. This keeps backend choice aligned with actual
@@ -2262,7 +2262,7 @@ fn loadedModelHasPackedNvfp4Weights(loaded: *const LoadedModel) bool {
 
 test "isMetalSupported supports quantized and bf16" {
     var config = std.mem.zeroes(ModelConfig);
-    var runtime = std.mem.zeroes(tensor.ModelRuntime);
+    var runtime = std.mem.zeroes(models.config.ModelRuntime);
     config.num_experts = 0;
 
     try std.testing.expect(isMetalSupported(&config, &runtime, .grouped_affine_u4, false));
@@ -2272,7 +2272,7 @@ test "isMetalSupported supports quantized and bf16" {
 
 test "isMetalSupported rejects unsupported dtypes" {
     var config = std.mem.zeroes(ModelConfig);
-    var runtime = std.mem.zeroes(tensor.ModelRuntime);
+    var runtime = std.mem.zeroes(models.config.ModelRuntime);
     config.num_experts = 0;
 
     try std.testing.expect(!isMetalSupported(&config, &runtime, .f32, false));
@@ -2281,7 +2281,7 @@ test "isMetalSupported rejects unsupported dtypes" {
 
 test "isMetalSupported allows moe models" {
     var config = std.mem.zeroes(ModelConfig);
-    var runtime = std.mem.zeroes(tensor.ModelRuntime);
+    var runtime = std.mem.zeroes(models.config.ModelRuntime);
     config.num_experts = 4;
     runtime.has_moe = true;
 
@@ -2290,7 +2290,7 @@ test "isMetalSupported allows moe models" {
 
 test "getMetalUnsupportedReason mentions dtype" {
     var config = std.mem.zeroes(ModelConfig);
-    var runtime = std.mem.zeroes(tensor.ModelRuntime);
+    var runtime = std.mem.zeroes(models.config.ModelRuntime);
     config.num_experts = 0;
 
     const reason = getMetalUnsupportedReason(&config, &runtime, .f32, false);
@@ -2299,7 +2299,7 @@ test "getMetalUnsupportedReason mentions dtype" {
 
 test "isMetalSupported rejects models when runtime features are unsupported" {
     var config = std.mem.zeroes(ModelConfig);
-    var runtime = std.mem.zeroes(tensor.ModelRuntime);
+    var runtime = std.mem.zeroes(models.config.ModelRuntime);
     config.num_experts = 0;
     runtime.has_mamba = true;
 
@@ -2307,7 +2307,7 @@ test "isMetalSupported rejects models when runtime features are unsupported" {
 }
 
 test "runtimeHasMetalUnsupportedFeatures does not pre-reject known topologies" {
-    var runtime = std.mem.zeroes(tensor.ModelRuntime);
+    var runtime = std.mem.zeroes(models.config.ModelRuntime);
     try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
 
     runtime.has_mla = true;

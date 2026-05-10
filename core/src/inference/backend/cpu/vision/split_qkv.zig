@@ -24,7 +24,7 @@ const vision_program_mod = @import("../../../vision_program.zig");
 const vision_adapters = @import("../../../vision_program_adapters.zig");
 
 const Tensor = tensor.Tensor;
-const ModelConfig = tensor.ModelConfig;
+const ModelConfig = models.config.ModelConfig;
 const LoadedModel = models.LoadedModel;
 const vision_load = models.vision;
 const cpu_linalg = compute.cpu.linalg;

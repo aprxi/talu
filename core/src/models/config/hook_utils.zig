@@ -1,5 +1,7 @@
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const types = @import("types.zig");
+
+const ModelConfig = types.ModelConfig;
 
 pub fn getObjectIntField(obj: std.json.ObjectMap, key: []const u8) ?i32 {
     const value = obj.get(key) orelse return null;
@@ -45,7 +47,7 @@ pub fn getBoolFromConfigOrRoot(config_obj: std.json.ObjectMap, root_obj: std.jso
     return getObjectBoolField(config_obj, key) orelse getObjectBoolField(root_obj, key);
 }
 
-pub fn applyCommonTextConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
+pub fn applyCommonTextConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *ModelConfig) void {
     if (getBoolFromConfigOrRoot(config_obj, root_obj, "attention_bias")) |v| config.attention_bias = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "global_head_dim")) |v| config.global_head_dim = v;
     if (getBoolFromConfigOrRoot(config_obj, root_obj, "use_qk_norm")) |v| config.use_qk_norm = v;
@@ -116,12 +118,12 @@ pub fn applyCommonTextConfig(config_obj: std.json.ObjectMap, root_obj: std.json.
 pub fn applyCommonTextConfigHook(
     config_obj: std.json.ObjectMap,
     root_obj: std.json.ObjectMap,
-    config: *tensor.ModelConfig,
+    config: *ModelConfig,
 ) void {
     applyCommonTextConfig(config_obj, root_obj, config);
 }
 
-pub fn applyMambaConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
+pub fn applyMambaConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *ModelConfig) void {
     if (getIntFromConfigOrRoot(config_obj, root_obj, "mamba_d_state")) |v| config.mamba_d_state = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "mamba_d_conv")) |v| config.mamba_d_conv = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "mamba_n_heads")) |v| config.mamba_n_heads = v;
@@ -130,27 +132,27 @@ pub fn applyMambaConfig(config_obj: std.json.ObjectMap, root_obj: std.json.Objec
     if (getIntFromConfigOrRoot(config_obj, root_obj, "mamba_expand")) |v| config.mamba_expand = v;
 }
 
-pub fn applyShortConvConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
+pub fn applyShortConvConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *ModelConfig) void {
     if (getIntFromConfigOrRoot(config_obj, root_obj, "conv_L_cache")) |v| config.shortconv_d_conv = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "conv_dim")) |v| config.shortconv_conv_dim = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "conv_dim_out")) |v| config.shortconv_conv_dim_out = v;
     if (getBoolFromConfigOrRoot(config_obj, root_obj, "conv_bias")) |v| config.shortconv_has_bias = v;
 }
 
-pub fn applyLinearAttentionConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
+pub fn applyLinearAttentionConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *ModelConfig) void {
     if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_num_key_heads")) |v| config.linear_num_key_heads = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_num_value_heads")) |v| config.linear_num_value_heads = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_key_head_dim")) |v| config.linear_key_head_dim = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_value_head_dim")) |v| config.linear_value_head_dim = v;
 }
 
-pub fn applyPhiPartialRotary(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
+pub fn applyPhiPartialRotary(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *ModelConfig) void {
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "partial_rotary_factor")) |partial_rotary_factor| {
         config.rope_dim = @intFromFloat(@as(f32, @floatFromInt(config.head_dim)) * partial_rotary_factor);
     }
 }
 
-pub fn applyVisionConfig(root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
+pub fn applyVisionConfig(root_obj: std.json.ObjectMap, config: *ModelConfig) void {
     const vision_obj = if (root_obj.get("vision_config")) |vision_cfg|
         switch (vision_cfg) {
             .object => vision_cfg.object,

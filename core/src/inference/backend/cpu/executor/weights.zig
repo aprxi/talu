@@ -26,6 +26,7 @@ const progress_mod = @import("progress_pkg");
 const runtime_blocks = @import("models_pkg").runtime_blocks;
 const topology = @import("models_pkg").op_types;
 const models_registry = @import("models_pkg").registry;
+const model_config = @import("models_pkg").config;
 
 pub const BufferId = layer_ops.BufferId;
 
@@ -42,7 +43,7 @@ const shortconv = @import("../kernels/shortconv.zig");
 const mla = @import("../kernels/mla_attention.zig");
 
 const Tensor = tensor.Tensor;
-const ModelConfig = tensor.ModelConfig;
+const ModelConfig = model_config.ModelConfig;
 
 // Re-export kernel types for external use
 pub const AttnTemp = attn.AttnTemp;
@@ -111,7 +112,7 @@ pub const BlockInitContext = struct {
     head_dim: usize,
     max_seq_len: usize,
     norm_eps: f32,
-    runtime: tensor.ModelRuntime,
+    runtime: model_config.ModelRuntime,
     rope_interleaved: bool = false,
     residual_multiplier: f32,
     attention_scale: f32,
@@ -1074,7 +1075,7 @@ pub const TransformerBlock = struct {
         max_seq_len: usize,
         weights: BlockWeights,
         norm_eps: f32,
-        runtime: tensor.ModelRuntime,
+        runtime: model_config.ModelRuntime,
         rope_interleaved: bool,
         residual_multiplier: f32,
         attention_scale: f32,
@@ -1112,7 +1113,7 @@ pub const TransformerBlock = struct {
         weights: BlockWeights,
         program: ?[]const layer_ops.LayerOp,
         norm_eps: f32,
-        runtime: tensor.ModelRuntime,
+        runtime: model_config.ModelRuntime,
         rope_interleaved: bool,
         residual_multiplier: f32,
         attention_scale: f32,
@@ -1186,7 +1187,7 @@ pub const TransformerBlock = struct {
         weights: AttentionMlpWeights,
         program: ?[]const layer_ops.LayerOp,
         norm_eps: f32,
-        runtime: tensor.ModelRuntime,
+        runtime: model_config.ModelRuntime,
         rope_interleaved: bool,
         residual_multiplier: f32,
         attention_scale: f32,
@@ -1364,40 +1365,42 @@ pub const TransformerBlock = struct {
                     break :blk @as(usize, @intCast(gp.shape[0]));
                 } else break :blk d_ff;
             } else d_ff;
-            ffn_ptr.* = .{ .moe_ffn = .{
-                .allocator = allocator,
-                .d_model = d_model,
-                .d_ff = expert_d_ff,
-                .num_experts = moe_w.num_experts,
-                .experts_per_token = moe_w.experts_per_token,
-                .router_weight = moe_w.router_weight,
-                .router_bias = moe_w.router_bias,
-                .experts = toKernelExperts(moe_w.experts),
-                .use_mxfp4 = moe_w.use_mxfp4,
-                .use_swiglu_variant = runtime.use_swiglu_variant,
-                .use_transposed_weights = runtime.use_transposed_mxfp4,
-                .use_gelu = use_gelu,
-                // Shared MLP (fused MoE)
-                .shared_gate_proj = moe_w.shared_w1,
-                .shared_up_proj = moe_w.shared_w3,
-                .shared_down_proj = moe_w.shared_w2,
-                .shared_d_ff = if (moe_w.shared_w1) |t| @intCast(t.shape[0]) else 0,
-                .shared_expert_gate = moe_w.shared_expert_gate,
-                // Router scaling (fused MoE)
-                .router_input_scale = if (moe_w.router_input_scale) |t| t.asSlice(f32) else null,
-                .router_per_expert_scale = if (moe_w.router_per_expert_scale) |t| t.asSlice(f32) else null,
-                .router_scalar_root_size = if (has_shared_mlp) 1.0 / @sqrt(@as(f32, @floatFromInt(d_model))) else 0.0,
-                // Internal norms for fused FFN+MoE (models with pre/post expert norms)
-                .pre_ffn_norm_weight = moe_w.pre_ffn_norm,
-                .post_shared_norm_weight = moe_w.post_shared_norm,
-                .pre_expert_norm_weight = moe_w.pre_expert_norm,
-                .post_expert_norm_weight = moe_w.post_expert_norm,
-                .post_combine_norm_weight = moe_w.post_combine_norm,
-                .norm_eps = norm_eps,
-                .norm_weight_offset = runtime.weight_offset,
-                .layer_idx = @intCast(block_idx),
-                .kernel_name = if (has_shared_mlp) "moe_fused" else if (moe_w.use_mxfp4) "moe_mxfp4" else "moe_f32",
-            } };
+            ffn_ptr.* = .{
+                .moe_ffn = .{
+                    .allocator = allocator,
+                    .d_model = d_model,
+                    .d_ff = expert_d_ff,
+                    .num_experts = moe_w.num_experts,
+                    .experts_per_token = moe_w.experts_per_token,
+                    .router_weight = moe_w.router_weight,
+                    .router_bias = moe_w.router_bias,
+                    .experts = toKernelExperts(moe_w.experts),
+                    .use_mxfp4 = moe_w.use_mxfp4,
+                    .use_swiglu_variant = runtime.use_swiglu_variant,
+                    .use_transposed_weights = runtime.use_transposed_mxfp4,
+                    .use_gelu = use_gelu,
+                    // Shared MLP (fused MoE)
+                    .shared_gate_proj = moe_w.shared_w1,
+                    .shared_up_proj = moe_w.shared_w3,
+                    .shared_down_proj = moe_w.shared_w2,
+                    .shared_d_ff = if (moe_w.shared_w1) |t| @intCast(t.shape[0]) else 0,
+                    .shared_expert_gate = moe_w.shared_expert_gate,
+                    // Router scaling (fused MoE)
+                    .router_input_scale = if (moe_w.router_input_scale) |t| t.asSlice(f32) else null,
+                    .router_per_expert_scale = if (moe_w.router_per_expert_scale) |t| t.asSlice(f32) else null,
+                    .router_scalar_root_size = if (has_shared_mlp) 1.0 / @sqrt(@as(f32, @floatFromInt(d_model))) else 0.0,
+                    // Internal norms for fused FFN+MoE (models with pre/post expert norms)
+                    .pre_ffn_norm_weight = moe_w.pre_ffn_norm,
+                    .post_shared_norm_weight = moe_w.post_shared_norm,
+                    .pre_expert_norm_weight = moe_w.pre_expert_norm,
+                    .post_expert_norm_weight = moe_w.post_expert_norm,
+                    .post_combine_norm_weight = moe_w.post_combine_norm,
+                    .norm_eps = norm_eps,
+                    .norm_weight_offset = runtime.weight_offset,
+                    .layer_idx = @intCast(block_idx),
+                    .kernel_name = if (has_shared_mlp) "moe_fused" else if (moe_w.use_mxfp4) "moe_mxfp4" else "moe_f32",
+                },
+            };
         } else {
             const w2 = weights.w2 orelse return error.MissingFFNWeights;
             var fused_gate_up = weights.fused.gate_up;
@@ -1542,7 +1545,7 @@ pub const TransformerBlock = struct {
         d_ff: usize,
         weights: MambaBlockWeights,
         norm_eps: f32,
-        runtime: tensor.ModelRuntime,
+        runtime: model_config.ModelRuntime,
         residual_multiplier: f32,
         use_gelu: bool,
         block_idx: usize,
@@ -1618,7 +1621,7 @@ pub const TransformerBlock = struct {
         d_ff: usize,
         weights: GatedDeltaBlockWeights,
         norm_eps: f32,
-        runtime: tensor.ModelRuntime,
+        runtime: model_config.ModelRuntime,
         residual_multiplier: f32,
         use_gelu: bool,
         block_idx: usize,
@@ -1762,7 +1765,7 @@ pub const TransformerBlock = struct {
         d_ff: usize,
         weights: ShortConvBlockWeights,
         norm_eps: f32,
-        runtime: tensor.ModelRuntime,
+        runtime: model_config.ModelRuntime,
         residual_multiplier: f32,
         use_gelu: bool,
         block_idx: usize,
@@ -1967,7 +1970,7 @@ pub const TransformerBlock = struct {
 pub fn buildBlocks(
     allocator: std.mem.Allocator,
     config: ModelConfig,
-    runtime: tensor.ModelRuntime,
+    runtime: model_config.ModelRuntime,
     block_weights: []const BlockWeights,
     progress: progress_mod.Context,
 ) ![]TransformerBlock {
@@ -2047,7 +2050,7 @@ pub fn buildBlocksFromLayers(
     allocator: std.mem.Allocator,
     _arena_allocator: std.mem.Allocator,
     config: ModelConfig,
-    runtime: tensor.ModelRuntime,
+    runtime: model_config.ModelRuntime,
     layer_weights: []const LayerWeights,
     progress: progress_mod.Context,
 ) ![]TransformerBlock {
@@ -2673,7 +2676,7 @@ test "buildBlocks: creates correct number of blocks" {
         .gaffine_group_size = 128,
     };
 
-    const runtime = tensor.ModelRuntime{};
+    const runtime = model_config.ModelRuntime{};
 
     // Create dummy weights for testing
     var ln1_weights: [n_layers]tensor.OwnedTensor = undefined; // initialized in loop below
@@ -2785,7 +2788,7 @@ test "buildBlocks handles heterogeneous blocks" {
         .gaffine_group_size = 128,
     };
 
-    const runtime = tensor.ModelRuntime{};
+    const runtime = model_config.ModelRuntime{};
 
     var ln1_attn = try tensor.OwnedTensor.init(allocator, .f32, &.{d_model});
     defer ln1_attn.deinit();
@@ -2926,7 +2929,7 @@ test "buildBlocks: validates layer count mismatch" {
         .gaffine_group_size = 128,
     };
 
-    const runtime = tensor.ModelRuntime{};
+    const runtime = model_config.ModelRuntime{};
 
     // Create only 2 block weights when config expects 3
     const empty_block_weights = [_]BlockWeights{};

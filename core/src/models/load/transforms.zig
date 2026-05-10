@@ -4,13 +4,14 @@
 
 const std = @import("std");
 const tensor = @import("tensor_pkg");
+const config_types = @import("../config/types.zig");
 const dtype = @import("dtype_pkg");
 const st_loader = @import("io_pkg").safetensors.root;
 const log = @import("log_pkg");
 const op_types = @import("models_pkg").op_types;
 
 const Tensor = tensor.Tensor;
-const ModelConfig = tensor.ModelConfig;
+const ModelConfig = config_types.ModelConfig;
 const DType = dtype.DType;
 const GroupedAffineMeta = dtype.GroupedAffineMeta;
 const Nvfp4Meta = dtype.Nvfp4Meta;

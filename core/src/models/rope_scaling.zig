@@ -1,10 +1,10 @@
 //! Model-owned RoPE scaling materialization.
 //!
-//! This module translates model configuration policy (`tensor.RopeScaling`) into
+//! This module translates model configuration policy (`config_types.RopeScaling`) into
 //! plain numeric inverse-frequency tables consumed by compute primitives.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const config_types = @import("config/types.zig");
 
 pub const MaterializedRope = struct {
     inv_freq: []f32,
@@ -20,7 +20,7 @@ pub fn materializeInverseFrequencies(
     allocator: std.mem.Allocator,
     dim: usize,
     theta: f32,
-    rope_scaling: tensor.RopeScaling,
+    rope_scaling: config_types.RopeScaling,
 ) !MaterializedRope {
     if ((dim % 2) != 0) return error.InvalidShape;
     if (theta <= 0.0) return error.InvalidShape;
@@ -56,7 +56,7 @@ fn fillStandardInverseFrequencies(inv_freq: []f32, dim: usize, theta: f32, inv_f
     }
 }
 
-fn fillLlama3InverseFrequencies(inv_freq: []f32, dim: usize, theta: f32, rope_scaling: tensor.RopeScaling) void {
+fn fillLlama3InverseFrequencies(inv_freq: []f32, dim: usize, theta: f32, rope_scaling: config_types.RopeScaling) void {
     const factor = rope_scaling.factor;
     const low_freq_factor = rope_scaling.low_freq_factor;
     const high_freq_factor = rope_scaling.high_freq_factor;
@@ -89,7 +89,7 @@ fn fillLlama3InverseFrequencies(inv_freq: []f32, dim: usize, theta: f32, rope_sc
     }
 }
 
-fn fillYarnInverseFrequencies(inv_freq: []f32, dim: usize, theta: f32, rope_scaling: tensor.RopeScaling) f32 {
+fn fillYarnInverseFrequencies(inv_freq: []f32, dim: usize, theta: f32, rope_scaling: config_types.RopeScaling) f32 {
     const factor: f64 = if (rope_scaling.factor > 0) @as(f64, rope_scaling.factor) else 1.0;
     const beta_fast: f64 = @as(f64, rope_scaling.beta_fast);
     const beta_slow: f64 = @as(f64, rope_scaling.beta_slow);
@@ -129,7 +129,7 @@ fn fillYarnInverseFrequencies(inv_freq: []f32, dim: usize, theta: f32, rope_scal
     return attention_scaling;
 }
 
-fn computeYarnAttentionScaling(factor: f32, rope_scaling: tensor.RopeScaling) f32 {
+fn computeYarnAttentionScaling(factor: f32, rope_scaling: config_types.RopeScaling) f32 {
     if (rope_scaling.attention_factor > 0) return rope_scaling.attention_factor;
 
     const mscale_value: f32 = if (rope_scaling.mscale > 0) rope_scaling.mscale else 1.0;
@@ -156,7 +156,7 @@ test "materializeInverseFrequencies llama3 matches expected" {
     const allocator = std.testing.allocator;
     const dim: usize = 128;
     const theta: f32 = 500_000.0;
-    const scaling = tensor.RopeScaling{
+    const scaling = config_types.RopeScaling{
         .rope_type = .llama3,
         .factor = 8.0,
         .low_freq_factor = 1.0,
@@ -199,7 +199,7 @@ test "materializeInverseFrequencies yarn matches reference values" {
     const allocator = std.testing.allocator;
     const dim: usize = 128;
     const theta: f32 = 150000.0;
-    const scaling = tensor.RopeScaling{
+    const scaling = config_types.RopeScaling{
         .rope_type = .yarn,
         .factor = 32.0,
         .beta_fast = 32.0,

@@ -5,6 +5,7 @@
 const std = @import("std");
 const weights = @import("weights.zig");
 const tensor = @import("tensor_pkg");
+const config_types = @import("../config/types.zig");
 const log = @import("log_pkg");
 const op_types = @import("models_pkg").op_types;
 
@@ -998,7 +999,7 @@ test "validateCommon: valid minimal model" {
     const vocab_size: i32 = 1000;
     const n_layers: i32 = 2;
 
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
         .n_layers = n_layers,
@@ -1202,7 +1203,7 @@ test "validateCommon: token_embeddings wrong dimensions" {
     const d_model: i32 = 64;
     const vocab_size: i32 = 1000;
 
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
         .n_layers = 1,
@@ -1338,7 +1339,7 @@ test "validateCommon: token_embeddings shape mismatch" {
     const d_model: i32 = 64;
     const vocab_size: i32 = 1000;
 
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
         .n_layers = 1,
@@ -1475,7 +1476,7 @@ test "validateCommon: blocks count mismatch" {
     const vocab_size: i32 = 1000;
     const n_layers: i32 = 3; // Config says 3 layers
 
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
         .n_layers = n_layers,
@@ -1612,7 +1613,7 @@ test "validateCommon: layer ln1 shape mismatch" {
     const d_model: i32 = 64;
     const vocab_size: i32 = 1000;
 
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
         .n_layers = 1,
@@ -1750,7 +1751,7 @@ test "validateCommon: missing q/k/v without fused qkv" {
     const d_model: i32 = 64;
     const vocab_size: i32 = 1000;
 
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
         .n_layers = 1,
@@ -1922,7 +1923,7 @@ test "validateCommon: lm_head not 2D" {
     const d_model: i32 = 64;
     const vocab_size: i32 = 1000;
 
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
         .n_layers = 1,

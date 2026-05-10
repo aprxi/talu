@@ -1,8 +1,8 @@
 //! Shared multimodal RoPE helpers for inference backends.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
 const vision_common = @import("vision_types.zig");
+const models = @import("models_pkg");
 
 pub const PrefillVisionImage = vision_common.PrefillVisionImage;
 
@@ -13,7 +13,7 @@ pub fn applyPositionDelta(base_pos: usize, delta: isize) !usize {
     return @as(usize, @intCast(shifted));
 }
 
-pub fn resolveMropeSection(config: *const tensor.ModelConfig, head_dim: usize) [3]usize {
+pub fn resolveMropeSection(config: *const models.config.ModelConfig, head_dim: usize) [3]usize {
     const half_dim = head_dim / 2;
     const parsed = config.rope_scaling.mrope_section;
     const parsed_total = @as(usize, parsed[0]) + @as(usize, parsed[1]) + @as(usize, parsed[2]);
@@ -118,7 +118,7 @@ test "applyPositionDelta shifts base position and rejects negative result" {
 }
 
 test "resolveMropeSection returns configured section only when valid" {
-    var cfg = tensor.ModelConfig{
+    var cfg = models.config.ModelConfig{
         .vocab_size = 10,
         .d_model = 8,
         .n_layers = 1,

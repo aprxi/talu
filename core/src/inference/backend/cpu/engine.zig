@@ -1590,7 +1590,7 @@ pub const FusedCpuBackend = struct {
         position_delta: isize,
     };
 
-    fn resolveMropeSection(config: *const tensor.ModelConfig, head_dim: usize) [3]usize {
+    fn resolveMropeSection(config: *const models.config.ModelConfig, head_dim: usize) [3]usize {
         return common_mrope.resolveMropeSection(config, head_dim);
     }
 
@@ -2191,7 +2191,7 @@ test "FusedCpuBackend.decodeBatch addResidual performance" {
 }
 
 test "embed applyEmbeddingScaling no scaling" {
-    const config = tensor.ModelConfig{
+    const config = models.config.ModelConfig{
         .model_arch = .custom,
         .d_model = 4,
         .vocab_size = 100,
@@ -2221,7 +2221,7 @@ test "embed applyEmbeddingScaling no scaling" {
 }
 
 test "embed applyEmbeddingScaling multiplier" {
-    const config = tensor.ModelConfig{
+    const config = models.config.ModelConfig{
         .model_arch = .custom,
         .d_model = 4,
         .vocab_size = 100,
@@ -2250,7 +2250,7 @@ test "embed applyEmbeddingScaling multiplier" {
 }
 
 test "embed applyEmbeddingScaling fractional" {
-    const config = tensor.ModelConfig{
+    const config = models.config.ModelConfig{
         .model_arch = .custom,
         .d_model = 4,
         .vocab_size = 100,
@@ -2279,7 +2279,7 @@ test "embed applyEmbeddingScaling fractional" {
 }
 
 test "decode applyLogitsScaling no scaling" {
-    const config = tensor.ModelConfig{
+    const config = models.config.ModelConfig{
         .model_arch = .custom,
         .d_model = 4,
         .vocab_size = 100,
@@ -2309,7 +2309,7 @@ test "decode applyLogitsScaling no scaling" {
 }
 
 test "decode applyLogitsScaling division" {
-    const config = tensor.ModelConfig{
+    const config = models.config.ModelConfig{
         .model_arch = .custom,
         .d_model = 4,
         .vocab_size = 100,
@@ -2339,7 +2339,7 @@ test "decode applyLogitsScaling division" {
 }
 
 test "decode applyLogitsScaling inverse" {
-    const config = tensor.ModelConfig{
+    const config = models.config.ModelConfig{
         .model_arch = .custom,
         .d_model = 4,
         .vocab_size = 100,
@@ -2837,7 +2837,7 @@ test "slotActivationBytes and slotActivationBytesMut expose slot hidden storage"
 }
 
 test "initRuntimeRopeHandles preserves logical pairing when rope_dim is smaller than global_head_dim" {
-    var config = std.mem.zeroes(tensor.ModelConfig);
+    var config = std.mem.zeroes(models.config.ModelConfig);
     config.head_dim = 256;
     config.global_head_dim = 512;
     config.rope_dim = 128;

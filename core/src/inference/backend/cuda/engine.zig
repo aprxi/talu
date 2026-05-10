@@ -1666,7 +1666,7 @@ pub const CudaBackend = struct {
     pub fn computeInitLayerRange(
         opts: InitOptions,
         total_layers: usize,
-        config: tensor.ModelConfig,
+        config: models.config.ModelConfig,
     ) error{InvalidTopologyConfig}!LayerRangeResult {
         if (opts.init_layer_range) |r| {
             // init_layer_range is internal: used by topology init to create stage

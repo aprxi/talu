@@ -54,7 +54,7 @@ pub const ConvertResult = extern struct {
     success: bool = false,
 };
 
-/// Quantization method enum (matches tensor.QuantMethod)
+/// Quantization method enum (matches models.config.QuantMethod)
 pub const QuantMethodEnum = enum(i32) {
     none = 0,
     gaffine = 1,
@@ -169,7 +169,6 @@ pub export fn talu_convert_free_string(string_ptr: ?[*:0]const u8) callconv(.c) 
         allocator.free(ptr[0 .. length + 1]);
     }
 }
-
 
 /// Get all available schemes as a JSON string: {"canonical": ["alias1", ...], ...}.
 ///

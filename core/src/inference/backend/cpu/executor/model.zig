@@ -49,7 +49,7 @@ const kv_cache = @import("../kernels/kv_cache.zig");
 const LayeredBatchedKVCache = kv_cache.LayeredBatchedKVCache;
 
 const LoadedModel = models.LoadedModel;
-const ModelConfig = tensor_mod.ModelConfig;
+const ModelConfig = models.config.ModelConfig;
 const LayerOp = layer_ops.LayerOp;
 const BlockKind = block_kernels.BlockType;
 const per_layer_branch_models = models.per_layer_branch;

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const tensor = @import("tensor_pkg");
+const config_types = @import("../config/types.zig");
 const st_loader = @import("io_pkg").safetensors.root;
 const model_types = @import("models_pkg").op_types;
 const transforms = @import("transforms.zig");
@@ -220,7 +221,7 @@ noinline fn splitFusedQkv(
     allocator: Allocator,
     map: *WeightMap,
     fused: *const Tensor,
-    model_config: *const tensor.ModelConfig,
+    model_config: *const config_types.ModelConfig,
 ) !void {
     if (fused.n_dims != 2) return;
     const total_out: usize = @intCast(fused.shape[0]);
@@ -295,7 +296,7 @@ pub noinline fn loadWeightMap(
     specs: []const WeightSpec,
     weight_prefixes: []const []const u8,
     layer_idx: usize,
-    model_config: *const tensor.ModelConfig,
+    model_config: *const config_types.ModelConfig,
     options: LoadOptions,
 ) !WeightMap {
     var map = WeightMap{};
@@ -373,7 +374,7 @@ fn loadWeightBySpec(
     spec: WeightSpec,
     weight_prefixes: []const []const u8,
     layer_idx: usize,
-    model_config: *const tensor.ModelConfig,
+    model_config: *const config_types.ModelConfig,
     options: LoadOptions,
     name_resolver: *NameResolver,
 ) !?*const Tensor {
@@ -425,7 +426,7 @@ noinline fn tryLoadCandidate(
     safetensors: *st_loader.UnifiedSafeTensors,
     spec: WeightSpec,
     name: []const u8,
-    model_config: *const tensor.ModelConfig,
+    model_config: *const config_types.ModelConfig,
     options: LoadOptions,
     name_resolver: *NameResolver,
 ) !?*const Tensor {
@@ -518,7 +519,7 @@ fn applySpecTransforms(
     name: []const u8,
     raw_tensor: Tensor,
     spec: WeightSpec,
-    model_config: *const tensor.ModelConfig,
+    model_config: *const config_types.ModelConfig,
     options: LoadOptions,
 ) !Tensor {
     var tensor_view = raw_tensor;
@@ -576,7 +577,7 @@ fn applySpecTransforms(
 /// Strategy:
 /// 1. If expected_shape is provided, use shape[1] (always unpacked dimensions)
 /// 2. Otherwise, infer from tensor shape and d_model, accounting for packing
-fn getExpectedIn(spec: WeightSpec, raw_tensor: Tensor, model_config: *const tensor.ModelConfig) usize {
+fn getExpectedIn(spec: WeightSpec, raw_tensor: Tensor, model_config: *const config_types.ModelConfig) usize {
     const d_model: usize = @intCast(model_config.d_model);
 
     // If expected_shape is provided, always use it - it contains unpacked dimensions
@@ -797,7 +798,7 @@ test "WeightSpec.force_f32 overrides preserve_native_norm_dtype for norm weights
         .force_f32 = false,
     };
 
-    const model_config = tensor.ModelConfig{
+    const model_config = config_types.ModelConfig{
         .d_model = 2,
         .vocab_size = 16,
         .n_layers = 1,
@@ -873,7 +874,7 @@ test "loadWeightMap resolves repeated wrapper prefix via normalized fallback" {
         .required = true,
     };
     const prefixes = [_][]const u8{"model.language_model.layers.{d}."};
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .d_model = 2,
         .vocab_size = 16,
         .n_layers = 1,
@@ -945,7 +946,7 @@ test "loadWeightMap fails on ambiguous normalized wrapper mapping" {
         .required = true,
     };
     const prefixes = [_][]const u8{"model.language_model.layers.{d}."};
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .d_model = 2,
         .vocab_size = 16,
         .n_layers = 1,
@@ -1042,7 +1043,7 @@ test "loadWeightMap splits fused gate_up nvfp4 metadata rows" {
         },
     };
     const prefixes = [_][]const u8{"model.layers.{d}."};
-    const config = tensor.ModelConfig{
+    const config = config_types.ModelConfig{
         .d_model = 4,
         .vocab_size = 16,
         .n_layers = 1,

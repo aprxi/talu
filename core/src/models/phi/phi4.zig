@@ -1,7 +1,7 @@
 //! Phi4 model-version metadata.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const config_types = @import("../config/types.zig");
 const layer_ops = @import("models_pkg").layer_ops;
 const types = @import("models_pkg").op_types;
 const config_hooks = @import("../config/hook_utils.zig");
@@ -82,7 +82,7 @@ const phi4_sampling_presets: sp.SamplingPresets = .{
 fn parseConfigHook(
     config_obj: std.json.ObjectMap,
     root_obj: std.json.ObjectMap,
-    config: *tensor.ModelConfig,
+    config: *config_types.ModelConfig,
 ) void {
     config_hooks.applyCommonTextConfig(config_obj, root_obj, config);
     config_hooks.applyPhiPartialRotary(config_obj, root_obj, config);

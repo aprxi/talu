@@ -4,10 +4,10 @@
 //! This module handles directory structure and config format generation.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
 const io = @import("io_pkg");
+const model_config_mod = @import("models_pkg").config;
 
-const ModelConfig = tensor.ModelConfig;
+const ModelConfig = model_config_mod.ModelConfig;
 
 /// GAF model configuration (compatible with MLX format)
 pub const GAFConfig = struct {

@@ -4,7 +4,7 @@
 //! with Mixture-of-Experts in the FFN path (256 routed experts + shared expert).
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const config_types = @import("../config/types.zig");
 const layer_ops = @import("models_pkg").layer_ops;
 const types = @import("models_pkg").op_types;
 const config_hooks = @import("../config/hook_utils.zig");
@@ -129,7 +129,7 @@ fn optionalLayerWeight(comptime id_suffix: []const u8, comptime module_type: []c
 fn parseConfigHook(
     config_obj: std.json.ObjectMap,
     root_obj: std.json.ObjectMap,
-    config: *tensor.ModelConfig,
+    config: *config_types.ModelConfig,
 ) void {
     config_hooks.applyCommonTextConfig(config_obj, root_obj, config);
     config_hooks.applyLinearAttentionConfig(config_obj, root_obj, config);

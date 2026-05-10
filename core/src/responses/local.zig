@@ -10,7 +10,6 @@ const std = @import("std");
 const inference_bridge = @import("inference_bridge.zig");
 const inference = inference_bridge.root;
 const models = @import("models_pkg");
-const tensor = @import("tensor_pkg");
 const conversation_mod = @import("conversation/root.zig");
 const Chat = conversation_mod.Chat;
 const protocol = @import("protocol/root.zig");
@@ -280,7 +279,7 @@ pub const LocalEngine = struct {
     /// Loaded model weights/config when retained by the active backend.
     loaded: ?*models.LoadedModel,
     /// Immutable model config snapshot used by serving/template logic.
-    model_config: tensor.ModelConfig,
+    model_config: models.config.ModelConfig,
     model_file_size: usize,
     model_tensor_count: usize,
     model_weight_dtype_tag: u8,

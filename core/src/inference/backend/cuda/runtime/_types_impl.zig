@@ -243,7 +243,7 @@ pub fn resolveCudaMaxSeqLen(model_max_seq_len: usize) usize {
     return resolved;
 }
 
-pub fn resolveSharedKvSourceLayer(config: tensor.ModelConfig, layer_idx: usize) ?usize {
+pub fn resolveSharedKvSourceLayer(config: models.config.ModelConfig, layer_idx: usize) ?usize {
     if (config.num_kv_shared_layers <= 0) return null;
     const layer_types = config.layer_types orelse return null;
     const n_layers: usize = @intCast(config.n_layers);
@@ -268,7 +268,7 @@ pub fn resolveSharedKvSourceLayer(config: tensor.ModelConfig, layer_idx: usize) 
 /// not separate KV-shared layers from their source layers. Returns the
 /// adjusted split (may be lower than `proposed_split`). Returns null when
 /// no valid split exists (source layer below `floor`).
-pub fn adjustSplitForKvSharing(config: tensor.ModelConfig, proposed_split: usize, total_layers: usize, floor: usize) ?usize {
+pub fn adjustSplitForKvSharing(config: models.config.ModelConfig, proposed_split: usize, total_layers: usize, floor: usize) ?usize {
     if (config.num_kv_shared_layers <= 0) return proposed_split;
     var min_source = proposed_split;
     var layer_idx = proposed_split;

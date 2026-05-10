@@ -4,7 +4,7 @@
 //! and inference runtime wiring.
 
 const std = @import("std");
-const tensor = @import("tensor_pkg");
+const config_types = @import("config/types.zig");
 const runtime_contract = @import("runtime_contract_pkg");
 const perf_hints = @import("perf_hints.zig");
 const sampling_presets = @import("sampling_presets.zig");
@@ -177,7 +177,7 @@ pub const KernelMeta = struct {
 pub const ConfigParseHook = *const fn (
     config_obj: std.json.ObjectMap,
     root_obj: std.json.ObjectMap,
-    config: *tensor.ModelConfig,
+    config: *config_types.ModelConfig,
 ) void;
 
 /// Weight layout hints for loading and transformation.

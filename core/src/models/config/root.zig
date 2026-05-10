@@ -5,19 +5,23 @@
 
 const std = @import("std");
 const json = @import("io_pkg").json;
-const tensor = @import("tensor_pkg");
 const model_types = @import("models_pkg").op_types;
 const registry = @import("models_pkg").registry;
+const types = @import("types.zig");
 
-const ModelConfig = tensor.ModelConfig;
+pub const QuantMethod = types.QuantMethod;
+pub const RopeScaling = types.RopeScaling;
+pub const ModelArch = types.ModelArch;
+pub const ModelRuntime = types.ModelRuntime;
+pub const ModelConfig = types.ModelConfig;
 
 // =============================================================================
 // Rope Scaling Parsing
 // =============================================================================
 
 /// Parse rope_scaling from a JSON object.
-pub fn parseRopeScalingFromObject(obj: std.json.ObjectMap) tensor.RopeScaling {
-    var rope_type: @TypeOf((tensor.RopeScaling{}).rope_type) = .none;
+pub fn parseRopeScalingFromObject(obj: std.json.ObjectMap) RopeScaling {
+    var rope_type: @TypeOf((RopeScaling{}).rope_type) = .none;
     if (obj.get("rope_type")) |rtv| {
         if (rtv == .string) {
             if (std.mem.eql(u8, rtv.string, "llama3")) rope_type = .llama3;
@@ -609,7 +613,7 @@ pub fn loadConfigForArchitectureWithHook(
     }
 
     // Determine quantization method
-    const quant_method_kind: tensor.QuantMethod = blk: {
+    const quant_method_kind: QuantMethod = blk: {
         // Check quantization_config first (both quant_method and mode fields)
         if (config_json.quantization_config) |quant_config| {
             if (quant_config.quant_method) |method| {
@@ -653,9 +657,9 @@ pub fn loadConfigForArchitectureWithHook(
 
     // Parse rope_scaling if present.
     // Note: some models use `rope_type="yarn"` with `beta_fast/beta_slow`.
-    const rope_scaling_params: tensor.RopeScaling = if (config_json.rope_scaling) |rope_scaling_config| blk: {
+    const rope_scaling_params: RopeScaling = if (config_json.rope_scaling) |rope_scaling_config| blk: {
         // Determine rope_type enum value
-        var rope_type_val: @TypeOf((tensor.RopeScaling{}).rope_type) = .none;
+        var rope_type_val: @TypeOf((RopeScaling{}).rope_type) = .none;
         if (rope_scaling_config.rope_type) |rope_type_str| {
             if (std.mem.eql(u8, rope_type_str, "llama3")) rope_type_val = .llama3;
             if (std.mem.eql(u8, rope_type_str, "linear")) rope_type_val = .linear;
@@ -693,7 +697,7 @@ pub fn loadConfigForArchitectureWithHook(
             .mrope_interleaved = rope_scaling_config.mrope_interleaved orelse false,
         };
     } else if (config_json.rope_parameters) |rope_params| blk: {
-        var rope_type_val: @TypeOf((tensor.RopeScaling{}).rope_type) = .none;
+        var rope_type_val: @TypeOf((RopeScaling{}).rope_type) = .none;
         if (rope_params.rope_type) |rope_type_str| {
             if (std.mem.eql(u8, rope_type_str, "llama3")) rope_type_val = .llama3;
             if (std.mem.eql(u8, rope_type_str, "linear")) rope_type_val = .linear;
@@ -818,16 +822,6 @@ pub fn loadConfigFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !M
 // =============================================================================
 // C-compatible model description (for FFI)
 // =============================================================================
-
-/// Quantization method enum for C interop.
-pub const QuantMethod = enum(c_int) {
-    none = 0,
-    gaffine = 1,
-    mxfp4 = 2,
-    native = 3,
-    fp8 = 4,
-    mxfp8 = 5,
-};
 
 /// C-compatible model description with null-terminated strings.
 /// Used by the C API for model introspection.
@@ -1219,7 +1213,7 @@ test "loadConfig reads root quantization when parsing text_config" {
     defer std.testing.allocator.free(path);
 
     const config = try loadConfig(std.testing.allocator, path);
-    try std.testing.expectEqual(tensor.QuantMethod.gaffine, config.quant_method);
+    try std.testing.expectEqual(QuantMethod.gaffine, config.quant_method);
     try std.testing.expectEqual(@as(i32, 8), config.gaffine_bits);
     try std.testing.expectEqual(@as(i32, 64), config.gaffine_group_size);
     try std.testing.expectEqual(false, config.tie_word_embeddings);
@@ -1286,7 +1280,7 @@ test "loadConfig accepts mxfp8 quantization_config with contract version 1" {
     defer std.testing.allocator.free(path);
 
     const config = try loadConfig(std.testing.allocator, path);
-    try std.testing.expectEqual(tensor.QuantMethod.mxfp8, config.quant_method);
+    try std.testing.expectEqual(QuantMethod.mxfp8, config.quant_method);
 }
 
 test "loadConfig rejects nvfp4 quantization_config with unsupported contract version" {
@@ -1355,7 +1349,7 @@ test "loadConfig accepts modelopt NVFP4 config and extracts group size from conf
     defer std.testing.allocator.free(path);
 
     const config = try loadConfig(std.testing.allocator, path);
-    try std.testing.expectEqual(tensor.QuantMethod.gaffine, config.quant_method);
+    try std.testing.expectEqual(QuantMethod.gaffine, config.quant_method);
     try std.testing.expectEqual(@as(i32, 4), config.gaffine_bits);
     try std.testing.expectEqual(@as(i32, 16), config.gaffine_group_size);
 }

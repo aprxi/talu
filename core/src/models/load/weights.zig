@@ -6,13 +6,14 @@
 
 const std = @import("std");
 const tensor = @import("tensor_pkg");
+const config_types = @import("../config/types.zig");
 const dtype = @import("dtype_pkg");
 const log = @import("log_pkg");
 const progress_mod = @import("progress_pkg");
 const runtime_blocks = @import("models_pkg").runtime_blocks;
 
 const Tensor = tensor.Tensor;
-const ModelConfig = tensor.ModelConfig;
+const ModelConfig = config_types.ModelConfig;
 const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
 const st_loader = @import("io_pkg").safetensors.root;
@@ -47,7 +48,7 @@ pub const LoadOptions = struct {
 pub const LoadedModel = struct {
     arena: std.heap.ArenaAllocator,
     config: ModelConfig,
-    runtime: tensor.ModelRuntime = .{},
+    runtime: config_types.ModelRuntime = .{},
     st: ?st_loader.UnifiedSafeTensors = null,
     ln_final: ?Tensor = null,
     lm_head: ?Tensor = null,

@@ -474,7 +474,7 @@ test "tryPopulateHiddenFromToken supports [vocab, d_model] layout" {
 
     var loaded = LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-        .config = std.mem.zeroes(tensor.ModelConfig),
+        .config = std.mem.zeroes(models.config.ModelConfig),
         .token_embeddings = embeddings,
         .blocks = &.{},
         .original_weight_dtype = .f32,
@@ -500,7 +500,7 @@ test "tryPopulateHiddenFromToken supports [d_model, vocab] layout" {
 
     var loaded = LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-        .config = std.mem.zeroes(tensor.ModelConfig),
+        .config = std.mem.zeroes(models.config.ModelConfig),
         .token_embeddings = embeddings,
         .blocks = &.{},
         .original_weight_dtype = .f32,
@@ -523,7 +523,7 @@ test "populatePrefillHiddenFromTokens applies embedding multiplier" {
     const bytes = std.mem.sliceAsBytes(embedding_data[0..]);
     const embeddings = Tensor.view(bytes.ptr, &.{ 2, 3 }, .f32, bytes.len);
 
-    var cfg = std.mem.zeroes(tensor.ModelConfig);
+    var cfg = std.mem.zeroes(models.config.ModelConfig);
     cfg.embedding_multiplier = 2.0;
     var loaded = LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
@@ -555,7 +555,7 @@ test "populatePrefillHiddenFromTokens zero-fills configured skip token rows" {
     const bytes = std.mem.sliceAsBytes(embedding_data[0..]);
     const embeddings = Tensor.view(bytes.ptr, &.{ 2, 3 }, .f32, bytes.len);
 
-    var cfg = std.mem.zeroes(tensor.ModelConfig);
+    var cfg = std.mem.zeroes(models.config.ModelConfig);
     cfg.embedding_multiplier = 1.0;
     var loaded = LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
@@ -617,7 +617,7 @@ test "tryPopulateFinalNormWeight supports bf16 weights" {
 
     var loaded = LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-        .config = std.mem.zeroes(tensor.ModelConfig),
+        .config = std.mem.zeroes(models.config.ModelConfig),
         .ln_final = norm_tensor,
         .token_embeddings = std.mem.zeroes(Tensor),
         .blocks = &.{},
@@ -634,7 +634,7 @@ test "tryPopulateFinalNormWeight supports bf16 weights" {
 test "populatePrefillHiddenFromTokens rejects missing embeddings" {
     var loaded = LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-        .config = std.mem.zeroes(tensor.ModelConfig),
+        .config = std.mem.zeroes(models.config.ModelConfig),
         .token_embeddings = std.mem.zeroes(Tensor),
         .blocks = &.{},
         .original_weight_dtype = .f32,
@@ -4814,7 +4814,7 @@ test "interleaved multi-slot lifecycle with pipeline stage" {
 
 const computeInitLayerRange = CudaBackend.computeInitLayerRange;
 const InitOptions = CudaBackend.InitOptions;
-const no_sharing_config: tensor.ModelConfig = .{
+const no_sharing_config: models.config.ModelConfig = .{
     .vocab_size = 1000,
     .d_model = 256,
     .n_layers = 32,
