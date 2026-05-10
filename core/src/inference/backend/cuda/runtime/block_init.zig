@@ -142,7 +142,7 @@ fn compileLayerProgramMetadata(
     allocator: std.mem.Allocator,
     layer: *BlockRuntimeLayer,
     program: anytype,
-    options: anytype,
+    options: plan_compiler.CompileOptions,
     layer_idx: usize,
     kind: op_types.BlockKind,
     adapter_table: anytype,

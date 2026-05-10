@@ -22,6 +22,7 @@ const trace = @import("xray_pkg").trace;
 const load_transforms = @import("models_pkg").load.transforms;
 const vision_types = @import("../../vision_types.zig");
 const common_mrope = @import("../../vision_mrope.zig");
+const bridge = @import("../../bridge/root.zig");
 const smoke_checks = @import("selftest.zig");
 const attention_policy = @import("attention_policy.zig");
 const attention_mod = @import("attention_path.zig");
@@ -491,12 +492,12 @@ pub const CudaBackend = struct {
     pipeline_stage0_event: ?compute.cuda.EventHandle = null,
     pipeline_host_staging: ?[]align(4096) u8 = null,
     pipeline_host_staging_stage12: ?[]align(4096) u8 = null,
-    pipeline_boundary_dtype: backend_root.pipeline.BoundaryDType = .f32,
-    pipeline_boundary_layout: backend_root.pipeline.BoundaryLayout = .row_major,
+    pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+    pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
     pipeline_stage0_boundary_conversion: bool = false,
     pipeline_stage1_boundary_conversion: bool = false,
-    pipeline_boundary_dtype_stage12: backend_root.pipeline.BoundaryDType = .f32,
-    pipeline_boundary_layout_stage12: backend_root.pipeline.BoundaryLayout = .row_major,
+    pipeline_boundary_dtype_stage12: bridge.BoundaryDType = .f32,
+    pipeline_boundary_layout_stage12: bridge.BoundaryLayout = .row_major,
     pipeline_stage1_boundary_conversion_stage12: bool = false,
     pipeline_stage2_boundary_conversion_stage12: bool = false,
 
@@ -1288,7 +1289,7 @@ pub const CudaBackend = struct {
                 }
                 backend.pipeline_backend1 = stage1_ptr;
 
-                const boundary = try backend_root.pipeline.negotiateBoundaryContract(.{
+                const boundary = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
                     .stage0_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
@@ -1387,7 +1388,7 @@ pub const CudaBackend = struct {
                 backend.pipeline_backend0_cpu = stage0_cpu_ptr;
                 init_options.progress.updateLine(1, @intCast(split), null);
 
-                const boundary = try backend_root.pipeline.negotiateBoundaryContract(.{
+                const boundary = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
                     .stage0_supported_boundary_dtypes = cpu_stage.CpuStage.supported_boundary_dtypes[0..],
@@ -1486,7 +1487,7 @@ pub const CudaBackend = struct {
                 // via init_layer_range computed above.
 
                 // Boundary 0->1 (CPU->GPU1) contract.
-                const boundary_01 = try backend_root.pipeline.negotiateBoundaryContract(.{
+                const boundary_01 = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
                     .stage0_supported_boundary_dtypes = cpu_stage.CpuStage.supported_boundary_dtypes[0..],
@@ -1501,7 +1502,7 @@ pub const CudaBackend = struct {
                 }
 
                 // Boundary 1->2 (GPU1->GPU2) contract.
-                const boundary_12 = try backend_root.pipeline.negotiateBoundaryContract(.{
+                const boundary_12 = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
                     .stage0_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
