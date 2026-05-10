@@ -1,5 +1,6 @@
 //! Configuration file support (`~/.talu/config.toml`).
 
+use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -15,9 +16,33 @@ pub struct TaluConfig {
 
 /// Return `~/.talu/`.
 pub fn talu_home() -> PathBuf {
-    dirs::home_dir()
+    user_home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".talu")
+}
+
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            #[cfg(windows)]
+            {
+                if let Some(profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty())
+                {
+                    return Some(PathBuf::from(profile));
+                }
+                let drive = env::var_os("HOMEDRIVE")?;
+                let path = env::var_os("HOMEPATH")?;
+                let mut combined = PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        })
 }
 
 /// Return `~/.talu/config.toml`.

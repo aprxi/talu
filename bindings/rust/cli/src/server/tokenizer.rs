@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,13 +20,23 @@ use talu::{
     TokenizerEncodeOptions, TokenizerHandle, TokenizerSpecialTokens, TokenizerTruncation,
     TokenizerTruncationSide,
 };
-use uuid::Uuid;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
+use crate::server::url_codec::parse_query_pairs;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 type TokenizerInstanceHandle = Arc<tokio::sync::Mutex<TokenizerInstance>>;
+static TOKENIZER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_tokenizer_id() -> String {
+    let counter = TOKENIZER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("tok_{:x}_{:x}_{}", timestamp, std::process::id(), counter)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizerBackend {
@@ -657,7 +668,7 @@ pub async fn handle_create_instance(
 
         let vocab_size = handle.vocab_size();
 
-        let tokenizer_id = format!("tok_{}", Uuid::new_v4().simple());
+        let tokenizer_id = next_tokenizer_id();
         let instance = TokenizerInstance {
             backend,
             source_kind: source_kind.to_string(),
@@ -2598,13 +2609,7 @@ fn parse_accept_q_parameter(param: &str) -> Option<f32> {
 }
 
 fn parse_query(query: Option<&str>) -> HashMap<String, String> {
-    query
-        .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default()
+    parse_query_pairs(query).into_iter().collect()
 }
 
 async fn parse_json_body<T: for<'de> Deserialize<'de>>(

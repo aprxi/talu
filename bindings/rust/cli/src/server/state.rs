@@ -41,8 +41,6 @@ pub struct StoredResponse {
     pub tools_json: Option<serde_json::Value>,
     /// Tool choice (if any).
     pub tool_choice_json: Option<serde_json::Value>,
-    /// Session ID associated with this in-memory conversation chain.
-    pub session_id: Option<String>,
     /// Tenant scope for secure `previous_response_id` chaining.
     /// `None` means gateway auth is disabled (single-tenant server mode).
     pub tenant_id: Option<String>,

@@ -2,17 +2,15 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::HeaderValue;
+use hyper::service::Service;
 use hyper::{Method, Request, Response, StatusCode};
-use once_cell::sync::Lazy;
 use serde_json::Value;
-use tower_service::Service;
 
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -28,6 +26,7 @@ use crate::server::responses;
 use crate::server::responses_openapi;
 use crate::server::state::AppState;
 use crate::server::tokenizer;
+use crate::server::url_codec::decode_path_component;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 const TALU_INSTANCE: &str = "talu";
@@ -81,7 +80,7 @@ pub async fn handle_health(
     json_response(StatusCode::OK, &payload)
 }
 
-static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
+static OPENAPI_SPEC: LazyLock<Vec<u8>> = LazyLock::new(|| {
     let spec = openapi::build_openapi_json();
     filter_openapi_paths(
         &spec,
@@ -96,21 +95,21 @@ static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
         ],
     )
 });
-static OPENAPI_CHAT_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/completions"]));
-static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
+static OPENAPI_CHAT_SPEC: LazyLock<Vec<u8>> =
+    LazyLock::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/completions"]));
+static OPENAPI_RESPONSES_SPEC: LazyLock<Vec<u8>> = LazyLock::new(|| {
     responses_openapi::patch_responses_openapi_spec(&filter_openapi_paths(
         &OPENAPI_SPEC,
         &["/v1/responses"],
     ))
 });
-static OPENAPI_MODELS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/model", "/v1/models"]));
-static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
-static OPENAPI_TOKENIZER_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tokenizer"]));
-static KNOWN_PATHS: Lazy<HashSet<String>> = Lazy::new(|| {
+static OPENAPI_MODELS_SPEC: LazyLock<Vec<u8>> =
+    LazyLock::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/model", "/v1/models"]));
+static OPENAPI_REPO_SPEC: LazyLock<Vec<u8>> =
+    LazyLock::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
+static OPENAPI_TOKENIZER_SPEC: LazyLock<Vec<u8>> =
+    LazyLock::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tokenizer"]));
+static KNOWN_PATHS: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let mut paths = HashSet::new();
     let parsed: Value = serde_json::from_slice(&OPENAPI_SPEC).unwrap_or(Value::Null);
     if let Some(obj) = parsed.get("paths").and_then(|val| val.as_object()) {
@@ -137,11 +136,7 @@ impl Service<Request<Incoming>> for Router {
     type Error = Infallible;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
         let state = self.state.clone();
         Box::pin(async move {
             let method = req.method().clone();
@@ -263,8 +258,7 @@ impl Service<Request<Incoming>> for Router {
                             let Some((raw_id, action)) = tail.rsplit_once('/') else {
                                 return Ok(method_not_allowed(&["GET", "POST"]));
                             };
-                            let id =
-                                percent_encoding::percent_decode_str(raw_id).decode_utf8_lossy();
+                            let id = decode_path_component(raw_id);
                             match action {
                                 "pause" => repo::handle_download_pause(state, req, auth, &id).await,
                                 "resume" => {
@@ -283,14 +277,12 @@ impl Service<Request<Incoming>> for Router {
                             if p.starts_with("/v1/repo/models/") && p.ends_with("/files") =>
                         {
                             let raw = &p["/v1/repo/models/".len()..p.len() - "/files".len()];
-                            let model_id =
-                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+                            let model_id = decode_path_component(raw);
                             repo::handle_list_files(state, req, auth, &model_id).await
                         }
                         (Method::DELETE, p) if p.starts_with("/v1/repo/models/") => {
                             let raw = &p["/v1/repo/models/".len()..];
-                            let model_id =
-                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+                            let model_id = decode_path_component(raw);
                             repo::handle_delete(state, req, auth, &model_id).await
                         }
                         (Method::POST, "/v1/responses") => {

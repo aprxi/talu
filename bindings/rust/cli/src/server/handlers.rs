@@ -91,7 +91,7 @@ struct ReasoningConfig {
 /// Error type for response generation with HTTP status code information.
 #[derive(Debug)]
 pub enum ResponseError {
-    /// Bad request (400) - user error like invalid prompt_id
+    /// Bad request (400) - user error such as an invalid request shape.
     BadRequest { code: &'static str, message: String },
     /// Internal server error (500) - system error
     Internal { code: &'static str, message: String },
@@ -271,15 +271,12 @@ async fn handle_generate(
     let tool_choice_json = parsed.tool_choice.clone();
     let previous_response_id = parsed.previous_response_id.clone();
     let input_value = parsed.input.clone();
-    let request_session_id: Option<String> = None;
-    let prompt_id = None;
-    let project_id: Option<String> = None;
 
     log::debug!(
         target: "server::gen",
-        "model={} stream={} session_id={:?} prompt_id={:?} prev_response_id={:?}",
+        "model={} stream={} prev_response_id={:?}",
         request.model.as_deref().unwrap_or("(default)"),
-        stream, request_session_id, prompt_id, previous_response_id
+        stream, previous_response_id
     );
 
     // Validate that input is present (string, array, or null with previous_response_id).
@@ -300,9 +297,6 @@ async fn handle_generate(
             tools_json,
             tool_choice_json,
             previous_response_id,
-            request_session_id,
-            prompt_id,
-            project_id,
             strict_responses,
             auth_ctx,
         )
@@ -316,9 +310,6 @@ async fn handle_generate(
         tools_json,
         tool_choice_json,
         previous_response_id,
-        request_session_id,
-        prompt_id,
-        project_id,
         strict_responses,
         auth_ctx.as_ref(),
     )
@@ -434,27 +425,13 @@ pub async fn handle_models(
         .unwrap()
 }
 
-/// Resolve file references for structured input.
-///
-/// In the inference-only build, local DB/file-id indirection is disabled and
-/// request payloads are passed through unchanged.
-fn resolve_file_references(input_json: &str, storage_path: &std::path::Path) -> Result<String> {
-    let _ = storage_path;
-    Ok(input_json.to_string())
-}
-
-type PreviousState = (
-    String,
-    Option<serde_json::Value>,
-    Option<serde_json::Value>,
-    Option<String>,
-);
+type PreviousState = (String, Option<serde_json::Value>, Option<serde_json::Value>);
 
 /// Resolve `previous_response_id` from the in-memory response store only.
 ///
 /// This server is inference-only and intentionally does not perform durable
-/// conversation lookups. Durable continuation must be handled by the caller
-/// (for example `talupi`) by replaying prior items in `input`.
+/// conversation lookups. Durable continuation must be handled by the caller by
+/// replaying prior items in `input`.
 async fn load_in_memory_prev_state(
     state: Arc<AppState>,
     previous_response_id: Option<&str>,
@@ -472,7 +449,6 @@ async fn load_in_memory_prev_state(
                 stored.responses_json.clone(),
                 stored.tools_json.clone(),
                 stored.tool_choice_json.clone(),
-                stored.session_id.clone(),
             ))
         } else {
             None
@@ -497,9 +473,6 @@ async fn generate_response(
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
     previous_response_id: Option<String>,
-    request_session_id: Option<String>,
-    prompt_id: Option<String>,
-    _project_id: Option<String>,
     strict_responses: bool,
     auth_ctx: Option<&AuthContext>,
 ) -> Result<serde_json::Value, ResponseError> {
@@ -529,11 +502,6 @@ async fn generate_response(
     let effective_tool_choice =
         tool_choice_json.or_else(|| prev_state.as_ref().and_then(|s| s.2.clone()));
 
-    // Resolve session ID: explicit request > previous response chain > new UUID.
-    let session_id = request_session_id
-        .or_else(|| prev_state.as_ref().and_then(|s| s.3.clone()))
-        .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
-
     let auto_title = false;
     let is_new_conversation = previous_response_id.is_none();
 
@@ -559,22 +527,10 @@ async fn generate_response(
         log::warn!(target: "server::gen", "resolve_effective_generation_config: {e} (using raw request params)");
     }
 
-    // Prompt documents are no longer resolved from local storage in this build.
-    let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
-        return Err(ResponseError::bad_request(
-            "invalid_request",
-            format!(
-                "prompt_id '{}' is not supported in this inference-only build",
-                pid
-            ),
-        ));
-    } else {
-        None
-    };
     let effective_system_prompt = if strict_responses {
         instructions.clone()
     } else {
-        system_prompt_from_doc.clone()
+        None
     };
 
     let response_id = format!("resp_{}", random_id());
@@ -608,8 +564,6 @@ async fn generate_response(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let file_storage_path: Option<std::path::PathBuf> = None;
-
     // Create a stop flag so the generation can be cancelled when the client
     // disconnects (hyper drops the handler future).  The guard sets the flag
     // on drop; we defuse it after a successful result.
@@ -626,10 +580,7 @@ async fn generate_response(
     let contains_images_hint =
         vision::payload_may_include_images(input_json.as_deref(), prev_json.as_deref());
     let has_prepared_vision_prefill = prepared_vision_prefill.is_some();
-    if contains_images_hint
-        && !has_prepared_vision_prefill
-        && vision::file_host_from_env().is_none()
-    {
+    if contains_images_hint && !has_prepared_vision_prefill {
         return Err(ResponseError::bad_request(
             "invalid_vision_input",
             vision::RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE.to_string(),
@@ -651,7 +602,6 @@ async fn generate_response(
         .clone();
     let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json, response_status, incomplete_reason) =
         tokio::task::spawn_blocking(move || {
-            // Create ChatHandle with system prompt if prompt_id was provided
             log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt_for_task.is_some());
             let chat = ChatHandle::new(system_prompt_for_task.as_deref())?;
 
@@ -661,17 +611,12 @@ async fn generate_response(
                     .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
             }
 
-            // Load input items into the conversation, resolving file references.
+            // Load input items into the conversation.
             // The Zig protocol parser stores input_image parts in conversation
             // items; the generate function extracts them for the vision encoder.
             if let Some(ref json) = input_json {
-                log::trace!(target: "server::gen", "resolve_file_references(input, {} bytes)", json.len());
-                let resolved = match file_storage_path.as_deref() {
-                    Some(sp) => resolve_file_references(json, sp)?,
-                    None => json.clone(),
-                };
-                log::trace!(target: "server::gen", "load_responses_json(input, {} bytes)", resolved.len());
-                chat.load_responses_json(&resolved)
+                log::trace!(target: "server::gen", "load_responses_json(input, {} bytes)", json.len());
+                chat.load_responses_json(json)
                     .map_err(|e| anyhow!("failed to load input: {}", e))?;
             } else if let Some(ref text) = input_string {
                 log::trace!(target: "server::gen", "append_user_message({} chars)", text.len());
@@ -861,7 +806,6 @@ async fn generate_response(
         responses_json,
         tools_json: effective_tools.clone(),
         tool_choice_json: effective_tool_choice.clone(),
-        session_id: Some(session_id.clone()),
         tenant_id: tenant_id_for_store,
     };
     {
@@ -938,9 +882,8 @@ async fn generate_response(
             .map(|s| s.to_string());
         if let Some(input) = title_input {
             let title_backend = state.backend.clone();
-            let title_session_id = session_id.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = generate_title(&title_backend, &title_session_id, &input);
+                let _ = generate_title(&title_backend, &input);
             });
         }
     }
@@ -955,9 +898,6 @@ async fn stream_response(
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
     previous_response_id: Option<String>,
-    request_session_id: Option<String>,
-    prompt_id: Option<String>,
-    project_id: Option<String>,
     strict_responses: bool,
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
@@ -1017,11 +957,6 @@ async fn stream_response(
     let effective_tool_choice =
         tool_choice_json.or_else(|| prev_state.as_ref().and_then(|s| s.2.clone()));
 
-    // Resolve session ID: explicit request > previous response chain > new UUID.
-    let session_id = request_session_id
-        .or_else(|| prev_state.as_ref().and_then(|s| s.3.clone()))
-        .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
-
     let auto_title = false;
     let max_output_tokens = request_max_output_tokens;
 
@@ -1044,24 +979,10 @@ async fn stream_response(
     }
     let effective_config = effective_gen.ok();
 
-    // Prompt documents are no longer resolved from local storage in this build.
-    let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
-        return api_error(
-            strict_responses,
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            &format!(
-                "prompt_id '{}' is not supported in this inference-only build",
-                pid
-            ),
-        );
-    } else {
-        None
-    };
     let effective_system_prompt = if strict_responses {
         instructions.clone()
     } else {
-        system_prompt_from_doc.clone()
+        None
     };
 
     let prev_json = prev_state.map(|s| s.0);
@@ -1108,19 +1029,14 @@ async fn stream_response(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let file_storage_path: Option<std::path::PathBuf> = None;
-
     // Clones for the blocking task to store response after completion.
     let state_for_store = state.clone();
-    let session_id_for_store = session_id.clone();
     let tenant_id_for_store = auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone());
     let store_tools = effective_tools.clone();
     let store_tool_choice = effective_tool_choice.clone();
     let response_id_for_store = response_id.clone();
 
-    // A brand-new conversation has no previous_response_id and no request_session_id.
-    // For these, we persist session metadata BEFORE sending response.created so
-    // the session is visible in list_sessions when the client refreshes the sidebar.
+    // A brand-new conversation has no previous_response_id.
     let is_new_conversation = previous_response_id.is_none();
 
     let backend = state.backend.clone();
@@ -1131,16 +1047,12 @@ async fn stream_response(
 
     // Clones for post-generation title generation.
     let title_input = input_string.clone();
-    let title_session_id = session_id.clone();
     let title_backend = state.backend.clone();
     let previous_response_id_for_ctx = previous_response_id.clone();
     let has_prepared_vision_prefill = prepared_vision_prefill.is_some();
     let contains_images_hint =
         vision::payload_may_include_images(input_json.as_deref(), prev_json.as_deref());
-    if contains_images_hint
-        && !has_prepared_vision_prefill
-        && vision::file_host_from_env().is_none()
-    {
+    if contains_images_hint && !has_prepared_vision_prefill {
         return api_error(
             strict_responses,
             StatusCode::BAD_REQUEST,
@@ -1443,9 +1355,6 @@ async fn stream_response(
                     presence_penalty,
                     frequency_penalty,
                     effective_system_prompt,
-                    prompt_id,
-                    project_id.clone(),
-                    file_storage_path,
                     ctx,
                     stop_flag_for_gen,
                     reasoning_for_events.effort.clone(),
@@ -1472,9 +1381,6 @@ async fn stream_response(
                     presence_penalty,
                     frequency_penalty,
                     effective_system_prompt,
-                    prompt_id,
-                    project_id.clone(),
-                    file_storage_path,
                     ctx,
                     stop_flag_for_gen,
                     reasoning_for_events.effort.clone(),
@@ -1502,9 +1408,6 @@ async fn stream_response(
                 presence_penalty,
                 frequency_penalty,
                 effective_system_prompt,
-                prompt_id,
-                project_id.clone(),
-                file_storage_path,
                 ctx,
                 stop_flag_for_gen,
                 reasoning_for_events.effort.clone(),
@@ -1520,7 +1423,6 @@ async fn stream_response(
                     responses_json: r.responses_json.clone(),
                     tools_json: store_tools.clone(),
                     tool_choice_json: store_tool_choice.clone(),
-                    session_id: Some(session_id_for_store.clone()),
                     tenant_id: tenant_id_for_store.clone(),
                 };
                 {
@@ -1546,7 +1448,7 @@ async fn stream_response(
         // Auto-generate a descriptive title for new conversations.
         if !strict_responses && is_new_conversation && auto_title {
             if let Some(ref input) = title_input {
-                let _ = generate_title(&title_backend, &title_session_id, input);
+                let _ = generate_title(&title_backend, input);
             }
         }
     });
@@ -1587,9 +1489,6 @@ fn run_streaming_generation(
     presence_penalty: Option<f64>,
     frequency_penalty: Option<f64>,
     system_prompt: Option<String>,
-    _prompt_id: Option<String>,
-    _project_id: Option<String>,
-    file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
     reasoning_effort: Option<String>,
@@ -1601,7 +1500,6 @@ fn run_streaming_generation(
         .backend
         .as_mut()
         .ok_or_else(|| anyhow!("no backend available"))?;
-    // Create ChatHandle with system prompt if prompt_id was provided
     log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt.is_some());
     let chat = ChatHandle::new(system_prompt.as_deref())?;
 
@@ -1611,17 +1509,12 @@ fn run_streaming_generation(
             .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
     }
 
-    // Load input items into the conversation, resolving file references.
+    // Load input items into the conversation.
     // The Zig protocol parser stores input_image parts in conversation
     // items; batch-backed generation extracts them for the vision encoder.
     if let Some(ref json) = input_json {
-        log::trace!(target: "server::gen", "resolve_file_references(input, {} bytes)", json.len());
-        let resolved = match file_storage_path.as_deref() {
-            Some(sp) => resolve_file_references(json, sp)?,
-            None => json.clone(),
-        };
-        log::trace!(target: "server::gen", "load_responses_json(input, {} bytes)", resolved.len());
-        chat.load_responses_json(&resolved)
+        log::trace!(target: "server::gen", "load_responses_json(input, {} bytes)", json.len());
+        chat.load_responses_json(json)
             .map_err(|e| anyhow!("failed to load input: {}", e))?;
     } else if let Some(ref text) = input_string {
         log::trace!(target: "server::gen", "append_user_message({} chars)", text.len());
@@ -1768,9 +1661,6 @@ fn run_batch_streaming_generation(
     presence_penalty: Option<f64>,
     frequency_penalty: Option<f64>,
     system_prompt: Option<String>,
-    _prompt_id: Option<String>,
-    _project_id: Option<String>,
-    file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
     reasoning_effort: Option<String>,
@@ -1790,11 +1680,7 @@ fn run_batch_streaming_generation(
         chat.item_count(), prev_json.is_some());
 
     if let Some(ref json) = input_json {
-        let resolved = match file_storage_path.as_deref() {
-            Some(sp) => resolve_file_references(json, sp)?,
-            None => json.clone(),
-        };
-        chat.load_responses_json(&resolved)
+        chat.load_responses_json(json)
             .map_err(|e| anyhow!("failed to load input: {}", e))?;
     } else if let Some(ref text) = input_string {
         chat.append_user_message(text)
@@ -2062,7 +1948,6 @@ fn run_batch_streaming_generation(
 /// title-generation system prompt.
 fn generate_title(
     backend: &Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
-    session_id: &str,
     input_text: &str,
 ) -> Result<String> {
     let mut guard = backend.blocking_lock();
@@ -2110,7 +1995,7 @@ fn generate_title(
         return Err(anyhow!("generated title is empty"));
     }
 
-    log::info!(target: "server::gen", "auto-title generated for {session_id}: {title:?}");
+    log::info!(target: "server::gen", "auto-title generated: {title:?}");
 
     Ok(title)
 }
@@ -3565,7 +3450,7 @@ fn validate_max_output_tokens(max_output_tokens: Option<i64>) -> std::result::Re
 fn validate_max_tool_calls(max_tool_calls: Option<i64>) -> std::result::Result<(), String> {
     if max_tool_calls.is_some() {
         return Err(
-            "`max_tool_calls` is not supported in this inference-only build; enforce tool-call limits in talupi"
+            "`max_tool_calls` is not supported in this inference-only build; enforce tool-call limits in the client"
                 .to_string(),
         );
     }
@@ -3579,7 +3464,7 @@ fn validate_parallel_tool_calls(
 ) -> std::result::Result<(), String> {
     if parallel_tool_calls.is_some() {
         return Err(
-            "`parallel_tool_calls` is not supported in this inference-only build; enforce parallel tool execution in talupi".to_string(),
+            "`parallel_tool_calls` is not supported in this inference-only build; enforce parallel tool execution in the client".to_string(),
         );
     }
     Ok(())

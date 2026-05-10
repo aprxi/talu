@@ -1,6 +1,5 @@
 mod chaining;
 mod errors;
-mod files;
 mod openapi_contract;
 mod openapi_item_variants;
 mod openapi_nested_contract;

@@ -8,6 +8,7 @@ use std::io::IsTerminal;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zip::write::SimpleFileOptions;
 
 use talu::error::last_error_message;
@@ -18,6 +19,8 @@ use crate::provider::create_backend_for_model;
 use super::ask::{latest_visible_text, DEFAULT_SYSTEM_MESSAGE};
 use super::repo::{resolve_model_for_inference, resolve_model_path};
 use super::XrayArgs;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -2919,7 +2922,7 @@ fn default_dev_reference_path_for_inputs(
     reference_backend: &str,
     capture_mode: ReferenceCaptureMode,
 ) -> Result<PathBuf> {
-    let home = dirs::home_dir()
+    let home = crate::config::user_home_dir()
         .ok_or_else(|| anyhow!("failed to resolve home directory for xray dev cache path"))?;
     let dir = home.join(".cache").join("talu").join("dev");
     std::fs::create_dir_all(&dir)?;
@@ -4060,15 +4063,22 @@ fn run_command_capture_to_temp_files(
     command: &mut Command,
     context: &str,
 ) -> Result<(std::process::ExitStatus, String, String)> {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
     let stdout_path = std::env::temp_dir().join(format!(
-        "talu_xray_{}_{}_stdout.log",
+        "talu_xray_{}_{}_{}_stdout.log",
         std::process::id(),
-        uuid::Uuid::new_v4()
+        timestamp,
+        counter
     ));
     let stderr_path = std::env::temp_dir().join(format!(
-        "talu_xray_{}_{}_stderr.log",
+        "talu_xray_{}_{}_{}_stderr.log",
         std::process::id(),
-        uuid::Uuid::new_v4()
+        timestamp,
+        counter
     ));
     let stdout_writer = std::fs::OpenOptions::new()
         .write(true)
@@ -5487,9 +5497,6 @@ mod tests {
             }
         );
     }
-
-    // Note: Generation config policy tests were removed because policy is now
-    // core-owned. See core/src/capi/session.zig for the policy tests.
 
     #[test]
     fn write_filtered_reference_json_keeps_only_exact_target_checkpoint() {

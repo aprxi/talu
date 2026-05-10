@@ -26,6 +26,7 @@ pub mod responses_types;
 pub mod state;
 pub mod tenant;
 pub mod tokenizer;
+mod url_codec;
 pub mod vision;
 
 #[cfg(windows)]

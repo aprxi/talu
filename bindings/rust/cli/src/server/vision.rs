@@ -1,40 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use once_cell::sync::Lazy;
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use talu::{router, ChatHandle};
 
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 pub const VISION_PROFILE_VERSION: &str = "2026-04-17";
 pub const RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE: &str =
-    "input_image requires external vision preprocessing; set TALU_FILE_HOST/TALUPI_HOST or provide input_image.prepared";
-const DOCUMENT_MAX_PIXELS_DEFAULT: u64 = 640 * 640;
-const DOCUMENT_MIN_TOKENS_DEFAULT: u64 = 64;
-
-#[derive(Debug, Serialize)]
-struct PrepareVisionRequest {
-    model_profile: PrepareVisionModelProfile,
-    inputs: Vec<PrepareVisionInput>,
-    output: PrepareVisionOutput,
-}
-
-#[derive(Debug, Serialize)]
-struct PrepareVisionInput {
-    input_id: String,
-    source: PrepareVisionSource,
-}
-
-#[derive(Debug, Serialize)]
-struct PrepareVisionSource {
-    #[serde(rename = "type")]
-    source_type: String,
-    file_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pdf_page: Option<u32>,
-}
+    "input_image requires prepared vision input; raw image preprocessing is not served by talu";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PrepareVisionModelProfile {
@@ -64,19 +37,6 @@ struct PrepareVisionRgb {
     r: u8,
     g: u8,
     b: u8,
-}
-
-#[derive(Debug, Serialize)]
-struct PrepareVisionOutput {
-    tensor_encoding: &'static str,
-    layout: &'static str,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PrepareVisionResponse {
-    object: String,
-    items: Vec<PreparedImage>,
-    total_token_count: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,11 +70,6 @@ struct PreparedImageEnvelope {
     item: PreparedImage,
 }
 
-#[derive(Debug, Deserialize)]
-struct FileUploadResponse {
-    id: String,
-}
-
 impl Default for PrepareVisionModelProfile {
     fn default() -> Self {
         Self {
@@ -129,25 +84,6 @@ impl Default for PrepareVisionModelProfile {
             alpha_background: None,
         }
     }
-}
-
-fn normalize_host(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        Some(trimmed.to_string())
-    } else {
-        Some(format!("http://{trimmed}"))
-    }
-}
-
-pub fn file_host_from_env() -> Option<String> {
-    std::env::var("TALU_FILE_HOST")
-        .ok()
-        .or_else(|| std::env::var("TALUPI_HOST").ok())
-        .and_then(|raw| normalize_host(&raw))
 }
 
 pub fn payload_may_include_images(input_json: Option<&str>, prev_json: Option<&str>) -> bool {
@@ -381,111 +317,22 @@ fn prepare_vision_prefill_from_urls(
     model_id: &str,
     image_urls: Vec<String>,
 ) -> Result<Option<router::VisionPrefillInput>> {
+    let _ = model_id;
     if image_urls.is_empty() {
         return Ok(None);
     }
 
-    let host = file_host_from_env();
-    if host.is_none() {
-        for image_url in &image_urls {
-            let source = classify_input_image_source(image_url)?;
-            if matches!(source, ImageSourceKind::DataUrl) {
-                validate_input_image_without_file_host(image_url, source)?;
-            }
-        }
-        return Err(anyhow!(RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE));
+    for image_url in &image_urls {
+        validate_raw_image_source(image_url)?;
     }
-    let host = host.expect("host checked as Some");
-    let prepare_url = format!("{host}/v1/image/prepare");
-    let image_token_id = image_token_id_from_env()
-        .or_else(|| image_token_id_for_model(model_id))
-        .ok_or_else(|| {
-            anyhow!(
-                "vision prepare requires image_token_id; set TALU_IMAGE_TOKEN_ID or provide model config with image_token_id"
-            )
-        })?;
-    let mut model_profile = vision_profile_for_model(model_id);
-    let inputs = image_urls
-        .into_iter()
-        .enumerate()
-        .map(|(index, image_url)| build_prepare_input_from_image_url(&host, index, &image_url))
-        .collect::<Result<Vec<_>>>()?;
-    apply_document_resize_defaults(&mut model_profile, &inputs);
-
-    let payload = PrepareVisionRequest {
-        model_profile: model_profile.clone(),
-        inputs,
-        output: PrepareVisionOutput {
-            tensor_encoding: "f32le_base64",
-            layout: "cthw",
-        },
-    };
-    let payload_json =
-        serde_json::to_vec(&payload).context("encode vision prepare request JSON")?;
-
-    let response = HTTP_CLIENT
-        .post(&prepare_url)
-        .header("content-type", "application/json")
-        .body(payload_json)
-        .send()
-        .with_context(|| format!("POST {prepare_url}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .context("read vision prepare response body")?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "vision prepare failed: POST {prepare_url} -> {status}; body={body}"
-        ));
-    }
-
-    let parsed: PrepareVisionResponse =
-        serde_json::from_str(&body).context("decode vision prepare response JSON")?;
-    if parsed.object.trim().is_empty() {
-        return Err(anyhow!("vision prepare response missing object"));
-    }
-    if parsed.total_token_count == 0 {
-        return Err(anyhow!(
-            "vision prepare response contains zero total_token_count"
-        ));
-    }
-
-    let mut images = Vec::with_capacity(parsed.items.len());
-    for img in parsed.items {
-        if img.width == 0 || img.height == 0 {
-            return Err(anyhow!("vision prepare response contains zero-sized image"));
-        }
-        if img.token_count == 0 {
-            return Err(anyhow!("vision prepare response contains zero token_count"));
-        }
-        validate_prepared_image_shape(&img, &model_profile, model_id, &host)?;
-        let pixels = decode_f32_base64(&img.tensor_b64)?;
-        images.push(router::VisionPrefillImage {
-            pixels,
-            width: img.width,
-            height: img.height,
-            grid_temporal: img.grid.temporal,
-            grid_height: img.grid.height,
-            grid_width: img.grid.width,
-            token_count: img.token_count,
-        });
-    }
-
-    Ok(Some(router::VisionPrefillInput {
-        image_token_id,
-        images,
-    }))
+    Err(anyhow!(RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE))
 }
 
 fn image_token_id_from_env() -> Option<u32> {
-    const KEYS: [&str; 2] = ["TALU_IMAGE_TOKEN_ID", "TALUPI_IMAGE_TOKEN_ID"];
-    for key in KEYS {
-        if let Ok(raw) = std::env::var(key) {
-            if let Ok(parsed) = raw.trim().parse::<u32>() {
-                if parsed > 0 {
-                    return Some(parsed);
-                }
+    if let Ok(raw) = std::env::var("TALU_IMAGE_TOKEN_ID") {
+        if let Ok(parsed) = raw.trim().parse::<u32>() {
+            if parsed > 0 {
+                return Some(parsed);
             }
         }
     }
@@ -780,50 +627,6 @@ fn normalize_temporal_profile(profile: &mut PrepareVisionModelProfile) {
     }
 }
 
-fn apply_document_resize_defaults(
-    profile: &mut PrepareVisionModelProfile,
-    inputs: &[PrepareVisionInput],
-) {
-    if !inputs.iter().any(is_document_prepare_input) {
-        return;
-    }
-
-    let factor = profile
-        .patch_size
-        .max(1)
-        .saturating_mul(profile.spatial_merge_size.max(1))
-        .max(1);
-    let step_pixels = checked_square_u64(factor).unwrap_or(1);
-    let default_min_pixels = step_pixels
-        .saturating_mul(DOCUMENT_MIN_TOKENS_DEFAULT)
-        .max(1);
-
-    match profile.smart_resize.as_mut() {
-        Some(smart) => {
-            smart.factor = factor;
-            smart.max_pixels = smart.max_pixels.min(DOCUMENT_MAX_PIXELS_DEFAULT);
-            if smart.min_pixels == 0 {
-                smart.min_pixels = default_min_pixels;
-            }
-            if smart.max_pixels < smart.min_pixels {
-                smart.max_pixels = smart.min_pixels;
-            }
-        }
-        None => {
-            let min_pixels = default_min_pixels.min(DOCUMENT_MAX_PIXELS_DEFAULT);
-            profile.smart_resize = Some(PrepareVisionSmartResize {
-                factor,
-                min_pixels,
-                max_pixels: DOCUMENT_MAX_PIXELS_DEFAULT.max(min_pixels),
-            });
-        }
-    }
-}
-
-fn is_document_prepare_input(input: &PrepareVisionInput) -> bool {
-    input.source.pdf_page.is_some()
-}
-
 fn validate_prepared_image_shape(
     img: &PreparedImage,
     expected_profile: &PrepareVisionModelProfile,
@@ -1089,235 +892,22 @@ fn decode_f32_base64(value: &str) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-fn build_prepare_input_from_image_url(
-    host: &str,
-    index: usize,
-    image_url: &str,
-) -> Result<PrepareVisionInput> {
+fn validate_raw_image_source(image_url: &str) -> Result<()> {
     let trimmed = image_url.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("input_image URL cannot be empty"));
     }
-
-    if is_likely_file_id(trimmed) {
-        return Ok(PrepareVisionInput {
-            input_id: format!("input_{index}"),
-            source: PrepareVisionSource {
-                source_type: "file_id".to_string(),
-                file_id: trimmed.to_string(),
-                pdf_page: None,
-            },
-        });
-    }
-
-    let (bytes, mime) = resolve_image_url_to_bytes(trimmed)?;
-    let ext = extension_for_mime(&mime);
-    let filename = format!("input_{index}.{ext}");
-    let file_id = upload_file(host, &bytes, &mime, &filename)?;
-    let pdf_page = default_pdf_page_for_mime(&mime);
-
-    Ok(PrepareVisionInput {
-        input_id: format!("input_{index}"),
-        source: PrepareVisionSource {
-            source_type: "file_id".to_string(),
-            file_id,
-            pdf_page,
-        },
-    })
-}
-
-fn is_likely_file_id(value: &str) -> bool {
-    (value.starts_with("file_") || value.starts_with("file-")) && !value.contains("://")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImageSourceKind {
-    FileId,
-    DataUrl,
-    HttpUrl,
-}
-
-fn classify_input_image_source(image_url: &str) -> Result<ImageSourceKind> {
-    let trimmed = image_url.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("input_image URL cannot be empty"));
-    }
-    if is_likely_file_id(trimmed) {
-        return Ok(ImageSourceKind::FileId);
-    }
-    if trimmed.starts_with("data:") {
-        return Ok(ImageSourceKind::DataUrl);
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Ok(ImageSourceKind::HttpUrl);
+    if trimmed.starts_with("data:")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || ((trimmed.starts_with("file_") || trimmed.starts_with("file-"))
+            && !trimmed.contains("://"))
+    {
+        return Ok(());
     }
     Err(anyhow!(
         "unsupported input_image source: expected data URL, http(s) URL, or file id"
     ))
-}
-
-fn validate_input_image_without_file_host(image_url: &str, kind: ImageSourceKind) -> Result<()> {
-    match kind {
-        ImageSourceKind::FileId => Ok(()),
-        ImageSourceKind::DataUrl => {
-            let _ = parse_data_url(image_url)?;
-            Ok(())
-        }
-        ImageSourceKind::HttpUrl => Ok(()),
-    }
-}
-
-fn resolve_image_url_to_bytes(image_url: &str) -> Result<(Vec<u8>, String)> {
-    if image_url.starts_with("data:") {
-        return parse_data_url(image_url);
-    }
-
-    if image_url.starts_with("http://") || image_url.starts_with("https://") {
-        let response = HTTP_CLIENT
-            .get(image_url)
-            .send()
-            .with_context(|| format!("GET {image_url}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .unwrap_or_else(|_| "<unavailable>".to_string());
-            return Err(anyhow!(
-                "failed to fetch image URL {image_url}: {status}; body={body}"
-            ));
-        }
-        let mime = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or("application/octet-stream")
-                    .trim()
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let bytes = response
-            .bytes()
-            .context("read remote image bytes")?
-            .to_vec();
-        if bytes.is_empty() {
-            return Err(anyhow!("remote image URL returned empty body"));
-        }
-        return Ok((bytes, mime));
-    }
-
-    Err(anyhow!(
-        "unsupported input_image source: expected data URL, http(s) URL, or file id"
-    ))
-}
-
-fn parse_data_url(data_url: &str) -> Result<(Vec<u8>, String)> {
-    let payload = data_url
-        .strip_prefix("data:")
-        .ok_or_else(|| anyhow!("invalid data URL: missing data: prefix"))?;
-    let (meta, encoded) = payload
-        .split_once(',')
-        .ok_or_else(|| anyhow!("invalid data URL: missing comma separator"))?;
-    if !meta.contains(";base64") {
-        return Err(anyhow!(
-            "invalid data URL: only base64 payloads are supported"
-        ));
-    }
-    let mime = meta
-        .split(';')
-        .next()
-        .filter(|m| !m.is_empty())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .context("decode input_image data URL base64")?;
-    if bytes.is_empty() {
-        return Err(anyhow!("data URL payload is empty"));
-    }
-    Ok((bytes, mime))
-}
-
-fn extension_for_mime(mime: &str) -> &'static str {
-    match mime.trim().to_ascii_lowercase().as_str() {
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "application/pdf" => "pdf",
-        _ => "bin",
-    }
-}
-
-fn default_pdf_page_for_mime(mime: &str) -> Option<u32> {
-    if mime.trim().eq_ignore_ascii_case("application/pdf") {
-        Some(0)
-    } else {
-        None
-    }
-}
-
-fn upload_file(host: &str, bytes: &[u8], mime: &str, filename: &str) -> Result<String> {
-    let url = format!("{host}/v1/files");
-    let boundary = format!("----talu-vision-{}", std::process::id());
-    let safe_filename = sanitize_filename(filename);
-    let mut body = Vec::with_capacity(bytes.len() + 512);
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
-        format!(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
-            safe_filename
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(format!("Content-Type: {mime}\r\n\r\n").as_bytes());
-    body.extend_from_slice(bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-
-    let response = HTTP_CLIENT
-        .post(&url)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(body)
-        .send()
-        .with_context(|| format!("POST {url}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .context("read /v1/files upload response body")?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "file upload failed: POST {url} -> {status}; body={body}"
-        ));
-    }
-
-    let parsed: FileUploadResponse =
-        serde_json::from_str(&body).context("decode /v1/files upload response JSON")?;
-    if parsed.id.trim().is_empty() {
-        return Err(anyhow!("file upload response missing id"));
-    }
-    Ok(parsed.id)
-}
-
-fn sanitize_filename(filename: &str) -> String {
-    let mut out = String::with_capacity(filename.len());
-    for ch in filename.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "upload.bin".to_string()
-    } else {
-        out
-    }
 }
 
 #[cfg(test)]
@@ -1328,65 +918,26 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn file_host_from_env_trims_trailing_slash() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::set_var("TALU_FILE_HOST", " http://localhost:8259/ ");
-        std::env::remove_var("TALUPI_HOST");
-        assert_eq!(
-            file_host_from_env().as_deref(),
-            Some("http://localhost:8259")
-        );
-        std::env::remove_var("TALU_FILE_HOST");
-    }
-
-    #[test]
-    fn file_host_from_env_adds_http_scheme_when_missing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::set_var("TALU_FILE_HOST", " localhost:7258 ");
-        std::env::remove_var("TALUPI_HOST");
-        assert_eq!(
-            file_host_from_env().as_deref(),
-            Some("http://localhost:7258")
-        );
-        std::env::remove_var("TALU_FILE_HOST");
-    }
-
-    #[test]
-    fn prepare_vision_prefill_from_urls_without_file_host_requires_external_preprocessing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::remove_var("TALU_FILE_HOST");
-        std::env::remove_var("TALUPI_HOST");
+    fn prepare_vision_prefill_from_urls_requires_prepared_input() {
         let data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jx9QAAAAASUVORK5CYII=";
         let err = prepare_vision_prefill_from_urls("test-model", vec![data_url.to_string()])
-            .expect_err("raw image without file host must fail");
+            .expect_err("raw image must fail");
         assert_eq!(err.to_string(), RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE);
     }
 
     #[test]
-    fn prepare_vision_prefill_from_urls_without_file_host_rejects_file_id() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::remove_var("TALU_FILE_HOST");
-        std::env::remove_var("TALUPI_HOST");
+    fn prepare_vision_prefill_from_urls_rejects_file_id() {
         let err = prepare_vision_prefill_from_urls("test-model", vec!["file_abc".to_string()])
-            .expect_err("file id must require file host");
+            .expect_err("file id must fail");
         assert_eq!(err.to_string(), RAW_IMAGE_PREPROCESS_REQUIRED_MESSAGE);
     }
 
     #[test]
-    fn classify_input_image_source_supports_data_http_and_file_id() {
-        assert_eq!(
-            classify_input_image_source("file_abc").expect("file id"),
-            ImageSourceKind::FileId
-        );
-        assert_eq!(
-            classify_input_image_source("https://example.com/x.png").expect("http"),
-            ImageSourceKind::HttpUrl
-        );
-        assert_eq!(
-            classify_input_image_source("data:image/png;base64,AA==").expect("data"),
-            ImageSourceKind::DataUrl
-        );
-        let err = classify_input_image_source("relative/path.png").expect_err("invalid");
+    fn validate_raw_image_source_accepts_data_http_and_file_id() {
+        validate_raw_image_source("file_abc").expect("file id");
+        validate_raw_image_source("https://example.com/x.png").expect("http");
+        validate_raw_image_source("data:image/png;base64,AA==").expect("data");
+        let err = validate_raw_image_source("relative/path.png").expect_err("invalid");
         assert!(
             err.to_string().contains("unsupported input_image source"),
             "unexpected error: {err}"
@@ -1426,25 +977,6 @@ mod tests {
     fn vision_patch_size_from_config_json_reads_nested_key() {
         let json = r#"{"vision_config":{"patch_size":32}}"#;
         assert_eq!(vision_patch_size_from_config_json(json), Some(32));
-    }
-
-    #[test]
-    fn parse_data_url_png_base64() {
-        let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G'];
-        let data_url = format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes.clone())
-        );
-        let (decoded, mime) = parse_data_url(&data_url).expect("decode data URL");
-        assert_eq!(mime, "image/png");
-        assert_eq!(decoded, bytes);
-    }
-
-    #[test]
-    fn default_pdf_page_for_mime_sets_first_page_for_pdf() {
-        assert_eq!(default_pdf_page_for_mime("application/pdf"), Some(0));
-        assert_eq!(default_pdf_page_for_mime(" application/pdf "), Some(0));
-        assert_eq!(default_pdf_page_for_mime("image/png"), None);
     }
 
     #[test]
@@ -1508,104 +1040,6 @@ mod tests {
         );
         assert_eq!(profile.temporal_patch_size, 2);
         assert_eq!(profile.temporal_frames, 2);
-    }
-
-    #[test]
-    fn apply_document_resize_defaults_caps_existing_profile_for_pdf_inputs() {
-        let mut profile = PrepareVisionModelProfile {
-            version: VISION_PROFILE_VERSION.to_string(),
-            normalize: "minus_one_to_one".to_string(),
-            temporal_frames: 2,
-            patch_size: 16,
-            temporal_patch_size: 2,
-            spatial_merge_size: 2,
-            smart_resize: Some(PrepareVisionSmartResize {
-                factor: 1,
-                min_pixels: 65_536,
-                max_pixels: 16_777_216,
-            }),
-            alpha_mode: None,
-            alpha_background: None,
-        };
-        let inputs = vec![PrepareVisionInput {
-            input_id: "input_0".to_string(),
-            source: PrepareVisionSource {
-                source_type: "file_id".to_string(),
-                file_id: "file_x".to_string(),
-                pdf_page: Some(0),
-            },
-        }];
-
-        apply_document_resize_defaults(&mut profile, &inputs);
-
-        let smart = profile.smart_resize.expect("smart resize");
-        assert_eq!(smart.factor, 32);
-        assert_eq!(smart.min_pixels, 65_536);
-        assert_eq!(smart.max_pixels, DOCUMENT_MAX_PIXELS_DEFAULT);
-    }
-
-    #[test]
-    fn apply_document_resize_defaults_sets_smart_resize_when_missing_for_pdf_inputs() {
-        let mut profile = PrepareVisionModelProfile {
-            version: VISION_PROFILE_VERSION.to_string(),
-            normalize: "minus_one_to_one".to_string(),
-            temporal_frames: 1,
-            patch_size: 16,
-            temporal_patch_size: 1,
-            spatial_merge_size: 2,
-            smart_resize: None,
-            alpha_mode: None,
-            alpha_background: None,
-        };
-        let inputs = vec![PrepareVisionInput {
-            input_id: "input_0".to_string(),
-            source: PrepareVisionSource {
-                source_type: "file_id".to_string(),
-                file_id: "file_x".to_string(),
-                pdf_page: Some(0),
-            },
-        }];
-
-        apply_document_resize_defaults(&mut profile, &inputs);
-
-        let smart = profile.smart_resize.expect("smart resize");
-        assert_eq!(smart.factor, 32);
-        assert_eq!(smart.min_pixels, 65_536);
-        assert_eq!(smart.max_pixels, DOCUMENT_MAX_PIXELS_DEFAULT);
-    }
-
-    #[test]
-    fn apply_document_resize_defaults_is_noop_for_non_document_inputs() {
-        let mut profile = PrepareVisionModelProfile {
-            version: VISION_PROFILE_VERSION.to_string(),
-            normalize: "minus_one_to_one".to_string(),
-            temporal_frames: 1,
-            patch_size: 16,
-            temporal_patch_size: 1,
-            spatial_merge_size: 2,
-            smart_resize: Some(PrepareVisionSmartResize {
-                factor: 32,
-                min_pixels: 65_536,
-                max_pixels: 2_000_000,
-            }),
-            alpha_mode: None,
-            alpha_background: None,
-        };
-        let inputs = vec![PrepareVisionInput {
-            input_id: "input_0".to_string(),
-            source: PrepareVisionSource {
-                source_type: "file_id".to_string(),
-                file_id: "file_x".to_string(),
-                pdf_page: None,
-            },
-        }];
-
-        apply_document_resize_defaults(&mut profile, &inputs);
-
-        let smart = profile.smart_resize.expect("smart resize");
-        assert_eq!(smart.factor, 32);
-        assert_eq!(smart.min_pixels, 65_536);
-        assert_eq!(smart.max_pixels, 2_000_000);
     }
 
     #[test]

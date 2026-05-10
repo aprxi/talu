@@ -13,36 +13,20 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 talu = { path = "../talu" }
-talu-sys = { path = "../talu-sys" }
 anyhow.workspace = true
 clap = { version = "4.5", features = ["derive", "env"] }
 indicatif = "0.18.3"
 bytes = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "sync", "signal", "macros"] }
 tokio-stream = "0.1"
-multer = "3"
-tower-service = "0.3"
-regress = "0.10"
-once_cell = "1"
 utoipa = "5"
-getrandom = "0.3"
-uuid = { version = "1", features = ["v4"] }
-dirs = "6"
 toml = "0.9"
-ratatui = { version = "0.29", features = ["crossterm"] }
-crossterm = "0.28"
-# Proxy endpoint (plugin outbound HTTP)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
-url = "2"
-percent-encoding = "2"
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"

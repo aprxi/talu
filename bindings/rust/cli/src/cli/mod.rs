@@ -3,7 +3,6 @@ mod convert;
 mod eval;
 mod models;
 mod repo;
-mod talupi_sessions;
 mod util;
 mod xray;
 
@@ -55,7 +54,7 @@ pub(super) struct Cli {
 pub(super) enum Commands {
     /// Show help
     Help,
-    /// Chat (new session)
+    /// Ask the local inference engine
     Ask(AskArgs),
     /// Run the HTTP server
     Serve(ServerArgs),
@@ -75,13 +74,14 @@ pub(super) enum Commands {
     Xray(XrayArgs),
     /// Evaluate model quality metrics
     Eval(EvalArgs),
-    /// Set default model (interactive picker or explicit)
+    /// Set or show the default model
     Set(SetArgs),
 }
 
 #[derive(Args)]
 pub(super) struct SetArgs {
     /// Model ID to set as default, or "show" to display config
+    #[arg(required_unless_present = "model_uri")]
     pub model: Option<String>,
 
     /// Set default model URI and print it only (script-friendly)
@@ -144,25 +144,9 @@ pub(super) struct AskArgs {
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
-    /// Create a new session and output its UUID (no prompt allowed)
-    #[arg(long)]
-    pub new: bool,
-
-    /// Create a new session and output its ID only (requires prompt)
-    #[arg(long = "session-id")]
-    pub session_id_only: bool,
-
-    /// Append to an existing session (UUID or prefix)
-    #[arg(long)]
-    pub session: Option<String>,
-
     /// No stdout output (errors still go to stderr)
     #[arg(short = 's', long)]
     pub silent: bool,
-
-    /// Delete an existing session (requires --session)
-    #[arg(long)]
-    pub delete: bool,
 
     /// Output format (json only)
     #[arg(long, value_enum)]
@@ -594,21 +578,7 @@ fn cmd_set(args: SetArgs) -> Result<()> {
             eprintln!();
             Ok(())
         }
-        // talu set — interactive picker
-        None => {
-            match crate::model_selector::run_interactive_selector()? {
-                Some(model) => {
-                    eprintln!();
-                    eprintln!(
-                        "  \x1b[1;32m✓\x1b[0m  Default model set to \x1b[1;37m{}\x1b[0m",
-                        model
-                    );
-                    eprintln!();
-                }
-                None => eprintln!("No changes."),
-            }
-            Ok(())
-        }
+        None => bail!("Error: specify a model, --model-uri, or 'show'."),
     }
 }
 
@@ -690,50 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_ask_with_session_target() {
-        let cli =
-            parse(&["talu", "ask", "--session", "abc123", "hello"]).expect("parse should succeed");
-
-        match cli.command {
-            Some(Commands::Ask(args)) => {
-                assert_eq!(args.session.as_deref(), Some("abc123"));
-                assert_eq!(args.prompt, vec!["hello"]);
-            }
-            _ => panic!("expected ask command"),
-        }
-    }
-
-    #[test]
     fn reject_removed_ask_flags() {
         assert!(parse(&["talu", "ask", "-r", "1"]).is_err());
-    }
-
-    #[test]
-    fn parse_ask_delete_with_session() {
-        let cli = parse(&["talu", "ask", "--session", "abc123", "--delete"])
-            .expect("parse should succeed");
-
-        match cli.command {
-            Some(Commands::Ask(args)) => {
-                assert_eq!(args.session.as_deref(), Some("abc123"));
-                assert!(args.delete);
-                assert!(args.prompt.is_empty());
-            }
-            _ => panic!("expected ask command"),
-        }
-    }
-
-    #[test]
-    fn parse_ask_session_id_flag() {
-        let cli = parse(&["talu", "ask", "--session-id", "hello"]).expect("parse should succeed");
-
-        match cli.command {
-            Some(Commands::Ask(args)) => {
-                assert!(args.session_id_only);
-                assert_eq!(args.prompt, vec!["hello"]);
-            }
-            _ => panic!("expected ask command"),
-        }
+        assert!(parse(&["talu", "ask", "--delete", "hello"]).is_err());
+        assert!(parse(&["talu", "ask", "--new"]).is_err());
     }
 
     #[test]
@@ -832,6 +762,24 @@ mod tests {
             Some(Commands::Set(args)) => {
                 assert_eq!(args.model_uri.as_deref(), Some("Qwen/Qwen3-0.6B"));
                 assert!(args.model.is_none());
+            }
+            _ => panic!("expected set command"),
+        }
+    }
+
+    #[test]
+    fn parse_set_requires_model_or_model_uri() {
+        assert!(parse(&["talu", "set"]).is_err());
+    }
+
+    #[test]
+    fn parse_set_show_command() {
+        let cli = parse(&["talu", "set", "show"]).expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Set(args)) => {
+                assert_eq!(args.model.as_deref(), Some("show"));
+                assert!(args.model_uri.is_none());
             }
             _ => panic!("expected set command"),
         }

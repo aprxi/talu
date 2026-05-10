@@ -20,6 +20,7 @@ use utoipa::ToSchema;
 use crate::quant_scheme as quant_scheme_display;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
+use crate::server::url_codec::parse_query_pairs;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 /// A cached model entry returned by the list endpoint.
@@ -196,14 +197,7 @@ pub async fn handle_list(
     _auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let uri = req.uri().clone();
-    let params: Vec<(String, String)> = uri
-        .query()
-        .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .into_owned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let params = parse_query_pairs(uri.query());
 
     let source_filter: Option<String> = params
         .iter()
@@ -538,14 +532,7 @@ pub async fn handle_search(
     _auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let uri = req.uri().clone();
-    let params: Vec<(String, String)> = uri
-        .query()
-        .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .into_owned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let params = parse_query_pairs(uri.query());
 
     let query = params
         .iter()
@@ -862,14 +849,7 @@ pub async fn handle_list_files(
     }
 
     let uri = req.uri().clone();
-    let params: Vec<(String, String)> = uri
-        .query()
-        .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .into_owned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let params = parse_query_pairs(uri.query());
 
     let token: Option<String> = params
         .iter()

@@ -1,10 +1,8 @@
 use std::env;
 use std::io::{self, Read, Write};
 
-use anyhow::{anyhow, bail, Context, Result};
-use base64::Engine;
+use anyhow::{anyhow, bail, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use serde_json::json;
 use talu::responses::ResponsesView;
 
 use talu::error::last_error_message;
@@ -14,7 +12,6 @@ use crate::provider::ensure_local_model_target;
 use crate::server::vision;
 
 use super::repo::{resolve_model_for_inference, UnifiedProgressCtx};
-use super::talupi_sessions::{self, SessionRecord, UpsertSessionRequest};
 use super::util::DEFAULT_MAX_TOKENS;
 use super::{AskArgs, AskOutputFormat};
 
@@ -257,22 +254,6 @@ fn trim_trailing_stdin_whitespace(bytes: &mut Vec<u8>) {
     }
 }
 
-fn sniff_stdin_mime(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
-        return "image/png";
-    }
-    if bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff {
-        return "image/jpeg";
-    }
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return "image/webp";
-    }
-    if bytes.starts_with(b"%PDF-") {
-        return "application/pdf";
-    }
-    "application/octet-stream"
-}
-
 fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
     if stdin_buf.is_empty() {
         return Ok(ParsedStdin {
@@ -284,25 +265,7 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
 
     let is_binary = stdin_buf.contains(&0) || std::str::from_utf8(&stdin_buf).is_err();
     if is_binary {
-        if vision::file_host_from_env().is_none() {
-            bail!(
-                "Error: binary stdin input is not supported in this build without TALU_FILE_HOST."
-            );
-        }
-        let mime = sniff_stdin_mime(&stdin_buf);
-        let data_url = format!(
-            "data:{};base64,{}",
-            mime,
-            base64::engine::general_purpose::STANDARD.encode(&stdin_buf)
-        );
-        return Ok(ParsedStdin {
-            text: None,
-            images: vec![talu::router::ContentPart::ImageUrl {
-                url: data_url,
-                mime: Some(mime.to_string()),
-            }],
-            prepared_stdin_json: None,
-        });
+        bail!("Error: binary stdin input is not supported; provide prepared vision JSON instead.");
     }
 
     trim_trailing_stdin_whitespace(&mut stdin_buf);
@@ -329,126 +292,12 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
     })
 }
 
-#[derive(Debug, Clone)]
-struct SessionCtx {
-    db_host: String,
-    session_id: String,
-    existing: Option<SessionRecord>,
-}
-
-fn conversation_title_from_prompt(prompt: &str) -> Option<String> {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.chars().take(80).collect())
-}
-
-fn default_metadata_object(metadata: &serde_json::Value) -> serde_json::Value {
-    if metadata.is_object() {
-        metadata.clone()
-    } else {
-        json!({})
-    }
-}
-
-fn load_session_history(chat: &ChatHandle, session: Option<&SessionCtx>) -> Result<()> {
-    if let Some(sess) = session {
-        if !sess
-            .existing
-            .as_ref()
-            .map_or(true, |s| s.responses_json.trim().is_empty())
-        {
-            if let Some(existing) = sess.existing.as_ref() {
-                chat.load_responses_json(&existing.responses_json)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn persist_session(
-    chat: &ChatHandle,
-    session: &SessionCtx,
-    model_id: &str,
-    system_msg: &str,
-    prompt: &str,
-) -> Result<()> {
-    let responses_json = chat.to_responses_json(1)?;
-    let existing = session.existing.as_ref();
-    let metadata = existing
-        .map(|s| default_metadata_object(&s.metadata))
-        .unwrap_or_else(|| json!({}));
-    let title = existing
-        .and_then(|s| s.title.clone())
-        .or_else(|| conversation_title_from_prompt(prompt));
-    let req = UpsertSessionRequest {
-        session_id: session.session_id.clone(),
-        responses_json,
-        model: existing
-            .and_then(|s| s.model.clone())
-            .or_else(|| Some(model_id.to_string())),
-        title,
-        system_prompt: existing.and_then(|s| s.system_prompt.clone()).or_else(|| {
-            if system_msg.is_empty() {
-                None
-            } else {
-                Some(system_msg.to_string())
-            }
-        }),
-        metadata,
-        project_id: existing.and_then(|s| s.project_id.clone()),
-        marker: existing
-            .and_then(|s| s.marker.clone())
-            .or_else(|| Some("active".to_string())),
-        parent_session_id: existing.and_then(|s| s.parent_session_id.clone()),
-    };
-    talupi_sessions::upsert_session(&session.db_host, &req)
-}
-
-fn message_role_label(role: talu::responses::MessageRole) -> &'static str {
-    match role {
-        talu::responses::MessageRole::System => "system",
-        talu::responses::MessageRole::User => "user",
-        talu::responses::MessageRole::Assistant => "assistant",
-        talu::responses::MessageRole::Developer => "developer",
-        _ => "unknown",
-    }
-}
-
-fn format_session_transcript(session: &SessionRecord, include_reasoning: bool) -> Result<String> {
-    let chat = ChatHandle::new(None)?;
-    chat.load_responses_json(&session.responses_json)?;
-    let conv = chat.responses();
-    let mut lines = Vec::new();
-    for index in 0..conv.item_count() {
-        let item_type = conv.item_type(index);
-        if item_type == talu::responses::ItemType::Message {
-            let msg = conv.get_message(index)?;
-            let text = conv.message_text(index)?;
-            if !text.trim().is_empty() {
-                lines.push(format!("{}: {}", message_role_label(msg.role), text));
-            }
-        } else if include_reasoning && item_type == talu::responses::ItemType::Reasoning {
-            let text = reasoning_text_for_item(&conv, index)?;
-            if !text.trim().is_empty() {
-                lines.push(format!("assistant_reasoning: {}", text));
-            }
-        }
-    }
-    if lines.is_empty() {
-        Ok(String::new())
-    } else {
-        Ok(lines.join("\n"))
-    }
-}
-
 /// Chat: one-shot generation (stateless).
 pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Result<()> {
     let no_chat = args.no_chat;
     let use_json = args.format == Some(AskOutputFormat::Json);
     let quiet = args.quiet && !use_json;
-    let mut silent = args.silent;
+    let silent = args.silent;
     let raw_output = args.raw;
     let hide_thinking = args.hide_thinking;
     let mut system_msg = args.system.clone();
@@ -457,113 +306,10 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
     let mut stdin_image_parts: Vec<talu::router::ContentPart> = Vec::new();
     let mut stdin_prepared_payload_json: Option<String> = None;
     let seed = args.seed.unwrap_or(0);
-    let session_env = env::var("SESSION_ID").ok().filter(|s| !s.is_empty());
-    let session_target = args.session.clone().or(session_env);
-    let db_host = talupi_sessions::db_host_from_env();
-    let mut preloaded_stdin: Option<Vec<u8>> = None;
     let output_path = args.output.clone();
 
     if silent && args.quiet {
         bail!("Error: cannot specify both --quiet and --silent.");
-    }
-    if args.session_id_only && session_target.is_some() {
-        bail!("Error: --session-id cannot be combined with --session or SESSION_ID.");
-    }
-    if args.new {
-        if !args.prompt.is_empty() {
-            bail!("Error: --new does not accept a prompt.");
-        }
-        let db_host = db_host.ok_or_else(|| {
-            anyhow!("Error: --new requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258).")
-        })?;
-        let session_id = format!("sess_{}", uuid::Uuid::new_v4().hyphenated());
-        let req = UpsertSessionRequest {
-            session_id: session_id.clone(),
-            responses_json: "[]".to_string(),
-            model: args.model.clone().or_else(crate::config::get_default_model),
-            title: None,
-            system_prompt: if no_chat {
-                None
-            } else {
-                Some(system_msg.clone())
-            },
-            metadata: json!({}),
-            project_id: None,
-            marker: Some("active".to_string()),
-            parent_session_id: None,
-        };
-        talupi_sessions::upsert_session(&db_host, &req)?;
-        if let Some(path) = &output_path {
-            std::fs::write(path, format!("{session_id}\n"))?;
-        } else if !silent {
-            println!("{session_id}");
-        }
-        return Ok(());
-    }
-    if args.delete {
-        let target = session_target
-            .as_deref()
-            .ok_or_else(|| anyhow!("Error: --delete requires --session or SESSION_ID."))?;
-        let db_host = db_host.ok_or_else(|| {
-            anyhow!("Error: --delete requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258).")
-        })?;
-        let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
-        talupi_sessions::delete_session(&db_host, &session_id)?;
-        return Ok(());
-    }
-    if let Some(target) = session_target.as_deref() {
-        if args.prompt.is_empty() && !args.session_id_only {
-            if stdin_is_pipe {
-                let mut probe = Vec::new();
-                io::stdin()
-                    .read_to_end(&mut probe)
-                    .context("read stdin for session dispatch")?;
-                if !probe.is_empty() {
-                    preloaded_stdin = Some(probe);
-                } else {
-                    let db_host = db_host.ok_or_else(|| {
-                        anyhow!(
-                            "Error: --session requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258)."
-                        )
-                    })?;
-                    let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
-                    let session = talupi_sessions::get_session(&db_host, &session_id)?;
-                    let output = if use_json {
-                        session.responses_json
-                    } else {
-                        format_session_transcript(&session, !hide_thinking)?
-                    };
-                    if let Some(path) = &output_path {
-                        std::fs::write(path, format!("{output}\n"))?;
-                    } else if !silent {
-                        println!("{output}");
-                    }
-                    return Ok(());
-                }
-            } else {
-                let db_host = db_host.ok_or_else(|| {
-                    anyhow!(
-                        "Error: --session requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258)."
-                    )
-                })?;
-                let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
-                let session = talupi_sessions::get_session(&db_host, &session_id)?;
-                let output = if use_json {
-                    session.responses_json
-                } else {
-                    format_session_transcript(&session, !hide_thinking)?
-                };
-                if let Some(path) = &output_path {
-                    std::fs::write(path, format!("{output}\n"))?;
-                } else if !silent {
-                    println!("{output}");
-                }
-                return Ok(());
-            }
-        }
-    }
-    if args.session_id_only {
-        silent = true;
     }
 
     let no_stream = args.no_stream || use_json || silent || output_path.is_some();
@@ -578,28 +324,14 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
         println!("{text}");
         Ok(())
     };
-    let emit_session_id = |session_id: &str| -> Result<()> {
-        if let Some(path) = &output_path {
-            std::fs::write(path, format!("{session_id}\n"))?;
-        } else {
-            println!("{session_id}");
-        }
-        Ok(())
-    };
 
     // --each-line: collect stdin lines as separate prompts for batched decode.
     let mut each_line_prompts: Vec<String> = Vec::new();
 
     if stdin_is_pipe {
-        let stdin_buf = if let Some(buf) = preloaded_stdin.take() {
-            buf
-        } else {
-            let mut buf = Vec::new();
-            if io::stdin().read_to_end(&mut buf).is_err() {
-                Vec::new()
-            } else {
-                buf
-            }
+        let mut stdin_buf = Vec::new();
+        if io::stdin().read_to_end(&mut stdin_buf).is_err() {
+            stdin_buf.clear();
         };
         if !stdin_buf.is_empty() {
             if args.each_line {
@@ -652,44 +384,6 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
         eprintln!("  MODEL_URI=Org/Model talu ask \"prompt\"  Use env var");
         return Ok(());
     };
-
-    let mut session_ctx: Option<SessionCtx> = None;
-    if let Some(target) = session_target.as_deref() {
-        let db_host = db_host.ok_or_else(|| {
-            anyhow!(
-                "Error: persistent sessions require TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258)."
-            )
-        })?;
-        let session_id = talupi_sessions::resolve_session_id(&db_host, target)?;
-        let existing = talupi_sessions::get_session(&db_host, &session_id)?;
-        if !no_chat
-            && system_msg == DEFAULT_SYSTEM_MESSAGE
-            && existing
-                .system_prompt
-                .as_deref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        {
-            system_msg = existing.system_prompt.clone().unwrap_or_default();
-        }
-        session_ctx = Some(SessionCtx {
-            db_host,
-            session_id,
-            existing: Some(existing),
-        });
-    } else if let Some(db_host) = db_host.clone() {
-        session_ctx = Some(SessionCtx {
-            db_host,
-            session_id: format!("sess_{}", uuid::Uuid::new_v4().hyphenated()),
-            existing: None,
-        });
-    }
-    if args.session_id_only && session_ctx.is_none() {
-        bail!("Error: --session-id requires TALU_DB_HOST (example: TALU_DB_HOST=localhost:7258).");
-    }
-    if session_ctx.is_some() && (args.each_line || args.completions > 1) {
-        bail!("Error: persistent session mode does not support --each-line or --completions > 1.");
-    }
 
     ensure_local_model_target(&model_arg)?;
 
@@ -749,7 +443,6 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
     } else {
         Some(system_msg.as_str())
     })?;
-    load_session_history(&chat, session_ctx.as_ref())?;
 
     let has_stdin_images = !stdin_image_parts.is_empty();
     let mut content = Vec::new();
@@ -1093,14 +786,6 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
             // Fallback to raw generation text if item reconstruction is unavailable.
             emit_output(&text)?;
         }
-        if let Some(ref session) = session_ctx {
-            persist_session(&chat, session, &model_arg, &system_msg, &prompt)?;
-            if args.session_id_only {
-                emit_session_id(&session.session_id)?;
-                return Ok(());
-            }
-        }
-
         if !quiet && !silent && !use_json && output_path.is_none() {
             let output_tok_per_sec = if result.generation_ns() > 0 {
                 (result.token_count() as f64) / (result.generation_ns() as f64 / 1_000_000_000.0)
@@ -1191,14 +876,6 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
                 emit_output(&text)?;
             }
         }
-        if let Some(ref session) = session_ctx {
-            persist_session(&chat, session, &model_arg, &system_msg, &prompt)?;
-            if args.session_id_only {
-                emit_session_id(&session.session_id)?;
-                return Ok(());
-            }
-        }
-
         // Print stats (cyan color)
         let stream_result = batch
             .take_result(request_id)
@@ -1232,11 +909,8 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, _verbose: u8) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
 
     const JPEG_MAGIC_AND_BINARY_TAIL: &[u8] = &[0xff, 0xd8, 0xff, 0x00];
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn parse_stdin_content_text_trims_trailing_whitespace() {
@@ -1247,63 +921,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_stdin_content_rejects_binary_image_bytes_without_file_host() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::remove_var("TALU_FILE_HOST");
-        std::env::remove_var("TALUPI_HOST");
+    fn parse_stdin_content_rejects_binary_image_bytes() {
         let err = parse_stdin_content(JPEG_MAGIC_AND_BINARY_TAIL.to_vec())
             .expect_err("binary image stdin should fail");
-        assert!(err.to_string().contains("without TALU_FILE_HOST"));
+        assert!(err
+            .to_string()
+            .contains("binary stdin input is not supported"));
     }
 
     #[test]
-    fn parse_stdin_content_rejects_binary_pdf_bytes_without_file_host() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::remove_var("TALU_FILE_HOST");
-        std::env::remove_var("TALUPI_HOST");
+    fn parse_stdin_content_rejects_binary_pdf_bytes() {
         // Include a non-UTF8 byte so stdin is treated as binary.
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n\xff";
         let err = parse_stdin_content(pdf.to_vec()).expect_err("binary pdf stdin should fail");
-        assert!(err.to_string().contains("without TALU_FILE_HOST"));
+        assert!(err
+            .to_string()
+            .contains("binary stdin input is not supported"));
     }
 
     #[test]
-    fn parse_stdin_content_rejects_binary_nul_data_without_file_host() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::remove_var("TALU_FILE_HOST");
-        std::env::remove_var("TALUPI_HOST");
+    fn parse_stdin_content_rejects_binary_nul_data() {
         let err = parse_stdin_content(vec![0, 1, 2, 3]).expect_err("binary stdin should fail");
-        assert!(err.to_string().contains("without TALU_FILE_HOST"));
+        assert!(err
+            .to_string()
+            .contains("binary stdin input is not supported"));
     }
 
     #[test]
-    fn parse_stdin_content_rejects_non_utf8_text_data_without_file_host() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::remove_var("TALU_FILE_HOST");
-        std::env::remove_var("TALUPI_HOST");
+    fn parse_stdin_content_rejects_non_utf8_text_data() {
         let err = parse_stdin_content(vec![0xf0, 0x28, 0x8c, 0x28])
             .expect_err("non-utf8 stdin should fail");
-        assert!(err.to_string().contains("without TALU_FILE_HOST"));
-    }
-
-    #[test]
-    fn parse_stdin_content_binary_image_with_file_host_builds_data_url() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::set_var("TALU_FILE_HOST", "http://localhost:7258");
-        std::env::remove_var("TALUPI_HOST");
-        let parsed =
-            parse_stdin_content(JPEG_MAGIC_AND_BINARY_TAIL.to_vec()).expect("parse jpeg stdin");
-        assert!(parsed.text.is_none());
-        assert_eq!(parsed.images.len(), 1);
-        assert!(parsed.prepared_stdin_json.is_none());
-        match &parsed.images[0] {
-            talu::router::ContentPart::ImageUrl { url, mime } => {
-                assert_eq!(mime.as_deref(), Some("image/jpeg"));
-                assert!(url.starts_with("data:image/jpeg;base64,"));
-            }
-            _ => panic!("expected image url content part"),
-        }
-        std::env::remove_var("TALU_FILE_HOST");
+        assert!(err
+            .to_string()
+            .contains("binary stdin input is not supported"));
     }
 
     #[test]

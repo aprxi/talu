@@ -1,5 +1,4 @@
 use std::env;
-use std::io::{self, BufRead};
 
 use anyhow::{anyhow, bail, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -333,36 +332,13 @@ pub(super) fn resolve_model_path(path: &str) -> Result<String> {
     talu::repo::resolve_model_path(path).map_err(|e| anyhow!("{}", e))
 }
 
-/// Read a line from /dev/tty (bypasses piped stdin).
-/// Returns None if no TTY is available.
-fn tty_read_line(prompt: &str) -> Option<String> {
-    // Unit tests must stay non-interactive and deterministic.
-    if cfg!(test) {
-        return None;
-    }
-    let tty = std::fs::File::open("/dev/tty").ok()?;
-    eprint!("{}", prompt);
-    let mut reader = io::BufReader::new(tty);
-    let mut answer = String::new();
-    reader.read_line(&mut answer).ok()?;
-    Some(answer)
-}
-
-/// Ask a yes/no question via TTY. Returns false if no TTY available.
-fn tty_confirm(prompt: &str) -> bool {
-    tty_read_line(prompt)
-        .map(|a| matches!(a.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
-        .unwrap_or(false)
-}
-
-/// Resolve a model argument for inference, prompting before download.
+/// Resolve a model argument for inference without interactive fallback.
 ///
 /// Resolution order:
 /// 1. Local filesystem path (exists on disk) → use directly
 /// 2. Talu local cache ($TALU_HOME/models/) → use cached path
 /// 3. HuggingFace cache → use cached path
-/// 4. Not a model ID (no org/name) → offer to search HuggingFace
-/// 5. Model ID not found locally → ask user for download permission
+/// 4. Missing model → fail with an explicit `talu get` instruction
 pub(super) fn resolve_model_for_inference(model_arg: &str) -> Result<String> {
     // If it exists as a local path, use it directly
     if path_exists(model_arg) {
@@ -374,53 +350,18 @@ pub(super) fn resolve_model_for_inference(model_arg: &str) -> Result<String> {
         return Ok(resolved);
     }
 
-    // Not cached anywhere — if it doesn't look like org/model, offer search
     if !is_model_id(model_arg) {
-        eprintln!("Model '{}' not found locally.", model_arg);
-        if !tty_confirm("Search HuggingFace? [y/N] ") {
-            bail!("Model not found: {}", model_arg);
-        }
-        let token = env::var("HF_TOKEN").ok();
-        let results = repo_search(model_arg, 5, token.as_deref())?;
-        if results.is_empty() {
-            bail!("No models found matching '{}'.", model_arg);
-        }
-        eprintln!("Found {} models:", results.len());
-        for (i, r) in results.iter().enumerate() {
-            eprintln!("  [{}] {}", i + 1, r);
-        }
-        let choice = tty_read_line("Enter number to download (or Enter to cancel): ");
-        let model_id = match choice {
-            Some(ref s) => {
-                let s = s.trim();
-                if s.is_empty() {
-                    bail!("Cancelled.");
-                }
-                let idx: usize = s.parse().map_err(|_| anyhow!("Invalid selection."))?;
-                if idx < 1 || idx > results.len() {
-                    bail!("Selection out of range.");
-                }
-                results[idx - 1].clone()
-            }
-            None => bail!("No TTY available for selection."),
-        };
-        eprintln!("Downloading '{}'...", model_id);
-        repo_fetch_with_progress(&model_id, false, None)?;
-        return resolve_model_path(&model_id);
-    }
-
-    eprintln!("Model '{}' not found locally.", model_arg);
-
-    if !tty_confirm("Download from HuggingFace? [y/N] ") {
         bail!(
-            "Model '{}' is not cached. Use 'talu get {}' to download it first.",
-            model_arg,
+            "Model '{}' was not found locally. Use 'talu ls' to inspect cached models or 'talu get <Org/Model>' to download a model.",
             model_arg
         );
     }
 
-    repo_fetch_with_progress(model_arg, false, None)?;
-    resolve_model_path(model_arg)
+    bail!(
+        "Model '{}' is not cached. Use 'talu get {}' to download it first.",
+        model_arg,
+        model_arg
+    );
 }
 
 /// Result type for cache path lookup - distinguishes "not cached" from errors.
@@ -520,8 +461,4 @@ pub(super) fn repo_list_models(
 
 pub(super) fn repo_list_files(model_path: &str, token: Option<&str>) -> Result<Vec<String>> {
     talu::repo::repo_list_files(model_path, token).map_err(|e| anyhow!("{}", e))
-}
-
-pub(super) fn repo_search(query: &str, limit: usize, token: Option<&str>) -> Result<Vec<String>> {
-    talu::repo::repo_search(query, limit, token).map_err(|e| anyhow!("{}", e))
 }

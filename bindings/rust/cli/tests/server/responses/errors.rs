@@ -93,14 +93,10 @@ fn responses_put_and_delete_not_supported() {
 }
 
 #[test]
-fn responses_rejects_raw_image_without_file_host() {
+fn responses_rejects_raw_image_without_prepared_input() {
     let model = require_model!();
     let mut cfg = model_config();
     cfg.model = Some(model.clone());
-    cfg.env_vars
-        .push(("TALU_FILE_HOST".to_string(), "".to_string()));
-    cfg.env_vars
-        .push(("TALUPI_HOST".to_string(), "".to_string()));
     let ctx = ServerTestContext::new(cfg);
     let body = serde_json::json!({
         "model": model,
@@ -123,8 +119,6 @@ fn responses_rejects_raw_image_without_file_host() {
     assert_eq!(json["error"]["code"].as_str(), Some("invalid_vision_input"));
     assert_eq!(
         json["error"]["message"].as_str(),
-        Some(
-            "input_image requires external vision preprocessing; set TALU_FILE_HOST/TALUPI_HOST or provide input_image.prepared"
-        )
+        Some("input_image requires prepared vision input; raw image preprocessing is not served by talu")
     );
 }

@@ -35,18 +35,7 @@ fn responses_rejects_non_spec_fields() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "input": "hello",
-        "session_id": "chat_only_field"
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-}
-
-#[test]
-fn responses_rejects_chat_only_prompt_id_field() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
-    let body = serde_json::json!({
-        "input": "hello",
-        "prompt_id": "doc_legacy_prompt"
+        "unsupported_field": "value"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 400, "body: {}", resp.body);

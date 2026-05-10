@@ -6,7 +6,7 @@
 //! never faces end users directly — it binds to localhost / a Unix socket
 //! and sits behind a gateway (reverse proxy, API gateway, etc.) that:
 //!
-//! 1. Authenticates end users (OAuth, API keys, sessions, …).
+//! 1. Authenticates end users (OAuth, API keys, SSO credentials, …).
 //! 2. Resolves the authenticated user to a tenant.
 //! 3. Forwards the request to talu with internal headers:
 //!    - `X-Talu-Gateway-Secret` — shared secret proving the request

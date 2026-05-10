@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
-use hyper_util::service::TowerToHyperService;
 use tokio::net::{TcpListener, TcpStream};
 
 #[cfg(unix)]
@@ -113,9 +112,8 @@ async fn accept_tcp(listener: TcpListener, router: Router) {
 
 async fn serve_tcp_connection(stream: TcpStream, router: Router) -> Result<()> {
     let io = TokioIo::new(stream);
-    let service: TowerToHyperService<Router> = TowerToHyperService::new(router);
     http1::Builder::new()
-        .serve_connection(io, service)
+        .serve_connection(io, router)
         .with_upgrades()
         .await
         .context("TCP connection failed")?;
@@ -142,9 +140,8 @@ async fn accept_unix(listener: UnixListener, router: Router) {
 #[cfg(unix)]
 async fn serve_unix_connection(stream: UnixStream, router: Router) -> Result<()> {
     let io = TokioIo::new(stream);
-    let service: TowerToHyperService<Router> = TowerToHyperService::new(router);
     http1::Builder::new()
-        .serve_connection(io, service)
+        .serve_connection(io, router)
         .with_upgrades()
         .await
         .context("UDS connection failed")?;

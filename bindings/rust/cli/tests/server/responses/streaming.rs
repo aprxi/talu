@@ -189,14 +189,10 @@ fn responses_stream_emits_queued_and_omits_progress() {
 }
 
 #[test]
-fn responses_stream_rejects_raw_image_without_file_host() {
+fn responses_stream_rejects_raw_image_without_prepared_input() {
     let model = require_model!();
     let mut cfg = model_config();
     cfg.model = Some(model.clone());
-    cfg.env_vars
-        .push(("TALU_FILE_HOST".to_string(), "".to_string()));
-    cfg.env_vars
-        .push(("TALUPI_HOST".to_string(), "".to_string()));
     let ctx = ServerTestContext::new(cfg);
     let body = serde_json::json!({
         "model": model,
@@ -220,52 +216,7 @@ fn responses_stream_rejects_raw_image_without_file_host() {
     assert_eq!(json["error"]["code"].as_str(), Some("invalid_vision_input"));
     assert_eq!(
         json["error"]["message"].as_str(),
-        Some(
-            "input_image requires external vision preprocessing; set TALU_FILE_HOST/TALUPI_HOST or provide input_image.prepared"
-        )
-    );
-}
-
-#[test]
-fn responses_stream_does_not_inject_session_metadata() {
-    let model = require_model!();
-    let mut cfg = model_config();
-    cfg.model = Some(model.clone());
-    let ctx = ServerTestContext::new(cfg);
-    let body = serde_json::json!({
-        "model": model,
-        "input": "hello",
-        "stream": true,
-        "max_output_tokens": 16
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
-    let events = parse_sse_events(&resp.body);
-
-    let created = events
-        .iter()
-        .find(|(t, _)| t == "response.created")
-        .map(|(_, e)| &e["response"])
-        .expect("missing response.created");
-    assert!(
-        created["metadata"]
-            .as_object()
-            .map(|m| !m.contains_key("session_id"))
-            .unwrap_or(false),
-        "created metadata should not contain chat session_id",
-    );
-
-    let terminal = events
-        .iter()
-        .find(|(t, _)| t == "response.completed" || t == "response.incomplete")
-        .map(|(_, e)| &e["response"])
-        .expect("missing terminal response event");
-    assert!(
-        terminal["metadata"]
-            .as_object()
-            .map(|m| !m.contains_key("session_id"))
-            .unwrap_or(false),
-        "terminal metadata should not contain chat session_id",
+        Some("input_image requires prepared vision input; raw image preprocessing is not served by talu")
     );
 }
 
