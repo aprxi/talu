@@ -409,7 +409,7 @@ const CorePackages = struct {
                 .link_libc = true,
             }),
             .compute_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/compute_pkg.zig"),
+                .root_source_file = b.path("core/src/compute/root.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
@@ -421,7 +421,7 @@ const CorePackages = struct {
                 .link_libc = true,
             }),
             .io_pkg = b.createModule(.{
-                .root_source_file = b.path("core/src/io_pkg.zig"),
+                .root_source_file = b.path("core/src/io/root.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,

@@ -4,13 +4,17 @@
 //! transport primitives consumed by higher-level graph/inference code.
 
 /// Model repository format (HF-style structure).
-pub const repository = @import("repository/root.zig");
+pub const repository = struct {
+    pub const root = @import("repository/root.zig");
+    pub const scheme = @import("repository/scheme.zig");
+    pub const talu_cache = @import("repository/talu_cache.zig");
+};
 
 /// Transport layer (HTTP, HuggingFace Hub API).
 pub const transport = @import("transport/root.zig");
 
 /// HuggingFace model config fetch and minimal metadata view.
-pub const model_config = @import("io_pkg").model_config;
+pub const model_config = @import("model_config.zig");
 
 /// SafeTensors format parsing.
 pub const safetensors = struct {
