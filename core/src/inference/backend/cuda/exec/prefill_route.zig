@@ -88,7 +88,7 @@ pub fn resolveStagedPrefillChunkRows(total_rows: usize, requested_cap: usize, en
     return clamped;
 }
 
-pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
+pub fn executePrefillWithLayerLimit(
     self: anytype,
     tokens: []const u32,
     slot_index: usize,

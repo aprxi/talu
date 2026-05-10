@@ -133,10 +133,10 @@ pub fn executeCpuStage0LayerRange(
     ensure_kv_capacity: bool,
 ) !void {
     const Stage0Type = @TypeOf(stage0.*);
-    if (comptime !typeHasDecl(Stage0Type, "computePrototypeLogitsWithLayerRange")) {
+    if (comptime !typeHasDecl(Stage0Type, "executeDecodeLayerRange")) {
         return error.InvalidTopologyConfig;
     }
-    try stage0.computePrototypeLogitsWithLayerRange(
+    try stage0.executeDecodeLayerRange(
         token,
         position,
         slot_index,

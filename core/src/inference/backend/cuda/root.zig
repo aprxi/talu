@@ -14,7 +14,7 @@ pub const DecodeRequest = contract.DecodeRequest;
 pub const DecodeResult = contract.DecodeResult;
 
 pub const engine = engine_mod;
-pub const stage = @import("stage.zig");
+pub const stage_capabilities = @import("stage_capabilities.zig");
 pub const attention_path = @import("attention_path.zig");
 pub const attention = attention_path;
 pub const attention_policy = @import("attention_policy.zig");

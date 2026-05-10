@@ -10,7 +10,7 @@ pub const buffers = @import("buffers.zig");
 pub const blocks = @import("blocks.zig");
 const block_init = @import("block_init.zig");
 
-pub const prototype_eps = config.prototype_eps;
+pub const default_norm_eps = config.default_norm_eps;
 pub const initial_kv_cache_tokens = config.initial_kv_cache_tokens;
 pub const KvCacheDtype = config.KvCacheDtype;
 pub const resolveKvCacheDtype = config.resolveKvCacheDtype;

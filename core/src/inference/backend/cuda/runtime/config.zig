@@ -7,7 +7,7 @@ const compute = @import("compute_pkg");
 const log = @import("log_pkg");
 const attention_policy = @import("../attention_policy.zig");
 
-pub const prototype_eps: f32 = 1e-5;
+pub const default_norm_eps: f32 = 1e-5;
 pub const initial_kv_cache_tokens: usize = 512;
 pub const KvCacheDtype = enum(u8) {
     f16,

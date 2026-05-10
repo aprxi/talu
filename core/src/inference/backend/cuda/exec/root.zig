@@ -5,13 +5,14 @@ pub const prefill_route = @import("prefill_route.zig");
 pub const kv_capacity = @import("kv_capacity.zig");
 pub const transfers = @import("transfers.zig");
 pub const resets = @import("resets.zig");
+pub const stage_adapters = @import("stage_adapters.zig");
 pub const pipeline2 = @import("pipeline2.zig");
 pub const cpu_gpu = @import("cpu_gpu.zig");
 pub const cpu_gpu_gpu = @import("cpu_gpu_gpu.zig");
 
 pub const resolveStagedPrefillChunkRows = prefill_route.resolveStagedPrefillChunkRows;
-pub const computeGpuPrototypePrefillLogitsWithLayerLimit = prefill_route.computeGpuPrototypePrefillLogitsWithLayerLimit;
-pub const computeGpuPrototypeLogitsWithLayerLimit = decode_route.computeGpuPrototypeLogitsWithLayerLimit;
+pub const executePrefillWithLayerLimit = prefill_route.executePrefillWithLayerLimit;
+pub const executeDecodeWithLayerLimit = decode_route.executeDecodeWithLayerLimit;
 pub const computeBatchedDecodeLogits = decode_route.computeBatchedDecodeLogits;
 pub const computeBatchedDecodeLogitsDeviceOnly = decode_route.computeBatchedDecodeLogitsDeviceOnly;
 pub const ensureKvCapacity = kv_capacity.ensureKvCapacity;

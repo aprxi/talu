@@ -42,7 +42,7 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     self.beginPhaseBudgetWindow();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
     self.parity_prefill_token_index = tokens.len - 1;
-    self.computeGpuPrototypePrefillLogitsWithLayerLimit(
+    self.executePrefillWithLayerLimit(
         tokens,
         0,
         self.slotLogits(0),
@@ -120,7 +120,7 @@ pub fn prefillSlot(
     self.beginPhaseBudgetWindow();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
     self.parity_prefill_token_index = tokens.len - 1;
-    self.computeGpuPrototypePrefillLogitsWithLayerLimit(
+    self.executePrefillWithLayerLimit(
         tokens,
         slot_index,
         self.slotLogits(slot_index),
@@ -241,7 +241,7 @@ const MockBackend = struct {
         self.log_phase_budget_summary_calls += 1;
     }
 
-    fn computeGpuPrototypePrefillLogitsWithLayerLimit(
+    fn executePrefillWithLayerLimit(
         self: *MockBackend,
         tokens: []const u32,
         slot_index: usize,

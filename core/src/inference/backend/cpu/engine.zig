@@ -1098,7 +1098,7 @@ pub const FusedCpuBackend = struct {
 
     /// Execute a decode-style layer range [layer_start, layer_end) for one slot.
     /// Used by staged heterogeneous topology orchestration.
-    pub fn computePrototypeLogitsWithLayerRange(
+    pub fn executeDecodeLayerRange(
         self: *FusedCpuBackend,
         token: u32,
         position: usize,
@@ -2801,12 +2801,12 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
 }
 
-test "computePrototypeLogitsWithLayerRange rejects download request without logits compute" {
+test "executeDecodeLayerRange rejects download request without logits compute" {
     // Safe: parameter validation returns error before any field access on self.
     var backend: FusedCpuBackend = undefined;
     try std.testing.expectError(
         error.InvalidArgument,
-        backend.computePrototypeLogitsWithLayerRange(
+        backend.executeDecodeLayerRange(
             0,
             0,
             0,

@@ -49,6 +49,7 @@ const common = @import("common.zig");
 const kv_capacity = @import("kv_capacity.zig");
 const decode_route = @import("decode_route.zig");
 const resets = @import("resets.zig");
+const stage_adapters = @import("stage_adapters.zig");
 const transfers = @import("transfers.zig");
 const resolveStagedPrefillChunkRows = @import("prefill_route.zig").resolveStagedPrefillChunkRows;
 const transferPipelineActivationStage12MultiRow = transfers.transferPipelineActivationStage12MultiRow;
@@ -60,7 +61,7 @@ const resetShortConvStates = resets.resetShortConvStates;
 const resetGatedDeltaStates = resets.resetGatedDeltaStates;
 const resetAttentionCpuStates = resets.resetAttentionCpuStates;
 const ensureGatedDeltaHostStageCapacity = resets.ensureGatedDeltaHostStageCapacity;
-const computeGpuPrototypeLogitsWithLayerLimit = decode_route.computeGpuPrototypeLogitsWithLayerLimit;
+const executeDecodeWithLayerLimit = decode_route.executeDecodeWithLayerLimit;
 
 pub fn computeBatchedPrefillCpuGpuGpu(
     self: anytype,
@@ -331,50 +332,21 @@ pub fn runCpuGpuGpuWithPipelineRuntime(
     activation01_byte_count: usize,
     activation12_byte_count: usize,
 ) !void {
-    const Ctx = struct {
-        token: u32,
-        position: usize,
-        slot_index: usize,
-        logits_out_opt: ?[]f32,
-        compute_logits: bool,
-        download_logits: bool,
-        ensure_kv_capacity: bool,
-        trace_seq_len_u32: u32,
-        trace_pos_offset: usize,
-    };
     const Stage0 = struct {
         backend: @TypeOf(cpu_stage0_backend),
-        ctx: *const Ctx,
+        ctx: *const stage_adapters.DecodeContext,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            if (input.len != 0) return error.InvalidArgument;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            try stage.backend.computePrototypeLogitsWithLayerRange(
-                stage.ctx.token,
-                stage.ctx.position,
-                stage.ctx.slot_index,
-                null,
-                layer_start,
-                layer_end,
-                false,
-                false,
-                stage.ctx.ensure_kv_capacity,
-                false,
-            );
+            try stage_adapters.validateEmptyInput(input);
+            try stage_adapters.executeCpuDecodeLayerRange(stage.backend, stage.ctx, layer_start, layer_end, false);
         }
 
         pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            const src = stage.backend.slotActivationBytes(stage.ctx.slot_index);
-            if (byte_count > src.len) return error.InvalidArgument;
-            @memcpy(host_buf[0..byte_count], src[0..byte_count]);
+            try stage_adapters.downloadCpuActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
         }
 
         pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            const dst = stage.backend.slotActivationBytesMut(stage.ctx.slot_index);
-            if (byte_count > dst.len) return error.InvalidArgument;
-            @memcpy(dst[0..byte_count], host_buf[0..byte_count]);
+            try stage_adapters.uploadCpuActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
         }
 
         pub fn synchronize(_: *@This()) anyerror!void {}
@@ -383,122 +355,72 @@ pub fn runCpuGpuGpuWithPipelineRuntime(
     };
     const Stage1 = struct {
         backend: @TypeOf(gpu_stage1_backend),
-        ctx: *const Ctx,
+        ctx: *const stage_adapters.DecodeContext,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            if (input.len != 0) return error.InvalidArgument;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const local_layer_limit = layer_end - layer_start;
-            try computeGpuPrototypeLogitsWithLayerLimit(
+            try stage_adapters.validateEmptyInput(input);
+            try stage_adapters.executeCudaDecodeLayerRange(
+                executeDecodeWithLayerLimit,
                 stage.backend,
-                stage.ctx.token,
-                stage.ctx.position,
-                stage.ctx.slot_index,
+                stage.ctx,
+                layer_start,
+                layer_end,
                 null,
-                local_layer_limit,
                 false,
                 false,
-                stage.ctx.ensure_kv_capacity,
-                stage.ctx.trace_seq_len_u32,
-                stage.ctx.trace_pos_offset,
-                null,
-                null,
-                null,
                 true,
             );
         }
 
         pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            const BackendType = @TypeOf(stage.backend.*);
-            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
-                return stage.backend.runtime_buffers.input_dev.download(&stage.backend.device, host_buf[0..byte_count]);
-            }
-            return error.InvalidTopologyConfig;
+            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
         }
 
         pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            const BackendType = @TypeOf(stage.backend.*);
-            if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
-                return stage.backend.uploadPipelineActivationFromHost(stage.ctx.slot_index, host_buf[0..byte_count], byte_count);
-            }
-            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
-                return stage.backend.runtime_buffers.input_dev.upload(&stage.backend.device, host_buf[0..byte_count]);
-            }
-            return error.InvalidTopologyConfig;
+            try stage_adapters.uploadCudaActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
         }
 
         pub fn synchronize(stage: *@This()) anyerror!void {
-            if (stage.backend.compute_stream) |stream| {
-                try stage.backend.device.synchronizeStream(stream);
-                return;
-            }
-            try stage.backend.device.synchronize();
+            try stage_adapters.synchronizeCudaBackend(stage.backend);
         }
 
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
     };
     const Stage2 = struct {
         backend: @TypeOf(self),
-        ctx: *const Ctx,
+        ctx: *const stage_adapters.DecodeContext,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            if (input.len != 0) return error.InvalidArgument;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const local_layer_limit = layer_end - layer_start;
-            try computeGpuPrototypeLogitsWithLayerLimit(
+            try stage_adapters.validateEmptyInput(input);
+            try stage_adapters.executeCudaDecodeLayerRange(
+                executeDecodeWithLayerLimit,
                 stage.backend,
-                stage.ctx.token,
-                stage.ctx.position,
-                stage.ctx.slot_index,
+                stage.ctx,
+                layer_start,
+                layer_end,
                 stage.ctx.logits_out_opt,
-                local_layer_limit,
                 stage.ctx.compute_logits,
                 stage.ctx.download_logits,
-                stage.ctx.ensure_kv_capacity,
-                stage.ctx.trace_seq_len_u32,
-                stage.ctx.trace_pos_offset,
-                null,
-                null,
-                null,
                 true,
             );
         }
 
         pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            const BackendType = @TypeOf(stage.backend.*);
-            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
-                return stage.backend.runtime_buffers.input_dev.download(&stage.backend.device, host_buf[0..byte_count]);
-            }
-            return error.InvalidTopologyConfig;
+            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
         }
 
         pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            const BackendType = @TypeOf(stage.backend.*);
-            if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
-                return stage.backend.uploadPipelineActivationFromHost(stage.ctx.slot_index, host_buf[0..byte_count], byte_count);
-            }
-            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
-                return stage.backend.runtime_buffers.input_dev.upload(&stage.backend.device, host_buf[0..byte_count]);
-            }
-            return error.InvalidTopologyConfig;
+            try stage_adapters.uploadCudaActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
         }
 
         pub fn synchronize(stage: *@This()) anyerror!void {
-            if (stage.backend.compute_stream) |stream| {
-                try stage.backend.device.synchronizeStream(stream);
-                return;
-            }
-            try stage.backend.device.synchronize();
+            try stage_adapters.synchronizeCudaBackend(stage.backend);
         }
 
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
     };
 
-    var ctx = Ctx{
+    var ctx = stage_adapters.DecodeContext{
         .token = token,
         .position = position,
         .slot_index = slot_index,

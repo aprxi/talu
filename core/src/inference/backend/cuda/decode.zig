@@ -47,7 +47,7 @@ pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !vo
         return error.InvalidArgument;
     }
     const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[0]);
-    try self.computeGpuPrototypeLogits(token, effective_position, logits_out);
+    try self.executeDecode(token, effective_position, logits_out);
     trace.emitFinal(
         .logits_ready,
         0,
@@ -168,7 +168,7 @@ pub fn decodeBatch(
             self.activateKvSlot(req.slot_index);
         }
 
-        try self.computeGpuPrototypeLogitsWithLayerLimit(
+        try self.executeDecodeWithLayerLimit(
             req.token,
             effective_position,
             req.slot_index,
@@ -247,7 +247,7 @@ pub fn decodeStreaming(
     }
     while (generated < budget) : (generated += 1) {
         const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[0]);
-        self.computeGpuPrototypeLogitsWithLayerLimit(
+        self.executeDecodeWithLayerLimit(
             current_token,
             effective_position,
             0,
@@ -482,7 +482,7 @@ const MockDecodeBackend = struct {
         if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
     }
 
-    fn computeGpuPrototypeLogits(
+    fn executeDecode(
         self: *MockDecodeBackend,
         token: u32,
         position: usize,
@@ -496,7 +496,7 @@ const MockDecodeBackend = struct {
         }
     }
 
-    fn computeGpuPrototypeLogitsWithLayerLimit(
+    fn executeDecodeWithLayerLimit(
         self: *MockDecodeBackend,
         token: u32,
         position: usize,

@@ -1761,7 +1761,7 @@ test "computeBatchedDecodeLogits routes pipeline2 decode per request through sin
             return self.slot_logits_storage[offset .. offset + self.vocab_size];
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -1848,7 +1848,7 @@ test "computeBatchedDecodeLogitsDeviceOnly routes pipeline2 decode per request w
             self.activate_calls += 1;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -1938,7 +1938,7 @@ test "computeBatchedDecodeLogits routes cpu_gpu decode per request through singl
             return self.slot_logits_storage[offset .. offset + self.vocab_size];
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -1999,7 +1999,7 @@ test "computeBatchedDecodeLogits routes cpu_gpu decode per request through singl
     }
 }
 
-test "computeGpuPrototypePrefillLogitsWithLayerLimit routes pipeline2 prefill through staged token loop" {
+test "executePrefillWithLayerLimit routes pipeline2 prefill through staged token loop" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [4]u8 = [_]u8{0} ** 4,
@@ -2019,7 +2019,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes pipeline2 prefill th
             return slot_index < 2;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2064,7 +2064,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes pipeline2 prefill th
     const tokens = [_]u32{ 100, 101, 102, 103 };
     var logits_out: [6]f32 = undefined;
 
-    try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+    try engine_forward.executePrefillWithLayerLimit(
         &mock,
         tokens[0..],
         0,
@@ -2082,7 +2082,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes pipeline2 prefill th
     }
 }
 
-test "computeGpuPrototypePrefillLogitsWithLayerLimit routes cpu_gpu prefill through staged token loop" {
+test "executePrefillWithLayerLimit routes cpu_gpu prefill through staged token loop" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [4]u8 = [_]u8{0} ** 4,
@@ -2102,7 +2102,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes cpu_gpu prefill thro
             return slot_index < 2;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2147,7 +2147,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes cpu_gpu prefill thro
     const tokens = [_]u32{ 100, 101, 102, 103 };
     var logits_out: [6]f32 = undefined;
 
-    try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+    try engine_forward.executePrefillWithLayerLimit(
         &mock,
         tokens[0..],
         0,
@@ -2165,7 +2165,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes cpu_gpu prefill thro
     }
 }
 
-test "computeGpuPrototypeLogitsWithLayerLimit orchestrates pipeline2 stage0 transfer and stage1" {
+test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and stage1" {
     const TraceStep = enum(u8) {
         mirror,
         activate,
@@ -2241,7 +2241,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates pipeline2 stage0 tran
             self.trace.push(.transfer);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2317,7 +2317,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates pipeline2 stage0 tran
         &[_]f32{ 0.5, 0.6 },
         &[_]f32{ 0.7, 0.8 },
     };
-    try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+    try engine_forward.executeDecodeWithLayerLimit(
         &stage0,
         123,
         9,
@@ -2367,7 +2367,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates pipeline2 stage0 tran
     try std.testing.expect(trace_state.stage1_logits_out_present);
 }
 
-test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage1" {
+test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage1" {
     const TraceStep = enum(u8) {
         stage0_compute,
         transfer,
@@ -2404,7 +2404,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu stage0 transf
     const CpuStage0Mock = struct {
         trace: *SharedTrace,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2465,7 +2465,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu stage0 transf
             self.trace.push(.transfer);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2513,7 +2513,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu stage0 transf
     };
     var logits: [7]f32 = undefined;
 
-    try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+    try engine_forward.executeDecodeWithLayerLimit(
         &stage1,
         123,
         9,
@@ -2558,7 +2558,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu stage0 transf
     try std.testing.expect(trace_state.stage1_logits_out_present);
 }
 
-test "computeGpuPrototypeLogitsWithLayerLimit cpu_gpu returns error when stage0 is missing" {
+test "executeDecodeWithLayerLimit cpu_gpu returns error when stage0 is missing" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [2]u8 = [_]u8{0} ** 2,
@@ -2580,7 +2580,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit cpu_gpu returns error when stage0 
             return;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             _: *@This(),
             _: u32,
             _: usize,
@@ -2605,7 +2605,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit cpu_gpu returns error when stage0 
     var logits: [5]f32 = undefined;
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+        engine_forward.executeDecodeWithLayerLimit(
             &mock,
             1,
             0,
@@ -2634,7 +2634,7 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
     const CpuStage0Mock = struct {
         activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2724,7 +2724,7 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2790,7 +2790,7 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
                 var logits_single: [vocab]f32 = undefined;
                 var logits_split: [vocab]f32 = undefined;
 
-                try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+                try engine_forward.executeDecodeWithLayerLimit(
                     &single,
                     token,
                     positions[slot_index],
@@ -2807,7 +2807,7 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
                     null,
                     false,
                 );
-                try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+                try engine_forward.executeDecodeWithLayerLimit(
                     &split,
                     token,
                     positions[slot_index],
@@ -2841,7 +2841,7 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
     const CpuStage0Mock = struct {
         activation: [d_model]f32 = [_]f32{0.0} ** d_model,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2927,7 +2927,7 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
             @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -2988,7 +2988,7 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
         };
         for (windows) |window_tokens| {
             var logits_split: [vocab]f32 = undefined;
-            try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+            try engine_forward.executePrefillWithLayerLimit(
                 &split,
                 window_tokens,
                 0,
@@ -3015,7 +3015,7 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
     const CpuStage0Mock = struct {
         activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3102,7 +3102,7 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
             @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3172,7 +3172,7 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
         for (slot_windows, 0..) |windows, slot_index| {
             for (windows) |window_tokens| {
                 var logits_split: [vocab]f32 = undefined;
-                try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+                try engine_forward.executePrefillWithLayerLimit(
                     &split,
                     window_tokens,
                     slot_index,
@@ -3191,7 +3191,7 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
     }
 }
 
-test "computeGpuPrototypeLogitsWithLayerLimit pipeline2 returns error when stage1 is missing" {
+test "executeDecodeWithLayerLimit pipeline2 returns error when stage1 is missing" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [4]u8 = [_]u8{0} ** 4,
@@ -3216,7 +3216,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit pipeline2 returns error when stage
             return;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             _: *@This(),
             _: u32,
             _: usize,
@@ -3241,7 +3241,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit pipeline2 returns error when stage
     var logits: [5]f32 = undefined;
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+        engine_forward.executeDecodeWithLayerLimit(
             &mock,
             1,
             0,
@@ -3291,7 +3291,7 @@ test "computeBatchedDecodeLogits routes cpu_gpu_gpu decode per request through s
             return self.slot_logits_storage[offset .. offset + self.vocab_size];
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3350,7 +3350,7 @@ test "computeBatchedDecodeLogits routes cpu_gpu_gpu decode per request through s
     }
 }
 
-test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
+test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
     const TraceStep = enum(u8) {
         mirror,
         stage1_activate,
@@ -3382,7 +3382,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu_gpu stage cha
         trace: *SharedTrace,
         activation: [8]f32 = [_]f32{0.0} ** 8,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3446,7 +3446,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu_gpu stage cha
             self.trace.push(.transfer_12);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3526,7 +3526,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu_gpu stage cha
             return;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3580,7 +3580,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu_gpu stage cha
     };
     var logits: [7]f32 = undefined;
 
-    try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+    try engine_forward.executeDecodeWithLayerLimit(
         &stage2,
         123,
         9,
@@ -3616,7 +3616,7 @@ test "computeGpuPrototypeLogitsWithLayerLimit orchestrates cpu_gpu_gpu stage cha
     try std.testing.expect(trace_state.stage2_logits_present);
 }
 
-test "computeGpuPrototypePrefillLogitsWithLayerLimit routes cpu_gpu_gpu prefill through staged token loop" {
+test "executePrefillWithLayerLimit routes cpu_gpu_gpu prefill through staged token loop" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [4]u8 = [_]u8{0} ** 4,
@@ -3636,7 +3636,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes cpu_gpu_gpu prefill 
             return slot_index < 2;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3681,7 +3681,7 @@ test "computeGpuPrototypePrefillLogitsWithLayerLimit routes cpu_gpu_gpu prefill 
     const tokens = [_]u32{ 100, 101, 102, 103 };
     var logits_out: [6]f32 = undefined;
 
-    try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+    try engine_forward.executePrefillWithLayerLimit(
         &mock,
         tokens[0..],
         0,
@@ -3709,7 +3709,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
     const CpuStage0Mock = struct {
         activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3773,7 +3773,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
             @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3863,7 +3863,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
             return slot_index < slot_count;
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -3929,7 +3929,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
                 var logits_single: [vocab]f32 = undefined;
                 var logits_split: [vocab]f32 = undefined;
 
-                try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+                try engine_forward.executeDecodeWithLayerLimit(
                     &single,
                     token,
                     positions[slot_index],
@@ -3946,7 +3946,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
                     null,
                     false,
                 );
-                try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+                try engine_forward.executeDecodeWithLayerLimit(
                     &split,
                     token,
                     positions[slot_index],
@@ -3981,7 +3981,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
     const CpuStage0Mock = struct {
         activation: [d_model]f32 = [_]f32{0.0} ** d_model,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -4043,7 +4043,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
             @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -4132,7 +4132,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -4194,7 +4194,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
         };
         for (windows) |window_tokens| {
             var logits_split: [vocab]f32 = undefined;
-            try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+            try engine_forward.executePrefillWithLayerLimit(
                 &split,
                 window_tokens,
                 0,
@@ -4222,7 +4222,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
     const CpuStage0Mock = struct {
         activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
 
-        pub fn computePrototypeLogitsWithLayerRange(
+        pub fn executeDecodeLayerRange(
             self: *@This(),
             token: u32,
             position: usize,
@@ -4286,7 +4286,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
             @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
         }
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -4375,7 +4375,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
-        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+        pub fn executeDecodeWithLayerLimitTestHook(
             self: *@This(),
             token: u32,
             position: usize,
@@ -4446,7 +4446,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
         for (slot_windows, 0..) |windows, slot_index| {
             for (windows) |window_tokens| {
                 var logits_split: [vocab]f32 = undefined;
-                try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+                try engine_forward.executePrefillWithLayerLimit(
                     &split,
                     window_tokens,
                     slot_index,

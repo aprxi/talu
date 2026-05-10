@@ -84,7 +84,7 @@ const resetGatedDeltaStates = resets.resetGatedDeltaStates;
 const resetAttentionCpuStates = resets.resetAttentionCpuStates;
 const ensureGatedDeltaHostStageCapacity = resets.ensureGatedDeltaHostStageCapacity;
 
-pub fn computeGpuPrototypeLogitsWithLayerLimit(
+pub fn executeDecodeWithLayerLimit(
     self: anytype,
     token: u32,
     position: usize,
@@ -150,7 +150,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
             }
             stage1.activateKvSlot(slot_index);
-            try computeGpuPrototypeLogitsWithLayerLimit(
+            try executeDecodeWithLayerLimit(
                 self,
                 token,
                 position,
@@ -169,7 +169,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             );
             const activation_bytes = try pipelineActivationByteCountFor(self);
             try self.transferPipelineActivation(stage1, activation_bytes);
-            try computeGpuPrototypeLogitsWithLayerLimit(
+            try executeDecodeWithLayerLimit(
                 stage1,
                 token,
                 position,
@@ -253,7 +253,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 );
                 const activation_bytes = try pipelineActivationByteCountFor(self);
                 try stage1.transferPipelineActivationFromCpu(stage0, slot_index, activation_bytes);
-                try computeGpuPrototypeLogitsWithLayerLimit(
+                try executeDecodeWithLayerLimit(
                     stage1,
                     token,
                     position,
@@ -271,7 +271,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                     true,
                 );
                 try stage1.transferPipelineActivation(self, activation_bytes);
-                return computeGpuPrototypeLogitsWithLayerLimit(
+                return executeDecodeWithLayerLimit(
                     self,
                     token,
                     position,
@@ -331,7 +331,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             try uploadCpuKvToMirrors(self, stage0, slot_index, position, 1);
             const activation_bytes = try pipelineActivationByteCountFor(self);
             try self.transferPipelineActivationFromCpu(stage0, slot_index, activation_bytes);
-            return computeGpuPrototypeLogitsWithLayerLimit(
+            return executeDecodeWithLayerLimit(
                 self,
                 token,
                 position,
@@ -350,8 +350,8 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             );
         }
     }
-    if (comptime @hasDecl(SelfType, "computeGpuPrototypeLogitsWithLayerLimitTestHook")) {
-        return self.computeGpuPrototypeLogitsWithLayerLimitTestHook(
+    if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook")) {
+        return self.executeDecodeWithLayerLimitTestHook(
             token,
             position,
             slot_index,
@@ -394,7 +394,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     }
     if (ensure_kv_capacity) {
         ensureKvCapacity(self, position + 1) catch |err| {
-            log.warn("inference", "CUDA ensureKvCapacity failed in prototype decode", .{
+            log.warn("inference", "CUDA ensureKvCapacity failed in layer-range decode", .{
                 .slot = slot_index,
                 .position = position,
                 .required_tokens = position + 1,
@@ -1057,7 +1057,7 @@ const BatchedDecodeOutputMode = enum {
 };
 
 const BatchedDecodeExecutionPlan = struct {
-    bypass_topology_prototype: bool = false,
+    allow_staged_internal_execution: bool = false,
     use_preloaded_input: bool = false,
     compute_logits: bool = true,
     emit_decode_summary: bool = true,
@@ -1100,7 +1100,7 @@ pub fn computeBatchedDecodePipeline2WithMode(
     // Stage0: run decode layers only (no final norm/LM head).
     const stage0_start_ns = std.time.nanoTimestamp();
     try computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, .device_only, .{
-        .bypass_topology_prototype = true,
+        .allow_staged_internal_execution = true,
         .use_preloaded_input = false,
         .compute_logits = false,
         .emit_decode_summary = false,
@@ -1132,7 +1132,7 @@ pub fn computeBatchedDecodePipeline2WithMode(
     // Stage1: consume transferred activations and complete decode.
     const stage1_start_ns = std.time.nanoTimestamp();
     try computeBatchedDecodeLogitsWithPlan(stage1, tokens, slot_indices, positions, output_mode, .{
-        .bypass_topology_prototype = true,
+        .allow_staged_internal_execution = true,
         .use_preloaded_input = true,
         .compute_logits = true,
         .emit_decode_summary = false,
@@ -1248,7 +1248,7 @@ pub fn computeBatchedDecodeCpuGpuWithMode(
     }
 
     try computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{
-        .bypass_topology_prototype = true,
+        .allow_staged_internal_execution = true,
         .use_preloaded_input = true,
         .compute_logits = true,
         .emit_decode_summary = true,
@@ -1311,7 +1311,7 @@ pub fn computeBatchedDecodeCpuGpuGpuWithMode(
 
     // Stage1: decode layers only from preloaded rows.
     try computeBatchedDecodeLogitsWithPlan(stage1, tokens, slot_indices, positions, .device_only, .{
-        .bypass_topology_prototype = true,
+        .allow_staged_internal_execution = true,
         .use_preloaded_input = true,
         .compute_logits = false,
         .emit_decode_summary = false,
@@ -1323,7 +1323,7 @@ pub fn computeBatchedDecodeCpuGpuGpuWithMode(
 
     // Stage2: final decode from preloaded rows.
     try computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{
-        .bypass_topology_prototype = true,
+        .allow_staged_internal_execution = true,
         .use_preloaded_input = true,
         .compute_logits = true,
         .emit_decode_summary = true,
@@ -1392,7 +1392,7 @@ fn computeBatchedDecodeLogitsWithPlan(
         false;
     const n_usize = tokens.len;
     if (n_usize == 0) return;
-    if (!plan.bypass_topology_prototype) try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
+    if (!plan.allow_staged_internal_execution) try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;

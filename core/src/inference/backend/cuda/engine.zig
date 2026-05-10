@@ -29,8 +29,8 @@ const attention_mod = @import("attention_path.zig");
 const decode_mod = @import("decode.zig");
 const prefill_mod = @import("prefill.zig");
 const cpu_backend = @import("../cpu/root.zig");
-const cuda_stage = @import("stage.zig");
-const cpu_stage = @import("../cpu/stage.zig");
+const cuda_stage_capabilities = @import("stage_capabilities.zig");
+const cpu_stage_capabilities = @import("../cpu/stage_capabilities.zig");
 const shared_scheduler = @import("../cpu/scheduler.zig");
 const progress_mod = @import("progress_pkg");
 const sampling_mod = @import("sampling.zig");
@@ -46,7 +46,7 @@ const Tensor = tensor.Tensor;
 
 // --- Re-exported types from engine_types.zig ---
 const engine_types = @import("runtime/root.zig");
-const prototype_eps = engine_types.prototype_eps;
+const default_norm_eps = engine_types.default_norm_eps;
 const initial_kv_cache_tokens = engine_types.initial_kv_cache_tokens;
 const KvCacheDtype = engine_types.KvCacheDtype;
 const resolveKvCacheDtype = engine_types.resolveKvCacheDtype;
@@ -733,7 +733,7 @@ pub const CudaBackend = struct {
             .dequant_cache_bytes = 0,
             .strict_guard_bytes = 0,
             .measured_external_overhead_bytes = 0,
-            .norm_eps = prototype_eps,
+            .norm_eps = default_norm_eps,
             .cpu_rope_global = null,
             .cpu_rope_local = null,
             .slot_in_use = &.{},
@@ -833,7 +833,7 @@ pub const CudaBackend = struct {
             });
             return err;
         };
-        backend.norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else prototype_eps;
+        backend.norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else default_norm_eps;
         if (backend.device.supportsStreams()) {
             const stream = try backend.device.createStream();
             backend.compute_stream = stream;
@@ -1292,8 +1292,8 @@ pub const CudaBackend = struct {
                 const boundary = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
-                    .stage0_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
-                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                    .stage0_supported_boundary_dtypes = cuda_stage_capabilities.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage_capabilities.supported_boundary_dtypes[0..],
                 });
                 backend.pipeline_boundary_dtype = boundary.boundary_dtype;
                 backend.pipeline_boundary_layout = boundary.layout;
@@ -1391,8 +1391,8 @@ pub const CudaBackend = struct {
                 const boundary = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
-                    .stage0_supported_boundary_dtypes = cpu_stage.CpuStage.supported_boundary_dtypes[0..],
-                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                    .stage0_supported_boundary_dtypes = cpu_stage_capabilities.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage_capabilities.supported_boundary_dtypes[0..],
                 });
                 backend.pipeline_boundary_dtype = boundary.boundary_dtype;
                 backend.pipeline_boundary_layout = boundary.layout;
@@ -1490,8 +1490,8 @@ pub const CudaBackend = struct {
                 const boundary_01 = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
-                    .stage0_supported_boundary_dtypes = cpu_stage.CpuStage.supported_boundary_dtypes[0..],
-                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                    .stage0_supported_boundary_dtypes = cpu_stage_capabilities.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage_capabilities.supported_boundary_dtypes[0..],
                 });
                 backend.pipeline_boundary_dtype = boundary_01.boundary_dtype;
                 backend.pipeline_boundary_layout = boundary_01.layout;
@@ -1505,8 +1505,8 @@ pub const CudaBackend = struct {
                 const boundary_12 = try bridge.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
                     .stage1_native_dtype = .f32,
-                    .stage0_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
-                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                    .stage0_supported_boundary_dtypes = cuda_stage_capabilities.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage_capabilities.supported_boundary_dtypes[0..],
                 });
                 backend.pipeline_boundary_dtype_stage12 = boundary_12.boundary_dtype;
                 backend.pipeline_boundary_layout_stage12 = boundary_12.layout;
@@ -1609,7 +1609,7 @@ pub const CudaBackend = struct {
             .kv_projected_max_seq_mib = bytesToMiB(kv_ready_footprint.projected_max_seq_bytes),
             .shortconv_state_mib = bytesToMiB(backend.block_runtime.shortconv_state_bytes),
             .gated_delta_state_mib = bytesToMiB(backend.block_runtime.gated_delta_state_bytes),
-            .prototype_mib = bytesToMiB(backend.runtime_buffers.deviceByteSize()),
+            .runtime_buffers_mib = bytesToMiB(backend.runtime_buffers.deviceByteSize()),
             .slot_logits_mib = bytesToMiB(std.math.mul(usize, backend.slot_logits.len, @sizeOf(f32)) catch 0),
             .reserve_mib = bytesToMiB(backend.memory_reserve_bytes),
             .fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
@@ -3601,7 +3601,7 @@ pub const CudaBackend = struct {
                 findPositionIndex(image_token_positions, i)
             else
                 null;
-            engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+            engine_forward.executeDecodeWithLayerLimit(
                 self,
                 tokens[i],
                 i,
@@ -4020,8 +4020,8 @@ pub const CudaBackend = struct {
         logPrefillTiming(self, mode, token_count, elapsed_ns);
     }
 
-    pub fn computeGpuPrototypeLogits(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
-        return engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+    pub fn executeDecode(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
+        return engine_forward.executeDecodeWithLayerLimit(
             self,
             token,
             position,
@@ -4041,7 +4041,7 @@ pub const CudaBackend = struct {
     }
 
     // --- Delegation to engine_forward.zig ---
-    pub fn computeGpuPrototypeLogitsWithLayerLimit(
+    pub fn executeDecodeWithLayerLimit(
         self: *CudaBackend,
         token: u32,
         position: usize,
@@ -4058,7 +4058,7 @@ pub const CudaBackend = struct {
         deepstack_feature_index_opt: ?usize,
         use_preloaded_input: bool,
     ) !void {
-        return engine_forward.computeGpuPrototypeLogitsWithLayerLimit(self, token, position, slot_index, logits_out_opt, layer_limit, compute_logits, download_logits, ensure_kv_capacity, trace_seq_len_u32, trace_pos_offset, hidden_override, deepstack_layer_features_opt, deepstack_feature_index_opt, use_preloaded_input);
+        return engine_forward.executeDecodeWithLayerLimit(self, token, position, slot_index, logits_out_opt, layer_limit, compute_logits, download_logits, ensure_kv_capacity, trace_seq_len_u32, trace_pos_offset, hidden_override, deepstack_layer_features_opt, deepstack_feature_index_opt, use_preloaded_input);
     }
 
     pub fn computeBatchedDecodeLogits(
@@ -4088,14 +4088,14 @@ pub const CudaBackend = struct {
         return self.runtime_buffers.projected_logits_batch_host[start..end];
     }
 
-    pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
+    pub fn executePrefillWithLayerLimit(
         self: *CudaBackend,
         tokens: []const u32,
         slot_index: usize,
         logits_out: []f32,
         layer_limit: usize,
     ) !void {
-        return engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(self, tokens, slot_index, logits_out, layer_limit);
+        return engine_forward.executePrefillWithLayerLimit(self, tokens, slot_index, logits_out, layer_limit);
     }
 
     pub fn ensureKvCapacity(self: *CudaBackend, required_tokens: usize) !void {
