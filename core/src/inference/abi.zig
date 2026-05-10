@@ -16,6 +16,7 @@ pub const TokenEvent = root.TokenEvent;
 pub const SamplingStrategy = root.SamplingStrategy;
 pub const SamplingConfig = root.SamplingConfig;
 pub const bridge = root.bridge;
+pub const diagnostics = root.diagnostics;
 
 pub const backend = @import("backend/root.zig");
 pub const preprocessor_config = @import("config/preprocessor.zig");

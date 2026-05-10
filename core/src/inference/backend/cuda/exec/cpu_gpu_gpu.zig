@@ -8,7 +8,6 @@ const std = @import("std");
 const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
-const trace = @import("xray_pkg").trace;
 const orchestrator = @import("../../../bridge/orchestrator.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 

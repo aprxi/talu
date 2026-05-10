@@ -6,6 +6,7 @@
 const std = @import("std");
 const pipeline = @import("pipeline.zig");
 const tensor_frame = @import("tensor_frame.zig");
+const xray_bridge = @import("../diagnostics/xray_bridge.zig");
 
 pub const LocalDecodeHandoffConfig = struct {
     metadata: tensor_frame.TensorFrameMetadata,
@@ -65,6 +66,7 @@ pub fn executeLocalDecodeHandoff(
             if (byte_count > staging.len) return error.PipelineTransferBufferTooSmall;
             try src.downloadActivation(staging[0..byte_count], byte_count);
             try dst.uploadActivation(staging[0..byte_count], byte_count);
+            xray_bridge.emitActivationHandoffLayerInput(&transfer_ctx.metadata, staging.ptr);
         }
 
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
@@ -238,6 +240,84 @@ test "executeLocalDecodeHandoff runs stages through metadata validated transfer"
     try std.testing.expectEqual(@as(usize, 33), log.entries[3].arg);
     try std.testing.expectEqual(TestLog.Kind.execute, log.entries[4].kind);
     try std.testing.expectEqual(@as(usize, 5), log.entries[4].arg);
+}
+
+test "executeLocalDecodeHandoff emits xray layer input from bridge metadata when requested" {
+    const trace = @import("xray_pkg").trace;
+    const Capture = struct {
+        var count: usize = 0;
+        var last: ?trace.TraceEmission = null;
+
+        fn handler(emission: trace.TraceEmission) void {
+            count += 1;
+            last = emission;
+        }
+
+        fn reset() void {
+            count = 0;
+            last = null;
+        }
+    };
+
+    Capture.reset();
+    trace.setHandler(&Capture.handler);
+    trace.setActiveBuiltInPointMask(@as(u64, 1) << @intFromEnum(trace.TracePoint.layer_input));
+    trace.setActiveExactEmissionFilter(null);
+    defer {
+        trace.setActiveBuiltInPointMask(0);
+        trace.setActiveExactEmissionFilter(null);
+        trace.setHandler(null);
+    }
+
+    var log = TestLog{};
+    var staging: [64]u8 align(64) = undefined;
+    const metadata = try tensor_frame.activationHandoffFrame(.{
+        .frame_id = 1,
+        .graph_id = 2,
+        .request_id = 3,
+        .source = .{ .stage_id = 0, .backend = .cpu },
+        .target = .{ .stage_id = 1, .backend = .cuda },
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+        .dtype = .f32,
+        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
+        .device = .{ .cuda = 0 },
+        .sequence_start = 7,
+        .sequence_len = 1,
+        .batch_size = 1,
+        .slot_index = 0,
+    });
+
+    try executeLocalDecodeHandoff(
+        MockStage,
+        MockStage,
+        .{ .id = 0, .log = &log },
+        .{ .id = 1, .log = &log },
+        .{
+            .metadata = metadata,
+            .activation_byte_count = 32,
+            .host_staging = staging[0..],
+        },
+    );
+
+    if (!trace.isEnabled()) {
+        try std.testing.expectEqual(@as(usize, 0), Capture.count);
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), Capture.count);
+    const emission = Capture.last.?;
+    try std.testing.expectEqual(trace.TracePoint.layer_input, emission.point);
+    try std.testing.expectEqual(@as(u16, 2), emission.layer);
+    try std.testing.expectEqual(@as(u32, 0), emission.token);
+    try std.testing.expectEqual(@as(u32, 1), emission.position);
+    try std.testing.expectEqual(trace.Backend.cuda, emission.backend);
+    try std.testing.expectEqual(trace.DType.f32, emission.tensor.dtype);
+    try std.testing.expectEqual(@as(u8, 3), emission.tensor.ndim);
+    try std.testing.expectEqual([4]u32{ 1, 1, 8, 0 }, emission.tensor.shape);
+    try std.testing.expectEqual(@as(u64, 32), emission.work_bytes);
 }
 
 test "executeLocalDecodeHandoff rejects stale byte count before transfer" {
