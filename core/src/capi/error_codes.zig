@@ -101,6 +101,17 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.NotDir => .io_not_directory,
         error.DirNotEmpty => .io_not_empty,
         error.FileTooBig => .io_file_too_big,
+        error.NotFound => .io_file_not_found,
+        error.ResponseTooLarge => .io_file_too_big,
+        error.StreamWriteFailed => .io_write_failed,
+        error.NetworkError,
+        error.NetworkFailed,
+        error.TlsFailed,
+        error.RequestFailed,
+        error.HttpError,
+        error.Unauthorized,
+        error.RateLimited,
+        => .io_network_failed,
         error.InvalidArgument => .invalid_argument,
         error.UnsupportedContentType => .invalid_argument,
         error.IdempotencyConflict => .invalid_argument,
@@ -191,4 +202,15 @@ test "ErrorCode: training error mappings" {
     try std.testing.expectEqual(ErrorCode.train_invalid_state, errorToCode(error.InvalidState));
     try std.testing.expectEqual(ErrorCode.train_data_invalid_format, errorToCode(error.InvalidDataFormat));
     try std.testing.expectEqual(ErrorCode.train_cancelled, errorToCode(error.Cancelled));
+}
+
+test "ErrorCode: HTTP transport errors map to I/O codes" {
+    try std.testing.expectEqual(ErrorCode.io_network_failed, errorToCode(error.NetworkFailed));
+    try std.testing.expectEqual(ErrorCode.io_network_failed, errorToCode(error.TlsFailed));
+    try std.testing.expectEqual(ErrorCode.io_network_failed, errorToCode(error.RequestFailed));
+    try std.testing.expectEqual(ErrorCode.io_network_failed, errorToCode(error.HttpError));
+    try std.testing.expectEqual(ErrorCode.io_network_failed, errorToCode(error.NetworkError));
+    try std.testing.expectEqual(ErrorCode.io_file_not_found, errorToCode(error.NotFound));
+    try std.testing.expectEqual(ErrorCode.io_write_failed, errorToCode(error.StreamWriteFailed));
+    try std.testing.expectEqual(ErrorCode.io_file_too_big, errorToCode(error.ResponseTooLarge));
 }

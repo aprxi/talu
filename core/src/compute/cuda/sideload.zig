@@ -108,9 +108,6 @@ pub fn loadOrFetchArtifact(
     const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_url, file_name });
     defer allocator.free(url);
 
-    transport.http.globalInit();
-    defer transport.http.globalCleanup();
-
     const downloaded = try transport.http.fetch(allocator, url, .{});
     errdefer allocator.free(downloaded);
     try verifySha256(downloaded, expected_sha256);
@@ -137,9 +134,6 @@ pub fn loadOrFetchManifest(
     defer allocator.free(file_name);
     const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_url, file_name });
     defer allocator.free(url);
-
-    transport.http.globalInit();
-    defer transport.http.globalCleanup();
 
     const downloaded = try transport.http.fetch(allocator, url, .{});
     errdefer allocator.free(downloaded);

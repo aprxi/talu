@@ -396,7 +396,6 @@ const Manager = struct {
             return;
         }
 
-        transport.globalInit();
         var progress_ctx = WorkerProgressCtx{ .manager = self, .job = job };
         const path = transport.hf.fetchModel(self.allocator, job.model_id, .{
             .token = job.token,
@@ -406,7 +405,6 @@ const Manager = struct {
             .progress = progress_api.Context.init(onProgress, @ptrCast(&progress_ctx)),
             .cancel_flag = &job.cancel_flag,
         });
-        transport.globalCleanup();
 
         self.finish(job, path);
     }

@@ -140,8 +140,13 @@ class ZigBuildHook(BuildHookInterface):
         # Check for required tools
         if not shutil.which("zig"):
             raise RuntimeError("Zig compiler not found. Install from https://ziglang.org/download/")
-        if not shutil.which("cmake"):
-            raise RuntimeError("CMake not found. Install cmake to build from source.")
+        needs_mlx_cmake = platform.system() == "Darwin" and not os.environ.get(
+            "TALU_DISABLE_METAL"
+        )
+        if needs_mlx_cmake and not shutil.which("cmake"):
+            raise RuntimeError(
+                "CMake not found. Install cmake to build macOS MLX support from source."
+            )
         if not shutil.which("cargo"):
             raise RuntimeError("Cargo not found. Install Rust from https://rustup.rs/")
 

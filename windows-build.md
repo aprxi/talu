@@ -11,19 +11,13 @@ This file records the generic steps and code changes needed to make `talu` build
   - The codebase is currently pinned to this Zig line
 - Rust toolchain / Cargo
   - Needed for the CLI build in `bindings/rust`
-- CMake
-  - Used to build `mbedtls` and `curl`
 
 ## Build steps
 
 1. Use Zig `0.15.2` instead of Zig `0.16.x`.
 2. Make sure `make` runs recipes through a POSIX shell on Windows.
-3. Ensure `cmake.exe` is on PATH, or pass an explicit path with `CMAKE=/path/to/cmake`.
-4. Build third-party dependencies with Windows archive names:
-   - `deps/mbedtls/build/library/Release/*.lib`
-   - `deps/curl/build/lib/Release/libcurl.lib`
-5. Build the project with `make`.
-6. For runtime testing in PowerShell, set environment variables with `$env:NAME = "value"`.
+3. Build the project with `make`.
+4. For runtime testing in PowerShell, set environment variables with `$env:NAME = "value"`.
 
 ## Code changes kept for Windows support
 
@@ -34,13 +28,11 @@ This file records the generic steps and code changes needed to make `talu` build
   - `HOMEDRIVE` + `HOMEPATH`
 - Added Windows file mapping for safetensor reads.
 - Added Windows build/link handling in `build.zig`:
-  - correct static archive names
   - required Windows system libraries
   - Windows Python binding copy step
   - MSVC ABI preference on Windows
 - Added Windows `Makefile` handling:
   - use Git for Windows `sh.exe` through PATH
-  - use `CMAKE`/PATH for `cmake.exe`
   - use repo-local temp storage instead of `/tmp`
   - clean the generated Windows Python DLL
 - Added Windows CUDA robustness fixes:

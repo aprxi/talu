@@ -10,7 +10,7 @@
 
 const std = @import("std");
 
-/// Generic HTTP client (libcurl wrapper)
+/// Generic HTTP client.
 pub const http = @import("http.zig");
 
 /// HuggingFace Hub API
@@ -24,12 +24,6 @@ pub const FileStartCallback = http.FileStartCallback;
 
 pub const DownloadConfig = hf.DownloadConfig;
 pub const DownloadError = hf.DownloadError;
-
-/// Initialize HTTP globally (call once at program start)
-pub const globalInit = http.globalInit;
-
-/// Clean up HTTP globally (call once at program end)
-pub const globalCleanup = http.globalCleanup;
 
 // =============================================================================
 // Tests

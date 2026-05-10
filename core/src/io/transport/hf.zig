@@ -209,9 +209,9 @@ pub const DownloadError = error{
     HttpError,
     ResponseTooLarge,
     NotFound,
-    CurlInitFailed,
-    CurlSetOptFailed,
-    CurlPerformFailed,
+    NetworkFailed,
+    TlsFailed,
+    RequestFailed,
     StreamWriteFailed,
     // Filesystem errors
     PermissionDenied, // EACCES - permission denied
@@ -281,9 +281,6 @@ pub fn fetchFileList(
     model_id: []const u8,
     download_config: DownloadConfig,
 ) ![][]const u8 {
-    // Initialize curl (safe to call multiple times - reference counted)
-    http.globalInit();
-
     const base_url = getEffectiveEndpoint(download_config.endpoint_url);
     const model_api_url = try std.fmt.allocPrint(allocator, "{s}/api/models/{s}", .{ base_url, model_id });
     defer allocator.free(model_api_url);
@@ -476,7 +473,7 @@ pub fn fetchModel(
         msg_buf[copy_len] = 0;
         progress.updateLine(0, files_downloaded, @ptrCast(&msg_buf));
 
-        // Add byte-level progress line for this file (indeterminate total until curl reports)
+        // Add byte-level progress line for this file (indeterminate total until the server reports it)
         progress.addLine(1, @ptrCast(&msg_buf), 0, null, "bytes");
         byte_ctx.file_name = filename;
         byte_ctx.last_log_ms = 0;
@@ -761,9 +758,6 @@ pub fn searchModels(
     query: []const u8,
     config: SearchConfig,
 ) ![][]const u8 {
-    // Initialize curl (safe to call multiple times - reference counted)
-    http.globalInit();
-
     const limit = if (config.limit == 0) 10 else config.limit;
     const base_url = getEffectiveEndpoint(config.endpoint_url);
 
@@ -889,8 +883,6 @@ pub fn searchModelsRich(
     query: []const u8,
     config: SearchConfig,
 ) ![]SearchResult {
-    http.globalInit();
-
     const limit = if (config.limit == 0) 10 else config.limit;
     const base_url = getEffectiveEndpoint(config.endpoint_url);
 
@@ -918,7 +910,7 @@ pub fn searchModelsRich(
 
     // Using expand[] switches the HF API to explicit field mode: only
     // expanded fields (plus _id, id, trendingScore) are returned. We must
-    // expand every field we need. Brackets are percent-encoded for curl.
+    // expand every field we need. Brackets are percent-encoded for HTTP.
     try writer.writeAll("&expand%5B%5D=safetensors&expand%5B%5D=downloads&expand%5B%5D=likes&expand%5B%5D=lastModified&expand%5B%5D=pipeline_tag");
 
     const search_url = url_buf.items;

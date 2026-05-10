@@ -1,4 +1,4 @@
-.PHONY: all deps build core inference static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build gen-bindings-python
+.PHONY: all deps build core inference static cuda clean clean-deps test docs mlx-build gen-bindings-python
 
 WINDOWS := $(filter Windows_NT,$(OS))
 CURDIR_POSIX := $(subst \,/,$(CURDIR))
@@ -35,8 +35,6 @@ ifeq ($(WINDOWS),Windows_NT)
 	ZIG_BUILD_FLAGS := -Drelease -Dcpu=x86_64_v3
 	ZIG_CC_FLAGS :=
 	SED_INPLACE := sed -i
-	MBEDTLS_ARCHIVE := deps/mbedtls/build/library/Release/mbedtls.lib
-	CURL_ARCHIVE := deps/curl/build/lib/Release/libcurl.lib
 else ifeq ($(UNAME_S),Darwin)
 	LIB_EXT := dylib
 	PYTHON_LIB_NAME := libtalu.dylib
@@ -45,8 +43,6 @@ else ifeq ($(UNAME_S),Darwin)
 	ZIG_CC_FLAGS := -fno-sanitize=all -DNDEBUG -O3
 	# BSD sed requires '' after -i for in-place edit without backup
 	SED_INPLACE := sed -i ''
-	MBEDTLS_ARCHIVE := deps/mbedtls/build/library/libmbedtls.a
-	CURL_ARCHIVE := deps/curl/build/lib/libcurl.a
 	# Metal GPU is enabled by default. Set TALU_DISABLE_METAL=1 for CPU-only builds.
 	ifdef TALU_DISABLE_METAL
 		ZIG_BUILD_FLAGS += -Dmetal=false
@@ -60,8 +56,6 @@ else
 	ZIG_CC_FLAGS := -target x86_64-linux-gnu.2.28 -mcpu=x86_64_v3 -fno-sanitize=all -DNDEBUG -O3
 	# GNU sed uses -i without argument
 	SED_INPLACE := sed -i
-	MBEDTLS_ARCHIVE := deps/mbedtls/build/library/libmbedtls.a
-	CURL_ARCHIVE := deps/curl/build/lib/libcurl.a
 endif
 
 ifdef TALU_ENABLE_CUDA
@@ -98,45 +92,11 @@ check-zig-version:
 deps: check-zig-version
 	@test -d deps/utf8proc || git clone --branch v2.11.2 --depth 1 https://github.com/JuliaStrings/utf8proc.git deps/utf8proc
 	@test -f deps/pcre2/deps/sljit/sljit_src/sljitLir.c || (rm -rf deps/pcre2 && git clone --branch pcre2-10.47 --depth 1 --recurse-submodules https://github.com/PCRE2Project/pcre2.git deps/pcre2)
-	@test -d deps/curl || git clone --branch curl-8_17_0 --depth 1 https://github.com/curl/curl.git deps/curl
-	@test -d deps/mbedtls || (git clone --branch v3.6.2 --depth 1 --recurse-submodules https://github.com/Mbed-TLS/mbedtls.git deps/mbedtls)
 	@test -f deps/cacert.pem || curl -sL https://curl.se/ca/cacert.pem -o deps/cacert.pem
 	@printf '%s\n%s\n' '//! Mozilla CA certificates - auto-generated, do not edit' 'pub const data = @embedFile("cacert.pem");' > deps/cacert.zig
-	@test -f $(MBEDTLS_ARCHIVE) || $(MAKE) mbedtls-build
-	@test -f $(CURL_ARCHIVE) || $(MAKE) curl-build
 ifeq ($(UNAME_S),Darwin)
 	@{ test -f deps/mlx/lib/libmlx.a && test -f deps/mlx/lib/mlx.metallib; } || $(MAKE) mlx-build
 endif
-
-mbedtls-build:
-	@echo "Building mbedTLS static library..."
-	@rm -rf deps/mbedtls/build
-	@mkdir -p deps/mbedtls/build
-ifeq ($(UNAME_S),Windows)
-	@cd deps/mbedtls/build && "$(CMAKE)" .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DENABLE_TESTING=OFF \
-		-DENABLE_PROGRAMS=OFF \
-		-DMBEDTLS_FATAL_WARNINGS=OFF
-else ifeq ($(UNAME_S),Darwin)
-	@cd deps/mbedtls/build && "$(CMAKE)" .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DENABLE_TESTING=OFF \
-		-DENABLE_PROGRAMS=OFF \
-		-DMBEDTLS_FATAL_WARNINGS=OFF
-else
-	@cd deps/mbedtls/build && \
-	CC="$(ZIG) cc $(ZIG_CC_FLAGS)" "$(CMAKE)" .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DENABLE_TESTING=OFF \
-		-DENABLE_PROGRAMS=OFF \
-		-DMBEDTLS_FATAL_WARNINGS=OFF
-endif
-	@cd deps/mbedtls/build && "$(CMAKE)" --build . --config Release -j$(BUILD_JOBS)
-	@echo "mbedTLS installed to deps/mbedtls/build/library/"
 
 mlx-build:
 	@echo "Building MLX static library..."
@@ -168,143 +128,6 @@ mlx-build:
 	@rm -rf deps/mlx/include/mlx
 	@cp -r deps/mlx-src/mlx deps/mlx/include/
 	@echo "MLX $(MLX_VERSION) (JIT mode) installed to deps/mlx/"
-
-curl-build:
-	@echo "Building libcurl with CMake (HTTP-only, minimal)..."
-	@rm -rf deps/curl/build
-	@mkdir -p deps/curl/build
-ifeq ($(UNAME_S),Windows)
-	@cd deps/curl/build && "$(CMAKE)" .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DBUILD_CURL_EXE=OFF \
-		-DBUILD_TESTING=OFF \
-		-DHTTP_ONLY=ON \
-		-DCURL_USE_OPENSSL=OFF \
-		-DCURL_USE_MBEDTLS=ON \
-		-DMBEDTLS_INCLUDE_DIRS=$(CURDIR_POSIX)/deps/mbedtls/include \
-		-DMBEDTLS_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/Release/mbedtls.lib \
-		-DMBEDX509_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/Release/mbedx509.lib \
-		-DMBEDCRYPTO_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/Release/mbedcrypto.lib \
-		-DCURL_USE_LIBPSL=OFF \
-		-DCURL_USE_LIBSSH2=OFF \
-		-DCURL_ZLIB=OFF \
-		-DUSE_LIBIDN2=OFF \
-		-DUSE_NGHTTP2=OFF \
-		-DCURL_BROTLI=OFF \
-		-DCURL_ZSTD=OFF \
-		-DCURL_DISABLE_ALTSVC=ON \
-		-DCURL_DISABLE_COOKIES=OFF \
-		-DCURL_DISABLE_DOH=ON \
-		-DCURL_DISABLE_GETOPTIONS=ON \
-		-DCURL_DISABLE_HSTS=ON \
-		-DCURL_DISABLE_MIME=ON \
-		-DCURL_DISABLE_NETRC=ON \
-		-DCURL_DISABLE_NTLM=ON \
-		-DCURL_DISABLE_PROGRESS_METER=ON \
-		-DCURL_DISABLE_PROXY=OFF \
-		-DCURL_DISABLE_VERBOSE_STRINGS=ON \
-		-DCURL_DISABLE_WEBSOCKETS=ON \
-		-DCURL_DISABLE_IPFS=ON \
-		-DCURL_DISABLE_FORM_API=ON \
-		-DCURL_DISABLE_HEADERS_API=ON \
-		-DCURL_DISABLE_BINDLOCAL=ON \
-		-DCURL_DISABLE_DIGEST_AUTH=ON \
-		-DCURL_DISABLE_BEARER_AUTH=ON \
-		-DCURL_DISABLE_KERBEROS_AUTH=ON \
-		-DCURL_DISABLE_NEGOTIATE_AUTH=ON \
-		-DCURL_DISABLE_AWS=ON \
-		-DCURL_DISABLE_SRP=ON
-else ifeq ($(UNAME_S),Darwin)
-	@cd deps/curl/build && "$(CMAKE)" .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DBUILD_CURL_EXE=OFF \
-		-DBUILD_TESTING=OFF \
-		-DHTTP_ONLY=ON \
-		-DCURL_USE_OPENSSL=OFF \
-		-DCURL_USE_MBEDTLS=ON \
-		-DMBEDTLS_INCLUDE_DIRS=$(CURDIR_POSIX)/deps/mbedtls/include \
-		-DMBEDTLS_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/libmbedtls.a \
-		-DMBEDX509_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/libmbedx509.a \
-		-DMBEDCRYPTO_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/libmbedcrypto.a \
-		-DCURL_USE_LIBPSL=OFF \
-		-DCURL_USE_LIBSSH2=OFF \
-		-DCURL_ZLIB=OFF \
-		-DUSE_LIBIDN2=OFF \
-		-DUSE_NGHTTP2=OFF \
-		-DCURL_BROTLI=OFF \
-		-DCURL_ZSTD=OFF \
-		-DCURL_DISABLE_ALTSVC=ON \
-		-DCURL_DISABLE_COOKIES=OFF \
-		-DCURL_DISABLE_DOH=ON \
-		-DCURL_DISABLE_GETOPTIONS=ON \
-		-DCURL_DISABLE_HSTS=ON \
-		-DCURL_DISABLE_MIME=ON \
-		-DCURL_DISABLE_NETRC=ON \
-		-DCURL_DISABLE_NTLM=ON \
-		-DCURL_DISABLE_PROGRESS_METER=ON \
-		-DCURL_DISABLE_PROXY=OFF \
-		-DCURL_DISABLE_VERBOSE_STRINGS=ON \
-		-DCURL_DISABLE_WEBSOCKETS=ON \
-		-DCURL_DISABLE_IPFS=ON \
-		-DCURL_DISABLE_FORM_API=ON \
-		-DCURL_DISABLE_HEADERS_API=ON \
-		-DCURL_DISABLE_BINDLOCAL=ON \
-		-DCURL_DISABLE_DIGEST_AUTH=ON \
-		-DCURL_DISABLE_BEARER_AUTH=ON \
-		-DCURL_DISABLE_KERBEROS_AUTH=ON \
-		-DCURL_DISABLE_NEGOTIATE_AUTH=ON \
-		-DCURL_DISABLE_AWS=ON \
-		-DCURL_DISABLE_SRP=ON
-else
-	@cd deps/curl/build && \
-	CC="$(ZIG) cc $(ZIG_CC_FLAGS)" "$(CMAKE)" .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DBUILD_CURL_EXE=OFF \
-		-DBUILD_TESTING=OFF \
-		-DHTTP_ONLY=ON \
-		-DCURL_USE_OPENSSL=OFF \
-		-DCURL_USE_MBEDTLS=ON \
-		-DMBEDTLS_INCLUDE_DIRS=$(CURDIR_POSIX)/deps/mbedtls/include \
-		-DMBEDTLS_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/libmbedtls.a \
-		-DMBEDX509_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/libmbedx509.a \
-		-DMBEDCRYPTO_LIBRARY=$(CURDIR_POSIX)/deps/mbedtls/build/library/libmbedcrypto.a \
-		-DCURL_USE_LIBPSL=OFF \
-		-DCURL_USE_LIBSSH2=OFF \
-		-DCURL_ZLIB=OFF \
-		-DUSE_LIBIDN2=OFF \
-		-DUSE_NGHTTP2=OFF \
-		-DCURL_BROTLI=OFF \
-		-DCURL_ZSTD=OFF \
-		-DCURL_DISABLE_ALTSVC=ON \
-		-DCURL_DISABLE_COOKIES=OFF \
-		-DCURL_DISABLE_DOH=ON \
-		-DCURL_DISABLE_GETOPTIONS=ON \
-		-DCURL_DISABLE_HSTS=ON \
-		-DCURL_DISABLE_MIME=ON \
-		-DCURL_DISABLE_NETRC=ON \
-		-DCURL_DISABLE_NTLM=ON \
-		-DCURL_DISABLE_PROGRESS_METER=ON \
-		-DCURL_DISABLE_PROXY=OFF \
-		-DCURL_DISABLE_VERBOSE_STRINGS=ON \
-		-DCURL_DISABLE_WEBSOCKETS=ON \
-		-DCURL_DISABLE_IPFS=ON \
-		-DCURL_DISABLE_FORM_API=ON \
-		-DCURL_DISABLE_HEADERS_API=ON \
-		-DCURL_DISABLE_BINDLOCAL=ON \
-		-DCURL_DISABLE_DIGEST_AUTH=ON \
-		-DCURL_DISABLE_BEARER_AUTH=ON \
-		-DCURL_DISABLE_KERBEROS_AUTH=ON \
-		-DCURL_DISABLE_NEGOTIATE_AUTH=ON \
-		-DCURL_DISABLE_AWS=ON \
-		-DCURL_DISABLE_SRP=ON
-endif
-	@cd deps/curl/build && "$(CMAKE)" --build . --config Release -j$(BUILD_JOBS)
 
 build: deps sync-version
 	$(ZIG) build release $(ZIG_BUILD_FLAGS)
@@ -350,9 +173,7 @@ clean:
 	rm -f bindings/python/talu/$(PYTHON_LIB_NAME)
 	rm -rf docs/dist .venv
 	rm -rf .pytest_cache .ruff_cache
-	rm -rf deps/curl/build
 	rm -rf deps/mlx-src/build
-	rm -rf deps/mbedtls/build
 
 clean-deps:
 	rm -rf deps/

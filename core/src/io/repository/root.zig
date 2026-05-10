@@ -274,12 +274,6 @@ pub fn deleteCachedSnapshot(allocator: std.mem.Allocator, model_id: []const u8, 
     return cache.deleteCachedSnapshot(allocator, model_id, revision);
 }
 
-/// Initialize HTTP globally (call once at program start if using fetch)
-pub const globalInit = http.globalInit;
-
-/// Clean up HTTP globally (call once at program end)
-pub const globalCleanup = http.globalCleanup;
-
 // =============================================================================
 // Unified Repository Operations
 // =============================================================================
@@ -335,9 +329,6 @@ pub fn listFiles(
             }
 
             // Not cached - list from HuggingFace API
-            transport.globalInit();
-            defer transport.globalCleanup();
-
             return ModelSource.default.listFiles(allocator, uri.path, config) catch |err| {
                 return switch (err) {
                     SourceError.Unauthorized => error.Unauthorized,
@@ -433,9 +424,6 @@ pub fn resolveModelPath(allocator: std.mem.Allocator, uri: []const u8, config: R
             }
 
             // Not in any local cache - fetch from HuggingFace Hub
-            transport.globalInit();
-            defer transport.globalCleanup();
-
             return try transport.hf.fetchModel(allocator, parsed.path, .{
                 .token = token,
                 .force = config.force_download,

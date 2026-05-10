@@ -231,30 +231,6 @@ fn normalizePathSeparators(allocator: std.mem.Allocator, path: []const u8) []con
     return normalized;
 }
 
-fn curlArchivePath(target_os: std.Target.Os.Tag) []const u8 {
-    return switch (target_os) {
-        .windows => "deps/curl/build/lib/Release/libcurl.lib",
-        else => "deps/curl/build/lib/libcurl.a",
-    };
-}
-
-fn mbedtlsArchivePath(target_os: std.Target.Os.Tag, name: []const u8) []const u8 {
-    return switch (target_os) {
-        .windows => if (std.mem.eql(u8, name, "mbedtls"))
-            "deps/mbedtls/build/library/Release/mbedtls.lib"
-        else if (std.mem.eql(u8, name, "mbedx509"))
-            "deps/mbedtls/build/library/Release/mbedx509.lib"
-        else
-            "deps/mbedtls/build/library/Release/mbedcrypto.lib",
-        else => if (std.mem.eql(u8, name, "mbedtls"))
-            "deps/mbedtls/build/library/libmbedtls.a"
-        else if (std.mem.eql(u8, name, "mbedx509"))
-            "deps/mbedtls/build/library/libmbedx509.a"
-        else
-            "deps/mbedtls/build/library/libmbedcrypto.a",
-    };
-}
-
 fn rustCliArchivePath(target_os: std.Target.Os.Tag) []const u8 {
     return switch (target_os) {
         .windows => "bindings/rust/target/release/talu_cli.lib",
@@ -536,7 +512,6 @@ fn addCDependencies(
     mod.addIncludePath(b.path("deps/utf8proc"));
     mod.addIncludePath(pcre2.include_dir);
     mod.addIncludePath(b.path("deps/pcre2/src"));
-    mod.addIncludePath(b.path("deps/curl/include"));
 
     // Mozilla CA certificates bundle for HTTPS - generated during `make deps`
     mod.addImport("cacert", cacert_mod);
@@ -548,24 +523,14 @@ fn linkCDependencies(
     pcre2: Pcre2,
     comptime skip_external_archives: bool,
 ) void {
+    _ = b;
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
     const target_os = artifact.rootModuleTarget().os.tag;
 
-    // For static libraries, skip external .a archives to avoid nested archive warnings.
+    // For static libraries, skip external objects to avoid nested archive warnings.
     // The final executable/shared lib will link them directly.
     if (!skip_external_archives) {
-        artifact.addObjectFile(b.path(curlArchivePath(target_os)));
-
-        artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedtls")));
-        artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedx509")));
-        artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedcrypto")));
-
-        if (target_os == .macos) {
-            artifact.linkFramework("CoreFoundation");
-            artifact.linkFramework("SystemConfiguration");
-            artifact.linkFramework("Security");
-        }
         if (target_os == .linux or target_os == .macos) {
             artifact.linkSystemLibrary("pthread");
         } else if (target_os == .windows) {
@@ -603,21 +568,11 @@ fn linkExternalArchives(
     artifact: *std.Build.Step.Compile,
     pcre2: Pcre2,
 ) void {
+    _ = b;
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
     const target_os = artifact.rootModuleTarget().os.tag;
 
-    artifact.addObjectFile(b.path(curlArchivePath(target_os)));
-
-    artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedtls")));
-    artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedx509")));
-    artifact.addObjectFile(b.path(mbedtlsArchivePath(target_os, "mbedcrypto")));
-
-    if (target_os == .macos) {
-        artifact.linkFramework("CoreFoundation");
-        artifact.linkFramework("SystemConfiguration");
-        artifact.linkFramework("Security");
-    }
     if (target_os == .linux or target_os == .macos) {
         artifact.linkSystemLibrary("pthread");
     } else if (target_os == .windows) {
@@ -1100,7 +1055,7 @@ pub fn build(b: *std.Build) void {
         // Link CLI against the shared core library to avoid compiling core twice
         // (shared + static) in the release path.
         exe.linkLibrary(lib);
-        // Link all deps including external .a archives (curl, mbedtls)
+        // Link core C/runtime dependencies.
         linkCDependencies(b, exe, pcre2, false);
 
         // Link platform-specific runtime libraries for Rust CLI
@@ -1116,8 +1071,6 @@ pub fn build(b: *std.Build) void {
         } else if (cli_target_os == .macos) {
             exe.root_module.addRPathSpecial("@executable_path/../lib");
         }
-        // macOS frameworks already linked via linkCDependencies
-
         const install_exe = b.addInstallArtifact(exe, .{});
         install_exe.step.dependOn(&install_lib.step);
         b.getInstallStep().dependOn(&install_exe.step);

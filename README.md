@@ -256,7 +256,7 @@ Models are downloaded from HuggingFace on first use. The models below have been 
 
 ## Build from Source
 
-Requires [Zig 0.15.2](https://ziglang.org/download/), [Cargo (Rust)](https://www.rust-lang.org/tools/install), [Bun](https://bun.sh/), [uv](https://docs.astral.sh/uv/), and CMake.
+Requires [Zig 0.15.2](https://ziglang.org/download/), [Cargo (Rust)](https://www.rust-lang.org/tools/install), [Bun](https://bun.sh/), and [uv](https://docs.astral.sh/uv/). CMake is only needed for macOS MLX source builds.
 
 ```bash
 git clone https://github.com/aprxi/talu.git
