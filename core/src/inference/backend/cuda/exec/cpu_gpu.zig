@@ -84,7 +84,8 @@ fn cpuGpuRequestId(slot_index: u32, token: u32) u64 {
 fn cpuGpuActivationDevice(self: anytype) !bridge.TensorFrameDevice {
     const SelfType = @TypeOf(self.*);
     if (comptime !@hasField(SelfType, "device")) return error.InvalidTopologyConfig;
-    return .{ .cuda = self.device.ordinal() };
+    const ordinal = std.math.cast(u16, self.device.ordinal()) orelse return error.InvalidTopologyConfig;
+    return .{ .cuda = ordinal };
 }
 
 fn buildCpuGpuActivationFrame(
@@ -442,8 +443,8 @@ pub fn runCpuGpuWithPipelineRuntime(
 
 test "buildCpuGpuActivationFrame describes cpu cuda decode handoff" {
     const MockCudaDevice = struct {
-        pub fn ordinal(_: *const @This()) u16 {
-            return 0;
+        pub fn ordinal(_: *const @This()) usize {
+            return 7;
         }
     };
 
@@ -481,16 +482,55 @@ test "buildCpuGpuActivationFrame describes cpu cuda decode handoff" {
     try std.testing.expectEqual(@as(u64, 0x0000_0002_0000_0009), metadata.frame_id);
     try std.testing.expectEqual(@as(u64, 0x0000_0003_0000_0005), metadata.graph_id);
     try std.testing.expectEqual(@as(u64, 0x0000_0002_0000_007b), metadata.request_id);
+    try std.testing.expectEqual(bridge.TensorFrameDevice{ .cuda = 7 }, metadata.device);
     try std.testing.expectEqual(@as(u32, 9), metadata.sequence_start);
     try std.testing.expectEqual(@as(u32, 1), metadata.sequence_len);
     try std.testing.expectEqual(@as(?u32, 2), metadata.slot_index);
+}
+
+test "buildCpuGpuActivationFrame rejects cuda ordinal outside tensor frame range" {
+    const MockCudaDevice = struct {
+        pub fn ordinal(_: *const @This()) usize {
+            return @as(usize, std.math.maxInt(u16)) + 1;
+        }
+    };
+
+    const MockBackend = struct {
+        const BlockRuntimeMock = struct {
+            blocks: []const u8 = &.{},
+        };
+
+        split_layer: usize = 3,
+        d_model: usize = 8,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        block_runtime: BlockRuntimeMock = .{},
+        device: MockCudaDevice = .{},
+    };
+
+    var backend = MockBackend{
+        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+    };
+    const ctx = stage_adapters.DecodeContext{
+        .token = 123,
+        .position = 9,
+        .slot_index = 2,
+        .logits_out_opt = null,
+        .compute_logits = false,
+        .download_logits = false,
+        .ensure_kv_capacity = true,
+        .trace_seq_len_u32 = 10,
+        .trace_pos_offset = 9,
+    };
+
+    try std.testing.expectError(error.InvalidTopologyConfig, buildCpuGpuActivationFrame(&backend, &ctx));
 }
 
 test "runCpuGpuWithPipelineRuntime rejects stale activation byte count before transfer" {
     const d_model: usize = 4;
 
     const MockCudaDevice = struct {
-        pub fn ordinal(_: *const @This()) u16 {
+        pub fn ordinal(_: *const @This()) usize {
             return 0;
         }
     };
