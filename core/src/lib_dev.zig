@@ -12,6 +12,11 @@ pub const talu_get_abi_version = prod.talu_get_abi_version;
 
 pub const tokenizer = @import("tokenizer/root.zig");
 pub const template = @import("template/root.zig");
+pub const template_internals = struct {
+    pub const Evaluator = @import("template/eval.zig").Evaluator;
+    pub const Lexer = @import("template/lexer.zig").Lexer;
+    pub const Parser = @import("template/parser.zig").Parser;
+};
 pub const io = @import("io_pkg");
 pub const inference = @import("inference_pkg");
 pub const responses = @import("responses/root.zig");

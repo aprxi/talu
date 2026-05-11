@@ -20,6 +20,70 @@ pub const TaluModelSpec = capi_types.TaluModelSpec;
 pub const TaluCapabilities = capi_types.TaluCapabilities;
 
 // =============================================================================
+// Structural Validation
+// =============================================================================
+
+pub const ValidationIssue = enum {
+    none,
+    bad_abi,
+    struct_too_small,
+    ref_null,
+    ref_empty,
+    unsupported_namespace,
+    invalid_backend_type,
+    unsupported_backend_type,
+    local_config_out_of_bounds,
+};
+
+pub const ValidationResult = struct {
+    valid: bool,
+    issue: ValidationIssue,
+};
+
+pub fn validateSpec(spec: *const TaluModelSpec) bool {
+    return validateSpecDetailed(spec).valid;
+}
+
+/// Validate the ABI-visible structure without resolving local filesystem paths.
+pub fn validateSpecDetailed(spec: *const TaluModelSpec) ValidationResult {
+    if (spec.abi_version != 1) return invalid(.bad_abi);
+    if (spec.struct_size < MIN_HEADER_SIZE) return invalid(.struct_too_small);
+
+    const ref_ptr = spec.ref orelse return invalid(.ref_null);
+    const ref_raw = std.mem.sliceTo(ref_ptr, 0);
+    if (ref_raw.len == 0) return invalid(.ref_empty);
+    if (hasUnsupportedNamespace(ref_raw)) return invalid(.unsupported_namespace);
+
+    const parsed_backend = parseBackendType(spec.backend_type_raw) orelse return invalid(.invalid_backend_type);
+    const backend_type = if (parsed_backend == .Unspecified)
+        inferBackendTypeStructurally(ref_raw) orelse return invalid(.unsupported_backend_type)
+    else
+        parsed_backend;
+    if (backend_type != .Local) return invalid(.unsupported_backend_type);
+    if (!localConfigInBounds(spec.struct_size)) return invalid(.local_config_out_of_bounds);
+
+    return .{ .valid = true, .issue = .none };
+}
+
+pub fn validationIssueMessage(issue: ValidationIssue) []const u8 {
+    return switch (issue) {
+        .none => "valid",
+        .bad_abi => "unsupported ABI version",
+        .struct_too_small => "model spec struct_size is too small for the requested fields",
+        .ref_null => "model ref is null",
+        .ref_empty => "model ref is empty",
+        .unsupported_namespace => "model ref namespace is unsupported",
+        .invalid_backend_type => "backend type value is invalid",
+        .unsupported_backend_type => "backend type is unsupported or cannot be inferred",
+        .local_config_out_of_bounds => "local backend config is outside struct_size",
+    };
+}
+
+fn invalid(issue: ValidationIssue) ValidationResult {
+    return .{ .valid = false, .issue = issue };
+}
+
+// =============================================================================
 // Canonical Specification
 // =============================================================================
 
@@ -250,6 +314,11 @@ fn inferBackendType(ref: []const u8) !BackendType {
     return error.AmbiguousBackend;
 }
 
+fn inferBackendTypeStructurally(ref: []const u8) ?BackendType {
+    if (std.mem.indexOf(u8, ref, "://") != null) return null;
+    return .Local;
+}
+
 fn hasUnsupportedNamespace(ref: []const u8) bool {
     return std.mem.indexOf(u8, ref, "::") != null;
 }
@@ -292,4 +361,32 @@ test "canonicalizeSpec rejects namespaced model identifiers" {
     spec.backend_type_raw = 0; // Local
 
     try std.testing.expectError(error.InvalidArgument, canonicalizeSpec(std.testing.allocator, &spec));
+}
+
+test "validateSpec validates structure without filesystem checks" {
+    const ref_z = try std.testing.allocator.dupeZ(u8, "/nonexistent/path/to/model");
+    defer std.testing.allocator.free(ref_z);
+
+    var spec = std.mem.zeroes(TaluModelSpec);
+    spec.abi_version = 1;
+    spec.struct_size = @sizeOf(TaluModelSpec);
+    spec.ref = ref_z.ptr;
+    spec.backend_type_raw = 0;
+
+    try std.testing.expect(validateSpec(&spec));
+}
+
+test "validateSpecDetailed reports structural issue" {
+    var spec = std.mem.zeroes(TaluModelSpec);
+    spec.abi_version = 1;
+    spec.struct_size = @sizeOf(TaluModelSpec);
+    spec.backend_type_raw = 0;
+
+    const result = validateSpecDetailed(&spec);
+    try std.testing.expect(!result.valid);
+    try std.testing.expectEqual(ValidationIssue.ref_null, result.issue);
+}
+
+test "validationIssueMessage returns stable text" {
+    try std.testing.expectEqualStrings("model ref is null", validationIssueMessage(.ref_null));
 }

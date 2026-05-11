@@ -477,6 +477,51 @@ fn addCorePackageBuildImportsAndDeps(
     }
 }
 
+fn prepareCorePackages(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    cuda_assets_mod: *std.Build.Module,
+    build_options_mod: *std.Build.Module,
+    cacert_mod: *std.Build.Module,
+    pcre2: Pcre2,
+) CorePackages {
+    var pkgs = CorePackages.init(b, target, optimize);
+    wireCorePackageImports(&pkgs);
+    pkgs.compute_pkg.addImport("cuda_assets", cuda_assets_mod);
+    addCorePackageBuildImportsAndDeps(
+        b,
+        &pkgs,
+        build_options_mod,
+        cacert_mod,
+        pcre2,
+    );
+    return pkgs;
+}
+
+fn createInferencePackageModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    cuda_assets_mod: *std.Build.Module,
+    core_pkgs: *const CorePackages,
+    build_options_mod: *std.Build.Module,
+    cacert_mod: *std.Build.Module,
+    pcre2: Pcre2,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("core/src/inference/abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("cuda_assets", cuda_assets_mod);
+    addCorePackageImports(mod, core_pkgs);
+    mod.addImport("build_options", build_options_mod);
+    addCDependencies(b, mod, cacert_mod, pcre2);
+    return mod;
+}
+
 // =============================================================================
 // Helper to add C dependencies to a module
 // =============================================================================
@@ -523,6 +568,10 @@ fn linkCDependencies(
             artifact.linkSystemLibrary("ntdll");
         }
 
+        if (target_os == .macos) {
+            artifact.linkFramework("Accelerate");
+        }
+
         artifact.addCSourceFiles(.{
             .files = &.{"deps/utf8proc/utf8proc.c"},
             .flags = if (target_os == .windows)
@@ -564,6 +613,10 @@ fn linkExternalArchives(
         artifact.linkSystemLibrary("user32");
         artifact.linkSystemLibrary("ntdll");
     }
+
+    if (target_os == .macos) {
+        artifact.linkFramework("Accelerate");
+    }
 }
 
 // =============================================================================
@@ -574,7 +627,7 @@ const UnitTestCfg = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    build_options: *std.Build.Step.Options,
+    build_options_mod: *std.Build.Module,
     cuda_assets_mod: *std.Build.Module,
     inference_pkg_mod: *std.Build.Module,
     cacert_mod: *std.Build.Module,
@@ -596,7 +649,7 @@ const UnitTestCfg = struct {
         mod.addImport("cuda_assets", self.cuda_assets_mod);
         mod.addImport("inference_pkg", self.inference_pkg_mod);
         addCorePackageImports(mod, self.core_pkgs);
-        mod.addOptions("build_options", self.build_options);
+        mod.addImport("build_options", self.build_options_mod);
         addCDependencies(self.b, mod, self.cacert_mod, self.pcre2);
 
         const test_artifact = self.b.addTest(.{
@@ -846,13 +899,6 @@ pub fn build(b: *std.Build) void {
     const cacert_mod = b.createModule(.{
         .root_source_file = b.path("deps/cacert.zig"),
     });
-    const inference_pkg_mod = b.createModule(.{
-        .root_source_file = b.path("core/src/inference/abi.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
     const cuda_assets_mod = b.createModule(.{
         .root_source_file = b.path("core/cuda_assets.zig"),
         .target = target,
@@ -861,19 +907,25 @@ pub fn build(b: *std.Build) void {
 
     // Build dependencies
     const pcre2 = pcre2_port.add(b, target, optimize);
-    var core_pkgs = CorePackages.init(b, target, optimize);
-    wireCorePackageImports(&core_pkgs);
-    core_pkgs.compute_pkg.addImport("cuda_assets", cuda_assets_mod);
-    addCorePackageBuildImportsAndDeps(
+    const core_pkgs = prepareCorePackages(
         b,
+        target,
+        optimize,
+        cuda_assets_mod,
+        build_options_mod,
+        cacert_mod,
+        pcre2,
+    );
+    const inference_pkg_mod = createInferencePackageModule(
+        b,
+        target,
+        optimize,
+        cuda_assets_mod,
         &core_pkgs,
         build_options_mod,
         cacert_mod,
         pcre2,
     );
-    addCorePackageImports(inference_pkg_mod, &core_pkgs);
-    inference_pkg_mod.addImport("build_options", build_options_mod);
-    addCDependencies(b, inference_pkg_mod, cacert_mod, pcre2);
 
     // ==========================================================================
     // Internal inference library (inference + models + compute)
@@ -1218,6 +1270,26 @@ pub fn build(b: *std.Build) void {
     unit_test_build_options.addOption(bool, "dump_tensors", dump_tensors);
     unit_test_build_options.addOption(bool, "xray_bridge", xray_bridge);
     unit_test_build_options.addOption([]const u8, "version", version);
+    const unit_test_build_options_mod = unit_test_build_options.createModule();
+    const unit_core_pkgs = prepareCorePackages(
+        b,
+        target,
+        optimize,
+        cuda_assets_mod,
+        unit_test_build_options_mod,
+        cacert_mod,
+        pcre2,
+    );
+    const unit_inference_pkg_mod = createInferencePackageModule(
+        b,
+        target,
+        optimize,
+        cuda_assets_mod,
+        &unit_core_pkgs,
+        unit_test_build_options_mod,
+        cacert_mod,
+        pcre2,
+    );
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&FailStep.create(b,
@@ -1258,11 +1330,11 @@ pub fn build(b: *std.Build) void {
         .b = b,
         .target = target,
         .optimize = optimize,
-        .build_options = unit_test_build_options,
+        .build_options_mod = unit_test_build_options_mod,
         .cuda_assets_mod = cuda_assets_mod,
-        .inference_pkg_mod = inference_pkg_mod,
+        .inference_pkg_mod = unit_inference_pkg_mod,
         .cacert_mod = cacert_mod,
-        .core_pkgs = &core_pkgs,
+        .core_pkgs = &unit_core_pkgs,
         .pcre2 = pcre2,
     };
     ut.addLazy("tokenizer", b.path("core/src/lib_dev.zig"), &.{
@@ -1397,6 +1469,26 @@ pub fn build(b: *std.Build) void {
     integration_build_options.addOption(bool, "dump_tensors", dump_tensors);
     integration_build_options.addOption(bool, "xray_bridge", xray_bridge);
     integration_build_options.addOption([]const u8, "version", version);
+    const integration_build_options_mod = integration_build_options.createModule();
+    const integration_core_pkgs = prepareCorePackages(
+        b,
+        target,
+        optimize,
+        cuda_assets_mod,
+        integration_build_options_mod,
+        cacert_mod,
+        pcre2,
+    );
+    const integration_inference_pkg_mod = createInferencePackageModule(
+        b,
+        target,
+        optimize,
+        cuda_assets_mod,
+        &integration_core_pkgs,
+        integration_build_options_mod,
+        cacert_mod,
+        pcre2,
+    );
 
     const integration_main_mod = b.createModule(.{
         .root_source_file = b.path("core/src/lib_dev.zig"),
@@ -1405,9 +1497,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     integration_main_mod.addImport("cuda_assets", cuda_assets_mod);
-    integration_main_mod.addImport("inference_pkg", inference_pkg_mod);
-    addCorePackageImports(integration_main_mod, &core_pkgs);
-    integration_main_mod.addOptions("build_options", integration_build_options);
+    integration_main_mod.addImport("inference_pkg", integration_inference_pkg_mod);
+    addCorePackageImports(integration_main_mod, &integration_core_pkgs);
+    integration_main_mod.addImport("build_options", integration_build_options_mod);
     addCDependencies(b, integration_main_mod, cacert_mod, pcre2);
 
     const integration_test_mod = b.createModule(.{
@@ -1442,6 +1534,26 @@ pub fn build(b: *std.Build) void {
         integration_metal_build_options.addOption(bool, "dump_tensors", dump_tensors);
         integration_metal_build_options.addOption(bool, "xray_bridge", xray_bridge);
         integration_metal_build_options.addOption([]const u8, "version", version);
+        const integration_metal_build_options_mod = integration_metal_build_options.createModule();
+        const integration_metal_core_pkgs = prepareCorePackages(
+            b,
+            target,
+            optimize,
+            cuda_assets_mod,
+            integration_metal_build_options_mod,
+            cacert_mod,
+            pcre2,
+        );
+        const integration_metal_inference_pkg_mod = createInferencePackageModule(
+            b,
+            target,
+            optimize,
+            cuda_assets_mod,
+            &integration_metal_core_pkgs,
+            integration_metal_build_options_mod,
+            cacert_mod,
+            pcre2,
+        );
 
         const integration_metal_main_mod = b.createModule(.{
             .root_source_file = b.path("core/src/lib_dev.zig"),
@@ -1450,9 +1562,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         integration_metal_main_mod.addImport("cuda_assets", cuda_assets_mod);
-        integration_metal_main_mod.addImport("inference_pkg", inference_pkg_mod);
-        addCorePackageImports(integration_metal_main_mod, &core_pkgs);
-        integration_metal_main_mod.addOptions("build_options", integration_metal_build_options);
+        integration_metal_main_mod.addImport("inference_pkg", integration_metal_inference_pkg_mod);
+        addCorePackageImports(integration_metal_main_mod, &integration_metal_core_pkgs);
+        integration_metal_main_mod.addImport("build_options", integration_metal_build_options_mod);
         addCDependencies(b, integration_metal_main_mod, cacert_mod, pcre2);
 
         const integration_metal_test_mod = b.createModule(.{
@@ -1637,11 +1749,6 @@ pub fn build(b: *std.Build) void {
     const perf_sanity_path = "core/tests/helpers/perf_sanity/root.zig";
     if (std.fs.cwd().access(perf_sanity_path, .{})) |_| {
         const host_target = b.resolveTargetQuery(.{});
-        const perf_exe_build_options = b.addOptions();
-        perf_exe_build_options.addOption(bool, "enable_metal", enable_metal);
-        perf_exe_build_options.addOption(bool, "enable_cuda", enable_cuda);
-        perf_exe_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
-        perf_exe_build_options.addOption(bool, "xray_bridge", xray_bridge);
 
         const perf_exe_mod = b.createModule(.{
             .root_source_file = b.path(perf_sanity_path),
@@ -1651,13 +1758,12 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "main", .module = integration_main_mod },
             },
         });
-        perf_exe_mod.addOptions("build_options", perf_exe_build_options);
+        perf_exe_mod.addImport("build_options", integration_build_options_mod);
         const perf_exe = b.addExecutable(.{
             .name = "perf_sanity",
             .root_module = perf_exe_mod,
         });
         linkCDependencies(b, perf_exe, pcre2, false);
-        addMetalCoreSupport(b, perf_exe_mod, perf_exe, enable_metal);
         b.installArtifact(perf_exe);
 
         const run_perf = b.addRunArtifact(perf_exe);
@@ -1669,12 +1775,6 @@ pub fn build(b: *std.Build) void {
         const perf_step = b.step("perf-sanity", "Run perf/lifecycle sanity checks");
         perf_step.dependOn(&run_perf.step);
 
-        const perf_test_build_options = b.addOptions();
-        perf_test_build_options.addOption(bool, "enable_metal", false);
-        perf_test_build_options.addOption(bool, "enable_cuda", enable_cuda);
-        perf_test_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
-        perf_test_build_options.addOption(bool, "xray_bridge", xray_bridge);
-
         const perf_test_mod = b.createModule(.{
             .root_source_file = b.path(perf_sanity_path),
             .target = host_target,
@@ -1683,7 +1783,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "main", .module = integration_main_mod },
             },
         });
-        perf_test_mod.addOptions("build_options", perf_test_build_options);
+        perf_test_mod.addImport("build_options", integration_build_options_mod);
 
         const perf_tests = b.addTest(.{
             .root_module = perf_test_mod,

@@ -18,7 +18,7 @@ const std = @import("std");
 
 // responses
 pub const responses_local_engine = @import("responses/local_engine_test.zig");
-pub const responses_generation_result = @import("responses/generation_result_test.zig");
+pub const responses_batch_result = @import("responses/batch_result_test.zig");
 pub const responses_canonical_spec = @import("responses/canonical_spec_test.zig");
 pub const responses_inference_backend = @import("responses/inference_backend_test.zig");
 pub const responses_parsed_tool_call = @import("responses/parsed_tool_call_test.zig");

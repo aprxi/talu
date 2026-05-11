@@ -13,6 +13,10 @@ const dtype_mod = @import("compute_pkg").dtype;
 
 pub const DumpEnabled = build_options.dump_tensors;
 
+pub fn isDumpEnabled() bool {
+    return DumpEnabled;
+}
+
 /// Maximum number of tensors that can be captured in one run.
 /// Verification/reference sidecars can exceed 4K checkpoints for 100-token runs.
 const MAX_CAPTURES = 1_048_576;
@@ -318,4 +322,8 @@ pub fn shouldStopGlobal() bool {
         return cap.shouldStop();
     }
     return false;
+}
+
+test "isDumpEnabled returns build option" {
+    try std.testing.expectEqual(DumpEnabled, isDumpEnabled());
 }

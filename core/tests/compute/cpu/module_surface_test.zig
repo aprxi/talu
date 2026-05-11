@@ -24,7 +24,7 @@ test "compute.cpu exposes primitive-first modules" {
     _ = compute.cpu.math;
 }
 
-test "compute.cpu transitional sdpa aliases are removed" {
-    try std.testing.expect(!@hasDecl(compute.cpu, "linalg_sdpa"));
+test "compute.cpu linalg sdpa surface is explicit" {
+    try std.testing.expect(@hasDecl(compute.cpu, "linalg_sdpa"));
     try std.testing.expect(!@hasDecl(compute.cpu, "sdpa_decode"));
 }

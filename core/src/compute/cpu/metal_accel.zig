@@ -7,9 +7,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const log = @import("log_pkg");
 
-const metal = if (builtin.os.tag == .macos) @import("../metal/root.zig") else struct {
+const has_metal_accel = build_options.enable_metal and builtin.os.tag == .macos;
+
+const metal = if (has_metal_accel) @import("../metal/root.zig") else struct {
     pub const device = struct {
         pub const Device = void;
     };
@@ -30,7 +33,7 @@ pub fn init() void {
     if (initialized) return;
     initialized = true;
 
-    if (comptime builtin.os.tag != .macos) return;
+    if (comptime !has_metal_accel) return;
 
     // Check if Metal acceleration is disabled via env var
     const disabled = std.process.hasEnvVar(std.heap.page_allocator, "TALU_NO_METAL_ACCEL") catch false;
@@ -78,7 +81,7 @@ pub fn matmulTransBScaled(
     k: usize,
     alpha: f32,
 ) bool {
-    if (comptime builtin.os.tag != .macos) return false;
+    if (comptime !has_metal_accel) return false;
 
     const dev = getDevice() orelse return false;
 
@@ -96,7 +99,7 @@ pub fn matmul(
     n: usize,
     k: usize,
 ) bool {
-    if (comptime builtin.os.tag != .macos) return false;
+    if (comptime !has_metal_accel) return false;
 
     const dev = getDevice() orelse return false;
 

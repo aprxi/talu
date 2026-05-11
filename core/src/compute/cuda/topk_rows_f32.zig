@@ -26,6 +26,16 @@ pub const phase2_op_name: []const u8 = "topk_rows_phase2";
 /// Number of chunks to split each row into for phase 1 parallelism.
 pub const CHUNKS: u32 = 20;
 
+/// Required bytes for one phase-1 scratch buffer.
+pub fn scratchBytes(rows: u32, k: u32) usize {
+    const row_count = @as(usize, rows);
+    const chunks = @as(usize, CHUNKS);
+    const top_k = @as(usize, k);
+    const row_chunks = std.math.mul(usize, row_count, chunks) catch @panic("topk scratch row/chunk count overflow");
+    const entries = std.math.mul(usize, row_chunks, top_k) catch @panic("topk scratch entry count overflow");
+    return std.math.mul(usize, entries, @sizeOf(f32)) catch @panic("topk scratch byte count overflow");
+}
+
 pub fn runTwoPhase(
     arg_pack: *args_mod.ArgPack,
     device: *device_mod.Device,
@@ -77,4 +87,10 @@ pub fn runTwoPhase(
         .grid_x = rows,
         .block_x = block_x,
     }, arg_pack, .pointwise);
+}
+
+test "scratchBytes returns one scratch buffer byte size" {
+    try std.testing.expectEqual(@as(usize, 3 * CHUNKS * 16 * @sizeOf(f32)), scratchBytes(3, 16));
+    try std.testing.expectEqual(@as(usize, 0), scratchBytes(0, 16));
+    try std.testing.expectEqual(@as(usize, 0), scratchBytes(3, 0));
 }

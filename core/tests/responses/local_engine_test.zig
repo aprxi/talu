@@ -10,7 +10,9 @@ const std = @import("std");
 const main = @import("main");
 const LocalEngine = main.responses.LocalEngine;
 const GenerateOptions = main.responses.GenerateOptions;
-const GenerationResult = main.responses.GenerationResult;
+const InferenceConfig = main.responses.InferenceConfig;
+const InferenceState = main.responses.InferenceState;
+const SchedulerConfig = main.responses.SchedulerConfig;
 
 // =============================================================================
 // Type Export Tests
@@ -25,41 +27,57 @@ test "LocalEngine is exported from responses" {
 test "LocalEngine has expected fields" {
     const fields = @typeInfo(LocalEngine).@"struct".fields;
 
-    // Should have allocator, loaded, tok, samp, backend, gen_config,
-    // preproc_config, model_path, scheduler_state_descriptors.
-    try std.testing.expectEqual(@as(usize, 9), fields.len);
+    try std.testing.expectEqual(@as(usize, 15), fields.len);
 
     var has_allocator = false;
     var has_loaded = false;
+    var has_model_config = false;
+    var has_model_file_size = false;
+    var has_model_tensor_count = false;
+    var has_model_weight_dtype_tag = false;
     var has_tok = false;
     var has_samp = false;
     var has_backend = false;
     var has_gen_config = false;
     var has_preproc_config = false;
     var has_model_path = false;
+    var has_cached_chat_template = false;
     var has_scheduler_state_descriptors = false;
+    var has_backend_init_options = false;
 
     inline for (fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "allocator")) has_allocator = true;
         if (comptime std.mem.eql(u8, field.name, "loaded")) has_loaded = true;
+        if (comptime std.mem.eql(u8, field.name, "model_config")) has_model_config = true;
+        if (comptime std.mem.eql(u8, field.name, "model_file_size")) has_model_file_size = true;
+        if (comptime std.mem.eql(u8, field.name, "model_tensor_count")) has_model_tensor_count = true;
+        if (comptime std.mem.eql(u8, field.name, "model_weight_dtype_tag")) has_model_weight_dtype_tag = true;
         if (comptime std.mem.eql(u8, field.name, "tok")) has_tok = true;
         if (comptime std.mem.eql(u8, field.name, "samp")) has_samp = true;
         if (comptime std.mem.eql(u8, field.name, "backend")) has_backend = true;
         if (comptime std.mem.eql(u8, field.name, "gen_config")) has_gen_config = true;
         if (comptime std.mem.eql(u8, field.name, "preproc_config")) has_preproc_config = true;
         if (comptime std.mem.eql(u8, field.name, "model_path")) has_model_path = true;
+        if (comptime std.mem.eql(u8, field.name, "cached_chat_template")) has_cached_chat_template = true;
         if (comptime std.mem.eql(u8, field.name, "scheduler_state_descriptors")) has_scheduler_state_descriptors = true;
+        if (comptime std.mem.eql(u8, field.name, "backend_init_options")) has_backend_init_options = true;
     }
 
     try std.testing.expect(has_allocator);
     try std.testing.expect(has_loaded);
+    try std.testing.expect(has_model_config);
+    try std.testing.expect(has_model_file_size);
+    try std.testing.expect(has_model_tensor_count);
+    try std.testing.expect(has_model_weight_dtype_tag);
     try std.testing.expect(has_tok);
     try std.testing.expect(has_samp);
     try std.testing.expect(has_backend);
     try std.testing.expect(has_gen_config);
     try std.testing.expect(has_preproc_config);
     try std.testing.expect(has_model_path);
+    try std.testing.expect(has_cached_chat_template);
     try std.testing.expect(has_scheduler_state_descriptors);
+    try std.testing.expect(has_backend_init_options);
 }
 
 // =============================================================================
@@ -85,8 +103,12 @@ test "LocalEngine has deinit method" {
     try std.testing.expect(@hasDecl(LocalEngine, "deinit"));
 }
 
-test "LocalEngine has generate method" {
-    try std.testing.expect(@hasDecl(LocalEngine, "generate"));
+test "LocalEngine has run method" {
+    try std.testing.expect(@hasDecl(LocalEngine, "run"));
+}
+
+test "LocalEngine has createScheduler method" {
+    try std.testing.expect(@hasDecl(LocalEngine, "createScheduler"));
 }
 
 test "LocalEngine has getEosTokens method" {
@@ -130,21 +152,33 @@ test "LocalEngine.initWithSeed returns error for missing model" {
 // Type Relationship Tests
 // =============================================================================
 
-test "LocalEngine.generate returns GenerationResult" {
+test "LocalEngine.run returns InferenceState" {
     // Verify return type through reflection
-    const generate_fn = @typeInfo(@TypeOf(LocalEngine.generate)).@"fn";
-    const ReturnType = generate_fn.return_type.?;
+    const run_fn = @typeInfo(@TypeOf(LocalEngine.run)).@"fn";
+    const ReturnType = run_fn.return_type.?;
 
-    // Should be an error union with GenerationResult
+    // Should be an error union with InferenceState
     const error_union_info = @typeInfo(ReturnType);
     try std.testing.expect(error_union_info == .error_union);
-    try std.testing.expect(error_union_info.error_union.payload == GenerationResult);
+    try std.testing.expect(error_union_info.error_union.payload == InferenceState);
 }
 
-test "LocalEngine.generate accepts GenerateOptions" {
-    const generate_fn = @typeInfo(@TypeOf(LocalEngine.generate)).@"fn";
+test "LocalEngine.run accepts prompt and InferenceConfig" {
+    const run_fn = @typeInfo(@TypeOf(LocalEngine.run)).@"fn";
 
-    // Third parameter should be GenerateOptions
-    try std.testing.expectEqual(@as(usize, 3), generate_fn.params.len);
-    try std.testing.expect(generate_fn.params[2].type == GenerateOptions);
+    try std.testing.expectEqual(@as(usize, 3), run_fn.params.len);
+    try std.testing.expect(run_fn.params[1].type == []const u8);
+    try std.testing.expect(run_fn.params[2].type == InferenceConfig);
+}
+
+test "LocalEngine.createScheduler accepts SchedulerConfig" {
+    const create_fn = @typeInfo(@TypeOf(LocalEngine.createScheduler)).@"fn";
+
+    try std.testing.expectEqual(@as(usize, 2), create_fn.params.len);
+    try std.testing.expect(create_fn.params[1].type == SchedulerConfig);
+}
+
+test "GenerateOptions remains exported for batch configuration" {
+    const fields = @typeInfo(GenerateOptions).@"struct".fields;
+    try std.testing.expect(fields.len > 0);
 }

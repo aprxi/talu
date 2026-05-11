@@ -1,5 +1,6 @@
 id	family	version	model_types
-gemma3	gemma	gemma3	gemma3,gemma3_text,gemma2,gemma
+gemma3	gemma	gemma3	gemma3,gemma3_text,gemma4,gemma4_text,gemma2,gemma
+gemma4_moe	gemma	gemma4_moe	gemma4_moe
 gpt_oss	gpt_oss	gpt_oss	gpt_oss
 granite3	granite	granite3	granite
 granite_hybrid	granite	granite_hybrid	granite_hybrid,granitehybrid,granitemoehybrid
@@ -11,6 +12,8 @@ minilm	bert	minilm	bert,minilm
 ministral3	mistral	ministral3	ministral3,mistral3
 phi	phi	phi4	phi3,phi4,phi
 qwen3	qwen	qwen3	qwen3,qwen3_vl,qwen2.5,qwen2,qwen
+qwen3_5	qwen	qwen3_5	qwen3_5,qwen3.5,qwen3_5_text
+qwen3_5_moe	qwen	qwen3_5_moe	qwen3_5_moe,qwen3_5_moe_text
 qwen3_moe	qwen	qwen3_moe	qwen3_moe
 qwen3_next	qwen	qwen3_next	qwen3_next
 youtu_vl	youtu_vl	youtu_vl	youtu_vl

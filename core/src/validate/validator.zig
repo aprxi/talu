@@ -65,15 +65,49 @@ pub const Validator = struct {
         return self.bytes_consumed;
     }
 
+    /// Get active parser state count.
+    pub fn getStateCount(self: *const Validator) usize {
+        return self.engine.states.stacks.items.len;
+    }
+
     /// Get valid next bytes from current state.
     pub fn getValidFirstBytes(self: *const Validator, valid: *[256]bool) void {
         for (valid) |*v| v.* = false;
         self.engine.getValidFirstBytes(valid);
     }
 
+    /// Count valid next bytes from current state.
+    pub fn countValidBytes(self: *const Validator) usize {
+        var valid: [256]bool = undefined;
+        self.getValidFirstBytes(&valid);
+
+        var count: usize = 0;
+        for (valid) |is_valid| {
+            if (is_valid) count += 1;
+        }
+        return count;
+    }
+
+    /// Return a required literal continuation when the state is deterministic.
+    pub fn getDeterministicContinuation(self: *const Validator) ?[]const u8 {
+        return self.engine.getDeterministicContinuation();
+    }
+
     /// Check if byte sequence can be accepted from current state (read-only).
     pub fn canAccept(self: *Validator, data: []const u8) !bool {
         return self.engine.canAccept(data);
+    }
+
+    /// Advance state by a single byte.
+    /// Returns false and leaves state unchanged when the byte is not valid.
+    pub fn advanceByte(self: *Validator, byte: u8) !bool {
+        var valid: [256]bool = undefined;
+        self.getValidFirstBytes(&valid);
+        if (!valid[byte]) return false;
+
+        try self.engine.advance(&.{byte});
+        self.bytes_consumed += 1;
+        return true;
     }
 
     /// Advance state by byte sequence.
@@ -177,6 +211,17 @@ test "Validator.getPosition returns bytes_consumed" {
     try std.testing.expectEqual(@as(usize, 42), validator.getPosition());
 }
 
+test "Validator.getStateCount returns active parser states" {
+    const allocator = std.testing.allocator;
+
+    var validator = try Validator.init(allocator,
+        \\{"type": "object", "properties": {"x": {"type": "integer"}}}
+    );
+    defer validator.deinit();
+
+    try std.testing.expect(validator.getStateCount() > 0);
+}
+
 test "Validator.getValidFirstBytes populates array" {
     const allocator = std.testing.allocator;
 
@@ -192,6 +237,28 @@ test "Validator.getValidFirstBytes populates array" {
     try std.testing.expectEqual(true, valid['{']);
 }
 
+test "Validator.countValidBytes counts valid next bytes" {
+    const allocator = std.testing.allocator;
+
+    var validator = try Validator.init(allocator,
+        \\{"type": "object", "properties": {"x": {"type": "integer"}}}
+    );
+    defer validator.deinit();
+
+    try std.testing.expect(validator.countValidBytes() > 0);
+}
+
+test "Validator.getDeterministicContinuation forwards engine result" {
+    const allocator = std.testing.allocator;
+
+    var validator = try Validator.init(allocator,
+        \\{"type": "null"}
+    );
+    defer validator.deinit();
+
+    _ = validator.getDeterministicContinuation();
+}
+
 test "Validator.canAccept does not modify state" {
     const allocator = std.testing.allocator;
 
@@ -205,4 +272,18 @@ test "Validator.canAccept does not modify state" {
     const pos_after = validator.getPosition();
 
     try std.testing.expectEqual(pos_before, pos_after);
+}
+
+test "Validator.advanceByte advances valid byte only" {
+    const allocator = std.testing.allocator;
+
+    var validator = try Validator.init(allocator,
+        \\{"type": "object", "properties": {"x": {"type": "integer"}}}
+    );
+    defer validator.deinit();
+
+    try std.testing.expect(try validator.advanceByte('{'));
+    try std.testing.expectEqual(@as(usize, 1), validator.getPosition());
+    try std.testing.expect(!try validator.advanceByte('x'));
+    try std.testing.expectEqual(@as(usize, 1), validator.getPosition());
 }
