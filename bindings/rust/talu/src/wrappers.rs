@@ -279,13 +279,18 @@ impl TokenizerHandle {
     /// Creates a new tokenizer from a model path.
     pub fn new(model_path: &str) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        let c_path = CString::new(model_path)?;
+        let c_path = CString::new(model_path)
+            .map_err(|_| crate::Error::talu("tokenizer model path contains interior NUL byte"))?;
         // SAFETY: c_path is a valid CString; ptr is a valid out-param.
         let rc = unsafe {
             talu_sys::talu_tokenizer_create(c_path.as_ptr(), &mut ptr as *mut _ as *mut c_void)
         };
         if rc != 0 || ptr.is_null() {
-            return Err(error_from_last_or("Failed to load tokenizer"));
+            let detail = crate::error::last_error_message()
+                .unwrap_or_else(|| "native tokenizer creation returned no handle".to_string());
+            return Err(crate::Error::talu(format!(
+                "failed to load tokenizer from {model_path:?}: {detail}"
+            )));
         }
         Ok(Self { ptr })
     }

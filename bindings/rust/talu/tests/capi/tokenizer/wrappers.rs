@@ -8,7 +8,44 @@ use std::ffi::{c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use talu::{TokenizerEncodeOptions, TokenizerHandle, TokenizerTruncation, TokenizerTruncationSide};
+
+const TEMPLATE_POSTPROCESSOR_TOKENIZER_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"H": 4, "i": 5},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
 
 struct TempTokenizerModel {
     dir: tempfile::TempDir,
@@ -107,6 +144,17 @@ fn non_empty_error_text(error: talu::Error) -> String {
     text
 }
 
+fn encode_with_template_options(
+    tokenizer: &TokenizerHandle,
+    text: &str,
+    options: TokenizerEncodeOptions,
+) -> Vec<u32> {
+    tokenizer
+        .encode_with_options(text, options)
+        .expect("template encode must succeed")
+        .ids
+}
+
 #[test]
 fn wrapper_from_json_encode_decode_and_vocab_contract() {
     let tokenizer = TokenizerHandle::from_json(TOKENIZER_JSON).expect("JSON tokenizer must load");
@@ -172,6 +220,175 @@ fn wrapper_encode_with_options_returns_full_encoding_fields() {
 }
 
 #[test]
+fn wrapper_encode_options_add_bos_eos_are_forwarded() {
+    let tokenizer = TokenizerHandle::from_json(TEMPLATE_POSTPROCESSOR_TOKENIZER_JSON)
+        .expect("JSON tokenizer must load");
+
+    assert_eq!(
+        encode_with_template_options(&tokenizer, "Hi", TokenizerEncodeOptions::default()),
+        vec![4, 5],
+        "default wrapper options must not add template special tokens"
+    );
+    assert_eq!(
+        encode_with_template_options(
+            &tokenizer,
+            "Hi",
+            TokenizerEncodeOptions {
+                add_bos: true,
+                ..Default::default()
+            },
+        ),
+        vec![1, 4, 5],
+        "add_bos must prepend only BOS"
+    );
+    assert_eq!(
+        encode_with_template_options(
+            &tokenizer,
+            "Hi",
+            TokenizerEncodeOptions {
+                add_eos: true,
+                ..Default::default()
+            },
+        ),
+        vec![4, 5, 2],
+        "add_eos must append only EOS"
+    );
+    assert_eq!(
+        encode_with_template_options(
+            &tokenizer,
+            "Hi",
+            TokenizerEncodeOptions {
+                add_bos: true,
+                add_eos: true,
+                ..Default::default()
+            },
+        ),
+        vec![1, 4, 5, 2],
+        "add_bos and add_eos together must apply the full template"
+    );
+    assert_eq!(
+        encode_with_template_options(
+            &tokenizer,
+            "",
+            TokenizerEncodeOptions {
+                add_bos: true,
+                ..Default::default()
+            },
+        ),
+        vec![1],
+        "empty input with add_bos must produce only BOS"
+    );
+    assert_eq!(
+        encode_with_template_options(
+            &tokenizer,
+            "",
+            TokenizerEncodeOptions {
+                add_eos: true,
+                ..Default::default()
+            },
+        ),
+        vec![2],
+        "empty input with add_eos must produce only EOS"
+    );
+}
+
+#[test]
+fn wrapper_batch_options_match_individual_encode() {
+    let tokenizer = TokenizerHandle::from_json(TEMPLATE_POSTPROCESSOR_TOKENIZER_JSON)
+        .expect("JSON tokenizer must load");
+    let texts = vec!["Hi".to_string(), "H".to_string(), String::new()];
+    let options = TokenizerEncodeOptions {
+        add_bos: true,
+        add_eos: true,
+        truncation: Some(TokenizerTruncation {
+            max_length: 3,
+            side: TokenizerTruncationSide::Right,
+        }),
+    };
+
+    let expected = texts
+        .iter()
+        .map(|text| encode_with_template_options(&tokenizer, text, options))
+        .collect::<Vec<_>>();
+    assert_eq!(expected, vec![vec![1, 4, 5], vec![1, 4, 2], vec![1, 2]]);
+
+    let rows = tokenizer
+        .encode_batch_ids(&texts, options)
+        .expect("batch encode with wrapper options must succeed");
+    assert_eq!(
+        rows, expected,
+        "batch wrapper options must match individual encode_with_options"
+    );
+}
+
+#[test]
+fn wrapper_encoding_fields_include_special_token_masks() {
+    let tokenizer = TokenizerHandle::from_json(TEMPLATE_POSTPROCESSOR_TOKENIZER_JSON)
+        .expect("JSON tokenizer must load");
+
+    let encoding = tokenizer
+        .encode_with_options(
+            "Hi",
+            TokenizerEncodeOptions {
+                add_bos: true,
+                add_eos: true,
+                ..Default::default()
+            },
+        )
+        .expect("template encode must succeed");
+
+    assert_eq!(encoding.ids, vec![1, 4, 5, 2]);
+    assert_eq!(encoding.attention_mask, vec![1, 1, 1, 1]);
+    assert_eq!(encoding.special_tokens_mask, vec![1, 0, 0, 1]);
+    assert_eq!(encoding.offsets, vec![[0, 0], [0, 1], [1, 2], [0, 0]]);
+}
+
+#[test]
+fn wrapper_shared_handle_supports_concurrent_queries() {
+    let tokenizer =
+        Arc::new(TokenizerHandle::from_json(TOKENIZER_JSON).expect("JSON tokenizer must load"));
+    let thread_count = 8;
+    let barrier = Arc::new(Barrier::new(thread_count));
+    let mut handles = Vec::with_capacity(thread_count);
+
+    for thread_id in 0..thread_count {
+        let tokenizer = Arc::clone(&tokenizer);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for iter in 0..100 {
+                assert_eq!(
+                    tokenizer.encode("Hi").unwrap().tokens,
+                    vec![44, 77],
+                    "thread {thread_id} iter {iter}: encode mismatch"
+                );
+                assert_eq!(
+                    tokenizer.decode(&[44, 77], false).unwrap(),
+                    "Hi",
+                    "thread {thread_id} iter {iter}: decode mismatch"
+                );
+                assert_eq!(
+                    tokenizer.token_to_id("H").unwrap(),
+                    44,
+                    "thread {thread_id} iter {iter}: token_to_id mismatch"
+                );
+                assert_eq!(
+                    tokenizer.id_to_token(77).unwrap(),
+                    "i",
+                    "thread {thread_id} iter {iter}: id_to_token mismatch"
+                );
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("concurrent wrapper query thread must not panic");
+    }
+}
+
+#[test]
 fn wrapper_batch_encode_returns_rows_and_handles_empty_inputs() {
     let tokenizer = TokenizerHandle::from_json(TOKENIZER_JSON).expect("JSON tokenizer must load");
     let texts = vec!["Hi".to_string(), "A".to_string(), String::new()];
@@ -218,6 +435,45 @@ fn wrapper_error_paths_return_result_errors_with_context() {
     assert!(
         non_empty_error_text(tokenizer.id_to_token(9999).unwrap_err()).contains("9999"),
         "unknown id error should include the requested id"
+    );
+}
+
+#[test]
+fn wrapper_new_error_paths_are_diagnosable() {
+    let temp = tempfile::tempdir().expect("temp dir must be created");
+    let missing_path = temp.path().join("missing-tokenizer");
+    let missing_path_text = missing_path
+        .to_str()
+        .expect("temp missing path must be valid UTF-8");
+    let missing_error = non_empty_error_text(TokenizerHandle::new(missing_path_text).unwrap_err());
+    assert!(
+        missing_error.contains("failed to load tokenizer"),
+        "missing path error should name the failed operation: {missing_error}"
+    );
+    assert!(
+        missing_error.contains(missing_path_text),
+        "missing path error should include the requested path: {missing_error}"
+    );
+
+    let empty_dir = tempfile::tempdir().expect("empty model dir must be created");
+    let empty_dir_text = empty_dir
+        .path()
+        .to_str()
+        .expect("temp model dir must be valid UTF-8");
+    let empty_dir_error = non_empty_error_text(TokenizerHandle::new(empty_dir_text).unwrap_err());
+    assert!(
+        empty_dir_error.contains("failed to load tokenizer"),
+        "empty model dir error should name the failed operation: {empty_dir_error}"
+    );
+    assert!(
+        empty_dir_error.contains(empty_dir_text),
+        "empty model dir error should include the requested path: {empty_dir_error}"
+    );
+
+    let nul_error = non_empty_error_text(TokenizerHandle::new("bad\0path").unwrap_err());
+    assert!(
+        nul_error.contains("interior NUL"),
+        "interior-NUL path error should identify the invalid path shape: {nul_error}"
     );
 }
 
