@@ -96,6 +96,15 @@ pub const WeightMap = runtime_blocks.WeightMap;
 pub const BlockMapContext = runtime_blocks.BlockMapContext;
 pub const LayerWeights = runtime_blocks.LayerWeights;
 
+pub const LayerRange = struct {
+    start: usize,
+    end: usize,
+
+    pub fn len(self: LayerRange) usize {
+        return self.end - self.start;
+    }
+};
+
 comptime {
     if (cpu_linalg.matmul.MAX_GROUPS != topology.MAX_SUPPORTED_GAFFINE_GROUPS) {
         @compileError("Grouped-affine max groups mismatch between model loader and CPU matmul kernels");
@@ -449,6 +458,123 @@ fn tensor_bytes_to_u32(
     owned.* = aligned;
     return aligned;
 }
+
+inline fn fp4E2m1NibbleToF32(nibble: u8) f32 {
+    const magnitude = switch (nibble & 0x07) {
+        0 => @as(f32, 0.0),
+        1 => @as(f32, 0.5),
+        2 => @as(f32, 1.0),
+        3 => @as(f32, 1.5),
+        4 => @as(f32, 2.0),
+        5 => @as(f32, 3.0),
+        6 => @as(f32, 4.0),
+        7 => @as(f32, 6.0),
+        else => unreachable,
+    };
+    if ((nibble & 0x08) != 0) return -magnitude;
+    return magnitude;
+}
+
+pub const MaterializedWeightStore = struct {
+    allocator: std.mem.Allocator,
+    tensors: std.ArrayListUnmanaged(*Tensor) = .{},
+
+    pub fn init(allocator: std.mem.Allocator) MaterializedWeightStore {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *MaterializedWeightStore) void {
+        const allocator = self.allocator;
+        for (self.tensors.items) |owned| {
+            owned.deinit(allocator);
+        }
+        self.tensors.deinit(allocator);
+        self.* = .{ .allocator = allocator };
+    }
+
+    pub fn materializeTensorForCpu(self: *MaterializedWeightStore, source: *const Tensor) !*const Tensor {
+        if (source.nvfp4 == null) return source;
+        return try self.materializeNvfp4ToBf16(source);
+    }
+
+    pub fn materializeLayerWeights(
+        self: *MaterializedWeightStore,
+        map_allocator: std.mem.Allocator,
+        layer: *const LayerWeights,
+    ) !LayerWeights {
+        var weight_map = WeightMap{};
+        errdefer weight_map.deinit(map_allocator);
+
+        var it = layer.weight_map.iterator();
+        while (it.next()) |entry| {
+            const materialized = try self.materializeTensorForCpu(entry.value_ptr.*);
+            try weight_map.put(map_allocator, entry.key_ptr.*, materialized);
+        }
+
+        return .{
+            .block_type = layer.block_type,
+            .weight_map = weight_map,
+            .map_context = layer.map_context,
+        };
+    }
+
+    pub fn deinitLayerWeights(_: *MaterializedWeightStore, map_allocator: std.mem.Allocator, layer: *LayerWeights) void {
+        layer.weight_map.deinit(map_allocator);
+        layer.* = undefined;
+    }
+
+    fn materializeNvfp4ToBf16(self: *MaterializedWeightStore, source: *const Tensor) !*const Tensor {
+        const meta = source.nvfp4 orelse return error.MissingScales;
+        if (source.n_dims != 2) return error.InvalidShape;
+
+        const rows: usize = @intCast(meta.rows);
+        const cols: usize = @intCast(meta.cols);
+        const packed_cols: usize = @intCast(meta.packed_cols);
+        const scale_cols: usize = @intCast(meta.scale_cols);
+        const group_size: usize = @intCast(meta.group_size);
+        if (rows == 0 or cols == 0 or packed_cols == 0 or scale_cols == 0 or group_size == 0) {
+            return error.InvalidShape;
+        }
+        if (packed_cols * 2 != cols) return error.InvalidShape;
+        if (cols % group_size != 0) return error.InvalidShape;
+        if (meta.weight_global_scale == 0.0 or !std.math.isFinite(meta.weight_global_scale)) {
+            return error.InvalidShape;
+        }
+
+        const packed_bytes = source.data();
+        const packed_required = std.math.mul(usize, rows, packed_cols) catch return error.InvalidShape;
+        if (packed_bytes.len < packed_required) return error.InvalidShape;
+
+        const scales_ptr = meta.block_scales_data orelse return error.MissingScales;
+        const scale_required = std.math.mul(usize, rows, scale_cols) catch return error.InvalidShape;
+        if (meta.block_scales_len < scale_required) return error.InvalidShape;
+        const scales = scales_ptr[0..scale_required];
+
+        const materialized = try Tensor.init(
+            self.allocator,
+            &.{ @intCast(rows), @intCast(cols) },
+            .bf16,
+            tensor.Device.cpu(),
+        );
+        errdefer materialized.deinit(self.allocator);
+
+        const dst = materialized.asSliceMut(u16);
+        for (0..rows) |row_idx| {
+            const packed_row = packed_bytes[row_idx * packed_cols ..][0..packed_cols];
+            const scale_row = scales[row_idx * scale_cols ..][0..scale_cols];
+            for (0..cols) |col_idx| {
+                const packed_byte = packed_row[col_idx / 2];
+                const nibble = if ((col_idx & 1) == 0) packed_byte & 0x0F else (packed_byte >> 4) & 0x0F;
+                const local_scale = dtype.fp8e4m3ToF32(scale_row[col_idx / group_size]);
+                const value = fp4E2m1NibbleToF32(nibble) * (local_scale / meta.weight_global_scale);
+                dst[row_idx * cols + col_idx] = dtype.f32ToBf16(value);
+            }
+        }
+
+        try self.tensors.append(self.allocator, materialized);
+        return materialized;
+    }
+};
 
 /// Create a heap-allocated NormKernel, choosing LayerNorm when bias is present.
 fn createNormKernel(
@@ -2052,12 +2178,17 @@ pub fn buildBlocksFromLayers(
     config: ModelConfig,
     runtime: model_config.ModelRuntime,
     layer_weights: []const LayerWeights,
+    layer_range: LayerRange,
+    materialized_store: ?*MaterializedWeightStore,
     progress: progress_mod.Context,
 ) ![]TransformerBlock {
     _ = _arena_allocator;
     if (layer_weights.len != config.n_layers) return error.InvalidLayerCount;
+    if (layer_range.start > layer_range.end or layer_range.end > layer_weights.len) return error.InvalidLayerRange;
+    const layer_count = layer_range.len();
+    if (layer_count == 0) return error.InvalidLayerRange;
 
-    const block_array = try allocator.alloc(TransformerBlock, @intCast(config.n_layers));
+    const block_array = try allocator.alloc(TransformerBlock, layer_count);
     errdefer allocator.free(block_array);
 
     const base_attention_scale = resolveAttentionScale(config, @intCast(config.head_dim));
@@ -2067,7 +2198,17 @@ pub fn buildBlocksFromLayers(
     else
         null;
 
-    for (block_array, layer_weights, 0..) |*block_slot, *layer, layer_idx| {
+    for (block_array, layer_weights[layer_range.start..layer_range.end], 0..) |*block_slot, *source_layer, local_layer_idx| {
+        const layer_idx = layer_range.start + local_layer_idx;
+        var materialized_layer: ?LayerWeights = null;
+        defer if (materialized_layer) |*owned_layer| {
+            if (materialized_store) |store| store.deinitLayerWeights(allocator, owned_layer);
+        };
+        const layer: *const LayerWeights = if (materialized_store) |store| blk: {
+            materialized_layer = try store.materializeLayerWeights(allocator, source_layer);
+            break :blk if (materialized_layer) |*owned_layer| owned_layer else unreachable;
+        } else source_layer;
+
         var layer_d_ff: usize = @intCast(config.d_ff);
         var layer_n_heads: usize = @intCast(config.n_heads);
         var layer_n_kv_heads: usize = @intCast(config.n_kv_groups);
@@ -2115,7 +2256,7 @@ pub fn buildBlocksFromLayers(
             attn_ptr.kv_shared_source_layer = resolveSharedKvSourceLayer(config, layer_idx);
         }
         try block_slot.initWeightRegistry(allocator, block_weight);
-        progress.updateLine(1, @intCast(layer_idx + 1), null);
+        progress.updateLine(1, @intCast(local_layer_idx + 1), null);
     }
 
     return block_array;
@@ -2650,6 +2791,237 @@ test "TransformerBlock: getDModel from SwiGLU FFN" {
     const ffn_layer_ptr = block.getFfnLayer() orelse unreachable;
     const result = ffn_layer_ptr.getDModel();
     try std.testing.expectEqual(@as(usize, d_model), result);
+}
+
+test "MaterializedWeightStore.materializeTensorForCpu converts NVFP4 to BF16" {
+    const allocator = std.testing.allocator;
+    var store = MaterializedWeightStore.init(allocator);
+    defer store.deinit();
+
+    var packed_bytes = [_]u8{ 0x21, 0xB4 };
+    var scales = [_]u8{ dtype.f32ToFp8E4M3(1.0), dtype.f32ToFp8E4M3(1.0) };
+    var source = Tensor.view(@ptrCast(packed_bytes[0..].ptr), &.{ 1, 4 }, .u8, packed_bytes.len);
+    source.nvfp4 = .{
+        .block_scales_data = scales[0..].ptr,
+        .block_scales_len = scales.len,
+        .rows = 1,
+        .cols = 4,
+        .packed_cols = 2,
+        .scale_cols = 2,
+        .group_size = 2,
+        .weight_global_scale = 1.0,
+    };
+
+    const materialized = try store.materializeTensorForCpu(&source);
+    try std.testing.expect(materialized != &source);
+    try std.testing.expectEqual(dtype.DType.bf16, materialized.dtype);
+    try std.testing.expectEqual(@as(i64, 1), materialized.shape[0]);
+    try std.testing.expectEqual(@as(i64, 4), materialized.shape[1]);
+
+    const decoded = materialized.asSlice(u16);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), dtype.bf16ToF32(decoded[0]), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dtype.bf16ToF32(decoded[1]), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), dtype.bf16ToF32(decoded[2]), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.5), dtype.bf16ToF32(decoded[3]), 0.01);
+}
+
+test "MaterializedWeightStore.materializeTensorForCpu leaves CPU-supported tensors native" {
+    const allocator = std.testing.allocator;
+    var store = MaterializedWeightStore.init(allocator);
+    defer store.deinit();
+
+    var dense_data = [_]f32{ 1, 2, 3, 4 };
+    var dense = Tensor.view2DSlice(dense_data[0..], 2, 2);
+    try std.testing.expect((try store.materializeTensorForCpu(&dense)) == &dense);
+
+    var fp8_data = [_]u8{ dtype.f32ToFp8E4M3(1.0), dtype.f32ToFp8E4M3(-0.5) };
+    var fp8 = Tensor.view(@ptrCast(fp8_data[0..].ptr), &.{ 1, 2 }, .f8_e4m3, null);
+    fp8.fp8 = .{ .scale_inv = 1.0 };
+    try std.testing.expect((try store.materializeTensorForCpu(&fp8)) == &fp8);
+
+    var packed_words = [_]u32{0};
+    var scale_words = [_]u16{dtype.f32ToBf16(1.0)};
+    var bias_words = [_]u16{dtype.f32ToBf16(0.0)};
+    var gaffine = Tensor.view(@ptrCast(std.mem.sliceAsBytes(packed_words[0..]).ptr), &.{ 1, 8 }, .grouped_affine_u4, @sizeOf(u32));
+    gaffine.gaffine = .{
+        .scales = std.mem.sliceAsBytes(scale_words[0..]),
+        .biases = std.mem.sliceAsBytes(bias_words[0..]),
+        .group_size = 8,
+        .scales_dtype = .bf16,
+    };
+    try std.testing.expect((try store.materializeTensorForCpu(&gaffine)) == &gaffine);
+}
+
+fn testAttentionConfig(n_layers: usize, d_model: usize, d_ff: usize) ModelConfig {
+    return .{
+        .vocab_size = 128,
+        .d_model = @intCast(d_model),
+        .n_layers = @intCast(n_layers),
+        .n_heads = 1,
+        .n_kv_groups = 1,
+        .d_ff = @intCast(d_ff),
+        .max_seq_len = 16,
+        .head_dim = @intCast(d_model),
+        .rope_theta = 10000.0,
+        .norm_eps = 1e-5,
+        .gaffine_group_size = 128,
+    };
+}
+
+fn putMinimalAttentionLayer(
+    allocator: std.mem.Allocator,
+    map: *WeightMap,
+    ln1: *const Tensor,
+    ln2: *const Tensor,
+    q: *const Tensor,
+    k: *const Tensor,
+    v: *const Tensor,
+    o: *const Tensor,
+    w1: *const Tensor,
+    w2: *const Tensor,
+    w3: *const Tensor,
+) !void {
+    try map.put(allocator, "input_layernorm.weight", ln1);
+    try map.put(allocator, "post_attention_layernorm.weight", ln2);
+    try map.put(allocator, "self_attn.q_proj.weight", q);
+    try map.put(allocator, "self_attn.k_proj.weight", k);
+    try map.put(allocator, "self_attn.v_proj.weight", v);
+    try map.put(allocator, "self_attn.o_proj.weight", o);
+    try map.put(allocator, "mlp.gate_proj.weight", w1);
+    try map.put(allocator, "mlp.down_proj.weight", w2);
+    try map.put(allocator, "mlp.up_proj.weight", w3);
+}
+
+test "buildBlocksFromLayers builds only requested layer range" {
+    const allocator = std.testing.allocator;
+    const d_model: usize = 4;
+    const d_ff: usize = 8;
+    const config = testAttentionConfig(2, d_model, d_ff);
+    const runtime = model_config.ModelRuntime{};
+
+    var ln1_data = [_]f32{1} ** d_model;
+    var ln2_data = [_]f32{1} ** d_model;
+    var q_data = [_]f32{1} ** (d_model * d_model);
+    var k_data = [_]f32{1} ** (d_model * d_model);
+    var v_data = [_]f32{1} ** (d_model * d_model);
+    var o_data = [_]f32{1} ** (d_model * d_model);
+    var w1_data = [_]f32{1} ** (d_ff * d_model);
+    var w2_data = [_]f32{1} ** (d_model * d_ff);
+    var w3_data = [_]f32{1} ** (d_ff * d_model);
+
+    var ln1 = Tensor.view(@ptrCast(ln1_data[0..].ptr), &.{d_model}, .f32, null);
+    var ln2 = Tensor.view(@ptrCast(ln2_data[0..].ptr), &.{d_model}, .f32, null);
+    var q = Tensor.view2DSlice(q_data[0..], d_model, d_model);
+    var k = Tensor.view2DSlice(k_data[0..], d_model, d_model);
+    var v = Tensor.view2DSlice(v_data[0..], d_model, d_model);
+    var o = Tensor.view2DSlice(o_data[0..], d_model, d_model);
+    var w1 = Tensor.view2DSlice(w1_data[0..], d_ff, d_model);
+    var w2 = Tensor.view2DSlice(w2_data[0..], d_model, d_ff);
+    var w3 = Tensor.view2DSlice(w3_data[0..], d_ff, d_model);
+
+    var map0 = WeightMap{};
+    defer map0.deinit(allocator);
+    try putMinimalAttentionLayer(allocator, &map0, &ln1, &ln2, &q, &k, &v, &o, &w1, &w2, &w3);
+
+    var map1 = WeightMap{};
+    defer map1.deinit(allocator);
+
+    var layers = [_]LayerWeights{
+        .{ .block_type = .attention_mlp, .weight_map = map0, .map_context = .{} },
+        .{ .block_type = .attention_mlp, .weight_map = map1, .map_context = .{} },
+    };
+    map0 = .{};
+    map1 = .{};
+    defer {
+        layers[0].weight_map.deinit(allocator);
+        layers[1].weight_map.deinit(allocator);
+    }
+
+    const blocks = try buildBlocksFromLayers(
+        allocator,
+        allocator,
+        config,
+        runtime,
+        layers[0..],
+        .{ .start = 0, .end = 1 },
+        null,
+        progress_mod.Context.NONE,
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 0), blocks[0].block_idx);
+}
+
+test "buildBlocksFromLayers materializes NVFP4 layer weights for CPU" {
+    const allocator = std.testing.allocator;
+    const d_model: usize = 4;
+    const d_ff: usize = 8;
+    const config = testAttentionConfig(1, d_model, d_ff);
+    const runtime = model_config.ModelRuntime{};
+
+    var ln1_data = [_]f32{1} ** d_model;
+    var ln2_data = [_]f32{1} ** d_model;
+    var q_packed = [_]u8{ 0x21, 0x43, 0x21, 0x43, 0x21, 0x43, 0x21, 0x43 };
+    var q_scales = [_]u8{dtype.f32ToFp8E4M3(1.0)} ** (d_model * 2);
+    var k_data = [_]f32{1} ** (d_model * d_model);
+    var v_data = [_]f32{1} ** (d_model * d_model);
+    var o_data = [_]f32{1} ** (d_model * d_model);
+    var w1_data = [_]f32{1} ** (d_ff * d_model);
+    var w2_data = [_]f32{1} ** (d_model * d_ff);
+    var w3_data = [_]f32{1} ** (d_ff * d_model);
+
+    var ln1 = Tensor.view(@ptrCast(ln1_data[0..].ptr), &.{d_model}, .f32, null);
+    var ln2 = Tensor.view(@ptrCast(ln2_data[0..].ptr), &.{d_model}, .f32, null);
+    var q = Tensor.view(@ptrCast(q_packed[0..].ptr), &.{ d_model, d_model }, .u8, q_packed.len);
+    q.nvfp4 = .{
+        .block_scales_data = q_scales[0..].ptr,
+        .block_scales_len = q_scales.len,
+        .rows = @intCast(d_model),
+        .cols = @intCast(d_model),
+        .packed_cols = @intCast(d_model / 2),
+        .scale_cols = 2,
+        .group_size = 2,
+        .weight_global_scale = 1.0,
+    };
+    var k = Tensor.view2DSlice(k_data[0..], d_model, d_model);
+    var v = Tensor.view2DSlice(v_data[0..], d_model, d_model);
+    var o = Tensor.view2DSlice(o_data[0..], d_model, d_model);
+    var w1 = Tensor.view2DSlice(w1_data[0..], d_ff, d_model);
+    var w2 = Tensor.view2DSlice(w2_data[0..], d_model, d_ff);
+    var w3 = Tensor.view2DSlice(w3_data[0..], d_ff, d_model);
+
+    var map = WeightMap{};
+    try putMinimalAttentionLayer(allocator, &map, &ln1, &ln2, &q, &k, &v, &o, &w1, &w2, &w3);
+    var layers = [_]LayerWeights{.{ .block_type = .attention_mlp, .weight_map = map, .map_context = .{} }};
+    map = .{};
+    defer layers[0].weight_map.deinit(allocator);
+
+    var store = MaterializedWeightStore.init(allocator);
+    defer store.deinit();
+    const blocks = try buildBlocksFromLayers(
+        allocator,
+        allocator,
+        config,
+        runtime,
+        layers[0..],
+        .{ .start = 0, .end = 1 },
+        &store,
+        progress_mod.Context.NONE,
+    );
+    defer {
+        for (blocks) |*block| block.deinit(allocator);
+        allocator.free(blocks);
+    }
+
+    const attention = blocks[0].getAttention() orelse return error.TestExpectedEqual;
+    try std.testing.expect(attention.q_proj != null);
+    try std.testing.expectEqual(dtype.DType.bf16, attention.q_proj.?.dtype);
+    try std.testing.expectEqual(dtype.DType.u8, q.dtype);
+    try std.testing.expect(q.nvfp4 != null);
 }
 
 test "buildBlocks: creates correct number of blocks" {

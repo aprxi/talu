@@ -153,6 +153,10 @@ fn parseCudaTopologyMode(raw: []const u8) ?CudaTopologyMode {
     if (std.ascii.eqlIgnoreCase(token, "pipeline2")) return .pipeline2;
     if (std.ascii.eqlIgnoreCase(token, "pipeline_2")) return .pipeline2;
     if (std.ascii.eqlIgnoreCase(token, "pipeline_2way")) return .pipeline2;
+    if (std.ascii.eqlIgnoreCase(token, "gpu_gpu")) return .pipeline2;
+    if (std.ascii.eqlIgnoreCase(token, "gpu-gpu")) return .pipeline2;
+    if (std.ascii.eqlIgnoreCase(token, "gpu+gpu")) return .pipeline2;
+    if (std.ascii.eqlIgnoreCase(token, "pipeline_gpu_gpu")) return .pipeline2;
     if (std.ascii.eqlIgnoreCase(token, "cpu_gpu")) return .cpu_gpu;
     if (std.ascii.eqlIgnoreCase(token, "cpu+gpu")) return .cpu_gpu;
     if (std.ascii.eqlIgnoreCase(token, "pipeline_cpu_gpu")) return .cpu_gpu;
@@ -690,8 +694,8 @@ fn minKvSharedSourceLayer(config: ModelConfig) ?usize {
 /// Pure-logic topology selection from a requested CPU layer count.
 ///
 /// CPU runs layers [0, cpu_layers), GPU(s) run [cpu_layers, total_layers).
-/// With 2+ GPUs the GPU portion is split using model-aware estimation that
-/// accounts for projection weight on the last stage.
+/// With 2+ GPUs, prefer one GPU when the GPU-owned suffix fits there; split the
+/// suffix only when model-aware estimation says one GPU is insufficient.
 ///
 /// Returns null when cpu_layers is 0 (all on GPU → auto-detect) or invalid.
 fn topologyFromCpuLayers(
@@ -705,26 +709,50 @@ fn topologyFromCpuLayers(
 
     const gpu_layers = total_layers - cpu_layers;
 
-    if (gpu_infos.len == 1 or gpu_layers < 2) {
-        // 1 GPU or only 1 GPU layer → cpu_gpu.
+    var best0: usize = 0;
+    var best1: usize = if (gpu_infos.len > 1) 1 else 0;
+    for (gpu_infos, 0..) |info, i| {
+        if (info.free > gpu_infos[best0].free) {
+            best1 = best0;
+            best0 = i;
+        } else if (gpu_infos.len > 1 and i != best0 and info.free > gpu_infos[best1].free) {
+            best1 = i;
+        }
+    }
+    const best0_budget = if (gpu_infos[best0].free > AUTO_TOPO_OVERHEAD_BYTES)
+        gpu_infos[best0].free - AUTO_TOPO_OVERHEAD_BYTES
+    else
+        0;
+
+    if (model_params) |p| {
+        const one_gpu_est = estimatePerGpuBytes(p, gpu_layers, false, true);
+        if (one_gpu_est <= best0_budget) {
+            return .{
+                .mode = .cpu_gpu,
+                .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
+                .split_layer = cpu_layers,
+            };
+        }
+    } else {
+        // Without model parameters, avoid using a second GPU just because it is
+        // visible. The caller passes model parameters on the normal load path.
         return .{
             .mode = .cpu_gpu,
-            .stage_device_ordinals = .{ gpu_infos[0].ordinal, gpu_infos[0].ordinal },
+            .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
+            .split_layer = cpu_layers,
+        };
+    }
+
+    if (gpu_infos.len == 1 or gpu_layers < 2) {
+        // One visible GPU, or only one GPU layer, cannot use a second GPU stage.
+        return .{
+            .mode = .cpu_gpu,
+            .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
             .split_layer = cpu_layers,
         };
     }
 
     // 2+ GPUs: cpu_gpu_gpu. Pick best 2 GPUs and split.
-    var best0: usize = 0;
-    var best1: usize = 1;
-    for (gpu_infos, 0..) |info, i| {
-        if (info.free > gpu_infos[best0].free) {
-            best1 = best0;
-            best0 = i;
-        } else if (i != best0 and info.free > gpu_infos[best1].free) {
-            best1 = i;
-        }
-    }
     const ord0 = @min(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
     const ord1 = @max(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
     const free0 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best0].free else gpu_infos[best1].free;
@@ -941,6 +969,9 @@ test "parseCudaTopologyMode parses supported modes" {
     try std.testing.expectEqual(CudaTopologyMode.single, parseCudaTopologyMode("single").?);
     try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline2").?);
     try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline_2way").?);
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("gpu_gpu").?);
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("gpu-gpu").?);
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("gpu+gpu").?);
     try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, parseCudaTopologyMode("cpu_gpu").?);
     try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, parseCudaTopologyMode("cpu+gpu").?);
     try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, parseCudaTopologyMode("cpu_gpu_gpu").?);
@@ -1335,23 +1366,36 @@ test "topologyFromCpuLayers: 1 GPU → cpu_gpu" {
     try std.testing.expectEqual(@as(?usize, 8), result.split_layer);
 }
 
-test "topologyFromCpuLayers: 2 GPUs equal memory → cpu_gpu_gpu even split (no model)" {
+test "topologyFromCpuLayers: 2 GPUs without model params prefer one GPU" {
     const infos = testGpuInfos(2, .{
-        .{ 16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
+        .{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
         .{ 16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
     });
     const result = topologyFromCpuLayers(8, 32, &infos, null).?;
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
     try std.testing.expectEqual(@as(?usize, 8), result.split_layer);
-    // 24 GPU layers, equal GPUs → gpu0 gets 12, gpu1 gets 12.
-    try std.testing.expectEqual(@as(?usize, 20), result.split_layer_stage2); // 8 + 12 = 20
+    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[0]);
+    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[1]);
 }
 
-test "topologyFromCpuLayers: model-aware split gives GPU0 more layers (proj on GPU1)" {
+test "topologyFromCpuLayers: 2 GPUs keep GPU suffix on one GPU when it fits" {
     const gb = 1024 * 1024 * 1024;
     const infos = testGpuInfos(2, .{
-        .{ 16 * gb, 16 * gb },
-        .{ 16 * gb, 16 * gb },
+        .{ 8 * gb, 16 * gb },
+        .{ 8 * gb, 16 * gb },
+    });
+    const p = testMinimalParams(3 * gb, 32);
+    const result = topologyFromCpuLayers(1, 32, &infos, p).?;
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
+    try std.testing.expectEqual(@as(?usize, 1), result.split_layer);
+    try std.testing.expectEqual(@as([2]usize, .{ 0, 0 }), result.stage_device_ordinals);
+}
+
+test "topologyFromCpuLayers: model-aware split uses 2 GPUs when suffix exceeds one GPU" {
+    const gb = 1024 * 1024 * 1024;
+    const infos = testGpuInfos(2, .{
+        .{ 4 * gb, 4 * gb },
+        .{ 4 * gb, 4 * gb },
     });
     // Large vocab means projection weight is significant.
     const p = ModelSizeParams{
@@ -1371,13 +1415,14 @@ test "topologyFromCpuLayers: model-aware split gives GPU0 more layers (proj on G
     try std.testing.expect(gpu0_layers > gpu1_layers);
 }
 
-test "topologyFromCpuLayers: 2 GPUs unequal memory → proportional split" {
+test "topologyFromCpuLayers: 2 GPUs split overflowing suffix by memory" {
     const gb = 1024 * 1024 * 1024;
     const infos = testGpuInfos(2, .{
         .{ 12 * gb, 16 * gb }, // GPU0: 12 GB
         .{ 4 * gb, 8 * gb }, // GPU1: 4 GB
     });
-    const result = topologyFromCpuLayers(12, 32, &infos, null).?;
+    const p = testMinimalParams(24 * gb, 32);
+    const result = topologyFromCpuLayers(12, 32, &infos, p).?;
     try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
     try std.testing.expectEqual(@as(?usize, 12), result.split_layer);
     // 20 GPU layers, GPU0 has 3x more memory → gets most layers.

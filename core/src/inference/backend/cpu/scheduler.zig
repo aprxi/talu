@@ -609,7 +609,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const submit_config = options orelse SubmitOptions{};
 
             const request_entry = try self.allocator.create(Request);
-            errdefer self.allocator.destroy(request_entry);
+            var request_registered = false;
+            errdefer if (!request_registered) self.allocator.destroy(request_entry);
 
             request_entry.* = Request{
                 .id = self.next_request_id,
@@ -638,15 +639,30 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .max_completion_tokens_limit = submit_config.max_completion_tokens,
             };
 
-            try self.requests.put(request_entry.id, request_entry);
-            try self.pending_queue.append(self.allocator, request_entry.id);
+            const request_id = request_entry.id;
+            errdefer if (request_registered) {
+                for (self.pending_queue.items, 0..) |queued_id, idx| {
+                    if (queued_id == request_id) {
+                        _ = self.pending_queue.orderedRemove(idx);
+                        break;
+                    }
+                }
+                if (self.requests.fetchRemove(request_id)) |kv| {
+                    kv.value.deinit(self.allocator);
+                    self.allocator.destroy(kv.value);
+                }
+            };
+
+            try self.requests.put(request_id, request_entry);
+            request_registered = true;
+            try self.pending_queue.append(self.allocator, request_id);
 
             self.next_request_id += 1;
 
             // Try to activate immediately if slots available
             try self.activatePending();
 
-            return request_entry.id;
+            return request_id;
         }
 
         /// Options for submit().
@@ -6459,6 +6475,26 @@ test "Scheduler descriptor-backed state blocks are bound and validated" {
     try std.testing.expect(backend.unbind_slot_state_blocks_calls > 0);
     try std.testing.expectEqual(@as(usize, 1), backend.last_bound_state_block_count);
     try std.testing.expect(backend.saw_state_blocks_valid);
+}
+
+test "Scheduler submit rolls back request when activation binding fails" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 1);
+    defer backend.deinit();
+
+    const scheduler_descriptors = [_]runtime_contract.StateDescriptor{
+        runtime_contract.defaultStateDescriptor(.shortconv),
+    };
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = scheduler_descriptors[0..],
+    });
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    try std.testing.expectError(error.UnknownStateDescriptorId, scheduler.submit(&prompt, 1, null));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.requests.count());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pending_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.active_requests.items.len);
 }
 
 test "Scheduler zero-inits shortconv descriptor state on alloc" {
