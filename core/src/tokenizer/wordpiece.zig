@@ -5,9 +5,10 @@
 
 const std = @import("std");
 const ct = @import("c_types.zig");
+const schema = @import("schema.zig");
 
 const MAX_MODEL_VOCAB_SIZE: usize = 1_000_000;
-const decoders = @import("decoders.zig");
+const model_helpers = @import("model_helpers.zig");
 const utils = @import("utils.zig");
 
 const tok_fns = @import("pipeline.zig");
@@ -63,21 +64,19 @@ fn initModel(allocator: std.mem.Allocator) !*WordPieceModel {
         .max_input_chars_per_word = 200,
         .owner = null,
     };
-    setUnkToken(model, DEFAULT_UNK);
+    utils.setUnkToken(&model.unk_token, DEFAULT_UNK);
     return model;
 }
 
-fn setUnkToken(model: *WordPieceModel, token: []const u8) void {
-    utils.setUnkToken(&model.unk_token, token);
-}
-
-fn unkSlice(model: *const WordPieceModel) []const u8 {
-    return utils.unkSlice(&model.unk_token);
-}
-
-fn addVocabEntry(model: *WordPieceModel, token_z: [:0]const u8, id: i32) !void {
+fn addVocabEntry(model: *WordPieceModel, token: []const u8, id: i32) !void {
     if (id < 0) return error.InvalidId;
-    const dup = try model.allocator.dupeZ(u8, token_z);
+    if (token.len == 0 or std.mem.indexOfScalar(u8, token, 0) != null) return error.InvalidVocab;
+    const id_index: usize = @intCast(id);
+    if (id_index >= model.id_to_token.len) return error.InvalidId;
+    if (model.id_to_token[id_index] != null) return error.InvalidId;
+    if (model.vocab.contains(token)) return error.InvalidVocab;
+
+    const dup = try model.allocator.dupeZ(u8, token);
     model.vocab_strings.append(model.allocator, dup) catch |err| {
         model.allocator.free(dup);
         return err;
@@ -88,9 +87,7 @@ fn addVocabEntry(model: *WordPieceModel, token_z: [:0]const u8, id: i32) !void {
         model.allocator.free(dup);
         return err;
     };
-    if (@as(usize, @intCast(id)) < model.id_to_token.len) {
-        model.id_to_token[@as(usize, @intCast(id))] = dup.ptr;
-    }
+    model.id_to_token[id_index] = dup.ptr;
 }
 
 fn findId(model: *const WordPieceModel, token: []const u8) ?i32 {
@@ -205,7 +202,7 @@ fn wordpiece_encode(tokenizer: *ct.Tokenizer, text: []const u8, enc: *ct.Tokeniz
         const encoded = encodeWord(model, tokenizer, word) catch {
             // Unknown word -> push UNK
             ids.append(allocator, model.unk_id) catch return -1;
-            const unk = allocator.dupeZ(u8, unkSlice(model)) catch return -1;
+            const unk = allocator.dupeZ(u8, utils.unkSlice(&model.unk_token)) catch return -1;
             tokens.append(allocator, unk.ptr) catch {
                 allocator.free(unk);
                 return -1;
@@ -260,7 +257,7 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
 
         // Check if this is a special token (skip if requested)
         if (options.skip_special_tokens) {
-            if (isSpecialToken(tokenizer, id)) continue;
+            if (model_helpers.isAddedSpecialToken(tokenizer, id)) continue;
         }
 
         const token_slice = blk: {
@@ -381,15 +378,6 @@ fn isCleanupPunct(ch: u8) bool {
     };
 }
 
-fn isSpecialToken(tokenizer: *ct.Tokenizer, id: i32) bool {
-    var cur = tokenizer.added;
-    while (cur) |node| {
-        if (node.id == id and node.special != 0) return true;
-        cur = node.next;
-    }
-    return false;
-}
-
 fn wordpiece_destroy(tokenizer: *ct.Tokenizer) void {
     if (tokenizer.model == null) return;
     const model = @as(*WordPieceModel, @ptrCast(@alignCast(tokenizer.model.?)));
@@ -412,8 +400,8 @@ fn initTokenizerWithAllocator(allocator: std.mem.Allocator) !*ct.Tokenizer {
     tokenizer.postproc.cls_id = -1;
     tokenizer.postproc.sep_id = -1;
     tokenizer.postproc.add_special = 1;
-    setFixedString(tokenizer.postproc.cls_token[0..], DEFAULT_CLS);
-    setFixedString(tokenizer.postproc.sep_token[0..], DEFAULT_SEP);
+    model_helpers.setFixedString(tokenizer.postproc.cls_token[0..], DEFAULT_CLS);
+    model_helpers.setFixedString(tokenizer.postproc.sep_token[0..], DEFAULT_SEP);
     tokenizer.postproc.cls_id = DEFAULT_CLS_ID;
     tokenizer.postproc.sep_id = DEFAULT_SEP_ID;
     return tokenizer;
@@ -423,38 +411,30 @@ fn initTokenizer() !*ct.Tokenizer {
     return initTokenizerWithAllocator(std.heap.c_allocator);
 }
 
-fn attachPretokenizer(tokenizer: *ct.Tokenizer) !void {
-    if (tok_fns.tokenizer_pretokenizer_set(&tokenizer.pretokenizer, WORDPIECE_PATTERN.ptr) != 0) {
-        tok_fns.tokenizer_set_error(tokenizer, "Failed to compile WordPiece regex");
-        return error.PretokenizerInitFailed;
-    }
-}
-
 fn finalizeSpecialIds(model: *WordPieceModel, tokenizer: *ct.Tokenizer) void {
     if (findId(model, DEFAULT_CLS)) |id| tokenizer.postproc.cls_id = id;
     if (findId(model, DEFAULT_SEP)) |id| tokenizer.postproc.sep_id = id;
-    if (findId(model, unkSlice(model))) |id| model.unk_id = id;
-}
-
-fn setFixedString(dst: []u8, text: []const u8) void {
-    @memset(dst, 0);
-    const copy_len = @min(dst.len - 1, text.len);
-    std.mem.copyForwards(u8, dst[0..copy_len], text[0..copy_len]);
-    dst[copy_len] = 0;
+    if (findId(model, utils.unkSlice(&model.unk_token))) |id| model.unk_id = id;
 }
 
 fn allocIdToToken(model: *WordPieceModel, size: usize) !void {
-    model.id_to_token = try model.allocator.alloc(?[*:0]u8, size);
-    for (model.id_to_token) |*slot| slot.* = null;
+    model.id_to_token = try model_helpers.allocIdToToken(model.allocator, size);
     model.vocab_size = size;
 }
 
-fn buildFromSpec(model: *WordPieceModel, spec: *const ct.WordPieceModelSpec) !void {
+fn buildFromVocab(
+    model: *WordPieceModel,
+    vocab: []const schema.TokenId,
+    unk_token: ?[]const u8,
+    max_input_chars_per_word: i32,
+) !void {
+    if (vocab.len == 0) return error.IncompleteSpec;
+
     var max_id: usize = 0;
-    const vocab_ptr: [*]const ct.TokenIdPair = @ptrCast(spec.vocab.?);
-    const vocab = vocab_ptr[0..spec.vocab_len];
     for (vocab) |entry| {
-        if (entry.id < 0) continue;
+        if (entry.id < 0 or entry.token.len == 0 or std.mem.indexOfScalar(u8, entry.token, 0) != null) {
+            return error.InvalidVocab;
+        }
         const next = @as(usize, @intCast(entry.id)) + 1;
         if (next > max_id) max_id = next;
     }
@@ -463,52 +443,40 @@ fn buildFromSpec(model: *WordPieceModel, spec: *const ct.WordPieceModelSpec) !vo
     try allocIdToToken(model, max_id);
 
     for (vocab) |entry| {
-        if (entry.token == null or entry.id < 0) continue;
-        const token_ptr: [*:0]const u8 = @ptrCast(entry.token.?);
-        const token_slice = std.mem.sliceTo(token_ptr, 0);
-        addVocabEntry(model, token_slice, entry.id) catch continue;
+        try addVocabEntry(model, entry.token, entry.id);
     }
 
-    if (spec.unk_token) |unk| {
-        const unk_ptr: [*:0]const u8 = @ptrCast(unk);
-        setUnkToken(model, std.mem.sliceTo(unk_ptr, 0));
+    if (unk_token) |unk| {
+        utils.setUnkToken(&model.unk_token, unk);
     }
 
-    if (spec.max_input_chars_per_word > 0) {
-        model.max_input_chars_per_word = @intCast(spec.max_input_chars_per_word);
+    if (max_input_chars_per_word > 0) {
+        model.max_input_chars_per_word = @intCast(max_input_chars_per_word);
     }
 }
 
-pub fn tokenizer_wordpiece_create_from_spec(spec: ?*const ct.WordPieceModelSpec) ?*ct.Tokenizer {
-    if (spec == null or spec.?.vocab == null or spec.?.vocab_len == 0) return null;
+pub fn createWordPieceTokenizer(
+    vocab: []const schema.TokenId,
+    unk_token: ?[]const u8,
+    max_input_chars_per_word: i32,
+) !*ct.Tokenizer {
     const allocator = std.heap.c_allocator;
-    var tokenizer = initTokenizer() catch return null;
-    errdefer allocator.destroy(tokenizer);
+    const tokenizer = try initTokenizer();
+    errdefer tok_fns.tokenizer_free(tokenizer);
 
-    var model = initModel(allocator) catch {
-        allocator.destroy(tokenizer);
-        return null;
-    };
+    const model = try initModel(allocator);
     tokenizer.model = model;
     model.owner = tokenizer;
 
-    attachPretokenizer(tokenizer) catch {
-        wordpiece_destroy(tokenizer);
-        allocator.destroy(tokenizer);
-        return null;
-    };
+    try model_helpers.attachRegexPretokenizer(tokenizer, WORDPIECE_PATTERN, "Failed to compile WordPiece regex");
 
-    buildFromSpec(model, spec.?) catch |err| switch (err) {
+    buildFromVocab(model, vocab, unk_token, max_input_chars_per_word) catch |err| switch (err) {
         error.IncompleteSpec => {
             tok_fns.tokenizer_set_error(tokenizer, "Incomplete WordPiece specification");
-            wordpiece_destroy(tokenizer);
-            allocator.destroy(tokenizer);
-            return null;
+            return err;
         },
         else => {
-            wordpiece_destroy(tokenizer);
-            allocator.destroy(tokenizer);
-            return null;
+            return err;
         },
     };
 
@@ -524,10 +492,6 @@ pub fn wordpieceEncode(tokenizer: *ct.Tokenizer, input: []const u8, enc: *ct.Tok
     return wordpiece_encode(tokenizer, input, enc);
 }
 
-pub fn wordpieceDecode(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-    return wordpiece_decode_impl(tokenizer, ids, ids_len, out, out_len, .{});
-}
-
 pub fn wordpieceDecodeWithOptions(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
     return wordpiece_decode_impl(tokenizer, ids, ids_len, out, out_len, options);
 }
@@ -539,10 +503,6 @@ pub fn wordpieceDestroy(tokenizer: *ct.Tokenizer) void {
 // =============================================================================
 // Tests
 // =============================================================================
-
-// Note: Most wordpiece functions (encodeWord, wordpiece_encode, wordpiece_decode, etc.)
-// require full model context with vocab and tokenizer state.
-// They are tested via integration tests in tests/tokenizer/.
 
 test "setUnkToken copies token to buffer" {
     var model = WordPieceModel{
@@ -557,8 +517,8 @@ test "setUnkToken copies token to buffer" {
         .owner = null,
     };
 
-    setUnkToken(&model, DEFAULT_UNK);
-    const result = unkSlice(&model);
+    utils.setUnkToken(&model.unk_token, DEFAULT_UNK);
+    const result = utils.unkSlice(&model.unk_token);
     try std.testing.expectEqualStrings(DEFAULT_UNK, result);
 }
 
@@ -568,7 +528,32 @@ test "initModel creates empty model" {
     defer allocator.destroy(model);
 
     try std.testing.expectEqual(@as(usize, 0), model.vocab.count());
-    try std.testing.expectEqualStrings(DEFAULT_UNK, unkSlice(model));
+    try std.testing.expectEqualStrings(DEFAULT_UNK, utils.unkSlice(&model.unk_token));
+}
+
+test "createWordPieceTokenizer builds tokenizer from schema vocab" {
+    const vocab = [_]schema.TokenId{
+        .{ .token = "[UNK]", .id = 0, .score = -1.0 },
+        .{ .token = "hello", .id = 1, .score = -1.0 },
+        .{ .token = "##s", .id = 2, .score = -1.0 },
+    };
+
+    const tokenizer = try createWordPieceTokenizer(&vocab, "[UNK]", 12);
+    defer tok_fns.tokenizer_free(tokenizer);
+
+    try std.testing.expectEqual(ct.ModelType.wordpiece, tokenizer.type);
+    try std.testing.expectEqual(@as(usize, 3), tokenizer.getVocabSize());
+    try std.testing.expectEqual(@as(i32, 1), tokenizer.tokenToId("hello").?);
+    try std.testing.expectEqual(@as(i32, 0), tokenizer.getUnkId());
+
+    const model: *const WordPieceModel = @ptrCast(@alignCast(tokenizer.model.?));
+    try std.testing.expectEqual(@as(u32, 12), model.max_input_chars_per_word);
+    try std.testing.expectEqualStrings("[UNK]", utils.unkSlice(&model.unk_token));
+}
+
+test "createWordPieceTokenizer rejects empty vocab" {
+    const vocab = [_]schema.TokenId{};
+    try std.testing.expectError(error.IncompleteSpec, createWordPieceTokenizer(&vocab, null, 200));
 }
 
 test "freeEncodedWordDeep frees all memory" {
@@ -594,26 +579,11 @@ test "freeEncodedWordDeep frees all memory" {
 
 test "setFixedString copies string to buffer" {
     var buffer: [16]u8 = undefined;
-    setFixedString(&buffer, "test");
+    model_helpers.setFixedString(&buffer, "test");
 
     try std.testing.expectEqual(@as(u8, 't'), buffer[0]);
     try std.testing.expectEqual(@as(u8, 0), buffer[4]);
     try std.testing.expectEqualStrings("test", std.mem.sliceTo(&buffer, 0));
-}
-
-test "wordpieceEncode requires integration testing" {
-    // This function requires:
-    // - Fully initialized WordPiece model with vocab
-    // - Greedy longest-match algorithm
-    // - ## prefix handling for subword tokens
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "wordpieceDecode requires integration testing" {
-    // This function requires:
-    // - Complete WordPiece model with id_to_token mapping
-    // - Decoder that removes ## prefixes and joins tokens
-    // Integration tests: tests/tokenizer/test_*.py
 }
 
 test "wordpieceDecodeWithOptions decodes token IDs with subword joining" {
@@ -777,22 +747,6 @@ test "wordpieceDecodeWithOptions preserves spacing when cleanup disabled" {
     try std.testing.expectEqualStrings("hello , world ?", out[0..out_len]);
 }
 
-test "wordpieceDestroy requires integration testing" {
-    // This function requires:
-    // - Fully allocated WordPiece model
-    // - Proper cleanup of vocab, strings, and mappings
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_wordpiece_create_from_spec requires integration testing" {
-    // This function requires:
-    // - Complete WordPieceModelSpec with vocab entries
-    // - Model initialization and vocab setup
-    // - Pretokenizer attachment with regex pattern
-    // - Special token ID finalization (CLS, SEP, UNK)
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
 test "addVocabEntry adds token to vocab and updates mappings" {
     const allocator = std.testing.allocator;
     const model = try initModel(allocator);
@@ -868,7 +822,7 @@ test "addVocabEntry rejects negative IDs" {
     try std.testing.expectError(error.InvalidId, result);
 }
 
-test "addVocabEntry handles IDs beyond id_to_token bounds" {
+test "addVocabEntry rejects IDs beyond id_to_token bounds" {
     const allocator = std.testing.allocator;
     const model = try initModel(allocator);
     defer allocator.destroy(model);
@@ -881,13 +835,9 @@ test "addVocabEntry handles IDs beyond id_to_token bounds" {
 
     try allocIdToToken(model, 5);
 
-    // Add entry with ID beyond current array size
-    try addVocabEntry(model, "token", 10);
-
-    // Should still be in vocab hashmap
-    try std.testing.expectEqual(@as(i32, 10), model.vocab.get("token").?);
-    // But not in id_to_token array
-    try std.testing.expect(10 >= model.id_to_token.len);
+    try std.testing.expectError(error.InvalidId, addVocabEntry(model, "token", 10));
+    try std.testing.expect(model.vocab.get("token") == null);
+    try std.testing.expectEqual(@as(usize, 5), model.id_to_token.len);
 }
 
 test "findId returns correct ID for existing token" {

@@ -190,17 +190,6 @@ pub const Tokenizer = extern struct {
         };
     }
 
-    pub fn decode(self: *Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-        return switch (self.type) {
-            .bpe => blk: {
-                const model: *bpe.BpeModel = @ptrCast(@alignCast(self.model.?));
-                break :blk model.decode(self, ids, ids_len, out, out_len);
-            },
-            .wordpiece => wordpiece.wordpieceDecode(self, ids, ids_len, out, out_len),
-            .unigram => unigram.unigramDecode(self, ids, ids_len, out, out_len),
-        };
-    }
-
     pub fn decodeWithOptions(self: *Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: DecodeOptions) c_int {
         return switch (self.type) {
             .bpe => blk: {
@@ -327,45 +316,6 @@ pub const Tokenizer = extern struct {
     pub fn initBpe(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: bool) !*Tokenizer {
         return bpe.createBpeTokenizer(allocator, json_buffer, json_owned);
     }
-};
-
-pub const TokenIdPair = extern struct {
-    token: [*c]const u8,
-    id: c_int,
-};
-
-pub const BpeMergePair = extern struct {
-    a: [*c]const u8,
-    b: [*c]const u8,
-};
-
-pub const BpeModelSpec = extern struct {
-    vocab: [*c]const TokenIdPair,
-    vocab_len: usize,
-    merges: [*c]const BpeMergePair,
-    merges_len: usize,
-    unk_token: [*c]const u8,
-};
-
-pub const WordPieceModelSpec = extern struct {
-    vocab: [*c]const TokenIdPair,
-    vocab_len: usize,
-    unk_token: [*c]const u8,
-    max_input_chars_per_word: c_int = 200,
-};
-
-pub const UnigramVocabEntry = extern struct {
-    token: [*c]const u8,
-    score: f32,
-    id: c_int,
-};
-
-pub const UnigramModelSpec = extern struct {
-    vocab: [*c]const UnigramVocabEntry,
-    vocab_len: usize,
-    unk_token: [*c]const u8,
-    bos_token: [*c]const u8,
-    eos_token: [*c]const u8,
 };
 
 pub const NormalizerSpec = extern struct {

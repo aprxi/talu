@@ -7,14 +7,14 @@
 const std = @import("std");
 const pipeline = @import("pipeline.zig");
 const ct = @import("c_types.zig");
+const token_surface = @import("token_surface.zig");
 const tok_encode = @import("encode.zig");
 const normalize = @import("normalize.zig");
 const unigram = @import("unigram.zig");
 const utils = @import("utils.zig");
 const wordpiece = @import("wordpiece.zig");
-const c = @cImport({
-    @cInclude("utf8proc.h");
-});
+const isUtf8ContinuationByte = utils.isUtf8ContinuationByte;
+const whitespaceLenAt = utils.whitespaceLenAt;
 
 /// Token offset in source text (UTF-8 byte indices).
 pub const TokenOffset = extern struct {
@@ -28,29 +28,6 @@ fn findAddedTokenById(tokenizer_handle: *const ct.Tokenizer, token_id: i32) ?*co
         if (added.id == token_id) return added;
     }
     return null;
-}
-
-fn isUtf8ContinuationByte(byte_value: u8) bool {
-    return (byte_value & 0xC0) == 0x80;
-}
-
-fn isUnicodeWhitespaceCodepoint(codepoint: c.utf8proc_int32_t) bool {
-    return switch (c.utf8proc_category(codepoint)) {
-        c.UTF8PROC_CATEGORY_ZS, c.UTF8PROC_CATEGORY_ZL, c.UTF8PROC_CATEGORY_ZP => true,
-        else => false,
-    };
-}
-
-fn whitespaceLenAt(input_bytes: []const u8, position: usize) usize {
-    if (position >= input_bytes.len) return 0;
-    const byte_value = input_bytes[position];
-    if (byte_value < 0x80) {
-        return if (std.ascii.isWhitespace(byte_value)) 1 else 0;
-    }
-    var codepoint: c.utf8proc_int32_t = 0;
-    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + position), @intCast(input_bytes.len - position), &codepoint);
-    if (consumed <= 0) return 0;
-    return if (isUnicodeWhitespaceCodepoint(codepoint)) @intCast(consumed) else 0;
 }
 
 fn allWhitespace(input_bytes: []const u8) bool {
@@ -101,7 +78,7 @@ fn adjustAddedTokenSpan(
 /// Matches each token's decoded byte representation against normalized text and
 /// maps the normalized byte span back to the original source byte span.
 /// Caller owns the returned slice.
-pub fn computeOffsetsFromEncoding(
+fn computeOffsetsFromEncoding(
     alloc: std.mem.Allocator,
     encoding: *const ct.TokenizerEncoding,
     tokenizer_handle: *ct.Tokenizer,
@@ -143,19 +120,13 @@ pub fn computeOffsetsFromEncoding(
             // original UTF-8 text. Use the vocab/add-token text by ID here so a
             // single raw byte never expands to an entire emoji or accented scalar.
             if (is_byte_level and token_id != unk_id) {
-                break :blk tokenizer_handle.idToToken(token_id) orelse
-                    tok_encode.findAddedTokenContentById(tokenizer_handle, token_id) orelse "";
-            }
-            if (token_cstrs) |ts| {
-                const token_ptr: [*c]u8 = ts[token_idx];
-                if (token_ptr != null) break :blk std.mem.sliceTo(token_ptr, 0);
+                break :blk token_surface.byId(tokenizer_handle, token_id);
             }
             // Fall back to vocabulary lookup by ID.
             // For unk tokens, idToToken returns "<unk>" which won't match source text.
             // In byte-level mode each unk represents exactly 1 source byte, handled below.
             if (is_byte_level and token_id == unk_id) break :blk "";
-            break :blk tokenizer_handle.idToToken(token_id) orelse
-                tok_encode.findAddedTokenContentById(tokenizer_handle, token_id) orelse "";
+            break :blk token_surface.fromEncoding(tokenizer_handle, enc_ids, token_cstrs, token_idx);
         };
 
         if (is_byte_level and token_id == unk_id) {
@@ -249,15 +220,7 @@ pub fn computeOffsetsFromEncoding(
                     const next_id = enc_ids[lookahead];
                     if (next_id == unk_id) continue;
 
-                    var next_text: []const u8 = "";
-                    if (token_cstrs) |ts| {
-                        const ptr: [*c]u8 = ts[lookahead];
-                        if (ptr != null) next_text = std.mem.sliceTo(ptr, 0);
-                    }
-                    if (next_text.len == 0) {
-                        next_text = tokenizer_handle.idToToken(next_id) orelse
-                            tok_encode.findAddedTokenContentById(tokenizer_handle, next_id) orelse "";
-                    }
+                    const next_text = token_surface.fromEncoding(tokenizer_handle, enc_ids, token_cstrs, lookahead);
                     if (next_text.len == 0) continue;
 
                     const next_bytes = decodeTokenToBytes(alloc, next_text, tokenizer_handle) catch continue;
@@ -601,7 +564,7 @@ pub fn decodeTokenToBytes(allocator: std.mem.Allocator, token_text: []const u8, 
 /// Map a unicode codepoint to its raw byte value.
 /// Handles the GPT-2 byte-level BPE encoding where bytes 0-255 are mapped
 /// to unicode codepoints, with some gaps filled by codepoints >= 256.
-pub fn unicodeToRawByte(codepoint: u21) u8 {
+fn unicodeToRawByte(codepoint: u21) u8 {
     if (codepoint < 256) {
         return @intCast(codepoint);
     }
@@ -646,7 +609,7 @@ pub fn utf8CharLen(first_byte: u8) usize {
 }
 
 /// Find a subsequence in a source slice. Returns the offset if found, null otherwise.
-pub fn findSubsequence(source: []const u8, pattern: []const u8) ?usize {
+fn findSubsequence(source: []const u8, pattern: []const u8) ?usize {
     if (pattern.len == 0) return 0;
     if (pattern.len > source.len) return null;
 
@@ -798,11 +761,6 @@ test "decodeTokenToBytes returns borrowed empty slice for standalone unigram met
 
     try std.testing.expectEqual(@as(usize, 0), decoded.len);
     try std.testing.expectEqual(token.ptr, decoded.ptr);
-}
-
-test "computeOffsetsFromEncoding requires integration testing" {
-    // Requires fully initialized tokenizer with vocab, model, normalizer.
-    // Integration tests: tests/tokenizer/test_*.py
 }
 
 fn addWordPieceTestToken(model: *wordpiece.WordPieceModel, token: []const u8, id: usize) !void {
@@ -1146,9 +1104,4 @@ test "computeOffsetsFromEncoding maps large nfkc expansion bytes to original sca
         try std.testing.expectEqual(@as(u32, 3), off.end);
         _ = idx;
     }
-}
-
-test "encode requires integration testing" {
-    // Requires fully initialized tokenizer with vocab, model, normalizer.
-    // Integration tests: tests/tokenizer/test_*.py
 }

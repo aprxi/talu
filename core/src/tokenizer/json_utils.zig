@@ -1,7 +1,7 @@
 //! JSON Utilities
 //!
 //! JSON string unescaping for tokenizer vocab parsing.
-//! Handles escape sequences (\n, \t, \uXXXX, etc.) in JSON strings. lint:ignore todo-issue
+//! Handles escape sequences (\n, \t, \uXXXX, etc.) in JSON strings.
 
 const std = @import("std");
 
@@ -96,6 +96,94 @@ pub fn unescapeJsonString(allocator: std.mem.Allocator, input: []const u8) JsonU
     }
 
     return try output_bytes.toOwnedSlice(allocator);
+}
+
+fn findJsonKeyPos(json_bytes: []const u8, field_bytes: []const u8) ?usize {
+    var cursor: usize = 0;
+    while (cursor < json_bytes.len) {
+        if (json_bytes[cursor] == '"') {
+            const key_start = cursor;
+            cursor += 1;
+            while (cursor < json_bytes.len) {
+                if (json_bytes[cursor] == '\\' and cursor + 1 < json_bytes.len) {
+                    cursor += 2;
+                } else if (json_bytes[cursor] == '"') {
+                    cursor += 1;
+                    break;
+                } else {
+                    cursor += 1;
+                }
+            }
+            const key_end = cursor;
+            if (key_end - key_start == field_bytes.len and std.mem.eql(u8, json_bytes[key_start..key_end], field_bytes)) {
+                return key_start;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    return null;
+}
+
+pub fn findJsonFieldValue(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
+    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
+    var cursor = pos + field_bytes.len;
+    skipJsonSeparators(json_bytes, &cursor);
+    if (cursor >= json_bytes.len) return null;
+
+    const value_start = cursor;
+    while (cursor < json_bytes.len and
+        json_bytes[cursor] != ',' and
+        json_bytes[cursor] != '}' and
+        json_bytes[cursor] != ']' and
+        !std.ascii.isWhitespace(json_bytes[cursor])) : (cursor += 1)
+    {}
+    return json_bytes[value_start..cursor];
+}
+
+pub fn findJsonFieldString(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
+    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
+    var cursor = pos + field_bytes.len;
+    skipJsonSeparators(json_bytes, &cursor);
+    if (cursor >= json_bytes.len or json_bytes[cursor] != '"') return null;
+
+    cursor += 1;
+    const value_start = cursor;
+    while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
+        if (json_bytes[cursor] == '\\') cursor += 2 else cursor += 1;
+    }
+    if (cursor > json_bytes.len) return null;
+    return json_bytes[value_start..cursor];
+}
+
+/// Parse a JSON field whose value is a ["string", number] tuple.
+pub fn findJsonFieldArrayString(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
+    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
+    var cursor = pos + field_bytes.len;
+    skipJsonSeparators(json_bytes, &cursor);
+    if (cursor >= json_bytes.len or json_bytes[cursor] != '[') return null;
+
+    cursor += 1;
+    skipJsonWhitespace(json_bytes, &cursor);
+    if (cursor >= json_bytes.len or json_bytes[cursor] != '"') return null;
+
+    cursor += 1;
+    const value_start = cursor;
+    while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
+        if (json_bytes[cursor] == '\\') cursor += 2 else cursor += 1;
+    }
+    if (cursor > json_bytes.len) return null;
+    return json_bytes[value_start..cursor];
+}
+
+fn skipJsonSeparators(json_bytes: []const u8, cursor: *usize) void {
+    while (cursor.* < json_bytes.len and
+        (json_bytes[cursor.*] == ':' or std.ascii.isWhitespace(json_bytes[cursor.*]))) : (cursor.* += 1)
+    {}
+}
+
+fn skipJsonWhitespace(json_bytes: []const u8, cursor: *usize) void {
+    while (cursor.* < json_bytes.len and std.ascii.isWhitespace(json_bytes[cursor.*])) : (cursor.* += 1) {}
 }
 
 test "unescapeJsonString handles escapes and unicode" {

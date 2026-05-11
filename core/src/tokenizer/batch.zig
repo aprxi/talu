@@ -156,7 +156,7 @@ fn encodeOne(
 }
 
 /// Worker function for parallel batch encoding.
-pub fn batchEncodeWorker(start: usize, end: usize, ctx: *BatchEncodeContext) void {
+fn batchEncodeWorker(start: usize, end: usize, ctx: *BatchEncodeContext) void {
     for (start..end) |seq_idx| {
         const text_bytes = ctx.text_ptrs[seq_idx][0..ctx.text_lengths[seq_idx]];
         const encoded_ids = encodeOne(ctx.tokenizer.allocator, ctx.tokenizer, text_bytes, ctx.options) catch {

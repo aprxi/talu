@@ -578,11 +578,6 @@ pub fn addPrefixSpace(normalized: *Normalized) !void {
 // Tests
 // =============================================================================
 
-// Note: normalize_text requires full tokenizer context and C library
-// dependencies (utf8proc). It is tested via integration tests in
-// tests/tokenizer/. Helper functions like addPrefixSpace and
-// applyNfcWithNullBytes are unit-testable.
-
 test "addPrefixSpace adds space at beginning" {
     var normalized = Normalized{
         .text = try Allocator.dupe(u8, "hello"),
@@ -664,17 +659,7 @@ test "tokenizer_apply_normalizer_spec sets normalization options" {
 
 test "stripAccents processes codepoint" {
     // stripAccents is a private function but we can test via normalize flow
-    // This is a basic smoke test to ensure the function exists
     const codepoint: c.utf8proc_int32_t = 'e'; // Simple ASCII
     const result = stripAccents(codepoint);
     try std.testing.expectEqual(@as(c.utf8proc_int32_t, 'e'), result);
-}
-
-test "normalize_text requires integration testing" {
-    // This function requires a fully initialized normalizer with:
-    // - utf8proc library for Unicode normalization
-    // - Full tokenizer context with normalizer spec
-    // - Support for NFC/NFD/NFKC normalization
-    // - Clean text and Chinese character handling
-    // Integration tests: tests/tokenizer/test_*.py
 }

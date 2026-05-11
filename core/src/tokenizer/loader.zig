@@ -5,7 +5,8 @@
 
 const std = @import("std");
 const schema = @import("schema.zig");
-const bpe = @import("bpe.zig");
+const loader_model_json = @import("loader_model_json.zig");
+const loader_pipeline_json = @import("loader_pipeline_json.zig");
 const json_utils = @import("json_utils.zig");
 const wordpiece_model = @import("wordpiece.zig");
 const unigram_model = @import("unigram.zig");
@@ -16,11 +17,30 @@ const log = @import("log_pkg");
 
 const ManagedArrayList = std.array_list.Managed;
 
+const parseMetadataSections = loader_pipeline_json.parseMetadataSections;
+const ensureJsonDepthWithinLimit = loader_pipeline_json.ensureJsonDepthWithinLimit;
+const parseNormalizer = loader_pipeline_json.parseNormalizer;
+const parsePreTokenizer = loader_pipeline_json.parsePreTokenizer;
+const parsePostProcessor = loader_pipeline_json.parsePostProcessor;
+const parseDecoder = loader_pipeline_json.parseDecoder;
+const MAX_JSON_PIPELINE_DEPTH = loader_pipeline_json.MAX_JSON_PIPELINE_DEPTH;
+const validateModelOptions = loader_model_json.validateModelOptions;
+const validateBpeMergeReferences = loader_model_json.validateBpeMergeReferences;
+const findQuotedString = loader_model_json.findQuotedString;
+const parseMergesFastSection = loader_model_json.parseMergesFastSection;
+const parseVocabFastSection = loader_model_json.parseVocabFastSection;
+const unescapeJsonStringFast = loader_model_json.unescapeJsonStringFast;
+const findSection = utils.findJsonSection;
+const findMatchingBrace = utils.findMatchingBrace;
+const findJsonFieldValue = json_utils.findJsonFieldValue;
+const findJsonFieldString = json_utils.findJsonFieldString;
+const findJsonFieldArrayString = json_utils.findJsonFieldArrayString;
+
 // -------------------- Streaming Loader (hot path) --------------------
 
 /// Fast tokenizer loader - uses direct scanning for vocab/merges (the heavy parts)
 /// Falls back to std.json only for small metadata sections
-pub fn load_from_slice_streaming(allocator: std.mem.Allocator, json_content: []const u8) !schema.TokenizerRoot {
+pub fn parseTokenizerJson(allocator: std.mem.Allocator, json_content: []const u8) !schema.TokenizerRoot {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
@@ -243,1346 +263,66 @@ pub fn load_from_slice_streaming(allocator: std.mem.Allocator, json_content: []c
     };
 }
 
-fn parseMetadataSections(
-    arena_allocator: std.mem.Allocator,
-    json_content: []const u8,
-    added_token_entries: *ManagedArrayList(schema.AddedToken),
-    normalizer: *schema.Normalizer,
-    pretokenizer: *schema.PreTokenizer,
-    postprocessor: *schema.PostProcessor,
-    decoder: *schema.Decoder,
-) !void {
-    var direct_bytefallback_decoder = false;
-    if (findSection(json_content, "\"decoder\"")) |section| {
-        if (section.len > 0 and section[0] == '{') {
-            const end = findMatchingBrace(section, '{', '}') orelse return error.InvalidDecoder;
-            const decoder_section = section[0..end];
-            try ensureJsonDepthWithinLimit(decoder_section, error.InvalidDecoder);
-            if (findJsonFieldString(decoder_section, "\"type\"")) |decoder_type| {
-                direct_bytefallback_decoder =
-                    std.mem.eql(u8, decoder_type, "ByteFallback") and
-                    std.mem.indexOf(u8, decoder_section, "\"decoders\"") == null;
-            }
-        }
-    }
+// -------------------- Exports retained for C API --------------------
 
-    // Use std.json for the small metadata sections
-    var scanner = std.json.Scanner.initCompleteInput(arena_allocator, json_content);
-    if ((try scanner.next()) == .object_begin) {
-        while (true) {
-            const json_token = try scanner.nextAlloc(arena_allocator, .alloc_if_needed);
-            switch (json_token) {
-                .object_end => break,
-                .string, .allocated_string => |field_name| {
-                    if (std.mem.eql(u8, field_name, "added_tokens")) {
-                        try parseAddedTokens(arena_allocator, &scanner, added_token_entries);
-                    } else if (std.mem.eql(u8, field_name, "normalizer")) {
-                        normalizer.* = try parseNormalizer(arena_allocator, &scanner);
-                    } else if (std.mem.eql(u8, field_name, "pre_tokenizer")) {
-                        pretokenizer.* = try parsePreTokenizer(arena_allocator, &scanner);
-                    } else if (std.mem.eql(u8, field_name, "post_processor")) {
-                        postprocessor.* = try parsePostProcessor(arena_allocator, &scanner);
-                    } else if (std.mem.eql(u8, field_name, "decoder")) {
-                        if (direct_bytefallback_decoder) {
-                            try scanner.skipValue();
-                            decoder.* = .{ .type = "ByteFallback" };
-                        } else {
-                            decoder.* = try parseDecoder(arena_allocator, &scanner);
-                        }
-                    } else {
-                        try scanner.skipValue();
-                    }
-                },
-                else => break,
-            }
-        }
-    }
-}
-
-fn validateModelOptions(model_type_name: []const u8, model_json: []const u8) !void {
-    if (!std.mem.eql(u8, model_type_name, "BPE")) return;
-
-    // HuggingFace BPE configs often emit these fields with a neutral default
-    // value even when the feature is effectively disabled. Accept the inert
-    // form so real-world tokenizers still load, but continue rejecting any
-    // non-default value that would silently change runtime behavior.
-    if (findJsonFieldValue(model_json, "\"dropout\"")) |value| {
-        if (!std.mem.eql(u8, value, "null")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
-                .field = "dropout",
-                .value_len = value.len,
-                .value_preview = value[0..@min(value.len, 32)],
-            });
-            return error.InvalidModel;
-        }
-    }
-    var fuse_unk_enabled = false;
-    if (findJsonFieldValue(model_json, "\"fuse_unk\"")) |value| {
-        if (std.mem.eql(u8, value, "true")) {
-            fuse_unk_enabled = true;
-        } else if (!std.mem.eql(u8, value, "false")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
-                .field = "fuse_unk",
-                .value_len = value.len,
-                .value_preview = value[0..@min(value.len, 32)],
-            });
-            return error.InvalidModel;
-        }
-    }
-    var byte_fallback_enabled = false;
-    if (findJsonFieldValue(model_json, "\"byte_fallback\"")) |value| {
-        if (std.mem.eql(u8, value, "true")) {
-            byte_fallback_enabled = true;
-        } else if (!std.mem.eql(u8, value, "false")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
-                .field = "byte_fallback",
-                .value_len = value.len,
-                .value_preview = value[0..@min(value.len, 32)],
-            });
-            return error.InvalidModel;
-        }
-    }
-    // `fuse_unk` affects unknown-token behavior. We only accept it when byte
-    // fallback is also enabled, which keeps runtime behavior aligned with BPE
-    // byte fallback and avoids silently changing unknown-token semantics.
-    if (fuse_unk_enabled and !byte_fallback_enabled) {
-        log.warn("tokenizer", "Tokenizer BPE option rejected", .{
-            .field = "fuse_unk",
-            .reason = "requires_byte_fallback",
-        });
-        return error.InvalidModel;
-    }
-    if (findJsonFieldValue(model_json, "\"continuing_subword_prefix\"")) |value| {
-        if (!std.mem.eql(u8, value, "null") and !std.mem.eql(u8, value, "\"\"")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
-                .field = "continuing_subword_prefix",
-                .value_len = value.len,
-                .value_preview = value[0..@min(value.len, 32)],
-            });
-            return error.InvalidModel;
-        }
-    }
-    if (findJsonFieldValue(model_json, "\"end_of_word_suffix\"")) |value| {
-        if (!std.mem.eql(u8, value, "null") and !std.mem.eql(u8, value, "\"\"")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
-                .field = "end_of_word_suffix",
-                .value_len = value.len,
-                .value_preview = value[0..@min(value.len, 32)],
-            });
-            return error.InvalidModel;
-        }
-    }
-    if (findJsonFieldValue(model_json, "\"ignore_merges\"")) |value| {
-        if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "true")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
-                .field = "ignore_merges",
-                .value_len = value.len,
-                .value_preview = value[0..@min(value.len, 32)],
-            });
-            return error.InvalidModel;
-        }
-    }
-}
-
-fn validateBpeMergeReferences(
-    arena_allocator: std.mem.Allocator,
-    model_type_name: []const u8,
-    vocab_entries: []const schema.TokenId,
-    merge_entries: []const []const u8,
-) !void {
-    if (!std.mem.eql(u8, model_type_name, "BPE")) return;
-
-    var vocab_tokens = std.StringHashMap(void).init(arena_allocator);
-    defer vocab_tokens.deinit();
-    for (vocab_entries) |entry| {
-        try vocab_tokens.put(entry.token, {});
-    }
-
-    for (merge_entries) |merge_entry| {
-        const split_at = std.mem.indexOfScalar(u8, merge_entry, ' ') orelse return error.InvalidMerges;
-        const lhs = merge_entry[0..split_at];
-        const rhs = merge_entry[split_at + 1 ..];
-        if (!vocab_tokens.contains(lhs) or !vocab_tokens.contains(rhs)) return error.InvalidMerges;
-
-        // Later merge rules are allowed to reference intermediate merge outputs
-        // even when those merged tokens are not declared in the original vocab.
-        const merged = try std.mem.concat(arena_allocator, u8, &.{ lhs, rhs });
-        try vocab_tokens.put(merged, {});
-    }
-}
-
-// Use shared JSON parsing utilities
-const findSection = utils.findJsonSection;
-const findMatchingBrace = utils.findMatchingBrace;
-
-/// Find first quoted string value
-fn findQuotedString(s: []const u8) ?[]const u8 {
-    var scan_idx: usize = 0;
-    // Find opening quote
-    while (scan_idx < s.len and s[scan_idx] != '"') : (scan_idx += 1) {}
-    if (scan_idx >= s.len) return null;
-    scan_idx += 1;
-    const start = scan_idx;
-    // Find closing quote
-    while (scan_idx < s.len and s[scan_idx] != '"') {
-        if (s[scan_idx] == '\\') scan_idx += 2 else scan_idx += 1;
-    }
-    return s[start..scan_idx];
-}
-
-fn skipJsonValueFast(json_bytes: []const u8, cursor_ptr: *usize) !void {
-    var cursor = cursor_ptr.*;
-    if (cursor >= json_bytes.len) return;
-
-    switch (json_bytes[cursor]) {
-        '{' => {
-            const end = findMatchingBrace(json_bytes[cursor..], '{', '}') orelse return error.InvalidVocab;
-            cursor += end;
-        },
-        '[' => {
-            const end = findMatchingBrace(json_bytes[cursor..], '[', ']') orelse return error.InvalidVocab;
-            cursor += end;
-        },
-        '"' => {
-            cursor += 1;
-            while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
-                if (json_bytes[cursor] == '\\') {
-                    cursor += 2;
-                } else {
-                    cursor += 1;
-                }
-            }
-            if (cursor >= json_bytes.len) return error.InvalidVocab;
-            cursor += 1;
-        },
-        else => {
-            while (cursor < json_bytes.len and json_bytes[cursor] != ',' and json_bytes[cursor] != '}') : (cursor += 1) {}
-        },
-    }
-
-    cursor_ptr.* = cursor;
-}
-
-/// Fast merges parser - handles both ["a", "b"] and "a b" formats
-fn parseMergesFastSection(arena_allocator: std.mem.Allocator, json_bytes: []const u8, merge_entries: *ManagedArrayList([]const u8)) !void {
-    // Some models have 500k+ merges, so use a large capacity
-    try merge_entries.ensureTotalCapacity(600000);
-    var seen_merges = std.StringHashMap(void).init(arena_allocator);
-    defer seen_merges.deinit();
-
-    var cursor: usize = 0;
-    while (cursor < json_bytes.len and std.ascii.isWhitespace(json_bytes[cursor])) : (cursor += 1) {}
-    if (cursor < json_bytes.len and json_bytes[cursor] == '[') cursor += 1;
-    while (cursor < json_bytes.len) {
-        // Look for either [ (array format) or " (string format)
-        while (cursor < json_bytes.len and json_bytes[cursor] != '[' and json_bytes[cursor] != '"') : (cursor += 1) {}
-        if (cursor >= json_bytes.len) break;
-
-        if (json_bytes[cursor] == '[') {
-            // Array format: ["a", "b"]
-            cursor += 1;
-            while (cursor < json_bytes.len and std.ascii.isWhitespace(json_bytes[cursor])) : (cursor += 1) {}
-            if (cursor < json_bytes.len and json_bytes[cursor] == ']') {
-                cursor += 1;
-                continue;
-            }
-
-            // Find first string
-            if (cursor >= json_bytes.len or json_bytes[cursor] != '"') return error.InvalidMerges;
-            cursor += 1;
-            const a_start = cursor;
-            var a_escape = false;
-            while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
-                if (json_bytes[cursor] == '\\') {
-                    a_escape = true;
-                    cursor += 2;
-                } else cursor += 1;
-            }
-            if (cursor >= json_bytes.len) break;
-            const a_end = cursor;
-            cursor += 1;
-            while (cursor < json_bytes.len and (std.ascii.isWhitespace(json_bytes[cursor]) or json_bytes[cursor] == ',')) : (cursor += 1) {}
-
-            // Find second string
-            if (cursor >= json_bytes.len or json_bytes[cursor] != '"') return error.InvalidMerges;
-            cursor += 1;
-            const b_start = cursor;
-            var b_escape = false;
-            while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
-                if (json_bytes[cursor] == '\\') {
-                    b_escape = true;
-                    cursor += 2;
-                } else cursor += 1;
-            }
-            if (cursor >= json_bytes.len) break;
-            const b_end = cursor;
-            cursor += 1;
-
-            // Get strings
-            const lhs = if (a_escape) try unescapeJsonStringFast(arena_allocator, json_bytes[a_start..a_end]) else json_bytes[a_start..a_end];
-            const rhs = if (b_escape) try unescapeJsonStringFast(arena_allocator, json_bytes[b_start..b_end]) else json_bytes[b_start..b_end];
-            if (lhs.len == 0 or rhs.len == 0 or std.mem.indexOfScalar(u8, lhs, 0) != null or std.mem.indexOfScalar(u8, rhs, 0) != null) {
-                return error.InvalidMerges;
-            }
-
-            // Join with space
-            const merged = try std.fmt.allocPrint(arena_allocator, "{s} {s}", .{ lhs, rhs });
-            if (seen_merges.contains(merged)) return error.InvalidMerges;
-            try seen_merges.put(merged, {});
-            merge_entries.appendAssumeCapacity(merged);
-
-            // Skip to end of array
-            while (cursor < json_bytes.len and std.ascii.isWhitespace(json_bytes[cursor])) : (cursor += 1) {}
-            if (cursor >= json_bytes.len or json_bytes[cursor] != ']') return error.InvalidMerges;
-            cursor += 1;
-        } else {
-            // String format: "a b"
-            cursor += 1;
-            const start = cursor;
-            var has_escape = false;
-            while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
-                if (json_bytes[cursor] == '\\') {
-                    has_escape = true;
-                    cursor += 2;
-                } else cursor += 1;
-            }
-            if (cursor >= json_bytes.len) break;
-
-            const merge_str = if (has_escape) try unescapeJsonStringFast(arena_allocator, json_bytes[start..cursor]) else json_bytes[start..cursor];
-            const first_space = std.mem.indexOfScalar(u8, merge_str, ' ') orelse return error.InvalidMerges;
-            if (first_space == 0 or first_space + 1 >= merge_str.len) return error.InvalidMerges;
-            if (std.mem.indexOfScalarPos(u8, merge_str, first_space + 1, ' ') != null) return error.InvalidMerges;
-            if (seen_merges.contains(merge_str)) return error.InvalidMerges;
-            try seen_merges.put(merge_str, {});
-            merge_entries.appendAssumeCapacity(merge_str);
-            cursor += 1;
-        }
-
-        while (cursor < json_bytes.len and (std.ascii.isWhitespace(json_bytes[cursor]) or json_bytes[cursor] == ',')) : (cursor += 1) {}
-        if (cursor < json_bytes.len and json_bytes[cursor] == ']') break;
-    }
-}
-
-/// Fast direct vocab parser - bypasses std.json for speed
-/// Scans for "key": number patterns directly in the JSON buffer
-fn parseVocabFastSection(
-    arena_allocator: std.mem.Allocator,
-    json_bytes: []const u8,
-    vocab_entries: *ManagedArrayList(schema.TokenId),
-) !void {
-    // Pre-allocate for large vocabularies (some models have 250k+ tokens)
-    try vocab_entries.ensureTotalCapacity(300000);
-    var seen_tokens = std.StringHashMap(void).init(arena_allocator);
-    defer seen_tokens.deinit();
-    var seen_ids = std.AutoHashMap(i32, void).init(arena_allocator);
-    defer seen_ids.deinit();
-
-    var cursor: usize = 0;
-    while (cursor < json_bytes.len) {
-        // Find opening quote for key
-        while (cursor < json_bytes.len and json_bytes[cursor] != '"') : (cursor += 1) {}
-        if (cursor >= json_bytes.len) break;
-        cursor += 1; // skip opening quote
-
-        // Find closing quote (handle escapes)
-        const key_start = cursor;
-        var has_escape = false;
-        while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
-            if (json_bytes[cursor] == '\\') {
-                has_escape = true;
-                cursor += 2; // skip escape sequence
-            } else {
-                cursor += 1;
-            }
-        }
-        if (cursor >= json_bytes.len) break;
-        const key_end = cursor;
-        cursor += 1; // skip closing quote
-
-        // Skip whitespace and colon
-        while (cursor < json_bytes.len and (json_bytes[cursor] == ' ' or json_bytes[cursor] == ':' or json_bytes[cursor] == '\t' or json_bytes[cursor] == '\n' or json_bytes[cursor] == '\r')) : (cursor += 1) {}
-
-        // Check if value is a number (vocab entry) or something else (skip)
-        if (cursor >= json_bytes.len) break;
-        const ch = json_bytes[cursor];
-        if (ch == '-') return error.InvalidVocab;
-        if (ch >= '0' and ch <= '9') {
-            // Parse number
-            const num_start = cursor;
-            while (cursor < json_bytes.len and json_bytes[cursor] >= '0' and json_bytes[cursor] <= '9') : (cursor += 1) {}
-            if (cursor < json_bytes.len and (json_bytes[cursor] == '.' or json_bytes[cursor] == 'e' or json_bytes[cursor] == 'E')) {
-                return error.InvalidVocab;
-            }
-            const id_num = std.fmt.parseInt(i32, json_bytes[num_start..cursor], 10) catch return error.InvalidVocab;
-
-            // Get the key - zero-copy if no escapes
-            const key = if (has_escape)
-                try unescapeJsonStringFast(arena_allocator, json_bytes[key_start..key_end])
-            else
-                json_bytes[key_start..key_end];
-            if (key.len == 0 or std.mem.indexOfScalar(u8, key, 0) != null) return error.InvalidVocab;
-            if (seen_tokens.contains(key) or seen_ids.contains(id_num)) return error.InvalidVocab;
-            try seen_tokens.put(key, {});
-            try seen_ids.put(id_num, {});
-
-            vocab_entries.appendAssumeCapacity(.{ .token = key, .id = id_num, .score = -1.0 });
-        } else {
-            try skipJsonValueFast(json_bytes, &cursor);
-        }
-    }
-}
-
-fn unescapeJsonStringFast(arena_allocator: std.mem.Allocator, input_bytes: []const u8) ![]const u8 {
-    const unescaped = try json_utils.unescapeJsonString(arena_allocator, input_bytes);
-    if (unescaped.ptr == input_bytes.ptr and unescaped.len == input_bytes.len) {
-        return try arena_allocator.dupe(u8, input_bytes);
-    }
-    return unescaped;
-}
-
-fn parseAddedTokens(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, added_entries: *ManagedArrayList(schema.AddedToken)) !void {
-    if ((try json_scanner.next()) != .array_begin) return error.InvalidAdded;
-    var seen_ids = std.AutoHashMap(i32, void).init(arena_allocator);
-    defer seen_ids.deinit();
-    var seen_content = std.StringHashMap(i32).init(arena_allocator);
-    defer seen_content.deinit();
-    while (true) {
-        const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-        switch (json_token) {
-            .array_end => break,
-            .object_begin => {
-                var added_entry = schema.AddedToken{
-                    .id = 0,
-                    .content = "",
-                };
-                var saw_id = false;
-                var saw_content = false;
-                while (true) {
-                    const key_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    switch (key_token) {
-                        .object_end => break,
-                        .allocated_string => |key| {
-                            if (std.mem.eql(u8, key, "id")) {
-                                const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                added_entry.id = switch (value) {
-                                    .allocated_number => |bytes| std.fmt.parseInt(i32, bytes, 10) catch return error.InvalidAdded,
-                                    .number => |bytes| std.fmt.parseInt(i32, bytes, 10) catch return error.InvalidAdded,
-                                    else => return error.InvalidAdded,
-                                };
-                                if (added_entry.id < 0) return error.InvalidAdded;
-                                saw_id = true;
-                            } else if (std.mem.eql(u8, key, "content")) {
-                                const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                added_entry.content = switch (value) {
-                                    .allocated_string => |s| s,
-                                    .string => |s| s,
-                                    else => return error.InvalidAdded,
-                                };
-                                saw_content = true;
-                            } else if (std.mem.eql(u8, key, "single_word")) {
-                                const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                added_entry.single_word = (value == .true);
-                            } else if (std.mem.eql(u8, key, "lstrip")) {
-                                const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                added_entry.lstrip = (value == .true);
-                            } else if (std.mem.eql(u8, key, "rstrip")) {
-                                const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                added_entry.rstrip = (value == .true);
-                            } else if (std.mem.eql(u8, key, "normalized")) {
-                                const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                added_entry.normalized = (value == .true);
-                            } else if (std.mem.eql(u8, key, "special")) {
-                                const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                added_entry.special = (value == .true);
-                            } else {
-                                // Skip unknown added_token fields
-                                try json_scanner.skipValue();
-                            }
-                        },
-                        else => return error.InvalidAdded,
-                    }
-                }
-                if (!saw_id or !saw_content) return error.InvalidAdded;
-                if (std.mem.indexOfScalar(u8, added_entry.content, 0) != null) return error.InvalidAdded;
-                if (added_entry.content.len == 0) continue;
-                if (seen_ids.contains(added_entry.id)) return error.InvalidAdded;
-                if (seen_content.get(added_entry.content)) |existing_id| {
-                    if (existing_id != added_entry.id) return error.InvalidAdded;
-                } else {
-                    try seen_content.put(added_entry.content, added_entry.id);
-                }
-                try seen_ids.put(added_entry.id, {});
-                try added_entries.append(added_entry);
-            },
-            else => return error.InvalidAdded,
-        }
-    }
-}
-
-const MAX_JSON_PIPELINE_DEPTH: usize = 128;
-const MAX_JSON_PIPELINE_BREADTH: usize = 16_384;
-
-fn ensureJsonDepthWithinLimit(json_bytes: []const u8, comptime err: anyerror) !void {
-    // Match the recursive parser's actual risk surface: nested objects.
-    // Arrays are containers but do not add parser recursion by themselves.
-    // The recursive functions start at depth=0 for the outer object, so the
-    // maximum object nesting permitted here is MAX_JSON_PIPELINE_DEPTH + 1.
-    const max_object_depth = MAX_JSON_PIPELINE_DEPTH + 1;
-    var object_depth: usize = 0;
-    var cursor: usize = 0;
-    while (cursor < json_bytes.len) {
-        const byte = json_bytes[cursor];
-        if (byte == '"') {
-            cursor += 1;
-            while (cursor < json_bytes.len) {
-                if (json_bytes[cursor] == '\\' and cursor + 1 < json_bytes.len) {
-                    cursor += 2;
-                } else if (json_bytes[cursor] == '"') {
-                    cursor += 1;
-                    break;
-                } else {
-                    cursor += 1;
-                }
-            }
-            continue;
-        }
-        if (byte == '{') {
-            object_depth += 1;
-            if (object_depth > max_object_depth) return err;
-        } else if (byte == '}') {
-            if (object_depth == 0) return err;
-            object_depth -= 1;
-        }
-        cursor += 1;
-    }
-    if (object_depth != 0) return err;
-}
-
-fn parseNormalizer(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner) !schema.Normalizer {
-    return parseNormalizerDepth(arena_allocator, json_scanner, 0);
-}
-
-fn parseNormalizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, depth: usize) !schema.Normalizer {
-    if (depth > MAX_JSON_PIPELINE_DEPTH) return error.InvalidNormalizer;
-    var normalizer = schema.Normalizer{};
-    var saw_lowercase = false;
-    var saw_strip_accents = false;
-    var saw_clean_text = false;
-    var saw_handle_chinese_chars = false;
-    var saw_prepend = false;
-    var saw_replace_pattern = false;
-    const first_token = try json_scanner.next();
-    if (first_token == .null) return normalizer;
-    if (first_token != .object_begin) {
-        log.warn("tokenizer", "Normalizer parse rejected non-object token", .{
-            .token = @tagName(first_token),
-        });
-        return error.InvalidNormalizer;
-    }
-
-    while (true) {
-        const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-        switch (json_token) {
-            .object_end => break,
-            .allocated_string => |key| {
-                if (std.mem.eql(u8, key, "type")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.type = switch (value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidNormalizer,
-                    };
-                } else if (std.mem.eql(u8, key, "lowercase")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.lowercase = (value == .true);
-                    saw_lowercase = true;
-                } else if (std.mem.eql(u8, key, "strip_accents")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.strip_accents = (value == .true);
-                    saw_strip_accents = true;
-                } else if (std.mem.eql(u8, key, "nfc") or std.mem.eql(u8, key, "NFC")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.nfc = (value == .true);
-                } else if (std.mem.eql(u8, key, "nfd") or std.mem.eql(u8, key, "NFD")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.nfd = (value == .true);
-                } else if (std.mem.eql(u8, key, "nfkc") or std.mem.eql(u8, key, "NFKC")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.nfkc = (value == .true);
-                } else if (std.mem.eql(u8, key, "nfkd") or std.mem.eql(u8, key, "NFKD")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.nfkd = (value == .true);
-                } else if (std.mem.eql(u8, key, "clean_text")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.clean_text = (value == .true);
-                    saw_clean_text = true;
-                } else if (std.mem.eql(u8, key, "handle_chinese_chars")) {
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.handle_chinese_chars = (value == .true);
-                    saw_handle_chinese_chars = true;
-                } else if (std.mem.eql(u8, key, "prepend")) {
-                    // Prepend normalizer: prepend this string to input
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.prepend = switch (value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidNormalizer,
-                    };
-                    saw_prepend = true;
-                } else if (std.mem.eql(u8, key, "pattern")) {
-                    // Replace normalizer pattern - can be {"String": "..."} or just a string
-                    const pattern_token = try json_scanner.next();
-                    if (pattern_token == .object_begin) {
-                        // Parse {"String": "..."} or {"Regex": "..."}
-                        while (true) {
-                            const pattern_entry = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                            switch (pattern_entry) {
-                                .object_end => break,
-                                .allocated_string => |pat_key| {
-                                    if (std.mem.eql(u8, pat_key, "String") or std.mem.eql(u8, pat_key, "Regex")) {
-                                        const pat_val = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                        normalizer.replace_pattern = switch (pat_val) {
-                                            .allocated_string => |s| s,
-                                            .string => |s| s,
-                                            else => return error.InvalidNormalizer,
-                                        };
-                                        saw_replace_pattern = true;
-                                    } else {
-                                        try json_scanner.skipValue();
-                                    }
-                                },
-                                else => return error.InvalidNormalizer,
-                            }
-                        }
-                    } else switch (pattern_token) {
-                        .allocated_string => |s| {
-                            normalizer.replace_pattern = s;
-                            saw_replace_pattern = true;
-                        },
-                        .string => |s| {
-                            normalizer.replace_pattern = s;
-                            saw_replace_pattern = true;
-                        },
-                        else => return error.InvalidNormalizer,
-                    }
-                } else if (std.mem.eql(u8, key, "content")) {
-                    // Replace normalizer content (replacement string)
-                    const value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    normalizer.replace_content = switch (value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidNormalizer,
-                    };
-                } else if (std.mem.eql(u8, key, "normalizers")) {
-                    // Sequence normalizer - parse the array and aggregate settings
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidNormalizer;
-                    var element_count: usize = 0;
-                    while (true) {
-                        const arr_token = try json_scanner.peekNextTokenType();
-                        if (arr_token == .array_end) {
-                            _ = try json_scanner.next();
-                            break;
-                        }
-                        element_count += 1;
-                        if (element_count > MAX_JSON_PIPELINE_BREADTH) return error.InvalidNormalizer;
-                        // Recursively parse each sub-normalizer
-                        const sub = try parseNormalizerDepth(arena_allocator, json_scanner, depth + 1);
-                        // Aggregate: OR the boolean flags
-                        normalizer.lowercase = normalizer.lowercase or sub.lowercase;
-                        normalizer.strip_accents = normalizer.strip_accents or sub.strip_accents;
-                        normalizer.nfc = normalizer.nfc or sub.nfc;
-                        normalizer.nfd = normalizer.nfd or sub.nfd;
-                        normalizer.nfkc = normalizer.nfkc or sub.nfkc;
-                        normalizer.clean_text = normalizer.clean_text or sub.clean_text;
-                        normalizer.handle_chinese_chars = normalizer.handle_chinese_chars or sub.handle_chinese_chars;
-                        // Aggregate Prepend/Replace (take first non-null)
-                        if (normalizer.prepend == null) normalizer.prepend = sub.prepend;
-                        if (normalizer.replace_pattern == null) normalizer.replace_pattern = sub.replace_pattern;
-                        if (normalizer.replace_content == null) normalizer.replace_content = sub.replace_content;
-                    }
-                } else {
-                    try json_scanner.skipValue();
-                }
-            },
-            else => return error.InvalidNormalizer,
-        }
-    }
-    // Infer settings from type if not explicitly set
-    if (std.mem.eql(u8, normalizer.type, "BertNormalizer")) {
-        if (!saw_clean_text) normalizer.clean_text = true;
-        if (!saw_handle_chinese_chars) normalizer.handle_chinese_chars = true;
-        if (!saw_lowercase) normalizer.lowercase = true;
-        if (!saw_strip_accents) normalizer.strip_accents = true;
-    } else if (std.mem.eql(u8, normalizer.type, "Lowercase")) {
-        normalizer.lowercase = true;
-    } else if (std.mem.eql(u8, normalizer.type, "NFC")) {
-        normalizer.nfc = true;
-    } else if (std.mem.eql(u8, normalizer.type, "NFD")) {
-        normalizer.nfd = true;
-    } else if (std.mem.eql(u8, normalizer.type, "NFKC")) {
-        normalizer.nfkc = true;
-    } else if (std.mem.eql(u8, normalizer.type, "NFKD")) {
-        normalizer.nfkd = true;
-    } else if (std.mem.eql(u8, normalizer.type, "StripAccents")) {
-        normalizer.strip_accents = true;
-    } else if (std.mem.eql(u8, normalizer.type, "Prepend")) {
-        if (!saw_prepend or normalizer.prepend == null) return error.InvalidNormalizer;
-    } else if (std.mem.eql(u8, normalizer.type, "Replace")) {
-        if (!saw_replace_pattern or normalizer.replace_pattern == null) return error.InvalidNormalizer;
-    } else if (std.mem.eql(u8, normalizer.type, "Sequence")) {
-        // already validated by recursive parsing
-    } else if (std.mem.eql(u8, normalizer.type, "Custom")) {
-        // Internal parser tests use Custom as a container for explicit flags.
-    } else if (normalizer.type.len > 0) {
-        return error.InvalidNormalizer;
-    }
-    return normalizer;
-}
-
-fn parsePreTokenizer(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner) !schema.PreTokenizer {
-    return parsePreTokenizerDepth(arena_allocator, json_scanner, 0);
-}
-
-fn parsePreTokenizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, depth: usize) !schema.PreTokenizer {
-    if (depth > MAX_JSON_PIPELINE_DEPTH) return error.InvalidPreTokenizer;
-    var pretokenizer = schema.PreTokenizer{};
-    var split_behavior: ?[]const u8 = null;
-    const first = try json_scanner.next();
-    if (first == .null) return pretokenizer;
-    if (first != .object_begin) return error.InvalidPreTokenizer;
-    var saw_type = false;
-    var saw_pattern = false;
-    var saw_regex_pattern = false;
-    var saw_sequence = false;
-
-    while (true) {
-        const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-        switch (json_token) {
-            .object_end => break,
-            .allocated_string => |key| {
-                if (std.mem.eql(u8, key, "type")) {
-                    const type_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    pretokenizer.type = switch (type_value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidPreTokenizer,
-                    };
-                    saw_type = true;
-                } else if (std.mem.eql(u8, key, "behavior")) {
-                    const behavior_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    split_behavior = switch (behavior_value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidPreTokenizer,
-                    };
-                } else if (std.mem.eql(u8, key, "add_prefix_space")) {
-                    const flag_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    pretokenizer.add_prefix_space = (flag_value == .true);
-                } else if (std.mem.eql(u8, key, "prepend_scheme")) {
-                    const scheme_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    if (scheme_value == .allocated_string) {
-                        const scheme = scheme_value.allocated_string;
-                        if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
-                            pretokenizer.add_prefix_space = true;
-                        } else if (std.mem.eql(u8, scheme, "never")) {
-                            pretokenizer.add_prefix_space = false;
-                        }
-                    } else if (scheme_value == .string) {
-                        const scheme = scheme_value.string;
-                        if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
-                            pretokenizer.add_prefix_space = true;
-                        } else if (std.mem.eql(u8, scheme, "never")) {
-                            pretokenizer.add_prefix_space = false;
-                        }
-                    }
-                } else if (std.mem.eql(u8, key, "trim_offsets")) {
-                    const flag_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    pretokenizer.trim_offsets = (flag_value == .true);
-                } else if (std.mem.eql(u8, key, "invert")) {
-                    const flag_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    pretokenizer.regex_invert = (flag_value == .true);
-                } else if (std.mem.eql(u8, key, "use_regex")) {
-                    const flag_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    pretokenizer.use_regex = (flag_value == .true);
-                } else if (std.mem.eql(u8, key, "pattern")) {
-                    // Pattern can be a string or an object with "Regex" or "String" field
-                    const pattern_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    if (pattern_value == .allocated_string) {
-                        pretokenizer.pattern = pattern_value.allocated_string;
-                        saw_pattern = true;
-                    } else if (pattern_value == .string) {
-                        pretokenizer.pattern = pattern_value.string;
-                        saw_pattern = true;
-                    } else if (pattern_value == .object_begin) {
-                        // Parse {"Regex": "..."} or {"String": "..."} format
-                        while (true) {
-                            const pattern_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                            switch (pattern_token) {
-                                .object_end => break,
-                                .allocated_string => |pattern_key| {
-                                    if (std.mem.eql(u8, pattern_key, "Regex") or std.mem.eql(u8, pattern_key, "String")) {
-                                        const pattern_field = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                        pretokenizer.pattern = switch (pattern_field) {
-                                            .allocated_string => |s| s,
-                                            .string => |s| s,
-                                            else => return error.InvalidPreTokenizer,
-                                        };
-                                        saw_pattern = true;
-                                        if (std.mem.eql(u8, pattern_key, "Regex")) saw_regex_pattern = true;
-                                    } else {
-                                        try json_scanner.skipValue();
-                                    }
-                                },
-                                else => return error.InvalidPreTokenizer,
-                            }
-                        }
-                    }
-                } else if (std.mem.eql(u8, key, "pretokenizers")) {
-                    // Sequence pre_tokenizer
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidPreTokenizer;
-                    saw_sequence = true;
-                    var element_count: usize = 0;
-                    while (true) {
-                        const arr_token = try json_scanner.peekNextTokenType();
-                        if (arr_token == .array_end) {
-                            _ = try json_scanner.next();
-                            break;
-                        }
-                        element_count += 1;
-                        if (element_count > MAX_JSON_PIPELINE_BREADTH) return error.InvalidPreTokenizer;
-                        const sub = try parsePreTokenizerDepth(arena_allocator, json_scanner, depth + 1);
-                        // Aggregate settings
-                        pretokenizer.add_prefix_space = pretokenizer.add_prefix_space or sub.add_prefix_space;
-                        pretokenizer.byte_level = pretokenizer.byte_level or sub.byte_level;
-                        pretokenizer.whitespace = pretokenizer.whitespace or sub.whitespace;
-                        pretokenizer.punctuation = pretokenizer.punctuation or sub.punctuation;
-                        // Take first non-null pattern
-                        if (pretokenizer.pattern == null and sub.pattern != null) {
-                            pretokenizer.pattern = sub.pattern;
-                            pretokenizer.regex_split = sub.regex_split;
-                            pretokenizer.regex_invert = sub.regex_invert;
-                        }
-                    }
-                } else {
-                    try json_scanner.skipValue();
-                }
-            },
-            else => return error.InvalidPreTokenizer,
-        }
-    }
-    if (!saw_type) return error.InvalidPreTokenizer;
-    // Infer settings from type
-    if (std.mem.eql(u8, pretokenizer.type, "ByteLevel")) {
-        pretokenizer.byte_level = true;
-    } else if (std.mem.eql(u8, pretokenizer.type, "Whitespace")) {
-        pretokenizer.whitespace = true;
-    } else if (std.mem.eql(u8, pretokenizer.type, "WhitespaceSplit")) {
-        pretokenizer.whitespace = true;
-    } else if (std.mem.eql(u8, pretokenizer.type, "Punctuation")) {
-        pretokenizer.punctuation = true;
-    } else if (std.mem.eql(u8, pretokenizer.type, "BertPreTokenizer")) {
-        pretokenizer.whitespace = true;
-        pretokenizer.punctuation = true;
-    } else if (std.mem.eql(u8, pretokenizer.type, "Metaspace")) {
-        pretokenizer.metaspace = true;
-        pretokenizer.whitespace = true; // Split on spaces before ▁ replacement
-    } else if (std.mem.eql(u8, pretokenizer.type, "Split")) {
-        if (!saw_pattern or pretokenizer.pattern == null) return error.InvalidPreTokenizer;
-        // For Split type, behavior determines whether we emit matches or split on pattern
-        // "Isolated" = emit matches (regex_split = false)
-        // Other behaviors = split on pattern (regex_split = true)
-        if (split_behavior) |b| {
-            pretokenizer.regex_split = !std.mem.eql(u8, b, "Isolated");
-        } else {
-            pretokenizer.regex_split = true; // Default: split on pattern
-        }
-        if (saw_regex_pattern) {
-            var regex_validator = std.mem.zeroes(ct.PreTokenizer);
-            defer tok_fns.tokenizer_pretokenizer_free(&regex_validator);
-            const pat_z = try arena_allocator.dupeZ(u8, pretokenizer.pattern.?);
-            if (tok_fns.tokenizer_pretokenizer_set(&regex_validator, pat_z.ptr) != 0) {
-                return error.InvalidPreTokenizer;
-            }
-        }
-    } else if (std.mem.eql(u8, pretokenizer.type, "Sequence")) {
-        if (!saw_sequence) return error.InvalidPreTokenizer;
-    } else {
-        return error.InvalidPreTokenizer;
-    }
-    if (pretokenizer.regex_invert) {
-        pretokenizer.regex_split = false;
-    }
-    return pretokenizer;
-}
-
-test "parsePreTokenizer captures invert" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const json =
-        \\{
-        \\  "type": "Split",
-        \\  "behavior": "Removed",
-        \\  "invert": true,
-        \\  "pattern": {"Regex": "\\s+"}
-        \\}
-    ;
-
-    var scanner = std.json.Scanner.initCompleteInput(arena.allocator(), json);
-    const parsed = try parsePreTokenizer(arena.allocator(), &scanner);
-    try std.testing.expect(parsed.regex_invert);
-    try std.testing.expect(!parsed.regex_split);
-}
-
-const ParsedTemplateSequence = struct {
-    has_sequence: bool = false,
-    first_before_sequence: ?[]const u8 = null,
-    first_after_sequence: ?[]const u8 = null,
+const LazyBpeRawPostProcessorMode = enum {
+    raw_json,
+    root_for_noop_sequence,
 };
 
-fn parseTemplateSequence(
-    arena_allocator: std.mem.Allocator,
-    json_scanner: *std.json.Scanner,
-    referenced_special_tokens: *std.StringHashMap(void),
-    template_info: ?*ParsedTemplateSequence,
+fn rootPostProcessorSchemaIsNoopSequence(root: schema.TokenizerRoot) bool {
+    const postprocessor = root.post_processor;
+    return std.mem.eql(u8, postprocessor.type, "Sequence") and
+        !postprocessor.add_special and
+        !postprocessor.pair and
+        postprocessor.cls_token == null and
+        postprocessor.sep_token == null;
+}
+
+fn findJsonObjectSection(json_bytes: []const u8, key: []const u8) ?[]const u8 {
+    const section = findSection(json_bytes, key) orelse return null;
+    if (section.len == 0 or section[0] != '{') return null;
+    const end = findMatchingBrace(section, '{', '}') orelse section.len;
+    return section[0..end];
+}
+
+fn applyLazyBpePostProcessorFromRawJson(
+    arena: *std.heap.ArenaAllocator,
+    tokenizer: *ct.Tokenizer,
+    root: schema.TokenizerRoot,
+    json_bytes: []const u8,
+    mode: LazyBpeRawPostProcessorMode,
 ) !void {
-    while (true) {
-        const entry = try json_scanner.next();
-        if (entry == .array_end) break;
-        if (entry != .object_begin) return error.InvalidPostProcessor;
-        while (true) {
-            const field = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-            switch (field) {
-                .object_end => break,
-                .allocated_string => |field_name| {
-                    if (std.mem.eql(u8, field_name, "SpecialToken")) {
-                        if ((try json_scanner.next()) != .object_begin) return error.InvalidPostProcessor;
-                        var saw_id = false;
-                        while (true) {
-                            const special_field = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                            switch (special_field) {
-                                .object_end => break,
-                                .allocated_string => |special_name| {
-                                    if (std.mem.eql(u8, special_name, "id")) {
-                                        const id_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                        const id_str = switch (id_value) {
-                                            .allocated_string => |s| s,
-                                            .string => |s| s,
-                                            else => return error.InvalidPostProcessor,
-                                        };
-                                        try referenced_special_tokens.put(id_str, {});
-                                        if (template_info) |info| {
-                                            if (!info.has_sequence) {
-                                                if (info.first_before_sequence == null) info.first_before_sequence = id_str;
-                                            } else if (info.first_after_sequence == null) {
-                                                info.first_after_sequence = id_str;
-                                            }
-                                        }
-                                        saw_id = true;
-                                    } else {
-                                        try json_scanner.skipValue();
-                                    }
-                                },
-                                else => return error.InvalidPostProcessor,
-                            }
-                        }
-                        if (!saw_id) return error.InvalidPostProcessor;
-                    } else if (std.mem.eql(u8, field_name, "Sequence")) {
-                        if (template_info) |info| info.has_sequence = true;
-                        try json_scanner.skipValue();
-                    } else {
-                        try json_scanner.skipValue();
-                    }
-                },
-                else => return error.InvalidPostProcessor,
-            }
-        }
+    if (mode == .root_for_noop_sequence and rootPostProcessorSchemaIsNoopSequence(root)) {
+        try applyRootPostProcessorMetadata(arena, tokenizer, root);
+        return;
     }
+
+    // schema.PostProcessor stores flattened metadata for direct model builders.
+    // Lazy BPE reparses the raw object so nested Sequence processors are not
+    // dropped before TemplateProcessing/BertProcessing metadata is applied.
+    const postprocessor_json = findJsonObjectSection(json_bytes, "\"post_processor\"") orelse return;
+    try applyPostProcessorFromJson(tokenizer, postprocessor_json);
 }
 
-fn parsePostProcessor(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner) !schema.PostProcessor {
-    return parsePostProcessorDepth(arena_allocator, json_scanner, 0);
+fn buildLazyBpeTokenizerFromOwnedJson(
+    allocator: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    root: schema.TokenizerRoot,
+    json_bytes: []u8,
+    postprocessor_mode: LazyBpeRawPostProcessorMode,
+) !*ct.Tokenizer {
+    const tokenizer = ct.Tokenizer.initBpe(allocator, json_bytes, true) catch |err| {
+        allocator.free(json_bytes);
+        return err;
+    };
+    errdefer tok_fns.tokenizer_free(tokenizer);
+
+    try applyRootMetadataWithoutPostProcessor(arena, tokenizer, root);
+    try applyLazyBpePostProcessorFromRawJson(arena, tokenizer, root, json_bytes, postprocessor_mode);
+    applyRootDecoderMetadata(tokenizer, root);
+    return tokenizer;
 }
-
-fn parsePostProcessorDepth(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, depth: usize) !schema.PostProcessor {
-    if (depth > MAX_JSON_PIPELINE_DEPTH) return error.InvalidPostProcessor;
-    var postprocessor = schema.PostProcessor{};
-    const first = try json_scanner.next();
-    if (first == .null) return postprocessor;
-    if (first != .object_begin) return error.InvalidPostProcessor;
-    var declared_type: []const u8 = "";
-    var saw_type = false;
-    var saw_single = false;
-    var saw_special_tokens = false;
-    var saw_processors = false;
-    var single_template = ParsedTemplateSequence{};
-    var referenced_special_tokens = std.StringHashMap(void).init(arena_allocator);
-    defer referenced_special_tokens.deinit();
-    var defined_special_tokens = std.StringHashMap(void).init(arena_allocator);
-    defer defined_special_tokens.deinit();
-
-    while (true) {
-        const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-        switch (json_token) {
-            .object_end => break,
-            .allocated_string => |key| {
-                if (std.mem.eql(u8, key, "type")) {
-                    const type_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    declared_type = switch (type_value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidPostProcessor,
-                    };
-                    postprocessor.type = declared_type;
-                    saw_type = true;
-                } else if (std.mem.eql(u8, key, "cls")) {
-                    // Parse [token, type_id] array
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidPostProcessor;
-                    const cls_tok = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    postprocessor.cls_token = switch (cls_tok) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidPostProcessor,
-                    };
-                    try json_scanner.skipValue(); // skip type_id
-                    if ((try json_scanner.next()) != .array_end) return error.InvalidPostProcessor;
-                } else if (std.mem.eql(u8, key, "sep")) {
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidPostProcessor;
-                    const sep_tok = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    postprocessor.sep_token = switch (sep_tok) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidPostProcessor,
-                    };
-                    try json_scanner.skipValue(); // skip type_id
-                    if ((try json_scanner.next()) != .array_end) return error.InvalidPostProcessor;
-                } else if (std.mem.eql(u8, key, "add_special_tokens")) {
-                    const flag_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    postprocessor.add_special = (flag_value == .true);
-                } else if (std.mem.eql(u8, key, "single")) {
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidPostProcessor;
-                    saw_single = true;
-                    try parseTemplateSequence(arena_allocator, json_scanner, &referenced_special_tokens, &single_template);
-                } else if (std.mem.eql(u8, key, "pair")) {
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidPostProcessor;
-                    try parseTemplateSequence(arena_allocator, json_scanner, &referenced_special_tokens, null);
-                } else if (std.mem.eql(u8, key, "processors")) {
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidPostProcessor;
-                    saw_processors = true;
-                    while (true) {
-                        const next_token = try json_scanner.peekNextTokenType();
-                        if (next_token == .array_end) {
-                            _ = try json_scanner.next();
-                            break;
-                        }
-                        const sub = try parsePostProcessorDepth(arena_allocator, json_scanner, depth + 1);
-                        mergeParsedPostProcessor(&postprocessor, sub);
-                    }
-                } else if (std.mem.eql(u8, key, "special_tokens")) {
-                    if ((try json_scanner.next()) != .object_begin) return error.InvalidPostProcessor;
-                    saw_special_tokens = true;
-                    while (true) {
-                        const entry = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                        switch (entry) {
-                            .object_end => break,
-                            .allocated_string => |name| {
-                                if ((try json_scanner.next()) != .object_begin) return error.InvalidPostProcessor;
-                                var ids_valid = false;
-                                while (true) {
-                                    const field = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                    switch (field) {
-                                        .object_end => break,
-                                        .allocated_string => |field_name| {
-                                            if (std.mem.eql(u8, field_name, "ids")) {
-                                                if ((try json_scanner.next()) != .array_begin) return error.InvalidPostProcessor;
-                                                if ((try json_scanner.next()) != .number) return error.InvalidPostProcessor;
-                                                if ((try json_scanner.next()) != .array_end) return error.InvalidPostProcessor;
-                                                ids_valid = true;
-                                            } else {
-                                                try json_scanner.skipValue();
-                                            }
-                                        },
-                                        else => return error.InvalidPostProcessor,
-                                    }
-                                }
-                                if (!ids_valid) return error.InvalidPostProcessor;
-                                try defined_special_tokens.put(name, {});
-                            },
-                            else => return error.InvalidPostProcessor,
-                        }
-                    }
-                } else {
-                    try json_scanner.skipValue();
-                }
-            },
-            else => return error.InvalidPostProcessor,
-        }
-    }
-    if (!saw_type) return error.InvalidPostProcessor;
-    // Infer settings from type
-    if (std.mem.eql(u8, declared_type, "BertProcessing")) {
-        postprocessor.add_special = true;
-        if (postprocessor.cls_token == null) postprocessor.cls_token = "[CLS]";
-        if (postprocessor.sep_token == null) postprocessor.sep_token = "[SEP]";
-    } else if (std.mem.eql(u8, declared_type, "TemplateProcessing")) {
-        postprocessor.add_special = true;
-        if (single_template.first_before_sequence) |cls| postprocessor.cls_token = cls;
-        if (single_template.first_after_sequence) |sep| postprocessor.sep_token = sep;
-    } else if (std.mem.eql(u8, declared_type, "RobertaProcessing")) {
-        postprocessor.add_special = true;
-        postprocessor.pair = true; // RoBERTa uses double SEP in pair encoding
-        if (postprocessor.cls_token == null) postprocessor.cls_token = "<s>";
-        if (postprocessor.sep_token == null) postprocessor.sep_token = "</s>";
-    } else if (std.mem.eql(u8, declared_type, "Sequence")) {
-        if (!saw_processors) return error.InvalidPostProcessor;
-    } else if (std.mem.eql(u8, declared_type, "ByteLevel")) {
-        // ByteLevel post-processors only affect offsets; keep them as a valid no-op
-        // in the strict loader so Sequence(ByteLevel, TemplateProcessing) is accepted.
-    } else {
-        return error.InvalidPostProcessor;
-    }
-    if (std.mem.eql(u8, declared_type, "TemplateProcessing") and (!saw_single or !saw_special_tokens)) {
-        return error.InvalidPostProcessor;
-    }
-    if (std.mem.eql(u8, declared_type, "TemplateProcessing")) {
-        var referenced_iter = referenced_special_tokens.keyIterator();
-        while (referenced_iter.next()) |name| {
-            if (!defined_special_tokens.contains(name.*)) return error.InvalidPostProcessor;
-        }
-    }
-    return postprocessor;
-}
-
-fn mergeParsedPostProcessor(target: *schema.PostProcessor, sub: schema.PostProcessor) void {
-    if (sub.type.len == 0 or std.mem.eql(u8, sub.type, "ByteLevel")) return;
-
-    target.type = sub.type;
-    target.add_special = target.add_special or sub.add_special;
-    target.pair = target.pair or sub.pair;
-    if (sub.cls_token != null) target.cls_token = sub.cls_token;
-    if (sub.sep_token != null) target.sep_token = sub.sep_token;
-}
-
-/// Parse decoder section from tokenizer.json
-/// Handles both Sequence decoder (with Strip) and simple decoders
-fn mergeParsedDecoder(decoder: *schema.Decoder, sub: schema.Decoder) void {
-    if (sub.strip_start != 0 or sub.strip_stop != 0) {
-        decoder.strip_start = sub.strip_start;
-        decoder.strip_stop = sub.strip_stop;
-    }
-    if (sub.metaspace) {
-        decoder.metaspace = true;
-        decoder.add_prefix_space = sub.add_prefix_space;
-    }
-    if (std.mem.eql(u8, sub.type, "WordPiece") or !sub.cleanup) {
-        decoder.cleanup = sub.cleanup;
-    }
-}
-
-fn parseDecoder(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner) !schema.Decoder {
-    return parseDecoderDepth(arena_allocator, json_scanner, 0);
-}
-
-fn parseDecoderDepth(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, depth: usize) !schema.Decoder {
-    if (depth > MAX_JSON_PIPELINE_DEPTH) return error.InvalidDecoder;
-    var decoder = schema.Decoder{};
-    const first = try json_scanner.next();
-    if (first == .null) return decoder;
-    if (first != .object_begin) return error.InvalidDecoder;
-    var saw_type = false;
-    var saw_decoders = false;
-
-    while (true) {
-        const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-        switch (json_token) {
-            .object_end => break,
-            .allocated_string => |key| {
-                if (std.mem.eql(u8, key, "type")) {
-                    const type_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    decoder.type = switch (type_value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => return error.InvalidDecoder,
-                    };
-                    saw_type = true;
-                } else if (std.mem.eql(u8, key, "decoders")) {
-                    // Sequence decoder - parse array of sub-decoders
-                    if ((try json_scanner.next()) != .array_begin) return error.InvalidDecoder;
-                    saw_decoders = true;
-                    try parseDecoderSequence(arena_allocator, json_scanner, &decoder, depth + 1);
-                } else if (std.mem.eql(u8, key, "start")) {
-                    // Direct Strip decoder
-                    const start_token = try json_scanner.next();
-                    if (start_token == .number) decoder.strip_start = std.fmt.parseInt(i32, start_token.number, 10) catch 0;
-                } else if (std.mem.eql(u8, key, "stop")) {
-                    const stop_token = try json_scanner.next();
-                    if (stop_token == .number) decoder.strip_stop = std.fmt.parseInt(i32, stop_token.number, 10) catch 0;
-                } else if (std.mem.eql(u8, key, "add_prefix_space")) {
-                    const val = try json_scanner.next();
-                    if (val == .true) decoder.add_prefix_space = true;
-                } else if (std.mem.eql(u8, key, "cleanup")) {
-                    const val = try json_scanner.next();
-                    decoder.cleanup = (val != .false);
-                } else if (std.mem.eql(u8, key, "prepend_scheme")) {
-                    const scheme_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    const scheme = switch (scheme_value) {
-                        .allocated_string => |s| s,
-                        .string => |s| s,
-                        else => "",
-                    };
-                    if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
-                        decoder.add_prefix_space = true;
-                    } else if (std.mem.eql(u8, scheme, "never")) {
-                        decoder.add_prefix_space = false;
-                    }
-                } else {
-                    try json_scanner.skipValue();
-                }
-            },
-            else => return error.InvalidDecoder,
-        }
-    }
-    if (!saw_type) return error.InvalidDecoder;
-    if (std.mem.eql(u8, decoder.type, "Sequence") and !saw_decoders) return error.InvalidDecoder;
-    if (std.mem.eql(u8, decoder.type, "Metaspace")) {
-        decoder.metaspace = true;
-    }
-    if (!std.mem.eql(u8, decoder.type, "Sequence") and
-        !std.mem.eql(u8, decoder.type, "Strip") and
-        !std.mem.eql(u8, decoder.type, "ByteLevel") and
-        !std.mem.eql(u8, decoder.type, "ByteFallback") and
-        !std.mem.eql(u8, decoder.type, "Metaspace") and
-        !std.mem.eql(u8, decoder.type, "WordPiece") and
-        !std.mem.eql(u8, decoder.type, "BPEDecoder"))
-    {
-        return error.InvalidDecoder;
-    }
-    return decoder;
-}
-
-/// Parse decoders array within a Sequence decoder
-fn parseDecoderSequence(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanner, decoder: *schema.Decoder, depth: usize) !void {
-    if (depth > MAX_JSON_PIPELINE_DEPTH) return error.InvalidDecoder;
-    while (true) {
-        const json_token = try json_scanner.next();
-        switch (json_token) {
-            .array_end => break,
-            .object_begin => {
-                // Parse sub-decoder object
-                var sub = schema.Decoder{};
-                var saw_type = false;
-                var saw_decoders = false;
-                var sub_pattern_string: ?[]const u8 = null;
-                var sub_content: ?[]const u8 = null;
-                while (true) {
-                    const sub_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                    switch (sub_token) {
-                        .object_end => break,
-                        .allocated_string => |key| {
-                            if (std.mem.eql(u8, key, "type")) {
-                                const type_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                sub.type = switch (type_value) {
-                                    .allocated_string => |s| s,
-                                    .string => |s| s,
-                                    else => return error.InvalidDecoder,
-                                };
-                                saw_type = true;
-                            } else if (std.mem.eql(u8, key, "decoders")) {
-                                if ((try json_scanner.next()) != .array_begin) return error.InvalidDecoder;
-                                saw_decoders = true;
-                                try parseDecoderSequence(arena_allocator, json_scanner, &sub, depth + 1);
-                            } else if (std.mem.eql(u8, key, "start")) {
-                                const start_token = try json_scanner.next();
-                                if (start_token == .number) sub.strip_start = std.fmt.parseInt(i32, start_token.number, 10) catch 0;
-                            } else if (std.mem.eql(u8, key, "stop")) {
-                                const stop_token = try json_scanner.next();
-                                if (stop_token == .number) sub.strip_stop = std.fmt.parseInt(i32, stop_token.number, 10) catch 0;
-                            } else if (std.mem.eql(u8, key, "cleanup")) {
-                                const cleanup_token = try json_scanner.next();
-                                sub.cleanup = (cleanup_token != .false);
-                            } else if (std.mem.eql(u8, key, "add_prefix_space")) {
-                                const add_prefix_space_token = try json_scanner.next();
-                                sub.add_prefix_space = (add_prefix_space_token == .true);
-                            } else if (std.mem.eql(u8, key, "prepend_scheme")) {
-                                const scheme_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                const scheme = switch (scheme_value) {
-                                    .allocated_string => |s| s,
-                                    .string => |s| s,
-                                    else => "",
-                                };
-                                if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
-                                    sub.add_prefix_space = true;
-                                } else if (std.mem.eql(u8, scheme, "never")) {
-                                    sub.add_prefix_space = false;
-                                }
-                            } else if (std.mem.eql(u8, key, "content")) {
-                                const content_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                sub_content = switch (content_value) {
-                                    .allocated_string => |s| s,
-                                    .string => |s| s,
-                                    else => null,
-                                };
-                            } else if (std.mem.eql(u8, key, "pattern")) {
-                                if ((try json_scanner.next()) != .object_begin) return error.InvalidDecoder;
-                                while (true) {
-                                    const pattern_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                    switch (pattern_token) {
-                                        .object_end => break,
-                                        .allocated_string => |pattern_key| {
-                                            if (std.mem.eql(u8, pattern_key, "String")) {
-                                                const pattern_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
-                                                sub_pattern_string = switch (pattern_value) {
-                                                    .allocated_string => |s| s,
-                                                    .string => |s| s,
-                                                    else => return error.InvalidDecoder,
-                                                };
-                                            } else {
-                                                try json_scanner.skipValue();
-                                            }
-                                        },
-                                        else => return error.InvalidDecoder,
-                                    }
-                                }
-                            } else {
-                                try json_scanner.skipValue();
-                            }
-                        },
-                        else => return error.InvalidDecoder,
-                    }
-                }
-                if (!saw_type) return error.InvalidDecoder;
-                if (std.mem.eql(u8, sub.type, "Sequence") and !saw_decoders) return error.InvalidDecoder;
-                if (std.mem.eql(u8, sub.type, "Metaspace")) {
-                    sub.metaspace = true;
-                } else if (std.mem.eql(u8, sub.type, "Replace")) {
-                    if (sub_pattern_string) |pattern| {
-                        if (sub_content) |content| {
-                            if (std.mem.eql(u8, pattern, "▁") and std.mem.eql(u8, content, " ")) {
-                                sub.metaspace = true;
-                            }
-                        }
-                    }
-                }
-                if (!std.mem.eql(u8, sub.type, "Sequence") and
-                    !std.mem.eql(u8, sub.type, "Strip") and
-                    !std.mem.eql(u8, sub.type, "ByteLevel") and
-                    !std.mem.eql(u8, sub.type, "Metaspace") and
-                    !std.mem.eql(u8, sub.type, "WordPiece") and
-                    !std.mem.eql(u8, sub.type, "BPEDecoder") and
-                    !std.mem.eql(u8, sub.type, "Replace") and
-                    !std.mem.eql(u8, sub.type, "Fuse") and
-                    !std.mem.eql(u8, sub.type, "ByteFallback"))
-                {
-                    return error.InvalidDecoder;
-                }
-                mergeParsedDecoder(decoder, sub);
-            },
-            else => return error.InvalidDecoder,
-        }
-    }
-}
-
-// -------------------- Exports retained for C API --------------------
 
 pub fn tokenizer_loader_from_json_string(json_data: ?[*:0]const u8) ?*ct.Tokenizer {
     const json_ptr = json_data orelse return null;
@@ -1594,7 +334,7 @@ pub fn tokenizer_loader_from_json_string(json_data: ?[*:0]const u8) ?*ct.Tokeniz
     // its encode-time behavior; WordPiece/Unigram build directly from root.
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = load_from_slice_streaming(arena.allocator(), json_bytes) catch |err| {
+    const root = parseTokenizerJson(arena.allocator(), json_bytes) catch |err| {
         log.warn("tokenizer", "Tokenizer JSON parse failed", .{
             .reason = @errorName(err),
             .json_bytes = json_bytes.len,
@@ -1615,60 +355,23 @@ pub fn tokenizer_loader_from_json_string(json_data: ?[*:0]const u8) ?*ct.Tokeniz
             return null;
         };
 
-        const tokenizer = ct.Tokenizer.initBpe(allocator, json_copy, true) catch {
-            allocator.free(json_copy);
-            log.warn("tokenizer", "Lazy BPE tokenizer init failed", .{
-                .json_bytes = json_bytes.len,
-            });
-            return null;
-        };
-
-        // Keep the validated root-based metadata path for everything except
-        // post-processing. TemplateProcessing must still use the dedicated
-        // JSON parser to preserve one-sided BOS/EOS templates and Sequence
-        // wrappers on the lazy BPE path.
-        apply_root_metadata_without_postprocessor(&arena, tokenizer, root) catch |err| {
-            tokenizer.destroy();
-            log.warn("tokenizer", "Tokenizer metadata application failed", .{
+        return buildLazyBpeTokenizerFromOwnedJson(
+            allocator,
+            &arena,
+            root,
+            json_copy,
+            .root_for_noop_sequence,
+        ) catch |err| {
+            log.warn("tokenizer", "Lazy BPE tokenizer build failed", .{
                 .reason = @errorName(err),
+                .json_bytes = json_bytes.len,
                 .model_type = model_type_name,
             });
             return null;
         };
-        const postprocessor_is_noop_sequence =
-            std.mem.eql(u8, root.post_processor.type, "Sequence") and
-            !root.post_processor.add_special and
-            !root.post_processor.pair and
-            root.post_processor.cls_token == null and
-            root.post_processor.sep_token == null;
-
-        if (postprocessor_is_noop_sequence) {
-            apply_root_postprocessor_metadata(&arena, tokenizer, root) catch |err| {
-                tokenizer.destroy();
-                log.warn("tokenizer", "Tokenizer post-processor application failed", .{
-                    .reason = @errorName(err),
-                    .model_type = model_type_name,
-                });
-                return null;
-            };
-        } else if (findSection(json_bytes, "\"post_processor\"")) |section| {
-            if (section.len > 0 and section[0] == '{') {
-                const end = findMatchingBrace(section, '{', '}') orelse section.len;
-                applyPostProcessorFromJson(tokenizer, section[0..end]) catch |err| {
-                    tokenizer.destroy();
-                    log.warn("tokenizer", "Tokenizer post-processor application failed", .{
-                        .reason = @errorName(err),
-                        .model_type = model_type_name,
-                    });
-                    return null;
-                };
-            }
-        }
-        apply_root_decoder_metadata(tokenizer, root);
-        return @ptrCast(tokenizer);
     }
 
-    return build_tokenizer_from_root(&arena, root) catch |err| {
+    return buildTokenizerFromRoot(&arena, root) catch |err| {
         log.warn("tokenizer", "Tokenizer model build failed", .{
             .reason = @errorName(err),
             .model_type = model_type_name,
@@ -1785,7 +488,7 @@ pub fn tokenizer_loader_from_dir(path: ?[*:0]const u8) ?*ct.Tokenizer {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = load_from_slice_streaming(arena.allocator(), json_bytes) catch |err| {
+    const root = parseTokenizerJson(arena.allocator(), json_bytes) catch |err| {
         log.warn("tokenizer", "Tokenizer JSON parse failed", .{
             .reason = @errorName(err),
             .json_path = json_path,
@@ -1798,61 +501,32 @@ pub fn tokenizer_loader_from_dir(path: ?[*:0]const u8) ?*ct.Tokenizer {
 
     if (std.mem.eql(u8, model_type_name, "BPE")) {
         // Use lazy BPE loader - defers vocab/merges parsing until first encode
-        const tokenizer = ct.Tokenizer.initBpe(allocator, json_bytes, true) catch {
-            log.warn("tokenizer", "Lazy BPE tokenizer init failed", .{
-                .json_path = json_path,
-                .json_bytes = json_bytes.len,
-            });
-            allocator.free(json_bytes);
-            return null;
-        };
-        {
-            const now = std.time.nanoTimestamp();
-            const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-            log.debug("tokenizer", "Lazy init", .{ .duration_ms = duration_ms }, @src());
-            t_start = now;
-        }
-
-        // Keep the validated root-based metadata path for everything except
-        // post-processing. TemplateProcessing must still use the dedicated
-        // JSON parser to preserve one-sided BOS/EOS templates and Sequence
-        // wrappers on the lazy BPE path.
-        apply_root_metadata_without_postprocessor(&arena, tokenizer, root) catch |err| {
-            tokenizer.destroy();
-            log.warn("tokenizer", "Tokenizer metadata application failed", .{
+        const tokenizer = buildLazyBpeTokenizerFromOwnedJson(
+            allocator,
+            &arena,
+            root,
+            json_bytes,
+            .raw_json,
+        ) catch |err| {
+            log.warn("tokenizer", "Lazy BPE tokenizer build failed", .{
                 .reason = @errorName(err),
                 .json_path = json_path,
+                .json_bytes = json_bytes.len,
                 .model_type = model_type_name,
             });
             return null;
         };
-        if (findSection(json_bytes, "\"post_processor\"")) |section| {
-            if (section.len > 0 and section[0] == '{') {
-                const end = findMatchingBrace(section, '{', '}') orelse section.len;
-                applyPostProcessorFromJson(tokenizer, section[0..end]) catch |err| {
-                    tokenizer.destroy();
-                    log.warn("tokenizer", "Tokenizer post-processor application failed", .{
-                        .reason = @errorName(err),
-                        .json_path = json_path,
-                        .model_type = model_type_name,
-                    });
-                    return null;
-                };
-            }
-        }
-        apply_root_decoder_metadata(tokenizer, root);
         {
             const now = std.time.nanoTimestamp();
             const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-            log.debug("tokenizer", "Apply config", .{ .duration_ms = duration_ms }, @src());
+            log.debug("tokenizer", "Build lazy BPE", .{ .duration_ms = duration_ms }, @src());
         }
         return @ptrCast(tokenizer);
     }
 
-    // json_bytes must stay alive until after build_tokenizer_from_root — the
+    // json_bytes must stay alive until after buildTokenizerFromRoot — the
     // parsed root struct contains slices that reference the original buffer
-    // (e.g. model.type from detectModelType, normalizer/pretokenizer fields
-    // from std.json Scanner's .alloc_if_needed path).
+    // from std.json Scanner's .alloc_if_needed path.
     defer allocator.free(json_bytes);
     {
         const now = std.time.nanoTimestamp();
@@ -1860,7 +534,7 @@ pub fn tokenizer_loader_from_dir(path: ?[*:0]const u8) ?*ct.Tokenizer {
         log.debug("tokenizer", "Parse JSON", .{ .duration_ms = duration_ms }, @src());
         t_start = now;
     }
-    const result = build_tokenizer_from_root(&arena, root) catch |err| {
+    const result = buildTokenizerFromRoot(&arena, root) catch |err| {
         log.warn("tokenizer", "Tokenizer model build failed", .{
             .reason = @errorName(err),
             .json_path = json_path,
@@ -1876,321 +550,7 @@ pub fn tokenizer_loader_from_dir(path: ?[*:0]const u8) ?*ct.Tokenizer {
     return result;
 }
 
-/// Detect model type by scanning JSON for "type" field in "model" section
-fn detectModelType(json_bytes: []const u8) []const u8 {
-    // Find "model" section
-    if (std.mem.indexOf(u8, json_bytes, "\"model\"")) |model_pos| {
-        // Find "type" within next 200 bytes
-        const search_end = @min(model_pos + 200, json_bytes.len);
-        if (std.mem.indexOf(u8, json_bytes[model_pos..search_end], "\"type\"")) |type_pos| {
-            const abs_pos = model_pos + type_pos + 6; // skip "type"
-            // Find the value string
-            var cursor = abs_pos;
-            while (cursor < json_bytes.len and json_bytes[cursor] != '"') : (cursor += 1) {}
-            if (cursor >= json_bytes.len) return "BPE";
-            cursor += 1;
-            const value_start = cursor;
-            while (cursor < json_bytes.len and json_bytes[cursor] != '"') : (cursor += 1) {}
-            return json_bytes[value_start..cursor];
-        }
-    }
-    return "BPE";
-}
-
 /// Find a field value (number/bool) in JSON object
-fn findJsonFieldValue(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
-    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
-    var cursor = pos + field_bytes.len;
-    while (cursor < json_bytes.len and (json_bytes[cursor] == ' ' or json_bytes[cursor] == ':' or json_bytes[cursor] == '\t' or json_bytes[cursor] == '\n' or json_bytes[cursor] == '\r')) : (cursor += 1) {}
-    if (cursor >= json_bytes.len) return null;
-    const value_start = cursor;
-    while (cursor < json_bytes.len and json_bytes[cursor] != ',' and json_bytes[cursor] != '}' and json_bytes[cursor] != ']' and json_bytes[cursor] != ' ' and json_bytes[cursor] != '\n' and json_bytes[cursor] != '\r') : (cursor += 1) {}
-    return json_bytes[value_start..cursor];
-}
-
-fn findJsonFieldString(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
-    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
-    var cursor = pos + field_bytes.len;
-    while (cursor < json_bytes.len and (json_bytes[cursor] == ' ' or json_bytes[cursor] == ':' or json_bytes[cursor] == '\t' or json_bytes[cursor] == '\n' or json_bytes[cursor] == '\r')) : (cursor += 1) {}
-    if (cursor >= json_bytes.len or json_bytes[cursor] != '"') return null;
-    cursor += 1;
-    const value_start = cursor;
-    while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
-        if (json_bytes[cursor] == '\\') cursor += 2 else cursor += 1;
-    }
-    return json_bytes[value_start..cursor];
-}
-
-/// Parse a JSON field whose value is a ["string", number] tuple (e.g. BertProcessing cls/sep).
-/// Returns the string element, or null if the field is absent or not in array format.
-fn findJsonFieldArrayString(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
-    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
-    var cursor = pos + field_bytes.len;
-    // Skip whitespace and colon
-    while (cursor < json_bytes.len and (json_bytes[cursor] == ' ' or json_bytes[cursor] == ':' or json_bytes[cursor] == '\t' or json_bytes[cursor] == '\n')) : (cursor += 1) {}
-    if (cursor >= json_bytes.len or json_bytes[cursor] != '[') return null;
-    cursor += 1;
-    // Skip whitespace inside array
-    while (cursor < json_bytes.len and (json_bytes[cursor] == ' ' or json_bytes[cursor] == '\t' or json_bytes[cursor] == '\n')) : (cursor += 1) {}
-    if (cursor >= json_bytes.len or json_bytes[cursor] != '"') return null;
-    cursor += 1;
-    const str_start = cursor;
-    while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
-        if (json_bytes[cursor] == '\\') cursor += 2 else cursor += 1;
-    }
-    return json_bytes[str_start..cursor];
-}
-
-fn findJsonKeyPos(json_bytes: []const u8, field_bytes: []const u8) ?usize {
-    var cursor: usize = 0;
-    while (cursor < json_bytes.len) {
-        if (json_bytes[cursor] == '"') {
-            const key_start = cursor;
-            cursor += 1;
-            while (cursor < json_bytes.len) {
-                if (json_bytes[cursor] == '\\' and cursor + 1 < json_bytes.len) {
-                    cursor += 2;
-                } else if (json_bytes[cursor] == '"') {
-                    cursor += 1;
-                    break;
-                } else {
-                    cursor += 1;
-                }
-            }
-            const key_end = cursor;
-            if (key_end - key_start == field_bytes.len and std.mem.eql(u8, json_bytes[key_start..key_end], field_bytes)) {
-                return key_start;
-            }
-        } else {
-            cursor += 1;
-        }
-    }
-    return null;
-}
-
-fn applyNormalizerFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator, depth: usize) !void {
-    if (depth > MAX_JSON_PIPELINE_DEPTH) return error.InvalidNormalizer;
-    // Handle "type" field to infer normalization type
-    if (findJsonFieldValue(json_bytes, "\"type\"")) |type_val| {
-        // Type values are quoted strings like "NFC", "NFD", etc.
-        // Strip surrounding quotes if present
-        const type_str = if (type_val.len >= 2 and type_val[0] == '"')
-            type_val[1 .. type_val.len - 1]
-        else
-            type_val;
-        if (std.mem.eql(u8, type_str, "NFC")) {
-            tokenizer.*.normalizer.nfc = 1;
-        } else if (std.mem.eql(u8, type_str, "NFD")) {
-            tokenizer.*.normalizer.nfd = 1;
-        } else if (std.mem.eql(u8, type_str, "NFKC")) {
-            tokenizer.*.normalizer.nfkc = 1;
-        } else if (std.mem.eql(u8, type_str, "NFKD")) {
-            tokenizer.*.normalizer.nfkd = 1;
-        } else if (std.mem.eql(u8, type_str, "Lowercase")) {
-            tokenizer.*.normalizer.lowercase = 1;
-        } else if (std.mem.eql(u8, type_str, "StripAccents")) {
-            tokenizer.*.normalizer.strip_accents = 1;
-        } else if (std.mem.eql(u8, type_str, "BertNormalizer")) {
-            tokenizer.*.normalizer.lowercase = 1;
-            tokenizer.*.normalizer.strip_accents = 1;
-            tokenizer.*.normalizer.clean_text = 1;
-            tokenizer.*.normalizer.handle_chinese_chars = 1;
-        } else if (std.mem.eql(u8, type_str, "Sequence")) {
-            // Handle Sequence normalizer - process nested normalizers
-            if (findSection(json_bytes, "\"normalizers\"")) |arr_section| {
-                if (arr_section.len > 0 and arr_section[0] == '[') {
-                    const arr_end = findMatchingBrace(arr_section, '[', ']') orelse arr_section.len;
-                    const arr_content = arr_section[0..arr_end];
-                    // Recursively apply each normalizer in the sequence
-                    var cursor: usize = 0;
-                    while (cursor < arr_content.len) {
-                        // Find start of next object
-                        if (std.mem.indexOfPos(u8, arr_content, cursor, "{")) |obj_start| {
-                            const obj_end = findMatchingBrace(arr_content[obj_start..], '{', '}') orelse break;
-                            const obj_content = arr_content[obj_start .. obj_start + obj_end];
-                            try applyNormalizerFromJsonDepth(tokenizer, obj_content, arena_allocator, depth + 1);
-                            cursor = obj_start + obj_end;
-                        } else break;
-                    }
-                }
-            }
-            return; // Don't process other fields for Sequence type
-        } else if (std.mem.eql(u8, type_str, "Prepend")) {
-            // Handle Prepend normalizer
-            // Use c_allocator for persistent allocations (arena is freed on function return)
-            if (findJsonFieldString(json_bytes, "\"prepend\"")) |prepend_str| {
-                const unescaped = try json_utils.unescapeJsonString(arena_allocator, prepend_str);
-                const dup = std.heap.c_allocator.dupeZ(u8, unescaped) catch return error.OutOfMemory;
-                tokenizer.*.normalizer.prepend = dup.ptr;
-            }
-            return;
-        } else if (std.mem.eql(u8, type_str, "Replace")) {
-            // Handle Replace normalizer
-            // Pattern can be {"String": "..."} - find the String value
-            // Use c_allocator for persistent allocations (arena is freed on function return)
-            if (findSection(json_bytes, "\"pattern\"")) |pat_section| {
-                if (findJsonFieldString(pat_section, "\"String\"")) |pat_str| {
-                    const unescaped = try json_utils.unescapeJsonString(arena_allocator, pat_str);
-                    const dup = std.heap.c_allocator.dupeZ(u8, unescaped) catch return error.OutOfMemory;
-                    tokenizer.*.normalizer.replace_pattern = dup.ptr;
-                }
-            }
-            if (findJsonFieldString(json_bytes, "\"content\"")) |content_str| {
-                const unescaped = try json_utils.unescapeJsonString(arena_allocator, content_str);
-                const dup = std.heap.c_allocator.dupeZ(u8, unescaped) catch return error.OutOfMemory;
-                tokenizer.*.normalizer.replace_content = dup.ptr;
-            }
-            return;
-        }
-    }
-    if (findJsonFieldValue(json_bytes, "\"lowercase\"")) |v| {
-        tokenizer.*.normalizer.lowercase = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    if (findJsonFieldValue(json_bytes, "\"strip_accents\"")) |v| {
-        tokenizer.*.normalizer.strip_accents = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    if (findJsonFieldValue(json_bytes, "\"nfc\"")) |v| {
-        tokenizer.*.normalizer.nfc = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    if (findJsonFieldValue(json_bytes, "\"nfd\"")) |v| {
-        tokenizer.*.normalizer.nfd = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    if (findJsonFieldValue(json_bytes, "\"nfkc\"")) |v| {
-        tokenizer.*.normalizer.nfkc = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    if (findJsonFieldValue(json_bytes, "\"clean_text\"")) |v| {
-        tokenizer.*.normalizer.clean_text = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    if (findJsonFieldValue(json_bytes, "\"handle_chinese_chars\"")) |v| {
-        tokenizer.*.normalizer.handle_chinese_chars = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-}
-
-fn applyPreTokenizerFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator, depth: usize) !void {
-    if (depth > MAX_JSON_PIPELINE_DEPTH) return error.InvalidPreTokenizer;
-    if (findJsonFieldValue(json_bytes, "\"add_prefix_space\"")) |v| {
-        tokenizer.*.pretokenizer.add_prefix_space = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    // Newer HF config uses prepend_scheme instead of add_prefix_space (Metaspace)
-    if (findJsonFieldString(json_bytes, "\"prepend_scheme\"")) |scheme| {
-        if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
-            tokenizer.*.pretokenizer.add_prefix_space = 1;
-        } else if (std.mem.eql(u8, scheme, "never")) {
-            tokenizer.*.pretokenizer.add_prefix_space = 0;
-        }
-    }
-    if (findJsonFieldValue(json_bytes, "\"trim_offsets\"")) |v| {
-        tokenizer.*.pretokenizer.trim_offsets = if (std.mem.eql(u8, v, "true")) 1 else 0;
-    }
-    // Check for type
-    if (findJsonFieldString(json_bytes, "\"type\"")) |type_str| {
-        if (std.mem.eql(u8, type_str, "Sequence")) {
-            // Sequence type - process nested pretokenizers
-            if (findSection(json_bytes, "\"pretokenizers\"")) |arr_section| {
-                if (arr_section.len > 0 and arr_section[0] == '[') {
-                    const arr_end = findMatchingBrace(arr_section, '[', ']') orelse arr_section.len;
-                    const arr_content = arr_section[0..arr_end];
-                    // Find each pretokenizer object in the array
-                    var cursor: usize = 0;
-                    while (cursor < arr_content.len) {
-                        while (cursor < arr_content.len and arr_content[cursor] != '{') : (cursor += 1) {}
-                        if (cursor >= arr_content.len) break;
-                        const obj_start = cursor;
-                        const obj_end = if (findMatchingBrace(arr_content[cursor..], '{', '}')) |len| cursor + len else break;
-                        const obj = arr_content[obj_start..obj_end];
-                        // Recursively apply this nested pretokenizer
-                        try applyPreTokenizerFromJsonDepth(tokenizer, obj, arena_allocator, depth + 1);
-                        cursor = obj_end;
-                    }
-                }
-            }
-        } else if (std.mem.eql(u8, type_str, "ByteLevel")) {
-            tokenizer.*.pretokenizer.byte_level = 1;
-            // ByteLevel with use_regex=true needs its own GPT-2 regex for splitting.
-            // This overrides any prior regex (e.g., a no-op \Q...\E from a String Split).
-            if (findJsonFieldValue(json_bytes, "\"use_regex\"")) |v| {
-                if (std.mem.eql(u8, v, "true")) {
-                    const gpt2_pattern: [*:0]const u8 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
-                    _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, gpt2_pattern);
-                } else if (std.mem.eql(u8, v, "false")) {
-                    tok_fns.tokenizer_pretokenizer_free(&tokenizer.*.pretokenizer);
-                    tokenizer.*.pretokenizer.regex_split = 0;
-                    tokenizer.*.pretokenizer.regex_invert = 0;
-                }
-            }
-        } else if (std.mem.eql(u8, type_str, "Whitespace") or std.mem.eql(u8, type_str, "WhitespaceSplit")) {
-            _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, null);
-            tokenizer.*.pretokenizer.whitespace = 1;
-        } else if (std.mem.eql(u8, type_str, "Punctuation")) {
-            _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, null);
-            tokenizer.*.pretokenizer.punctuation = 1;
-        } else if (std.mem.eql(u8, type_str, "BertPreTokenizer")) {
-            // Clear model default regex — BertPreTokenizer uses whitespace/punctuation splitting
-            _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, null);
-            tokenizer.*.pretokenizer.whitespace = 1;
-            tokenizer.*.pretokenizer.punctuation = 1;
-        } else if (std.mem.eql(u8, type_str, "Metaspace")) {
-            // Clear BPE default regex — Metaspace uses whitespace splitting, not regex
-            _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, null);
-            tokenizer.*.pretokenizer.metaspace = 1;
-            tokenizer.*.pretokenizer.whitespace = 1;
-        } else if (std.mem.eql(u8, type_str, "Split")) {
-            // Split type - parse pattern, behavior, and invert
-            // Behavior: "Isolated" = emit matches and gaps, "Removed" = drop matches
-            //           "MergedWithPrevious/Next" = split on pattern
-            // Note: Don't reset byte_level here - it may be set by a sibling ByteLevel pretokenizer in a Sequence
-
-            // Check behavior - default to MergedWithPrevious (regex_split=1)
-            // "Isolated" emits matches and gaps; everything else splits on pattern.
-            if (findJsonFieldString(json_bytes, "\"behavior\"")) |behavior| {
-                if (std.mem.eql(u8, behavior, "Isolated")) {
-                    tokenizer.*.pretokenizer.regex_split = 0;
-                } else {
-                    tokenizer.*.pretokenizer.regex_split = 1;
-                }
-            } else {
-                tokenizer.*.pretokenizer.regex_split = 1;
-            }
-
-            // Check invert - if true, emit matches instead of gaps
-            // With invert=true, the regex pattern describes what tokens to KEEP
-            if (findJsonFieldValue(json_bytes, "\"invert\"")) |invert_val| {
-                if (std.mem.eql(u8, invert_val, "true")) {
-                    tokenizer.*.pretokenizer.regex_invert = 1;
-                    tokenizer.*.pretokenizer.regex_split = 0;
-                }
-            }
-
-            // Parse pattern - can be {"String": " "} or {"Regex": "..."}
-            // Use c_allocator for persistent allocations (arena is freed on function return)
-            if (findSection(json_bytes, "\"pattern\"")) |pattern_section| {
-                if (pattern_section.len > 0 and pattern_section[0] == '{') {
-                    // Object format: {"String": " "} or {"Regex": "..."}
-                    if (findJsonFieldString(pattern_section, "\"String\"")) |str_pattern| {
-                        // String patterns are literal matches — wrap with \Q...\E so
-                        // PCRE2 treats the value as a literal, not as a regex.
-                        const unescaped = try json_utils.unescapeJsonString(arena_allocator, str_pattern);
-                        const content_len = 2 + unescaped.len + 2; // \Q + content + \E
-                        const pat_z = std.heap.c_allocator.allocSentinel(u8, content_len, 0) catch return error.OutOfMemory;
-                        pat_z[0] = '\\';
-                        pat_z[1] = 'Q';
-                        @memcpy(pat_z[2 .. 2 + unescaped.len], unescaped);
-                        pat_z[2 + unescaped.len] = '\\';
-                        pat_z[2 + unescaped.len + 1] = 'E';
-                        _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, pat_z.ptr);
-                    } else if (findJsonFieldString(pattern_section, "\"Regex\"")) |regex_pattern| {
-                        // Unescape JSON string and compile pattern as regex
-                        const unescaped = try json_utils.unescapeJsonString(arena_allocator, regex_pattern);
-                        const pat_z = std.heap.c_allocator.dupeZ(u8, unescaped) catch return error.OutOfMemory;
-                        _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, pat_z.ptr);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Apply decoder settings from JSON (fast path)
 /// Apply post_processor settings from JSON for the fast-path BPE loader.
 /// Parses type, cls/sep tokens (BertProcessing format), and resolves IDs
 /// from the added_tokens list.
@@ -2242,7 +602,8 @@ fn applyPostProcessorFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const
 
     if (std.mem.eql(u8, type_str, "BertProcessing")) {
         // BertProcessing stores cls/sep as ["token_string", id] arrays.
-        // Try array format first, fall back to plain string.
+        // BertProcessing stores arrays in tokenizer.json; accept the plain
+        // string shape as a secondary valid encoding.
         cls_str = findJsonFieldArrayString(json_bytes, "\"cls\"") orelse
             findJsonFieldString(json_bytes, "\"cls\"");
         sep_str = findJsonFieldArrayString(json_bytes, "\"sep\"") orelse
@@ -2310,7 +671,12 @@ fn applyPostProcessorFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const
         tokenizer.postproc.sep_token[copy_len] = 0;
     }
 
-    // Resolve cls_id/sep_id from added tokens
+    resolvePostProcessorAddedTokenIds(tokenizer);
+}
+
+fn resolvePostProcessorAddedTokenIds(tokenizer: *ct.Tokenizer) void {
+    if (tokenizer.postproc.add_special == 0) return;
+
     if (tokenizer.postproc.cls_id == -1) {
         const cls_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.cls_token);
         if (tok_fns.tokenizer_added_token_find(tokenizer, cls_z)) |added| {
@@ -2325,12 +691,28 @@ fn applyPostProcessorFromJsonDepth(tokenizer: *ct.Tokenizer, json_bytes: []const
     }
 }
 
-fn apply_root_metadata_without_postprocessor(arena: *std.heap.ArenaAllocator, tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) !void {
-    try apply_added_tokens(tokenizer, root.added_tokens);
+fn dupeArenaZ(arena: *std.heap.ArenaAllocator, bytes: []const u8) ![*c]const u8 {
+    return (try arena.allocator().dupeZ(u8, bytes)).ptr;
+}
+
+fn dupeArenaZIfPresent(arena: *std.heap.ArenaAllocator, bytes: []const u8) ![*c]const u8 {
+    return if (bytes.len > 0) try dupeArenaZ(arena, bytes) else null;
+}
+
+fn dupeArenaZOptional(arena: *std.heap.ArenaAllocator, maybe_bytes: ?[]const u8) ![*c]const u8 {
+    return if (maybe_bytes) |bytes| try dupeArenaZ(arena, bytes) else null;
+}
+
+fn dupeRuntimeZOptional(maybe_bytes: ?[]const u8) ![*c]const u8 {
+    return if (maybe_bytes) |bytes| (try std.heap.c_allocator.dupeZ(u8, bytes)).ptr else null;
+}
+
+fn applyRootMetadataWithoutPostProcessor(arena: *std.heap.ArenaAllocator, tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) !void {
+    try applyAddedTokens(tokenizer, root.added_tokens);
 
     // Apply normalizer settings
     const normalizer_spec = ct.NormalizerSpec{
-        .type = if (root.normalizer.type.len > 0) (arena.allocator().dupeZ(u8, root.normalizer.type) catch return error.BuildFailed).ptr else null,
+        .type = try dupeArenaZIfPresent(arena, root.normalizer.type),
         .lowercase = if (root.normalizer.lowercase) 1 else 0,
         .strip_accents = if (root.normalizer.strip_accents) 1 else 0,
         .nfc = if (root.normalizer.nfc) 1 else 0,
@@ -2340,22 +722,22 @@ fn apply_root_metadata_without_postprocessor(arena: *std.heap.ArenaAllocator, to
         .clean_text = if (root.normalizer.clean_text) 1 else 0,
         .handle_chinese_chars = if (root.normalizer.handle_chinese_chars) 1 else 0,
         // SentencePiece-style normalizers
-        .prepend = if (root.normalizer.prepend) |p| (std.heap.c_allocator.dupeZ(u8, p) catch return error.BuildFailed).ptr else null,
-        .replace_pattern = if (root.normalizer.replace_pattern) |p| (std.heap.c_allocator.dupeZ(u8, p) catch return error.BuildFailed).ptr else null,
-        .replace_content = if (root.normalizer.replace_content) |c_val| (std.heap.c_allocator.dupeZ(u8, c_val) catch return error.BuildFailed).ptr else null,
+        .prepend = try dupeRuntimeZOptional(root.normalizer.prepend),
+        .replace_pattern = try dupeRuntimeZOptional(root.normalizer.replace_pattern),
+        .replace_content = try dupeRuntimeZOptional(root.normalizer.replace_content),
     };
     tok_fns.tokenizer_apply_normalizer_spec(tokenizer, &normalizer_spec);
 
     // Apply pre_tokenizer settings
     const pretokenizer_spec = ct.PreTokenizerSpec{
-        .type = if (root.pre_tokenizer.type.len > 0) (arena.allocator().dupeZ(u8, root.pre_tokenizer.type) catch return error.BuildFailed).ptr else null,
+        .type = try dupeArenaZIfPresent(arena, root.pre_tokenizer.type),
         .add_prefix_space = if (root.pre_tokenizer.add_prefix_space) 1 else 0,
         .trim_offsets = if (root.pre_tokenizer.trim_offsets) 1 else 0,
         .use_regex = if (root.pre_tokenizer.use_regex) 1 else 0,
         .byte_level = if (root.pre_tokenizer.byte_level) 1 else 0,
         .whitespace = if (root.pre_tokenizer.whitespace) 1 else 0,
         .punctuation = if (root.pre_tokenizer.punctuation) 1 else 0,
-        .pattern = if (root.pre_tokenizer.pattern) |p| (arena.allocator().dupeZ(u8, p) catch return error.BuildFailed).ptr else null,
+        .pattern = try dupeArenaZOptional(arena, root.pre_tokenizer.pattern),
         .regex_split = if (root.pre_tokenizer.regex_split) 1 else 0,
         .regex_invert = if (root.pre_tokenizer.regex_invert) 1 else 0,
         .metaspace = if (root.pre_tokenizer.metaspace) 1 else 0,
@@ -2363,7 +745,7 @@ fn apply_root_metadata_without_postprocessor(arena: *std.heap.ArenaAllocator, to
     tok_fns.tokenizer_apply_pretokenizer_spec(tokenizer, &pretokenizer_spec);
 }
 
-fn apply_root_postprocessor_metadata(arena: *std.heap.ArenaAllocator, tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) !void {
+fn applyRootPostProcessorMetadata(arena: *std.heap.ArenaAllocator, tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) !void {
     // Apply post_processor settings from JSON.
     // When JSON explicitly specifies a post_processor, use those settings.
     // When JSON has no post_processor (null), clear any model default (e.g.,
@@ -2371,11 +753,11 @@ fn apply_root_postprocessor_metadata(arena: *std.heap.ArenaAllocator, tokenizer:
     // respect the JSON configuration as authoritative).
     if (root.post_processor.type.len > 0 or root.post_processor.add_special or root.post_processor.pair or root.post_processor.cls_token != null or root.post_processor.sep_token != null) {
         const postprocessor_spec = ct.PostProcessorSpec{
-            .type = if (root.post_processor.type.len > 0) (arena.allocator().dupeZ(u8, root.post_processor.type) catch return error.BuildFailed).ptr else null,
+            .type = try dupeArenaZIfPresent(arena, root.post_processor.type),
             .add_special = if (root.post_processor.add_special) 1 else 0,
             .pair = if (root.post_processor.pair) 1 else 0,
-            .cls_token = if (root.post_processor.cls_token) |cls| (arena.allocator().dupeZ(u8, cls) catch return error.BuildFailed).ptr else null,
-            .sep_token = if (root.post_processor.sep_token) |sep| (arena.allocator().dupeZ(u8, sep) catch return error.BuildFailed).ptr else null,
+            .cls_token = try dupeArenaZOptional(arena, root.post_processor.cls_token),
+            .sep_token = try dupeArenaZOptional(arena, root.post_processor.sep_token),
         };
         tok_fns.tokenizer_apply_postprocessor_spec(tokenizer, &postprocessor_spec);
         // Reset IDs so they're re-resolved from the configured token strings.
@@ -2387,21 +769,10 @@ fn apply_root_postprocessor_metadata(arena: *std.heap.ArenaAllocator, tokenizer:
 
     // Resolve cls_id/sep_id from added tokens when post_processor is active.
     // Look up the token strings in the added_tokens list to find the correct IDs.
-    if (tokenizer.postproc.add_special != 0 and tokenizer.postproc.cls_id == -1) {
-        const cls_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.cls_token);
-        if (tok_fns.tokenizer_added_token_find(tokenizer, cls_z)) |added| {
-            tokenizer.postproc.cls_id = added.id;
-        }
-    }
-    if (tokenizer.postproc.add_special != 0 and tokenizer.postproc.sep_id == -1) {
-        const sep_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.sep_token);
-        if (tok_fns.tokenizer_added_token_find(tokenizer, sep_z)) |added| {
-            tokenizer.postproc.sep_id = added.id;
-        }
-    }
+    resolvePostProcessorAddedTokenIds(tokenizer);
 }
 
-fn apply_root_decoder_metadata(tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) void {
+fn applyRootDecoderMetadata(tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) void {
     // Apply decoder settings (e.g., Strip decoder for SentencePiece)
     tokenizer.decoder.strip_start = @intCast(root.decoder.strip_start);
     tokenizer.decoder.strip_stop = @intCast(root.decoder.strip_stop);
@@ -2411,117 +782,47 @@ fn apply_root_decoder_metadata(tokenizer: *ct.Tokenizer, root: schema.TokenizerR
     tokenizer.decoder.metaspace = if (root.decoder.metaspace) 1 else 0;
 }
 
-fn apply_root_metadata(arena: *std.heap.ArenaAllocator, tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) !void {
-    try apply_root_metadata_without_postprocessor(arena, tokenizer, root);
-    try apply_root_postprocessor_metadata(arena, tokenizer, root);
-    apply_root_decoder_metadata(tokenizer, root);
+fn applyRootMetadata(arena: *std.heap.ArenaAllocator, tokenizer: *ct.Tokenizer, root: schema.TokenizerRoot) !void {
+    try applyRootMetadataWithoutPostProcessor(arena, tokenizer, root);
+    try applyRootPostProcessorMetadata(arena, tokenizer, root);
+    applyRootDecoderMetadata(tokenizer, root);
 }
 
-fn build_tokenizer_from_root(arena: *std.heap.ArenaAllocator, root: schema.TokenizerRoot) !*ct.Tokenizer {
+fn buildTokenizerFromRoot(arena: *std.heap.ArenaAllocator, root: schema.TokenizerRoot) !*ct.Tokenizer {
     const model_type_name = root.model.type;
-    if (std.mem.eql(u8, model_type_name, "BPE")) {
-        const tokenizer = try build_bpe(arena, root.model);
-        try apply_root_metadata(arena, tokenizer, root);
-        return tokenizer;
-    } else if (std.mem.eql(u8, model_type_name, "WordPiece")) {
-        const tokenizer = try build_wordpiece(arena, root.model);
-        try apply_root_metadata(arena, tokenizer, root);
+    if (std.mem.eql(u8, model_type_name, "WordPiece")) {
+        const tokenizer = try buildWordPiece(root.model);
+        errdefer tok_fns.tokenizer_free(tokenizer);
+        try applyRootMetadata(arena, tokenizer, root);
         return tokenizer;
     } else if (std.mem.eql(u8, model_type_name, "Unigram")) {
-        const tokenizer = try build_unigram(arena, root.model);
-        try apply_root_metadata(arena, tokenizer, root);
+        const tokenizer = try buildUnigram(root.model);
+        errdefer tok_fns.tokenizer_free(tokenizer);
+        try applyRootMetadata(arena, tokenizer, root);
         return tokenizer;
     } else {
         return error.UnsupportedModel;
     }
 }
 
-fn build_bpe(arena: *std.heap.ArenaAllocator, model: schema.Model) !*ct.Tokenizer {
-    var t_start: i128 = std.time.nanoTimestamp();
-
-    const vocab_len = model.vocab.len;
-    const vocab_arr = try arena.allocator().alloc(ct.TokenIdPair, vocab_len);
-    for (model.vocab, 0..) |entry, entry_idx| {
-        const token_dup = try arena.allocator().dupeZ(u8, entry.token);
-        vocab_arr[entry_idx] = .{ .token = token_dup.ptr, .id = entry.id };
-    }
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-        log.trace("tokenizer", "Vocab copy", .{ .duration_ms = duration_ms }, @src());
-        t_start = now;
-    }
-
-    const merges_len = if (model.merges) |m| m.len else 0;
-    const merges_arr = try arena.allocator().alloc(ct.BpeMergePair, merges_len);
-    if (model.merges) |m| {
-        for (m, 0..) |merge_str, merge_idx| {
-            const parts = std.mem.splitScalar(u8, merge_str, ' ');
-            var part_iter = parts;
-            const left = part_iter.next() orelse merge_str;
-            const right = part_iter.next() orelse "";
-            const left_dup = try arena.allocator().dupeZ(u8, left);
-            const right_dup = try arena.allocator().dupeZ(u8, right);
-            merges_arr[merge_idx] = .{ .a = left_dup.ptr, .b = right_dup.ptr };
-        }
-    }
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-        log.trace("tokenizer", "Merges copy", .{ .duration_ms = duration_ms }, @src());
-        t_start = now;
-    }
-
-    const model_spec = ct.BpeModelSpec{
-        .vocab = vocab_arr.ptr,
-        .vocab_len = vocab_len,
-        .merges = merges_arr.ptr,
-        .merges_len = merges_len,
-        .unk_token = if (model.unk_token) |u| (try arena.allocator().dupeZ(u8, u)).ptr else null,
-    };
-    const result = bpe.tokenizer_bpe_create_from_spec(@ptrCast(&model_spec)) orelse return error.BuildFailed;
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-        log.trace("tokenizer", "BPE create", .{ .duration_ms = duration_ms }, @src());
-    }
-    return result;
+fn buildWordPiece(model: schema.Model) !*ct.Tokenizer {
+    return wordpiece_model.createWordPieceTokenizer(
+        model.vocab,
+        model.unk_token,
+        model.max_input_chars_per_word,
+    );
 }
 
-fn build_wordpiece(arena: *std.heap.ArenaAllocator, model: schema.Model) !*ct.Tokenizer {
-    const vocab_len = model.vocab.len;
-    const vocab_arr = try arena.allocator().alloc(ct.TokenIdPair, vocab_len);
-    for (model.vocab, 0..) |entry, entry_idx| {
-        const token_dup = try arena.allocator().dupeZ(u8, entry.token);
-        vocab_arr[entry_idx] = .{ .token = token_dup.ptr, .id = entry.id };
-    }
-    const model_spec = ct.WordPieceModelSpec{
-        .vocab = vocab_arr.ptr,
-        .vocab_len = vocab_len,
-        .unk_token = if (model.unk_token) |u| (try arena.allocator().dupeZ(u8, u)).ptr else null,
-        .max_input_chars_per_word = model.max_input_chars_per_word,
-    };
-    return wordpiece_model.tokenizer_wordpiece_create_from_spec(@ptrCast(&model_spec)) orelse error.BuildFailed;
+fn buildUnigram(model: schema.Model) !*ct.Tokenizer {
+    return unigram_model.createUnigramTokenizer(
+        model.vocab,
+        model.unk_token,
+        model.bos_token,
+        model.eos_token,
+    );
 }
 
-fn build_unigram(arena: *std.heap.ArenaAllocator, model: schema.Model) !*ct.Tokenizer {
-    const vocab_len = model.vocab.len;
-    const vocab_arr = try arena.allocator().alloc(ct.UnigramVocabEntry, vocab_len);
-    for (model.vocab, 0..) |entry, entry_idx| {
-        const token_dup = try arena.allocator().dupeZ(u8, entry.token);
-        vocab_arr[entry_idx] = .{ .token = token_dup.ptr, .score = entry.score, .id = entry.id };
-    }
-    const model_spec = ct.UnigramModelSpec{
-        .vocab = vocab_arr.ptr,
-        .vocab_len = vocab_len,
-        .unk_token = if (model.unk_token) |u| (try arena.allocator().dupeZ(u8, u)).ptr else null,
-        .bos_token = if (model.bos_token) |u| (try arena.allocator().dupeZ(u8, u)).ptr else null,
-        .eos_token = if (model.eos_token) |u| (try arena.allocator().dupeZ(u8, u)).ptr else null,
-    };
-    return unigram_model.tokenizer_unigram_create_from_spec(@ptrCast(&model_spec)) orelse error.BuildFailed;
-}
-
-fn apply_added_tokens(tokenizer: *ct.Tokenizer, added_tokens: []const schema.AddedToken) !void {
+fn applyAddedTokens(tokenizer: *ct.Tokenizer, added_tokens: []const schema.AddedToken) !void {
     for (added_tokens) |token_entry| {
         const content_dup = try std.heap.c_allocator.dupeZ(u8, token_entry.content);
         defer std.heap.c_allocator.free(content_dup);
@@ -2538,20 +839,7 @@ fn apply_added_tokens(tokenizer: *ct.Tokenizer, added_tokens: []const schema.Add
 // Tests
 // =============================================================================
 
-// Note: Most loader functions (load_from_slice_streaming, tokenizer_loader_from_dir, etc.)
-// require file I/O and full JSON parsing. They are tested via integration tests.
-// Helper functions like detectModelType, findJsonFieldValue, and unescapeJsonStringFast
-// can be unit-tested.
-
-test "detectModelType finds BPE type" {
-    const json =
-        \\{"model": {"type": "BPE", "vocab": {}}}
-    ;
-    const model_type = detectModelType(json);
-    try std.testing.expectEqualStrings("BPE", model_type);
-}
-
-test "load_from_slice_streaming accepts valid minimal bpe" {
+test "parseTokenizerJson accepts valid minimal bpe" {
     const json =
         \\{
         \\  "version": "1.0",
@@ -2564,7 +852,7 @@ test "load_from_slice_streaming accepts valid minimal bpe" {
         \\}
     ;
 
-    const root = try load_from_slice_streaming(std.testing.allocator, json);
+    const root = try parseTokenizerJson(std.testing.allocator, json);
     try std.testing.expectEqualStrings("BPE", root.model.type);
     try std.testing.expectEqual(@as(usize, 1), root.model.vocab.len);
     try std.testing.expectEqual(@as(usize, 0), root.model.merges.?.len);
@@ -2577,6 +865,80 @@ test "findJsonFieldValue extracts number" {
     const value = findJsonFieldValue(json, "\"id\"");
     try std.testing.expect(value != null);
     try std.testing.expectEqualStrings("123", value.?);
+}
+
+test "validateModelOptions rejects unsupported BPE options" {
+    try validateModelOptions("BPE",
+        \\{"type":"BPE","dropout":null,"fuse_unk":true,"byte_fallback":true,"ignore_merges":false}
+    );
+    try validateModelOptions("WordPiece",
+        \\{"type":"WordPiece","dropout":0.25}
+    );
+
+    try std.testing.expectError(error.InvalidModel, validateModelOptions("BPE",
+        \\{"type":"BPE","dropout":0.25}
+    ));
+    try std.testing.expectError(error.InvalidModel, validateModelOptions("BPE",
+        \\{"type":"BPE","fuse_unk":true,"byte_fallback":false}
+    ));
+    try std.testing.expectError(error.InvalidModel, validateModelOptions("BPE",
+        \\{"type":"BPE","continuing_subword_prefix":"##"}
+    ));
+}
+
+test "parseMetadataSections parses added tokens and pipeline sections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{
+        \\  "added_tokens": [
+        \\    {"id": 4, "content": "[X]", "special": true, "single_word": true}
+        \\  ],
+        \\  "normalizer": {"type": "Lowercase"},
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
+        \\  "post_processor": null,
+        \\  "decoder": {"type": "ByteFallback"}
+        \\}
+    ;
+
+    var added = ManagedArrayList(schema.AddedToken).init(allocator);
+    var normalizer = schema.Normalizer{};
+    var pretokenizer = schema.PreTokenizer{};
+    var postprocessor = schema.PostProcessor{};
+    var decoder = schema.Decoder{};
+
+    try parseMetadataSections(allocator, json, &added, &normalizer, &pretokenizer, &postprocessor, &decoder);
+
+    try std.testing.expectEqual(@as(usize, 1), added.items.len);
+    try std.testing.expectEqual(@as(i32, 4), added.items[0].id);
+    try std.testing.expectEqualStrings("[X]", added.items[0].content);
+    try std.testing.expect(added.items[0].special);
+    try std.testing.expect(added.items[0].single_word);
+    try std.testing.expect(normalizer.lowercase);
+    try std.testing.expect(pretokenizer.byte_level);
+    try std.testing.expect(pretokenizer.add_prefix_space);
+    try std.testing.expectEqualStrings("ByteFallback", decoder.type);
+    try std.testing.expectEqualStrings("", postprocessor.type);
+}
+
+test "ensureJsonDepthWithinLimit rejects excessive object nesting" {
+    var json = std.ArrayListUnmanaged(u8){};
+    defer json.deinit(std.testing.allocator);
+
+    for (0..MAX_JSON_PIPELINE_DEPTH + 2) |_| {
+        try json.append(std.testing.allocator, '{');
+    }
+    for (0..MAX_JSON_PIPELINE_DEPTH + 2) |_| {
+        try json.append(std.testing.allocator, '}');
+    }
+
+    try std.testing.expectError(
+        error.InvalidDecoder,
+        ensureJsonDepthWithinLimit(json.items, error.InvalidDecoder),
+    );
+    try ensureJsonDepthWithinLimit("{}", error.InvalidDecoder);
 }
 
 test "unescapeJsonStringFast handles escape sequences" {
@@ -2629,36 +991,6 @@ test "unescapeJsonStringFast handles string without escapes" {
     const result = try unescapeJsonStringFast(allocator, input);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("hello world", result);
-}
-
-test "detectModelType finds WordPiece type" {
-    const json =
-        \\{"model": {"type": "WordPiece", "vocab": {}}}
-    ;
-    const model_type = detectModelType(json);
-    try std.testing.expectEqualStrings("WordPiece", model_type);
-}
-
-test "detectModelType finds Unigram type" {
-    const json =
-        \\{"model": {"type": "Unigram", "vocab": []}}
-    ;
-    const model_type = detectModelType(json);
-    try std.testing.expectEqualStrings("Unigram", model_type);
-}
-
-test "detectModelType defaults to BPE when not found" {
-    const json =
-        \\{"normalizer": {"type": "NFC"}}
-    ;
-    const model_type = detectModelType(json);
-    try std.testing.expectEqualStrings("BPE", model_type);
-}
-
-test "detectModelType handles malformed JSON" {
-    const json = "not valid json at all";
-    const model_type = detectModelType(json);
-    try std.testing.expectEqualStrings("BPE", model_type);
 }
 
 test "findJsonFieldValue extracts string value" {
@@ -3360,7 +1692,7 @@ fn appendNestedSequenceSection(
     );
 }
 
-test "load_from_slice_streaming accepts normalizer nesting at depth limit" {
+test "parseTokenizerJson accepts normalizer nesting at depth limit" {
     const json = try appendNestedSequenceSection(
         std.testing.allocator,
         "normalizer",
@@ -3370,11 +1702,11 @@ test "load_from_slice_streaming accepts normalizer nesting at depth limit" {
     );
     defer std.testing.allocator.free(json);
 
-    const root = try load_from_slice_streaming(std.testing.allocator, json);
+    const root = try parseTokenizerJson(std.testing.allocator, json);
     try std.testing.expect(root.normalizer.lowercase);
 }
 
-test "load_from_slice_streaming rejects normalizer nesting above depth limit" {
+test "parseTokenizerJson rejects normalizer nesting above depth limit" {
     const json = try appendNestedSequenceSection(
         std.testing.allocator,
         "normalizer",
@@ -3384,10 +1716,10 @@ test "load_from_slice_streaming rejects normalizer nesting above depth limit" {
     );
     defer std.testing.allocator.free(json);
 
-    try std.testing.expectError(error.InvalidNormalizer, load_from_slice_streaming(std.testing.allocator, json));
+    try std.testing.expectError(error.InvalidNormalizer, parseTokenizerJson(std.testing.allocator, json));
 }
 
-test "load_from_slice_streaming rejects pretokenizer nesting above depth limit" {
+test "parseTokenizerJson rejects pretokenizer nesting above depth limit" {
     const json = try appendNestedSequenceSection(
         std.testing.allocator,
         "pre_tokenizer",
@@ -3397,10 +1729,10 @@ test "load_from_slice_streaming rejects pretokenizer nesting above depth limit" 
     );
     defer std.testing.allocator.free(json);
 
-    try std.testing.expectError(error.InvalidPreTokenizer, load_from_slice_streaming(std.testing.allocator, json));
+    try std.testing.expectError(error.InvalidPreTokenizer, parseTokenizerJson(std.testing.allocator, json));
 }
 
-test "load_from_slice_streaming rejects postprocessor nesting above depth limit" {
+test "parseTokenizerJson rejects postprocessor nesting above depth limit" {
     const json = try appendNestedSequenceSection(
         std.testing.allocator,
         "post_processor",
@@ -3410,10 +1742,10 @@ test "load_from_slice_streaming rejects postprocessor nesting above depth limit"
     );
     defer std.testing.allocator.free(json);
 
-    try std.testing.expectError(error.InvalidPostProcessor, load_from_slice_streaming(std.testing.allocator, json));
+    try std.testing.expectError(error.InvalidPostProcessor, parseTokenizerJson(std.testing.allocator, json));
 }
 
-test "load_from_slice_streaming accepts postprocessor nesting at depth limit" {
+test "parseTokenizerJson accepts postprocessor nesting at depth limit" {
     const json = try appendNestedSequenceSection(
         std.testing.allocator,
         "post_processor",
@@ -3423,11 +1755,11 @@ test "load_from_slice_streaming accepts postprocessor nesting at depth limit" {
     );
     defer std.testing.allocator.free(json);
 
-    const root = try load_from_slice_streaming(std.testing.allocator, json);
+    const root = try parseTokenizerJson(std.testing.allocator, json);
     try std.testing.expect(root.post_processor.type.len > 0);
 }
 
-test "load_from_slice_streaming rejects decoder nesting above depth limit" {
+test "parseTokenizerJson rejects decoder nesting above depth limit" {
     const json = try appendNestedSequenceSection(
         std.testing.allocator,
         "decoder",
@@ -3437,10 +1769,10 @@ test "load_from_slice_streaming rejects decoder nesting above depth limit" {
     );
     defer std.testing.allocator.free(json);
 
-    try std.testing.expectError(error.InvalidDecoder, load_from_slice_streaming(std.testing.allocator, json));
+    try std.testing.expectError(error.InvalidDecoder, parseTokenizerJson(std.testing.allocator, json));
 }
 
-test "load_from_slice_streaming accepts decoder nesting at depth limit" {
+test "parseTokenizerJson accepts decoder nesting at depth limit" {
     const json = try appendNestedSequenceSection(
         std.testing.allocator,
         "decoder",
@@ -3450,11 +1782,11 @@ test "load_from_slice_streaming accepts decoder nesting at depth limit" {
     );
     defer std.testing.allocator.free(json);
 
-    const root = try load_from_slice_streaming(std.testing.allocator, json);
+    const root = try parseTokenizerJson(std.testing.allocator, json);
     try std.testing.expectEqualStrings("Sequence", root.decoder.type);
 }
 
-test "load_from_slice_streaming accepts direct ByteFallback decoder" {
+test "parseTokenizerJson accepts direct ByteFallback decoder" {
     const json =
         \\{
         \\  "version": "1.0",
@@ -3467,26 +1799,8 @@ test "load_from_slice_streaming accepts direct ByteFallback decoder" {
         \\}
     ;
 
-    const root = try load_from_slice_streaming(std.testing.allocator, json);
+    const root = try parseTokenizerJson(std.testing.allocator, json);
     try std.testing.expectEqualStrings("ByteFallback", root.decoder.type);
-}
-
-test "load_from_slice_streaming requires integration testing" {
-    // This function requires:
-    // - Full JSON tokenizer.json content
-    // - Complex vocab and merges parsing
-    // - Arena allocator with proper lifetime management
-    // - Metadata section parsing (normalizer, pretokenizer, etc.)
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_loader_from_dir requires integration testing" {
-    // This function requires:
-    // - File I/O access to tokenizer.json
-    // - Cache directory layout support (snapshots)
-    // - Full tokenizer initialization (BPE/WordPiece/Unigram)
-    // - Applied configuration (normalizer, pretokenizer, decoder)
-    // Integration tests: tests/tokenizer/test_*.py
 }
 
 test "tokenizer_loader_from_json_string applies whitespace pretokenizer on lazy bpe path" {
@@ -3702,7 +2016,7 @@ test "tokenizer_loader_from_json_string applies ignore_merges when enabled" {
     try std.testing.expectEqual(@as(i32, 5), ids[0]);
 }
 
-test "load_from_slice_streaming rejects fuse_unk without byte_fallback" {
+test "parseTokenizerJson rejects fuse_unk without byte_fallback" {
     const json =
         \\{
         \\  "version": "1.0",
@@ -3725,14 +2039,5 @@ test "load_from_slice_streaming rejects fuse_unk without byte_fallback" {
         \\  "decoder": null
         \\}
     ;
-    try std.testing.expectError(error.InvalidModel, load_from_slice_streaming(std.testing.allocator, json));
-}
-
-test "tokenizer_loader_from_json_string requires integration testing" {
-    // This function requires:
-    // - Complete JSON tokenizer specification
-    // - Model type detection and routing
-    // - Lazy/full parsing based on model type
-    // - Configuration application
-    // Integration tests: tests/tokenizer/test_*.py
+    try std.testing.expectError(error.InvalidModel, parseTokenizerJson(std.testing.allocator, json));
 }

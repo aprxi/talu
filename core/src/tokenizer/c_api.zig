@@ -10,6 +10,7 @@ const errors = @import("errors.zig");
 const normalize = @import("normalize.zig");
 const pretokenize = @import("pretokenize.zig");
 const strings = @import("strings.zig");
+const token_surface = @import("token_surface.zig");
 const types = @import("types.zig");
 
 const Allocator = types.Allocator;
@@ -85,31 +86,6 @@ pub fn tokenizer_free(tokenizer_handle: ?*ct.Tokenizer) void {
     tokenizer_free_impl(tokenizer_handle);
 }
 
-fn writeEncodingIds(encoding: *ct.TokenizerEncoding, out_ids: ?*i32, out_len: *usize) void {
-    out_len.* = encoding.ids_len;
-    if (out_ids) |out_ptr| {
-        if (encoding.ids) |ids_ptr| {
-            const ids_slice: [*]i32 = @ptrCast(ids_ptr);
-            const out_slice: [*]i32 = @ptrCast(out_ptr);
-            const copy_len = @min(out_len.*, encoding.ids_len);
-            @memcpy(out_slice[0..copy_len], ids_slice[0..copy_len]);
-        }
-    }
-}
-
-pub fn tokenizer_encode_ids(tokenizer_handle: ?*ct.Tokenizer, text: [*:0]const u8, out_ids: ?*i32, out_len: *usize) c_int {
-    const encoding = tokenizer_encode(tokenizer_handle, text) orelse return -1;
-    defer tokenizer_encoding_free(encoding);
-    writeEncodingIds(encoding, out_ids, out_len);
-    return 0;
-}
-
-fn tokenizer_encode(tokenizer_handle: ?*ct.Tokenizer, input: [*:0]const u8) ?*ct.TokenizerEncoding {
-    if (tokenizer_handle == null) return null;
-    const input_slice = std.mem.sliceTo(input, 0);
-    return tokenizer_encode_slice(tokenizer_handle, input_slice);
-}
-
 /// Encode text to tokens using a slice (supports text with null bytes).
 fn tokenizer_encode_slice(tokenizer_handle: ?*ct.Tokenizer, input: []const u8) ?*ct.TokenizerEncoding {
     // tokenize() is raw tokenization — never add special tokens.
@@ -134,38 +110,10 @@ fn tokenizer_encode_slice_with_options(
     return encoding;
 }
 
-/// Encode text to token IDs using a slice (supports text with null bytes).
-pub fn tokenizer_encode_ids_slice(tokenizer_handle: ?*ct.Tokenizer, text: []const u8, out_ids: ?*i32, out_len: *usize) c_int {
-    const encoding = tokenizer_encode_slice(tokenizer_handle, text) orelse return -1;
-    defer tokenizer_encoding_free(encoding);
-    writeEncodingIds(encoding, out_ids, out_len);
-    return 0;
-}
-
-/// Encode text to token IDs with options (thread-safe).
-pub fn tokenizer_encode_ids_slice_with_options(
-    tokenizer_handle: ?*ct.Tokenizer,
-    text: []const u8,
-    out_ids: ?*i32,
-    out_len: *usize,
-    add_special_tokens: bool,
-) c_int {
-    const options = encode.EncodeOptions{ .add_special_tokens = add_special_tokens };
-    const encoding = tokenizer_encode_slice_with_options(tokenizer_handle, text, options) orelse return -1;
-    defer tokenizer_encoding_free(encoding);
-    writeEncodingIds(encoding, out_ids, out_len);
-    return 0;
-}
-
 fn tokenizer_encoding_free(encoding_handle: ?*ct.TokenizerEncoding) void {
     if (encoding_handle == null) return;
     encode.tokenizer_encoding_free_struct(encoding_handle.?);
     Allocator.destroy(encoding_handle.?);
-}
-
-pub fn tokenizer_decode(tokenizer_handle: ?*ct.Tokenizer, ids: [*]const i32, id_count: usize, out: *[*c]u8, out_len: *usize) c_int {
-    if (tokenizer_handle == null) return -1;
-    return tokenizer_handle.?.decode(ids, id_count, out, out_len);
 }
 
 /// Decode token IDs to text with options (thread-safe).
@@ -198,16 +146,7 @@ pub fn tokenizer_tokenize(tokenizer_handle: ?*ct.Tokenizer, text: []const u8, ou
         const token_ptrs: ?[*][*c]u8 = if (encoding.tokens) |t| @ptrCast(t) else null;
 
         for (0..encoding.ids_len) |token_idx| {
-            // Try encoding.tokens first, fall back to vocab lookup by ID
-            const token_bytes: []const u8 = blk: {
-                if (token_ptrs) |ts| {
-                    if (ts[token_idx]) |token_ptr| {
-                        break :blk std.mem.span(@as([*:0]u8, @ptrCast(token_ptr)));
-                    }
-                }
-                break :blk tok.idToToken(ids_ptr[token_idx]) orelse
-                    encode.findAddedTokenContentById(tok, ids_ptr[token_idx]) orelse "";
-            };
+            const token_bytes = token_surface.fromEncoding(tok, ids_ptr, token_ptrs, token_idx);
             out_ptr[token_idx] = strings.dupTokenString(token_bytes) orelse return -1;
         }
     }
@@ -227,113 +166,4 @@ pub fn tokenizer_string_free_with_len(s: ?[*]u8, len: usize) void {
 pub fn tokenizer_get_last_error(tokenizer_handle: ?*ct.Tokenizer) ?[*:0]const u8 {
     if (tokenizer_handle == null) return null;
     return @ptrCast(tokenizer_handle.?.last_error);
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-// Note: All functions in c_api.zig are C API wrappers that require full
-// tokenizer initialization with vocab, models, and external dependencies.
-// They are comprehensively tested via integration tests in tests/tokenizer/.
-// These functions are designed to be called from C/Python, not as standalone
-// units, so integration testing provides better coverage.
-
-test "tokenizer_from_pretrained requires integration testing" {
-    // This function requires:
-    // - File I/O access to model directory
-    // - Full tokenizer loading and initialization
-    // - Complete vocab, model, normalizer, pretokenizer setup
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_from_json_string requires integration testing" {
-    // This function requires:
-    // - Complete JSON tokenizer specification
-    // - Model initialization (BPE/WordPiece/Unigram)
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_added_token_add requires integration testing" {
-    // This function requires:
-    // - Full tokenizer context
-    // - Proper memory management for added tokens
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_added_token_find requires integration testing" {
-    // This function requires:
-    // - Tokenizer with added tokens
-    // - String matching and lookup
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_free requires integration testing" {
-    // This function requires:
-    // - Fully allocated tokenizer
-    // - Proper cleanup of all resources (vocab, model, pretokenizer, etc.)
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_encode_ids requires integration testing" {
-    // This function requires:
-    // - Complete tokenizer with vocab and model
-    // - Encoding pipeline (normalize, pretokenize, encode, postprocess)
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_encode_ids_slice requires integration testing" {
-    // This function requires:
-    // - Complete tokenizer context
-    // - Support for null bytes in input
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_encode_ids_slice_with_options requires integration testing" {
-    // This function requires:
-    // - Complete tokenizer context
-    // - Thread-safe encoding with options (add_special_tokens)
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_decode requires integration testing" {
-    // This function requires:
-    // - Complete tokenizer with vocab mapping
-    // - Model-specific decode implementation
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_decode_with_options requires integration testing" {
-    // This function requires:
-    // - Complete tokenizer context
-    // - Thread-safe decoding with options (skip_special_tokens)
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_tokenize requires integration testing" {
-    // This function requires:
-    // - Complete tokenizer with encoding pipeline
-    // - Token string extraction without ID conversion
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_string_free requires integration testing" {
-    // This function requires:
-    // - Allocated token strings from tokenizer_tokenize
-    // - Proper memory management
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_string_free_with_len requires integration testing" {
-    // This function requires:
-    // - Allocated strings with known length
-    // - Proper memory management
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_get_last_error requires integration testing" {
-    // This function requires:
-    // - Tokenizer with error state
-    // - Error message retrieval
-    // Integration tests: tests/tokenizer/test_*.py
 }

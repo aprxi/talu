@@ -490,8 +490,10 @@ impl TokenizerHandle {
             )
         };
         if rc != 0 {
-            return Err(error_from_last_or(&format!(
-                "token id {token_id} is not in vocabulary"
+            let detail = crate::error::last_error_message()
+                .unwrap_or_else(|| "token id is not in vocabulary".to_string());
+            return Err(crate::Error::talu(format!(
+                "token id {token_id} lookup failed: {detail}"
             )));
         }
         let text = TextPtr::new(out_ptr)

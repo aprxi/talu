@@ -17,26 +17,6 @@ use std::{collections::HashMap, fs, ptr};
 const MAX_EXAMPLES: usize = 3;
 
 // ---------------------------------------------------------------------------
-// Correctly-typed FFI declarations
-// ---------------------------------------------------------------------------
-
-extern "C" {
-    fn talu_tokenizer_encode(
-        handle: *mut c_void,
-        text: *const u8,
-        text_len: usize,
-        options: *const talu_sys::EncodeOptions,
-    ) -> talu_sys::EncodeResult;
-
-    fn talu_tokenizer_decode(
-        handle: *mut c_void,
-        tokens: *const u32,
-        num_tokens: usize,
-        options: *const talu_sys::DecodeOptionsC,
-    ) -> talu_sys::DecodeResult;
-}
-
-// ---------------------------------------------------------------------------
 // Dataset schema
 // ---------------------------------------------------------------------------
 
@@ -110,7 +90,12 @@ impl FixtureTokenizer {
     fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
         let opts = talu_sys::EncodeOptions::default();
         let result = unsafe {
-            talu_tokenizer_encode(self.handle, text.as_bytes().as_ptr(), text.len(), &opts)
+            talu_sys::talu_tokenizer_encode(
+                self.handle,
+                text.as_bytes().as_ptr(),
+                text.len(),
+                &opts,
+            )
         };
         if !result.error_msg.is_null() {
             let msg = unsafe { CStr::from_ptr(result.error_msg as *const c_char) }
@@ -136,7 +121,12 @@ impl FixtureTokenizer {
             ..Default::default()
         };
         let result = unsafe {
-            talu_tokenizer_encode(self.handle, text.as_bytes().as_ptr(), text.len(), &opts)
+            talu_sys::talu_tokenizer_encode(
+                self.handle,
+                text.as_bytes().as_ptr(),
+                text.len(),
+                &opts,
+            )
         };
         if !result.error_msg.is_null() {
             let msg = unsafe { CStr::from_ptr(result.error_msg as *const c_char) }
@@ -157,8 +147,9 @@ impl FixtureTokenizer {
         let opts = talu_sys::DecodeOptionsC {
             skip_special_tokens: 0,
         };
-        let result =
-            unsafe { talu_tokenizer_decode(self.handle, tokens.as_ptr(), tokens.len(), &opts) };
+        let result = unsafe {
+            talu_sys::talu_tokenizer_decode(self.handle, tokens.as_ptr(), tokens.len(), &opts)
+        };
         if !result.error_msg.is_null() {
             let msg = unsafe { CStr::from_ptr(result.error_msg as *const c_char) }
                 .to_string_lossy()

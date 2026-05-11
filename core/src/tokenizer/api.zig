@@ -6,6 +6,8 @@
 const std = @import("std");
 
 const ct = @import("c_types.zig");
+const added_tokens = @import("added_tokens.zig");
+const token_surface = @import("token_surface.zig");
 const tok_encode = @import("encode.zig");
 const offsets_mod = @import("offsets.zig");
 const pipeline_impl = @import("pipeline.zig");
@@ -241,7 +243,7 @@ pub const Tokenizer = struct {
         const ids_i32_buffer = try self.allocator.alloc(i32, ids.len);
         errdefer self.allocator.free(ids_i32_buffer);
         for (ids, 0..) |id, idx| {
-            if (self.vocab_size > 0 and id >= self.vocab_size and tok_encode.findAddedTokenContentById(self.tokenizer_handle, @intCast(id)) == null) {
+            if (self.vocab_size > 0 and id >= self.vocab_size and added_tokens.findContentById(self.tokenizer_handle, @intCast(id)) == null) {
                 return TokenizerError.InvalidTokenId;
             }
             ids_i32_buffer[idx] = std.math.cast(i32, id) orelse return TokenizerError.InvalidTokenId;
@@ -627,83 +629,34 @@ test "EncodeOptions - custom values" {
     try std.testing.expectEqual(false, options.add_special_tokens);
 }
 
-// =============================================================================
-// Unit tests for coverage - functions requiring integration testing
-// =============================================================================
-
 test "initFromPathZ fails for missing path" {
-    // initFromPathZ requires a valid tokenizer.json file
-    // Test the error path for missing file
     const bad_path: [:0]const u8 = "/nonexistent/path/to/tokenizer";
     const result = Tokenizer.initFromPathZ(std.testing.allocator, bad_path);
     try std.testing.expectError(TokenizerError.InitFailed, result);
 }
 
 test "initFromPath fails for missing path" {
-    // initFromPath wraps initFromPathZ, testing error path
     const bad_path = "/nonexistent/tokenizer/path";
     const result = Tokenizer.initFromPath(std.testing.allocator, bad_path);
     try std.testing.expectError(TokenizerError.InitFailed, result);
 }
 
 test "initFromJsonZ fails for invalid JSON" {
-    // initFromJsonZ requires valid tokenizer JSON content
-    // Test the error path for invalid JSON
     const invalid_json: [:0]const u8 = "not valid json";
     const result = Tokenizer.initFromJsonZ(std.testing.allocator, invalid_json);
     try std.testing.expectError(TokenizerError.InitFailed, result);
 }
 
 test "initFromJson fails for invalid JSON" {
-    // initFromJson wraps initFromJsonZ, testing error path
     const invalid_json = "{invalid json content}";
     const result = Tokenizer.initFromJson(std.testing.allocator, invalid_json);
     try std.testing.expectError(TokenizerError.InitFailed, result);
 }
 
-// =============================================================================
-// API coverage tests for functions requiring C API handles
-// =============================================================================
-// Note: Functions like deinit, encodeZ, encode, encodeSlice,
-// encodeSliceWithOptions, decodeWithOptions, lastError, and StreamingDecoder.next
-// require valid tokenizer handles from the C API. Full functional testing
-// happens in integration tests (tests/tokenizer/) with real tokenizer configs.
-//
-// The tests below verify contracts that CAN be tested without C API interaction:
-// - Wrapper function behavior (aliases, default parameter forwarding)
-// - Error enum coverage
-// =============================================================================
-
 test "Tokenizer.init is alias for initFromPath" {
-    // Verify init is correctly aliased to initFromPath
     const path = "/nonexistent/tokenizer";
     const result = Tokenizer.init(std.testing.allocator, path);
     try std.testing.expectError(TokenizerError.InitFailed, result);
-}
-
-test "encodeSlice delegates to encodeSliceWithOptions with defaults" {
-    // encodeSlice should use default EncodeOptions
-    const default_opts = Tokenizer.EncodeOptions{};
-    try std.testing.expectEqual(true, default_opts.add_special_tokens);
-    // Integration tests verify encodeSlice behavior matches encodeSliceWithOptions(.{})
-}
-
-test "decode delegates to decodeWithOptions with defaults" {
-    // decode should use default DecodeOptions
-    const default_opts = Tokenizer.DecodeOptions{};
-    try std.testing.expectEqual(true, default_opts.skip_special_tokens);
-    // Integration tests verify decode behavior matches decodeWithOptions(.{})
-}
-
-test "TokenizerError - all error variants defined" {
-    // Verify all expected error types are defined
-    const init_err: TokenizerError = TokenizerError.InitFailed;
-    const encode_err: TokenizerError = TokenizerError.EncodeFailed;
-    const decode_err: TokenizerError = TokenizerError.DecodeFailed;
-
-    try std.testing.expectEqual(TokenizerError.InitFailed, init_err);
-    try std.testing.expectEqual(TokenizerError.EncodeFailed, encode_err);
-    try std.testing.expectEqual(TokenizerError.DecodeFailed, decode_err);
 }
 
 // =============================================================================
@@ -855,21 +808,10 @@ pub fn tokenizeToBytes(
     const ids_ptr: [*]i32 = @ptrCast(token_encoding.ids.?);
     const token_cstrs: ?[*][*c]u8 = if (token_encoding.tokens) |t| @ptrCast(t) else null;
 
-    // Resolve token string: from encoding.tokens if available, otherwise from vocab by ID.
-    const resolveToken = struct {
-        fn resolve(cstrs: ?[*][*c]u8, ids: [*]i32, idx: usize, tok_handle: *ct.Tokenizer) []const u8 {
-            if (cstrs) |ts| {
-                if (ts[idx]) |ptr| return std.mem.span(@as([*:0]u8, @ptrCast(ptr)));
-            }
-            return tok_handle.idToToken(ids[idx]) orelse
-                @import("encode.zig").findAddedTokenContentById(tok_handle, ids[idx]) orelse "";
-        }
-    }.resolve;
-
     // Calculate total bytes needed
     var total_bytes: usize = 0;
     for (0..token_count) |i| {
-        total_bytes += resolveToken(token_cstrs, ids_ptr, i, tokenizer_handle).len;
+        total_bytes += token_surface.fromEncoding(tokenizer_handle, ids_ptr, token_cstrs, i).len;
     }
 
     // Allocate output buffers
@@ -886,7 +828,7 @@ pub fn tokenizeToBytes(
     var write_pos: usize = 0;
     for (0..token_count) |i| {
         offsets[i] = write_pos;
-        const token_bytes = resolveToken(token_cstrs, ids_ptr, i, tokenizer_handle);
+        const token_bytes = token_surface.fromEncoding(tokenizer_handle, ids_ptr, token_cstrs, i);
         if (data.len > 0 and token_bytes.len > 0) {
             @memcpy(data[write_pos..][0..token_bytes.len], token_bytes);
         }

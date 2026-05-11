@@ -52,6 +52,45 @@ const Symbol = struct {
 const MAX_WORD_SYMBOLS = 512;
 const MAX_MODEL_VOCAB_SIZE: usize = 1_000_000;
 
+fn jsonUnescapeAllocated(raw: []const u8, decoded: []const u8) bool {
+    return decoded.ptr != raw.ptr;
+}
+
+fn freeJsonUnescapeScratch(allocator: std.mem.Allocator, raw: []const u8, decoded: []const u8) void {
+    if (jsonUnescapeAllocated(raw, decoded)) allocator.free(@constCast(decoded));
+}
+
+fn rememberOwnedVocabToken(model: *BpeModel, raw: []const u8, decoded: []const u8) !void {
+    if (jsonUnescapeAllocated(raw, decoded)) {
+        model.owned_vocab_tokens.append(model.allocator, @constCast(decoded)) catch |err| {
+            model.allocator.free(@constCast(decoded));
+            return err;
+        };
+    }
+}
+
+fn deinitBpeModelStorage(model: *BpeModel, free_json_buffer: bool) void {
+    for (model.merge_added_tokens.items) |token| model.allocator.free(token);
+    for (model.owned_vocab_tokens.items) |token| model.allocator.free(token);
+    model.merge_added_tokens.deinit(model.allocator);
+    model.owned_vocab_tokens.deinit(model.allocator);
+
+    for (model.merge_strings.items) |merge_storage| model.allocator.free(@constCast(merge_storage));
+    model.merge_strings.deinit(model.allocator);
+    model.merges.deinit(model.allocator);
+    model.pair_merges.deinit(model.allocator);
+    model.vocab_hash.deinit(model.allocator);
+    model.allocator.free(model.id_to_token);
+
+    for (model.byte_to_unicode) |mapped_bytes| {
+        if (mapped_bytes.len > 0) model.allocator.free(@constCast(mapped_bytes));
+    }
+
+    if (free_json_buffer and model.json_owned and model.json_buffer.len > 0) {
+        model.allocator.free(@constCast(model.json_buffer));
+    }
+}
+
 /// BPE model. Vocab and merges are parsed synchronously during creation.
 pub const BpeModel = struct {
     allocator: std.mem.Allocator,
@@ -60,9 +99,10 @@ pub const BpeModel = struct {
     json_buffer: []const u8,
     json_owned: bool,
 
-    // Vocab: array indexed by ID (zero-copy pointers into JSON)
-    // id_to_token[i] points directly into json_buffer for token with ID i
+    // Vocab: array indexed by ID. JSON-path entries usually borrow from
+    // json_buffer; escaped JSON strings are unescaped into owned_vocab_tokens.
     id_to_token: []?[]const u8,
+    owned_vocab_tokens: std.ArrayListUnmanaged([]u8),
     vocab_hash: std.StringHashMapUnmanaged(i32),
 
     // Merges: string-based hash map (used during init, kept for edge cases)
@@ -73,8 +113,8 @@ pub const BpeModel = struct {
     pair_merges: PairMergeMap,
 
     // Tokens auto-added from merge rules not present in vocab.
-    // Separately allocated; freed in destroy (JSON path only — files path
-    // frees all id_to_token entries).
+    // Separately allocated; id_to_token stores borrowed slices for normal JSON
+    // vocab entries and these owned slices for implicit merge tokens.
     merge_added_tokens: std.ArrayListUnmanaged([]u8),
 
     // Byte mapping (small, always built)
@@ -125,27 +165,18 @@ pub const BpeModel = struct {
     /// Encode a word and append IDs directly to the caller's list.
     /// Bypasses the TokenizerEncoding intermediary — no per-word allocation.
     /// Skips the added-token check (caller must pre-separate added tokens).
-    pub fn encodeWordDirect(self: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *IdList) !void {
+    pub fn encodeWordDirect(self: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *std.ArrayListUnmanaged(i32)) !void {
         return encodeWordCore(self, tok, word, out_ids);
     }
 
-    /// Decode token IDs to text
-    pub fn decode(self: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-        return bpe_decode_impl(self, tok, ids, ids_len, out, out_len);
-    }
-
     /// Decode token IDs to text with options (skip special tokens etc.)
-    pub fn decodeWithOptions(self: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: DecodeOptions) c_int {
+    pub fn decodeWithOptions(self: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
         return bpe_decode_with_options_impl(self, tok, ids, ids_len, out, out_len, options);
     }
 
     /// Free the model resources
     pub fn destroy(self: *BpeModel, tok: *ct.Tokenizer) void {
-        if (self.json_buffer.len == 0) {
-            bpe_destroy_files_impl(self, tok);
-        } else {
-            bpe_destroy_impl(self, tok);
-        }
+        bpe_destroy_impl(self, tok);
     }
 };
 
@@ -158,11 +189,17 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
     const vocab_size = try findVocabSize(json_buffer);
     if (vocab_size == 0 or vocab_size > MAX_MODEL_VOCAB_SIZE) return error.InvalidArgument;
 
+    var model_storage_initialized = false;
+    errdefer if (model_storage_initialized) {
+        deinitBpeModelStorage(model, false);
+    };
+
     model.* = .{
         .allocator = allocator,
         .json_buffer = json_buffer,
         .json_owned = json_owned,
         .id_to_token = try allocator.alloc(?[]const u8, vocab_size),
+        .owned_vocab_tokens = .{},
         .vocab_hash = .{},
         .merges = .{},
         .merge_strings = .{},
@@ -182,6 +219,7 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
         .vocab_size = vocab_size,
         .owner = null,
     };
+    model_storage_initialized = true;
 
     // Initialize id_to_token to null
     @memset(model.id_to_token, null);
@@ -203,59 +241,102 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
     return model;
 }
 
-/// Find vocab size by scanning for max ID in JSON
+fn skipJsonWhitespace(bytes: []const u8, cursor: *usize) void {
+    while (cursor.* < bytes.len and std.ascii.isWhitespace(bytes[cursor.*])) : (cursor.* += 1) {}
+}
+
+fn parseVocabEntryId(vocab_json: []const u8, cursor: *usize) !usize {
+    skipJsonWhitespace(vocab_json, cursor);
+    if (cursor.* >= vocab_json.len or vocab_json[cursor.*] != ':') return error.InvalidVocab;
+    cursor.* += 1;
+    skipJsonWhitespace(vocab_json, cursor);
+
+    if (cursor.* >= vocab_json.len) return error.InvalidVocab;
+    const first = vocab_json[cursor.*];
+    if (first == '-' or first == '+') return error.InvalidVocab;
+    if (first < '0' or first > '9') return error.InvalidVocab;
+
+    var id: usize = 0;
+    while (cursor.* < vocab_json.len and vocab_json[cursor.*] >= '0' and vocab_json[cursor.*] <= '9') : (cursor.* += 1) {
+        id = std.math.mul(usize, id, 10) catch return error.InvalidVocab;
+        id = std.math.add(usize, id, @as(usize, vocab_json[cursor.*] - '0')) catch return error.InvalidVocab;
+    }
+
+    skipJsonWhitespace(vocab_json, cursor);
+    if (cursor.* >= vocab_json.len) return error.InvalidVocab;
+    if (vocab_json[cursor.*] != ',' and vocab_json[cursor.*] != '}') return error.InvalidVocab;
+    return id;
+}
+
+fn vocabObjectSlice(json: []const u8) ![]const u8 {
+    const vocab_start = findSectionStart(json, "\"vocab\"") orelse return error.NoVocab;
+    const vocab_json = json[vocab_start..];
+    if (vocab_json.len == 0 or vocab_json[0] != '{') return error.InvalidVocab;
+    const vocab_end = utils.findMatchingBrace(vocab_json, '{', '}') orelse return error.InvalidVocab;
+    return vocab_json[0..vocab_end];
+}
+
+/// Find vocab size by scanning for the max ID inside the vocab object.
 fn findVocabSize(json: []const u8) !usize {
-    // Modern LLMs have varying vocab sizes (32k to 256k+)
-    // Scan for largest ID to get accurate size
+    const vocab_json = try vocabObjectSlice(json);
     var max_id: usize = 0;
+    var found_entry = false;
     var scan_idx: usize = 0;
-    while (scan_idx < json.len) {
-        // Look for pattern ": <number>," or ": <number>}"
-        if (json[scan_idx] == ':') {
+    var depth: usize = 0;
+
+    while (scan_idx < vocab_json.len) {
+        const ch = vocab_json[scan_idx];
+        if (ch == '{') {
+            depth += 1;
             scan_idx += 1;
-            // Skip whitespace
-            while (scan_idx < json.len and (json[scan_idx] == ' ' or json[scan_idx] == '\n' or json[scan_idx] == '\t')) : (scan_idx += 1) {}
-            // Parse number
-            if (scan_idx < json.len and json[scan_idx] >= '0' and json[scan_idx] <= '9') {
-                var num: usize = 0;
-                while (scan_idx < json.len and json[scan_idx] >= '0' and json[scan_idx] <= '9') {
-                    num = std.math.mul(usize, num, 10) catch return error.InvalidArgument;
-                    num = std.math.add(usize, num, @as(usize, json[scan_idx] - '0')) catch return error.InvalidArgument;
-                    scan_idx += 1;
-                }
-                if (num > max_id) max_id = num;
+        } else if (ch == '}') {
+            if (depth == 0) return error.InvalidVocab;
+            depth -= 1;
+            if (depth == 0) break;
+            scan_idx += 1;
+        } else if (ch == '"' and depth == 1) {
+            scan_idx += 1;
+            while (scan_idx < vocab_json.len and vocab_json[scan_idx] != '"') {
+                if (vocab_json[scan_idx] == '\\') scan_idx += 2 else scan_idx += 1;
             }
+            if (scan_idx >= vocab_json.len) return error.InvalidVocab;
+            scan_idx += 1;
+
+            const id = try parseVocabEntryId(vocab_json, &scan_idx);
+            if (id > max_id) max_id = id;
+            found_entry = true;
         } else {
             scan_idx += 1;
         }
     }
+
+    if (depth != 0) return error.InvalidVocab;
+    if (!found_entry) return 0;
     return std.math.add(usize, max_id, 1) catch error.InvalidArgument;
 }
 
 /// Parse vocab and merges from JSON - single pass, no pre-scanning
 fn parseVocabAndMerges(model: *BpeModel) !void {
-    var t_start: i128 = std.time.nanoTimestamp();
-
     const json = model.json_buffer;
-    const allocator = model.allocator;
-
-    // Find vocab start (quick string search)
     const vocab_start = findSectionStart(json, "\"vocab\"") orelse return error.NoVocab;
-
-    // Find merges start (optional - SentencePiece models don't have merges)
     const merges_start: ?usize = findSectionStart(json, "\"merges\"");
-
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-        log.trace("tokenizer", "Find sections", .{ .duration_ms = duration_ms }, @src());
-        t_start = now;
-    }
-
-    // Parse vocab - from vocab_start to merges_start (or end of json)
-    // First pass: just fill id_to_token array (zero-copy pointers)
     const vocab_end = merges_start orelse json.len;
-    const vocab_json = json[vocab_start..vocab_end];
+
+    const vocab_count = try parseVocabSection(model, json[vocab_start..vocab_end]);
+    try buildVocabHash(model, vocab_count);
+    initByteFallback(model);
+    initByteVocabIds(model);
+    initOrigByteVocabIds(model);
+
+    if (merges_start) |m_start| {
+        try parseMergesSection(model, json[m_start..]);
+    }
+    try buildPairMergeTable(model);
+    finalizeSpecialTokenIds(model);
+}
+
+fn parseVocabSection(model: *BpeModel, vocab_json: []const u8) !usize {
+    const allocator = model.allocator;
     var scan_idx: usize = 0;
     var count: usize = 0;
     var depth: usize = 0;
@@ -267,6 +348,7 @@ fn parseVocabAndMerges(model: *BpeModel) !void {
             depth += 1;
             scan_idx += 1;
         } else if (ch == '}') {
+            if (depth == 0) return error.InvalidVocab;
             depth -= 1;
             if (depth == 0) break; // End of vocab object
             scan_idx += 1;
@@ -279,243 +361,224 @@ fn parseVocabAndMerges(model: *BpeModel) !void {
             while (scan_idx < vocab_json.len and vocab_json[scan_idx] != '"') {
                 if (vocab_json[scan_idx] == '\\') scan_idx += 2 else scan_idx += 1;
             }
-            if (scan_idx >= vocab_json.len) break;
+            if (scan_idx >= vocab_json.len) return error.InvalidVocab;
             const key_end = scan_idx;
             scan_idx += 1;
 
-            // Skip to number
-            while (scan_idx < vocab_json.len and (vocab_json[scan_idx] < '0' or vocab_json[scan_idx] > '9')) : (scan_idx += 1) {}
-            if (scan_idx >= vocab_json.len) break;
-            const num_start = scan_idx;
-            while (scan_idx < vocab_json.len and vocab_json[scan_idx] >= '0' and vocab_json[scan_idx] <= '9') : (scan_idx += 1) {}
-            const id = std.fmt.parseInt(usize, vocab_json[num_start..scan_idx], 10) catch continue;
+            const id = try parseVocabEntryId(vocab_json, &scan_idx);
+            if (id >= model.id_to_token.len) return error.InvalidVocab;
+            if (model.id_to_token[id] != null) return error.InvalidVocab;
 
             // Store token - unescape JSON if needed
             const raw_token = vocab_json[key_start..key_end];
             const token = try json_utils.unescapeJsonString(allocator, raw_token);
-            if (id < model.id_to_token.len) {
-                model.id_to_token[id] = token;
-            }
+            try rememberOwnedVocabToken(model, raw_token, token);
+            model.id_to_token[id] = token;
             count += 1;
         } else {
             scan_idx += 1;
         }
     }
+    if (depth != 0) return error.InvalidVocab;
+    return count;
+}
 
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-        log.trace("tokenizer", "Vocab scan", .{ .duration_ms = duration_ms, .entries = count }, @src());
-        t_start = now;
-    }
-
-    // Build vocab_hash from id_to_token array (needed for encoding)
-    try model.vocab_hash.ensureTotalCapacity(allocator, @intCast(count));
+fn buildVocabHash(model: *BpeModel, vocab_count: usize) !void {
+    try model.vocab_hash.ensureTotalCapacity(model.allocator, @intCast(vocab_count));
     for (model.id_to_token, 0..) |maybe_token, id| {
         if (maybe_token) |token| {
-            model.vocab_hash.putAssumeCapacity(token, @intCast(id));
+            const entry = try model.vocab_hash.getOrPut(model.allocator, token);
+            if (entry.found_existing) return error.InvalidVocab;
+            entry.value_ptr.* = @intCast(id);
         }
     }
+}
 
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-        log.trace("tokenizer", "Vocab hash", .{ .duration_ms = duration_ms }, @src());
-        t_start = now;
-    }
+fn parseMergesSection(model: *BpeModel, merges_json: []const u8) !void {
+    const allocator = model.allocator;
+    const merge_buffer = try allocator.alloc(u8, 8 * 1024 * 1024);
+    var merge_buffer_owned_by_model = false;
+    errdefer if (!merge_buffer_owned_by_model) allocator.free(merge_buffer);
 
-    // Build byte fallback table for SentencePiece (looks for <0xNN> tokens)
-    initByteFallback(model);
+    var merge_buf_pos: usize = 0;
+    var rank: i32 = 0;
+    var merge_idx: usize = 0;
+    var depth: usize = 0;
 
-    // Build direct byte lookup table for single-byte vocab tokens
-    initByteVocabIds(model);
+    while (merge_idx < merges_json.len) {
+        const ch = merges_json[merge_idx];
 
-    // Build direct raw-byte→vocab-ID for byte-level BPE
-    initOrigByteVocabIds(model);
-
-    // Parse merges if present (SentencePiece/Unigram models don't have merges)
-    if (merges_start) |m_start| {
-        // Pre-allocate a single buffer for all merge strings
-        // Average merge is ~10 bytes, large models may have 400k+ merges = ~5MB
-        const merge_buffer = try allocator.alloc(u8, 8 * 1024 * 1024);
-        errdefer allocator.free(merge_buffer);
-        var merge_buf_pos: usize = 0;
-
-        try model.merges.ensureTotalCapacity(allocator, 500000);
-        const merges_json = json[m_start..];
-        var rank: i32 = 0;
-        var merge_idx: usize = 0;
-        depth = 0;
-
-        while (merge_idx < merges_json.len) {
-            const ch = merges_json[merge_idx];
-
-            if (ch == '[') {
-                depth += 1;
-                if (depth == 2) {
-                    // Start of merge pair ["a", "b"] (array format)
-                    merge_idx += 1;
-
-                    // Find first string
-                    while (merge_idx < merges_json.len and merges_json[merge_idx] != '"') : (merge_idx += 1) {}
-                    if (merge_idx >= merges_json.len) break;
-                    merge_idx += 1;
-                    const a_start = merge_idx;
-                    while (merge_idx < merges_json.len and merges_json[merge_idx] != '"') {
-                        if (merges_json[merge_idx] == '\\') merge_idx += 2 else merge_idx += 1;
-                    }
-                    if (merge_idx >= merges_json.len) break;
-                    const a_end = merge_idx;
-                    merge_idx += 1;
-
-                    // Find second string
-                    while (merge_idx < merges_json.len and merges_json[merge_idx] != '"') : (merge_idx += 1) {}
-                    if (merge_idx >= merges_json.len) break;
-                    merge_idx += 1;
-                    const b_start = merge_idx;
-                    while (merge_idx < merges_json.len and merges_json[merge_idx] != '"') {
-                        if (merges_json[merge_idx] == '\\') merge_idx += 2 else merge_idx += 1;
-                    }
-                    if (merge_idx >= merges_json.len) break;
-                    const b_end = merge_idx;
-                    merge_idx += 1;
-
-                    // Create merge key "a b" in pre-allocated buffer
-                    // Unescape JSON strings if needed
-                    const raw_a = merges_json[a_start..a_end];
-                    const raw_b = merges_json[b_start..b_end];
-                    const lhs = try json_utils.unescapeJsonString(allocator, raw_a);
-                    const rhs = try json_utils.unescapeJsonString(allocator, raw_b);
-                    const key_len = lhs.len + 1 + rhs.len;
-
-                    if (merge_buf_pos + key_len <= merge_buffer.len) {
-                        const merge_key = merge_buffer[merge_buf_pos .. merge_buf_pos + key_len];
-                        @memcpy(merge_key[0..lhs.len], lhs);
-                        merge_key[lhs.len] = ' ';
-                        @memcpy(merge_key[lhs.len + 1 ..], rhs);
-
-                        model.merges.putAssumeCapacity(merge_key, rank);
-                        merge_buf_pos += key_len;
-                        rank += 1;
-                    }
-                } else {
-                    merge_idx += 1;
-                }
-            } else if (ch == ']') {
-                depth -= 1;
-                if (depth == 0) break; // End of merges array
-                merge_idx += 1;
-            } else if (ch == '"' and depth == 1) {
-                // String format merge "a b"
-                merge_idx += 1;
-                const str_start = merge_idx;
-                while (merge_idx < merges_json.len and merges_json[merge_idx] != '"') {
-                    if (merges_json[merge_idx] == '\\') merge_idx += 2 else merge_idx += 1;
-                }
-                if (merge_idx >= merges_json.len) break;
-                const str_end = merge_idx;
-                merge_idx += 1;
-
-                // The merge is already in "a b" format, just unescape and store
-                const raw_merge = merges_json[str_start..str_end];
-                const merge_str = try json_utils.unescapeJsonString(allocator, raw_merge);
-
-                if (merge_buf_pos + merge_str.len <= merge_buffer.len) {
-                    const merge_key = merge_buffer[merge_buf_pos .. merge_buf_pos + merge_str.len];
-                    @memcpy(merge_key, merge_str);
-
-                    model.merges.putAssumeCapacity(merge_key, rank);
-                    merge_buf_pos += merge_str.len;
-                    rank += 1;
-                }
+        if (ch == '[') {
+            depth += 1;
+            if (depth == 2) {
+                try parseArrayMerge(model, merges_json, &merge_idx, merge_buffer, &merge_buf_pos, &rank);
             } else {
                 merge_idx += 1;
             }
-        }
-
-        // Store buffer pointer for cleanup
-        try model.merge_strings.append(allocator, merge_buffer);
-
-        {
-            const now = std.time.nanoTimestamp();
-            const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-            log.trace("tokenizer", "Merges parsed", .{ .duration_ms = duration_ms, .entries = model.merges.count() }, @src());
+        } else if (ch == ']') {
+            if (depth == 0) return error.InvalidMerges;
+            depth -= 1;
+            if (depth == 0) break;
+            merge_idx += 1;
+        } else if (ch == '"' and depth == 1) {
+            try parseStringMerge(model, merges_json, &merge_idx, merge_buffer, &merge_buf_pos, &rank);
+        } else {
+            merge_idx += 1;
         }
     }
+    if (depth != 0) return error.InvalidMerges;
 
-    // Build integer-pair merge table for fast encoding.
-    // For each string merge "left right" → rank, resolve vocab IDs and store
-    // (left_id, right_id) → { rank, new_id } where new_id = vocab("leftright").
-    {
-        t_start = std.time.nanoTimestamp();
-        const merge_count = model.merges.count();
-        try model.pair_merges.ensureTotalCapacity(allocator, @intCast(merge_count));
+    try model.merge_strings.append(allocator, merge_buffer);
+    merge_buffer_owned_by_model = true;
+}
 
-        // Scratch buffer for building the concatenated merge token
-        var concat_buf = std.ArrayListUnmanaged(u8){};
-        defer concat_buf.deinit(allocator);
+fn parseArrayMerge(
+    model: *BpeModel,
+    merges_json: []const u8,
+    merge_idx: *usize,
+    merge_buffer: []u8,
+    merge_buf_pos: *usize,
+    rank: *i32,
+) !void {
+    const allocator = model.allocator;
+    merge_idx.* += 1;
 
-        var merge_iter = model.merges.iterator();
-        while (merge_iter.next()) |entry| {
-            const key = entry.key_ptr.*; // "left right"
-            const rank_val = entry.value_ptr.*;
+    const raw_lhs = try nextJsonString(merges_json, merge_idx);
+    const raw_rhs = try nextJsonString(merges_json, merge_idx);
+    const lhs = try json_utils.unescapeJsonString(allocator, raw_lhs);
+    defer freeJsonUnescapeScratch(allocator, raw_lhs, lhs);
+    const rhs = try json_utils.unescapeJsonString(allocator, raw_rhs);
+    defer freeJsonUnescapeScratch(allocator, raw_rhs, rhs);
 
-            // Split on first space
-            const space_pos = std.mem.indexOfScalar(u8, key, ' ') orelse continue;
-            const left_str = key[0..space_pos];
-            const right_str = key[space_pos + 1 ..];
+    const key_len = lhs.len + 1 + rhs.len;
+    const merge_key = try reserveMergeKey(merge_buffer, merge_buf_pos, key_len);
+    @memcpy(merge_key[0..lhs.len], lhs);
+    merge_key[lhs.len] = ' ';
+    @memcpy(merge_key[lhs.len + 1 ..], rhs);
+    try putMerge(model, merge_key, rank.*);
+    rank.* += 1;
+}
 
-            // Look up vocab IDs
-            const left_id = model.vocab_hash.get(left_str) orelse continue;
-            const right_id = model.vocab_hash.get(right_str) orelse continue;
+fn parseStringMerge(
+    model: *BpeModel,
+    merges_json: []const u8,
+    merge_idx: *usize,
+    merge_buffer: []u8,
+    merge_buf_pos: *usize,
+    rank: *i32,
+) !void {
+    const allocator = model.allocator;
+    merge_idx.* += 1;
+    const str_start = merge_idx.*;
+    while (merge_idx.* < merges_json.len and merges_json[merge_idx.*] != '"') {
+        if (merges_json[merge_idx.*] == '\\') merge_idx.* += 2 else merge_idx.* += 1;
+    }
+    if (merge_idx.* >= merges_json.len) return error.InvalidMerges;
+    const raw_merge = merges_json[str_start..merge_idx.*];
+    merge_idx.* += 1;
 
-            // Build concatenated token and look up its ID.
-            // If the merged token isn't in vocab, auto-add it — merges
-            // implicitly define vocab entries (matches HuggingFace behavior).
-            concat_buf.clearRetainingCapacity();
-            try concat_buf.appendSlice(allocator, left_str);
-            try concat_buf.appendSlice(allocator, right_str);
-            const new_id = model.vocab_hash.get(concat_buf.items) orelse blk: {
-                const next_id: i32 = @intCast(model.vocab_size);
-                const token_copy = try allocator.dupe(u8, concat_buf.items);
-                errdefer allocator.free(token_copy);
+    const merge_str = try json_utils.unescapeJsonString(allocator, raw_merge);
+    defer freeJsonUnescapeScratch(allocator, raw_merge, merge_str);
+    const merge_key = try reserveMergeKey(merge_buffer, merge_buf_pos, merge_str.len);
+    @memcpy(merge_key, merge_str);
+    try putMerge(model, merge_key, rank.*);
+    rank.* += 1;
+}
 
-                // Grow id_to_token array if needed
-                if (model.vocab_size >= model.id_to_token.len) {
-                    model.id_to_token = try allocator.realloc(model.id_to_token, model.vocab_size + 1);
-                }
-                model.id_to_token[model.vocab_size] = token_copy;
-                try model.vocab_hash.put(allocator, token_copy, next_id);
-                try model.merge_added_tokens.append(allocator, token_copy);
-                model.vocab_size += 1;
-                break :blk next_id;
-            };
+fn putMerge(model: *BpeModel, merge_key: []const u8, rank: i32) !void {
+    const entry = try model.merges.getOrPut(model.allocator, merge_key);
+    if (entry.found_existing) return error.InvalidMerges;
+    entry.value_ptr.* = rank;
+}
 
-            model.pair_merges.putAssumeCapacity(
-                .{ .left = left_id, .right = right_id },
-                .{ .rank = rank_val, .new_id = new_id },
-            );
-        }
+fn nextJsonString(json: []const u8, cursor: *usize) ![]const u8 {
+    while (cursor.* < json.len and json[cursor.*] != '"') : (cursor.* += 1) {}
+    if (cursor.* >= json.len) return error.InvalidMerges;
+    cursor.* += 1;
+    const start = cursor.*;
+    while (cursor.* < json.len and json[cursor.*] != '"') {
+        if (json[cursor.*] == '\\') cursor.* += 2 else cursor.* += 1;
+    }
+    if (cursor.* >= json.len) return error.InvalidMerges;
+    const end = cursor.*;
+    cursor.* += 1;
+    return json[start..end];
+}
 
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
-        log.trace("tokenizer", "Pair merges built", .{ .duration_ms = duration_ms, .entries = model.pair_merges.count() }, @src());
+fn reserveMergeKey(merge_buffer: []u8, merge_buf_pos: *usize, key_len: usize) ![]u8 {
+    if (key_len == 0 or merge_buf_pos.* + key_len > merge_buffer.len) return error.InvalidMerges;
+    const merge_key = merge_buffer[merge_buf_pos.* .. merge_buf_pos.* + key_len];
+    merge_buf_pos.* += key_len;
+    return merge_key;
+}
+
+fn buildPairMergeTable(model: *BpeModel) !void {
+    const allocator = model.allocator;
+    const merge_count = model.merges.count();
+    try model.pair_merges.ensureTotalCapacity(allocator, @intCast(merge_count));
+    const ranked_merges = try allocator.alloc(?[]const u8, merge_count);
+    defer allocator.free(ranked_merges);
+    @memset(ranked_merges, null);
+
+    var merge_iter = model.merges.iterator();
+    while (merge_iter.next()) |entry| {
+        const rank: usize = @intCast(entry.value_ptr.*);
+        if (rank >= ranked_merges.len or ranked_merges[rank] != null) return error.InvalidMerges;
+        ranked_merges[rank] = entry.key_ptr.*;
     }
 
-    // Find unk_id
+    var concat_buf = std.ArrayListUnmanaged(u8){};
+    defer concat_buf.deinit(allocator);
+
+    for (ranked_merges, 0..) |maybe_key, rank| {
+        const key = maybe_key orelse return error.InvalidMerges;
+        const space_pos = std.mem.indexOfScalar(u8, key, ' ') orelse return error.InvalidMerges;
+        if (space_pos == 0 or space_pos + 1 >= key.len) return error.InvalidMerges;
+        if (std.mem.indexOfScalarPos(u8, key, space_pos + 1, ' ') != null) return error.InvalidMerges;
+
+        const left_str = key[0..space_pos];
+        const right_str = key[space_pos + 1 ..];
+        const left_id = model.vocab_hash.get(left_str) orelse return error.InvalidMerges;
+        const right_id = model.vocab_hash.get(right_str) orelse return error.InvalidMerges;
+
+        concat_buf.clearRetainingCapacity();
+        try concat_buf.appendSlice(allocator, left_str);
+        try concat_buf.appendSlice(allocator, right_str);
+        const new_id = model.vocab_hash.get(concat_buf.items) orelse try addImplicitMergeToken(model, concat_buf.items);
+
+        const pair_entry = try model.pair_merges.getOrPut(allocator, .{ .left = left_id, .right = right_id });
+        if (pair_entry.found_existing) return error.InvalidMerges;
+        pair_entry.value_ptr.* = .{ .rank = @intCast(rank), .new_id = new_id };
+    }
+}
+
+fn addImplicitMergeToken(model: *BpeModel, token: []const u8) !i32 {
+    const next_id: i32 = @intCast(model.vocab_size);
+    const token_copy = try model.allocator.dupe(u8, token);
+    errdefer model.allocator.free(token_copy);
+
+    if (model.vocab_size >= model.id_to_token.len) {
+        model.id_to_token = try model.allocator.realloc(model.id_to_token, model.vocab_size + 1);
+    }
+    model.id_to_token[model.vocab_size] = token_copy;
+    try model.vocab_hash.put(model.allocator, token_copy, next_id);
+    try model.merge_added_tokens.append(model.allocator, token_copy);
+    model.vocab_size += 1;
+    return next_id;
+}
+
+fn finalizeSpecialTokenIds(model: *BpeModel) void {
     const unk_slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&model.unk_token)), 0);
     if (model.vocab_hash.get(unk_slice)) |id| {
         model.unk_id = id;
     }
 
-    // Find bos_id - try common BOS token names
     if (model.vocab_hash.get("<bos>")) |id| {
         model.bos_id = id;
     } else if (model.vocab_hash.get("<s>")) |id| {
         model.bos_id = id;
     }
 
-    // Find eos_id - try common EOS token names
     if (model.vocab_hash.get("<eos>")) |id| {
         model.eos_id = id;
     } else if (model.vocab_hash.get("</s>")) |id| {
@@ -530,59 +593,6 @@ fn findSectionStart(json: []const u8, key: []const u8) ?usize {
     return @intFromPtr(section.ptr) - @intFromPtr(json.ptr);
 }
 
-fn findJsonKeyPos(json_bytes: []const u8, field_bytes: []const u8) ?usize {
-    var cursor: usize = 0;
-    while (cursor < json_bytes.len) {
-        if (json_bytes[cursor] == '"') {
-            const key_start = cursor;
-            cursor += 1;
-            while (cursor < json_bytes.len) {
-                if (json_bytes[cursor] == '\\' and cursor + 1 < json_bytes.len) {
-                    cursor += 2;
-                } else if (json_bytes[cursor] == '"') {
-                    cursor += 1;
-                    break;
-                } else {
-                    cursor += 1;
-                }
-            }
-            const key_end = cursor;
-            if (key_end - key_start == field_bytes.len and
-                std.mem.eql(u8, json_bytes[key_start..key_end], field_bytes))
-            {
-                return key_start;
-            }
-        } else {
-            cursor += 1;
-        }
-    }
-    return null;
-}
-
-fn findJsonFieldValue(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
-    const pos = findJsonKeyPos(json_bytes, field_bytes) orelse return null;
-    var cursor = pos + field_bytes.len;
-    while (cursor < json_bytes.len and
-        (json_bytes[cursor] == ' ' or
-            json_bytes[cursor] == ':' or
-            json_bytes[cursor] == '\t' or
-            json_bytes[cursor] == '\n' or
-            json_bytes[cursor] == '\r')) : (cursor += 1)
-    {}
-    if (cursor >= json_bytes.len) return null;
-
-    const value_start = cursor;
-    while (cursor < json_bytes.len and
-        json_bytes[cursor] != ',' and
-        json_bytes[cursor] != '}' and
-        json_bytes[cursor] != ']' and
-        json_bytes[cursor] != ' ' and
-        json_bytes[cursor] != '\n' and
-        json_bytes[cursor] != '\r') : (cursor += 1)
-    {}
-    return json_bytes[value_start..cursor];
-}
-
 fn parseIgnoreMergesOption(json: []const u8) bool {
     var search_scope = json;
     if (findSectionStart(json, "\"model\"")) |model_start| {
@@ -594,7 +604,7 @@ fn parseIgnoreMergesOption(json: []const u8) bool {
         }
     }
 
-    if (findJsonFieldValue(search_scope, "\"ignore_merges\"")) |value| {
+    if (json_utils.findJsonFieldValue(search_scope, "\"ignore_merges\"")) |value| {
         return std.mem.eql(u8, value, "true");
     }
     return false;
@@ -709,32 +719,7 @@ fn initByteMap(model: *BpeModel) !void {
     }
 }
 
-pub const IdList = std.ArrayListUnmanaged(i32);
-
-fn findBestPair(
-    tokens: []const []const u8,
-    merges: *const std.StringHashMapUnmanaged(i32),
-    scratch: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-) !?struct { pos: usize, rank: i32 } {
-    var best_rank: i32 = std.math.maxInt(i32);
-    var best_pos: ?usize = null;
-    if (tokens.len < 2) return null;
-    for (tokens[0 .. tokens.len - 1], 0..) |tok, pair_idx| {
-        scratch.clearRetainingCapacity();
-        try scratch.appendSlice(allocator, tok);
-        try scratch.append(allocator, ' ');
-        try scratch.appendSlice(allocator, tokens[pair_idx + 1]);
-        if (merges.get(scratch.items)) |rank| {
-            if (rank < best_rank) {
-                best_rank = rank;
-                best_pos = pair_idx;
-            }
-        }
-    }
-    if (best_pos) |pos| return .{ .pos = pos, .rank = best_rank };
-    return null;
-}
+const IdList = std.ArrayListUnmanaged(i32);
 
 /// Encode a word with added-token check (for C API vtable path).
 fn encodeWordAppend(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *IdList) !void {
@@ -775,6 +760,326 @@ fn lookupWholeWordId(model: *BpeModel, word: []const u8, use_raw_byte_init: bool
     return model.vocab_hash.get(word);
 }
 
+const SymbolInitResult = struct {
+    syms: []Symbol,
+    n_syms: usize,
+    used_raw_byte_init: bool,
+    heap_syms: ?[]Symbol,
+};
+
+const CachedPair = struct { pos: i32, rank: i32, new_id: i32 };
+
+fn initRawByteSymbols(model: *BpeModel, word: []const u8, syms: []Symbol) usize {
+    var n_syms: usize = 0;
+    for (word, 0..) |byte, i| {
+        syms[n_syms] = .{
+            .id = model.orig_byte_vocab_ids[byte],
+            .start = @intCast(i),
+            .len = 1,
+            .prev = if (n_syms > 0) @as(i32, @intCast(n_syms - 1)) else -1,
+            .next = -1,
+        };
+        if (n_syms > 0) syms[n_syms - 1].next = @intCast(n_syms);
+        n_syms += 1;
+    }
+    return n_syms;
+}
+
+fn countUtf8Symbols(word: []const u8) !usize {
+    var n_chars: usize = 0;
+    var byte_idx: usize = 0;
+    while (byte_idx < word.len) {
+        const char_len = utf8CharLen(word[byte_idx]);
+        if (byte_idx + char_len > word.len) return error.InvalidUtf8;
+        byte_idx += char_len;
+        n_chars += 1;
+    }
+    return n_chars;
+}
+
+fn initUtf8Symbols(model: *BpeModel, word: []const u8, syms: []Symbol) !usize {
+    var n_syms: usize = 0;
+    var byte_idx: usize = 0;
+    while (byte_idx < word.len) {
+        const char_len = utf8CharLen(word[byte_idx]);
+        if (byte_idx + char_len > word.len) return error.InvalidUtf8;
+
+        const id: i32 = if (char_len == 1)
+            model.byte_vocab_ids[word[byte_idx]]
+        else
+            model.vocab_hash.get(word[byte_idx .. byte_idx + char_len]) orelse -1;
+
+        syms[n_syms] = .{
+            .id = id,
+            .start = @intCast(byte_idx),
+            .len = @intCast(char_len),
+            .prev = if (n_syms > 0) @as(i32, @intCast(n_syms - 1)) else -1,
+            .next = -1,
+        };
+        if (n_syms > 0) syms[n_syms - 1].next = @intCast(n_syms);
+        byte_idx += char_len;
+        n_syms += 1;
+    }
+    return n_syms;
+}
+
+fn initWordSymbols(
+    model: *BpeModel,
+    word: []const u8,
+    use_raw_byte_init: bool,
+    stack_syms: *[MAX_WORD_SYMBOLS]Symbol,
+) !SymbolInitResult {
+    var heap_syms: ?[]Symbol = null;
+    var syms: []Symbol = stack_syms[0..];
+
+    if (use_raw_byte_init) {
+        if (word.len > MAX_WORD_SYMBOLS) {
+            heap_syms = try model.allocator.alloc(Symbol, word.len);
+            syms = heap_syms.?;
+        }
+        return .{
+            .syms = syms,
+            .n_syms = initRawByteSymbols(model, word, syms),
+            .used_raw_byte_init = true,
+            .heap_syms = heap_syms,
+        };
+    }
+
+    if (word.len > MAX_WORD_SYMBOLS) {
+        const n_chars = try countUtf8Symbols(word);
+        if (n_chars > MAX_WORD_SYMBOLS) {
+            heap_syms = try model.allocator.alloc(Symbol, n_chars);
+            syms = heap_syms.?;
+        }
+    }
+    return .{
+        .syms = syms,
+        .n_syms = try initUtf8Symbols(model, word, syms),
+        .used_raw_byte_init = false,
+        .heap_syms = heap_syms,
+    };
+}
+
+fn appendSymbolIds(model: *BpeModel, is_byte_level: bool, word: []const u8, sym: *const Symbol, out_ids: *IdList) !void {
+    if (sym.id >= 0) {
+        try out_ids.append(model.allocator, sym.id);
+    } else if (!is_byte_level) {
+        const token_bytes = word[sym.start .. sym.start + sym.len];
+        for (token_bytes) |byte_val| {
+            const fallback_id = model.byte_fallback_ids[byte_val];
+            try out_ids.append(model.allocator, if (fallback_id >= 0) fallback_id else model.unk_id);
+        }
+    } else {
+        try out_ids.append(model.allocator, model.unk_id);
+    }
+}
+
+fn appendSymbolIdsAssumeCapacity(model: *BpeModel, is_byte_level: bool, word: []const u8, sym: *const Symbol, out_ids: *IdList) void {
+    if (sym.id >= 0) {
+        out_ids.appendAssumeCapacity(sym.id);
+    } else if (!is_byte_level) {
+        const token_bytes = word[sym.start .. sym.start + sym.len];
+        for (token_bytes) |byte_val| {
+            const fallback_id = model.byte_fallback_ids[byte_val];
+            out_ids.appendAssumeCapacity(if (fallback_id >= 0) fallback_id else model.unk_id);
+        }
+    } else {
+        out_ids.appendAssumeCapacity(model.unk_id);
+    }
+}
+
+fn applySymbolMerge(syms: []Symbol, left_pos: i32, new_id: i32) void {
+    const left = &syms[@intCast(left_pos)];
+    const right_idx = left.next;
+    const right = &syms[@intCast(right_idx)];
+    left.id = new_id;
+    left.len += right.len;
+    left.next = right.next;
+    if (right.next >= 0) syms[@intCast(right.next)].prev = left_pos;
+    right.id = -2;
+}
+
+fn encodeTwoSymbolWord(model: *BpeModel, is_byte_level: bool, word: []const u8, syms: []Symbol, out_ids: *IdList) !void {
+    const s0 = &syms[0];
+    const s1 = &syms[1];
+    if (s0.id >= 0 and s1.id >= 0) {
+        if (model.pair_merges.get(.{ .left = s0.id, .right = s1.id })) |info| {
+            try out_ids.append(model.allocator, info.new_id);
+        } else {
+            try out_ids.ensureUnusedCapacity(model.allocator, 2);
+            out_ids.appendAssumeCapacity(s0.id);
+            out_ids.appendAssumeCapacity(s1.id);
+        }
+        return;
+    }
+
+    try appendSymbolIds(model, is_byte_level, word, s0, out_ids);
+    try appendSymbolIds(model, is_byte_level, word, s1, out_ids);
+}
+
+fn mergeShortWord(model: *BpeModel, syms: []Symbol) void {
+    while (true) {
+        var best_rank: i32 = std.math.maxInt(i32);
+        var best_pos: i32 = -1;
+        var best_new_id: i32 = -1;
+
+        var si: i32 = 0;
+        while (si >= 0) {
+            const sym = &syms[@intCast(si)];
+            if (sym.next >= 0 and sym.id >= 0) {
+                const right = &syms[@intCast(sym.next)];
+                if (right.id >= 0) {
+                    if (model.pair_merges.get(.{ .left = sym.id, .right = right.id })) |info| {
+                        if (info.rank < best_rank or
+                            (info.rank == best_rank and si < best_pos))
+                        {
+                            best_rank = info.rank;
+                            best_pos = si;
+                            best_new_id = info.new_id;
+                        }
+                    }
+                }
+            }
+            si = sym.next;
+        }
+        if (best_pos < 0) break;
+        applySymbolMerge(syms, best_pos, best_new_id);
+    }
+}
+
+fn findBestCachedPairIndex(pair_cache: []const CachedPair, n_cached: usize) usize {
+    var best_idx: usize = 0;
+    for (1..n_cached) |i| {
+        if (pair_cache[i].rank < pair_cache[best_idx].rank or
+            (pair_cache[i].rank == pair_cache[best_idx].rank and
+                pair_cache[i].pos < pair_cache[best_idx].pos))
+        {
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+fn removeCachedPairAt(pair_cache: []CachedPair, pos_to_cache: []i32, n_cached: *usize, stale_pos: i32) void {
+    if (stale_pos < 0) return;
+    const cache_idx = pos_to_cache[@intCast(stale_pos)];
+    if (cache_idx < 0 or @as(usize, @intCast(cache_idx)) >= n_cached.*) return;
+
+    const removed_idx: usize = @intCast(cache_idx);
+    n_cached.* -= 1;
+    if (removed_idx < n_cached.*) {
+        pair_cache[removed_idx] = pair_cache[n_cached.*];
+        pos_to_cache[@intCast(pair_cache[removed_idx].pos)] = @intCast(removed_idx);
+    }
+    pos_to_cache[@intCast(stale_pos)] = -1;
+}
+
+fn addCachedPairAt(model: *BpeModel, syms: []Symbol, pair_cache: []CachedPair, pos_to_cache: []i32, n_cached: *usize, pos: i32) void {
+    if (pos < 0) return;
+    const left = &syms[@intCast(pos)];
+    if (left.id < 0 or left.next < 0) return;
+    const right = &syms[@intCast(left.next)];
+    if (right.id < 0) return;
+
+    if (model.pair_merges.get(.{ .left = left.id, .right = right.id })) |info| {
+        std.debug.assert(n_cached.* < pair_cache.len);
+        pos_to_cache[@intCast(pos)] = @intCast(n_cached.*);
+        pair_cache[n_cached.*] = .{ .pos = pos, .rank = info.rank, .new_id = info.new_id };
+        n_cached.* += 1;
+    }
+}
+
+fn mergeCachedPairs(model: *BpeModel, syms: []Symbol, n_syms: usize) !void {
+    var pair_cache_stack: [MAX_WORD_SYMBOLS]CachedPair = undefined;
+    var pair_cache_heap: ?[]CachedPair = null;
+    defer if (pair_cache_heap) |cache| model.allocator.free(cache);
+    var pair_cache: []CachedPair = &pair_cache_stack;
+
+    var pos_to_cache_stack: [MAX_WORD_SYMBOLS]i32 = undefined;
+    var pos_to_cache_heap: ?[]i32 = null;
+    defer if (pos_to_cache_heap) |cache| model.allocator.free(cache);
+    var pos_to_cache: []i32 = &pos_to_cache_stack;
+
+    if (n_syms > MAX_WORD_SYMBOLS) {
+        pair_cache_heap = try model.allocator.alloc(CachedPair, n_syms);
+        pair_cache = pair_cache_heap.?;
+        pos_to_cache_heap = try model.allocator.alloc(i32, n_syms);
+        pos_to_cache = pos_to_cache_heap.?;
+    }
+    @memset(pos_to_cache[0..n_syms], -1);
+
+    var n_cached: usize = 0;
+    var si: i32 = 0;
+    while (si >= 0) {
+        addCachedPairAt(model, syms, pair_cache, pos_to_cache, &n_cached, si);
+        si = syms[@intCast(si)].next;
+    }
+
+    while (n_cached > 0) {
+        const best_idx = findBestCachedPairIndex(pair_cache, n_cached);
+        const best = pair_cache[best_idx];
+
+        n_cached -= 1;
+        if (best_idx < n_cached) {
+            pair_cache[best_idx] = pair_cache[n_cached];
+            pos_to_cache[@intCast(pair_cache[best_idx].pos)] = @intCast(best_idx);
+        }
+        pos_to_cache[@intCast(best.pos)] = -1;
+
+        const left = &syms[@intCast(best.pos)];
+        if (left.id < 0 or left.next < 0) continue;
+        const right_idx = left.next;
+        const right = &syms[@intCast(right_idx)];
+        if (right.id < 0) continue;
+
+        applySymbolMerge(syms, best.pos, best.new_id);
+        removeCachedPairAt(pair_cache, pos_to_cache, &n_cached, right_idx);
+        removeCachedPairAt(pair_cache, pos_to_cache, &n_cached, left.prev);
+        addCachedPairAt(model, syms, pair_cache, pos_to_cache, &n_cached, left.prev);
+        addCachedPairAt(model, syms, pair_cache, pos_to_cache, &n_cached, best.pos);
+    }
+}
+
+fn mergeWordSymbols(model: *BpeModel, syms: []Symbol, n_syms: usize) !void {
+    if (model.pair_merges.count() == 0) return;
+    if (n_syms >= 3 and n_syms <= 5) {
+        mergeShortWord(model, syms);
+    } else if (n_syms >= 6) {
+        try mergeCachedPairs(model, syms, n_syms);
+    }
+}
+
+fn containsUnknownSymbol(syms: []const Symbol) bool {
+    var si: i32 = 0;
+    while (si >= 0) {
+        if (syms[@intCast(si)].id < 0) return true;
+        si = syms[@intCast(si)].next;
+    }
+    return false;
+}
+
+fn countOutputIds(is_byte_level: bool, syms: []const Symbol) usize {
+    var n_output: usize = 0;
+    var ci: i32 = 0;
+    while (ci >= 0) {
+        const sym = &syms[@intCast(ci)];
+        n_output += if (sym.id >= 0 or is_byte_level) 1 else sym.len;
+        ci = sym.next;
+    }
+    return n_output;
+}
+
+fn appendMergedSymbolIds(model: *BpeModel, is_byte_level: bool, word: []const u8, syms: []const Symbol, out_ids: *IdList) !void {
+    try out_ids.ensureUnusedCapacity(model.allocator, countOutputIds(is_byte_level, syms));
+
+    var si: i32 = 0;
+    while (si >= 0) {
+        const sym = &syms[@intCast(si)];
+        appendSymbolIdsAssumeCapacity(model, is_byte_level, word, sym, out_ids);
+        si = sym.next;
+    }
+}
+
 /// Core BPE encode: symbol init → merge loop → collect. No added-token check.
 /// Used by the direct encode path where added tokens are pre-separated.
 fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *IdList) !void {
@@ -791,358 +1096,34 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
         }
     }
 
-    // --- Linked-list BPE merge with integer pair lookups ---
-
-    // 1. Split word into UTF-8 characters → Symbol array.
-    //    Stack-allocated for small words (word.len is an upper bound on char
-    //    count since each UTF-8 char is >= 1 byte); heap fallback for words
-    //    exceeding MAX_WORD_SYMBOLS bytes.
     var stack_syms: [MAX_WORD_SYMBOLS]Symbol = undefined;
-    var heap_syms: ?[]Symbol = null;
-    defer if (heap_syms) |hs| allocator.free(hs);
+    const symbol_init = try initWordSymbols(model, word, use_raw_byte_init, &stack_syms);
+    defer if (symbol_init.heap_syms) |heap_syms| allocator.free(heap_syms);
 
-    var n_syms: usize = 0;
-    var used_raw_byte_init = false;
+    const syms = symbol_init.syms;
+    const n_syms = symbol_init.n_syms;
+    if (n_syms == 0) return;
 
-    var syms: []Symbol = &stack_syms;
-
-    if (use_raw_byte_init) {
-        // Byte-level BPE with raw byte init: each byte maps directly to a
-        // vocab token via orig_byte_vocab_ids. No UTF-8 parsing or hash
-        // lookups needed. Requires applyByteLevel to be skipped (non-sequence
-        // pretokenizer) so words contain raw bytes.
-        if (word.len > MAX_WORD_SYMBOLS) {
-            heap_syms = try allocator.alloc(Symbol, word.len);
-            syms = heap_syms.?;
-        }
-        for (word, 0..) |byte, i| {
-            syms[n_syms] = .{
-                .id = model.orig_byte_vocab_ids[byte],
-                .start = @intCast(i),
-                .len = 1,
-                .prev = if (n_syms > 0) @as(i32, @intCast(n_syms - 1)) else -1,
-                .next = -1,
-            };
-            if (n_syms > 0) syms[n_syms - 1].next = @intCast(n_syms);
-            n_syms += 1;
-        }
-        used_raw_byte_init = true;
-    } else {
-        // Non-byte-level: split by UTF-8 characters and look up each in vocab.
-        if (word.len > MAX_WORD_SYMBOLS) {
-            var n_chars: usize = 0;
-            var bi: usize = 0;
-            while (bi < word.len) {
-                const cl = utf8CharLen(word[bi]);
-                if (bi + cl > word.len) return error.InvalidUtf8;
-                bi += cl;
-                n_chars += 1;
-            }
-            if (n_chars > MAX_WORD_SYMBOLS) {
-                heap_syms = try allocator.alloc(Symbol, n_chars);
-                syms = heap_syms.?;
-            }
-        }
-
-        var byte_idx: usize = 0;
-        while (byte_idx < word.len) {
-            const char_len = utf8CharLen(word[byte_idx]);
-            if (byte_idx + char_len > word.len) return error.InvalidUtf8;
-
-            const id: i32 = if (char_len == 1)
-                model.byte_vocab_ids[word[byte_idx]]
-            else
-                model.vocab_hash.get(word[byte_idx .. byte_idx + char_len]) orelse -1;
-
-            syms[n_syms] = .{
-                .id = id,
-                .start = @intCast(byte_idx),
-                .len = @intCast(char_len),
-                .prev = if (n_syms > 0) @as(i32, @intCast(n_syms - 1)) else -1,
-                .next = -1,
-            };
-            if (n_syms > 0) syms[n_syms - 1].next = @intCast(n_syms);
-            byte_idx += char_len;
-            n_syms += 1;
-        }
-    }
-    // Fast path: single-symbol words skip merge loop and collect entirely.
     if (n_syms == 1) {
-        const sym = &syms[0];
-        if (sym.id >= 0) {
-            try out_ids.append(allocator, sym.id);
-        } else if (!is_byte_level) {
-            const token_bytes = word[sym.start .. sym.start + sym.len];
-            for (token_bytes) |byte_val| {
-                const fallback_id = model.byte_fallback_ids[byte_val];
-                try out_ids.append(allocator, if (fallback_id >= 0) fallback_id else model.unk_id);
-            }
-        } else {
-            try out_ids.append(allocator, model.unk_id);
-        }
+        try appendSymbolIds(model, is_byte_level, word, &syms[0], out_ids);
         return;
     }
 
-    // Fast path: two-symbol words need at most one merge lookup.
-    // Skips pair cache setup (pos_to_cache zeroing, Phase 1/2 loops).
     if (n_syms == 2) {
-        const s0 = &syms[0];
-        const s1 = &syms[1];
-        if (s0.id >= 0 and s1.id >= 0) {
-            if (model.pair_merges.get(.{ .left = s0.id, .right = s1.id })) |info| {
-                try out_ids.append(allocator, info.new_id);
-            } else {
-                try out_ids.ensureUnusedCapacity(allocator, 2);
-                out_ids.appendAssumeCapacity(s0.id);
-                out_ids.appendAssumeCapacity(s1.id);
-            }
-        } else {
-            for ([2]*const Symbol{ s0, s1 }) |sym| {
-                if (sym.id >= 0) {
-                    try out_ids.append(allocator, sym.id);
-                } else if (!is_byte_level) {
-                    const token_bytes = word[sym.start .. sym.start + sym.len];
-                    for (token_bytes) |byte_val| {
-                        const fallback_id = model.byte_fallback_ids[byte_val];
-                        try out_ids.append(allocator, if (fallback_id >= 0) fallback_id else model.unk_id);
-                    }
-                } else {
-                    try out_ids.append(allocator, model.unk_id);
-                }
-            }
-        }
+        try encodeTwoSymbolWord(model, is_byte_level, word, syms, out_ids);
         return;
     }
 
-    // 2. Merge loop.
-    //    For short words (3-5 symbols), use simple re-scan: find best pair
-    //    by scanning all pairs each iteration. Avoids pair cache setup
-    //    (1KB pos_to_cache fill, Phase 1/2 bookkeeping) for the common case.
-    if (n_syms >= 3 and n_syms <= 5 and model.pair_merges.count() > 0) {
-        while (true) {
-            var best_rank: i32 = std.math.maxInt(i32);
-            var best_pos: i32 = -1;
-            var best_new_id: i32 = -1;
+    try mergeWordSymbols(model, syms, n_syms);
 
-            var si: i32 = 0;
-            while (si >= 0) {
-                const sym = &syms[@intCast(si)];
-                if (sym.next >= 0 and sym.id >= 0) {
-                    const right = &syms[@intCast(sym.next)];
-                    if (right.id >= 0) {
-                        if (model.pair_merges.get(.{ .left = sym.id, .right = right.id })) |info| {
-                            if (info.rank < best_rank or
-                                (info.rank == best_rank and si < best_pos))
-                            {
-                                best_rank = info.rank;
-                                best_pos = si;
-                                best_new_id = info.new_id;
-                            }
-                        }
-                    }
-                }
-                si = sym.next;
-            }
-            if (best_pos < 0) break;
-
-            const left = &syms[@intCast(best_pos)];
-            const right_idx = left.next;
-            const right = &syms[@intCast(right_idx)];
-            left.id = best_new_id;
-            left.len += right.len;
-            left.next = right.next;
-            if (right.next >= 0) syms[@intCast(right.next)].prev = best_pos;
-            right.id = -2;
-        }
-    } else if (n_syms >= 6 and model.pair_merges.count() > 0) {
-        // Cached-pair approach for longer words.
-        // Phase 1 builds a cache of all valid merge pairs (one full scan).
-        // Phase 2 repeatedly picks the lowest-rank pair from the cache,
-        // applies the merge, and updates only the 1-2 affected neighbors.
-        // This reduces pair_merges hash lookups from O(n_pairs × n_passes)
-        // to O(n_pairs + 2 × n_merges).
-        const CachedPair = struct { pos: i32, rank: i32, new_id: i32 };
-        var pair_cache_stack: [MAX_WORD_SYMBOLS]CachedPair = undefined;
-        var pair_cache_heap: ?[]CachedPair = null;
-        defer if (pair_cache_heap) |cache| allocator.free(cache);
-        var pair_cache: []CachedPair = &pair_cache_stack;
-        var n_cached: usize = 0;
-        // Position-to-cache-index tracking for O(1) stale entry removal.
-        // Use the actual symbol count here; long words already spill `syms`
-        // to the heap and the cache must follow suit to avoid overflow.
-        var pos_to_cache_stack: [MAX_WORD_SYMBOLS]i32 = undefined;
-        var pos_to_cache_heap: ?[]i32 = null;
-        defer if (pos_to_cache_heap) |cache| allocator.free(cache);
-        var pos_to_cache: []i32 = &pos_to_cache_stack;
-        if (n_syms > MAX_WORD_SYMBOLS) {
-            pair_cache_heap = try allocator.alloc(CachedPair, n_syms);
-            pair_cache = pair_cache_heap.?;
-            pos_to_cache_heap = try allocator.alloc(i32, n_syms);
-            pos_to_cache = pos_to_cache_heap.?;
-        }
-        @memset(pos_to_cache[0..n_syms], -1);
-
-        // Phase 1: Build pair cache (single scan, one hash lookup per pair)
-        {
-            var si: i32 = 0;
-            while (si >= 0) {
-                const sym = &syms[@intCast(si)];
-                if (sym.next >= 0 and sym.id >= 0) {
-                    const right_sym = &syms[@intCast(sym.next)];
-                    if (right_sym.id >= 0) {
-                        if (model.pair_merges.get(.{ .left = sym.id, .right = right_sym.id })) |info| {
-                            std.debug.assert(n_cached < pair_cache.len);
-                            pos_to_cache[@intCast(si)] = @intCast(n_cached);
-                            pair_cache[n_cached] = .{ .pos = si, .rank = info.rank, .new_id = info.new_id };
-                            n_cached += 1;
-                        }
-                    }
-                }
-                si = sym.next;
-            }
-        }
-        // Phase 2: Process merges from cache
-        while (n_cached > 0) {
-            // Find entry with minimum rank; leftmost position breaks ties
-            // (matches original left-to-right scan behavior)
-            var best_idx: usize = 0;
-            for (1..n_cached) |i| {
-                if (pair_cache[i].rank < pair_cache[best_idx].rank or
-                    (pair_cache[i].rank == pair_cache[best_idx].rank and
-                        pair_cache[i].pos < pair_cache[best_idx].pos))
-                {
-                    best_idx = i;
-                }
-            }
-            const best = pair_cache[best_idx];
-
-            // Swap-remove best entry from cache; update index for moved entry
-            n_cached -= 1;
-            if (best_idx < n_cached) {
-                pair_cache[best_idx] = pair_cache[n_cached];
-                pos_to_cache[@intCast(pair_cache[best_idx].pos)] = @intCast(best_idx);
-            }
-            pos_to_cache[@intCast(best.pos)] = -1;
-
-            // Validate: symbols may have been invalidated by an earlier merge
-            const left = &syms[@intCast(best.pos)];
-            if (left.id < 0 or left.next < 0) continue;
-            const right_idx = left.next;
-            const right = &syms[@intCast(right_idx)];
-            if (right.id < 0) continue;
-
-            // Apply merge: extend left symbol, unlink right
-            left.id = best.new_id;
-            left.len += right.len;
-            left.next = right.next;
-            if (right.next >= 0) {
-                syms[@intCast(right.next)].prev = best.pos;
-            }
-            right.id = -2;
-
-            // Remove stale cache entries via position index (O(1) per entry).
-            // After merging at pos P (right R removed):
-            //   - Entry at pos==R is invalid (R is dead)
-            //   - Entry at pos==P.prev is stale (P's id changed)
-            for ([_]i32{ right_idx, left.prev }) |stale_pos| {
-                if (stale_pos >= 0) {
-                    const ci = pos_to_cache[@intCast(stale_pos)];
-                    if (ci >= 0 and @as(usize, @intCast(ci)) < n_cached) {
-                        const cui: usize = @intCast(ci);
-                        n_cached -= 1;
-                        if (cui < n_cached) {
-                            pair_cache[cui] = pair_cache[n_cached];
-                            pos_to_cache[@intCast(pair_cache[cui].pos)] = @intCast(cui);
-                        }
-                        pos_to_cache[@intCast(stale_pos)] = -1;
-                    }
-                }
-            }
-
-            // Add new pair: (left_neighbor, merged)
-            if (left.prev >= 0) {
-                const ln = &syms[@intCast(left.prev)];
-                if (ln.id >= 0) {
-                    if (model.pair_merges.get(.{ .left = ln.id, .right = left.id })) |info| {
-                        std.debug.assert(n_cached < pair_cache.len);
-                        pos_to_cache[@intCast(left.prev)] = @intCast(n_cached);
-                        pair_cache[n_cached] = .{ .pos = left.prev, .rank = info.rank, .new_id = info.new_id };
-                        n_cached += 1;
-                    }
-                }
-            }
-            // Add new pair: (merged, right_neighbor)
-            if (left.next >= 0) {
-                const rn = &syms[@intCast(left.next)];
-                if (rn.id >= 0) {
-                    if (model.pair_merges.get(.{ .left = left.id, .right = rn.id })) |info| {
-                        std.debug.assert(n_cached < pair_cache.len);
-                        pos_to_cache[@intCast(best.pos)] = @intCast(n_cached);
-                        pair_cache[n_cached] = .{ .pos = best.pos, .rank = info.rank, .new_id = info.new_id };
-                        n_cached += 1;
-                    }
-                }
-            }
+    if (containsUnknownSymbol(syms)) {
+        if (lookupWholeWordId(model, word, symbol_init.used_raw_byte_init)) |id| {
+            try out_ids.append(allocator, id);
+            return;
         }
     }
 
-    // 3. Check if all symbols resolved to valid IDs. If any has id == -1
-    //    (unknown) and the whole word is in vocab, fall back to direct lookup.
-    {
-        var all_known = true;
-        var si: i32 = 0;
-        while (si >= 0) {
-            if (syms[@intCast(si)].id < 0) {
-                all_known = false;
-                break;
-            }
-            si = syms[@intCast(si)].next;
-        }
-        if (!all_known) {
-            if (lookupWholeWordId(model, word, used_raw_byte_init)) |id| {
-                try out_ids.append(allocator, id);
-                return;
-            }
-        }
-    }
-
-    // 4. Collect IDs from linked list directly into output.
-    //    Pre-count surviving symbols to reserve capacity, then append without
-    //    per-token capacity checks.
-    {
-        var n_output: usize = 0;
-        var ci: i32 = 0;
-        while (ci >= 0) {
-            const csym = &syms[@intCast(ci)];
-            if (csym.id >= 0) {
-                n_output += 1;
-            } else if (!is_byte_level) {
-                n_output += csym.len; // byte fallback: one ID per byte
-            } else {
-                n_output += 1;
-            }
-            ci = csym.next;
-        }
-        try out_ids.ensureUnusedCapacity(allocator, n_output);
-    }
-    var si: i32 = 0;
-    while (si >= 0) {
-        const sym = &syms[@intCast(si)];
-
-        if (sym.id >= 0) {
-            out_ids.appendAssumeCapacity(sym.id);
-        } else if (!is_byte_level) {
-            // SentencePiece: use byte fallback for unknown tokens
-            const token_bytes = word[sym.start .. sym.start + sym.len];
-            for (token_bytes) |byte_val| {
-                const fallback_id = model.byte_fallback_ids[byte_val];
-                out_ids.appendAssumeCapacity(if (fallback_id >= 0) fallback_id else model.unk_id);
-            }
-        } else {
-            out_ids.appendAssumeCapacity(model.unk_id);
-        }
-        si = sym.next;
-    }
+    try appendMergedSymbolIds(model, is_byte_level, word, syms, out_ids);
 }
 
 // ============= C API callbacks =============
@@ -1172,14 +1153,11 @@ fn bpe_encode(tok: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncodin
     if (tok.model == null) return -1;
     const model = @as(*BpeModel, @ptrCast(@alignCast(tok.model.?)));
     const text = std.mem.sliceTo(input, 0);
-
-    log.trace("tokenizer", "bpe_encode", .{ .text_len = text.len, .vocab_size = model.vocab_hash.count() }, @src());
     return bpe_encode_via_encoding(model, tok, text, enc);
 }
 
 /// Encode with explicit length (supports embedded null bytes) - implementation
 fn bpe_encode_slice_impl(model: *BpeModel, tok: *ct.Tokenizer, text: []const u8, enc: *ct.TokenizerEncoding) c_int {
-    log.trace("tokenizer", "bpe_encode_slice", .{ .text_len = text.len, .vocab_size = model.vocab_hash.count() }, @src());
     return bpe_encode_via_encoding(model, tok, text, enc);
 }
 
@@ -1219,13 +1197,7 @@ fn findAddedTokenById(tok: *ct.Tokenizer, id: i32) ?[*:0]const u8 {
     return null;
 }
 
-/// Decode options for controlling output.
-pub const DecodeOptions = struct {
-    /// If true, skip special tokens (BOS/EOS/etc.) in the output.
-    skip_special_tokens: bool = false,
-};
-
-fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: DecodeOptions) c_int {
+fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
     const allocator = model.allocator;
     const unk_ptr: [*:0]const u8 = @ptrCast(&model.unk_token);
 
@@ -1335,40 +1307,9 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
     return 0;
 }
 
-/// C API vtable adapter: extracts model from tokenizer and calls impl
-fn bpe_decode_with_options(tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: DecodeOptions) c_int {
-    if (tok.model == null) return -1;
-    const model = @as(*BpeModel, @ptrCast(@alignCast(tok.model.?)));
-    return bpe_decode_with_options_impl(model, tok, ids, ids_len, out, out_len, options);
-}
-
-fn bpe_decode_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-    return bpe_decode_with_options_impl(model, tok, ids, ids_len, out, out_len, .{});
-}
-
 fn bpe_destroy_impl(model: *BpeModel, tok: *ct.Tokenizer) void {
     tok.model = null;
-
-    // Free merge-implied tokens (separately allocated, not in json_buffer)
-    for (model.merge_added_tokens.items) |s| model.allocator.free(s);
-    model.merge_added_tokens.deinit(model.allocator);
-
-    // Free merge strings (we allocated these)
-    for (model.merge_strings.items) |s| model.allocator.free(s);
-    model.merge_strings.deinit(model.allocator);
-    model.merges.deinit(model.allocator);
-    model.pair_merges.deinit(model.allocator);
-    model.vocab_hash.deinit(model.allocator);
-    model.allocator.free(model.id_to_token);
-
-    // Free byte_to_unicode
-    for (model.byte_to_unicode) |s| {
-        if (s.len > 0) model.allocator.free(s);
-    }
-
-    if (model.json_owned and model.json_buffer.len > 0) {
-        model.allocator.free(@constCast(model.json_buffer));
-    }
+    deinitBpeModelStorage(model, true);
     model.allocator.destroy(model);
 }
 
@@ -1385,7 +1326,7 @@ pub fn createBpeTokenizer(allocator: std.mem.Allocator, json_buffer: []const u8,
     tok.postproc.sep_id = -1;
     tok.postproc.add_special = 0;
 
-    var model = create(allocator, json_buffer, json_owned) catch |err| {
+    const model = create(allocator, json_buffer, json_owned) catch |err| {
         log.warn("tokenizer", "BPE model creation failed", .{
             .reason = @errorName(err),
             .json_bytes = json_buffer.len,
@@ -1393,17 +1334,10 @@ pub fn createBpeTokenizer(allocator: std.mem.Allocator, json_buffer: []const u8,
         });
         return err;
     };
-    errdefer {
-        if (model.json_owned and model.json_buffer.len > 0) {
-            allocator.free(@constCast(model.json_buffer));
-        }
-        allocator.destroy(model);
-    }
 
     tok.model = model;
     model.owner = tok;
-
-    // Attach pretokenizer
+    errdefer bpe_destroy_impl(model, tok);
 
     if (tok_fns.tokenizer_pretokenizer_set(&tok.pretokenizer, DEFAULT_PATTERN.ptr) != 0) {
         tok_fns.tokenizer_set_error(tok, "Failed to compile BPE regex");
@@ -1417,219 +1351,24 @@ pub fn createBpeTokenizer(allocator: std.mem.Allocator, json_buffer: []const u8,
 }
 
 // =============================================================================
-
-/// Destroy implementation for file-loaded models (same as lazy but also frees vocab strings)
-fn bpe_destroy_files_impl(model: *BpeModel, tok: *ct.Tokenizer) void {
-    tok.model = null;
-
-    // Free vocab strings (we allocated these when parsing vocab.json)
-    // This also frees any merge-implied tokens since they're in id_to_token.
-    for (model.id_to_token) |maybe_token| {
-        if (maybe_token) |token| {
-            model.allocator.free(token);
-        }
-    }
-    // Just deinit the list; entries already freed above via id_to_token.
-    model.merge_added_tokens.deinit(model.allocator);
-
-    // Rest is same as lazy destroy
-    for (model.merge_strings.items) |s| model.allocator.free(s);
-    model.merge_strings.deinit(model.allocator);
-    model.merges.deinit(model.allocator);
-    model.pair_merges.deinit(model.allocator);
-    model.vocab_hash.deinit(model.allocator);
-    model.allocator.free(model.id_to_token);
-
-    for (model.byte_to_unicode) |s| {
-        if (s.len > 0) model.allocator.free(s);
-    }
-
-    model.allocator.destroy(model);
-}
-
-/// C API vtable adapter: extracts model from tokenizer and calls impl
-fn bpe_destroy_files(tok: *ct.Tokenizer) void {
-    if (tok.model == null) return;
-    const model = @as(*BpeModel, @ptrCast(@alignCast(tok.model.?)));
-    bpe_destroy_files_impl(model, tok);
-}
-
-// =============================================================================
-// C-API Spec-based loading
-// =============================================================================
-
-/// Create BPE tokenizer from a C-API specification struct
-pub fn tokenizer_bpe_create_from_spec(spec: ?*const ct.BpeModelSpec) ?*ct.Tokenizer {
-    if (spec == null) return null;
-    const bpe_spec = spec.?;
-    if (bpe_spec.vocab == null or bpe_spec.merges == null or bpe_spec.vocab_len == 0 or bpe_spec.merges_len == 0) return null;
-
-    const allocator = std.heap.c_allocator;
-
-    // Create tokenizer struct
-    var tok = allocator.create(ct.Tokenizer) catch return null;
-    tok.* = std.mem.zeroes(ct.Tokenizer);
-    tok.type = ct.ModelType.bpe;
-    tok.normalizer.lowercase = 0;
-    tok.normalizer.nfd = 0;
-    tok.postproc.cls_id = -1;
-    tok.postproc.sep_id = -1;
-    tok.postproc.add_special = 0;
-
-    // Create model from spec
-    var model = createFromSpec(allocator, bpe_spec) catch {
-        allocator.destroy(tok);
-        return null;
-    };
-
-    tok.model = model;
-    model.owner = tok;
-
-    // Attach pretokenizer
-
-    if (tok_fns.tokenizer_pretokenizer_set(&tok.pretokenizer, DEFAULT_PATTERN.ptr) != 0) {
-        tok_fns.tokenizer_set_error(tok, "Failed to compile BPE regex");
-        bpe_destroy_files(tok);
-        allocator.destroy(tok);
-        return null;
-    }
-
-    return tok;
-}
-
-/// Create model from C-API spec
-fn createFromSpec(allocator: std.mem.Allocator, spec: *const ct.BpeModelSpec) !*BpeModel {
-    var model = try allocator.create(BpeModel);
-    errdefer allocator.destroy(model);
-
-    // Find max ID
-    var max_id: usize = 0;
-    const vocab_ptr: [*]const ct.TokenIdPair = @ptrCast(spec.vocab.?);
-    const vocab = vocab_ptr[0..spec.vocab_len];
-    for (vocab) |entry| {
-        if (entry.id >= 0) {
-            const next = @as(usize, @intCast(entry.id)) + 1;
-            if (next > max_id) max_id = next;
-        }
-    }
-    if (max_id == 0) return error.IncompleteSpec;
-
-    model.* = .{
-        .allocator = allocator,
-        .json_buffer = "",
-        .json_owned = false,
-        .id_to_token = try allocator.alloc(?[]const u8, max_id),
-        .vocab_hash = .{},
-        .merges = .{},
-        .pair_merges = .{},
-        .merge_added_tokens = .{},
-        .merge_strings = .{},
-        .byte_to_unicode = undefined,
-        .unicode_to_byte = [_]i32{-1} ** 65536,
-        .byte_fallback_ids = [_]i32{-1} ** 256,
-        .byte_vocab_ids = [_]i32{-1} ** 256,
-        .orig_byte_vocab_ids = [_]i32{-1} ** 256,
-        .use_raw_byte_init = false,
-        .ignore_merges = false,
-        .unk_token = undefined,
-        .unk_id = 0,
-        .bos_id = -1,
-        .eos_id = -1,
-        .vocab_size = max_id,
-        .owner = null,
-    };
-
-    @memset(model.id_to_token, null);
-    for (&model.byte_to_unicode) |*slot| slot.* = "";
-    @memset(model.unk_token[0..], 0);
-    @memcpy(model.unk_token[0..DEFAULT_UNK.len], DEFAULT_UNK);
-
-    // Populate vocab
-    try model.vocab_hash.ensureTotalCapacity(allocator, @intCast(spec.vocab_len));
-    for (vocab) |entry| {
-        if (entry.token == null or entry.id < 0) continue;
-        const token_ptr: [*:0]const u8 = @ptrCast(entry.token.?);
-        const token_slice = std.mem.sliceTo(token_ptr, 0);
-        const token_dup = try allocator.dupe(u8, token_slice);
-        const idx: usize = @intCast(entry.id);
-        if (idx < model.id_to_token.len) {
-            model.id_to_token[idx] = token_dup;
-            model.vocab_hash.putAssumeCapacity(token_dup, entry.id);
-        } else {
-            allocator.free(token_dup);
-        }
-    }
-
-    // Build byte fallback table for SentencePiece (looks for <0xNN> tokens)
-    initByteFallback(model);
-
-    // Build direct byte lookup table for single-byte vocab tokens
-    initByteVocabIds(model);
-
-    // Build direct raw-byte→vocab-ID for byte-level BPE
-    initOrigByteVocabIds(model);
-
-    // Build merges
-    const merge_buffer = try allocator.alloc(u8, 8 * 1024 * 1024);
-    var merge_buf_pos: usize = 0;
-    try model.merge_strings.append(allocator, merge_buffer);
-    try model.merges.ensureTotalCapacity(allocator, @intCast(spec.merges_len));
-
-    const merges_ptr: [*]const ct.BpeMergePair = @ptrCast(spec.merges.?);
-    const merges = merges_ptr[0..spec.merges_len];
-    for (merges, 0..) |pair, rank| {
-        if (pair.a == null or pair.b == null) continue;
-        const left_ptr: [*:0]const u8 = @ptrCast(pair.a.?);
-        const right_ptr: [*:0]const u8 = @ptrCast(pair.b.?);
-        const left = std.mem.sliceTo(left_ptr, 0);
-        const right = std.mem.sliceTo(right_ptr, 0);
-        const key_len = left.len + 1 + right.len;
-
-        if (merge_buf_pos + key_len <= merge_buffer.len) {
-            const merge_key = merge_buffer[merge_buf_pos .. merge_buf_pos + key_len];
-            @memcpy(merge_key[0..left.len], left);
-            merge_key[left.len] = ' ';
-            @memcpy(merge_key[left.len + 1 ..], right);
-            model.merges.putAssumeCapacity(merge_key, @intCast(rank));
-            merge_buf_pos += key_len;
-        }
-    }
-
-    // Set unk token if provided
-    if (spec.unk_token) |unk| {
-        const unk_ptr: [*:0]const u8 = @ptrCast(unk);
-        const unk_slice = std.mem.sliceTo(unk_ptr, 0);
-        const copy_len = @min(unk_slice.len, model.unk_token.len - 1);
-        @memcpy(model.unk_token[0..copy_len], unk_slice[0..copy_len]);
-        model.unk_token[copy_len] = 0;
-    }
-
-    // Build byte map
-    try initByteMap(model);
-
-    // Finalize unk
-    const unk_slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&model.unk_token)), 0);
-    if (model.vocab_hash.get(unk_slice)) |id| {
-        model.unk_id = id;
-    }
-
-    return model;
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 
-// Integration tests: Most functions in this file require a fully initialized
-// BPE tokenizer with a loaded vocabulary and merge rules.
-// They are tested via integration tests in tests/tokenizer/ which test:
-// - createBpeTokenizer: BPE tokenizer creation from JSON
-// - tokenizer_bpe_create_from_spec: Tokenizer creation from C API spec
-// - bpeEncode/bpeEncodeSlice: Text to token ID encoding
-// - bpeDecode/bpeDecodeWithOptions: Token ID to text decoding
-// - bpeDestroy: Resource cleanup and memory management
+fn destroyTestJsonBpeModel(model: *BpeModel) void {
+    deinitBpeModelStorage(model, false);
+    model.allocator.destroy(model);
+}
 
-test "tokenizer_bpe_create_from_spec: findVocabSize with simple vocab" {
+fn expectCreateInvalidVocab(json: []const u8) !void {
+    const model = create(std.testing.allocator, json, false) catch |err| {
+        try std.testing.expectEqual(error.InvalidVocab, err);
+        return;
+    };
+    defer destroyTestJsonBpeModel(model);
+    return error.TestUnexpectedResult;
+}
+
+test "findVocabSize with simple vocab" {
     const json =
         \\{"vocab": {"a": 0, "b": 1, "c": 2}}
     ;
@@ -1637,7 +1376,7 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with simple vocab" {
     try std.testing.expectEqual(@as(usize, 3), size);
 }
 
-test "tokenizer_bpe_create_from_spec: findVocabSize with gaps in IDs" {
+test "findVocabSize with gaps in IDs" {
     const json =
         \\{"vocab": {"a": 0, "b": 5, "c": 10}}
     ;
@@ -1645,7 +1384,7 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with gaps in IDs" {
     try std.testing.expectEqual(@as(usize, 11), size);
 }
 
-test "tokenizer_bpe_create_from_spec: findVocabSize with large IDs" {
+test "findVocabSize with large IDs" {
     const json =
         \\{"vocab": {"token1": 100, "token2": 50000, "token3": 25}}
     ;
@@ -1653,7 +1392,7 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with large IDs" {
     try std.testing.expectEqual(@as(usize, 50001), size);
 }
 
-test "tokenizer_bpe_create_from_spec: findVocabSize with whitespace" {
+test "findVocabSize with whitespace" {
     const json =
         \\{
         \\  "vocab": {
@@ -1667,7 +1406,7 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with whitespace" {
     try std.testing.expectEqual(@as(usize, 3), size);
 }
 
-test "tokenizer_bpe_create_from_spec: findVocabSize reports oversize sparse ids" {
+test "findVocabSize reports oversize sparse ids" {
     const json =
         \\{"vocab": {"a": 2147483647}}
     ;
@@ -1675,7 +1414,15 @@ test "tokenizer_bpe_create_from_spec: findVocabSize reports oversize sparse ids"
     try std.testing.expect(size > MAX_MODEL_VOCAB_SIZE);
 }
 
-test "tokenizer_bpe_create_from_spec: findSectionStart finds vocab section" {
+test "findVocabSize ignores numeric fields outside vocab" {
+    const json =
+        \\{"model": {"dropout": 999999}, "vocab": {"a": 0, "b": 1}, "merges": [["a", "b"]]}
+    ;
+    const size = try findVocabSize(json);
+    try std.testing.expectEqual(@as(usize, 2), size);
+}
+
+test "findSectionStart finds vocab section" {
     const json =
         \\{"model": "bpe", "vocab": {"a": 0}, "merges": []}
     ;
@@ -1684,7 +1431,7 @@ test "tokenizer_bpe_create_from_spec: findSectionStart finds vocab section" {
     try std.testing.expect(start.? > 0);
 }
 
-test "tokenizer_bpe_create_from_spec: findSectionStart finds merges section" {
+test "findSectionStart finds merges section" {
     const json =
         \\{"model": "bpe", "vocab": {"a": 0}, "merges": []}
     ;
@@ -1693,7 +1440,7 @@ test "tokenizer_bpe_create_from_spec: findSectionStart finds merges section" {
     try std.testing.expect(start.? > 0);
 }
 
-test "tokenizer_bpe_create_from_spec: findSectionStart returns null for missing section" {
+test "findSectionStart returns null for missing section" {
     const json =
         \\{"model": "bpe", "vocab": {"a": 0}}
     ;
@@ -1701,46 +1448,55 @@ test "tokenizer_bpe_create_from_spec: findSectionStart returns null for missing 
     try std.testing.expect(start == null);
 }
 
-test "bpeDecodeWithOptions: DecodeOptions default values" {
-    const opts = DecodeOptions{};
-    try std.testing.expect(opts.skip_special_tokens == false);
+test "parseVocabAndMerges rejects malformed vocab ids" {
+    const cases = [_][]const u8{
+        \\{"vocab": {"a": -1}, "merges": []}
+        ,
+        \\{"vocab": {"a": +1}, "merges": []}
+        ,
+        \\{"vocab": {"a": "1"}, "merges": []}
+        ,
+        \\{"vocab": {"a": 1.0}, "merges": []}
+        ,
+        \\{"vocab": {"a": 1e3}, "merges": []}
+        ,
+        \\{"vocab": {"a": null}, "merges": []}
+        ,
+        \\{"vocab": {"a": {}}, "merges": []}
+        ,
+        \\{"vocab": {"a": []}, "merges": []}
+        ,
+        \\{"vocab": {"a": }, "merges": []}
+        ,
+        \\{"vocab": {"a": 1x}, "merges": []}
+    };
+
+    for (cases) |json| {
+        try expectCreateInvalidVocab(json);
+    }
 }
 
-test "bpeDecodeWithOptions: DecodeOptions with skip_special_tokens enabled" {
-    const opts = DecodeOptions{ .skip_special_tokens = true };
-    try std.testing.expect(opts.skip_special_tokens == true);
+test "parseVocabAndMerges rejects duplicate vocab ids and tokens" {
+    try expectCreateInvalidVocab(
+        \\{"vocab": {"a": 0, "b": 0}, "merges": []}
+    );
+    try expectCreateInvalidVocab(
+        \\{"vocab": {"a": 0, "a": 1}, "merges": []}
+    );
 }
 
 // =============================================================================
 // Unit tests for critical internal functions
 // =============================================================================
 
-test "tokenizer_bpe_create_from_spec: parseVocabAndMerges with minimal valid JSON" {
+test "parseVocabAndMerges with minimal valid JSON" {
     const json =
         \\{"vocab": {"a": 0, "b": 1, "c": 2}, "merges": [["a", "b"]]}
     ;
     const allocator = std.testing.allocator;
 
-    var model = try create(allocator, json, false);
-    defer {
-        // Note: vocab tokens are either borrowed from json_buffer (when no escapes)
-        // or allocated by unescapeJsonString (when escapes present).
-        // Since json is a string literal and simple tokens have no escapes,
-        // the tokens are borrowed and should NOT be freed.
-        // Only the byte_to_unicode mapping and merge_strings need cleanup.
-        for (model.merge_added_tokens.items) |s| allocator.free(s);
-        model.merge_added_tokens.deinit(allocator);
-        model.vocab_hash.deinit(allocator);
-        model.merges.deinit(allocator);
-        model.pair_merges.deinit(allocator);
-        for (model.merge_strings.items) |s| allocator.free(s);
-        model.merge_strings.deinit(allocator);
-        allocator.free(model.id_to_token);
-        for (model.byte_to_unicode) |s| {
-            if (s.len > 0) allocator.free(s);
-        }
-        allocator.destroy(model);
-    }
+    const model = try create(allocator, json, false);
+    defer destroyTestJsonBpeModel(model);
 
     // Verify vocab was parsed (3 explicit + 1 auto-added from merge "a b" → "ab")
     try std.testing.expect(model.vocab_hash.count() == 4);
@@ -1763,27 +1519,14 @@ test "tokenizer_bpe_create_from_spec: parseVocabAndMerges with minimal valid JSO
     try std.testing.expect(model.pair_merges.count() == 1);
 }
 
-test "tokenizer_bpe_create_from_spec: parseVocabAndMerges with string format merges" {
+test "parseVocabAndMerges with string format merges" {
     const json =
         \\{"vocab": {"a": 0, "b": 1, "ab": 2}, "merges": ["a b"]}
     ;
     const allocator = std.testing.allocator;
 
-    var model = try create(allocator, json, false);
-    defer {
-        for (model.merge_added_tokens.items) |s| allocator.free(s);
-        model.merge_added_tokens.deinit(allocator);
-        model.vocab_hash.deinit(allocator);
-        model.merges.deinit(allocator);
-        model.pair_merges.deinit(allocator);
-        for (model.merge_strings.items) |s| allocator.free(s);
-        model.merge_strings.deinit(allocator);
-        allocator.free(model.id_to_token);
-        for (model.byte_to_unicode) |s| {
-            if (s.len > 0) allocator.free(s);
-        }
-        allocator.destroy(model);
-    }
+    const model = try create(allocator, json, false);
+    defer destroyTestJsonBpeModel(model);
 
     // Verify vocab
     try std.testing.expect(model.vocab_hash.count() == 3);
@@ -1795,26 +1538,14 @@ test "tokenizer_bpe_create_from_spec: parseVocabAndMerges with string format mer
     try std.testing.expect(rank.? == 0);
 }
 
-test "tokenizer_bpe_create_from_spec: parseVocabAndMerges without merges (SentencePiece style)" {
+test "parseVocabAndMerges without merges (SentencePiece style)" {
     const json =
         \\{"vocab": {"<unk>": 0, "a": 1, "b": 2}}
     ;
     const allocator = std.testing.allocator;
 
-    var model = try create(allocator, json, false);
-    defer {
-        model.merge_added_tokens.deinit(allocator);
-        model.vocab_hash.deinit(allocator);
-        model.merges.deinit(allocator);
-        model.pair_merges.deinit(allocator);
-        for (model.merge_strings.items) |s| allocator.free(s);
-        model.merge_strings.deinit(allocator);
-        allocator.free(model.id_to_token);
-        for (model.byte_to_unicode) |s| {
-            if (s.len > 0) allocator.free(s);
-        }
-        allocator.destroy(model);
-    }
+    const model = try create(allocator, json, false);
+    defer destroyTestJsonBpeModel(model);
 
     // Verify vocab was parsed
     try std.testing.expect(model.vocab_hash.count() == 3);
@@ -1826,36 +1557,14 @@ test "tokenizer_bpe_create_from_spec: parseVocabAndMerges without merges (Senten
     try std.testing.expect(model.unk_id == 0);
 }
 
-test "tokenizer_bpe_create_from_spec: parseVocabAndMerges with escaped characters" {
+test "parseVocabAndMerges with escaped characters" {
     const json =
         \\{"vocab": {"a": 0, "\"": 1, "\\": 2}, "merges": []}
     ;
     const allocator = std.testing.allocator;
 
-    var model = try create(allocator, json, false);
-    defer {
-        // Escaped characters ("\"", "\\") are allocated by unescapeJsonString
-        // and need to be freed. Simple "a" is borrowed.
-        for (model.id_to_token) |maybe_token| {
-            if (maybe_token) |token| {
-                // Check if this is an allocated string (escaped chars)
-                if (token.len > 0 and (token[0] == '"' or token[0] == '\\')) {
-                    allocator.free(token);
-                }
-            }
-        }
-        model.merge_added_tokens.deinit(allocator);
-        model.vocab_hash.deinit(allocator);
-        model.merges.deinit(allocator);
-        model.pair_merges.deinit(allocator);
-        for (model.merge_strings.items) |s| allocator.free(s);
-        model.merge_strings.deinit(allocator);
-        allocator.free(model.id_to_token);
-        for (model.byte_to_unicode) |s| {
-            if (s.len > 0) allocator.free(s);
-        }
-        allocator.destroy(model);
-    }
+    const model = try create(allocator, json, false);
+    defer destroyTestJsonBpeModel(model);
 
     // Verify escaped characters were parsed correctly
     try std.testing.expect(model.vocab_hash.count() == 3);
@@ -1864,117 +1573,21 @@ test "tokenizer_bpe_create_from_spec: parseVocabAndMerges with escaped character
     try std.testing.expect(model.vocab_hash.get("\\") != null);
 }
 
-test "tokenizer_bpe_create_from_spec: parseVocabAndMerges finds special tokens" {
+test "parseVocabAndMerges finds special tokens" {
     const json =
         \\{"vocab": {"<s>": 0, "</s>": 1, "a": 2}, "merges": []}
     ;
     const allocator = std.testing.allocator;
 
-    var model = try create(allocator, json, false);
-    defer {
-        model.merge_added_tokens.deinit(allocator);
-        model.vocab_hash.deinit(allocator);
-        model.merges.deinit(allocator);
-        model.pair_merges.deinit(allocator);
-        for (model.merge_strings.items) |s| allocator.free(s);
-        model.merge_strings.deinit(allocator);
-        allocator.free(model.id_to_token);
-        for (model.byte_to_unicode) |s| {
-            if (s.len > 0) allocator.free(s);
-        }
-        allocator.destroy(model);
-    }
+    const model = try create(allocator, json, false);
+    defer destroyTestJsonBpeModel(model);
 
     // Verify bos_id and eos_id were set
     try std.testing.expect(model.bos_id == 0);
     try std.testing.expect(model.eos_id == 1);
 }
 
-test "bpeEncode: findBestPair with single merge" {
-    const allocator = std.testing.allocator;
-    var merges = std.StringHashMapUnmanaged(i32){};
-    defer merges.deinit(allocator);
-
-    try merges.put(allocator, "a b", 0);
-
-    var scratch = std.ArrayListUnmanaged(u8){};
-    defer scratch.deinit(allocator);
-
-    const tokens = [_][]const u8{ "a", "b", "c" };
-
-    const result = try findBestPair(&tokens, &merges, &scratch, allocator);
-    try std.testing.expect(result != null);
-    try std.testing.expect(result.?.pos == 0);
-    try std.testing.expect(result.?.rank == 0);
-}
-
-test "bpeEncode: findBestPair with multiple merges chooses lowest rank" {
-    const allocator = std.testing.allocator;
-    var merges = std.StringHashMapUnmanaged(i32){};
-    defer merges.deinit(allocator);
-
-    try merges.put(allocator, "a b", 5);
-    try merges.put(allocator, "b c", 2);
-    try merges.put(allocator, "c d", 10);
-
-    var scratch = std.ArrayListUnmanaged(u8){};
-    defer scratch.deinit(allocator);
-
-    const tokens = [_][]const u8{ "a", "b", "c", "d" };
-
-    const result = try findBestPair(&tokens, &merges, &scratch, allocator);
-    try std.testing.expect(result != null);
-    try std.testing.expect(result.?.pos == 1); // "b c" has lowest rank (2)
-    try std.testing.expect(result.?.rank == 2);
-}
-
-test "bpeEncode: findBestPair returns null when no merges match" {
-    const allocator = std.testing.allocator;
-    var merges = std.StringHashMapUnmanaged(i32){};
-    defer merges.deinit(allocator);
-
-    try merges.put(allocator, "x y", 0);
-
-    var scratch = std.ArrayListUnmanaged(u8){};
-    defer scratch.deinit(allocator);
-
-    const tokens = [_][]const u8{ "a", "b", "c" };
-
-    const result = try findBestPair(&tokens, &merges, &scratch, allocator);
-    try std.testing.expect(result == null);
-}
-
-test "bpeEncode: findBestPair returns null for single token" {
-    const allocator = std.testing.allocator;
-    var merges = std.StringHashMapUnmanaged(i32){};
-    defer merges.deinit(allocator);
-
-    try merges.put(allocator, "a b", 0);
-
-    var scratch = std.ArrayListUnmanaged(u8){};
-    defer scratch.deinit(allocator);
-
-    const tokens = [_][]const u8{"a"};
-
-    const result = try findBestPair(&tokens, &merges, &scratch, allocator);
-    try std.testing.expect(result == null);
-}
-
-test "bpeEncode: findBestPair returns null for empty tokens" {
-    const allocator = std.testing.allocator;
-    var merges = std.StringHashMapUnmanaged(i32){};
-    defer merges.deinit(allocator);
-
-    var scratch = std.ArrayListUnmanaged(u8){};
-    defer scratch.deinit(allocator);
-
-    const tokens = [_][]const u8{};
-
-    const result = try findBestPair(&tokens, &merges, &scratch, allocator);
-    try std.testing.expect(result == null);
-}
-
-test "tokenizer_bpe_create_from_spec: initByteMap creates valid mappings" {
+test "initByteMap creates valid mappings" {
     const allocator = std.testing.allocator;
 
     // Create a minimal model for testing
@@ -2057,7 +1670,7 @@ test "tokenizer_bpe_create_from_spec: initByteMap creates valid mappings" {
     }
 }
 
-test "tokenizer_bpe_create_from_spec: initByteMap handles control characters with offset" {
+test "initByteMap handles control characters with offset" {
     const allocator = std.testing.allocator;
 
     var model = try allocator.create(BpeModel);

@@ -13,273 +13,15 @@ const postprocess = @import("postprocess.zig");
 const buffers = @import("encoding_buffers.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
-const log = @import("log_pkg");
+const added_tokens = @import("added_tokens.zig");
+const encode_accum = @import("encode_accum.zig");
 const parallel = @import("compute_pkg").parallel;
-const c = @cImport({
-    @cInclude("utf8proc.h");
-});
 
 const Allocator = types.Allocator;
 const Token = types.Token;
 const Normalized = types.Normalized;
 const Range = types.Range;
-
-// Added token span
-const AddedSpan = struct {
-    start: usize,
-    end: usize,
-    at: *const ct.AddedToken,
-};
-
-fn isAddedTokenWordByte(byte_value: u8) bool {
-    return std.ascii.isAlphabetic(byte_value) or std.ascii.isDigit(byte_value) or byte_value == '_';
-}
-
-fn isUtf8ContinuationByte(byte_value: u8) bool {
-    return (byte_value & 0xC0) == 0x80;
-}
-
-fn isUnicodeWhitespaceCodepoint(codepoint: c.utf8proc_int32_t) bool {
-    return switch (c.utf8proc_category(codepoint)) {
-        c.UTF8PROC_CATEGORY_ZS, c.UTF8PROC_CATEGORY_ZL, c.UTF8PROC_CATEGORY_ZP => true,
-        else => false,
-    };
-}
-
-fn whitespaceLenAt(input_bytes: []const u8, position: usize) usize {
-    if (position >= input_bytes.len) return 0;
-    const byte_value = input_bytes[position];
-    if (byte_value < 0x80) {
-        return if (std.ascii.isWhitespace(byte_value)) 1 else 0;
-    }
-
-    var codepoint: c.utf8proc_int32_t = 0;
-    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + position), @intCast(input_bytes.len - position), &codepoint);
-    if (consumed <= 0) return 0;
-    return if (isUnicodeWhitespaceCodepoint(codepoint)) @intCast(consumed) else 0;
-}
-
-fn isAddedTokenWordCodepoint(codepoint: c.utf8proc_int32_t) bool {
-    return switch (c.utf8proc_category(codepoint)) {
-        c.UTF8PROC_CATEGORY_LU,
-        c.UTF8PROC_CATEGORY_LL,
-        c.UTF8PROC_CATEGORY_LT,
-        c.UTF8PROC_CATEGORY_LM,
-        c.UTF8PROC_CATEGORY_LO,
-        c.UTF8PROC_CATEGORY_MN,
-        c.UTF8PROC_CATEGORY_MC,
-        c.UTF8PROC_CATEGORY_ME,
-        c.UTF8PROC_CATEGORY_ND,
-        c.UTF8PROC_CATEGORY_NL,
-        c.UTF8PROC_CATEGORY_NO,
-        => true,
-        else => false,
-    };
-}
-
-fn isAddedTokenWordAt(input_bytes: []const u8, position: usize) bool {
-    if (position >= input_bytes.len) return false;
-    const first_byte = input_bytes[position];
-    if (first_byte < 0x80) return isAddedTokenWordByte(first_byte);
-
-    var codepoint: c.utf8proc_int32_t = 0;
-    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + position), @intCast(input_bytes.len - position), &codepoint);
-    if (consumed <= 0) return false;
-    return isAddedTokenWordCodepoint(codepoint);
-}
-
-fn isAddedTokenWordBefore(input_bytes: []const u8, position: usize) bool {
-    if (position == 0) return false;
-
-    var start = position - 1;
-    while (start > 0 and isUtf8ContinuationByte(input_bytes[start])) : (start -= 1) {}
-
-    if (input_bytes[start] < 0x80) {
-        return isAddedTokenWordByte(input_bytes[start]);
-    }
-
-    var codepoint: c.utf8proc_int32_t = 0;
-    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + start), @intCast(input_bytes.len - start), &codepoint);
-    if (consumed <= 0 or start + @as(usize, @intCast(consumed)) != position) {
-        return false;
-    }
-    return isAddedTokenWordCodepoint(codepoint);
-}
-
-fn hasAddedTokenBoundary(input_bytes: []const u8, position: usize, content_len: usize) bool {
-    const left_boundary_ok = position == 0 or !isAddedTokenWordBefore(input_bytes, position);
-    const right_pos = position + content_len;
-    const right_boundary_ok = right_pos == input_bytes.len or !isAddedTokenWordAt(input_bytes, right_pos);
-    return left_boundary_ok and right_boundary_ok;
-}
-
-fn consumeAddedWhitespaceForward(input_bytes: []const u8, start: usize) usize {
-    var cursor = start;
-    while (cursor < input_bytes.len) {
-        const ws_len = whitespaceLenAt(input_bytes, cursor);
-        if (ws_len > 0) {
-            cursor += ws_len;
-            continue;
-        }
-        if (cursor + 3 <= input_bytes.len and
-            input_bytes[cursor] == 0xE2 and
-            input_bytes[cursor + 1] == 0x96 and
-            input_bytes[cursor + 2] == 0x81)
-        {
-            cursor += 3;
-            continue;
-        }
-        break;
-    }
-    return cursor;
-}
-
-fn leadingAsciiWhitespaceLen(input_bytes: []const u8) usize {
-    var cursor: usize = 0;
-    while (cursor < input_bytes.len) {
-        const ws_len = whitespaceLenAt(input_bytes, cursor);
-        if (ws_len == 0) break;
-        cursor += ws_len;
-    }
-    return cursor;
-}
-
-fn trailingAsciiWhitespaceStart(input_bytes: []const u8) usize {
-    var cursor = input_bytes.len;
-    while (cursor > 0) {
-        var start = cursor - 1;
-        while (start > 0 and isUtf8ContinuationByte(input_bytes[start])) : (start -= 1) {}
-        const ws_len = whitespaceLenAt(input_bytes, start);
-        if (ws_len == 0 or start + ws_len != cursor) break;
-        cursor = start;
-    }
-    return cursor;
-}
-
-fn findNormalizedCursorForSourceEnd(normalized: *const Normalized, start_cursor: usize, source_end: usize) usize {
-    if (source_end == 0) return start_cursor;
-    var cursor = start_cursor;
-    while (cursor < normalized.text.len and cursor < normalized.map_end.len) : (cursor += 1) {
-        const mapped_end = normalized.map_end[cursor];
-        if (mapped_end >= @as(i32, @intCast(source_end))) {
-            return cursor + 1;
-        }
-    }
-    return normalized.text.len;
-}
-
-// ============================================================================
-// ADDED TOKENS COLLECTION
-// ============================================================================
-
-fn matches_added_token_boundaries(added_token: *const ct.AddedToken, input_bytes: []const u8, position: usize) bool {
-    if (added_token.content == null) return false;
-    const content = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(added_token.content.?)), 0);
-    if (position + content.len > input_bytes.len) return false;
-    if (!std.mem.eql(u8, input_bytes[position..][0..content.len], content)) return false;
-
-    if (added_token.single_word != 0) {
-        if (!hasAddedTokenBoundary(input_bytes, position, content.len)) return false;
-    }
-    return true;
-}
-
-fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: *const Normalized, original_input: []const u8) ?std.ArrayListUnmanaged(AddedSpan) {
-    // Fast path: no added tokens → no spans possible.
-    // Skips the O(normalized.len × n_added) byte-by-byte walk.
-    if (tokenizer.added == null) {
-        return std.ArrayListUnmanaged(AddedSpan){};
-    }
-
-    var spans = std.ArrayListUnmanaged(AddedSpan){};
-
-    log.trace("tokenizer", "collect_added_spans", .{
-        .normalized_len = normalized.text.len,
-        .has_added_tokens = tokenizer.added != null,
-    }, @src());
-
-    var cursor: usize = 0;
-    while (cursor < normalized.text.len) {
-        var best_match: ?AddedSpan = null;
-        var best_span_len: usize = 0;
-
-        var added_iter = tokenizer.added;
-        while (added_iter) |added_token| {
-            if (added_token.content == null) {
-                added_iter = added_token.next;
-                continue;
-            }
-            const content = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(added_token.content.?)), 0);
-            if (content.len == 0) {
-                added_iter = added_token.next;
-                continue;
-            }
-
-            const text = if (added_token.normalized != 0) normalized.text else original_input;
-            const text_pos_opt: ?usize = if (added_token.normalized != 0) cursor else blk: {
-                // For non-normalized tokens, map back to original position
-                if (cursor < normalized.map.len and normalized.map[cursor] >= 0) {
-                    break :blk @as(usize, @intCast(normalized.map[cursor]));
-                }
-                // Position doesn't map to original (e.g., prepended chars) - skip
-                break :blk null;
-            };
-            if (text_pos_opt == null) {
-                added_iter = added_token.next;
-                continue;
-            }
-            const text_len = text.len;
-            const text_pos = text_pos_opt.?;
-            const content_pos = if (added_token.lstrip != 0) consumeAddedWhitespaceForward(text, text_pos) else text_pos;
-
-            if (content_pos + content.len > text_len) {
-                added_iter = added_token.next;
-                continue;
-            }
-            if (!std.mem.eql(u8, text[content_pos..][0..content.len], content)) {
-                added_iter = added_token.next;
-                continue;
-            }
-            if (!matches_added_token_boundaries(added_token, text, content_pos)) {
-                added_iter = added_token.next;
-                continue;
-            }
-            var text_end = content_pos + content.len;
-            if (added_token.rstrip != 0) {
-                text_end = consumeAddedWhitespaceForward(text, text_end);
-            }
-
-            const span_end = if (added_token.normalized != 0)
-                cursor + (text_end - text_pos)
-            else
-                findNormalizedCursorForSourceEnd(normalized, cursor, text_end);
-
-            const span = AddedSpan{
-                .start = cursor,
-                .end = span_end,
-                .at = added_token,
-            };
-            const span_len = span.end - span.start;
-            if (span_len > best_span_len) {
-                best_match = span;
-                best_span_len = span_len;
-            }
-            added_iter = added_token.next;
-        }
-
-        if (best_match) |matched| {
-            spans.append(Allocator, matched) catch {
-                spans.deinit(Allocator);
-                return null;
-            };
-            cursor = matched.end;
-        } else {
-            cursor += 1;
-        }
-    }
-
-    return spans;
-}
+const EncodeAccum = encode_accum.EncodeAccum;
 
 // ============================================================================
 // ENCODING
@@ -444,130 +186,11 @@ pub fn tokenizer_encoding_free_struct(encoding: *ct.TokenizerEncoding) void {
     encoding.* = std.mem.zeroes(ct.TokenizerEncoding);
 }
 
-/// Look up an added token's content string by ID.
-pub fn findAddedTokenContentById(tokenizer: *ct.Tokenizer, id: i32) ?[]const u8 {
-    var added_iter = tokenizer.added;
-    while (added_iter) |at| : (added_iter = at.next) {
-        if (at.id == id) {
-            if (at.content) |content_ptr| {
-                return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(content_ptr)), 0);
-            }
-        }
-    }
-    return null;
-}
-
-/// Accumulator for building token encoding results.
-/// Token strings are not tracked here — they are resolved lazily from IDs
-/// by consumers that need them (e.g. offset computation via idToToken).
-///
-/// Special token flags use a sparse representation: only positions where
-/// special == 1 are stored (typically 0-10 per input). This eliminates
-/// per-word zero-append overhead (161K appendNTimes calls for 1MB input).
-const EncodeAccum = struct {
-    ids: std.ArrayListUnmanaged(i32) = .{},
-    /// Sparse positions where special == 1 (added tokens only).
-    special_positions: std.ArrayListUnmanaged(u32) = .{},
-
-    fn deinit(self: *EncodeAccum) void {
-        self.special_positions.deinit(Allocator);
-        self.ids.deinit(Allocator);
-    }
-
-    fn appendAdded(self: *EncodeAccum, added_token: *const ct.AddedToken) !void {
-        if (added_token.special != 0) {
-            try self.special_positions.append(Allocator, @intCast(self.ids.items.len));
-        }
-        try self.ids.append(Allocator, added_token.id);
-    }
-
-    /// Append tokens from cached IDs (word cache hit path).
-    /// BPE-produced tokens are never special — no tracking needed.
-    fn appendCachedIds(self: *EncodeAccum, cached_ids: []const i32) !void {
-        try self.ids.appendSlice(Allocator, cached_ids);
-    }
-
-    fn appendEncoding(self: *EncodeAccum, encoding: *const ct.TokenizerEncoding, added_head: ?*ct.AddedToken) !void {
-        if (encoding.ids == null) return;
-        const ids_ptr: [*]i32 = @ptrCast(encoding.ids.?);
-
-        for (0..encoding.ids_len) |id_index| {
-            if (checkSpecial(added_head, ids_ptr[id_index]) != 0) {
-                try self.special_positions.append(Allocator, @intCast(self.ids.items.len));
-            }
-            try self.ids.append(Allocator, ids_ptr[id_index]);
-        }
-    }
-
-    fn checkSpecial(added_head: ?*ct.AddedToken, id: i32) i32 {
-        var added_iter = added_head;
-        while (added_iter) |token| : (added_iter = token.next) {
-            if (token.special != 0 and token.id == id) return 1;
-        }
-        return 0;
-    }
-
-    fn buildOutput(self: *EncodeAccum, out_encoding: *ct.TokenizerEncoding) !void {
-        const token_count = self.ids.items.len;
-        if (token_count == 0) {
-            out_encoding.* = std.mem.zeroes(ct.TokenizerEncoding);
-            return;
-        }
-
-        // Transfer ids ownership directly (avoids alloc + memcpy for the
-        // largest buffer). Allocate remaining buffers individually.
-        var buffers_out = buffers.Buffers{
-            .ids = try self.ids.toOwnedSlice(Allocator),
-            .tokens = &.{},
-            .attention_mask = &.{},
-            .type_ids = &.{},
-            .special = &.{},
-            .offsets = &.{},
-        };
-        errdefer buffers_out.deinit();
-
-        buffers_out.tokens = try Allocator.alloc([*c]u8, token_count);
-        @memset(buffers_out.tokens, null);
-        buffers_out.attention_mask = try Allocator.alloc(i32, token_count);
-        @memset(buffers_out.attention_mask, 1);
-        buffers_out.type_ids = try Allocator.alloc(i32, token_count);
-        @memset(buffers_out.type_ids, 0);
-        buffers_out.special = try Allocator.alloc(i32, token_count);
-        @memset(buffers_out.special, 0);
-        for (self.special_positions.items) |pos| {
-            buffers_out.special[pos] = 1;
-        }
-        buffers_out.offsets = try Allocator.alloc(ct.Offset, token_count);
-        @memset(std.mem.sliceAsBytes(buffers_out.offsets), 0);
-
-        buffers.initEncoding(out_encoding, &buffers_out, token_count, null, 0);
-
-        // ids ownership transferred via toOwnedSlice; just free sparse positions
-        self.special_positions.deinit(Allocator);
-        self.* = .{};
-    }
-};
-
 fn encodeLiteralBpeBytes(tokenizer: *ct.Tokenizer, bytes: []const u8, accumulator: *EncodeAccum) !void {
     if (bytes.len == 0 or tokenizer.type != .bpe) return;
     const model_ptr = tokenizer.model orelse return error.OutOfMemory;
     const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
     try model.encodeWordDirect(tokenizer, bytes, &accumulator.ids);
-}
-
-/// Check if input exactly matches an added token
-fn findExactAddedToken(tokenizer: *ct.Tokenizer, input: []const u8) ?*const ct.AddedToken {
-    var added_iter = tokenizer.added;
-    while (added_iter) |added_token| {
-        if (added_token.content) |content_ptr| {
-            const content = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(content_ptr)), 0);
-            if (std.mem.eql(u8, content, input)) {
-                return added_token;
-            }
-        }
-        added_iter = added_token.next;
-    }
-    return null;
 }
 
 fn encode_internal(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.TokenizerEncoding, apply_postprocess: bool) c_int {
@@ -617,7 +240,7 @@ fn encode_internal_impl(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.To
     }
 
     // This prevents SentencePiece prepend from affecting special tokens like </s>
-    if (findExactAddedToken(tokenizer, input)) |at| {
+    if (added_tokens.findExact(tokenizer, input)) |at| {
         var accum = EncodeAccum{};
         errdefer accum.deinit();
         try accum.appendAdded(at);
@@ -657,7 +280,7 @@ fn encode_internal_impl(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.To
 
 fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *const Normalized, out: *ct.TokenizerEncoding) !void {
     // Step 2: Collect added token spans
-    var spans = collect_added_spans(tokenizer, normalized, input) orelse return error.OutOfMemory;
+    var spans = added_tokens.collectSpans(Allocator, tokenizer, normalized, input) orelse return error.OutOfMemory;
     defer spans.deinit(Allocator);
 
     // Step 3: Encode segments
@@ -695,7 +318,7 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
         // Handle added token spans
         if (span_index < spans.items.len and cursor == spans.items[span_index].start) {
             const added_span = spans.items[span_index];
-            try accum.appendAdded(added_span.at);
+            try accum.appendAdded(added_span.token);
             cursor = added_span.end;
             span_index += 1;
             // Re-arm prepend for the next non-special segment: SentencePiece
@@ -716,7 +339,7 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
         var segment_end: usize = segment.len;
 
         if (preserve_literal_gap_whitespace and previous_was_added) {
-            const leading_ws_len = leadingAsciiWhitespaceLen(segment);
+            const leading_ws_len = added_tokens.leadingWhitespaceLen(segment);
             if (leading_ws_len > 0) {
                 try encodeLiteralBpeBytes(tokenizer, segment[0..leading_ws_len], &accum);
                 segment_start = leading_ws_len;
@@ -724,7 +347,7 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
         }
 
         if (preserve_literal_gap_whitespace and span_index < spans.items.len) {
-            const trailing_ws_start = trailingAsciiWhitespaceStart(segment[segment_start..]) + segment_start;
+            const trailing_ws_start = added_tokens.trailingWhitespaceStart(segment[segment_start..]) + segment_start;
             if (trailing_ws_start < segment_end) {
                 segment_end = trailing_ws_start;
             }
@@ -795,7 +418,8 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
 
     // Regex pretokenizers can emit very long single tokens (e.g. 8k spaces).
     // Overlap dedup is only safe when token runs are shorter than overlap.
-    // Keep parallelism for normal inputs, fall back to sequential on risky runs.
+    // Keep parallelism for normal inputs; route risky runs through the
+    // sequential path where ownership does not depend on overlap windows.
     const regex_parallel_risky = blk: {
         if (tokenizer.pretokenizer.re == null) break :blk false;
         var current_class: u8 = 255;
@@ -1001,7 +625,7 @@ fn processChunk(ctx: *ChunkContext, chunk_idx: usize) void {
     for (words, ranges, 0..) |token_item, range, token_index| {
         // Overlap dedup is only correct when every token fully fits inside
         // the overlap window; otherwise ownership-by-start can drop or
-        // duplicate bytes across chunk boundaries. Signal fallback.
+        // duplicate bytes across chunk boundaries. Request sequential retry.
         if (range.end > range.start and (range.end - range.start) > overlap_bytes) {
             ctx.had_oversized_token.store(true, .release);
             return;
@@ -1259,7 +883,7 @@ fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiec
         }
     }
 
-    // Fallback for non-BPE models: go through TokenizerEncoding
+    // Non-BPE models go through their TokenizerEncoding vtable path.
     var encoding = std.mem.zeroes(ct.TokenizerEncoding);
     defer tokenizer_encoding_free_struct(&encoding);
 
@@ -1303,7 +927,7 @@ fn encodeCombined(
         total_len += token_item.len;
     }
 
-    // Stack buffer with heap fallback
+    // Use stack storage for normal segments and heap storage for larger ones.
     var stack_buf: [4096]u8 = undefined;
     var heap_buf: ?[]u8 = null;
     defer if (heap_buf) |hb| Allocator.free(hb);
@@ -1404,10 +1028,6 @@ pub const EncodeOptions = struct {
     add_special_tokens: ?bool = null,
 };
 
-pub fn tokenizer_encode_struct(tokenizer_handle: *ct.Tokenizer, input: []const u8, out: *ct.TokenizerEncoding) c_int {
-    return tokenizer_encode_struct_with_options(tokenizer_handle, input, out, .{});
-}
-
 /// Encode with options (thread-safe - does not mutate tokenizer state).
 pub fn tokenizer_encode_struct_with_options(
     tokenizer_handle: *ct.Tokenizer,
@@ -1477,36 +1097,7 @@ fn tokenizer_encode_pair_struct_with_options(
 // Tests
 // =============================================================================
 
-// Note: Most encoding functions (encode_internal, encodeNormalized, encodeSegment, etc.)
-// require full tokenizer context with vocab, added tokens, and model state.
-// They are tested via integration tests in tests/tokenizer/.
-
-test "EncodeAccum appendAdded adds token" {
-    var accum = EncodeAccum{};
-    defer accum.deinit();
-
-    // Use a mutable buffer since AddedToken.content expects ?*u8
-    var content_buf = [_]u8{ 't', 'e', 's', 't' };
-    var added = ct.AddedToken{
-        .content = @ptrCast(&content_buf),
-        .id = 123,
-        .special = 1,
-        .single_word = 0,
-        .lstrip = 0,
-        .rstrip = 0,
-        .normalized = 0,
-        .next = null,
-    };
-
-    try accum.appendAdded(&added);
-
-    try std.testing.expectEqual(@as(usize, 1), accum.ids.items.len);
-    try std.testing.expectEqual(@as(i32, 123), accum.ids.items[0]);
-    try std.testing.expectEqual(@as(usize, 1), accum.special_positions.items.len);
-    try std.testing.expectEqual(@as(u32, 0), accum.special_positions.items[0]);
-}
-
-test "tokenizer collect_added_spans matches single_word token at punctuation boundary" {
+test "tokenizer collectSpans matches single_word token at punctuation boundary" {
     var normalized = Normalized{
         .text = try Allocator.dupe(u8, "cat."),
         .map = try Allocator.dupe(i32, &[_]i32{ 0, 1, 2, 3 }),
@@ -1528,7 +1119,7 @@ test "tokenizer collect_added_spans matches single_word token at punctuation bou
     var tokenizer = std.mem.zeroes(ct.Tokenizer);
     tokenizer.added = &added;
 
-    var spans = collect_added_spans(&tokenizer, &normalized, "cat.") orelse return error.OutOfMemory;
+    var spans = added_tokens.collectSpans(Allocator, &tokenizer, &normalized, "cat.") orelse return error.OutOfMemory;
     defer spans.deinit(Allocator);
 
     try std.testing.expectEqual(@as(usize, 1), spans.items.len);
@@ -1536,7 +1127,7 @@ test "tokenizer collect_added_spans matches single_word token at punctuation bou
     try std.testing.expectEqual(@as(usize, 3), spans.items[0].end);
 }
 
-test "tokenizer collect_added_spans expands lstrip to include leading whitespace" {
+test "tokenizer collectSpans expands lstrip to include leading whitespace" {
     var normalized = Normalized{
         .text = try Allocator.dupe(u8, " \t\n[MID]x"),
         .map = try Allocator.dupe(i32, &[_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8 }),
@@ -1558,7 +1149,7 @@ test "tokenizer collect_added_spans expands lstrip to include leading whitespace
     var tokenizer = std.mem.zeroes(ct.Tokenizer);
     tokenizer.added = &added;
 
-    var spans = collect_added_spans(&tokenizer, &normalized, " \t\n[MID]x") orelse return error.OutOfMemory;
+    var spans = added_tokens.collectSpans(Allocator, &tokenizer, &normalized, " \t\n[MID]x") orelse return error.OutOfMemory;
     defer spans.deinit(Allocator);
 
     try std.testing.expectEqual(@as(usize, 1), spans.items.len);
@@ -1566,7 +1157,7 @@ test "tokenizer collect_added_spans expands lstrip to include leading whitespace
     try std.testing.expectEqual(@as(usize, 8), spans.items[0].end);
 }
 
-test "tokenizer collect_added_spans does not match normalized false token on normalized-only text" {
+test "tokenizer collectSpans does not match normalized false token on normalized-only text" {
     var normalized = Normalized{
         .text = try Allocator.dupe(u8, "hello"),
         .map = try Allocator.dupe(i32, &[_]i32{ 0, 1, 2, 3, 4 }),
@@ -1588,13 +1179,13 @@ test "tokenizer collect_added_spans does not match normalized false token on nor
     var tokenizer = std.mem.zeroes(ct.Tokenizer);
     tokenizer.added = &added;
 
-    var spans = collect_added_spans(&tokenizer, &normalized, "HELLO") orelse return error.OutOfMemory;
+    var spans = added_tokens.collectSpans(Allocator, &tokenizer, &normalized, "HELLO") orelse return error.OutOfMemory;
     defer spans.deinit(Allocator);
 
     try std.testing.expectEqual(@as(usize, 0), spans.items.len);
 }
 
-test "tokenizer collect_added_spans does not match single_word token inside unicode letters" {
+test "tokenizer collectSpans does not match single_word token inside unicode letters" {
     const allocator = std.testing.allocator;
     const content: [:0]const u8 = "cat";
 
@@ -1616,7 +1207,7 @@ test "tokenizer collect_added_spans does not match single_word token inside unic
         var normalized = try normalize.normalize_text(&normalizer, input);
         defer normalized.deinit();
 
-        var spans = collect_added_spans(&tokenizer, &normalized, input) orelse return error.OutOfMemory;
+        var spans = added_tokens.collectSpans(Allocator, &tokenizer, &normalized, input) orelse return error.OutOfMemory;
         defer spans.deinit(allocator);
 
         try std.testing.expectEqual(@as(usize, 0), spans.items.len);
@@ -1696,21 +1287,4 @@ test "truncateEncoding reduces encoding length" {
     truncateEncoding(&encoding, 3);
 
     try std.testing.expectEqual(@as(usize, 3), encoding.ids_len);
-}
-
-test "tokenizer_encode_struct requires integration testing" {
-    // This function requires a fully initialized tokenizer with:
-    // - Loaded vocabulary and model (BPE/WordPiece/Unigram)
-    // - Normalizer configuration
-    // - Pretokenizer with compiled regex patterns
-    // - Post-processor for special token handling
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_encode_struct_with_options requires integration testing" {
-    // This function requires a fully initialized tokenizer with:
-    // - Complete tokenizer context (vocab, model, normalizer, pretokenizer)
-    // - Support for encoding options (add_special_tokens override)
-    // - Thread-safe operation
-    // Integration tests: tests/tokenizer/test_*.py
 }

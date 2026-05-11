@@ -5,8 +5,10 @@
 
 const std = @import("std");
 const ct = @import("c_types.zig");
-const decoders = @import("decoders.zig");
+const schema = @import("schema.zig");
+const added_tokens = @import("added_tokens.zig");
 const encode = @import("encode.zig");
+const model_helpers = @import("model_helpers.zig");
 const utils = @import("utils.zig");
 
 const tok_fns = @import("pipeline.zig");
@@ -45,14 +47,6 @@ const SpPiece = struct {
     ptype: i32 = 0, // 0 normal, 1 unk, 2 bos, 3 eos
 };
 
-fn setUnkToken(model: *UnigramModel, token: []const u8) void {
-    utils.setUnkToken(&model.unk_token, token);
-}
-
-fn unkSlice(model: *const UnigramModel) []const u8 {
-    return utils.unkSlice(&model.unk_token);
-}
-
 fn initModel(allocator: std.mem.Allocator) !*UnigramModel {
     const model = try allocator.create(UnigramModel);
     model.* = .{
@@ -67,11 +61,15 @@ fn initModel(allocator: std.mem.Allocator) !*UnigramModel {
         .unk_entry = null,
         .owner = null,
     };
-    setUnkToken(model, DEFAULT_UNK);
+    utils.setUnkToken(&model.unk_token, DEFAULT_UNK);
     return model;
 }
 
 fn addEntry(model: *UnigramModel, token: []const u8, score: f32, id: i32) !void {
+    if (id < 0) return error.InvalidId;
+    if (token.len == 0 or std.mem.indexOfScalar(u8, token, 0) != null) return error.InvalidVocab;
+    if (findEntry(model, token) != null or findEntryById(model, id) != null) return error.InvalidVocab;
+
     const dup = try model.allocator.dupeZ(u8, token);
     errdefer model.allocator.free(dup);
     try model.vocab.append(model.allocator, .{
@@ -99,8 +97,7 @@ fn findEntryById(model: *UnigramModel, id: i32) ?*UniEntry {
 }
 
 fn allocIdToToken(model: *UnigramModel, size: usize) !void {
-    model.id_to_token = try model.allocator.alloc(?[*:0]u8, size);
-    for (model.id_to_token) |*slot| slot.* = null;
+    model.id_to_token = try model_helpers.allocIdToToken(model.allocator, size);
     model.vocab_size = size;
 }
 
@@ -152,10 +149,6 @@ fn skipField(data: []const u8, pos: *usize, wire: u3) !void {
         },
         else => return error.BadWire,
     }
-}
-
-fn outAllocator() std.mem.Allocator {
-    return std.heap.c_allocator;
 }
 
 fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) !EncodedWord {
@@ -219,7 +212,7 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
         const token_len = best_len[pos];
 
         if (unk_entry != null and entry == unk_entry.? and token_len == 1) {
-            // Fuse consecutive fallback unknown bytes into a single <unk> run.
+            // Fuse consecutive unknown bytes into a single <unk> run.
             const run_start = pos;
             var run_end = pos + token_len;
             while (run_end < len and best_entry[run_end] != null) {
@@ -424,17 +417,17 @@ fn unigram_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: us
 
         // Check if this is a special token (skip if requested)
         if (options.skip_special_tokens) {
-            if (isSpecialToken(tokenizer, id)) continue;
+            if (model_helpers.isAddedSpecialToken(tokenizer, id)) continue;
         }
 
         const token_slice = blk: {
-            if (encode.findAddedTokenContentById(tokenizer, id)) |content| {
+            if (added_tokens.findContentById(tokenizer, id)) |content| {
                 break :blk content;
             }
             if (id >= 0 and @as(usize, @intCast(id)) < model.id_to_token.len and model.id_to_token[@as(usize, @intCast(id))] != null) {
                 break :blk std.mem.sliceTo(model.id_to_token[@as(usize, @intCast(id))].?, 0);
             }
-            break :blk unkSlice(model);
+            break :blk utils.unkSlice(&model.unk_token);
         };
 
         // Replace ▁ (U+2581) with space, copy everything else as-is
@@ -474,15 +467,6 @@ fn unigram_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: us
     return 0;
 }
 
-fn isSpecialToken(tokenizer: *ct.Tokenizer, id: i32) bool {
-    var cur = tokenizer.added;
-    while (cur) |node| {
-        if (node.id == id and node.special != 0) return true;
-        cur = node.next;
-    }
-    return false;
-}
-
 fn unigram_destroy(tokenizer: *ct.Tokenizer) void {
     if (tokenizer.model == null) return;
     const model = @as(*UnigramModel, @ptrCast(@alignCast(tokenizer.model.?)));
@@ -506,70 +490,68 @@ fn initTokenizer() !*ct.Tokenizer {
     return tokenizer;
 }
 
-fn attachPretokenizer(tokenizer: *ct.Tokenizer) !void {
-    if (tok_fns.tokenizer_pretokenizer_set(&tokenizer.pretokenizer, UNIGRAM_PATTERN.ptr) != 0) {
-        tok_fns.tokenizer_set_error(tokenizer, "Failed to compile Unigram regex");
-        return error.PretokenizerInitFailed;
-    }
-}
-
-pub fn tokenizer_unigram_create_from_spec(spec: ?*const ct.UnigramModelSpec) ?*ct.Tokenizer {
-    if (spec == null or spec.?.vocab == null or spec.?.vocab_len == 0) return null;
-    const allocator = std.heap.c_allocator;
-    var tokenizer = initTokenizer() catch return null;
-    errdefer allocator.destroy(tokenizer);
-
-    var model = initModel(allocator) catch {
-        allocator.destroy(tokenizer);
-        return null;
-    };
-    tokenizer.model = model;
-    model.owner = tokenizer;
-
-    attachPretokenizer(tokenizer) catch {
-        unigram_destroy(tokenizer);
-        allocator.destroy(tokenizer);
-        return null;
-    };
-
+fn buildFromVocab(
+    model: *UnigramModel,
+    vocab: []const schema.TokenId,
+    unk_token: ?[]const u8,
+    bos_token: ?[]const u8,
+    eos_token: ?[]const u8,
+) !void {
+    if (vocab.len == 0) return error.IncompleteSpec;
     var max_id: usize = 0;
-    const vocab_ptr: [*]const ct.UnigramVocabEntry = @ptrCast(spec.?.vocab.?);
-    const vocab = vocab_ptr[0..spec.?.vocab_len];
     for (vocab) |entry| {
-        if (entry.token == null) continue;
-        const token_ptr: [*:0]const u8 = @ptrCast(entry.token.?);
-        const tok_slice = std.mem.sliceTo(token_ptr, 0);
-        addEntry(model, tok_slice, entry.score, entry.id) catch continue;
+        if (entry.id < 0) return error.InvalidVocab;
+        try addEntry(model, entry.token, entry.score, entry.id);
         const next = @as(usize, @intCast(entry.id)) + 1;
         if (next > max_id) max_id = next;
     }
-    if (max_id == 0) {
-        tok_fns.tokenizer_set_error(tokenizer, "Incomplete Unigram specification");
-        unigram_destroy(tokenizer);
-        allocator.destroy(tokenizer);
-        return null;
-    }
-    allocIdToToken(model, max_id) catch {
-        tok_fns.tokenizer_set_error(tokenizer, "Allocation failure");
-        unigram_destroy(tokenizer);
-        allocator.destroy(tokenizer);
-        return null;
-    };
+    if (max_id == 0) return error.IncompleteSpec;
+    try allocIdToToken(model, max_id);
     populateIdToToken(model);
 
-    if (spec.?.unk_token) |u| {
-        const unk_ptr: [*:0]const u8 = @ptrCast(u);
-        setUnkToken(model, std.mem.sliceTo(unk_ptr, 0));
-        if (findEntry(model, std.mem.sliceTo(unk_ptr, 0))) |e| model.unk_id = e.id;
+    if (unk_token) |unk| {
+        utils.setUnkToken(&model.unk_token, unk);
+        if (findEntry(model, unk)) |entry| model.unk_id = entry.id;
     }
-    if (spec.?.bos_token) |u| {
-        const bos_ptr: [*:0]const u8 = @ptrCast(u);
-        if (findEntry(model, std.mem.sliceTo(bos_ptr, 0))) |e| model.bos_id = e.id;
+    if (bos_token) |bos| {
+        if (findEntry(model, bos)) |entry| model.bos_id = entry.id;
     }
-    if (spec.?.eos_token) |u| {
-        const eos_ptr: [*:0]const u8 = @ptrCast(u);
-        if (findEntry(model, std.mem.sliceTo(eos_ptr, 0))) |e| model.eos_id = e.id;
+    if (eos_token) |eos| {
+        if (findEntry(model, eos)) |entry| model.eos_id = entry.id;
     }
+}
+
+pub fn createUnigramTokenizer(
+    vocab: []const schema.TokenId,
+    unk_token: ?[]const u8,
+    bos_token: ?[]const u8,
+    eos_token: ?[]const u8,
+) !*ct.Tokenizer {
+    const allocator = std.heap.c_allocator;
+    const tokenizer = try initTokenizer();
+    errdefer tok_fns.tokenizer_free(tokenizer);
+
+    const model = try initModel(allocator);
+    tokenizer.model = model;
+    model.owner = tokenizer;
+
+    try model_helpers.attachRegexPretokenizer(tokenizer, UNIGRAM_PATTERN, "Failed to compile Unigram regex");
+
+    buildFromVocab(model, vocab, unk_token, bos_token, eos_token) catch |err| switch (err) {
+        error.InvalidVocab => {
+            tok_fns.tokenizer_set_error(tokenizer, "Invalid Unigram vocabulary entry");
+            return err;
+        },
+        error.IncompleteSpec => {
+            tok_fns.tokenizer_set_error(tokenizer, "Incomplete Unigram specification");
+            return err;
+        },
+        error.OutOfMemory => {
+            tok_fns.tokenizer_set_error(tokenizer, "Allocation failure");
+            return err;
+        },
+        else => return err,
+    };
 
     return tokenizer;
 }
@@ -580,10 +562,6 @@ pub fn tokenizer_unigram_create_from_spec(spec: ?*const ct.UnigramModelSpec) ?*c
 
 pub fn unigramEncode(tokenizer: *ct.Tokenizer, input: []const u8, enc: *ct.TokenizerEncoding) c_int {
     return unigram_encode(tokenizer, input, enc);
-}
-
-pub fn unigramDecode(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-    return unigram_decode_impl(tokenizer, ids, ids_len, out, out_len, .{});
 }
 
 pub fn unigramDecodeWithOptions(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
@@ -597,10 +575,6 @@ pub fn unigramDestroy(tokenizer: *ct.Tokenizer) void {
 // =============================================================================
 // Tests
 // =============================================================================
-
-// Note: Most unigram functions (encodeWord, unigram_encode, unigram_decode, etc.)
-// require full model context with vocab, scores, and tokenizer state.
-// They are tested via integration tests in tests/tokenizer/.
 
 test "setUnkToken copies token to buffer" {
     var model = UnigramModel{
@@ -616,8 +590,8 @@ test "setUnkToken copies token to buffer" {
         .owner = null,
     };
 
-    setUnkToken(&model, "<unk>");
-    const result = unkSlice(&model);
+    utils.setUnkToken(&model.unk_token, "<unk>");
+    const result = utils.unkSlice(&model.unk_token);
     try std.testing.expectEqualStrings("<unk>", result);
 }
 
@@ -647,22 +621,34 @@ test "initModel creates empty model" {
     defer allocator.destroy(model);
 
     try std.testing.expectEqual(@as(usize, 0), model.vocab.items.len);
-    try std.testing.expectEqualStrings(DEFAULT_UNK, unkSlice(model));
+    try std.testing.expectEqualStrings(DEFAULT_UNK, utils.unkSlice(&model.unk_token));
 }
 
-test "unigramEncode requires integration testing" {
-    // This function requires:
-    // - Fully initialized Unigram model with vocab and scores
-    // - Viterbi algorithm for optimal segmentation
-    // - BOS/EOS token handling
-    // Integration tests: tests/tokenizer/test_*.py
+test "createUnigramTokenizer builds tokenizer from schema vocab" {
+    const vocab = [_]schema.TokenId{
+        .{ .token = "<unk>", .id = 0, .score = 0.0 },
+        .{ .token = "<s>", .id = 1, .score = -1.0 },
+        .{ .token = "hello", .id = 2, .score = -2.0 },
+        .{ .token = "</s>", .id = 3, .score = -1.0 },
+    };
+
+    const tokenizer = try createUnigramTokenizer(&vocab, "<unk>", "<s>", "</s>");
+    defer tok_fns.tokenizer_free(tokenizer);
+
+    try std.testing.expectEqual(ct.ModelType.unigram, tokenizer.type);
+    try std.testing.expectEqual(@as(usize, 4), tokenizer.getVocabSize());
+    try std.testing.expectEqual(@as(i32, 2), tokenizer.tokenToId("hello").?);
+    try std.testing.expectEqual(@as(i32, 0), tokenizer.getUnkId());
+    try std.testing.expectEqual(@as(i32, 1), tokenizer.getBosId());
+
+    const model: *const UnigramModel = @ptrCast(@alignCast(tokenizer.model.?));
+    try std.testing.expectEqual(@as(i32, 3), model.eos_id);
+    try std.testing.expectEqualStrings("<unk>", utils.unkSlice(&model.unk_token));
 }
 
-test "unigramDecode requires integration testing" {
-    // This function requires:
-    // - Complete Unigram model with id_to_token mapping
-    // - Token reconstruction from IDs
-    // Integration tests: tests/tokenizer/test_*.py
+test "createUnigramTokenizer rejects empty vocab" {
+    const vocab = [_]schema.TokenId{};
+    try std.testing.expectError(error.IncompleteSpec, createUnigramTokenizer(&vocab, null, null, null));
 }
 
 test "unigramDecodeWithOptions decodes token IDs to text" {
@@ -784,21 +770,6 @@ test "unigramDecodeWithOptions retains added special token text when requested" 
     defer allocator.free(out[0 .. out_len + 1]);
 
     try std.testing.expectEqualStrings("<s> hello world", out[0..out_len]);
-}
-
-test "unigramDestroy requires integration testing" {
-    // This function requires:
-    // - Fully allocated Unigram model
-    // - Proper cleanup of vocab, strings, and mappings
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "tokenizer_unigram_create_from_spec requires integration testing" {
-    // This function requires:
-    // - Complete UnigramModelSpec with vocab entries
-    // - Model initialization and vocab setup
-    // - Pretokenizer attachment with regex pattern
-    // Integration tests: tests/tokenizer/test_*.py
 }
 
 test "addEntry adds vocab entry and updates vocab_size" {

@@ -204,13 +204,6 @@ fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const
     errdefer result.deinit();
 
     if (pretokenizer) |p| {
-        log.trace("tokenizer", "pretokenize", .{
-            .input_len = input.len,
-            .byte_level = p.byte_level,
-            .regex_split = p.regex_split,
-            .regex_invert = p.regex_invert,
-        }, @src());
-
         if (p.metaspace != 0 and p.re == null) {
             // Metaspace: replace spaces with ▁, then split on word boundaries
             try splitMetaspace(&result, input, base_offset, p.add_prefix_space != 0);
@@ -346,7 +339,7 @@ fn splitByGpt2Fast(result: *PretokenizeResult, input: []const u8, base_offset: u
     while (cursor < input.len) {
         const ch = input[cursor];
 
-        // Non-ASCII: fall back to PCRE2 for one match
+        // Non-ASCII is delegated to PCRE2 so Unicode classes stay authoritative.
         if (ch >= 0x80) {
             if (match_data == null) {
                 match_data = pcre2_match_data_create_from_pattern(regex_code) orelse return error.OutOfMemory;
@@ -648,10 +641,6 @@ fn pretokenize_sequence(pretokenizer: *const ct.PreTokenizer, input: []const u8,
 // Tests
 // =============================================================================
 
-// Note: pretokenize_single, pretokenize_sequence, and splitByRegex require
-// full tokenizer context and PCRE2 regex engine. They are tested via
-// integration tests in tests/tokenizer/.
-
 test "isPunctuation recognizes punctuation chars" {
     try std.testing.expect(isPunctuation('!'));
     try std.testing.expect(isPunctuation('.'));
@@ -770,20 +759,6 @@ test "tokenizer_pretokenizer_set handles null pattern" {
     var pretok = std.mem.zeroes(ct.PreTokenizer);
     const result = tokenizer_pretokenizer_set(&pretok, null);
     try std.testing.expectEqual(@as(c_int, 0), result);
-}
-
-test "pretokenize requires integration testing" {
-    // This function requires a fully initialized pretokenizer with:
-    // - Compiled PCRE2 regex patterns
-    // - Proper byte-level encoding support
-    // - Complete tokenizer context
-    // Integration tests: tests/tokenizer/test_*.py
-}
-
-test "pretokenize requires integration testing 2" {
-    // GPT-4 regex \p{N}{1,3} is greedy: "2025" → "202" + "5" in PCRE2.
-    // HuggingFace fancy-regex produces "20" + "25" (possibly different semantics).
-    // This difference is tracked as a known issue for granite-4.0-h-1B.
 }
 
 test "matchContraction matches valid suffixes" {

@@ -4,6 +4,10 @@
 
 const std = @import("std");
 
+const c = @cImport({
+    @cInclude("utf8proc.h");
+});
+
 // =============================================================================
 // UTF-8 Encoding/Decoding
 // =============================================================================
@@ -40,6 +44,30 @@ pub fn utf8Decode(byte_values: []const u8, idx: *usize) i32 {
 /// Get the byte length of a UTF-8 character from its first byte
 pub fn utf8CharLen(first_byte: u8) usize {
     return std.unicode.utf8ByteSequenceLength(first_byte) catch 1;
+}
+
+pub fn isUtf8ContinuationByte(byte_value: u8) bool {
+    return (byte_value & 0xC0) == 0x80;
+}
+
+pub fn whitespaceLenAt(input_bytes: []const u8, position: usize) usize {
+    if (position >= input_bytes.len) return 0;
+    const byte_value = input_bytes[position];
+    if (byte_value < 0x80) {
+        return if (std.ascii.isWhitespace(byte_value)) 1 else 0;
+    }
+
+    var codepoint: c.utf8proc_int32_t = 0;
+    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + position), @intCast(input_bytes.len - position), &codepoint);
+    if (consumed <= 0) return 0;
+    return if (isUnicodeWhitespaceCodepoint(codepoint)) @intCast(consumed) else 0;
+}
+
+fn isUnicodeWhitespaceCodepoint(codepoint: c.utf8proc_int32_t) bool {
+    return switch (c.utf8proc_category(codepoint)) {
+        c.UTF8PROC_CATEGORY_ZS, c.UTF8PROC_CATEGORY_ZL, c.UTF8PROC_CATEGORY_ZP => true,
+        else => false,
+    };
 }
 
 /// GPT-2 byte-to-unicode mapping: converts a byte to its unicode code_point
@@ -154,7 +182,7 @@ test "findJsonSection ignores key text inside string values" {
 
 /// GPT-2 style byte-to-unicode mapping table
 /// Maps each byte (0-255) to a Unicode code_point that represents it
-pub const ByteMapping = struct {
+const ByteMapping = struct {
     /// Forward mapping: byte -> unicode code_point (as UTF-8 string)
     byte_to_unicode: [256][]const u8,
     /// Reverse mapping: unicode code_point -> original byte
@@ -344,7 +372,7 @@ test "utf8CharLen - multi-byte characters" {
 }
 
 test "utf8CharLen - invalid UTF-8 sequences" {
-    // Invalid UTF-8 start bytes should return 1 (fallback)
+    // Invalid UTF-8 start bytes are consumed one byte at a time.
     try std.testing.expectEqual(@as(usize, 1), utf8CharLen(0xFF));
     try std.testing.expectEqual(@as(usize, 1), utf8CharLen(0xFE));
     try std.testing.expectEqual(@as(usize, 1), utf8CharLen(0x80)); // continuation byte

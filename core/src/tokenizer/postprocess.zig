@@ -120,11 +120,6 @@ fn postprocess_single_impl(postprocessor: *const ct.PostProcessor, encoding: *ct
 // Tests
 // =============================================================================
 
-// Note: postprocess_single_impl is complex and requires full tokenizer context
-// including buffers allocation. It is primarily tested via integration tests
-// in tests/tokenizer/. The postprocess_single wrapper is unit-testable for
-// error handling.
-
 test "tokenizer_apply_postprocessor_spec sets options" {
     var tok = ct.Tokenizer{
         .model = null,
