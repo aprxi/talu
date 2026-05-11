@@ -13,6 +13,7 @@ pub const registry = @import("registry.zig");
 pub const layer_ops = @import("layer_ops.zig");
 pub const op_types = @import("op_types.zig");
 pub const perf_hints = @import("perf_hints.zig");
+pub const manifest = @import("manifest.zig");
 pub const runtime_blocks = @import("runtime_blocks.zig");
 pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");

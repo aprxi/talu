@@ -139,6 +139,14 @@ pub const SafeTensors = struct {
         dtype: DType,
         shape: []usize,
         data: []const u8,
+        byte_count: usize,
+    };
+
+    pub const TensorMetadata = struct {
+        name: []const u8,
+        dtype: DType,
+        shape: []const usize,
+        byte_count: usize,
     };
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !SafeTensors {
@@ -203,18 +211,17 @@ pub const SafeTensors = struct {
                 allocator.free(shape);
                 continue;
             };
-            const start = safetensors.data_start + offsets[0];
-            const end = safetensors.data_start + offsets[1];
-            if (start > end or end > mapped_buffer.mapped_data.len) {
+            const range = resolveDataRange(safetensors.data_start, mapped_buffer.mapped_data.len, offsets) orelse {
                 allocator.free(shape);
                 continue;
-            }
+            };
 
             const stored_name = try allocator.dupe(u8, tensor_name);
             try safetensors.entries.put(allocator, stored_name, .{
                 .dtype = entry_dtype,
                 .shape = shape,
-                .data = mapped_buffer.mapped_data[start..end],
+                .data = mapped_buffer.mapped_data[range.start..range.end],
+                .byte_count = range.byte_count,
             });
         }
 
@@ -272,6 +279,16 @@ pub const SafeTensors = struct {
         }
 
         return tensor_view;
+    }
+
+    pub fn getTensorMetadata(self: *const SafeTensors, name: []const u8) !TensorMetadata {
+        const tensor_entry = self.entries.get(name) orelse return error.NotFound;
+        return .{
+            .name = name,
+            .dtype = tensor_entry.dtype,
+            .shape = tensor_entry.shape,
+            .byte_count = tensor_entry.byte_count,
+        };
     }
 
     pub fn hasTensor(self: *const SafeTensors, name: []const u8) bool {
@@ -341,10 +358,11 @@ pub const SafeTensors = struct {
 
         if (parsed_json.value != .object) return error.InvalidHeader;
 
+        const data_start = 8 + header_size;
         var safetensors = SafeTensors{
             .allocator = allocator,
             .buffer = .{ .mapped_data = @as([]align(std.heap.page_size_min) u8, &.{}) },
-            .data_start = 0,
+            .data_start = data_start,
             .metadata_only_file_size = file_size,
         };
 
@@ -358,11 +376,24 @@ pub const SafeTensors = struct {
             const shape = try parseShape(allocator, meta.object.get("shape") orelse continue);
             errdefer allocator.free(shape);
 
+            const offsets = parseDataOffsets(meta.object.get("data_offsets") orelse {
+                allocator.free(shape);
+                continue;
+            }) catch {
+                allocator.free(shape);
+                continue;
+            };
+            const range = resolveDataRange(data_start, file_size, offsets) orelse {
+                allocator.free(shape);
+                continue;
+            };
+
             const stored_name = try allocator.dupe(u8, tensor_name);
             try safetensors.entries.put(allocator, stored_name, .{
                 .dtype = entry_dtype,
                 .shape = shape,
                 .data = &.{},
+                .byte_count = range.byte_count,
             });
         }
 
@@ -418,6 +449,24 @@ fn parseDataOffsets(value: std.json.Value) ![2]usize {
         };
     }
     return offsets;
+}
+
+const DataRange = struct {
+    start: usize,
+    end: usize,
+    byte_count: usize,
+};
+
+fn resolveDataRange(data_start: usize, file_size: usize, offsets: [2]usize) ?DataRange {
+    if (offsets[0] > offsets[1]) return null;
+    const start = std.math.add(usize, data_start, offsets[0]) catch return null;
+    const end = std.math.add(usize, data_start, offsets[1]) catch return null;
+    if (end > file_size) return null;
+    return .{
+        .start = start,
+        .end = end,
+        .byte_count = offsets[1] - offsets[0],
+    };
 }
 
 pub fn tryGetBytes(st: *const SafeTensors, base: []const u8, suffix: []const u8) ?[]u8 {
@@ -626,6 +675,13 @@ test "parseDataOffsets: invalid offsets" {
     }
 }
 
+test "resolveDataRange rejects offset overflow and out-of-file ranges" {
+    try std.testing.expect(resolveDataRange(8, 16, .{ 0, 8 }) != null);
+    try std.testing.expect(resolveDataRange(8, 16, .{ 8, 0 }) == null);
+    try std.testing.expect(resolveDataRange(8, 16, .{ 0, 9 }) == null);
+    try std.testing.expect(resolveDataRange(std.math.maxInt(usize) - 4, std.math.maxInt(usize), .{ 0, 8 }) == null);
+}
+
 /// Helper to create a minimal valid SafeTensors file in memory
 /// Format: [8 bytes header length][JSON header][tensor data]
 fn createMockSafeTensorsFile(allocator: std.mem.Allocator, header_json: []const u8, tensor_data: []const u8) ![]u8 {
@@ -694,6 +750,48 @@ test "SafeTensors: load valid file with single tensor" {
     try testing.expectEqual(@as(i64, 3), t.shape[1]);
     try testing.expectEqual(@as(usize, 6), t.numel);
     try testing.expect(!t.owns_data);
+}
+
+test "SafeTensors metadata bytes match data offsets in full and metadata-only loads" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const tensor_data = [_]u8{
+        0, 0,  128, 63,
+        0, 0,  0,   0,
+        0, 64, 1,   2,
+    };
+    const header =
+        \\{"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        \\ "aux": {"dtype": "I8", "shape": [8], "data_offsets": [4, 12]}}
+    ;
+    const file_data = try createMockSafeTensorsFile(allocator, header, &tensor_data);
+    defer allocator.free(file_data);
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var tmp_file = try tmp_dir.dir.createFile("test.safetensors", .{ .read = true });
+    defer tmp_file.close();
+    try tmp_file.writeAll(file_data);
+    try tmp_file.seekTo(0);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath("test.safetensors", &path_buf);
+
+    var full = try SafeTensors.load(allocator, tmp_path);
+    defer full.deinit();
+    const full_weight = try full.getTensorMetadata("weight");
+    const full_aux = try full.getTensorMetadata("aux");
+    try testing.expectEqual(@as(usize, 4), full_weight.byte_count);
+    try testing.expectEqual(@as(usize, 8), full_aux.byte_count);
+
+    var metadata_only = try SafeTensors.loadMetadataOnly(allocator, tmp_path);
+    defer metadata_only.deinit();
+    const metadata_weight = try metadata_only.getTensorMetadata("weight");
+    const metadata_aux = try metadata_only.getTensorMetadata("aux");
+    try testing.expectEqual(@as(usize, 4), metadata_weight.byte_count);
+    try testing.expectEqual(@as(usize, 8), metadata_aux.byte_count);
+    try testing.expectEqual(file_data.len, metadata_only.fileSize());
 }
 
 test "SafeTensors: load file with multiple tensors" {

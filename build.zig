@@ -1279,6 +1279,7 @@ pub fn build(b: *std.Build) void {
         "Http",
         "fetch ",
         "download",
+        "metadata bytes",
     });
     ut.addLazy("template", b.path("core/src/lib_dev.zig"), &.{
         "TemplateInput",
@@ -1301,6 +1302,7 @@ pub fn build(b: *std.Build) void {
         "getChatTemplateSource",
         "isEosToken",
         "addEosTokenId",
+        "manifest",
     });
     ut.addLazy("responses", b.path("core/src/lib_dev.zig"), &.{
         "TableAdapter",
@@ -1349,6 +1351,7 @@ pub fn build(b: *std.Build) void {
     });
     ut.addLazy("inference-cuda", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.cuda",
+        "topology",
     });
     ut.addLazy("train", b.path("core/src/lib_dev.zig"), &.{
         "GradTensor",

@@ -368,6 +368,54 @@ pub noinline fn loadWeightMap(
     return map;
 }
 
+pub fn resolveWeightNameBySpec(
+    allocator: Allocator,
+    safetensors: *st_loader.UnifiedSafeTensors,
+    spec: WeightSpec,
+    weight_prefixes: []const []const u8,
+    layer_idx: usize,
+    name_resolver: *NameResolver,
+    resolved_name_buf: []u8,
+) !?[]const u8 {
+    var name_buf: [512]u8 = undefined;
+    var prefix_buf: [256]u8 = undefined;
+    var qweight_buf: [1024]u8 = undefined;
+    const alias_count = spec.aliases.len;
+    var candidate_index: usize = 0;
+
+    while (candidate_index < alias_count + 1) : (candidate_index += 1) {
+        const candidate = if (candidate_index == 0) spec.suffix else spec.aliases[candidate_index - 1];
+
+        if (weight_prefixes.len == 0 or std.mem.indexOf(u8, candidate, "{d}") != null) {
+            const expanded_name = expandLayerTemplate(name_buf[0..], candidate, layer_idx) catch continue;
+            if (try name_resolver.resolve(allocator, safetensors, expanded_name, qweight_buf[0..])) |resolved_name| {
+                return copyResolvedName(resolved_name_buf, resolved_name);
+            }
+            continue;
+        }
+
+        for (weight_prefixes) |prefix_template| {
+            const expanded_prefix = expandLayerTemplate(prefix_buf[0..], prefix_template, layer_idx) catch continue;
+            const total_len = expanded_prefix.len + candidate.len;
+            if (total_len > name_buf.len) continue;
+            @memcpy(name_buf[0..expanded_prefix.len], expanded_prefix);
+            @memcpy(name_buf[expanded_prefix.len..total_len], candidate);
+            const expanded_name = name_buf[0..total_len];
+            if (try name_resolver.resolve(allocator, safetensors, expanded_name, qweight_buf[0..])) |resolved_name| {
+                return copyResolvedName(resolved_name_buf, resolved_name);
+            }
+        }
+    }
+
+    return null;
+}
+
+fn copyResolvedName(destination: []u8, resolved_name: []const u8) ?[]const u8 {
+    if (resolved_name.len > destination.len) return null;
+    @memcpy(destination[0..resolved_name.len], resolved_name);
+    return destination[0..resolved_name.len];
+}
+
 fn loadWeightBySpec(
     allocator: Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,

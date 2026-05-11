@@ -131,6 +131,12 @@ pub const ShardedSafeTensors = struct {
         return shard_tensor_file.getTensor(name, expected_dtype);
     }
 
+    pub fn getTensorMetadata(self: *const ShardedSafeTensors, name: []const u8) !reader.SafeTensors.TensorMetadata {
+        const shard_name = self.weight_map.get(name) orelse return error.NotFound;
+        const shard_file = self.shards.get(shard_name) orelse return error.NotFound;
+        return shard_file.getTensorMetadata(name);
+    }
+
     /// Check if a tensor exists
     pub fn hasTensor(self: *const ShardedSafeTensors, name: []const u8) bool {
         return self.weight_map.contains(name);
@@ -336,6 +342,13 @@ pub const UnifiedSafeTensors = union(enum) {
         return switch (self.*) {
             .single => |*s| s.getTensor(name, expected_dtype),
             .sharded => |*s| s.getTensor(name, expected_dtype),
+        };
+    }
+
+    pub fn getTensorMetadata(self: *const UnifiedSafeTensors, name: []const u8) !reader.SafeTensors.TensorMetadata {
+        return switch (self.*) {
+            .single => |*s| s.getTensorMetadata(name),
+            .sharded => |*s| s.getTensorMetadata(name),
         };
     }
 
@@ -847,6 +860,47 @@ test "UnifiedSafeTensors: load sharded via index path" {
 
     try std.testing.expect(unified.hasTensor("weight"));
     try std.testing.expectEqual(@as(usize, 1), unified.tensorCount());
+}
+
+test "ShardedSafeTensors metadata bytes are available after metadata-only load" {
+    const allocator = std.testing.allocator;
+    const writer = @import("writer.zig");
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const shard_data = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const shard_entries = [_]writer.TensorEntry{
+        .{ .name = "layer.weight", .dtype = .i8, .shape = &[_]usize{6}, .data = &shard_data },
+    };
+    const shard_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "model-00001-of-00001.safetensors" });
+    defer allocator.free(shard_path);
+    try writer.write(allocator, shard_path, &shard_entries);
+
+    const index_json =
+        \\{
+        \\  "weight_map": {
+        \\    "layer.weight": "model-00001-of-00001.safetensors"
+        \\  }
+        \\}
+    ;
+    const index_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    var index_file = try std.fs.cwd().createFile(index_path, .{});
+    defer index_file.close();
+    try index_file.writeAll(index_json);
+
+    var unified = try UnifiedSafeTensors.loadMetadataOnly(allocator, index_path);
+    defer unified.deinit();
+
+    const metadata = try unified.getTensorMetadata("layer.weight");
+    try std.testing.expectEqual(@as(usize, 6), metadata.byte_count);
+    try std.testing.expectEqual(DType.i8, metadata.dtype);
+    try std.testing.expectEqual(@as(usize, 1), metadata.shape.len);
+    try std.testing.expectEqual(@as(usize, 6), metadata.shape[0]);
+    try std.testing.expect(unified.fileSize() > 0);
 }
 
 test "UnifiedSafeTensors: load single file" {

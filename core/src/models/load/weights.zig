@@ -18,6 +18,7 @@ const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
 const st_loader = @import("io_pkg").safetensors.root;
 const model_types = @import("models_pkg").op_types;
+const manifest_mod = @import("../manifest.zig");
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
 
@@ -67,11 +68,19 @@ pub const LoadedModel = struct {
     file_size: usize = 0,
     /// Total tensor count (for display)
     tensor_count: usize = 0,
+    /// Metadata-only tensor ownership and checkpoint byte accounting.
+    manifest: ?manifest_mod.ModelManifest = null,
 
     pub fn deinit(self: *LoadedModel) void {
+        if (self.manifest) |*manifest| manifest.deinit();
         if (self.st) |*st| st.deinit();
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    pub fn manifestPtr(self: *const LoadedModel) ?*const manifest_mod.ModelManifest {
+        if (self.manifest) |*manifest| return manifest;
+        return null;
     }
 };
 
@@ -145,6 +154,8 @@ pub fn loadModelMetadataOnly(
         }
         break :blk detected;
     };
+    var model_manifest = try manifest_mod.build(backing_allocator, arch, &model_config, &safetensors_file);
+    errdefer model_manifest.deinit();
 
     // Populate block types from architecture metadata (no weight loading)
     for (0..layer_count) |layer_idx| {
@@ -272,6 +283,7 @@ pub fn loadModelMetadataOnly(
         .original_weight_dtype = original_weight_dtype,
         .file_size = safetensors_file.fileSize(),
         .tensor_count = safetensors_file.tensorCount(),
+        .manifest = model_manifest,
     };
 }
 
@@ -734,6 +746,8 @@ pub fn loadModelWithArchitecture(
         }
         break :blk detected;
     };
+    var model_manifest = try manifest_mod.build(backing_allocator, arch, &model_config, &safetensors_file);
+    errdefer model_manifest.deinit();
 
     var block_time_ns: i128 = 0;
 
@@ -1002,6 +1016,7 @@ pub fn loadModelWithArchitecture(
         .original_weight_dtype = original_weight_dtype,
         .file_size = safetensors_file.fileSize(),
         .tensor_count = safetensors_file.tensorCount(),
+        .manifest = model_manifest,
     };
 }
 
