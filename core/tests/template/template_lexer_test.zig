@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const main = @import("main");
-const TemplateLexer = main.template.TemplateLexer;
+const TemplateLexer = main.template_internals.Lexer;
 const TokenType = main.template.TokenType;
 
 // =============================================================================

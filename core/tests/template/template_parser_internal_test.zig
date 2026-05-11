@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const main = @import("main");
-const TemplateParserInternal = main.template.TemplateParserInternal;
-const TemplateLexer = main.template.TemplateLexer;
+const TemplateParserInternal = main.template_internals.Parser;
+const TemplateLexer = main.template_internals.Lexer;
 const ParseError = main.template.ParseError;
 
 // =============================================================================

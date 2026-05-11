@@ -5,10 +5,10 @@
 
 const std = @import("std");
 const main = @import("main");
-const TemplateEvaluator = main.template.TemplateEvaluator;
+const TemplateEvaluator = main.template_internals.Evaluator;
 const TemplateParser = main.template.TemplateParser;
-const TemplateParserInternal = main.template.TemplateParserInternal;
-const TemplateLexer = main.template.TemplateLexer;
+const TemplateParserInternal = main.template_internals.Parser;
+const TemplateLexer = main.template_internals.Lexer;
 const TemplateInput = main.template.TemplateInput;
 
 // =============================================================================
