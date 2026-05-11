@@ -1327,11 +1327,11 @@ pub fn createBpeTokenizer(allocator: std.mem.Allocator, json_buffer: []const u8,
     tok.postproc.add_special = 0;
 
     const model = create(allocator, json_buffer, json_owned) catch |err| {
-        log.warn("tokenizer", "BPE model creation failed", .{
+        log.debug("tokenizer", "BPE model creation failed", .{
             .reason = @errorName(err),
             .json_bytes = json_buffer.len,
             .json_owned = @intFromBool(json_owned),
-        });
+        }, @src());
         return err;
     };
 

@@ -494,7 +494,6 @@ proptest! {
     /// For valid Unicode text, byte-level encode/decode should roundtrip
     /// exactly.
     #[test]
-    #[ignore = "executed via subprocess wrapper to isolate native crashes while preserving failure signal"]
     fn byte_level_valid_unicode_roundtrips_exactly(
         // Must cross the 512-symbol threshold so property runs exercise both
         // BPE word paths (small iterative and large cached-pair).
@@ -795,7 +794,6 @@ proptest! {
     /// WordPiece greedy matching must stay deterministic and offset-safe across
     /// randomized overlapping-vocab variants, not just a single static model.
     #[test]
-    #[ignore = "executed via subprocess wrapper to isolate native crashes while preserving failure signal"]
     fn wordpiece_random_model_variants_are_deterministic_and_offset_safe(
         include_ab in any::<bool>(),
         include_ba in any::<bool>(),
@@ -968,7 +966,6 @@ proptest! {
     /// Unigram Viterbi segmentation must stay deterministic and offset-safe
     /// across randomized score-model variants.
     #[test]
-    #[ignore = "executed via subprocess wrapper to isolate native crashes while preserving failure signal"]
     fn unigram_random_score_models_are_deterministic_and_offset_safe(
         score_a in -90i16..=0,
         score_b in -90i16..=0,
@@ -1140,7 +1137,6 @@ proptest! {
     /// BPE merge behavior must remain deterministic and offset-semantically
     /// correct across randomized overlapping merge-graph variants.
     #[test]
-    #[ignore = "executed via subprocess wrapper to isolate native crashes while preserving failure signal"]
     fn bpe_random_model_variants_are_deterministic_and_offset_safe(
         include_ab in any::<bool>(),
         include_ba in any::<bool>(),
@@ -1286,7 +1282,6 @@ proptest! {
     /// Deep BPE merge-graph variants must exactly match an independent
     /// leftmost-min-rank reference implementation for IDs and offsets.
     #[test]
-    #[ignore = "executed via subprocess wrapper to isolate native crashes while preserving failure signal"]
     fn bpe_deep_merge_graph_matches_reference(
         mask in 1u16..2048u16,
         rotate in any::<u8>(),
@@ -1426,7 +1421,6 @@ fn byte_level_valid_unicode_roundtrips_exactly_subprocess() {
     let output = Command::new(exe)
         .arg("--exact")
         .arg("capi::tokenizer::property::byte_level_valid_unicode_roundtrips_exactly")
-        .arg("--ignored")
         .arg("--nocapture")
         .output()
         .expect("subprocess launch for long-range roundtrip proptest must succeed");
@@ -1447,7 +1441,6 @@ fn wordpiece_random_model_variants_are_deterministic_and_offset_safe_subprocess(
     let output = Command::new(exe)
         .arg("--exact")
         .arg("capi::tokenizer::property::wordpiece_random_model_variants_are_deterministic_and_offset_safe")
-        .arg("--ignored")
         .arg("--nocapture")
         .env("PROPTEST_RNG_SEED", "2004318071")
         .env("PROPTEST_DISABLE_FAILURE_PERSISTENCE", "1")
@@ -1470,7 +1463,6 @@ fn unigram_random_score_models_are_deterministic_and_offset_safe_subprocess() {
     let output = Command::new(exe)
         .arg("--exact")
         .arg("capi::tokenizer::property::unigram_random_score_models_are_deterministic_and_offset_safe")
-        .arg("--ignored")
         .arg("--nocapture")
         .env("PROPTEST_RNG_SEED", "2004318071")
         .env("PROPTEST_DISABLE_FAILURE_PERSISTENCE", "1")
@@ -1493,7 +1485,6 @@ fn bpe_random_model_variants_are_deterministic_and_offset_safe_subprocess() {
     let output = Command::new(exe)
         .arg("--exact")
         .arg("capi::tokenizer::property::bpe_random_model_variants_are_deterministic_and_offset_safe")
-        .arg("--ignored")
         .arg("--nocapture")
         .env("PROPTEST_RNG_SEED", "2004318071")
         .env("PROPTEST_DISABLE_FAILURE_PERSISTENCE", "1")
@@ -1516,7 +1507,6 @@ fn bpe_deep_merge_graph_matches_reference_subprocess() {
     let output = Command::new(exe)
         .arg("--exact")
         .arg("capi::tokenizer::property::bpe_deep_merge_graph_matches_reference")
-        .arg("--ignored")
         .arg("--nocapture")
         .env("PROPTEST_RNG_SEED", "2004318071")
         .env("PROPTEST_DISABLE_FAILURE_PERSISTENCE", "1")

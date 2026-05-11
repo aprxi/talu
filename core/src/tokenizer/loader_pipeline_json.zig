@@ -206,9 +206,9 @@ fn parseNormalizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std.j
     const first_token = try json_scanner.next();
     if (first_token == .null) return normalizer;
     if (first_token != .object_begin) {
-        log.warn("tokenizer", "Normalizer parse rejected non-object token", .{
+        log.debug("tokenizer", "Normalizer parse rejected non-object token", .{
             .token = @tagName(first_token),
-        });
+        }, @src());
         return error.InvalidNormalizer;
     }
 

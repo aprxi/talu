@@ -19,11 +19,11 @@ pub fn validateModelOptions(model_type_name: []const u8, model_json: []const u8)
     // runtime behavior without an explicit implementation.
     if (findJsonFieldValue(model_json, "\"dropout\"")) |value| {
         if (!std.mem.eql(u8, value, "null")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+            log.debug("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "dropout",
                 .value_len = value.len,
                 .value_preview = value[0..@min(value.len, 32)],
-            });
+            }, @src());
             return error.InvalidModel;
         }
     }
@@ -33,11 +33,11 @@ pub fn validateModelOptions(model_type_name: []const u8, model_json: []const u8)
         if (std.mem.eql(u8, value, "true")) {
             fuse_unk_enabled = true;
         } else if (!std.mem.eql(u8, value, "false")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+            log.debug("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "fuse_unk",
                 .value_len = value.len,
                 .value_preview = value[0..@min(value.len, 32)],
-            });
+            }, @src());
             return error.InvalidModel;
         }
     }
@@ -47,52 +47,52 @@ pub fn validateModelOptions(model_type_name: []const u8, model_json: []const u8)
         if (std.mem.eql(u8, value, "true")) {
             byte_fallback_enabled = true;
         } else if (!std.mem.eql(u8, value, "false")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+            log.debug("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "byte_fallback",
                 .value_len = value.len,
                 .value_preview = value[0..@min(value.len, 32)],
-            });
+            }, @src());
             return error.InvalidModel;
         }
     }
 
     if (fuse_unk_enabled and !byte_fallback_enabled) {
-        log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+        log.debug("tokenizer", "Tokenizer BPE option rejected", .{
             .field = "fuse_unk",
             .reason = "requires_byte_fallback",
-        });
+        }, @src());
         return error.InvalidModel;
     }
 
     if (findJsonFieldValue(model_json, "\"continuing_subword_prefix\"")) |value| {
         if (!std.mem.eql(u8, value, "null") and !std.mem.eql(u8, value, "\"\"")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+            log.debug("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "continuing_subword_prefix",
                 .value_len = value.len,
                 .value_preview = value[0..@min(value.len, 32)],
-            });
+            }, @src());
             return error.InvalidModel;
         }
     }
 
     if (findJsonFieldValue(model_json, "\"end_of_word_suffix\"")) |value| {
         if (!std.mem.eql(u8, value, "null") and !std.mem.eql(u8, value, "\"\"")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+            log.debug("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "end_of_word_suffix",
                 .value_len = value.len,
                 .value_preview = value[0..@min(value.len, 32)],
-            });
+            }, @src());
             return error.InvalidModel;
         }
     }
 
     if (findJsonFieldValue(model_json, "\"ignore_merges\"")) |value| {
         if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "true")) {
-            log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+            log.debug("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "ignore_merges",
                 .value_len = value.len,
                 .value_preview = value[0..@min(value.len, 32)],
-            });
+            }, @src());
             return error.InvalidModel;
         }
     }

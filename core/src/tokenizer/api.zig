@@ -36,22 +36,22 @@ pub const Tokenizer = struct {
     pub fn initFromPathZ(allocator: std.mem.Allocator, path: [:0]const u8) !Tokenizer {
         const tokenizer_handle = pipeline_impl.tokenizer_from_pretrained(path.ptr);
         if (tokenizer_handle == null) {
-            log.warn("tokenizer", "Tokenizer init from path failed", .{
+            log.debug("tokenizer", "Tokenizer init from path failed", .{
                 .source = "path",
                 .path = path,
                 .stage = "loader",
-            });
+            }, @src());
             return TokenizerError.InitFailed;
         }
         errdefer pipeline_impl.tokenizer_free(tokenizer_handle.?);
         var tokenizer = Tokenizer{ .allocator = allocator, .tokenizer_handle = tokenizer_handle.? };
         tokenizer.buildPrefixIndex() catch |err| {
-            log.warn("tokenizer", "Tokenizer init from path failed", .{
+            log.debug("tokenizer", "Tokenizer init from path failed", .{
                 .source = "path",
                 .path = path,
                 .stage = "prefix_index",
                 .reason = @errorName(err),
-            });
+            }, @src());
             return err;
         };
         return tokenizer;
@@ -71,22 +71,22 @@ pub const Tokenizer = struct {
     pub fn initFromJsonZ(allocator: std.mem.Allocator, json: [:0]const u8) !Tokenizer {
         const tokenizer_handle = pipeline_impl.tokenizer_from_json_string(json.ptr);
         if (tokenizer_handle == null) {
-            log.warn("tokenizer", "Tokenizer init from JSON failed", .{
+            log.debug("tokenizer", "Tokenizer init from JSON failed", .{
                 .source = "json",
                 .json_bytes = json.len,
                 .stage = "loader",
-            });
+            }, @src());
             return TokenizerError.InitFailed;
         }
         errdefer pipeline_impl.tokenizer_free(tokenizer_handle.?);
         var tokenizer = Tokenizer{ .allocator = allocator, .tokenizer_handle = tokenizer_handle.? };
         tokenizer.buildPrefixIndex() catch |err| {
-            log.warn("tokenizer", "Tokenizer init from JSON failed", .{
+            log.debug("tokenizer", "Tokenizer init from JSON failed", .{
                 .source = "json",
                 .json_bytes = json.len,
                 .stage = "prefix_index",
                 .reason = @errorName(err),
-            });
+            }, @src());
             return err;
         };
         return tokenizer;

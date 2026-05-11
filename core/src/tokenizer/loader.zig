@@ -46,24 +46,24 @@ pub fn parseTokenizerJson(allocator: std.mem.Allocator, json_content: []const u8
     const arena_allocator = arena.allocator();
 
     const model_section = findSection(json_content, "\"model\"") orelse {
-        log.warn("tokenizer", "Tokenizer model parse failed", .{
+        log.debug("tokenizer", "Tokenizer model parse failed", .{
             .stage = "model_section_missing",
             .json_bytes = json_content.len,
-        });
+        }, @src());
         return error.InvalidModel;
     };
     if (model_section.len == 0 or model_section[0] != '{') {
-        log.warn("tokenizer", "Tokenizer model parse failed", .{
+        log.debug("tokenizer", "Tokenizer model parse failed", .{
             .stage = "model_section_not_object",
             .json_bytes = json_content.len,
-        });
+        }, @src());
         return error.InvalidModel;
     }
     const model_end = findMatchingBrace(model_section, '{', '}') orelse {
-        log.warn("tokenizer", "Tokenizer model parse failed", .{
+        log.debug("tokenizer", "Tokenizer model parse failed", .{
             .stage = "model_section_unbalanced",
             .json_bytes = json_content.len,
-        });
+        }, @src());
         return error.InvalidModel;
     };
     const model_json = model_section[0..model_end];
@@ -73,20 +73,20 @@ pub fn parseTokenizerJson(allocator: std.mem.Allocator, json_content: []const u8
     var vocab_entries = ManagedArrayList(schema.TokenId).init(arena_allocator);
     var merge_entries = ManagedArrayList([]const u8).init(arena_allocator);
     const model_type_name = findJsonFieldString(model_json, "\"type\"") orelse {
-        log.warn("tokenizer", "Tokenizer model parse failed", .{
+        log.debug("tokenizer", "Tokenizer model parse failed", .{
             .stage = "model_type_missing",
             .model_bytes = model_json.len,
-        });
+        }, @src());
         return error.InvalidModel;
     };
     if (!std.mem.eql(u8, model_type_name, "BPE") and
         !std.mem.eql(u8, model_type_name, "WordPiece") and
         !std.mem.eql(u8, model_type_name, "Unigram"))
     {
-        log.warn("tokenizer", "Tokenizer model parse failed", .{
+        log.debug("tokenizer", "Tokenizer model parse failed", .{
             .stage = "model_type_unsupported",
             .model_type = model_type_name,
-        });
+        }, @src());
         return error.UnsupportedModel;
     }
     var vocab_is_array = false;
@@ -335,10 +335,10 @@ pub fn tokenizer_loader_from_json_string(json_data: ?[*:0]const u8) ?*ct.Tokeniz
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = parseTokenizerJson(arena.allocator(), json_bytes) catch |err| {
-        log.warn("tokenizer", "Tokenizer JSON parse failed", .{
+        log.debug("tokenizer", "Tokenizer JSON parse failed", .{
             .reason = @errorName(err),
             .json_bytes = json_bytes.len,
-        });
+        }, @src());
         return null;
     };
     const model_type_name = root.model.type;
@@ -362,20 +362,20 @@ pub fn tokenizer_loader_from_json_string(json_data: ?[*:0]const u8) ?*ct.Tokeniz
             json_copy,
             .root_for_noop_sequence,
         ) catch |err| {
-            log.warn("tokenizer", "Lazy BPE tokenizer build failed", .{
+            log.debug("tokenizer", "Lazy BPE tokenizer build failed", .{
                 .reason = @errorName(err),
                 .json_bytes = json_bytes.len,
                 .model_type = model_type_name,
-            });
+            }, @src());
             return null;
         };
     }
 
     return buildTokenizerFromRoot(&arena, root) catch |err| {
-        log.warn("tokenizer", "Tokenizer model build failed", .{
+        log.debug("tokenizer", "Tokenizer model build failed", .{
             .reason = @errorName(err),
             .model_type = model_type_name,
-        });
+        }, @src());
         return null;
     };
 }
@@ -489,11 +489,11 @@ pub fn tokenizer_loader_from_dir(path: ?[*:0]const u8) ?*ct.Tokenizer {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = parseTokenizerJson(arena.allocator(), json_bytes) catch |err| {
-        log.warn("tokenizer", "Tokenizer JSON parse failed", .{
+        log.debug("tokenizer", "Tokenizer JSON parse failed", .{
             .reason = @errorName(err),
             .json_path = json_path,
             .json_bytes = json_bytes.len,
-        });
+        }, @src());
         allocator.free(json_bytes);
         return null;
     };
@@ -508,12 +508,12 @@ pub fn tokenizer_loader_from_dir(path: ?[*:0]const u8) ?*ct.Tokenizer {
             json_bytes,
             .raw_json,
         ) catch |err| {
-            log.warn("tokenizer", "Lazy BPE tokenizer build failed", .{
+            log.debug("tokenizer", "Lazy BPE tokenizer build failed", .{
                 .reason = @errorName(err),
                 .json_path = json_path,
                 .json_bytes = json_bytes.len,
                 .model_type = model_type_name,
-            });
+            }, @src());
             return null;
         };
         {
@@ -535,11 +535,11 @@ pub fn tokenizer_loader_from_dir(path: ?[*:0]const u8) ?*ct.Tokenizer {
         t_start = now;
     }
     const result = buildTokenizerFromRoot(&arena, root) catch |err| {
-        log.warn("tokenizer", "Tokenizer model build failed", .{
+        log.debug("tokenizer", "Tokenizer model build failed", .{
             .reason = @errorName(err),
             .json_path = json_path,
             .model_type = model_type_name,
-        });
+        }, @src());
         return null;
     };
     {

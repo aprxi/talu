@@ -85,6 +85,21 @@ fn importTargetsInference(target: []const u8) bool {
         std.mem.eql(u8, target, "inference_pkg");
 }
 
+fn importTargetsForbiddenComputeDependency(target: []const u8) bool {
+    return std.mem.indexOf(u8, target, "inference/") != null or
+        std.mem.indexOf(u8, target, "models/") != null or
+        std.mem.indexOf(u8, target, "responses/") != null or
+        std.mem.indexOf(u8, target, "protocol/") != null or
+        std.mem.indexOf(u8, target, "capi/") != null or
+        std.mem.indexOf(u8, target, "bindings/") != null or
+        std.mem.indexOf(u8, target, "bridge") != null or
+        std.mem.indexOf(u8, target, "scheduler") != null or
+        std.mem.indexOf(u8, target, "runtime_contract") != null or
+        std.mem.eql(u8, target, "inference_pkg") or
+        std.mem.eql(u8, target, "models_pkg") or
+        std.mem.eql(u8, target, "capi_pkg");
+}
+
 fn isComputeRootImport(target: []const u8) bool {
     return std.mem.endsWith(u8, target, "compute/root.zig");
 }
@@ -151,10 +166,7 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
         const target = target_owned orelse continue;
 
         const line = lineNumberForOffset(source, tree.tokenStart(tree.firstToken(arg_node)));
-        if (isComputePath(file_path) and
-            (std.mem.indexOf(u8, target, "inference/") != null or
-                std.mem.indexOf(u8, target, "models/") != null))
-        {
+        if (isComputePath(file_path) and importTargetsForbiddenComputeDependency(target)) {
             violations += 1;
             if (emit) {
                 std.debug.print("{s}:{d}: forbidden compute dependency import: \"{s}\"\n", .{ file_path, line, target });
@@ -628,6 +640,35 @@ test "lintSource rejects models import in compute" {
         \\const bad = @import("../../models/root.zig");
     ;
     try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/cpu/bar.zig", src, false));
+}
+
+test "lintSource rejects C API import in compute" {
+    const src =
+        \\const bad = @import("../../capi/root.zig");
+    ;
+    try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/cpu/copy.zig", src, false));
+}
+
+test "lintSource rejects runtime contract import in compute" {
+    const src =
+        \\const bad = @import("../../models/plan/runtime_contract/types.zig");
+    ;
+    try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/cpu/capabilities.zig", src, false));
+}
+
+test "lintSource rejects bridge and scheduler imports in compute" {
+    const src =
+        \\const bad_bridge = @import("../../responses/inference_bridge.zig");
+        \\const bad_scheduler = @import("../../inference/backend/cpu/scheduler.zig");
+    ;
+    try std.testing.expectEqual(@as(usize, 2), try lintSource(std.testing.allocator, "core/src/compute/cuda/capabilities.zig", src, false));
+}
+
+test "lintSource rejects bindings import in compute" {
+    const src =
+        \\const bad = @import("../../../bindings/python/root.zig");
+    ;
+    try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/metal/capabilities.zig", src, false));
 }
 
 test "lintSource rejects legacy top-level simd import path" {

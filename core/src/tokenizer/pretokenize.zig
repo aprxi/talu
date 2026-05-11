@@ -134,10 +134,10 @@ pub fn tokenizer_pretokenizer_set(pretokenizer: *ct.PreTokenizer, pattern_opt: ?
     var error_offset: c.PCRE2_SIZE = 0;
     const regex_code = pcre2_compile(@ptrCast(pattern_ptr), PCRE2_ZERO_TERMINATED, PCRE2_UTF | PCRE2_UCP, &error_code, &error_offset, null);
     if (regex_code == null) {
-        log.warn("tokenizer", "Pretokenizer regex compile failed", .{
+        log.debug("tokenizer", "Pretokenizer regex compile failed", .{
             .error_code = error_code,
             .error_offset = error_offset,
-        });
+        }, @src());
         return -1;
     }
     pcre2_jit_compile(regex_code);
