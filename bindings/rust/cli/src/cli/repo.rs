@@ -27,6 +27,24 @@ struct ProgressLineMeta {
     label: String,
     total: u64,
     last_logged_current: u64,
+    last_message: String,
+    persist_on_complete: bool,
+}
+
+fn is_device_summary_message(label: &str, message: &str) -> bool {
+    label == "Devices"
+        && message.starts_with('[')
+        && message.contains("cpu:")
+        && message.contains("metal:")
+        && (message.contains("gpu:") || message.contains("gpu0:"))
+}
+
+fn completed_progress_line(label: &str, message: &str) -> String {
+    if label.is_empty() {
+        message.to_string()
+    } else {
+        format!("{label} {message}")
+    }
 }
 
 impl UnifiedProgressCtx {
@@ -102,6 +120,8 @@ impl UnifiedProgressCtx {
                         label: label.to_string(),
                         total,
                         last_logged_current: 0,
+                        last_message: message.to_string(),
+                        persist_on_complete: is_device_summary_message(label, message),
                     },
                 );
 
@@ -210,6 +230,30 @@ impl UnifiedProgressCtx {
                         bar.set_message(message.to_string());
                     }
                 }
+                if !message.is_empty() || !label.is_empty() || total > 0 {
+                    let line = self
+                        .line_meta
+                        .entry(line_id)
+                        .or_insert_with(|| ProgressLineMeta {
+                            label: label.to_string(),
+                            total,
+                            last_logged_current: 0,
+                            last_message: String::new(),
+                            persist_on_complete: false,
+                        });
+                    if !label.is_empty() {
+                        line.label = label.to_string();
+                    }
+                    if total > 0 {
+                        line.total = total;
+                    }
+                    if !message.is_empty() {
+                        line.last_message = message.to_string();
+                        if is_device_summary_message(&line.label, message) {
+                            line.persist_on_complete = true;
+                        }
+                    }
+                }
                 if emit_history_line && current > 0 {
                     let line = self
                         .line_meta
@@ -218,6 +262,8 @@ impl UnifiedProgressCtx {
                             label: label.to_string(),
                             total,
                             last_logged_current: 0,
+                            last_message: String::new(),
+                            persist_on_complete: false,
                         });
                     if !label.is_empty() {
                         line.label = label.to_string();
@@ -244,10 +290,19 @@ impl UnifiedProgressCtx {
                 }
             }
             RepoProgressAction::Complete => {
+                let completed_line = self.line_meta.remove(&line_id).and_then(|line| {
+                    if line.persist_on_complete && !line.last_message.is_empty() {
+                        Some(completed_progress_line(&line.label, &line.last_message))
+                    } else {
+                        None
+                    }
+                });
                 if let Some(bar) = self.bars.remove(&line_id) {
                     bar.finish_and_clear();
                 }
-                self.line_meta.remove(&line_id);
+                if let Some(line) = completed_line {
+                    let _ = self.multi.println(line);
+                }
             }
         }
     }
@@ -258,6 +313,40 @@ impl UnifiedProgressCtx {
             bar.finish_and_clear();
         }
         self.line_meta.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{completed_progress_line, is_device_summary_message};
+
+    #[test]
+    fn device_summary_message_matches_cuda_cpu_gpu_bar() {
+        let message = "[\x1b[33m########\x1b[0m\x1b[36m###############################\x1b[0m\x1b[32m#\x1b[0m] 32/32  \x1b[33mcpu: 10\x1b[0m · \x1b[36mgpu0: 21\x1b[0m · \x1b[32mgpu1: 1\x1b[0m · \x1b[35mmetal: 0\x1b[0m";
+        assert!(is_device_summary_message("Devices", message));
+    }
+
+    #[test]
+    fn device_summary_message_matches_cpu_backend_bar() {
+        let message = "[\x1b[33m########################################\x1b[0m] 32/32  \x1b[33mcpu: 32\x1b[0m · \x1b[36mgpu: 0\x1b[0m · \x1b[35mmetal: 0\x1b[0m";
+        assert!(is_device_summary_message("Devices", message));
+    }
+
+    #[test]
+    fn device_summary_message_rejects_regular_progress() {
+        assert!(!is_device_summary_message(
+            "Loading",
+            "Backend initialized, preparing runtime..."
+        ));
+        assert!(!is_device_summary_message("Devices", "Backend initialized"));
+    }
+
+    #[test]
+    fn completed_progress_line_keeps_label_with_message() {
+        assert_eq!(
+            completed_progress_line("Devices", "[##] 2/2  cpu: 1 · gpu0: 1 · metal: 0"),
+            "Devices [##] 2/2  cpu: 1 · gpu0: 1 · metal: 0"
+        );
     }
 }
 

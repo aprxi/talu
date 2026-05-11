@@ -665,6 +665,20 @@ pub const CudaBackend = struct {
         progress: progress_mod.Context = progress_mod.Context.NONE,
     };
 
+    pub fn buildCpuStage0InitOptions(
+        max_batch_size: usize,
+        max_sequence_len: usize,
+        split_layer: usize,
+    ) cpu_backend.BackendType.InitOptions {
+        return .{
+            .max_batch_size = max_batch_size,
+            .max_sequence_len = max_sequence_len,
+            .layer_range = .{ .start = 0, .end = split_layer },
+            .build_logits_head = false,
+            .progress = progress_mod.Context.NONE,
+        };
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
@@ -1374,12 +1388,14 @@ pub const CudaBackend = struct {
                 stage0_cpu_ptr.* = try cpu_backend.BackendType.init(
                     allocator,
                     loaded,
-                    max_batch_size,
-                    backend_root.resolveCpuMaxSeqLenForRuntime(
-                        allocator,
-                        @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
+                    buildCpuStage0InitOptions(
+                        max_batch_size,
+                        backend_root.resolveCpuMaxSeqLenForRuntime(
+                            allocator,
+                            @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
+                        ),
+                        split,
                     ),
-                    progress_mod.Context.NONE,
                 );
                 errdefer {
                     stage0_cpu_ptr.deinit();
@@ -1447,12 +1463,14 @@ pub const CudaBackend = struct {
                 stage0_cpu_ptr.* = try cpu_backend.BackendType.init(
                     allocator,
                     loaded,
-                    max_batch_size,
-                    backend_root.resolveCpuMaxSeqLenForRuntime(
-                        allocator,
-                        @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
+                    buildCpuStage0InitOptions(
+                        max_batch_size,
+                        backend_root.resolveCpuMaxSeqLenForRuntime(
+                            allocator,
+                            @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
+                        ),
+                        split,
                     ),
-                    progress_mod.Context.NONE,
                 );
                 errdefer {
                     stage0_cpu_ptr.deinit();
@@ -3325,31 +3343,96 @@ pub const CudaBackend = struct {
         return local_handle;
     }
 
+    fn validateStateBlocksCoverDescriptors(
+        descriptors: []const runtime_contract.StateDescriptor,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        var desc_seen: [256]bool = [_]bool{false} ** 256;
+        var block_seen: [256]bool = [_]bool{false} ** 256;
+
+        for (descriptors) |descriptor| {
+            if (desc_seen[descriptor.id]) return error.DuplicateStateDescriptorId;
+            desc_seen[descriptor.id] = true;
+            if (descriptor.align_bytes == 0) return error.InvalidStateAlignment;
+        }
+
+        for (state_blocks) |state_block| {
+            if (state_block.align_bytes == 0 or state_block.size == 0) return error.InvalidStateDescriptorBinding;
+            if (block_seen[state_block.id]) return error.InvalidStateDescriptorBinding;
+            block_seen[state_block.id] = true;
+        }
+
+        for (descriptors) |descriptor| {
+            const state_block = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            if (state_block.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
+            if (descriptor.size_bytes > 0 and state_block.size < descriptor.size_bytes) {
+                return error.InvalidStateDescriptorBinding;
+            }
+        }
+    }
+
+    fn descriptorSliceContainsId(descriptors: []const runtime_contract.StateDescriptor, state_id: u8) bool {
+        for (descriptors) |descriptor| {
+            if (descriptor.id == state_id) return true;
+        }
+        return false;
+    }
+
+    fn pipelineDescriptorIdAllowed(self: *const CudaBackend, state_id: u8) bool {
+        if (descriptorSliceContainsId(self.stateDescriptors(), state_id)) return true;
+        if (self.pipeline_backend1) |stage1| {
+            if (descriptorSliceContainsId(stage1.stateDescriptors(), state_id)) return true;
+        }
+        if (self.pipeline_backend0_cpu) |stage0_cpu| {
+            if (descriptorSliceContainsId(stage0_cpu.stateDescriptors(), state_id)) return true;
+        }
+        return false;
+    }
+
+    fn validatePipelineStateBlocks(
+        self: *const CudaBackend,
+        descriptors: []const runtime_contract.StateDescriptor,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        try validateStateBlocksCoverDescriptors(descriptors, state_blocks);
+        for (state_blocks) |state_block| {
+            if (!self.pipelineDescriptorIdAllowed(state_block.id)) return error.UnknownStateDescriptorId;
+        }
+    }
+
     pub fn bindSlotStateBlocks(
         self: *CudaBackend,
         slot_index: usize,
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
-        runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks) catch |err| {
+        const descriptors = self.stateDescriptors();
+        const has_pipeline_stage = self.pipeline_backend1 != null or self.pipeline_backend0_cpu != null;
+        const validation_result = if (has_pipeline_stage)
+            self.validatePipelineStateBlocks(descriptors, state_blocks)
+        else
+            runtime_contract.validateStateBlocksForDescriptors(descriptors, state_blocks);
+        validation_result catch |err| {
             log.warn("inference", "CUDA bindSlotStateBlocks descriptor validation failed", .{
                 .slot_index = slot_index,
                 .state_blocks = state_blocks.len,
-                .state_descriptors = self.stateDescriptors().len,
+                .state_descriptors = descriptors.len,
                 .reason = @errorName(err),
             });
             return err;
         };
         var binding = &self.slot_state_bindings[slot_index];
-        if (state_blocks.len > binding.handles.len) {
+        if (descriptors.len > binding.handles.len) {
             log.warn("inference", "CUDA bindSlotStateBlocks too many state blocks", .{
                 .slot_index = slot_index,
-                .state_blocks = state_blocks.len,
+                .state_blocks = descriptors.len,
                 .capacity = binding.handles.len,
             });
             return error.InvalidStateDescriptorBinding;
         }
-        for (self.stateDescriptors(), 0..) |descriptor, idx| {
+        for (descriptors, 0..) |descriptor, idx| {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 log.warn("inference", "CUDA bindSlotStateBlocks missing descriptor state id", .{
                     .slot_index = slot_index,
@@ -3366,7 +3449,7 @@ pub const CudaBackend = struct {
                 .align_bytes = bound.align_bytes,
             };
         }
-        binding.count = @intCast(state_blocks.len);
+        binding.count = @intCast(descriptors.len);
         binding.bound = true;
         if (self.pipeline_backend1) |stage1| {
             stage1.mirrorSlotStateBlocksFrom(self, slot_index) catch |err| {
@@ -3376,7 +3459,7 @@ pub const CudaBackend = struct {
             };
         }
         if (self.pipeline_backend0_cpu) |stage0_cpu| {
-            stage0_cpu.bindSlotStateBlocks(slot_index, state_blocks) catch |err| {
+            stage0_cpu.bindLocalRuntimeStateBlocks(slot_index) catch |err| {
                 // Rollback: unbind stage1 mirror and self before propagating.
                 if (self.pipeline_backend1) |stage1| {
                     stage1.unbindSlotStateBlocks(slot_index);

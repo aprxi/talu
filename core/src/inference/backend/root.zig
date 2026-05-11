@@ -365,7 +365,7 @@ pub const Backend = union(enum) {
 
         switch (selected) {
             .cpu => return initCpu(allocator, loaded, "configured", progress),
-            .metal => return initMetal(allocator, loaded, "configured", init_options.metal),
+            .metal => return initMetal(allocator, loaded, "configured", init_options.metal, progress),
             .cuda => return initCuda(allocator, loaded, "configured", cuda_probe, init_options.cuda_topology, progress),
             .auto => {},
         }
@@ -373,7 +373,7 @@ pub const Backend = union(enum) {
         // Check if we should use Metal backend (macOS + quantized/bf16 model)
         const has_unsupported_runtime_features = runtimeHasMetalUnsupportedFeatures(&loaded.runtime);
         if (has_metal and isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
-            return initMetal(allocator, loaded, "auto", init_options.metal);
+            return initMetal(allocator, loaded, "auto", init_options.metal, progress);
         }
 
         // Default to CPU backend
@@ -1041,9 +1041,13 @@ fn initCpu(
     const cpu_backend_state = cpu.BackendType.init(
         allocator,
         loaded,
-        cpu_max_batch_size,
-        cpu_max_seq_len,
-        progress,
+        .{
+            .max_batch_size = cpu_max_batch_size,
+            .max_sequence_len = cpu_max_seq_len,
+            .layer_range = .{ .start = 0, .end = @intCast(loaded.config.n_layers) },
+            .build_logits_head = true,
+            .progress = progress,
+        },
     ) catch |err| {
         log.warn("inference", "CPU backend init failed", .{
             .reason = @errorName(err),
@@ -1054,6 +1058,10 @@ fn initCpu(
         });
         return err;
     };
+    progress.completeLine(1);
+    publishDeviceLayerSummary(progress, .{
+        .cpu_layers = loaded.blocks.len,
+    });
     log.info("inference", "Backend selected: cpu", .{ .reason = reason });
     return .{ .cpu = cpu_backend_state };
 }
@@ -1063,6 +1071,7 @@ fn initMetal(
     loaded: *LoadedModel,
     reason: []const u8,
     config: ?InitOptions.MetalConfig,
+    progress: progress_mod.Context,
 ) !Backend {
     if (!has_metal) {
         return error.MetalNotEnabled;
@@ -1090,58 +1099,174 @@ fn initMetal(
         .weights_path = if (config) |c| c.weights_path else null,
         .memory_fit_is_error = std.mem.eql(u8, reason, "configured"),
     });
+    progress.completeLine(1);
+    publishDeviceLayerSummary(progress, .{
+        .metal_layers = loaded.blocks.len,
+    });
     log.info("inference", "Backend selected: metal", .{ .reason = reason });
     return .{ .metal = metal_backend_state };
 }
 
-/// Renders a two-color bar showing CPU vs GPU layer split.
-/// Yellow '#' = CPU layers, cyan '#' = GPU layers. 40-char width matches the Loading bar.
-/// Example output: `[####################████████████████████] 32/32  cpu 20 · gpu 12`
-fn renderColoredBar(
+const DeviceLayerSummary = struct {
+    cpu_layers: usize = 0,
+    gpu_stage_count: u8 = 0,
+    gpu0_ordinal: usize = 0,
+    gpu0_layers: usize = 0,
+    gpu1_ordinal: usize = 1,
+    gpu1_layers: usize = 0,
+    metal_layers: usize = 0,
+
+    fn totalLayers(self: DeviceLayerSummary) usize {
+        return self.cpu_layers + self.gpu0_layers + self.gpu1_layers + self.metal_layers;
+    }
+};
+
+const DeviceBarSegment = struct {
+    layers: usize,
+    color: []const u8,
+};
+
+fn fillDeviceBarSegmentWidths(segments: []const DeviceBarSegment, widths: []usize, total_layers: usize, bar_width: usize) void {
+    @memset(widths, 0);
+    if (total_layers == 0 or bar_width == 0) return;
+
+    var remainders = [_]usize{0} ** 4;
+    var used: usize = 0;
+    for (segments, 0..) |segment, idx| {
+        if (segment.layers == 0) continue;
+        const scaled = segment.layers * bar_width;
+        widths[idx] = scaled / total_layers;
+        remainders[idx] = scaled % total_layers;
+        used += widths[idx];
+    }
+
+    while (used < bar_width) {
+        var best_idx: ?usize = null;
+        var best_remainder: usize = 0;
+        for (segments, 0..) |segment, idx| {
+            if (segment.layers == 0) continue;
+            if (best_idx == null or remainders[idx] > best_remainder) {
+                best_idx = idx;
+                best_remainder = remainders[idx];
+            }
+        }
+        const idx = best_idx orelse break;
+        widths[idx] += 1;
+        remainders[idx] = 0;
+        used += 1;
+    }
+
+    while (used > bar_width) {
+        var largest_idx: ?usize = null;
+        var largest_width: usize = 0;
+        for (widths[0..segments.len], 0..) |width, idx| {
+            if (width > largest_width) {
+                largest_idx = idx;
+                largest_width = width;
+            }
+        }
+        const idx = largest_idx orelse break;
+        if (widths[idx] == 0) break;
+        widths[idx] -= 1;
+        used -= 1;
+    }
+}
+
+/// Renders a layer ownership summary across supported device classes.
+/// CPU is yellow, CUDA GPU0 is cyan, CUDA GPU1 is green, and Metal is magenta.
+/// Example output: `[#######...] 32/32  cpu: 10 · gpu0: 21 · gpu1: 1 · metal: 0`
+fn renderDeviceLayerSummary(
     buf: *[512]u8,
-    mode: CudaTopologyMode,
-    n_layers: usize,
-    split_layer: ?usize,
+    summary: DeviceLayerSummary,
 ) ?[*:0]const u8 {
     const bar_width: usize = 40;
-    if (mode == .single or n_layers == 0) return null;
-
-    const cpu_layers: usize = switch (mode) {
-        .cpu_gpu, .cpu_gpu_gpu => split_layer orelse 0,
-        .pipeline2 => 0,
-        .single => unreachable,
-    };
-    const gpu_layers: usize = n_layers - cpu_layers;
-
-    const w_cpu: usize = if (cpu_layers > 0) (cpu_layers * bar_width + n_layers / 2) / n_layers else 0;
-    const w_gpu: usize = bar_width - w_cpu;
+    const total_layers = summary.totalLayers();
+    if (total_layers == 0) return null;
 
     const yellow = "\x1b[33m";
     const cyan = "\x1b[36m";
+    const green = "\x1b[32m";
+    const magenta = "\x1b[35m";
     const reset = "\x1b[0m";
+    const segments = [_]DeviceBarSegment{
+        .{ .layers = summary.cpu_layers, .color = yellow },
+        .{ .layers = summary.gpu0_layers, .color = cyan },
+        .{ .layers = summary.gpu1_layers, .color = green },
+        .{ .layers = summary.metal_layers, .color = magenta },
+    };
+    var widths = [_]usize{0} ** segments.len;
+    fillDeviceBarSegmentWidths(segments[0..], widths[0..], total_layers, bar_width);
 
     var stream = std.io.fixedBufferStream(buf);
     const w = stream.writer();
 
     w.writeAll("[") catch return null;
-    if (w_cpu > 0) {
-        w.writeAll(yellow) catch return null;
-        for (0..w_cpu) |_| w.writeByte('#') catch return null;
+    for (segments, 0..) |segment, idx| {
+        const width = widths[idx];
+        if (width == 0) continue;
+        w.writeAll(segment.color) catch return null;
+        for (0..width) |_| w.writeByte('#') catch return null;
         w.writeAll(reset) catch return null;
     }
-    w.writeAll(cyan) catch return null;
-    for (0..w_gpu) |_| w.writeByte('#') catch return null;
-    w.writeAll(reset) catch return null;
 
-    w.print("] {d}/{d}", .{ n_layers, n_layers }) catch return null;
-    if (cpu_layers > 0) {
-        w.print("  {s}cpu {d}{s} \xc2\xb7 {s}gpu {d}{s}", .{ yellow, cpu_layers, reset, cyan, gpu_layers, reset }) catch return null;
+    w.print("] {d}/{d}  {s}cpu: {d}{s}", .{ total_layers, total_layers, yellow, summary.cpu_layers, reset }) catch return null;
+    switch (summary.gpu_stage_count) {
+        0 => w.print(" \xc2\xb7 {s}gpu: 0{s}", .{ cyan, reset }) catch return null,
+        1 => w.print(" \xc2\xb7 {s}gpu{d}: {d}{s}", .{ cyan, summary.gpu0_ordinal, summary.gpu0_layers, reset }) catch return null,
+        else => {
+            w.print(" \xc2\xb7 {s}gpu{d}: {d}{s}", .{ cyan, summary.gpu0_ordinal, summary.gpu0_layers, reset }) catch return null;
+            w.print(" \xc2\xb7 {s}gpu{d}: {d}{s}", .{ green, summary.gpu1_ordinal, summary.gpu1_layers, reset }) catch return null;
+        },
     }
+    w.print(" \xc2\xb7 {s}metal: {d}{s}", .{ magenta, summary.metal_layers, reset }) catch return null;
 
     const pos = stream.pos;
     if (pos >= buf.len) return null;
     buf[pos] = 0;
     return @ptrCast(buf[0..pos :0]);
+}
+
+fn publishDeviceLayerSummary(progress: progress_mod.Context, summary: DeviceLayerSummary) void {
+    var bar_buf: [512]u8 = undefined;
+    const msg = renderDeviceLayerSummary(&bar_buf, summary) orelse return;
+    progress.addLine(2, "Devices", 0, msg, null);
+    progress.completeLine(2);
+}
+
+const CudaResolvedLayerRange = struct {
+    split_layer: usize = 0,
+    split_layer_stage2: usize = 0,
+};
+
+fn cudaDeviceLayerSummary(topology: CudaTopology, range: CudaResolvedLayerRange, total_layers: usize) DeviceLayerSummary {
+    return switch (topology.mode) {
+        .single => .{
+            .gpu_stage_count = 1,
+            .gpu0_ordinal = topology.primaryDeviceOrdinal(),
+            .gpu0_layers = total_layers,
+        },
+        .pipeline2 => .{
+            .gpu_stage_count = 2,
+            .gpu0_ordinal = topology.stage_device_ordinals[0],
+            .gpu0_layers = range.split_layer,
+            .gpu1_ordinal = topology.stage_device_ordinals[1],
+            .gpu1_layers = total_layers - range.split_layer,
+        },
+        .cpu_gpu => .{
+            .cpu_layers = range.split_layer,
+            .gpu_stage_count = 1,
+            .gpu0_ordinal = topology.stage_device_ordinals[0],
+            .gpu0_layers = total_layers - range.split_layer,
+        },
+        .cpu_gpu_gpu => .{
+            .cpu_layers = range.split_layer,
+            .gpu_stage_count = 2,
+            .gpu0_ordinal = topology.stage_device_ordinals[0],
+            .gpu0_layers = range.split_layer_stage2 - range.split_layer,
+            .gpu1_ordinal = topology.stage_device_ordinals[1],
+            .gpu1_layers = total_layers - range.split_layer_stage2,
+        },
+    };
 }
 
 fn initCuda(
@@ -1334,28 +1459,41 @@ fn initCuda(
     }
     const cuda_max_batch_size = resolveMaxBatchSize(.cuda);
     const n_layers = loaded.blocks.len;
-    const cpu_layer_count: usize = switch (topology.mode) {
-        .cpu_gpu, .cpu_gpu_gpu => topology.split_layer orelse 0,
-        .pipeline2, .single => 0,
-    };
-    const gpu_layer_count: usize = n_layers - cpu_layer_count;
+    const resolved_layer_range = try cuda.BackendType.computeInitLayerRange(.{
+        .topology_mode = topology.mode,
+        .stage_device_ordinals = topology.stage_device_ordinals,
+        .split_layer = topology.split_layer,
+        .split_layer_stage2 = topology.split_layer_stage2,
+    }, n_layers, loaded.config);
+    const resolved_summary = cudaDeviceLayerSummary(topology, .{
+        .split_layer = resolved_layer_range.split_layer,
+        .split_layer_stage2 = resolved_layer_range.split_layer_stage2,
+    }, n_layers);
+    const cpu_layer_count = resolved_summary.cpu_layers;
+    const gpu_layer_count = resolved_summary.gpu0_layers + resolved_summary.gpu1_layers;
+    const gpu0_layer_count = resolved_summary.gpu0_layers;
+    const gpu1_layer_count = resolved_summary.gpu1_layers;
+    const split_layer_stage2_value = if (topology.mode == .cpu_gpu_gpu) resolved_layer_range.split_layer_stage2 else n_layers;
     log.info("inference", "CUDA backend init config", .{
         .max_batch = cuda_max_batch_size,
         .topology = @tagName(topology.mode),
         .cpu_layers = cpu_layer_count,
         .gpu_layers = gpu_layer_count,
+        .gpu0_layers = gpu0_layer_count,
+        .gpu1_layers = gpu1_layer_count,
+        .split_layer = resolved_layer_range.split_layer,
+        .split_layer_stage2 = split_layer_stage2_value,
         .total_layers = n_layers,
         .device = topology.primaryDeviceOrdinal(),
     });
     const total_layers: u64 = @intCast(n_layers);
 
-    // For multi-device topologies, render a colored bar in the message field.
-    // Use spinner mode (total=0) so we control the entire visual via {msg}.
-    // Yellow(\x1b[33m) = CPU, Cyan(\x1b[36m) = GPU0/gpu, Green(\x1b[32m) = GPU1.
-    const use_colored_bar = topology.mode != .single;
-    const bar_total: u64 = if (use_colored_bar) 0 else total_layers;
+    // Multi-stage topologies use spinner mode so the completed line can be the
+    // colored layer ownership summary. Single-GPU keeps the load progress bar
+    // during init, then publishes the same summary before completion.
+    const bar_total: u64 = if (topology.mode != .single) 0 else total_layers;
 
-    progress.addLine(1, "Devices", bar_total, null, null);
+    progress.addLine(1, "Loading", bar_total, null, null);
     const cuda_backend_state = if (has_cuda)
         try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size, .{
             .device_ordinal = topology.primaryDeviceOrdinal(),
@@ -1368,13 +1506,8 @@ fn initCuda(
     else
         unreachable;
 
-    if (use_colored_bar) {
-        var bar_buf: [512]u8 = undefined;
-        if (renderColoredBar(&bar_buf, topology.mode, n_layers, topology.split_layer)) |msg| {
-            progress.updateLine(1, 0, msg);
-        }
-    }
     progress.completeLine(1);
+    publishDeviceLayerSummary(progress, resolved_summary);
     log.info("inference", "Backend selected: cuda", .{ .reason = reason });
     return .{ .cuda = cuda_backend_state };
 }
@@ -1382,6 +1515,60 @@ fn initCuda(
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "renderDeviceLayerSummary reports all layers on one CUDA GPU" {
+    var buf: [512]u8 = undefined;
+    const rendered = renderDeviceLayerSummary(&buf, .{
+        .gpu_stage_count = 1,
+        .gpu0_ordinal = 0,
+        .gpu0_layers = 32,
+    }) orelse return error.TestExpectedEqual;
+    const text = std.mem.span(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "] 32/32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cpu: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "gpu0: 32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "metal: 0") != null);
+}
+
+test "renderDeviceLayerSummary reports CPU prefix and CUDA GPU stages" {
+    var buf: [512]u8 = undefined;
+    const rendered = renderDeviceLayerSummary(&buf, .{
+        .cpu_layers = 10,
+        .gpu_stage_count = 2,
+        .gpu0_ordinal = 0,
+        .gpu0_layers = 21,
+        .gpu1_ordinal = 1,
+        .gpu1_layers = 1,
+    }) orelse return error.TestExpectedEqual;
+    const text = std.mem.span(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "] 32/32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cpu: 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "gpu0: 21") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "gpu1: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "metal: 0") != null);
+}
+
+test "renderDeviceLayerSummary reports CPU and Metal backends with zero GPU class" {
+    var cpu_buf: [512]u8 = undefined;
+    const cpu_rendered = renderDeviceLayerSummary(&cpu_buf, .{
+        .cpu_layers = 32,
+    }) orelse return error.TestExpectedEqual;
+    const cpu_text = std.mem.span(cpu_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, cpu_text, "cpu: 32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cpu_text, "gpu: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cpu_text, "metal: 0") != null);
+
+    var metal_buf: [512]u8 = undefined;
+    const metal_rendered = renderDeviceLayerSummary(&metal_buf, .{
+        .metal_layers = 32,
+    }) orelse return error.TestExpectedEqual;
+    const metal_text = std.mem.span(metal_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, metal_text, "cpu: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metal_text, "gpu: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metal_text, "metal: 32") != null);
+}
 
 test "isMetalSupported supports quantized and bf16" {
     var config = std.mem.zeroes(ModelConfig);

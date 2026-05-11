@@ -237,7 +237,13 @@ pub fn main() !void {
     defer tok.deinit();
 
     // Initialize backend (CPU only for dump, batch size 1)
-    var backend = try FusedCpuBackend.init(allocator, &loaded, 1, progress_mod.ProgressContext.NONE);
+    var backend = try FusedCpuBackend.init(allocator, &loaded, .{
+        .max_batch_size = 1,
+        .max_sequence_len = @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
+        .layer_range = .{ .start = 0, .end = @intCast(loaded.config.n_layers) },
+        .build_logits_head = true,
+        .progress = progress_mod.ProgressContext.NONE,
+    });
     defer backend.deinit();
 
     // Tokenize prompt

@@ -85,6 +85,8 @@ pub const FusedCpuBackend = struct {
 
     /// CPU kernel blocks
     blocks: []cpu_blocks.TransformerBlock,
+    /// CPU-owned tensors materialized from CUDA-native packed weights.
+    materialized_weights: cpu_blocks.MaterializedWeightStore,
     /// Runtime RoPE objects owned by CPU backend (model loader stays data-only).
     rope_global: ?*cpu_blocks.RoPE = null,
     rope_local: ?*cpu_blocks.RoPE = null,
@@ -136,6 +138,11 @@ pub const FusedCpuBackend = struct {
     head_dim: usize,
     /// Cached at init: whether all layers support batched slot decode.
     supports_batched_decode_slots: bool,
+    /// Global decoder-layer range owned by this CPU backend instance.
+    layer_range: LayerRange,
+    /// False for CPU stage0 in staged CUDA topologies; such stages only
+    /// produce hidden activations for the next backend.
+    build_logits_head: bool,
 
     // Optional prefill progress callback (set by caller before generation)
     prefill_progress_fn: ?PrefillProgressFn = null,
@@ -146,6 +153,16 @@ pub const FusedCpuBackend = struct {
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
     pub const PrefillVisionInput = vision_runtime_mod.PrefillVisionInput;
+
+    pub const LayerRange = cpu_blocks.LayerRange;
+
+    pub const InitOptions = struct {
+        max_batch_size: usize,
+        max_sequence_len: usize,
+        layer_range: ?LayerRange = null,
+        build_logits_head: bool = true,
+        progress: progress_mod.Context = progress_mod.Context.NONE,
+    };
 
     const max_state_bindings_per_slot: usize = runtime_contract.max_state_descriptors;
 
@@ -354,27 +371,35 @@ pub const FusedCpuBackend = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
-        max_batch_size: usize,
-        max_sequence_len: usize,
-        progress: progress_mod.Context,
+        options: InitOptions,
     ) !FusedCpuBackend {
-        if (!loaded.config.tie_word_embeddings and loaded.lm_head == null) {
+        if (options.max_batch_size == 0) return error.InvalidArgument;
+        const layer_total: usize = @intCast(loaded.config.n_layers);
+        const layer_range = options.layer_range orelse LayerRange{ .start = 0, .end = layer_total };
+        if (layer_range.start > layer_range.end or layer_range.end > layer_total) return error.InvalidLayerRange;
+        const layer_count = layer_range.len();
+        if (layer_count == 0) return error.InvalidLayerRange;
+        if (options.build_logits_head and !loaded.config.tie_word_embeddings and loaded.lm_head == null) {
             return error.MissingLmHead;
         }
 
         const model_width: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
-        const layer_total: usize = @intCast(loaded.config.n_layers);
         const head_total: usize = @intCast(loaded.config.n_heads);
         const kv_head_total: usize = @intCast(loaded.config.n_kv_groups); // n_kv_groups = n_kv_heads
         const head_dim: usize = @intCast(loaded.config.head_dim);
+        const max_batch_size = options.max_batch_size;
+        const max_sequence_len = options.max_sequence_len;
+        const progress = options.progress;
 
         // Progress: n_layers (buildBlocks) + 3 (KV cache, scratch, model build)
-        const progress_total: u64 = @intCast(layer_total + 3);
-        progress.addLine(1, "Devices", progress_total, null, null);
+        const progress_total: u64 = @intCast(layer_count + 3);
+        progress.addLine(1, "Loading", progress_total, null, null);
 
         var runtime_rope = try initRuntimeRopeHandles(allocator, loaded, max_sequence_len);
         errdefer deinitRuntimeRopeHandles(allocator, &runtime_rope);
+        var materialized_weights = cpu_blocks.MaterializedWeightStore.init(allocator);
+        errdefer materialized_weights.deinit();
 
         const cpu_block_set = cpu_blocks.buildBlocksFromLayers(
             allocator,
@@ -382,6 +407,8 @@ pub const FusedCpuBackend = struct {
             loaded.config,
             loaded.runtime,
             loaded.blocks,
+            layer_range,
+            &materialized_weights,
             progress,
         ) catch |err| {
             log.warn("inference", "CPU block build failed", .{
@@ -415,7 +442,7 @@ pub const FusedCpuBackend = struct {
             .n_kv_heads = kv_head_total,
             .head_dim = head_dim,
         };
-        const layer_kv_shapes = try allocator.alloc(kv_cache_mod.LayeredBatchedKVCache.LayerShape, layer_total);
+        const layer_kv_shapes = try allocator.alloc(kv_cache_mod.LayeredBatchedKVCache.LayerShape, layer_count);
         defer allocator.free(layer_kv_shapes);
         for (layer_kv_shapes) |*shape| shape.* = default_layer_kv_shape;
 
@@ -458,7 +485,7 @@ pub const FusedCpuBackend = struct {
             kv_quant_mode,
         );
         errdefer kv_cache.deinit();
-        progress.updateLine(1, @intCast(layer_total + 1), null);
+        progress.updateLine(1, @intCast(layer_count + 1), null);
 
         // Build batched attention scratch
         var batched_attn_scratch = try BatchedAttnTemp.init(
@@ -476,7 +503,7 @@ pub const FusedCpuBackend = struct {
             allocator,
             model_width,
             max_d_ff,
-            layer_total,
+            layer_count,
             max_batch_size,
         );
         errdefer scratch.deinit();
@@ -490,7 +517,10 @@ pub const FusedCpuBackend = struct {
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
         // Build executor model
-        var model = Transformer.build(allocator, loaded, cpu_block_set) catch |err| {
+        var model = Transformer.build(allocator, loaded, cpu_block_set, .{
+            .layer_offset = layer_range.start,
+            .build_logits_head = options.build_logits_head,
+        }) catch |err| {
             log.warn("inference", "CPU model build failed", .{
                 .reason = @errorName(err),
             });
@@ -554,7 +584,7 @@ pub const FusedCpuBackend = struct {
             );
             log.info("inference", "Heterogeneous model detected", .{
                 .mamba_layers = mamba_layer_indices.items.len,
-                .attention_layers = @as(usize, layer_total) - mamba_layer_indices.items.len,
+                .attention_layers = layer_count - mamba_layer_indices.items.len,
             });
         }
 
@@ -596,13 +626,13 @@ pub const FusedCpuBackend = struct {
             );
             log.info("inference", "ShortConv heterogeneous model detected", .{
                 .shortconv_layers = shortconv_layer_indices.items.len,
-                .attention_layers = @as(usize, layer_total) - shortconv_layer_indices.items.len,
+                .attention_layers = layer_count - shortconv_layer_indices.items.len,
             });
         }
 
         // Ensure scratch has space for at least 1 token
         try scratch.ensureForMode(.decode, 1);
-        progress.updateLine(1, @intCast(layer_total + 2), null);
+        progress.updateLine(1, @intCast(layer_count + 2), null);
 
         progress.updateLine(1, progress_total, null);
         // Note: completeLine(1) is called by the caller after warmup, so the
@@ -611,6 +641,7 @@ pub const FusedCpuBackend = struct {
         // Log model structure at debug level
         log.debug("inference", "Model loaded", .{
             .n_layers = layer_total,
+            .owned_layers = layer_count,
             .d_model = model_width,
             .n_heads = head_total,
             .n_kv_heads = kv_head_total,
@@ -651,6 +682,7 @@ pub const FusedCpuBackend = struct {
             .loaded = loaded,
             .model = model,
             .blocks = cpu_block_set,
+            .materialized_weights = materialized_weights,
             .rope_global = runtime_rope.global,
             .rope_local = runtime_rope.local,
             .kv_cache = kv_cache,
@@ -672,11 +704,13 @@ pub const FusedCpuBackend = struct {
             .d_model = model_width,
             .vocab_size = vocab_size,
             .max_batch_size = max_batch_size,
-            .n_layers = layer_total,
+            .n_layers = layer_count,
             .n_heads = max_heads,
             .n_kv_heads = max_kv_heads,
             .head_dim = max_head_dim,
             .supports_batched_decode_slots = model.supportsBatchedDecodeSlots(),
+            .layer_range = layer_range,
+            .build_logits_head = options.build_logits_head,
         };
     }
 
@@ -704,6 +738,7 @@ pub const FusedCpuBackend = struct {
         self.model.deinit(self.allocator);
         for (self.blocks) |*block| block.deinit(self.allocator);
         self.allocator.free(self.blocks);
+        self.materialized_weights.deinit();
         self.scratch.deinit();
         self.batched_attn_scratch.deinit();
         self.kv_cache.deinit();
@@ -714,6 +749,26 @@ pub const FusedCpuBackend = struct {
     /// teardown does not need an extra device barrier here.
     pub fn synchronize(self: *FusedCpuBackend) void {
         _ = self;
+    }
+
+    fn fullModelLayerRange(self: *const FusedCpuBackend) bool {
+        return self.layer_range.start == 0 and self.layer_range.end == @as(usize, @intCast(self.loaded.config.n_layers));
+    }
+
+    fn localLayerRange(self: *const FusedCpuBackend, layer_start: usize, layer_end: usize) !LayerRange {
+        if (layer_end < layer_start) return error.InvalidLayerRange;
+        if (layer_start < self.layer_range.start or layer_end > self.layer_range.end) {
+            return error.InvalidTopologyConfig;
+        }
+        return .{
+            .start = layer_start - self.layer_range.start,
+            .end = layer_end - self.layer_range.start,
+        };
+    }
+
+    fn ensureFullModelRoute(self: *const FusedCpuBackend) !void {
+        if (!self.fullModelLayerRange()) return error.InvalidTopologyConfig;
+        if (!self.build_logits_head) return error.InvalidTopologyConfig;
     }
 
     // =========================================================================
@@ -808,6 +863,35 @@ pub const FusedCpuBackend = struct {
             }
         }
         binding.count = @intCast(state_blocks.len);
+        binding.bound = true;
+    }
+
+    pub fn bindLocalRuntimeStateBlocks(self: *FusedCpuBackend, slot_index: usize) !void {
+        if (slot_index >= self.slot_state_bindings.len) return error.InvalidArgument;
+        var binding = &self.slot_state_bindings[slot_index];
+        binding.reset();
+
+        const descriptors = self.stateDescriptors();
+        if (descriptors.len > max_state_bindings_per_slot) return error.InvalidStateDescriptorBinding;
+        for (descriptors, 0..) |descriptor, idx| {
+            if (descriptor.runtime_kind == runtime_contract.state_runtime_kind_none) {
+                return error.InvalidStateDescriptorBinding;
+            }
+            if (descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
+            if (descriptor.size_bytes > binding.local_blocks[idx].len) return error.InvalidStateDescriptorBinding;
+
+            const block_storage = &binding.local_blocks[idx];
+            if (descriptor.zero_init) @memset(block_storage, 0);
+            var local_handle: runtime_contract.StateBlockHandle = .{
+                .id = descriptor.id,
+                .ptr = block_storage[0..].ptr,
+                .size = block_storage.len,
+                .align_bytes = 64,
+            };
+            try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &local_handle);
+            binding.handles[idx] = local_handle;
+        }
+        binding.count = @intCast(descriptors.len);
         binding.bound = true;
     }
 
@@ -906,6 +990,7 @@ pub const FusedCpuBackend = struct {
     /// This resets the KV cache and processes the full prompt.
     /// Uses slot 0 for single-sequence operation.
     pub fn prefill(self: *FusedCpuBackend, tokens: []const u32, logits_out: []f32) !void {
+        try self.ensureFullModelRoute();
         // Always use slot 0 for single-sequence mode.
         self.ensureSlotStateBlocksBound(0) catch |err| {
             log.warn("inference", "CPU warmup slot-state binding check failed", .{
@@ -926,6 +1011,7 @@ pub const FusedCpuBackend = struct {
     /// Returns logits for the next token prediction.
     /// Uses graph-based model.forwardWithBatchedCache for architecture coverage.
     pub fn decode(self: *FusedCpuBackend, token: u32, position: usize, logits_out: []f32) !void {
+        try self.ensureFullModelRoute();
         try self.ensureSlotStateBlocksBound(0);
         try self.scratch.ensureForMode(.decode, 1);
         const model_dim = self.d_model;
@@ -986,6 +1072,7 @@ pub const FusedCpuBackend = struct {
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
     ) !usize {
+        try self.ensureFullModelRoute();
         try self.ensureSlotStateBlocksBound(0);
         try self.scratch.ensureForMode(.decode, 1);
         _ = start_position; // Position tracked internally
@@ -1058,6 +1145,7 @@ pub const FusedCpuBackend = struct {
     /// Single-step decode for one slot, returning logits for sampling.
     /// This is the minimal per-token operation used by the scheduler's single-request route.
     pub fn decodeStep(self: *FusedCpuBackend, slot_index: usize, token: u32) ![]f32 {
+        try self.ensureFullModelRoute();
         try self.ensureSlotStateBlocksBound(slot_index);
         try self.scratch.ensureForMode(.decode, 1);
         const model_dim = self.d_model;
@@ -1115,7 +1203,8 @@ pub const FusedCpuBackend = struct {
         // dynamic growth is needed, so ensure_kv_capacity is intentionally a no-op.
         _ = ensure_kv_capacity;
         if (!compute_logits and download_logits) return error.InvalidArgument;
-        if (layer_end < layer_start or layer_end > self.model.layers.len) return error.InvalidArgument;
+        const local_range = try self.localLayerRange(layer_start, layer_end);
+        if (compute_logits and !self.build_logits_head) return error.InvalidTopologyConfig;
         if (download_logits and logits_out_opt == null) return error.InvalidArgument;
         if (logits_out_opt) |logits_out| {
             if (logits_out.len != self.vocab_size) return error.InvalidArgument;
@@ -1169,8 +1258,8 @@ pub const FusedCpuBackend = struct {
             slot_index,
             token_ids,
             true,
-            layer_start,
-            layer_end,
+            local_range.start,
+            local_range.end,
         );
         if (!compute_logits) return;
 
@@ -1275,6 +1364,7 @@ pub const FusedCpuBackend = struct {
         layer_end: usize,
         source_embeddings_out: ?[]f32,
     ) !void {
+        const local_range = try self.localLayerRange(0, layer_end);
         try self.ensureSlotStateBlocksBound(slot_index);
         if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
             layered_cache.resetSlot(slot_index);
@@ -1310,8 +1400,8 @@ pub const FusedCpuBackend = struct {
             slot_index,
             tokens,
             false,
-            0,
-            layer_end,
+            local_range.start,
+            local_range.end,
         );
     }
 
@@ -1323,6 +1413,7 @@ pub const FusedCpuBackend = struct {
         vision_input: ?*const PrefillVisionInput,
         logits_out: []f32,
     ) !void {
+        try self.ensureFullModelRoute();
         try self.ensureSlotStateBlocksBound(slot_index);
         const prompt_len = tokens.len;
         if (prompt_len == 0) return;
@@ -1699,6 +1790,7 @@ pub const FusedCpuBackend = struct {
         requests: []const DecodeRequest,
         results: []DecodeResult,
     ) !void {
+        try self.ensureFullModelRoute();
         const request_total = requests.len;
         if (request_total == 0) return;
         std.debug.assert(results.len >= request_total);
@@ -1836,6 +1928,7 @@ pub const FusedCpuBackend = struct {
         row_count: usize,
         logits_out: []f32,
     ) !void {
+        if (!self.build_logits_head) return error.InvalidTopologyConfig;
         const lm_head_ptr = &(self.loaded.lm_head orelse return error.MissingLmHead);
         const lm_head_kernel_name = switch (lm_head_ptr.dtype) {
             .bf16 => "matmul_lm_head_bf16",
@@ -2675,6 +2768,64 @@ test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
     try std.testing.expectEqual(@intFromPtr(&backend.kv_cache), @intFromPtr(kv_state.layered_cache));
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, scratch_state.runtime_kind);
+}
+
+test "bindLocalRuntimeStateBlocks synthesizes stage-local runtime bindings" {
+    var backend: FusedCpuBackend = undefined;
+    backend.state_descriptor_count = 2;
+    backend.state_descriptors_storage[0] = .{
+        .id = 91,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    backend.state_descriptors_storage[1] = .{
+        .id = 92,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_gated_delta_cache,
+    };
+    backend.slot_state_bindings = try std.testing.allocator.alloc(FusedCpuBackend.SlotStateBinding, 1);
+    defer std.testing.allocator.free(backend.slot_state_bindings);
+    backend.slot_state_bindings[0] = .{};
+    backend.kv_cache = undefined;
+    backend.scratch = undefined;
+
+    try backend.bindLocalRuntimeStateBlocks(0);
+    defer backend.unbindSlotStateBlocks(0);
+
+    const bound = backend.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 2), bound.len);
+    try std.testing.expectEqual(@as(u8, 91), bound[0].id);
+    try std.testing.expectEqual(@as(u8, 92), bound[1].id);
+    const kv_state = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, &bound[0]) orelse return error.TestUnexpectedResult;
+    const recurrent_state = runtime_contract.stateValueFromBlock(*state_bindings.RecurrentRuntimeState, &bound[1]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_gated_delta_cache, recurrent_state.runtime_kind);
+}
+
+test "bindLocalRuntimeStateBlocks rejects opaque descriptors" {
+    var backend: FusedCpuBackend = undefined;
+    backend.state_descriptor_count = 1;
+    backend.state_descriptors_storage[0] = .{
+        .id = 93,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_none,
+    };
+    backend.slot_state_bindings = try std.testing.allocator.alloc(FusedCpuBackend.SlotStateBinding, 1);
+    defer std.testing.allocator.free(backend.slot_state_bindings);
+    backend.slot_state_bindings[0] = .{};
+    backend.kv_cache = undefined;
+    backend.scratch = undefined;
+
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, backend.bindLocalRuntimeStateBlocks(0));
 }
 
 test "bindSlotStateBlocks preserves bound slot index in runtime payload" {

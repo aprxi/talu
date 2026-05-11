@@ -628,6 +628,10 @@ pub const Transformer = struct {
     tensor_count: usize = 0,
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
+    pub const BuildOptions = struct {
+        layer_offset: usize = 0,
+        build_logits_head: bool = true,
+    };
     pub const DeepstackAdditions = struct {
         /// Token positions in the prompt where visual placeholders were scattered.
         positions: []const usize,
@@ -1593,6 +1597,7 @@ pub const Transformer = struct {
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
         blocks: []const cpu_blocks.TransformerBlock,
+        options: BuildOptions,
     ) !Transformer {
         const model_config = loaded.config;
         const layer_count = blocks.len;
@@ -1609,36 +1614,37 @@ pub const Transformer = struct {
 
         // Get block program for each layer (handles heterogeneous models)
         // For heterogeneous models, each layer may have a different program (e.g., Mamba vs Attention).
-        for (blocks, 0..) |*block, layer_idx| {
+        for (blocks, 0..) |*block, local_layer_idx| {
             const block_kind = block.block_type;
             const layer_program = try resolveLayerProgram(static_entry, block_kind);
-            block_layers[layer_idx] = try buildBlock(allocator, block, model_config, layer_idx, layer_program, static_entry);
-            built_layers = layer_idx + 1;
-            try block_layers[layer_idx].validate();
+            const global_layer_idx = options.layer_offset + local_layer_idx;
+            block_layers[local_layer_idx] = try buildBlock(allocator, block, model_config, global_layer_idx, layer_program, static_entry);
+            built_layers = local_layer_idx + 1;
+            try block_layers[local_layer_idx].validate();
         }
 
         // Build embedding
         const embed_tokens = Embedding.init(&loaded.token_embeddings);
 
         // Build final norm (optional — embed-only models may not have one)
-        const final_norm: ?RMSNorm = if (loaded.ln_final) |*ln_f|
-            RMSNorm{
-                .weight = ln_f,
-                .dim = @intCast(model_config.d_model),
-                .eps = model_config.norm_eps,
-                .weight_offset = loaded.runtime.weight_offset,
-                .trace_point = .final_norm,
+        const final_norm: ?RMSNorm = if (options.build_logits_head) blk: {
+            if (loaded.ln_final) |*ln_f| {
+                break :blk RMSNorm{
+                    .weight = ln_f,
+                    .dim = @intCast(model_config.d_model),
+                    .eps = model_config.norm_eps,
+                    .weight_offset = loaded.runtime.weight_offset,
+                    .trace_point = .final_norm,
+                };
             }
-        else
-            null;
+            break :blk null;
+        } else null;
 
         // Build LM head if not tied (optional — embed-only models may not have one)
-        const lm_head: ?Linear = if (loaded.lm_head) |*head|
-            try Linear.init(head, null)
-        else if (model_config.tie_word_embeddings)
-            null
-        else
-            null;
+        const lm_head: ?Linear = if (options.build_logits_head) blk: {
+            if (loaded.lm_head) |*head| break :blk try Linear.init(head, null);
+            break :blk null;
+        } else null;
         const per_layer_branch = try initPerLayerBranchRuntime(allocator, loaded, layer_count);
         const layer_scalars = try initStandaloneLayerScalars(allocator, loaded, layer_count);
 
@@ -1651,7 +1657,7 @@ pub const Transformer = struct {
             .layers = block_layers,
             .norm = final_norm,
             .lm_head = lm_head,
-            .tie_word_embeddings = model_config.tie_word_embeddings,
+            .tie_word_embeddings = options.build_logits_head and model_config.tie_word_embeddings,
             .hidden_size = @intCast(model_config.d_model),
             .vocab_size = @intCast(model_config.vocab_size),
             .num_hidden_layers = layer_count,

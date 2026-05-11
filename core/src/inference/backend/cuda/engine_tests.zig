@@ -1501,6 +1501,118 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
 }
 
+test "bindSlotStateBlocks accepts scheduler descriptor superset for staged topology" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+    var backend: CudaBackend = undefined;
+    backend.max_batch_size = 1;
+    backend.block_runtime = undefined;
+    backend.pipeline_backend0_cpu = null;
+    backend.state_descriptor_count = 1;
+    backend.state_descriptors_storage[0] = .{
+        .id = 121,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    backend.slot_state_bindings = slot_state_bindings[0..];
+
+    var stage1: CudaBackend = undefined;
+    stage1.max_batch_size = 1;
+    stage1.block_runtime = undefined;
+    stage1.pipeline_backend1 = null;
+    stage1.pipeline_backend0_cpu = null;
+    stage1.state_descriptor_count = 1;
+    stage1.state_descriptors_storage[0] = .{
+        .id = 122,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_gated_delta_cache,
+    };
+    var stage1_slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    stage1.slot_state_bindings = stage1_slot_state_bindings[0..];
+    backend.pipeline_backend1 = &stage1;
+
+    var kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    var staged_extra_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const state_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 121,
+            .ptr = kv_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+        .{
+            .id = 122,
+            .ptr = staged_extra_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+
+    try backend.bindSlotStateBlocks(0, state_blocks[0..]);
+    defer backend.unbindSlotStateBlocks(0);
+
+    const bound = backend.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 1), bound.len);
+    try std.testing.expectEqual(@as(u8, 121), bound[0].id);
+    const kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, &bound[0]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(kv_state.block_runtime));
+    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
+
+    const stage1_bound = stage1.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 1), stage1_bound.len);
+    try std.testing.expectEqual(@as(u8, 122), stage1_bound[0].id);
+}
+
+test "bindSlotStateBlocks rejects unknown scheduler descriptor extras for staged topology" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+    var backend: CudaBackend = undefined;
+    backend.max_batch_size = 1;
+    backend.block_runtime = undefined;
+    backend.pipeline_backend0_cpu = null;
+    backend.state_descriptor_count = 1;
+    backend.state_descriptors_storage[0] = .{
+        .id = 131,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    backend.slot_state_bindings = slot_state_bindings[0..];
+
+    var stage1: CudaBackend = undefined;
+    stage1.max_batch_size = 1;
+    stage1.state_descriptor_count = 0;
+    backend.pipeline_backend1 = &stage1;
+
+    var kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    var unknown_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const state_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 131,
+            .ptr = kv_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+        .{
+            .id = 132,
+            .ptr = unknown_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+
+    try std.testing.expectError(error.UnknownStateDescriptorId, backend.bindSlotStateBlocks(0, state_blocks[0..]));
+    try std.testing.expect(!backend.slot_state_bindings[0].bound);
+}
+
 test "mirrorSlotStateBlocksFrom synthesizes stage-local runtime descriptors without aliasing source" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
 
@@ -4830,6 +4942,7 @@ test "interleaved multi-slot lifecycle with pipeline stage" {
 
 const computeInitLayerRange = CudaBackend.computeInitLayerRange;
 const InitOptions = CudaBackend.InitOptions;
+const buildCpuStage0InitOptions = CudaBackend.buildCpuStage0InitOptions;
 const no_sharing_config: models.config.ModelConfig = .{
     .vocab_size = 1000,
     .d_model = 256,
@@ -5039,6 +5152,44 @@ test "computeInitLayerRange: cpu_gpu split points cover full model" {
     try std.testing.expectEqual(r.split_layer, r.start);
     try std.testing.expectEqual(total, r.end);
     try std.testing.expect(r.split_layer > 0 and r.split_layer < total);
+}
+
+test "buildCpuStage0InitOptions uses CPU-owned prefix without logits head" {
+    const opts = buildCpuStage0InitOptions(3, 512, 7);
+    const range = opts.layer_range orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), opts.max_batch_size);
+    try std.testing.expectEqual(@as(usize, 512), opts.max_sequence_len);
+    try std.testing.expectEqual(@as(usize, 0), range.start);
+    try std.testing.expectEqual(@as(usize, 7), range.end);
+    try std.testing.expect(!opts.build_logits_head);
+}
+
+test "cpu_gpu staged init derives CPU stage0 options from split layer" {
+    const total: usize = 24;
+    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 10 }, total, no_sharing_config);
+    const opts = buildCpuStage0InitOptions(2, 1024, r.split_layer);
+    const range = opts.layer_range orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(usize, 10), r.start);
+    try std.testing.expectEqual(@as(usize, 0), range.start);
+    try std.testing.expectEqual(@as(usize, 10), range.end);
+    try std.testing.expect(!opts.build_logits_head);
+}
+
+test "cpu_gpu_gpu staged init derives CPU stage0 options from first split layer" {
+    const total: usize = 24;
+    const r = try computeInitLayerRange(.{
+        .topology_mode = .cpu_gpu_gpu,
+        .split_layer = 6,
+        .split_layer_stage2 = 16,
+    }, total, no_sharing_config);
+    const opts = buildCpuStage0InitOptions(2, 1024, r.split_layer);
+    const range = opts.layer_range orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(usize, 16), r.start);
+    try std.testing.expectEqual(@as(usize, 0), range.start);
+    try std.testing.expectEqual(@as(usize, 6), range.end);
+    try std.testing.expect(!opts.build_logits_head);
 }
 
 test "computeInitLayerRange: cpu_gpu_gpu split points cover full model" {
