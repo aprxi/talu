@@ -8,6 +8,7 @@ const tensor = @import("compute_pkg").tensor;
 const config_types = @import("../config/types.zig");
 const log = @import("log_pkg");
 const op_types = @import("models_pkg").op_types;
+const manifest_mod = @import("../manifest.zig");
 
 pub const Error = error{ValidationFailed};
 
@@ -52,6 +53,133 @@ pub fn validate(loaded_model: *weights.LoadedModel) Error!void {
         }
         return err;
     };
+}
+
+pub fn validateStageModel(stage: *weights.LoadedStageModel) !void {
+    if (stage.layer_range.start >= stage.layer_range.end) return error.EmptyStageRange;
+    if (stage.blocks.len != stage.layer_range.end - stage.layer_range.start) {
+        return error.StageResidencyMismatch;
+    }
+    if (stage.config.n_layers < 0) return error.InvalidStageRange;
+    const configured_layers: usize = @intCast(stage.config.n_layers);
+    if (stage.layer_range.end > configured_layers) return error.InvalidStageRange;
+    if (stage.manifest.layer_count != configured_layers) return error.StageResidencyMismatch;
+    for (stage.blocks, 0..) |_, offset| {
+        const original_idx = try stage.originalLayerIndex(offset);
+        if (original_idx != stage.layer_range.start + offset) return error.InvalidStageLayerOffset;
+    }
+
+    var effective_roles = stage.requested_roles;
+    if (stage.lm_head_uses_token_embeddings) effective_roles.include_token_embeddings = true;
+
+    try validateStageRoleHydrated(stage, .token_embeddings, effective_roles.include_token_embeddings);
+    try validateStageRoleHydrated(stage, .final_norm, effective_roles.include_final_norm);
+    try validateStageRoleHydrated(stage, .lm_head, effective_roles.include_lm_head);
+    try validateStageRoleHydrated(stage, .embedding_side, effective_roles.include_embedding_side);
+    try validateStageRoleHydrated(stage, .vision_side, effective_roles.include_vision_side);
+    try validateStageRoleHydrated(stage, .architecture_side, effective_roles.include_architecture_side);
+    try validateStageRoleHydrated(stage, .unclassified_global, effective_roles.include_unclassified_global);
+
+    const expected = try stage.manifest.stageResidencyReport(effective_roles.toResidencyRequest(stage.layer_range));
+    if (expected.layer_start != stage.residency.layer_start or expected.layer_end != stage.residency.layer_end) {
+        return error.StageResidencyMismatch;
+    }
+    if (expected.total_checkpoint_bytes != stage.residency.total_checkpoint_bytes) {
+        return error.StageResidencyMismatch;
+    }
+    inline for (std.meta.fields(manifest_mod.TensorRole)) |field| {
+        const role: manifest_mod.TensorRole = @field(manifest_mod.TensorRole, field.name);
+        if (expected.bytesForRole(role) != stage.residency.bytesForRole(role)) {
+            return error.StageResidencyMismatch;
+        }
+    }
+
+    try validateStageShapeContract(stage);
+}
+
+fn validateStageRoleHydrated(
+    stage: *const weights.LoadedStageModel,
+    role: manifest_mod.TensorRole,
+    requested: bool,
+) !void {
+    if (!requested) return;
+    const planned_bytes = stage.residency.bytesForRole(role);
+    if (planned_bytes == 0) return;
+    const hydrated = switch (role) {
+        .token_embeddings => stage.token_embeddings != null,
+        .final_norm => stage.ln_final != null,
+        .lm_head => stage.lm_head != null,
+        .embedding_side => stage.position_embeddings != null or
+            stage.token_type_embeddings != null or
+            stage.embedding_norm_weight != null or
+            stage.embedding_norm_bias != null or
+            stage.extra_global_role_bytes[@intFromEnum(role)] > 0,
+        .vision_side, .architecture_side, .unclassified_global => stage.extra_global_role_bytes[@intFromEnum(role)] > 0,
+        .decoder_layer => stage.blocks.len > 0,
+        .quant_companion => true,
+    };
+    if (!hydrated) return error.MissingStageGlobalWeight;
+}
+
+fn validateStageShapeContract(stage: *weights.LoadedStageModel) Error!void {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var writer = fbs.writer().any();
+    var reporter = Reporter.init(&writer, false);
+    validateStageShapeContractCommon(&reporter, stage) catch |err| {
+        const written = fbs.getWritten();
+        if (written.len > 0) {
+            log.err("load", "Stage model validation failed", .{
+                .detail = written,
+            }, @src());
+        }
+        return err;
+    };
+}
+
+fn validateStageShapeContractCommon(reporter: *Reporter, stage: *weights.LoadedStageModel) Error!void {
+    const d_model: usize = @intCast(stage.config.d_model);
+    const vocab_size: usize = @intCast(stage.config.vocab_size);
+
+    var validation_config = stage.config;
+    validation_config.n_layers = @intCast(stage.blocks.len);
+    var validation_model = weights.LoadedModel{
+        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .config = validation_config,
+        .runtime = stage.runtime,
+        .st = null,
+        .ln_final = stage.ln_final,
+        .lm_head = stage.lm_head,
+        .token_embeddings = stage.token_embeddings orelse shapeOnlyTensor2D(vocab_size, d_model),
+        .position_embeddings = stage.position_embeddings,
+        .token_type_embeddings = stage.token_type_embeddings,
+        .embedding_norm_weight = stage.embedding_norm_weight,
+        .embedding_norm_bias = stage.embedding_norm_bias,
+        .blocks = stage.blocks,
+        .original_weight_dtype = stage.original_weight_dtype,
+        .file_size = stage.file_size,
+        .tensor_count = stage.tensor_count,
+        .manifest = null,
+    };
+    defer validation_model.arena.deinit();
+
+    try validateCommon(reporter, &validation_model);
+
+    if (stage.ln_final) |ln_final| {
+        if (!isVectorShape(&ln_final, d_model))
+            return reporter.reportError("final norm shape mismatch (n_dims={}, shape0={}, expected={})", .{
+                ln_final.n_dims, ln_final.shape[0], d_model,
+            });
+    }
+}
+
+fn shapeOnlyTensor2D(dim0: usize, dim1: usize) tensor.Tensor {
+    var tensor_view = std.mem.zeroes(tensor.Tensor);
+    tensor_view.dtype = .f32;
+    tensor_view.n_dims = 2;
+    tensor_view.shape[0] = @intCast(dim0);
+    tensor_view.shape[1] = @intCast(dim1);
+    return tensor_view;
 }
 
 fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void {
@@ -701,6 +829,199 @@ test "Reporter.reportInfo: handles multiple arguments" {
     reporter.reportInfo("layer {}: shape [{}, {}]", .{ 5, 128, 256 });
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "layer 5: shape [128, 256]\n") != null);
+}
+
+const validation_stage_shape_2d = [_]usize{ 4, 4 };
+
+fn makeValidationStageManifest(
+    allocator: std.mem.Allocator,
+    layer_count: usize,
+    entries: []const manifest_mod.TensorManifestEntry,
+) !manifest_mod.ModelManifest {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const stored_entries = try arena_allocator.alloc(manifest_mod.TensorManifestEntry, entries.len);
+    @memcpy(stored_entries, entries);
+
+    var role_bytes = [_]usize{0} ** manifest_mod.role_count;
+    var total_checkpoint_bytes: usize = 0;
+    for (stored_entries) |entry| {
+        role_bytes[@intFromEnum(entry.role)] +|= entry.checkpoint_bytes;
+        total_checkpoint_bytes +|= entry.checkpoint_bytes;
+    }
+
+    return .{
+        .arena = arena,
+        .architecture_id = "validation_stage",
+        .layer_count = layer_count,
+        .entries = stored_entries,
+        .total_checkpoint_bytes = total_checkpoint_bytes,
+        .role_bytes = role_bytes,
+    };
+}
+
+fn stageBlockStorage() [1]weights.blocks.LayerWeights {
+    return .{.{ .block_type = .attention_mlp, .weight_map = .{}, .map_context = .{} }};
+}
+
+test "manifest validateStageModel rejects blocks length mismatch" {
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.layer_range = .{ .start = 0, .end = 2 };
+    stage.blocks = &.{};
+
+    try std.testing.expectError(error.StageResidencyMismatch, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects empty stage range" {
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.layer_range = .{ .start = 1, .end = 1 };
+    stage.blocks = &.{};
+
+    try std.testing.expectError(error.EmptyStageRange, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects stage range beyond config layers" {
+    var block_storage = [_]weights.blocks.LayerWeights{
+        .{ .block_type = .attention_mlp, .weight_map = .{}, .map_context = .{} },
+        .{ .block_type = .attention_mlp, .weight_map = .{}, .map_context = .{} },
+    };
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.config.n_layers = 2;
+    stage.layer_range = .{ .start = 1, .end = 3 };
+    stage.blocks = block_storage[0..];
+    stage.manifest = try makeValidationStageManifest(std.testing.allocator, 2, &.{});
+    defer stage.manifest.deinit();
+
+    try std.testing.expectError(error.InvalidStageRange, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects missing requested global role" {
+    var blocks = stageBlockStorage();
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.config.n_layers = 1;
+    stage.layer_range = .{ .start = 0, .end = 1 };
+    stage.blocks = blocks[0..];
+    stage.requested_roles = .{ .include_token_embeddings = true };
+    stage.manifest = try makeValidationStageManifest(std.testing.allocator, 1, &.{
+        .{
+            .name = "tok.weight",
+            .dtype = .f32,
+            .shape = &validation_stage_shape_2d,
+            .checkpoint_bytes = 64,
+            .role = .token_embeddings,
+            .weight_id = "token_embeddings",
+            .status = .architecture_weight,
+        },
+    });
+    defer stage.manifest.deinit();
+    stage.residency = try stage.manifest.stageResidencyReport(stage.requested_roles.toResidencyRequest(stage.layer_range));
+
+    try std.testing.expectError(error.MissingStageGlobalWeight, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects tied lm_head missing token embedding" {
+    var blocks = stageBlockStorage();
+    const dummy_lm_head = std.mem.zeroes(tensor.Tensor);
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.config.n_layers = 1;
+    stage.layer_range = .{ .start = 0, .end = 1 };
+    stage.blocks = blocks[0..];
+    stage.requested_roles = .{ .include_lm_head = true };
+    stage.lm_head = dummy_lm_head;
+    stage.lm_head_uses_token_embeddings = true;
+    stage.manifest = try makeValidationStageManifest(std.testing.allocator, 1, &.{
+        .{
+            .name = "tok.weight",
+            .dtype = .f32,
+            .shape = &validation_stage_shape_2d,
+            .checkpoint_bytes = 64,
+            .role = .token_embeddings,
+            .weight_id = "token_embeddings",
+            .status = .architecture_weight,
+        },
+    });
+    defer stage.manifest.deinit();
+    const effective_roles = weights.StageRoleRequest{
+        .include_token_embeddings = true,
+        .include_lm_head = true,
+    };
+    stage.residency = try stage.manifest.stageResidencyReport(effective_roles.toResidencyRequest(stage.layer_range));
+
+    try std.testing.expectError(error.MissingStageGlobalWeight, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects residency mismatch" {
+    var blocks = stageBlockStorage();
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.config.n_layers = 1;
+    stage.layer_range = .{ .start = 0, .end = 1 };
+    stage.blocks = blocks[0..];
+    stage.manifest = try makeValidationStageManifest(std.testing.allocator, 1, &.{
+        .{
+            .name = "layers.0.proj.weight",
+            .dtype = .f32,
+            .shape = &validation_stage_shape_2d,
+            .checkpoint_bytes = 64,
+            .role = .decoder_layer,
+            .layer_index = 0,
+            .weight_id = "proj.weight",
+            .status = .architecture_weight,
+        },
+    });
+    defer stage.manifest.deinit();
+    stage.residency = try stage.manifest.stageResidencyReport(stage.requested_roles.toResidencyRequest(stage.layer_range));
+    stage.residency.role_bytes[@intFromEnum(manifest_mod.TensorRole.decoder_layer)] = 32;
+
+    try std.testing.expectError(error.StageResidencyMismatch, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects residency range metadata mismatch" {
+    var blocks = stageBlockStorage();
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.config.n_layers = 1;
+    stage.layer_range = .{ .start = 0, .end = 1 };
+    stage.blocks = blocks[0..];
+    stage.manifest = try makeValidationStageManifest(std.testing.allocator, 1, &.{});
+    defer stage.manifest.deinit();
+    stage.residency = .{
+        .layer_start = 1,
+        .layer_end = 2,
+    };
+
+    try std.testing.expectError(error.StageResidencyMismatch, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects malformed selected layer weights" {
+    var blocks = stageBlockStorage();
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.config.n_layers = 1;
+    stage.config.d_model = 4;
+    stage.config.d_ff = 8;
+    stage.config.head_dim = 4;
+    stage.config.n_heads = 1;
+    stage.config.n_kv_groups = 1;
+    stage.config.vocab_size = 4;
+    stage.layer_range = .{ .start = 0, .end = 1 };
+    stage.blocks = blocks[0..];
+    stage.manifest = try makeValidationStageManifest(std.testing.allocator, 1, &.{});
+    defer stage.manifest.deinit();
+    stage.residency = try stage.manifest.stageResidencyReport(stage.requested_roles.toResidencyRequest(stage.layer_range));
+
+    try std.testing.expectError(error.ValidationFailed, validateStageModel(&stage));
+}
+
+test "manifest validateStageModel rejects manifest layer count mismatch" {
+    var blocks = stageBlockStorage();
+    var stage = std.mem.zeroes(weights.LoadedStageModel);
+    stage.config.n_layers = 1;
+    stage.layer_range = .{ .start = 0, .end = 1 };
+    stage.blocks = blocks[0..];
+    stage.manifest = try makeValidationStageManifest(std.testing.allocator, 2, &.{});
+    defer stage.manifest.deinit();
+
+    try std.testing.expectError(error.StageResidencyMismatch, validateStageModel(&stage));
 }
 
 test "Reporter.reportInfo: handles empty format string" {

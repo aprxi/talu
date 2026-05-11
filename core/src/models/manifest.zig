@@ -54,6 +54,7 @@ pub const StageResidencyRequest = struct {
     include_final_norm: bool = false,
     include_lm_head: bool = false,
     include_embedding_side: bool = false,
+    include_vision_side: bool = false,
     include_architecture_side: bool = false,
     include_unclassified_global: bool = false,
 };
@@ -120,6 +121,41 @@ pub const ModelManifest = struct {
 
     pub fn bytesForRole(self: *const ModelManifest, role: TensorRole) usize {
         return self.role_bytes[@intFromEnum(role)];
+    }
+
+    pub fn hasRole(self: *const ModelManifest, role: TensorRole) bool {
+        return self.bytesForRole(role) > 0;
+    }
+
+    pub fn hasLayerWeight(self: *const ModelManifest, layer_index: usize, weight_id: []const u8) bool {
+        return self.findLayerWeight(layer_index, weight_id) != null;
+    }
+
+    pub fn findLayerWeight(
+        self: *const ModelManifest,
+        layer_index: usize,
+        weight_id: []const u8,
+    ) ?*const TensorManifestEntry {
+        for (self.entries) |*entry| {
+            if (entry.layer_index == null or entry.weight_id == null) continue;
+            if (entry.layer_index.? != layer_index) continue;
+            if (entry.role != .decoder_layer) continue;
+            if (std.mem.eql(u8, entry.weight_id.?, weight_id)) return entry;
+        }
+        return null;
+    }
+
+    pub fn hasGlobalWeight(self: *const ModelManifest, weight_id: []const u8) bool {
+        return self.findGlobalWeight(weight_id) != null;
+    }
+
+    pub fn findGlobalWeight(self: *const ModelManifest, weight_id: []const u8) ?*const TensorManifestEntry {
+        for (self.entries) |*entry| {
+            if (entry.layer_index != null or entry.weight_id == null) continue;
+            if (entry.role == .decoder_layer or entry.role == .quant_companion) continue;
+            if (std.mem.eql(u8, entry.weight_id.?, weight_id)) return entry;
+        }
+        return null;
     }
 
     pub fn stageResidencyReport(
@@ -379,10 +415,18 @@ fn companionBase(name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn roleForGlobalWeight(weight_id: []const u8) TensorRole {
+pub fn roleForGlobalWeight(weight_id: []const u8) TensorRole {
     if (std.mem.eql(u8, weight_id, "token_embeddings")) return .token_embeddings;
     if (std.mem.eql(u8, weight_id, "ln_final")) return .final_norm;
     if (std.mem.eql(u8, weight_id, "lm_head")) return .lm_head;
+    if (std.mem.indexOf(u8, weight_id, "vision") != null or
+        std.mem.indexOf(u8, weight_id, "visual") != null or
+        std.mem.indexOf(u8, weight_id, "projector") != null or
+        std.mem.indexOf(u8, weight_id, "merger") != null or
+        std.mem.indexOf(u8, weight_id, "patch") != null)
+    {
+        return .vision_side;
+    }
     if (std.mem.indexOf(u8, weight_id, "embedding") != null or
         std.mem.indexOf(u8, weight_id, "embedding_ln") != null)
     {
@@ -409,7 +453,8 @@ fn shouldIncludeEntry(entry: TensorManifestEntry, request: StageResidencyRequest
         .final_norm => request.include_final_norm,
         .lm_head => request.include_lm_head,
         .embedding_side => request.include_embedding_side,
-        .architecture_side, .vision_side => request.include_architecture_side,
+        .vision_side => request.include_vision_side,
+        .architecture_side => request.include_architecture_side,
         .unclassified_global => request.include_unclassified_global,
     };
 }
@@ -423,7 +468,8 @@ fn shouldIncludeCompanion(entry: TensorManifestEntry, request: StageResidencyReq
         .final_norm => request.include_final_norm,
         .lm_head => request.include_lm_head,
         .embedding_side => request.include_embedding_side,
-        .architecture_side, .vision_side => request.include_architecture_side,
+        .vision_side => request.include_vision_side,
+        .architecture_side => request.include_architecture_side,
         .unclassified_global => request.include_unclassified_global,
         .decoder_layer, .quant_companion => false,
     };
@@ -555,4 +601,15 @@ test "manifest classifies tensor roles and stage residency bytes" {
     try std.testing.expectEqual(@as(usize, 16), layer1_report.bytesForRole(.final_norm));
     try std.testing.expectEqual(@as(usize, 128), layer1_report.bytesForRole(.lm_head));
     try std.testing.expect(layer1_report.budgetExceeded(100) != null);
+
+    const vision_report = try model_manifest.stageResidencyReport(.{
+        .layer_start = 0,
+        .layer_end = 0,
+        .include_vision_side = true,
+    });
+    try std.testing.expectEqual(@as(usize, 12), vision_report.bytesForRole(.vision_side));
+    try std.testing.expectEqual(@as(usize, 0), vision_report.bytesForRole(.architecture_side));
+    try std.testing.expect(model_manifest.hasRole(.vision_side));
+    try std.testing.expect(model_manifest.hasLayerWeight(1, "self_attn.q_proj.weight"));
+    try std.testing.expect(model_manifest.hasGlobalWeight("token_embeddings"));
 }

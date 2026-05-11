@@ -46,6 +46,76 @@ pub const LoadOptions = struct {
     dequantize_nvfp4_to_bf16: bool = true,
 };
 
+pub const StageLoadError = error{
+    InvalidStageRange,
+    InvalidStageLayerOffset,
+    EmptyStageRange,
+    MissingStageWeight,
+    MissingStageGlobalWeight,
+    UnsupportedStageGlobalRole,
+    UnsupportedStageConfigInference,
+    StageResidencyMismatch,
+};
+
+pub const StageLayerRange = struct {
+    start: usize,
+    end: usize,
+
+    pub fn len(self: StageLayerRange) usize {
+        return self.end - self.start;
+    }
+};
+
+pub const StageRoleRequest = struct {
+    include_token_embeddings: bool = false,
+    include_final_norm: bool = false,
+    include_lm_head: bool = false,
+    include_embedding_side: bool = false,
+    include_vision_side: bool = false,
+    include_architecture_side: bool = false,
+    include_unclassified_global: bool = false,
+
+    pub fn includesManifestRole(self: StageRoleRequest, role: manifest_mod.TensorRole) bool {
+        return switch (role) {
+            .token_embeddings => self.include_token_embeddings,
+            .final_norm => self.include_final_norm,
+            .lm_head => self.include_lm_head,
+            .embedding_side => self.include_embedding_side,
+            .vision_side => self.include_vision_side,
+            .architecture_side => self.include_architecture_side,
+            .unclassified_global => self.include_unclassified_global,
+            .decoder_layer, .quant_companion => false,
+        };
+    }
+
+    pub fn toResidencyRequest(
+        self: StageRoleRequest,
+        range: StageLayerRange,
+    ) manifest_mod.StageResidencyRequest {
+        return .{
+            .layer_start = range.start,
+            .layer_end = range.end,
+            .include_token_embeddings = self.include_token_embeddings,
+            .include_final_norm = self.include_final_norm,
+            .include_lm_head = self.include_lm_head,
+            .include_embedding_side = self.include_embedding_side,
+            .include_vision_side = self.include_vision_side,
+            .include_architecture_side = self.include_architecture_side,
+            .include_unclassified_global = self.include_unclassified_global,
+        };
+    }
+};
+
+pub const StageLoadRequest = struct {
+    layer_start: usize,
+    layer_end: usize,
+    roles: StageRoleRequest,
+
+    pub fn range(self: StageLoadRequest) StageLayerRange {
+        return .{ .start = self.layer_start, .end = self.layer_end };
+    }
+};
+
 pub const LoadedModel = struct {
     arena: std.heap.ArenaAllocator,
     config: ModelConfig,
@@ -81,6 +151,49 @@ pub const LoadedModel = struct {
     pub fn manifestPtr(self: *const LoadedModel) ?*const manifest_mod.ModelManifest {
         if (self.manifest) |*manifest| return manifest;
         return null;
+    }
+};
+
+pub const LoadedStageModel = struct {
+    arena: std.heap.ArenaAllocator,
+    config: ModelConfig,
+    runtime: config_types.ModelRuntime = .{},
+    st: ?st_loader.UnifiedSafeTensors = null,
+    ln_final: ?Tensor = null,
+    lm_head: ?Tensor = null,
+    token_embeddings: ?Tensor = null,
+    position_embeddings: ?Tensor = null,
+    token_type_embeddings: ?Tensor = null,
+    embedding_norm_weight: ?Tensor = null,
+    embedding_norm_bias: ?Tensor = null,
+    blocks: []runtime_blocks.LayerWeights,
+    layer_range: StageLayerRange,
+    requested_roles: StageRoleRequest,
+    residency: manifest_mod.StageResidencyReport,
+    original_weight_dtype: DType,
+    file_size: usize = 0,
+    tensor_count: usize = 0,
+    manifest: manifest_mod.ModelManifest,
+    extra_global_weights: runtime_blocks.WeightMap = .{},
+    extra_global_role_bytes: [manifest_mod.role_count]usize = [_]usize{0} ** manifest_mod.role_count,
+    lm_head_uses_token_embeddings: bool = false,
+
+    /// Releases manifest-owned allocations, safetensors mappings, then arena-owned tensors.
+    /// Matching `LoadedModel`, the value is invalid after deinit returns.
+    pub fn deinit(self: *LoadedStageModel) void {
+        self.manifest.deinit();
+        if (self.st) |*st| st.deinit();
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn originalLayerIndex(self: *const LoadedStageModel, block_offset: usize) !usize {
+        if (block_offset >= self.blocks.len) return error.InvalidStageLayerOffset;
+        return self.layer_range.start + block_offset;
+    }
+
+    pub fn manifestPtr(self: *const LoadedStageModel) *const manifest_mod.ModelManifest {
+        return &self.manifest;
     }
 };
 
@@ -121,155 +234,41 @@ pub fn loadModelMetadataOnly(
     var safetensors_file = try st_loader.UnifiedSafeTensors.loadMetadataOnly(backing_allocator, safetensors_path);
     errdefer safetensors_file.deinit();
 
-    const arch = runtime_arch;
-    var model_config = try cfg_loader.loadConfigForArchitectureWithHook(
+    var discovery = try discoverModelForLoad(
+        backing_allocator,
         arena_allocator,
         config_path,
-        arch.name,
-        parse_config_hook orelse arch.parse_config_hook,
+        &safetensors_file,
+        runtime_arch,
+        parse_config_hook,
+        .full,
     );
+    errdefer discovery.manifest.deinit();
 
-    const layer_count: usize = @intCast(model_config.n_layers);
+    const layer_count = discovery.layer_block_kinds.len;
     var block_weights = try arena_allocator.alloc(runtime_blocks.LayerWeights, layer_count);
-
-    try requireArchitectureMetadata(arch);
-    inferMoEFromArchitecture(arch, &model_config);
-
-    // Parse heterogeneous layer types from config.json
-    if (arch.isHeterogeneous()) {
-        if (arch.block_variants) |variants| {
-            var variant_names = try arena_allocator.alloc([]const u8, variants.len);
-            for (variants, 0..) |variant, i| {
-                variant_names[i] = variant.name;
-            }
-            model_config.layer_types = cfg_loader.parseLayerTypes(arena_allocator, config_path, variant_names, arch.variant_aliases) catch null;
-        }
-    }
-
-    // Detect dtype from safetensors header metadata (no weight data access)
-    const original_weight_dtype = blk: {
-        const detected = try detectOriginalWeightDType(arena_allocator, arch, model_config.layer_types, &safetensors_file);
-        if (detected == .grouped_affine_u4 and model_config.gaffine_bits == 8) {
-            break :blk DType.grouped_affine_u8;
-        }
-        break :blk detected;
-    };
-    var model_manifest = try manifest_mod.build(backing_allocator, arch, &model_config, &safetensors_file);
-    errdefer model_manifest.deinit();
 
     // Populate block types from architecture metadata (no weight loading)
     for (0..layer_count) |layer_idx| {
-        const variant = arch.getVariantWithOverride(layer_idx, model_config.layer_types);
-        const block_type = if (variant) |v|
-            runtime_blocks.BlockKind.fromVariantName(v.name) orelse return error.UnknownBlockVariant
-        else if (arch.has_mamba)
-            runtime_blocks.BlockKind.mamba
-        else
-            runtime_blocks.BlockKind.attention_mlp;
-
-        const layer_meta = if (variant) |v| v.meta orelse arch.kernel_meta else arch.kernel_meta;
-
-        const variant_is_full_attention = if (variant) |v|
-            std.mem.eql(u8, v.name, "full_attention")
-        else
-            false;
-        const has_explicit_layer_types = model_config.layer_types != null;
-        const layer_has_global_attn = if (variant_is_full_attention)
-            true
-        else if (has_explicit_layer_types and model_config.sliding_window > 0)
-            false
-        else if (model_config.sliding_window <= 0)
-            true
-        else if (model_config.sliding_window_pattern > 0)
-            (@mod(@as(i32, @intCast(layer_idx)), model_config.sliding_window_pattern) == 0)
-        else
-            false;
-        const layer_window_size: usize = if (model_config.sliding_window > 0 and !layer_has_global_attn)
-            @intCast(model_config.sliding_window)
-        else
-            0;
-
-        var map_context = runtime_blocks.BlockMapContext{
-            .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
-            .kernel_meta = layer_meta,
-            .mamba_config = null,
-            .gated_delta_config = null,
-            .shortconv_config = null,
-            .num_experts = if (model_config.num_experts > 0) @intCast(model_config.num_experts) else 0,
-            .experts_per_token = if (model_config.experts_per_token > 0) @intCast(model_config.experts_per_token) else 0,
-            .allocator = null,
-        };
-
-        if (block_type == .mamba) {
-            const meta_cfg = layer_meta.mamba_config;
-            map_context.mamba_config = .{
-                .d_model = @intCast(model_config.d_model),
-                .d_state = if (meta_cfg) |cfg| cfg.d_state else @intCast(model_config.mamba_d_state),
-                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.mamba_d_conv),
-                .n_heads = if (meta_cfg) |cfg| cfg.n_heads else @intCast(model_config.mamba_n_heads),
-                .d_head = if (meta_cfg) |cfg| cfg.d_head else @intCast(model_config.mamba_d_head),
-                .n_groups = if (meta_cfg) |cfg| cfg.n_groups else @intCast(model_config.mamba_n_groups),
-            };
-        }
-
-        if (block_type == .gated_delta) {
-            const meta_cfg = layer_meta.gated_delta_config orelse return error.MissingGatedDeltaConfig;
-            const cfg_num_value_heads: u32 = if (model_config.linear_num_value_heads > 0)
-                @intCast(model_config.linear_num_value_heads)
-            else
-                meta_cfg.n_heads;
-            const cfg_value_head_dim: u32 = if (model_config.linear_value_head_dim > 0)
-                @intCast(model_config.linear_value_head_dim)
-            else
-                meta_cfg.d_head;
-            if (cfg_num_value_heads == 0 or cfg_value_head_dim == 0) return error.InvalidShape;
-            _ = std.math.mul(u32, cfg_num_value_heads, cfg_value_head_dim) catch return error.InvalidShape;
-            const cfg_num_key_heads: u32 = if (model_config.linear_num_key_heads > 0)
-                @intCast(model_config.linear_num_key_heads)
-            else
-                cfg_num_value_heads;
-            map_context.gated_delta_config = .{
-                .d_model = @intCast(model_config.d_model),
-                .d_conv = meta_cfg.d_conv,
-                .n_heads = cfg_num_value_heads,
-                .d_head = cfg_value_head_dim,
-                .n_key_heads = cfg_num_key_heads,
-            };
-        }
-
-        if (block_type == .shortconv) {
-            const meta_cfg = layer_meta.shortconv_config;
-            map_context.shortconv_config = .{
-                .d_model = @intCast(model_config.d_model),
-                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.shortconv_d_conv),
-                .conv_dim = if (meta_cfg) |cfg| cfg.conv_dim else @intCast(model_config.shortconv_conv_dim),
-                .conv_dim_out = if (meta_cfg) |cfg| cfg.conv_dim_out else @intCast(model_config.shortconv_conv_dim_out),
-                .has_bias = if (meta_cfg) |cfg| cfg.has_bias else model_config.shortconv_has_bias,
-            };
-        }
-
         block_weights[layer_idx] = .{
-            .block_type = block_type,
+            .block_type = discovery.layer_block_kinds[layer_idx],
             .weight_map = .{},
-            .map_context = map_context,
+            .map_context = discovery.layer_contexts[layer_idx],
         };
     }
 
-    // QK norm detection requires weight map inspection — skip for metadata-only.
-    // The Metal backend detects this independently from its own weight loading.
-
     return LoadedModel{
         .arena = arena_alloc,
-        .config = model_config,
+        .config = discovery.config,
         .runtime = .{
-            .architecture_id = arch.name,
-            .has_moe = arch.has_moe,
-            .has_mamba = arch.has_mamba,
-            .has_gated_delta = arch.has_gated_delta,
-            .has_shortconv = arch.has_shortconv,
-            .has_mla = arch.has_mla,
-            .explicit_qk_norm_ops = arch.explicit_qk_norm_ops,
-            .norm_weights_pre_shifted = arch.norm_weights_pre_shifted,
+            .architecture_id = runtime_arch.name,
+            .has_moe = runtime_arch.has_moe,
+            .has_mamba = runtime_arch.has_mamba,
+            .has_gated_delta = runtime_arch.has_gated_delta,
+            .has_shortconv = runtime_arch.has_shortconv,
+            .has_mla = runtime_arch.has_mla,
+            .explicit_qk_norm_ops = runtime_arch.explicit_qk_norm_ops,
+            .norm_weights_pre_shifted = runtime_arch.norm_weights_pre_shifted,
         },
         .st = safetensors_file,
         .ln_final = null,
@@ -280,10 +279,10 @@ pub fn loadModelMetadataOnly(
         .embedding_norm_weight = null,
         .embedding_norm_bias = null,
         .blocks = block_weights,
-        .original_weight_dtype = original_weight_dtype,
+        .original_weight_dtype = discovery.original_weight_dtype,
         .file_size = safetensors_file.fileSize(),
         .tensor_count = safetensors_file.tensorCount(),
-        .manifest = model_manifest,
+        .manifest = discovery.manifest,
     };
 }
 
@@ -650,33 +649,45 @@ fn inferMoEFromArchitecture(arch: *const model_types.Architecture, model_config:
     _ = model_config;
 }
 
-pub fn loadModelWithArchitecture(
-    backing_allocator: std.mem.Allocator,
-    config_path: []const u8,
-    safetensors_path: []const u8,
-    runtime_arch: ?*const model_types.Architecture,
-    parse_config_hook: ?model_types.ConfigParseHook,
-    model_load_options: LoadOptions,
-    progress: progress_mod.Context,
-) !LoadedModel {
-    // Collect environment flags once at the start
-    const env_flags = LoaderEnvFlags.fromEnvironment(backing_allocator);
-    var start_time_ns: i128 = std.time.nanoTimestamp();
+const ModelLoadDiscovery = struct {
+    config: ModelConfig,
+    runtime_arch: *const model_types.Architecture,
+    manifest: manifest_mod.ModelManifest,
+    layer_contexts: []runtime_blocks.BlockMapContext,
+    layer_block_kinds: []runtime_blocks.BlockKind,
+    original_weight_dtype: DType,
+};
 
-    var arena_alloc = std.heap.ArenaAllocator.init(backing_allocator);
-    errdefer arena_alloc.deinit();
-    const arena_allocator = arena_alloc.allocator();
+const StageErrorPolicy = enum {
+    full,
+    stage,
+};
 
-    var safetensors_file = try st_loader.UnifiedSafeTensors.load(backing_allocator, safetensors_path);
-    errdefer safetensors_file.deinit();
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - start_time_ns)) / 1_000_000.0;
-        log.debug("load", "Safetensors mmap", .{ .duration_ms = duration_ms }, @src());
-        start_time_ns = now;
+fn mapConfigInferenceError(comptime policy: StageErrorPolicy, err: anyerror) anyerror {
+    if (policy == .stage) {
+        return switch (err) {
+            error.MissingDffSourceWeight,
+            error.InvalidDffSourceWeightShape,
+            error.MissingShortConvSourceWeight,
+            error.InvalidShortConvSourceWeightShape,
+            error.InvalidShortConvConfig,
+            => error.UnsupportedStageConfigInference,
+            else => err,
+        };
     }
+    return err;
+}
 
-    const arch = runtime_arch orelse return error.MissingArchitecture;
+fn discoverModelForLoad(
+    backing_allocator: std.mem.Allocator,
+    arena_allocator: std.mem.Allocator,
+    config_path: []const u8,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    runtime_arch: *const model_types.Architecture,
+    parse_config_hook: ?model_types.ConfigParseHook,
+    comptime error_policy: StageErrorPolicy,
+) !ModelLoadDiscovery {
+    const arch = runtime_arch;
     var model_config = try cfg_loader.loadConfigForArchitectureWithHook(
         arena_allocator,
         config_path,
@@ -704,29 +715,13 @@ pub fn loadModelWithArchitecture(
         .n_heads = model_config.n_heads,
         .head_dim = model_config.head_dim,
     }, @src());
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - start_time_ns)) / 1_000_000.0;
-        log.debug("load", "Config parsed", .{ .duration_ms = duration_ms }, @src());
-        start_time_ns = now;
-    }
 
-    const layer_count: usize = @intCast(model_config.n_layers);
-
-    var block_weights = try arena_allocator.alloc(runtime_blocks.LayerWeights, layer_count);
-
-    // Graph metadata is now required for weight loading.
-    // Legacy hardcoded loader has been removed - all models need architecture definitions.
     try requireArchitectureMetadata(arch);
     if (!archHasBlockWeights(arch)) return error.MissingArchitecture;
     inferMoEFromArchitecture(arch, &model_config);
 
-    // For heterogeneous models, parse layer_types from model config.json.
-    // This allows different model sizes of the same architecture to have different
-    // layer arrangements (e.g., granite-4.0-h-350m vs granite-4.0-h-1b).
     if (arch.isHeterogeneous()) {
         if (arch.block_variants) |variants| {
-            // Extract variant names from block_variants
             var variant_names = try arena_allocator.alloc([]const u8, variants.len);
             for (variants, 0..) |variant, i| {
                 variant_names[i] = variant.name;
@@ -735,61 +730,576 @@ pub fn loadModelWithArchitecture(
         }
     }
 
-    // Detect original weight dtype from declarative architecture metadata.
-    // This is used to determine if model is BF16 for MLX GPU path.
     const original_weight_dtype = blk: {
-        const detected = try detectOriginalWeightDType(arena_allocator, arch, model_config.layer_types, &safetensors_file);
-        // SafeTensors maps U32 to grouped_affine_u4 by default. Correct
-        // based on config's authoritative gaffine_bits when it says 8-bit.
+        const detected = try detectOriginalWeightDType(arena_allocator, arch, model_config.layer_types, safetensors_file);
         if (detected == .grouped_affine_u4 and model_config.gaffine_bits == 8) {
             break :blk DType.grouped_affine_u8;
         }
         break :blk detected;
     };
-    var model_manifest = try manifest_mod.build(backing_allocator, arch, &model_config, &safetensors_file);
+
+    applyMetadataDffCorrection(
+        arena_allocator,
+        arch,
+        &model_config,
+        safetensors_file,
+    ) catch |err| return mapConfigInferenceError(error_policy, err);
+
+    var model_manifest = try manifest_mod.build(backing_allocator, arch, &model_config, safetensors_file);
     errdefer model_manifest.deinit();
 
+    if (manifestHasQkNorm(&model_manifest)) model_config.use_qk_norm = true;
+
+    const layer_count: usize = @intCast(model_config.n_layers);
+    var layer_contexts = try arena_allocator.alloc(runtime_blocks.BlockMapContext, layer_count);
+    var layer_block_kinds = try arena_allocator.alloc(runtime_blocks.BlockKind, layer_count);
+    for (0..layer_count) |layer_idx| {
+        const layer_info = buildLayerStaticContext(
+            arena_allocator,
+            arch,
+            &model_config,
+            safetensors_file,
+            layer_idx,
+        ) catch |err| return mapConfigInferenceError(error_policy, err);
+        layer_contexts[layer_idx] = layer_info.map_context;
+        layer_block_kinds[layer_idx] = layer_info.block_type;
+    }
+
+    return .{
+        .config = model_config,
+        .runtime_arch = arch,
+        .manifest = model_manifest,
+        .layer_contexts = layer_contexts,
+        .layer_block_kinds = layer_block_kinds,
+        .original_weight_dtype = original_weight_dtype,
+    };
+}
+
+fn manifestHasQkNorm(model_manifest: *const manifest_mod.ModelManifest) bool {
+    const qk_norm_ids = [_][]const u8{
+        "self_attn.q_norm.weight",
+        "self_attn.q_layernorm.weight",
+        "mixer.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "self_attn.k_layernorm.weight",
+        "mixer.k_norm.weight",
+    };
+    for (qk_norm_ids) |id| {
+        if (model_manifest.hasLayerWeight(0, id)) return true;
+    }
+    return false;
+}
+
+fn applyMetadataDffCorrection(
+    allocator: std.mem.Allocator,
+    arch: *const model_types.Architecture,
+    model_config: *ModelConfig,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+) !void {
+    if (!arch.resolve_d_ff_from_weights) return;
+    const specs = if (arch.getVariantWithOverride(0, model_config.layer_types)) |v| v.weights else arch.block_weights;
+    const d_model: usize = @intCast(model_config.d_model);
+    const config_d_ff: usize = @intCast(model_config.d_ff);
+    var found_source_weight = false;
+
+    for (arch.d_ff_source_weight_ids) |id| {
+        const spec = findWeightSpecById(specs, id) orelse continue;
+        const metadata = try metadataForWeightId(
+            allocator,
+            safetensors_file,
+            specs,
+            arch.weight_prefixes,
+            0,
+            id,
+        ) orelse continue;
+        found_source_weight = true;
+        if (inferDffFromMetadataShape(metadata, spec.*, model_config, safetensors_file, d_model)) |raw_inferred| {
+            const inferred = blk: {
+                if (arch.has_fused_gate_up) {
+                    if ((raw_inferred % 2) != 0) return error.InvalidDffSourceWeightShape;
+                    break :blk raw_inferred / 2;
+                }
+                break :blk raw_inferred;
+            };
+            if (inferred != config_d_ff) {
+                log.info("load", "Corrected d_ff from weight metadata", .{
+                    .config_d_ff = config_d_ff,
+                    .inferred_d_ff = inferred,
+                    .weight_id = id,
+                });
+                model_config.d_ff = @intCast(inferred);
+            }
+            return;
+        }
+
+        if (metadata.shape.len == 2 and
+            metadata.shape[0] == d_model and
+            metadata.shape[1] == d_model and
+            config_d_ff == d_model)
+        {
+            return;
+        }
+    }
+
+    if (!found_source_weight) return error.MissingDffSourceWeight;
+    return error.InvalidDffSourceWeightShape;
+}
+
+fn inferDffFromShape(shape: []const usize, d_model: usize) ?usize {
+    if (shape.len != 2) return null;
+    const dim0 = shape[0];
+    const dim1 = shape[1];
+    if (dim0 == d_model and dim1 != d_model) return dim1;
+    if (dim1 == d_model and dim0 != d_model) return dim0;
+    return null;
+}
+
+fn inferDffFromMetadataShape(
+    metadata: st_loader.reader.SafeTensors.TensorMetadata,
+    spec: model_types.WeightSpec,
+    model_config: *const ModelConfig,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    d_model: usize,
+) ?usize {
+    if (spec.expected_shape) |shape| {
+        if (inferDffFromShape(shape, d_model)) |inferred| return inferred;
+        if (shape.len == 2 and shape[0] == d_model and shape[1] == d_model) return d_model;
+        return null;
+    }
+
+    if (metadata.shape.len != 2) return null;
+    if (inferGptqDffFromMetadata(metadata, safetensors_file, model_config, d_model)) |inferred| return inferred;
+    if (inferNvfp4DffFromMetadata(metadata, safetensors_file, d_model)) |inferred| return inferred;
+
+    if (metadata.dtype == .grouped_affine_u4 or metadata.dtype == .grouped_affine_u8) {
+        const rows = metadata.shape[0];
+        const cols = metadata.shape[1];
+        const values_per_word: usize = if (model_config.gaffine_bits == 8) 4 else 8;
+        const unpacked_cols = cols * values_per_word;
+
+        if (rows == d_model) return unpacked_cols;
+        if (unpacked_cols == d_model) return rows;
+    }
+
+    return inferDffFromShape(metadata.shape, d_model);
+}
+
+fn inferGptqDffFromMetadata(
+    metadata: st_loader.reader.SafeTensors.TensorMetadata,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    model_config: *const ModelConfig,
+    d_model: usize,
+) ?usize {
+    const base = weightBaseForSuffix(metadata.name, ".qweight") orelse return null;
+    const scales_metadata = metadataForCompanion(safetensors_file, base, ".scales") orelse return null;
+    if (scales_metadata.shape.len != 2) return null;
+
+    const dim0 = metadata.shape[0];
+    const dim1 = metadata.shape[1];
+    const n_groups = scales_metadata.shape[0];
+    const scales_out = scales_metadata.shape[1];
+    if (n_groups == 0 or scales_out == 0) return null;
+
+    var in_packed: usize = undefined;
+    var out_features: usize = undefined;
+    if (dim1 == scales_out and dim0 != scales_out) {
+        in_packed = dim0;
+        out_features = dim1;
+    } else if (dim0 == scales_out and dim1 != scales_out) {
+        out_features = dim0;
+        in_packed = dim1;
+    } else if (dim0 == scales_out and dim1 == scales_out) {
+        if (dim0 * 8 == d_model or dim0 * 4 == d_model) {
+            in_packed = dim0;
+            out_features = dim1;
+        } else {
+            out_features = dim0;
+            in_packed = dim1;
+        }
+    } else {
+        return null;
+    }
+
+    const unpacked_4bit = in_packed * 8;
+    const unpacked_8bit = in_packed * 4;
+    const group_size_4bit = unpacked_4bit / n_groups;
+    const group_size_8bit = unpacked_8bit / n_groups;
+    const valid_4bit = (unpacked_4bit % n_groups) == 0 and
+        (group_size_4bit == 32 or group_size_4bit == 64 or group_size_4bit == 128);
+    const valid_8bit = (unpacked_8bit % n_groups) == 0 and
+        (group_size_8bit == 32 or group_size_8bit == 64 or group_size_8bit == 128);
+    const is_4bit = if (valid_4bit and valid_8bit)
+        model_config.gaffine_bits != 8
+    else
+        valid_4bit;
+    if (!is_4bit and !valid_8bit) return null;
+
+    const unpacked_in = if (is_4bit) unpacked_4bit else unpacked_8bit;
+    if (inferDffFromShape(&.{ out_features, unpacked_in }, d_model)) |inferred| return inferred;
+    if (out_features == d_model and unpacked_in == d_model) return d_model;
+    return null;
+}
+
+fn inferNvfp4DffFromMetadata(
+    metadata: st_loader.reader.SafeTensors.TensorMetadata,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    d_model: usize,
+) ?usize {
+    if (metadata.dtype != .u8 and metadata.dtype != .i8) return null;
+    const base = weightBaseForSuffix(metadata.name, ".weight_packed") orelse
+        weightBaseForSuffix(metadata.name, ".weight") orelse return null;
+    const scale_metadata = metadataForCompanion(safetensors_file, base, ".weight_scale") orelse return null;
+    if (scale_metadata.dtype != .f8_e4m3 or scale_metadata.shape.len != 2) return null;
+
+    const rows = metadata.shape[0];
+    const packed_cols = metadata.shape[1];
+    const scale_rows = scale_metadata.shape[0];
+    const scale_cols = scale_metadata.shape[1];
+    if (rows == 0 or packed_cols == 0 or scale_rows != rows or scale_cols == 0) return null;
+
+    const unpacked_cols = packed_cols * 2;
+    if ((unpacked_cols % scale_cols) != 0) return null;
+    if (inferDffFromShape(&.{ rows, unpacked_cols }, d_model)) |inferred| return inferred;
+    if (rows == d_model and unpacked_cols == d_model) return d_model;
+    return null;
+}
+
+fn weightBaseForSuffix(name: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    return name[0 .. name.len - suffix.len];
+}
+
+fn metadataForCompanion(
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    base: []const u8,
+    suffix: []const u8,
+) ?st_loader.reader.SafeTensors.TensorMetadata {
+    var name_buf: [1024]u8 = undefined;
+    const companion_name = std.fmt.bufPrint(name_buf[0..], "{s}{s}", .{ base, suffix }) catch return null;
+    return safetensors_file.getTensorMetadata(companion_name) catch null;
+}
+
+const LayerStaticContext = struct {
+    block_type: runtime_blocks.BlockKind,
+    map_context: runtime_blocks.BlockMapContext,
+};
+
+fn buildLayerStaticContext(
+    allocator: std.mem.Allocator,
+    arch: *const model_types.Architecture,
+    model_config: *ModelConfig,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    layer_idx: usize,
+) !LayerStaticContext {
+    const variant = arch.getVariantWithOverride(layer_idx, model_config.layer_types);
+    const block_type = if (variant) |v|
+        runtime_blocks.BlockKind.fromVariantName(v.name) orelse return error.UnknownBlockVariant
+    else if (arch.has_mamba)
+        runtime_blocks.BlockKind.mamba
+    else
+        runtime_blocks.BlockKind.attention_mlp;
+
+    const layer_meta = if (variant) |v| v.meta orelse arch.kernel_meta else arch.kernel_meta;
+    const variant_is_full_attention = if (variant) |v|
+        std.mem.eql(u8, v.name, "full_attention")
+    else
+        false;
+    const has_explicit_layer_types = model_config.layer_types != null;
+    const layer_has_global_attn = if (variant_is_full_attention)
+        true
+    else if (has_explicit_layer_types and model_config.sliding_window > 0)
+        false
+    else if (model_config.sliding_window <= 0)
+        true
+    else if (model_config.sliding_window_pattern > 0)
+        (@mod(@as(i32, @intCast(layer_idx)), model_config.sliding_window_pattern) == 0)
+    else
+        false;
+    const layer_window_size: usize = if (model_config.sliding_window > 0 and !layer_has_global_attn)
+        @intCast(model_config.sliding_window)
+    else
+        0;
+
+    var map_context = runtime_blocks.BlockMapContext{
+        .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
+        .kernel_meta = layer_meta,
+        .mamba_config = null,
+        .gated_delta_config = null,
+        .shortconv_config = null,
+        .num_experts = if (model_config.num_experts > 0) @intCast(model_config.num_experts) else 0,
+        .experts_per_token = if (model_config.experts_per_token > 0) @intCast(model_config.experts_per_token) else 0,
+        .allocator = null,
+    };
+
+    if (block_type == .mamba) {
+        const meta_cfg = layer_meta.mamba_config;
+        map_context.mamba_config = .{
+            .d_model = @intCast(model_config.d_model),
+            .d_state = if (meta_cfg) |cfg| cfg.d_state else @intCast(model_config.mamba_d_state),
+            .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.mamba_d_conv),
+            .n_heads = if (meta_cfg) |cfg| cfg.n_heads else @intCast(model_config.mamba_n_heads),
+            .d_head = if (meta_cfg) |cfg| cfg.d_head else @intCast(model_config.mamba_d_head),
+            .n_groups = if (meta_cfg) |cfg| cfg.n_groups else @intCast(model_config.mamba_n_groups),
+        };
+    }
+
+    if (block_type == .gated_delta) {
+        const meta_cfg = layer_meta.gated_delta_config orelse return error.MissingGatedDeltaConfig;
+        const cfg_num_value_heads: u32 = if (model_config.linear_num_value_heads > 0)
+            @intCast(model_config.linear_num_value_heads)
+        else
+            meta_cfg.n_heads;
+        const cfg_value_head_dim: u32 = if (model_config.linear_value_head_dim > 0)
+            @intCast(model_config.linear_value_head_dim)
+        else
+            meta_cfg.d_head;
+        if (cfg_num_value_heads == 0 or cfg_value_head_dim == 0) return error.InvalidShape;
+        _ = std.math.mul(u32, cfg_num_value_heads, cfg_value_head_dim) catch return error.InvalidShape;
+        const cfg_num_key_heads: u32 = if (model_config.linear_num_key_heads > 0)
+            @intCast(model_config.linear_num_key_heads)
+        else
+            cfg_num_value_heads;
+        map_context.gated_delta_config = .{
+            .d_model = @intCast(model_config.d_model),
+            .d_conv = meta_cfg.d_conv,
+            .n_heads = cfg_num_value_heads,
+            .d_head = cfg_value_head_dim,
+            .n_key_heads = cfg_num_key_heads,
+        };
+    }
+
+    if (block_type == .shortconv) {
+        const meta_cfg = layer_meta.shortconv_config;
+        map_context.shortconv_config = .{
+            .d_model = @intCast(model_config.d_model),
+            .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.shortconv_d_conv),
+            .conv_dim = if (meta_cfg) |cfg| cfg.conv_dim else @intCast(model_config.shortconv_conv_dim),
+            .conv_dim_out = if (meta_cfg) |cfg| cfg.conv_dim_out else @intCast(model_config.shortconv_conv_dim_out),
+            .has_bias = if (meta_cfg) |cfg| cfg.has_bias else model_config.shortconv_has_bias,
+        };
+        if (arch.resolve_shortconv_dims_from_weights) {
+            const specs = if (variant) |v| v.weights else arch.block_weights;
+            try inferShortConvDimsFromMetadata(
+                allocator,
+                &map_context.shortconv_config.?,
+                safetensors_file,
+                specs,
+                arch.weight_prefixes,
+                layer_idx,
+                arch.shortconv_dims_source_weight_id,
+            );
+        } else {
+            const cfg = &map_context.shortconv_config.?;
+            if (cfg.conv_dim == 0 or cfg.conv_dim_out == 0 or cfg.d_conv == 0) {
+                return error.InvalidShortConvConfig;
+            }
+        }
+    }
+
+    return .{ .block_type = block_type, .map_context = map_context };
+}
+
+fn metadataForWeightId(
+    allocator: std.mem.Allocator,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    specs: []const model_types.WeightSpec,
+    weight_prefixes: []const []const u8,
+    layer_idx: usize,
+    weight_id: []const u8,
+) !?st_loader.reader.SafeTensors.TensorMetadata {
+    const spec = findWeightSpecById(specs, weight_id) orelse return null;
+    var resolved_name_buf: [1024]u8 = undefined;
+    var name_resolver: generic_weights.NameResolver = .{};
+    defer name_resolver.deinit(allocator);
+    const resolved_name = try generic_weights.resolveWeightNameBySpec(
+        allocator,
+        safetensors_file,
+        spec.*,
+        weight_prefixes,
+        layer_idx,
+        &name_resolver,
+        resolved_name_buf[0..],
+    ) orelse return null;
+    return try safetensors_file.getTensorMetadata(resolved_name);
+}
+
+fn inferShortConvDimsFromMetadata(
+    allocator: std.mem.Allocator,
+    config: *runtime_blocks.ShortConvConfig,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    specs: []const model_types.WeightSpec,
+    weight_prefixes: []const []const u8,
+    layer_idx: usize,
+    source_weight_id: ?[]const u8,
+) !void {
+    const id = source_weight_id orelse return error.MissingShortConvSourceWeightId;
+    const metadata = try metadataForWeightId(
+        allocator,
+        safetensors_file,
+        specs,
+        weight_prefixes,
+        layer_idx,
+        id,
+    ) orelse return error.MissingShortConvSourceWeight;
+    if (metadata.shape.len != 2 and metadata.shape.len != 3) return error.InvalidShortConvSourceWeightShape;
+
+    const prev_conv_dim = config.conv_dim;
+    const inferred_conv_dim: u32 = @intCast(metadata.shape[0]);
+    const d_idx: usize = if (metadata.shape.len == 3) 2 else 1;
+    const inferred_d_conv: u32 = @intCast(metadata.shape[d_idx]);
+
+    if (config.conv_dim == 0 or config.conv_dim != inferred_conv_dim) {
+        config.conv_dim = inferred_conv_dim;
+    }
+    if (config.d_conv == 0 or config.d_conv != inferred_d_conv) {
+        config.d_conv = inferred_d_conv;
+    }
+    if (config.conv_dim_out == 0 and config.conv_dim != 0) {
+        config.conv_dim_out = config.conv_dim;
+    } else if (prev_conv_dim != 0 and config.conv_dim_out == prev_conv_dim and config.conv_dim != prev_conv_dim) {
+        config.conv_dim_out = config.conv_dim;
+    }
+    if (config.conv_dim == 0 or config.conv_dim_out == 0 or config.d_conv == 0) {
+        return error.InvalidShortConvConfig;
+    }
+}
+
+fn specsForLayer(
+    arch: *const model_types.Architecture,
+    model_config: *const ModelConfig,
+    layer_idx: usize,
+) []const model_types.WeightSpec {
+    const variant = arch.getVariantWithOverride(layer_idx, model_config.layer_types);
+    return if (variant) |v| v.weights else arch.block_weights;
+}
+
+fn requiredLayerSpecSatisfied(
+    model_manifest: *const manifest_mod.ModelManifest,
+    layer_idx: usize,
+    spec_id: []const u8,
+) bool {
+    if (model_manifest.hasLayerWeight(layer_idx, spec_id)) return true;
+    if (std.mem.eql(u8, spec_id, "mlp.up_proj.weight") and
+        model_manifest.hasLayerWeight(layer_idx, "mlp.gate_up_proj.weight"))
+    {
+        return true;
+    }
+    if ((std.mem.eql(u8, spec_id, "self_attn.q_proj.weight") or
+        std.mem.eql(u8, spec_id, "self_attn.k_proj.weight") or
+        std.mem.eql(u8, spec_id, "self_attn.v_proj.weight")) and
+        model_manifest.hasLayerWeight(layer_idx, "self_attn.qkv_proj.weight"))
+    {
+        return true;
+    }
+    return false;
+}
+
+fn roleSupportedByArchitectureOrManifest(
+    arch: *const model_types.Architecture,
+    model_config: *const ModelConfig,
+    model_manifest: *const manifest_mod.ModelManifest,
+    role: manifest_mod.TensorRole,
+) bool {
+    if (role == .lm_head and model_config.tie_word_embeddings and model_manifest.hasGlobalWeight("token_embeddings")) {
+        return true;
+    }
+    for (arch.global_weights) |spec| {
+        if (manifest_mod.roleForGlobalWeight(spec.id) == role) return true;
+    }
+    return model_manifest.hasRole(role);
+}
+
+fn effectiveRolesForStage(
+    roles: StageRoleRequest,
+    model_config: *const ModelConfig,
+    model_manifest: *const manifest_mod.ModelManifest,
+) StageRoleRequest {
+    var effective = roles;
+    if (roles.include_lm_head and
+        model_config.tie_word_embeddings and
+        !model_manifest.hasGlobalWeight("lm_head"))
+    {
+        effective.include_token_embeddings = true;
+    }
+    return effective;
+}
+
+fn validateRequestedRole(
+    discovery: *const ModelLoadDiscovery,
+    role: manifest_mod.TensorRole,
+    requested: bool,
+) !void {
+    if (!requested) return;
+    if (!roleSupportedByArchitectureOrManifest(discovery.runtime_arch, &discovery.config, &discovery.manifest, role)) {
+        return error.UnsupportedStageGlobalRole;
+    }
+    if (role == .lm_head and
+        discovery.config.tie_word_embeddings and
+        !discovery.manifest.hasGlobalWeight("lm_head"))
+    {
+        if (!discovery.manifest.hasGlobalWeight("token_embeddings")) return error.MissingStageGlobalWeight;
+        return;
+    }
+    if (!discovery.manifest.hasRole(role)) return error.MissingStageGlobalWeight;
+}
+
+fn validateStageLoadRequest(
+    discovery: *const ModelLoadDiscovery,
+    request: StageLoadRequest,
+) !manifest_mod.StageResidencyReport {
+    if (request.layer_start >= request.layer_end) return error.EmptyStageRange;
+    const layer_count: usize = @intCast(discovery.config.n_layers);
+    if (request.layer_end > layer_count) return error.InvalidStageRange;
+
+    for (request.layer_start..request.layer_end) |layer_idx| {
+        const specs = specsForLayer(discovery.runtime_arch, &discovery.config, layer_idx);
+        for (specs) |spec| {
+            if (!spec.required) continue;
+            if (!requiredLayerSpecSatisfied(&discovery.manifest, layer_idx, spec.id)) {
+                return error.MissingStageWeight;
+            }
+        }
+    }
+
+    try validateRequestedRole(discovery, .token_embeddings, request.roles.include_token_embeddings);
+    try validateRequestedRole(discovery, .final_norm, request.roles.include_final_norm);
+    try validateRequestedRole(discovery, .lm_head, request.roles.include_lm_head);
+    try validateRequestedRole(discovery, .embedding_side, request.roles.include_embedding_side);
+    try validateRequestedRole(discovery, .vision_side, request.roles.include_vision_side);
+    try validateRequestedRole(discovery, .architecture_side, request.roles.include_architecture_side);
+    try validateRequestedRole(discovery, .unclassified_global, request.roles.include_unclassified_global);
+
+    const effective_roles = effectiveRolesForStage(request.roles, &discovery.config, &discovery.manifest);
+    return discovery.manifest.stageResidencyReport(effective_roles.toResidencyRequest(request.range())) catch |err| switch (err) {
+        error.InvalidLayerRange => error.InvalidStageRange,
+        else => err,
+    };
+}
+
+fn loadModelLayersForRange(
+    arena_allocator: std.mem.Allocator,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    config: *ModelConfig,
+    runtime_arch: *const model_types.Architecture,
+    layer_contexts: []const runtime_blocks.BlockMapContext,
+    layer_block_kinds: []const runtime_blocks.BlockKind,
+    layer_range: StageLayerRange,
+    model_load_options: LoadOptions,
+    env_flags: LoaderEnvFlags,
+    progress: progress_mod.Context,
+) ![]runtime_blocks.LayerWeights {
+    if (layer_range.start > layer_range.end or layer_range.end > layer_block_kinds.len) {
+        return error.InvalidStageRange;
+    }
+    const range_len = layer_range.len();
+    var block_weights = try arena_allocator.alloc(runtime_blocks.LayerWeights, range_len);
     var block_time_ns: i128 = 0;
 
-    progress.addLine(0, "Loading", @intCast(layer_count), null, null);
-
-    for (0..layer_count) |layer_idx| {
+    progress.addLine(0, "Loading", @intCast(range_len), null, null);
+    for (0..range_len) |offset| {
+        const layer_idx = layer_range.start + offset;
         const block_start_ns: i128 = std.time.nanoTimestamp();
-
-        const variant = arch.getVariantWithOverride(layer_idx, model_config.layer_types);
-        const block_type = if (variant) |v|
-            runtime_blocks.BlockKind.fromVariantName(v.name) orelse return error.UnknownBlockVariant
-        else if (arch.has_mamba)
-            runtime_blocks.BlockKind.mamba
-        else
-            runtime_blocks.BlockKind.attention_mlp;
-
-        const specs = if (variant) |v| v.weights else arch.block_weights;
-        const layer_meta = if (variant) |v| v.meta orelse arch.kernel_meta else arch.kernel_meta;
-
-        // Standard attention + MLP layer settings (used by attention blocks)
-        const variant_is_full_attention = if (variant) |v|
-            std.mem.eql(u8, v.name, "full_attention")
-        else
-            false;
-        // When layer_types explicitly resolved this layer's variant, trust that
-        // determination.  Only fall back to the sliding_window_pattern heuristic
-        // when there is no explicit per-layer type information.
-        const has_explicit_layer_types = model_config.layer_types != null;
-        const layer_has_global_attn = if (variant_is_full_attention)
-            true
-        else if (has_explicit_layer_types and model_config.sliding_window > 0)
-            false
-        else if (model_config.sliding_window <= 0)
-            true
-        else if (model_config.sliding_window_pattern > 0)
-            (@mod(@as(i32, @intCast(layer_idx)), model_config.sliding_window_pattern) == 0)
-        else
-            false;
-        const layer_window_size: usize = if (model_config.sliding_window > 0 and !layer_has_global_attn)
-            @intCast(model_config.sliding_window)
-        else
-            0;
+        const specs = specsForLayer(runtime_arch, config, layer_idx);
         const weight_load_options = generic_weights.LoadOptions{
             .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
             .dequantize_mxfp8_to_bf16 = model_load_options.dequantize_mxfp8_to_bf16,
@@ -797,136 +1307,289 @@ pub fn loadModelWithArchitecture(
         };
         var weight_map = try generic_weights.loadWeightMap(
             arena_allocator,
-            &safetensors_file,
+            safetensors_file,
             specs,
-            arch.weight_prefixes,
+            runtime_arch.weight_prefixes,
             layer_idx,
-            &model_config,
+            config,
             weight_load_options,
         );
 
-        // When K and V projections share weights, alias v_proj to k_proj if
-        // the checkpoint omitted v_proj for this layer.
-        if (model_config.attention_k_eq_v and weight_map.get("self_attn.v_proj.weight") == null) {
+        if (config.attention_k_eq_v and weight_map.get("self_attn.v_proj.weight") == null) {
             if (weight_map.get("self_attn.k_proj.weight")) |k| {
                 try weight_map.put(arena_allocator, "self_attn.v_proj.weight", k);
             }
         }
 
-        // Fused gate_up and QKV splits are handled inside loadWeightMap.
-
-        // Optional weight-driven d_ff correction, explicitly enabled by architecture metadata.
-        if (arch.resolve_d_ff_from_weights and layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {
-            try inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids, arch.has_fused_gate_up);
-        }
-
-        if (env_flags.enable_cpu_fusion and arch.enable_loader_fusions) {
+        if (env_flags.enable_cpu_fusion and runtime_arch.enable_loader_fusions) {
             try maybeAddFusedWeights(arena_allocator, &weight_map);
         }
 
-        var map_context = runtime_blocks.BlockMapContext{
-            .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
-            .kernel_meta = layer_meta,
-            .mamba_config = null,
-            .gated_delta_config = null,
-            .shortconv_config = null,
-            // MoE configuration (architecture-driven loading)
-            .num_experts = if (model_config.num_experts > 0) @intCast(model_config.num_experts) else 0,
-            .experts_per_token = if (model_config.experts_per_token > 0) @intCast(model_config.experts_per_token) else 0,
-            .allocator = arena_allocator,
-        };
-
-        if (block_type == .attention_mlp) {
-            // layer_meta carries causal + MLA metadata for attention blocks
-        }
-
-        if (block_type == .mamba) {
-            const meta_cfg = layer_meta.mamba_config;
-            map_context.mamba_config = .{
-                .d_model = @intCast(model_config.d_model),
-                .d_state = if (meta_cfg) |cfg| cfg.d_state else @intCast(model_config.mamba_d_state),
-                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.mamba_d_conv),
-                .n_heads = if (meta_cfg) |cfg| cfg.n_heads else @intCast(model_config.mamba_n_heads),
-                .d_head = if (meta_cfg) |cfg| cfg.d_head else @intCast(model_config.mamba_d_head),
-                .n_groups = if (meta_cfg) |cfg| cfg.n_groups else @intCast(model_config.mamba_n_groups),
-            };
-        }
-        if (block_type == .gated_delta) {
-            const meta_cfg = layer_meta.gated_delta_config orelse return error.MissingGatedDeltaConfig;
-            const cfg_num_value_heads: u32 = if (model_config.linear_num_value_heads > 0)
-                @intCast(model_config.linear_num_value_heads)
-            else
-                meta_cfg.n_heads;
-            const cfg_value_head_dim: u32 = if (model_config.linear_value_head_dim > 0)
-                @intCast(model_config.linear_value_head_dim)
-            else
-                meta_cfg.d_head;
-            if (cfg_num_value_heads == 0 or cfg_value_head_dim == 0) return error.InvalidShape;
-            _ = std.math.mul(u32, cfg_num_value_heads, cfg_value_head_dim) catch return error.InvalidShape;
-            // Key heads may differ from value heads (GQA-style models).
-            // Fall back to value head count when not specified.
-            const cfg_num_key_heads: u32 = if (model_config.linear_num_key_heads > 0)
-                @intCast(model_config.linear_num_key_heads)
-            else
-                cfg_num_value_heads;
-            map_context.gated_delta_config = .{
-                .d_model = @intCast(model_config.d_model),
-                .d_conv = meta_cfg.d_conv,
-                .n_heads = cfg_num_value_heads,
-                .d_head = cfg_value_head_dim,
-                .n_key_heads = cfg_num_key_heads,
-            };
-        }
-        if (block_type == .shortconv) {
-            const meta_cfg = layer_meta.shortconv_config;
-            map_context.shortconv_config = .{
-                .d_model = @intCast(model_config.d_model),
-                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.shortconv_d_conv),
-                .conv_dim = if (meta_cfg) |cfg| cfg.conv_dim else @intCast(model_config.shortconv_conv_dim),
-                .conv_dim_out = if (meta_cfg) |cfg| cfg.conv_dim_out else @intCast(model_config.shortconv_conv_dim_out),
-                .has_bias = if (meta_cfg) |cfg| cfg.has_bias else model_config.shortconv_has_bias,
-            };
-            if (arch.resolve_shortconv_dims_from_weights) {
-                // Optional weight-driven shortconv dim correction, explicitly enabled by metadata.
-                try inferShortConvDims(&map_context.shortconv_config.?, &weight_map, arch.shortconv_dims_source_weight_id);
-            } else {
-                const cfg = &map_context.shortconv_config.?;
-                if (cfg.conv_dim == 0 or cfg.conv_dim_out == 0 or cfg.d_conv == 0) {
-                    return error.InvalidShortConvConfig;
-                }
-            }
-        }
-
-        var layer_context = map_context;
+        var layer_context = layer_contexts[layer_idx];
         layer_context.allocator = null;
-        block_weights[layer_idx] = .{
-            .block_type = block_type,
+        block_weights[offset] = .{
+            .block_type = layer_block_kinds[layer_idx],
             .weight_map = weight_map,
             .map_context = layer_context,
         };
         block_time_ns += std.time.nanoTimestamp() - block_start_ns;
-        progress.updateLine(0, @intCast(layer_idx + 1), null);
+        progress.updateLine(0, @intCast(offset + 1), null);
     }
-
     progress.completeLine(0);
 
     log.debug("load", "Blocks loaded", .{
-        .layer_count = layer_count,
+        .layer_count = range_len,
         .total_ms = @as(f64, @floatFromInt(block_time_ns)) / 1_000_000.0,
-        .per_block_ms = @as(f64, @floatFromInt(block_time_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(layer_count)),
+        .per_block_ms = if (range_len == 0) 0 else @as(f64, @floatFromInt(block_time_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(range_len)),
     }, @src());
 
-    // Detect QKNorm by checking if first layer map carries q/k norm weights.
-    if (block_weights.len > 0) {
-        const first_map = &block_weights[0].weight_map;
-        const has_q_norm = first_map.get("self_attn.q_norm.weight") != null or
-            first_map.get("self_attn.q_layernorm.weight") != null or
-            first_map.get("mixer.q_norm.weight") != null;
-        const has_k_norm = first_map.get("self_attn.k_norm.weight") != null or
-            first_map.get("self_attn.k_layernorm.weight") != null or
-            first_map.get("mixer.k_norm.weight") != null;
-        if (has_q_norm or has_k_norm) model_config.use_qk_norm = true;
+    return block_weights;
+}
+
+const LoadedGlobalWeights = struct {
+    ln_final: ?Tensor = null,
+    lm_head: ?Tensor = null,
+    token_embeddings: ?Tensor = null,
+    position_embeddings: ?Tensor = null,
+    token_type_embeddings: ?Tensor = null,
+    embedding_norm_weight: ?Tensor = null,
+    embedding_norm_bias: ?Tensor = null,
+    extra_global_weights: runtime_blocks.WeightMap = .{},
+    extra_global_role_bytes: [manifest_mod.role_count]usize = [_]usize{0} ** manifest_mod.role_count,
+    lm_head_uses_token_embeddings: bool = false,
+};
+
+const GlobalLoadMode = enum {
+    full,
+    stage,
+};
+
+fn filterGlobalSpecsForRoles(
+    allocator: std.mem.Allocator,
+    arch: *const model_types.Architecture,
+    roles: StageRoleRequest,
+) ![]model_types.WeightSpec {
+    var filtered = std.ArrayListUnmanaged(model_types.WeightSpec){};
+    for (arch.global_weights) |spec| {
+        const role = manifest_mod.roleForGlobalWeight(spec.id);
+        if (roles.includesManifestRole(role)) {
+            try filtered.append(allocator, spec);
+        }
     }
+    return try filtered.toOwnedSlice(allocator);
+}
+
+fn putExtraGlobalWeight(
+    allocator: std.mem.Allocator,
+    result: *LoadedGlobalWeights,
+    key: []const u8,
+    weight: Tensor,
+    role: manifest_mod.TensorRole,
+    checkpoint_bytes: usize,
+) !void {
+    const stored_key = try allocator.dupe(u8, key);
+    const stored_weight = try allocator.create(Tensor); // lint:ignore errdefer-alloc - arena freed atomically
+    stored_weight.* = weight;
+    try result.extra_global_weights.put(allocator, stored_key, stored_weight);
+    result.extra_global_role_bytes[@intFromEnum(role)] +|= checkpoint_bytes;
+}
+
+fn isKnownGlobalFieldId(id: []const u8) bool {
+    return std.mem.eql(u8, id, "token_embeddings") or
+        std.mem.eql(u8, id, "ln_final") or
+        std.mem.eql(u8, id, "lm_head") or
+        std.mem.eql(u8, id, "position_embeddings") or
+        std.mem.eql(u8, id, "token_type_embeddings") or
+        std.mem.eql(u8, id, "embedding_ln") or
+        std.mem.eql(u8, id, "embedding_ln_bias");
+}
+
+fn loadRawManifestEntriesForRole(
+    allocator: std.mem.Allocator,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    model_manifest: *const manifest_mod.ModelManifest,
+    result: *LoadedGlobalWeights,
+    role: manifest_mod.TensorRole,
+) !void {
+    for (model_manifest.entries) |entry| {
+        if (entry.role != role or entry.layer_index != null) continue;
+        if (entry.status == .quant_companion) continue;
+        if (entry.weight_id != null) continue;
+        const tensor_view = try safetensors_file.getTensor(entry.name, null);
+        try putExtraGlobalWeight(allocator, result, entry.name, tensor_view, role, entry.checkpoint_bytes);
+    }
+}
+
+fn loadGlobalWeightsForRoles(
+    arena_allocator: std.mem.Allocator,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    arch: *const model_types.Architecture,
+    model_config: *const ModelConfig,
+    model_manifest: *const manifest_mod.ModelManifest,
+    model_load_options: LoadOptions,
+    roles: StageRoleRequest,
+    comptime mode: GlobalLoadMode,
+) !LoadedGlobalWeights {
+    if (!archHasGlobalWeights(arch)) return error.MissingArchitecture;
+    var result = LoadedGlobalWeights{};
+    const filtered_specs = try filterGlobalSpecsForRoles(arena_allocator, arch, roles);
+    var global_map = generic_weights.loadWeightMap(
+        arena_allocator,
+        safetensors_file,
+        filtered_specs,
+        &.{},
+        0,
+        model_config,
+        .{
+            .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
+            .dequantize_mxfp8_to_bf16 = model_load_options.dequantize_mxfp8_to_bf16,
+            .dequantize_nvfp4_to_bf16 = model_load_options.dequantize_nvfp4_to_bf16,
+        },
+    ) catch |err| return if (mode == .stage) switch (err) {
+        error.MissingWeight => error.MissingStageGlobalWeight,
+        else => err,
+    } else err;
+
+    if (roles.include_token_embeddings) {
+        result.token_embeddings = if (global_map.get("token_embeddings")) |weight|
+            weight.*
+        else
+            return if (mode == .stage) error.MissingStageGlobalWeight else error.MissingWeight;
+    }
+
+    if (roles.include_final_norm) {
+        result.ln_final = if (global_map.get("ln_final")) |weight|
+            weight.*
+        else if (mode == .stage) return error.MissingStageGlobalWeight else null;
+    }
+
+    if (roles.include_lm_head) {
+        result.lm_head = if (global_map.get("lm_head")) |weight|
+            weight.*
+        else if (model_config.tie_word_embeddings) blk: {
+            if (try buildTiedLmHead(arena_allocator, safetensors_file, arch, model_config, model_load_options)) |tied_projection| {
+                result.lm_head_uses_token_embeddings = true;
+                break :blk tied_projection;
+            }
+            const token_embedding_weights = result.token_embeddings orelse {
+                if (mode == .stage) return error.MissingStageGlobalWeight;
+                return error.MissingWeight;
+            };
+            result.lm_head_uses_token_embeddings = true;
+            if (token_embedding_weights.dtype == .f32) {
+                break :blk try transposeToOwned(arena_allocator, token_embedding_weights, .f32);
+            } else {
+                break :blk token_embedding_weights;
+            }
+        } else if (mode == .stage) return error.MissingStageGlobalWeight else null;
+    }
+
+    if (roles.include_embedding_side) {
+        result.position_embeddings = if (global_map.get("position_embeddings")) |weight|
+            try transforms.ensureF32(arena_allocator, weight.*)
+        else
+            null;
+        result.token_type_embeddings = if (global_map.get("token_type_embeddings")) |weight|
+            try transforms.ensureF32(arena_allocator, weight.*)
+        else
+            null;
+        result.embedding_norm_weight = if (global_map.get("embedding_ln")) |weight|
+            try transforms.ensureF32(arena_allocator, weight.*)
+        else
+            null;
+        result.embedding_norm_bias = if (global_map.get("embedding_ln_bias")) |weight|
+            try transforms.ensureF32(arena_allocator, weight.*)
+        else
+            null;
+        if (model_manifest.hasRole(.embedding_side) and
+            result.position_embeddings == null and
+            result.token_type_embeddings == null and
+            result.embedding_norm_weight == null and
+            result.embedding_norm_bias == null)
+        {
+            return error.MissingStageGlobalWeight;
+        }
+    }
+
+    var it = global_map.iterator();
+    while (it.next()) |entry| {
+        const id = entry.key_ptr.*;
+        if (isKnownGlobalFieldId(id)) continue;
+        const role = manifest_mod.roleForGlobalWeight(id);
+        if (!roles.includesManifestRole(role)) continue;
+        const checkpoint_bytes = if (model_manifest.findGlobalWeight(id)) |manifest_entry|
+            manifest_entry.checkpoint_bytes
+        else
+            entry.value_ptr.*.*.data_size;
+        try putExtraGlobalWeight(arena_allocator, &result, id, entry.value_ptr.*.*, role, checkpoint_bytes);
+    }
+
+    if (mode == .stage and roles.include_vision_side) {
+        try loadRawManifestEntriesForRole(arena_allocator, safetensors_file, model_manifest, &result, .vision_side);
+    }
+    if (mode == .stage and roles.include_unclassified_global) {
+        try loadRawManifestEntriesForRole(arena_allocator, safetensors_file, model_manifest, &result, .unclassified_global);
+    }
+
+    return result;
+}
+
+pub fn loadModelWithArchitecture(
+    backing_allocator: std.mem.Allocator,
+    config_path: []const u8,
+    safetensors_path: []const u8,
+    runtime_arch: ?*const model_types.Architecture,
+    parse_config_hook: ?model_types.ConfigParseHook,
+    model_load_options: LoadOptions,
+    progress: progress_mod.Context,
+) !LoadedModel {
+    const env_flags = LoaderEnvFlags.fromEnvironment(backing_allocator);
+    var start_time_ns: i128 = std.time.nanoTimestamp();
+
+    var arena_alloc = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer arena_alloc.deinit();
+    const arena_allocator = arena_alloc.allocator();
+
+    var safetensors_file = try st_loader.UnifiedSafeTensors.load(backing_allocator, safetensors_path);
+    errdefer safetensors_file.deinit();
+    {
+        const now = std.time.nanoTimestamp();
+        const duration_ms = @as(f64, @floatFromInt(now - start_time_ns)) / 1_000_000.0;
+        log.debug("load", "Safetensors mmap", .{ .duration_ms = duration_ms }, @src());
+        start_time_ns = now;
+    }
+
+    const arch = runtime_arch orelse return error.MissingArchitecture;
+    var discovery = try discoverModelForLoad(
+        backing_allocator,
+        arena_allocator,
+        config_path,
+        &safetensors_file,
+        arch,
+        parse_config_hook,
+        .full,
+    );
+    errdefer discovery.manifest.deinit();
+    {
+        const now = std.time.nanoTimestamp();
+        const duration_ms = @as(f64, @floatFromInt(now - start_time_ns)) / 1_000_000.0;
+        log.debug("load", "Model discovery complete", .{ .duration_ms = duration_ms }, @src());
+        start_time_ns = now;
+    }
+
+    const layer_count = discovery.layer_block_kinds.len;
+    const block_weights = try loadModelLayersForRange(
+        arena_allocator,
+        &safetensors_file,
+        &discovery.config,
+        arch,
+        discovery.layer_contexts,
+        discovery.layer_block_kinds,
+        .{ .start = 0, .end = layer_count },
+        model_load_options,
+        env_flags,
+        progress,
+    );
 
     {
         const now = std.time.nanoTimestamp();
@@ -935,64 +1598,25 @@ pub fn loadModelWithArchitecture(
         start_time_ns = now;
     }
 
-    // Global weights (embeddings, final norm, lm_head) are loaded via architecture metadata.
-    if (!archHasGlobalWeights(arch)) return error.MissingArchitecture;
-
-    var global_map = try generic_weights.loadWeightMap(
+    const all_roles = StageRoleRequest{
+        .include_token_embeddings = true,
+        .include_final_norm = true,
+        .include_lm_head = true,
+        .include_embedding_side = true,
+        .include_vision_side = true,
+        .include_architecture_side = true,
+    };
+    const globals = try loadGlobalWeightsForRoles(
         arena_allocator,
         &safetensors_file,
-        arch.global_weights,
-        &.{},
-        0,
-        &model_config,
-        .{
-            .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
-            .dequantize_mxfp8_to_bf16 = model_load_options.dequantize_mxfp8_to_bf16,
-            .dequantize_nvfp4_to_bf16 = model_load_options.dequantize_nvfp4_to_bf16,
-        },
+        arch,
+        &discovery.config,
+        &discovery.manifest,
+        model_load_options,
+        all_roles,
+        .full,
     );
-
-    const token_embedding_weights = if (global_map.get("token_embeddings")) |weight|
-        weight.*
-    else
-        return error.MissingWeight;
-
-    const final_norm_weight: ?Tensor = if (global_map.get("ln_final")) |weight|
-        weight.*
-    else
-        null;
-
-    const lm_head: ?Tensor = if (global_map.get("lm_head")) |weight|
-        weight.*
-    else if (model_config.tie_word_embeddings) blk: {
-        if (try buildTiedLmHead(arena_allocator, &safetensors_file, arch, &model_config, model_load_options)) |tied_projection| {
-            break :blk tied_projection;
-        }
-        if (token_embedding_weights.dtype == .f32) {
-            break :blk try transposeToOwned(arena_allocator, token_embedding_weights, .f32);
-        } else {
-            break :blk token_embedding_weights;
-        }
-    } else null;
-
-    // Optional embedding tables (BERT-family models).
-    // These must be f32 since we index by position and add element-wise.
-    const position_embeddings: ?Tensor = if (global_map.get("position_embeddings")) |weight|
-        try transforms.ensureF32(arena_allocator, weight.*)
-    else
-        null;
-    const token_type_embeddings: ?Tensor = if (global_map.get("token_type_embeddings")) |weight|
-        try transforms.ensureF32(arena_allocator, weight.*)
-    else
-        null;
-    const embedding_norm_weight: ?Tensor = if (global_map.get("embedding_ln")) |weight|
-        try transforms.ensureF32(arena_allocator, weight.*)
-    else
-        null;
-    const embedding_norm_bias: ?Tensor = if (global_map.get("embedding_ln_bias")) |weight|
-        try transforms.ensureF32(arena_allocator, weight.*)
-    else
-        null;
+    const token_embedding_weights = globals.token_embeddings orelse return error.MissingWeight;
 
     {
         const now = std.time.nanoTimestamp();
@@ -1002,21 +1626,105 @@ pub fn loadModelWithArchitecture(
 
     return LoadedModel{
         .arena = arena_alloc,
-        .config = model_config,
+        .config = discovery.config,
         .runtime = .{},
         .st = safetensors_file,
-        .ln_final = final_norm_weight,
-        .lm_head = lm_head,
+        .ln_final = globals.ln_final,
+        .lm_head = globals.lm_head,
         .token_embeddings = token_embedding_weights,
-        .position_embeddings = position_embeddings,
-        .token_type_embeddings = token_type_embeddings,
-        .embedding_norm_weight = embedding_norm_weight,
-        .embedding_norm_bias = embedding_norm_bias,
+        .position_embeddings = globals.position_embeddings,
+        .token_type_embeddings = globals.token_type_embeddings,
+        .embedding_norm_weight = globals.embedding_norm_weight,
+        .embedding_norm_bias = globals.embedding_norm_bias,
         .blocks = block_weights,
-        .original_weight_dtype = original_weight_dtype,
+        .original_weight_dtype = discovery.original_weight_dtype,
         .file_size = safetensors_file.fileSize(),
         .tensor_count = safetensors_file.tensorCount(),
-        .manifest = model_manifest,
+        .manifest = discovery.manifest,
+    };
+}
+
+pub fn loadStageModelWithArchitecture(
+    backing_allocator: std.mem.Allocator,
+    config_path: []const u8,
+    safetensors_path: []const u8,
+    runtime_arch: *const model_types.Architecture,
+    parse_config_hook: ?model_types.ConfigParseHook,
+    model_load_options: LoadOptions,
+    request: StageLoadRequest,
+    progress: progress_mod.Context,
+) !LoadedStageModel {
+    const env_flags = LoaderEnvFlags.fromEnvironment(backing_allocator);
+    var arena_alloc = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer arena_alloc.deinit();
+    const arena_allocator = arena_alloc.allocator();
+
+    var safetensors_file = try st_loader.UnifiedSafeTensors.load(backing_allocator, safetensors_path);
+    errdefer safetensors_file.deinit();
+
+    var discovery = try discoverModelForLoad(
+        backing_allocator,
+        arena_allocator,
+        config_path,
+        &safetensors_file,
+        runtime_arch,
+        parse_config_hook,
+        .stage,
+    );
+    errdefer discovery.manifest.deinit();
+
+    const residency = try validateStageLoadRequest(&discovery, request);
+    const stage_blocks = loadModelLayersForRange(
+        arena_allocator,
+        &safetensors_file,
+        &discovery.config,
+        runtime_arch,
+        discovery.layer_contexts,
+        discovery.layer_block_kinds,
+        request.range(),
+        model_load_options,
+        env_flags,
+        progress,
+    ) catch |err| return switch (err) {
+        error.MissingWeight => error.MissingStageWeight,
+        else => err,
+    };
+
+    const effective_roles = effectiveRolesForStage(request.roles, &discovery.config, &discovery.manifest);
+    const globals = try loadGlobalWeightsForRoles(
+        arena_allocator,
+        &safetensors_file,
+        runtime_arch,
+        &discovery.config,
+        &discovery.manifest,
+        model_load_options,
+        effective_roles,
+        .stage,
+    );
+
+    return .{
+        .arena = arena_alloc,
+        .config = discovery.config,
+        .runtime = .{},
+        .st = safetensors_file,
+        .ln_final = globals.ln_final,
+        .lm_head = globals.lm_head,
+        .token_embeddings = globals.token_embeddings,
+        .position_embeddings = globals.position_embeddings,
+        .token_type_embeddings = globals.token_type_embeddings,
+        .embedding_norm_weight = globals.embedding_norm_weight,
+        .embedding_norm_bias = globals.embedding_norm_bias,
+        .blocks = stage_blocks,
+        .layer_range = request.range(),
+        .requested_roles = request.roles,
+        .residency = residency,
+        .original_weight_dtype = discovery.original_weight_dtype,
+        .file_size = safetensors_file.fileSize(),
+        .tensor_count = safetensors_file.tensorCount(),
+        .manifest = discovery.manifest,
+        .extra_global_weights = globals.extra_global_weights,
+        .extra_global_role_bytes = globals.extra_global_role_bytes,
+        .lm_head_uses_token_embeddings = globals.lm_head_uses_token_embeddings,
     };
 }
 
@@ -1062,6 +1770,813 @@ fn readEnvFlag(allocator: std.mem.Allocator, name: []const u8, default_value: bo
 // =============================================================================
 // Unit Tests
 // =============================================================================
+
+const stage_test_block_specs = [_]model_types.WeightSpec{
+    .{
+        .id = "proj.weight",
+        .suffix = "proj.weight",
+        .module_type = "Linear",
+        .layout = .linear,
+        .dtype = "float32",
+        .required = true,
+    },
+};
+
+const stage_test_global_specs = [_]model_types.WeightSpec{
+    .{
+        .id = "token_embeddings",
+        .suffix = "tok.weight",
+        .module_type = "Embedding",
+        .layout = .embedding,
+        .dtype = "float32",
+        .required = true,
+    },
+    .{
+        .id = "ln_final",
+        .suffix = "norm.weight",
+        .module_type = "RMSNorm",
+        .layout = .none,
+        .dtype = "float32",
+        .required = false,
+    },
+    .{
+        .id = "lm_head",
+        .suffix = "lm_head.weight",
+        .module_type = "Linear",
+        .layout = .linear,
+        .dtype = "float32",
+        .required = false,
+    },
+};
+
+const stage_test_prefixes = [_][]const u8{"layers.{d}."};
+
+fn stageTestArchitecture() model_types.Architecture {
+    return .{
+        .name = "stage_test",
+        .model_types = &.{},
+        .block_weights = &stage_test_block_specs,
+        .global_weights = &stage_test_global_specs,
+        .weight_prefixes = &stage_test_prefixes,
+        .weight_dtype_source_weight_ids = &.{"proj.weight"},
+    };
+}
+
+const StageFixtureOptions = struct {
+    include_token_embeddings: bool = true,
+    include_layer1: bool = true,
+    include_lm_head: bool = true,
+    include_vision: bool = false,
+    tie_word_embeddings: bool = false,
+    intermediate_size: usize = 8,
+};
+
+fn writeStageTestConfig(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    options: StageFixtureOptions,
+) ![]u8 {
+    const tie_value = if (options.tie_word_embeddings) "true" else "false";
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "model_type": "stage_test",
+        \\  "vocab_size": 4,
+        \\  "hidden_size": 4,
+        \\  "num_hidden_layers": 3,
+        \\  "num_attention_heads": 1,
+        \\  "intermediate_size": {d},
+        \\  "max_position_embeddings": 16,
+        \\  "tie_word_embeddings": {s}
+        \\}}
+    , .{ options.intermediate_size, tie_value });
+    defer allocator.free(config_json);
+    try dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    return try dir.realpathAlloc(allocator, "config.json");
+}
+
+fn writeStageTestSafetensors(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    options: StageFixtureOptions,
+) ![]u8 {
+    const model_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    errdefer allocator.free(model_path);
+
+    const embed = [_]f32{1.0} ** 16;
+    const layer0 = [_]f32{2.0} ** 16;
+    const layer1 = [_]f32{3.0} ** 16;
+    const layer2 = [_]f32{4.0} ** 16;
+    const norm = [_]f32{5.0} ** 4;
+    const lm_head = [_]f32{6.0} ** 16;
+    const vision = [_]f32{7.0} ** 4;
+
+    var entries = std.ArrayListUnmanaged(st_loader.TensorEntry){};
+    defer entries.deinit(allocator);
+    if (options.include_token_embeddings) {
+        try entries.append(allocator, .{ .name = "tok.weight", .dtype = .f32, .shape = &.{ 4, 4 }, .data = std.mem.sliceAsBytes(embed[0..]) });
+    }
+    try entries.append(allocator, .{ .name = "layers.0.proj.weight", .dtype = .f32, .shape = &.{ 4, 4 }, .data = std.mem.sliceAsBytes(layer0[0..]) });
+    if (options.include_layer1) {
+        try entries.append(allocator, .{ .name = "layers.1.proj.weight", .dtype = .f32, .shape = &.{ 4, 4 }, .data = std.mem.sliceAsBytes(layer1[0..]) });
+    }
+    try entries.append(allocator, .{ .name = "layers.2.proj.weight", .dtype = .f32, .shape = &.{ 4, 4 }, .data = std.mem.sliceAsBytes(layer2[0..]) });
+    try entries.append(allocator, .{ .name = "norm.weight", .dtype = .f32, .shape = &.{4}, .data = std.mem.sliceAsBytes(norm[0..]) });
+    if (options.include_lm_head) {
+        try entries.append(allocator, .{ .name = "lm_head.weight", .dtype = .f32, .shape = &.{ 4, 4 }, .data = std.mem.sliceAsBytes(lm_head[0..]) });
+    }
+    if (options.include_vision) {
+        try entries.append(allocator, .{ .name = "vision.patch_embed.weight", .dtype = .f32, .shape = &.{ 2, 2 }, .data = std.mem.sliceAsBytes(vision[0..]) });
+    }
+    try st_loader.write(allocator, model_path, entries.items);
+    return model_path;
+}
+
+fn expectStageProjFirstValue(block: *const runtime_blocks.LayerWeights, expected: f32) !void {
+    const proj = block.weight_map.get("proj.weight") orelse return error.TestExpectedEqual;
+    const values = proj.asSlice(f32);
+    try std.testing.expectApproxEqAbs(expected, values[0], 0.0001);
+}
+
+fn writeStageDffSafetensors(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) ![]u8 {
+    const model_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    errdefer allocator.free(model_path);
+
+    const embed = [_]f32{1.0} ** 16;
+    const layer0 = [_]f32{2.0} ** 32;
+    const layer1 = [_]f32{3.0} ** 32;
+    const layer2 = [_]f32{4.0} ** 32;
+
+    var entries = std.ArrayListUnmanaged(st_loader.TensorEntry){};
+    defer entries.deinit(allocator);
+    try entries.append(allocator, .{ .name = "tok.weight", .dtype = .f32, .shape = &.{ 4, 4 }, .data = std.mem.sliceAsBytes(embed[0..]) });
+    try entries.append(allocator, .{ .name = "layers.0.proj.weight", .dtype = .f32, .shape = &.{ 8, 4 }, .data = std.mem.sliceAsBytes(layer0[0..]) });
+    try entries.append(allocator, .{ .name = "layers.1.proj.weight", .dtype = .f32, .shape = &.{ 8, 4 }, .data = std.mem.sliceAsBytes(layer1[0..]) });
+    try entries.append(allocator, .{ .name = "layers.2.proj.weight", .dtype = .f32, .shape = &.{ 8, 4 }, .data = std.mem.sliceAsBytes(layer2[0..]) });
+    try st_loader.write(allocator, model_path, entries.items);
+    return model_path;
+}
+
+fn writeStagePackedDffSafetensors(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) ![]u8 {
+    const model_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    errdefer allocator.free(model_path);
+
+    const packed_layer0 = [_]u32{0} ** 64;
+    const entries = [_]st_loader.TensorEntry{
+        .{ .name = "layers.0.proj.weight", .dtype = .grouped_affine_u4, .shape = &.{ 32, 2 }, .data = std.mem.sliceAsBytes(packed_layer0[0..]) },
+    };
+    try st_loader.write(allocator, model_path, &entries);
+    return model_path;
+}
+
+fn writeStageGptqDffSafetensors(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) ![]u8 {
+    const model_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    errdefer allocator.free(model_path);
+
+    const qweight = [_]i32{0} ** (4 * 64);
+    const scales = [_]u16{0} ** 64;
+    const qzeros = [_]i32{0} ** 8;
+    const entries = [_]st_loader.TensorEntry{
+        .{ .name = "layers.0.proj.qweight", .dtype = .i32, .shape = &.{ 4, 64 }, .data = std.mem.sliceAsBytes(qweight[0..]) },
+        .{ .name = "layers.0.proj.scales", .dtype = .f16, .shape = &.{ 1, 64 }, .data = std.mem.sliceAsBytes(scales[0..]) },
+        .{ .name = "layers.0.proj.qzeros", .dtype = .i32, .shape = &.{ 1, 8 }, .data = std.mem.sliceAsBytes(qzeros[0..]) },
+    };
+    try st_loader.write(allocator, model_path, &entries);
+    return model_path;
+}
+
+fn writeStageNvfp4DffSafetensors(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) ![]u8 {
+    const model_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    errdefer allocator.free(model_path);
+
+    const packed_weight = [_]u8{0} ** (64 * 16);
+    const block_scales = [_]u8{0x38} ** 64;
+    const global_scale = [_]f32{1.0};
+    const entries = [_]st_loader.TensorEntry{
+        .{ .name = "layers.0.proj.weight_packed", .dtype = .u8, .shape = &.{ 64, 16 }, .data = packed_weight[0..] },
+        .{ .name = "layers.0.proj.weight_scale", .dtype = .f8_e4m3, .shape = &.{ 64, 1 }, .data = block_scales[0..] },
+        .{ .name = "layers.0.proj.weight_global_scale", .dtype = .f32, .shape = &.{1}, .data = std.mem.sliceAsBytes(global_scale[0..]) },
+    };
+    try st_loader.write(allocator, model_path, &entries);
+    return model_path;
+}
+
+fn stageTestArchitectureWithDffCorrection() model_types.Architecture {
+    var arch = stageTestArchitecture();
+    arch.resolve_d_ff_from_weights = true;
+    arch.d_ff_source_weight_ids = &.{"proj.weight"};
+    arch.weight_dtype_source_weight_ids = &.{"proj.weight"};
+    return arch;
+}
+
+const stage_shortconv_specs = [_]model_types.WeightSpec{
+    .{
+        .id = "conv.conv.weight",
+        .suffix = "conv.conv.weight",
+        .module_type = "Conv1d",
+        .layout = .conv1d_depthwise,
+        .dtype = "float32",
+        .required = true,
+    },
+};
+
+var stage_shortconv_variants = [_]model_types.BlockVariant{
+    .{ .name = "shortconv", .weights = &stage_shortconv_specs },
+};
+
+fn stageShortConvArchitecture() model_types.Architecture {
+    return .{
+        .name = "stage_shortconv",
+        .model_types = &.{},
+        .block_variants = &stage_shortconv_variants,
+        .global_weights = &stage_test_global_specs,
+        .weight_prefixes = &stage_test_prefixes,
+        .weight_dtype_source_weight_ids = &.{"conv.conv.weight"},
+        .shortconv_dims_source_weight_id = "conv.conv.weight",
+        .resolve_shortconv_dims_from_weights = true,
+        .has_shortconv = true,
+    };
+}
+
+fn writeStageShortConvConfig(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+) ![]u8 {
+    const config_json =
+        \\{
+        \\  "model_type": "stage_shortconv",
+        \\  "vocab_size": 4,
+        \\  "hidden_size": 4,
+        \\  "num_hidden_layers": 2,
+        \\  "num_attention_heads": 1,
+        \\  "intermediate_size": 8,
+        \\  "max_position_embeddings": 16,
+        \\  "tie_word_embeddings": false
+        \\}
+    ;
+    try dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    return try dir.realpathAlloc(allocator, "config.json");
+}
+
+fn writeStageShortConvSafetensors(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    include_layer0_source: bool,
+) ![]u8 {
+    const model_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    errdefer allocator.free(model_path);
+
+    const layer0 = [_]f32{2.0} ** 18;
+    const layer1 = [_]f32{3.0} ** 18;
+
+    var entries = std.ArrayListUnmanaged(st_loader.TensorEntry){};
+    defer entries.deinit(allocator);
+    if (include_layer0_source) {
+        try entries.append(allocator, .{ .name = "layers.0.conv.conv.weight", .dtype = .f32, .shape = &.{ 6, 3 }, .data = std.mem.sliceAsBytes(layer0[0..]) });
+    }
+    try entries.append(allocator, .{ .name = "layers.1.conv.conv.weight", .dtype = .f32, .shape = &.{ 6, 3 }, .data = std.mem.sliceAsBytes(layer1[0..]) });
+    try st_loader.write(allocator, model_path, entries.items);
+    return model_path;
+}
+
+test "manifest StageRoleRequest.toResidencyRequest maps vision side independently" {
+    const roles = StageRoleRequest{ .include_vision_side = true };
+    const request = roles.toResidencyRequest(.{ .start = 1, .end = 2 });
+    try std.testing.expectEqual(@as(usize, 1), request.layer_start);
+    try std.testing.expectEqual(@as(usize, 2), request.layer_end);
+    try std.testing.expect(request.include_vision_side);
+    try std.testing.expect(!request.include_architecture_side);
+    try std.testing.expect(roles.includesManifestRole(.vision_side));
+    try std.testing.expect(!roles.includesManifestRole(.decoder_layer));
+}
+
+test "manifest StageLayerRange.len and StageLoadRequest.range expose contiguous range" {
+    const request = StageLoadRequest{
+        .layer_start = 2,
+        .layer_end = 5,
+        .roles = .{},
+    };
+    const range = request.range();
+    try std.testing.expectEqual(@as(usize, 2), range.start);
+    try std.testing.expectEqual(@as(usize, 5), range.end);
+    try std.testing.expectEqual(@as(usize, 3), range.len());
+}
+
+test "manifest LoadedStageModel.originalLayerIndex maps dense stage offsets" {
+    var layer_storage = [_]runtime_blocks.LayerWeights{
+        .{ .block_type = .attention_mlp, .weight_map = .{}, .map_context = .{} },
+        .{ .block_type = .attention_mlp, .weight_map = .{}, .map_context = .{} },
+    };
+    var stage = std.mem.zeroes(LoadedStageModel);
+    stage.layer_range = .{ .start = 3, .end = 5 };
+    stage.blocks = layer_storage[0..];
+
+    try std.testing.expectEqual(@as(usize, 3), try stage.originalLayerIndex(0));
+    try std.testing.expectEqual(@as(usize, 4), try stage.originalLayerIndex(1));
+    try std.testing.expectError(error.InvalidStageLayerOffset, stage.originalLayerIndex(2));
+}
+
+test "manifest loadStageModelWithArchitecture hydrates requested layer range only" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{});
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    var stage = try loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{
+            .layer_start = 1,
+            .layer_end = 3,
+            .roles = .{ .include_final_norm = true },
+        },
+        progress_mod.Context.NONE,
+    );
+    defer stage.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), stage.blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), try stage.originalLayerIndex(0));
+    try std.testing.expectEqual(@as(usize, 2), try stage.originalLayerIndex(1));
+    try expectStageProjFirstValue(&stage.blocks[0], 3.0);
+    try expectStageProjFirstValue(&stage.blocks[1], 4.0);
+    try std.testing.expect(stage.token_embeddings == null);
+    try std.testing.expect(stage.ln_final != null);
+    try std.testing.expect(stage.lm_head == null);
+    try std.testing.expectEqual(@as(usize, 128), stage.residency.bytesForRole(.decoder_layer));
+    try std.testing.expectEqual(@as(usize, 16), stage.residency.bytesForRole(.final_norm));
+}
+
+test "manifest loadModelWithArchitecture hydrates complete model through shared range loader" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{});
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    var model = try loadModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        progress_mod.Context.NONE,
+    );
+    defer model.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), model.blocks.len);
+    try expectStageProjFirstValue(&model.blocks[0], 2.0);
+    try expectStageProjFirstValue(&model.blocks[1], 3.0);
+    try expectStageProjFirstValue(&model.blocks[2], 4.0);
+    try std.testing.expect(model.token_embeddings.data_ptr != null);
+    try std.testing.expect(model.ln_final != null);
+    try std.testing.expect(model.lm_head != null);
+}
+
+test "manifest loadStageModelWithArchitecture rejects missing selected layer tensor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{ .include_layer1 = false });
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    try std.testing.expectError(error.MissingStageWeight, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 1, .layer_end = 2, .roles = .{} },
+        progress_mod.Context.NONE,
+    ));
+}
+
+test "manifest loadStageModelWithArchitecture rejects invalid stage ranges" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{});
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    try std.testing.expectError(error.EmptyStageRange, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 1, .layer_end = 1, .roles = .{} },
+        progress_mod.Context.NONE,
+    ));
+    try std.testing.expectError(error.InvalidStageRange, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 2, .layer_end = 4, .roles = .{} },
+        progress_mod.Context.NONE,
+    ));
+}
+
+test "manifest loadStageModelWithArchitecture rejects unsupported requested global role" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{});
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    try std.testing.expectError(error.UnsupportedStageGlobalRole, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 0, .layer_end = 1, .roles = .{ .include_architecture_side = true } },
+        progress_mod.Context.NONE,
+    ));
+}
+
+test "manifest loadStageModelWithArchitecture rejects missing requested global tensor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{ .include_lm_head = false });
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    try std.testing.expectError(error.MissingStageGlobalWeight, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 0, .layer_end = 1, .roles = .{ .include_lm_head = true } },
+        progress_mod.Context.NONE,
+    ));
+}
+
+test "manifest loadStageModelWithArchitecture ties lm_head through token embeddings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{ .tie_word_embeddings = true });
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{ .include_lm_head = false });
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    var stage = try loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 0, .layer_end = 1, .roles = .{ .include_lm_head = true } },
+        progress_mod.Context.NONE,
+    );
+    defer stage.deinit();
+
+    try std.testing.expect(stage.token_embeddings != null);
+    try std.testing.expect(stage.lm_head != null);
+    try std.testing.expect(stage.lm_head_uses_token_embeddings);
+    try std.testing.expect(!stage.requested_roles.include_token_embeddings);
+    try std.testing.expectEqual(@as(usize, 64), stage.residency.bytesForRole(.token_embeddings));
+}
+
+test "manifest loadStageModelWithArchitecture rejects tied lm_head without token embeddings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{ .tie_word_embeddings = true });
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{
+        .include_token_embeddings = false,
+        .include_lm_head = false,
+    });
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    try std.testing.expectError(error.MissingStageGlobalWeight, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 0, .layer_end = 1, .roles = .{ .include_lm_head = true } },
+        progress_mod.Context.NONE,
+    ));
+}
+
+test "manifest loadStageModelWithArchitecture applies d_ff metadata correction outside selected stage" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{ .intermediate_size = 99 });
+    defer allocator.free(config_path);
+    const model_path = try writeStageDffSafetensors(allocator, tmp_path);
+    defer allocator.free(model_path);
+    var arch = stageTestArchitectureWithDffCorrection();
+
+    var stage = try loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 1, .layer_end = 2, .roles = .{} },
+        progress_mod.Context.NONE,
+    );
+    defer stage.deinit();
+
+    try std.testing.expectEqual(@as(i32, 8), stage.config.d_ff);
+    try std.testing.expectEqual(@as(usize, 1), stage.blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), try stage.originalLayerIndex(0));
+    try expectStageProjFirstValue(&stage.blocks[0], 3.0);
+    try std.testing.expectEqual(@as(usize, 128), stage.residency.bytesForRole(.decoder_layer));
+}
+
+test "manifest applyMetadataDffCorrection infers packed grouped affine source shape" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const model_path = try writeStagePackedDffSafetensors(allocator, tmp_path);
+    defer allocator.free(model_path);
+    var safetensors_file = try st_loader.UnifiedSafeTensors.loadMetadataOnly(allocator, model_path);
+    defer safetensors_file.deinit();
+
+    var arch = stageTestArchitectureWithDffCorrection();
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 16;
+    cfg.d_ff = 99;
+    cfg.n_layers = 1;
+    cfg.n_heads = 1;
+    cfg.n_kv_groups = 1;
+    cfg.head_dim = 16;
+    cfg.vocab_size = 4;
+    cfg.max_seq_len = 16;
+    cfg.gaffine_bits = 4;
+
+    try applyMetadataDffCorrection(allocator, &arch, &cfg, &safetensors_file);
+
+    try std.testing.expectEqual(@as(i32, 32), cfg.d_ff);
+}
+
+test "manifest applyMetadataDffCorrection infers GPTQ qweight source shape" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const model_path = try writeStageGptqDffSafetensors(allocator, tmp_path);
+    defer allocator.free(model_path);
+    var safetensors_file = try st_loader.UnifiedSafeTensors.loadMetadataOnly(allocator, model_path);
+    defer safetensors_file.deinit();
+
+    var arch = stageTestArchitectureWithDffCorrection();
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 32;
+    cfg.d_ff = 99;
+    cfg.n_layers = 1;
+    cfg.n_heads = 1;
+    cfg.n_kv_groups = 1;
+    cfg.head_dim = 32;
+    cfg.vocab_size = 4;
+    cfg.max_seq_len = 16;
+    cfg.gaffine_bits = 4;
+
+    try applyMetadataDffCorrection(allocator, &arch, &cfg, &safetensors_file);
+
+    try std.testing.expectEqual(@as(i32, 64), cfg.d_ff);
+}
+
+test "manifest applyMetadataDffCorrection infers NVFP4 packed source shape" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const model_path = try writeStageNvfp4DffSafetensors(allocator, tmp_path);
+    defer allocator.free(model_path);
+    var safetensors_file = try st_loader.UnifiedSafeTensors.loadMetadataOnly(allocator, model_path);
+    defer safetensors_file.deinit();
+
+    var arch = stageTestArchitectureWithDffCorrection();
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 32;
+    cfg.d_ff = 99;
+    cfg.n_layers = 1;
+    cfg.n_heads = 1;
+    cfg.n_kv_groups = 1;
+    cfg.head_dim = 32;
+    cfg.vocab_size = 4;
+    cfg.max_seq_len = 16;
+
+    try applyMetadataDffCorrection(allocator, &arch, &cfg, &safetensors_file);
+
+    try std.testing.expectEqual(@as(i32, 64), cfg.d_ff);
+}
+
+test "manifest loadStageModelWithArchitecture rejects unsupported d_ff metadata correction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{ .intermediate_size = 99 });
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{});
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+    arch.resolve_d_ff_from_weights = true;
+    arch.d_ff_source_weight_ids = &.{"missing.weight"};
+    arch.weight_dtype_source_weight_ids = &.{"proj.weight"};
+
+    try std.testing.expectError(error.UnsupportedStageConfigInference, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 1, .layer_end = 2, .roles = .{} },
+        progress_mod.Context.NONE,
+    ));
+}
+
+test "manifest loadStageModelWithArchitecture applies shortconv metadata correction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageShortConvConfig(allocator, tmp.dir);
+    defer allocator.free(config_path);
+    const model_path = try writeStageShortConvSafetensors(allocator, tmp_path, true);
+    defer allocator.free(model_path);
+    var arch = stageShortConvArchitecture();
+
+    var stage = try loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 1, .layer_end = 2, .roles = .{} },
+        progress_mod.Context.NONE,
+    );
+    defer stage.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), stage.blocks.len);
+    try std.testing.expectEqual(runtime_blocks.BlockKind.shortconv, stage.blocks[0].block_type);
+    const shortconv_cfg = stage.blocks[0].map_context.shortconv_config orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 6), shortconv_cfg.conv_dim);
+    try std.testing.expectEqual(@as(u32, 3), shortconv_cfg.d_conv);
+    try std.testing.expectEqual(@as(u32, 6), shortconv_cfg.conv_dim_out);
+    try std.testing.expectEqual(@as(usize, 72), stage.residency.bytesForRole(.decoder_layer));
+}
+
+test "manifest loadStageModelWithArchitecture rejects unsupported shortconv metadata correction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageShortConvConfig(allocator, tmp.dir);
+    defer allocator.free(config_path);
+    const model_path = try writeStageShortConvSafetensors(allocator, tmp_path, false);
+    defer allocator.free(model_path);
+    var arch = stageShortConvArchitecture();
+
+    try std.testing.expectError(error.UnsupportedStageConfigInference, loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 1, .layer_end = 2, .roles = .{} },
+        progress_mod.Context.NONE,
+    ));
+}
+
+test "manifest loadStageModelWithArchitecture hydrates requested vision side extras" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{ .include_vision = true });
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    var stage = try loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 0, .layer_end = 1, .roles = .{ .include_vision_side = true } },
+        progress_mod.Context.NONE,
+    );
+    defer stage.deinit();
+
+    try std.testing.expectEqual(@as(usize, 16), stage.residency.bytesForRole(.vision_side));
+    try std.testing.expectEqual(@as(usize, 16), stage.extra_global_role_bytes[@intFromEnum(manifest_mod.TensorRole.vision_side)]);
+    try std.testing.expect(stage.extra_global_weights.get("vision.patch_embed.weight") != null);
+}
+
+test "manifest LoadedStageModel.deinit releases loaded stage resources" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const config_path = try writeStageTestConfig(allocator, tmp.dir, .{});
+    defer allocator.free(config_path);
+    const model_path = try writeStageTestSafetensors(allocator, tmp_path, .{});
+    defer allocator.free(model_path);
+    var arch = stageTestArchitecture();
+
+    var stage = try loadStageModelWithArchitecture(
+        allocator,
+        config_path,
+        model_path,
+        &arch,
+        null,
+        .{},
+        .{ .layer_start = 0, .layer_end = 1, .roles = .{ .include_token_embeddings = true } },
+        progress_mod.Context.NONE,
+    );
+    stage.deinit();
+}
 
 /// Helper to free aligned tensor data allocated by OwnedTensor
 fn freeAlignedTensorData(allocator: std.mem.Allocator, t: Tensor) void {

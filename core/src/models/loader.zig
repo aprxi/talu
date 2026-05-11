@@ -16,7 +16,10 @@ const validation = @import("load/validation.zig");
 // Re-export types
 pub const weights = weights_impl;
 pub const LoadedModel = weights_impl.LoadedModel;
+pub const LoadedStageModel = weights_impl.LoadedStageModel;
 pub const LoadOptions = weights_impl.LoadOptions;
+pub const StageLoadRequest = weights_impl.StageLoadRequest;
+pub const StageRoleRequest = weights_impl.StageRoleRequest;
 
 // Re-export validation types so check_coverage.sh --integration can verify test coverage
 pub const Reporter = validation.Reporter;
@@ -81,6 +84,34 @@ fn loadSafeTensorsModel(
     return loaded_model;
 }
 
+pub fn loadStageModel(
+    backing_allocator: std.mem.Allocator,
+    config_path: []const u8,
+    weights_path: []const u8,
+    load_options: weights_impl.LoadOptions,
+    request: weights_impl.StageLoadRequest,
+    progress: progress_mod.Context,
+) !weights_impl.LoadedStageModel {
+    _ = loadArchitectureDefinitions(backing_allocator);
+    const model_kind = try resolveModelKindForConfig(backing_allocator, config_path);
+    var loaded_stage = try weights_impl.loadStageModelWithArchitecture(
+        backing_allocator,
+        config_path,
+        weights_path,
+        model_kind.runtime_arch,
+        model_kind.parse_config_hook,
+        load_options,
+        request,
+        progress,
+    );
+    errdefer loaded_stage.deinit();
+
+    applyRuntimeArchitectureMetadataTo(&loaded_stage, model_kind.runtime_arch);
+    try validation.validateStageModel(&loaded_stage);
+
+    return loaded_stage;
+}
+
 /// Load model config, architecture metadata, and per-layer block types WITHOUT
 /// loading weight tensor data. Reads only safetensors headers.
 pub fn loadModelMetadataOnly(
@@ -110,6 +141,13 @@ pub fn loadModelMetadataOnly(
 
 pub fn applyRuntimeArchitectureMetadata(
     loaded_model: *LoadedModel,
+    runtime_architecture: *const op_types.Architecture,
+) void {
+    applyRuntimeArchitectureMetadataTo(loaded_model, runtime_architecture);
+}
+
+fn applyRuntimeArchitectureMetadataTo(
+    loaded_model: anytype,
     runtime_architecture: *const op_types.Architecture,
 ) void {
     // All architectures are now .custom - actual behavior comes from runtime_arch
@@ -386,4 +424,28 @@ test "loadModel returns FileNotFound for missing config path" {
         progress_mod.Context.NONE,
     );
     try std.testing.expectError(error.FileNotFound, err_result);
+}
+
+test "manifest loadStageModel rejects unsupported model type before loading weights" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.json",
+        .data =
+        \\{
+        \\  "model_type": "not_a_real_model_type"
+        \\}
+        ,
+    });
+    const config_path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(config_path);
+
+    try std.testing.expectError(error.UnsupportedModel, loadStageModel(
+        std.testing.allocator,
+        config_path,
+        "unused.safetensors",
+        .{},
+        .{ .layer_start = 0, .layer_end = 1, .roles = .{} },
+        progress_mod.Context.NONE,
+    ));
 }

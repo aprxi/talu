@@ -366,6 +366,7 @@ fn estimatePerGpuBytes(
             .include_final_norm = needs_projection,
             .include_lm_head = needs_projection,
             .include_embedding_side = needs_embedding,
+            .include_vision_side = include_global_side,
             .include_architecture_side = include_global_side,
             .include_unclassified_global = include_global_side,
         }) catch return error.InvalidTopologyConfig;
