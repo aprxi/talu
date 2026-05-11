@@ -3,6 +3,7 @@
 //! This mirrors the production C-API root (`lib.zig`) and adds broad module
 //! exports used by integration tests and internal tooling.
 
+const std = @import("std");
 const prod = @import("lib.zig");
 
 pub const capi = prod.capi;
@@ -39,3 +40,7 @@ pub const core = struct {
     pub const Device = @import("compute_pkg").Device;
     pub const DeviceType = @import("compute_pkg").DeviceType;
 };
+
+test "stage_plan graphIdentity buildStagePlan StagePlan.stageLoadRequest contract tests" {
+    try @import("models_pkg").stage_plan.testing.runContractTests(std.testing.allocator);
+}

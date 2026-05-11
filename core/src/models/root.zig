@@ -14,6 +14,7 @@ pub const layer_ops = @import("layer_ops.zig");
 pub const op_types = @import("op_types.zig");
 pub const perf_hints = @import("perf_hints.zig");
 pub const manifest = @import("manifest.zig");
+pub const stage_plan = @import("stage_plan.zig");
 pub const runtime_blocks = @import("runtime_blocks.zig");
 pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");
@@ -97,4 +98,23 @@ pub fn performanceHintsByName(name: []const u8) ?*const perf_hints.PerfHints {
 test "models root delegates model type lookup to static registry" {
     try std.testing.expect(isSupportedModelType("llama3"));
     try std.testing.expect(!isSupportedModelType("not_a_real_model_type"));
+}
+
+test "models root exports stage_plan module" {
+    _ = stage_plan.GraphIdentity;
+    _ = stage_plan.StagePlanId;
+    _ = stage_plan.StagePlan;
+    _ = stage_plan.StageRoleSemantics;
+    _ = stage_plan.StagePlanValidationOptions;
+    _ = stage_plan.buildStagePlan;
+    _ = stage_plan.graphIdentityEql;
+    _ = stage_plan.dupeGraphIdentity;
+    _ = stage_plan.deinitGraphIdentity;
+    _ = stage_plan.validateGraphIdentity;
+    _ = stage_plan.assertGraphIdentity;
+    _ = stage_plan.validateStagePlan;
+}
+
+test "stage_plan module contract tests" {
+    _ = @import("stage_plan.zig");
 }
