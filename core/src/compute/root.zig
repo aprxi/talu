@@ -8,6 +8,9 @@
 //! - `device` - Device type definitions (CPU, CUDA, Metal)
 //! - `dtype` - canonical numeric and quantized data type definitions
 //! - `tensor` - tensor descriptors, owned tensor storage, and DLPack interop
+//! - `tensor_desc` - allocation-free tensor metadata and byte-span validation
+//! - `capability` - static backend capability query vocabulary
+//! - `copy_cast` - typed copy and cast contract validators
 //! - `parallel` - Thread pool and parallel execution
 //! - `dlpack` - DLPack tensor exchange protocol types
 //! - `mmap_policy` - file mapping policy helpers
@@ -31,6 +34,15 @@ pub const dtype = @import("dtype.zig");
 /// Tensor descriptors, owned tensor storage, and DLPack interop.
 pub const tensor = @import("tensor.zig");
 
+/// Allocation-free tensor metadata and byte-span validation.
+pub const tensor_desc = @import("tensor_desc.zig");
+
+/// Static backend capability query vocabulary.
+pub const capability = @import("capability.zig");
+
+/// Typed copy and cast contract validators.
+pub const copy_cast = @import("copy_cast.zig");
+
 /// Thread pool and parallel execution.
 pub const parallel = @import("parallel.zig");
 
@@ -46,6 +58,8 @@ pub const DeviceType = device.DeviceType;
 pub const DType = dtype.DType;
 pub const Tensor = tensor.Tensor;
 pub const OwnedTensor = tensor.OwnedTensor;
+pub const TensorDescriptor = tensor_desc.TensorDescriptor;
+pub const TensorLayout = tensor_desc.Layout;
 pub const ThreadPool = parallel.ThreadPool;
 
 // Re-export DLPack types for external interop

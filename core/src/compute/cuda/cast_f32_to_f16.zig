@@ -6,6 +6,7 @@ const args_mod = @import("args.zig");
 const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
 const registry_mod = @import("registry.zig");
+const copy_cast = @import("../copy_cast.zig");
 
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
@@ -36,11 +37,15 @@ pub fn runWithFunction(
 }
 
 fn validateArgs(src_f32: *const device_mod.Buffer, dst_f16: *device_mod.Buffer, count: u32) !void {
-    if (count == 0) return error.InvalidArgument;
-
-    const src_bytes = std.math.mul(usize, @as(usize, count), @sizeOf(f32)) catch return error.InvalidArgument;
-    const dst_bytes = std.math.mul(usize, @as(usize, count), @sizeOf(u16)) catch return error.InvalidArgument;
-    if (src_f32.size < src_bytes or dst_f16.size < dst_bytes) return error.InvalidArgument;
+    _ = try copy_cast.validateCastBuffers(.{
+        .backend = .cuda,
+        .src_dtype = .f32,
+        .dst_dtype = .f16,
+        .layout = .row_major_contiguous,
+        .element_count = @intCast(count),
+        .src_size = src_f32.size,
+        .dst_size = dst_f16.size,
+    });
 }
 
 fn ceilDiv(numerator: u32, denominator: u32) u32 {
@@ -50,13 +55,27 @@ fn ceilDiv(numerator: u32, denominator: u32) u32 {
 test "validateArgs rejects zero count" {
     const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
     var dst = src;
-    try std.testing.expectError(error.InvalidArgument, validateArgs(&src, &dst, 0));
+    try std.testing.expectError(error.InvalidShape, validateArgs(&src, &dst, 0));
 }
 
 test "validateArgs rejects undersized destination buffer" {
     const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
     var dst = device_mod.Buffer{ .pointer = 0, .size = 6 };
-    try std.testing.expectError(error.InvalidArgument, validateArgs(&src, &dst, 4));
+    try std.testing.expectError(error.BufferTooSmall, validateArgs(&src, &dst, 4));
+}
+
+test "validateArgs runWithFunction rejects undersized destination before mutating arg pack" {
+    var arg_pack = args_mod.ArgPack.init(std.testing.allocator);
+    defer arg_pack.deinit();
+    try arg_pack.appendScalar(u32, 123);
+    const before_len = arg_pack.len();
+
+    var fake_device: device_mod.Device = undefined;
+    const fake_function = module_mod.Function{ .handle = @ptrFromInt(1) };
+    const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
+    var dst = device_mod.Buffer{ .pointer = 0, .size = 6 };
+    try std.testing.expectError(error.BufferTooSmall, runWithFunction(&arg_pack, &fake_device, fake_function, &src, &dst, 4));
+    try std.testing.expectEqual(before_len, arg_pack.len());
 }
 
 test "ceilDiv computes expected block count" {

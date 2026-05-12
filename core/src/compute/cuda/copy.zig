@@ -6,6 +6,7 @@ const args_mod = @import("args.zig");
 const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
 const registry_mod = @import("registry.zig");
+const copy_cast = @import("../copy_cast.zig");
 
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
@@ -20,12 +21,7 @@ pub fn run(
     dst: *device_mod.Buffer,
     count: u32,
 ) !registry_mod.KernelSource {
-    if (count == 0) return error.InvalidArgument;
-
-    const required_bytes = @as(usize, count) * @sizeOf(f32);
-    if (src.size < required_bytes or dst.size < required_bytes) {
-        return error.InvalidArgument;
-    }
+    try validateArgs(src, dst, count);
 
     if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_module);
     const resolved = try registry.resolveFunction(op_name, embedded_symbol);
@@ -43,12 +39,7 @@ pub fn runWithFunction(
     dst: *device_mod.Buffer,
     count: u32,
 ) !void {
-    if (count == 0) return error.InvalidArgument;
-
-    const required_bytes = @as(usize, count) * @sizeOf(f32);
-    if (src.size < required_bytes or dst.size < required_bytes) {
-        return error.InvalidArgument;
-    }
+    try validateArgs(src, dst, count);
 
     arg_pack.reset();
     try arg_pack.appendBufferPtr(dst);
@@ -61,6 +52,18 @@ pub fn runWithFunction(
         .grid_x = grid_x,
         .block_x = block_x,
     }, arg_pack, .copy_cast);
+}
+
+fn validateArgs(src: *const device_mod.Buffer, dst: *device_mod.Buffer, count: u32) !void {
+    _ = try copy_cast.validateCopyBuffers(.{
+        .backend = .cuda,
+        .direction = .device_to_device,
+        .dtype = .f32,
+        .layout = .row_major_contiguous,
+        .element_count = @intCast(count),
+        .src_size = src.size,
+        .dst_size = dst.size,
+    });
 }
 
 fn ceilDiv(numerator: u32, denominator: u32) u32 {
@@ -79,9 +82,15 @@ test "run rejects zero count" {
     const fake_buffer = device_mod.Buffer{ .pointer = 0, .size = 4 };
     var dst = fake_buffer;
     try std.testing.expectError(
-        error.InvalidArgument,
+        error.InvalidShape,
         run(std.testing.allocator, &fake_device, &registry, &fake_buffer, &dst, 0),
     );
+}
+
+test "validateArgs rejects undersized destination buffer" {
+    const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
+    var dst = device_mod.Buffer{ .pointer = 0, .size = 12 };
+    try std.testing.expectError(error.BufferTooSmall, validateArgs(&src, &dst, 4));
 }
 
 test "ceilDiv computes expected block count" {

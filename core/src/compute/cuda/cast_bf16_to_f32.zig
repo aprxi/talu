@@ -5,6 +5,7 @@ const device_mod = @import("device.zig");
 const args_mod = @import("args.zig");
 const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
+const copy_cast = @import("../copy_cast.zig");
 
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
@@ -19,10 +20,7 @@ pub fn runWithFunction(
     dst_f32: *device_mod.Buffer,
     count: u32,
 ) !void {
-    if (count == 0) return error.InvalidArgument;
-    const src_bytes = std.math.mul(usize, @as(usize, count), @sizeOf(u16)) catch return error.InvalidArgument;
-    const dst_bytes = std.math.mul(usize, @as(usize, count), @sizeOf(f32)) catch return error.InvalidArgument;
-    if (src_bf16.size < src_bytes or dst_f32.size < dst_bytes) return error.InvalidArgument;
+    try validateArgs(src_bf16, dst_f32, count);
 
     arg_pack.reset();
     try arg_pack.appendBufferPtr(dst_f32);
@@ -35,4 +33,28 @@ pub fn runWithFunction(
         .grid_x = grid_x,
         .block_x = block_x,
     }, arg_pack, .copy_cast);
+}
+
+fn validateArgs(src_bf16: *const device_mod.Buffer, dst_f32: *device_mod.Buffer, count: u32) !void {
+    _ = try copy_cast.validateCastBuffers(.{
+        .backend = .cuda,
+        .src_dtype = .bf16,
+        .dst_dtype = .f32,
+        .layout = .row_major_contiguous,
+        .element_count = @intCast(count),
+        .src_size = src_bf16.size,
+        .dst_size = dst_f32.size,
+    });
+}
+
+test "validateArgs rejects zero count" {
+    const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
+    var dst = src;
+    try std.testing.expectError(error.InvalidShape, validateArgs(&src, &dst, 0));
+}
+
+test "validateArgs rejects undersized destination buffer" {
+    const src = device_mod.Buffer{ .pointer = 0, .size = 8 };
+    var dst = device_mod.Buffer{ .pointer = 0, .size = 12 };
+    try std.testing.expectError(error.BufferTooSmall, validateArgs(&src, &dst, 4));
 }

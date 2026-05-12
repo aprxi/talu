@@ -30,8 +30,14 @@ pub const ShardedSafeTensors = struct {
     weight_map: std.StringHashMapUnmanaged([]const u8),
     /// Map from shard filename to loaded SafeTensors
     shards: std.StringHashMapUnmanaged(SafeTensors),
+    /// Header-only shard cache used by full loads when metadata is needed
+    /// before the corresponding shard payload has been mmap'd.
+    metadata_shards: std.StringHashMapUnmanaged(SafeTensors),
     /// Base directory containing the shard files
     base_dir: []const u8,
+    /// True when this handle was created by loadMetadataOnly; getTensor then
+    /// preserves the historical metadata-only behavior.
+    metadata_only: bool = false,
 
     /// Load sharded safetensors from an index file
     /// index_path: path to model.safetensors.index.json
@@ -94,7 +100,9 @@ pub const ShardedSafeTensors = struct {
             .allocator = allocator,
             .weight_map = weight_map,
             .shards = .{},
+            .metadata_shards = .{},
             .base_dir = base_dir_storage,
+            .metadata_only = false,
         };
     }
 
@@ -115,6 +123,13 @@ pub const ShardedSafeTensors = struct {
         }
         self.shards.deinit(self.allocator);
 
+        var metadata_shard_it = self.metadata_shards.iterator();
+        while (metadata_shard_it.next()) |kv| {
+            self.allocator.free(kv.key_ptr.*);
+            kv.value_ptr.deinit();
+        }
+        self.metadata_shards.deinit(self.allocator);
+
         self.allocator.free(self.base_dir);
         self.* = undefined;
     }
@@ -131,9 +146,9 @@ pub const ShardedSafeTensors = struct {
         return shard_tensor_file.getTensor(name, expected_dtype);
     }
 
-    pub fn getTensorMetadata(self: *const ShardedSafeTensors, name: []const u8) !reader.SafeTensors.TensorMetadata {
+    pub fn getTensorMetadata(self: *ShardedSafeTensors, name: []const u8) !reader.SafeTensors.TensorMetadata {
         const shard_name = self.weight_map.get(name) orelse return error.NotFound;
-        const shard_file = self.shards.get(shard_name) orelse return error.NotFound;
+        const shard_file = try self.getOrLoadMetadataShard(shard_name);
         return shard_file.getTensorMetadata(name);
     }
 
@@ -171,7 +186,7 @@ pub const ShardedSafeTensors = struct {
 
     /// Ensure a shard is loaded, loading it if necessary
     fn getOrLoadShard(self: *ShardedSafeTensors, shard_name: []const u8) !*SafeTensors {
-        return self.getOrLoadShardImpl(shard_name, false);
+        return self.getOrLoadShardImpl(shard_name, self.metadata_only);
     }
 
     fn getOrLoadShardImpl(self: *ShardedSafeTensors, shard_name: []const u8, metadata_only: bool) !*SafeTensors {
@@ -195,9 +210,43 @@ pub const ShardedSafeTensors = struct {
         errdefer shard_file.deinit();
 
         const shard_name_storage = try self.allocator.dupe(u8, shard_name);
+        errdefer self.allocator.free(shard_name_storage);
         try self.shards.put(self.allocator, shard_name_storage, shard_file);
 
+        if (!metadata_only) {
+            if (self.metadata_shards.fetchRemove(shard_name)) |removed| {
+                self.allocator.free(removed.key);
+                var metadata_file = removed.value;
+                metadata_file.deinit();
+            }
+        }
+
         return self.shards.getPtr(shard_name).?;
+    }
+
+    fn getOrLoadMetadataShard(self: *ShardedSafeTensors, shard_name: []const u8) !*SafeTensors {
+        if (self.shards.getPtr(shard_name)) |shard_file| {
+            return shard_file;
+        }
+        if (self.metadata_only) {
+            return self.getOrLoadShardImpl(shard_name, true);
+        }
+        if (self.metadata_shards.getPtr(shard_name)) |metadata_file| {
+            return metadata_file;
+        }
+
+        const shard_file_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, shard_name });
+        defer self.allocator.free(shard_file_path);
+
+        var metadata_file = SafeTensors.loadMetadataOnly(self.allocator, shard_file_path) catch {
+            return ShardedLoadError.ShardNotFound;
+        };
+        errdefer metadata_file.deinit();
+
+        const shard_name_storage = try self.allocator.dupe(u8, shard_name);
+        errdefer self.allocator.free(shard_name_storage);
+        try self.metadata_shards.put(self.allocator, shard_name_storage, metadata_file);
+        return self.metadata_shards.getPtr(shard_name).?;
     }
 
     /// Pre-load all shard headers (metadata only, no mmap of weight data).
@@ -213,7 +262,11 @@ pub const ShardedSafeTensors = struct {
             const shard_name = kv.value_ptr.*;
             if (seen.contains(shard_name)) continue;
             try seen.put(self.allocator, shard_name, {});
-            _ = try self.getOrLoadShardImpl(shard_name, true);
+            if (self.metadata_only) {
+                _ = try self.getOrLoadShardImpl(shard_name, true);
+            } else {
+                _ = try self.getOrLoadMetadataShard(shard_name);
+            }
         }
     }
 
@@ -291,6 +344,7 @@ pub const UnifiedSafeTensors = union(enum) {
         if (std.mem.endsWith(u8, path, ".index.json")) {
             var sharded_tensors = try ShardedSafeTensors.load(allocator, path);
             errdefer sharded_tensors.deinit();
+            sharded_tensors.metadata_only = true;
             try sharded_tensors.loadAllShardsMetadataOnly();
             return .{ .sharded = sharded_tensors };
         }
@@ -300,6 +354,7 @@ pub const UnifiedSafeTensors = union(enum) {
             defer allocator.free(index_path);
             var sharded_tensors = try ShardedSafeTensors.load(allocator, index_path);
             errdefer sharded_tensors.deinit();
+            sharded_tensors.metadata_only = true;
             try sharded_tensors.loadAllShardsMetadataOnly();
             return .{ .sharded = sharded_tensors };
         }
@@ -345,7 +400,7 @@ pub const UnifiedSafeTensors = union(enum) {
         };
     }
 
-    pub fn getTensorMetadata(self: *const UnifiedSafeTensors, name: []const u8) !reader.SafeTensors.TensorMetadata {
+    pub fn getTensorMetadata(self: *UnifiedSafeTensors, name: []const u8) !reader.SafeTensors.TensorMetadata {
         return switch (self.*) {
             .single => |*s| s.getTensorMetadata(name),
             .sharded => |*s| s.getTensorMetadata(name),
@@ -463,6 +518,55 @@ test "ShardedSafeTensors: load from index file" {
 
     const t2 = try sharded.getTensor("layer2.weight", .i8);
     try std.testing.expectEqual(@as(usize, 4), t2.numel);
+}
+
+test "ShardedSafeTensors: getTensorMetadata loads unloaded shard header" {
+    const allocator = std.testing.allocator;
+    const writer = @import("writer.zig");
+
+    const tmp_dir_path = "/tmp/test_sharded_metadata_unloaded";
+    std.fs.cwd().makeDir(tmp_dir_path) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir_path) catch {};
+
+    const shard1_data = [_]u8{ 1, 2, 3, 4 };
+    const shard1_entries = [_]writer.TensorEntry{
+        .{ .name = "layer1.weight", .dtype = .i8, .shape = &[_]usize{4}, .data = &shard1_data },
+    };
+    const shard1_path = tmp_dir_path ++ "/model-00001-of-00002.safetensors";
+    try writer.write(allocator, shard1_path, &shard1_entries);
+
+    const shard2_data = [_]u8{ 5, 6, 7, 8, 9, 10 };
+    const shard2_entries = [_]writer.TensorEntry{
+        .{ .name = "layer2.weight", .dtype = .i8, .shape = &[_]usize{6}, .data = &shard2_data },
+    };
+    const shard2_path = tmp_dir_path ++ "/model-00002-of-00002.safetensors";
+    try writer.write(allocator, shard2_path, &shard2_entries);
+
+    const index_json =
+        \\{
+        \\  "weight_map": {
+        \\    "layer1.weight": "model-00001-of-00002.safetensors",
+        \\    "layer2.weight": "model-00002-of-00002.safetensors"
+        \\  }
+        \\}
+    ;
+    const index_path = tmp_dir_path ++ "/model.safetensors.index.json";
+    var index_file = try std.fs.cwd().createFile(index_path, .{});
+    defer index_file.close();
+    try index_file.writeAll(index_json);
+
+    var sharded = try ShardedSafeTensors.load(allocator, index_path);
+    defer sharded.deinit();
+
+    _ = try sharded.getTensor("layer1.weight", .i8);
+    const metadata = try sharded.getTensorMetadata("layer2.weight");
+    try std.testing.expectEqual(DType.i8, metadata.dtype);
+    try std.testing.expectEqual(@as(usize, 1), metadata.shape.len);
+    try std.testing.expectEqual(@as(usize, 6), metadata.shape[0]);
+    try std.testing.expectEqual(@as(usize, 6), metadata.byte_count);
+
+    const t2 = try sharded.getTensor("layer2.weight", .i8);
+    try std.testing.expectEqual(@as(usize, 6), t2.numel);
 }
 
 test "ShardedSafeTensors: getTensor with dtype validation" {

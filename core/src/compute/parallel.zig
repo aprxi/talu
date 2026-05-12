@@ -377,7 +377,7 @@ pub fn global() *ThreadPool {
                 };
             };
             const pool = global_pool.?;
-            log.warn("compute", "Thread pool initialized", .{ .pool_threads = pool.n_threads, .bw_threads = pool.bw_threads });
+            log.info("compute", "Thread pool initialized", .{ .pool_threads = pool.n_threads, .bw_threads = pool.bw_threads });
             global_pool_once.store(true, .release);
         }
     }

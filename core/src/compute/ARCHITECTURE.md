@@ -48,6 +48,34 @@ For hardware backends like Apple Silicon (Metal/MLX), `compute` **does not** def
 *   `compute/metal/graph.zig` exposes a generic, lazy computation graph API (e.g., "Add", "Matmul", "Reshape").
 *   The actual construction of a "Fused Transformer" lives entirely in `inference/backend/metal/`. 
 
+### Tensor Metadata And Layout Contract
+`compute/tensor_desc.zig` is the canonical compute-local path for tensor metadata validation:
+
+*   rank must be `1...8`
+*   active dimensions and generic strides must be positive
+*   inactive shape and stride slots must be zero
+*   logical element counts, dense byte counts, and strided physical byte spans use checked arithmetic
+*   `Tensor.data_size` is physical storage bytes, not an implicit dense byte count
+
+The compute layout vocabulary is intentionally small:
+
+| Layout | Meaning |
+| :--- | :--- |
+| `row_major_contiguous` | Dense C-order storage with canonical strides |
+| `strided` | Inspectable storage with explicit positive element strides |
+| `opaque_backend` | Backend-native storage that generic byte/span validators cannot inspect |
+
+Generic byte validators reject `opaque_backend`. Backend-native paths must opt into explicit backend capability checks instead of claiming dense byte compatibility.
+
+Block-quantized dtypes such as grouped-affine and MXFP4 do not have a generic dense element byte count. Callers must validate declared physical storage bytes explicitly.
+
+### Backend Capability Contract
+`compute/capability.zig` defines static query types for backend, primitive, dtype, layout, copy direction, cast pair, rank limits, and alignment requirements. CPU, CUDA, and Metal capability modules publish table-driven facts for their current primitive, copy, and cast surfaces.
+
+Unknown support defaults to unsupported. Capability declarations must stay compute-generic: no model ids, layer ranges, stages, request state, scheduler slots, placement, transport, or orchestration concepts.
+
+Copy and cast helpers use `compute/copy_cast.zig` validators before destination mutation or kernel argument packing wherever signatures expose dtype, layout, element count, and buffer sizes. Unsupported copy directions, cast pairs, dtypes, layouts, devices, buffer sizes, and alignment mismatches fail with typed errors.
+
 ---
 
 ## 3. Testing & Micro-Benchmarking Strategy

@@ -120,8 +120,25 @@ pub const DType = enum(u8) {
         };
     }
 
+    /// Dense element size in bytes for dtypes with one physical scalar per
+    /// logical element. Block-quantized dtypes require explicit storage bytes.
+    pub fn checkedDenseElementSize(self: DType) !usize {
+        if (self.isBlockQuantized()) return error.UnsupportedDType;
+        const size = self.elementSize();
+        if (size == 0) return error.UnsupportedDType;
+        return size;
+    }
+
     /// Check if this is a quantized block type
     pub fn isQuantized(self: DType) bool {
+        return switch (self) {
+            .grouped_affine_u4, .grouped_affine_u8, .mxfp4 => true,
+            else => false,
+        };
+    }
+
+    /// Check if this dtype needs block metadata to derive physical bytes.
+    pub fn isBlockQuantized(self: DType) bool {
         return switch (self) {
             .grouped_affine_u4, .grouped_affine_u8, .mxfp4 => true,
             else => false,
@@ -915,6 +932,20 @@ test "DType enum values - FFI compatibility" {
     // Verify quantized types start at 25
     try std.testing.expectEqual(@as(u8, 25), @intFromEnum(DType.grouped_affine_u4));
     try std.testing.expectEqual(@as(u8, 26), @intFromEnum(DType.grouped_affine_u8));
+}
+
+test "DType.checkedDenseElementSize returns dense byte width" {
+    try std.testing.expectEqual(@as(usize, 4), try DType.f32.checkedDenseElementSize());
+    try std.testing.expectEqual(@as(usize, 1), try DType.f8_e4m3.checkedDenseElementSize());
+    try std.testing.expectError(error.UnsupportedDType, DType.grouped_affine_u4.checkedDenseElementSize());
+}
+
+test "DType.isBlockQuantized identifies block-packed dtypes" {
+    try std.testing.expect(DType.grouped_affine_u4.isBlockQuantized());
+    try std.testing.expect(DType.grouped_affine_u8.isBlockQuantized());
+    try std.testing.expect(DType.mxfp4.isBlockQuantized());
+    try std.testing.expect(!DType.f8_e4m3.isBlockQuantized());
+    try std.testing.expect(!DType.f32.isBlockQuantized());
 }
 
 test "f32 and bf16 edge case - very large numbers" {
