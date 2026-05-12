@@ -26,3 +26,17 @@ fn get_fco_on_wrong_type_errors() {
         "get_function_call_output on message should return error"
     );
 }
+
+#[test]
+fn fco_part_accessor_rejects_text_output() {
+    let mut ctx = ResponsesTestContext::new();
+    let h = ctx.handle_mut();
+    h.append_function_call_output("call_42", "plain text")
+        .unwrap();
+
+    let result = h.get_function_call_output_part(0, 0);
+    assert!(
+        result.is_err(),
+        "part accessor must reject text-only function_call_output items"
+    );
+}

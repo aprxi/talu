@@ -1,4 +1,4 @@
-//! Shared helpers for router C-API tests.
+//! Shared helpers for response engine C-API tests.
 
 use std::ffi::{c_void, CString};
 
@@ -12,7 +12,7 @@ pub fn model_path() -> Option<String> {
 /// Skips the current test if `TALU_TEST_MODEL` is not set.
 macro_rules! skip_without_model {
     () => {
-        let Some(ref _model) = crate::capi::router::common::model_path() else {
+        let Some(ref _model) = crate::capi::responses::common::engine::model_path() else {
             eprintln!("skipping: TALU_TEST_MODEL not set");
             return;
         };

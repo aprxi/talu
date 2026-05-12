@@ -2,8 +2,8 @@
 //!
 //! Exercises `talu_backend_create_from_canonical` and `talu_backend_free`.
 
-use crate::capi::router::common;
-use crate::capi::router::common::skip_without_model;
+use crate::capi::responses::common::engine as common;
+use crate::capi::responses::common::engine::skip_without_model;
 use std::ffi::{c_void, CString};
 use std::ptr;
 

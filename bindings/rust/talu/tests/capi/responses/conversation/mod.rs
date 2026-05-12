@@ -1,6 +1,6 @@
-//! Conversation lifecycle, item CRUD, and ordering tests.
+//! Conversation lifecycle, clone/truncate, clear, and ordering tests.
 
-mod generation;
-mod items;
 mod lifecycle;
 mod ordering;
+mod state;
+mod status;

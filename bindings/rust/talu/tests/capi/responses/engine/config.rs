@@ -3,7 +3,7 @@
 //! Exercises `talu_config_canonicalize`, `talu_config_get_view`, and
 //! `talu_config_free` with both valid and invalid inputs.
 
-use crate::capi::router::common;
+use crate::capi::responses::common::engine as common;
 use std::ffi::{c_void, CString};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};

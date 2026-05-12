@@ -1,5 +1,7 @@
 //! Shared test fixtures for the Responses integration test suite.
 
+pub mod engine;
+
 use std::ffi::CString;
 use std::os::raw::c_void;
 use talu::responses::{ContentType, ItemType, MessageRole, ResponsesHandle, ResponsesView};

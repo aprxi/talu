@@ -60,3 +60,36 @@ fn content_type_matches_role() {
         "assistant content should be OutputText"
     );
 }
+
+#[test]
+fn message_content_out_of_bounds_errors() {
+    let mut ctx = ResponsesTestContext::new();
+    let h = ctx.handle_mut();
+    h.append_message(MessageRole::User, "one part").unwrap();
+
+    let result = h.get_message_content(0, 1);
+    assert!(result.is_err(), "missing content part must return error");
+}
+
+#[test]
+fn message_content_on_wrong_item_type_errors() {
+    let mut ctx = ResponsesTestContext::new();
+    let h = ctx.handle_mut();
+    h.append_function_call("call_1", "tool", "{}").unwrap();
+
+    let result = h.get_message_content(0, 0);
+    assert!(
+        result.is_err(),
+        "message content accessor must reject non-message items"
+    );
+}
+
+#[test]
+fn item_type_out_of_bounds_is_unknown() {
+    let ctx = ResponsesTestContext::new();
+    assert_eq!(
+        ctx.handle().item_type(0),
+        talu::responses::ItemType::Unknown,
+        "out-of-bounds item_type must be Unknown"
+    );
+}

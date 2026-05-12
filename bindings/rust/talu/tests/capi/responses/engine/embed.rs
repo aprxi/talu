@@ -3,8 +3,8 @@
 //! Null-safety tests run unconditionally. Actual embedding tests require
 //! `TALU_TEST_MODEL` to point to a model that supports embeddings.
 
-use crate::capi::router::common;
-use crate::capi::router::common::skip_without_model;
+use crate::capi::responses::common::engine as common;
+use crate::capi::responses::common::engine::skip_without_model;
 use std::ffi::CString;
 use std::ptr;
 
