@@ -4,8 +4,9 @@
 // Usage: const capi = @import("capi/root.zig");
 //
 // Primary APIs for talu/chat/:
-// - responses.zig: Chat/Session management (talu_chat_*), Item-based conversation (talu_responses_*)
-// - router.zig: Public router C API symbols (talu_router_*), backend management (talu_backend_*), config (talu_config_*)
+// - responses/root.zig: Chat/session management (talu_chat_*), item-based conversation
+//   (talu_responses_*), router helpers (talu_router_*), backend management
+//   (talu_backend_*), config (talu_config_*), and completions validation.
 //
 // Utility APIs:
 // - session.zig: Model resolution, chat templates, EOS tokens
@@ -19,7 +20,7 @@ const converter = @import("converter.zig");
 const model = @import("model.zig");
 const repo = @import("repository.zig");
 const err = @import("error.zig");
-const responses = @import("responses.zig");
+const responses = @import("responses/root.zig");
 const xray = @import("xray.zig");
 const validate = @import("validate.zig");
 const buffer = @import("buffer.zig");
@@ -28,7 +29,7 @@ const log_api = @import("log.zig");
 pub const progress = @import("progress.zig");
 const memory = @import("memory.zig");
 
-const router = @import("router.zig");
+const router = responses;
 const scheduler = @import("scheduler.zig");
 const batch = @import("batch.zig");
 const train = @import("train.zig");

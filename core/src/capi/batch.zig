@@ -13,9 +13,9 @@ const batch_mod = @import("../responses/batch.zig");
 const spec_mod = @import("../responses/spec.zig");
 const local_mod = @import("../responses/local.zig");
 const capi_bridge = @import("../responses/capi_bridge.zig");
-const router_capi = @import("router.zig");
+const router_capi = @import("responses/root.zig");
 const capi_error = @import("error.zig");
-const responses_capi = @import("responses.zig");
+const responses_capi = @import("responses/root.zig");
 const conversation_mod = @import("../responses/conversation/root.zig");
 
 const allocator = std.heap.c_allocator;

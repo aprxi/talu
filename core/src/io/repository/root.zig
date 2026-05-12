@@ -5,7 +5,7 @@
 //! ## Call Flow
 //!
 //! ```
-//! capi/router.zig
+//! capi/responses/engine.zig
 //!     ↓
 //! responses/spec.zig or responses/local.zig
 //!     ↓

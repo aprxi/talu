@@ -1,6 +1,6 @@
 //! Python Binding Generator
 //!
-//! Scans core/src/capi/*.zig files and generates Python ctypes bindings.
+//! Scans core/src/capi/**/*.zig files and generates Python ctypes bindings.
 //! This ensures the Python bindings are always in sync with the Zig C API.
 //!
 //! Scope note:

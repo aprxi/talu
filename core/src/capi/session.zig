@@ -1,7 +1,7 @@
 //! Utility C API
 //!
 //! Utility functions for model resolution, chat templates, and EOS tokens.
-//! For local generation, use the batch C API. Backend/config helpers live in router.zig.
+//! For local generation, use the batch C API. Backend/config helpers live in responses/engine.zig.
 //! For tokenization, see tokenizer.zig.
 
 const std = @import("std");
