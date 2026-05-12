@@ -596,19 +596,26 @@ fn canDerivePlainIndependentDecoderCuts(request: StagePlanRequest) bool {
     return true;
 }
 
-fn requiresBoundaryDependencies(request: StagePlanRequest) bool {
-    if (request.architecture) |architecture| {
+pub fn requiresBoundaryDependenciesFor(
+    architecture_opt: ?*const Architecture,
+    config_opt: ?*const ModelConfig,
+) bool {
+    if (architecture_opt) |architecture| {
         if (architecture.has_mamba or architecture.has_gated_delta or architecture.has_shortconv or architecture.has_mla) {
             return true;
         }
     }
-    if (request.model_config) |config| {
+    if (config_opt) |config| {
         if (config.num_kv_shared_layers != 0) return true;
         if (config.mamba_d_state != 0 or config.mamba_d_conv != 0 or config.mamba_n_heads != 0) return true;
         if (config.shortconv_d_conv != 0 or config.shortconv_conv_dim != 0) return true;
         if (config.linear_num_key_heads != 0 or config.linear_num_value_heads != 0) return true;
     }
     return false;
+}
+
+fn requiresBoundaryDependencies(request: StagePlanRequest) bool {
+    return requiresBoundaryDependenciesFor(request.architecture, request.model_config);
 }
 
 fn hasExplicitBoundaryDependencies(request: StagePlanRequest, stage_count: usize) bool {
@@ -3067,6 +3074,19 @@ test "stage_plan buildStagePlan fails closed for missing constraints and missing
     var plan = try buildStagePlan(allocator, with_dependency);
     defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), plan.dependencies.len);
+}
+
+test "stage_plan requiresBoundaryDependenciesFor centralizes stateful decoder cut semantics" {
+    var config = testConfig(4);
+    var arch = testArch();
+    try std.testing.expect(!requiresBoundaryDependenciesFor(&arch, &config));
+
+    config.num_kv_shared_layers = 1;
+    try std.testing.expect(requiresBoundaryDependenciesFor(&arch, &config));
+
+    config = testConfig(4);
+    arch.has_gated_delta = true;
+    try std.testing.expect(requiresBoundaryDependenciesFor(&arch, &config));
 }
 
 test "stage_plan buildStagePlan independent lm_head does not require token embedding residency" {

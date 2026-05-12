@@ -6,14 +6,17 @@
 const std = @import("std");
 const pipeline = @import("pipeline.zig");
 const tensor_frame = @import("tensor_frame.zig");
-const xray_bridge = @import("../diagnostics/xray_bridge.zig");
 
 pub const LocalDecodeHandoffConfig = struct {
+    plan_ref: *const tensor_frame.TensorFramePlanRef,
+    boundary_index: usize,
     metadata: tensor_frame.TensorFrameMetadata,
     activation_byte_count: usize,
     host_staging: ?[]align(64) u8,
     stage0_input: []const u8 = &.{},
     stage1_input: []const u8 = &.{},
+    observer: tensor_frame.TensorFrameObserver = .{},
+    observer_mode: tensor_frame.TensorFrameObserverMode = .best_effort,
 };
 
 pub fn executeTwoStageForward(
@@ -49,9 +52,9 @@ pub fn executeLocalDecodeHandoff(
     stage1: Stage1Type,
     config: LocalDecodeHandoffConfig,
 ) !void {
-    try config.metadata.validate();
-    if (config.metadata.role != .activation) return error.InvalidStageBoundary;
-    if (config.metadata.boundary.producer_layer_start != 0) return error.InvalidLayerRange;
+    try tensor_frame.validateTensorFrameForPlanBoundary(&config.metadata, config.plan_ref, config.boundary_index);
+    try tensor_frame.validatePayloadBufferLength(&config.metadata, config.activation_byte_count);
+    if (config.metadata.boundary.producer_layer_start != 0) return error.InvalidProducerLayerRange;
 
     const split_layer: usize = config.metadata.boundary.consumer_layer_start;
     const total_layers: usize = config.metadata.boundary.consumer_layer_end;
@@ -59,14 +62,15 @@ pub fn executeLocalDecodeHandoff(
     const Transfer = struct {
         metadata: tensor_frame.TensorFrameMetadata,
         host_staging: ?[]align(64) u8,
+        observer: tensor_frame.TensorFrameObserver,
+        observer_mode: tensor_frame.TensorFrameObserverMode,
 
         pub fn transfer(transfer_ctx: *@This(), src: *Stage0Type, dst: *Stage1Type, byte_count: usize) anyerror!void {
-            try tensor_frame.validateActivationFrameByteCount(&transfer_ctx.metadata, @intCast(byte_count));
             const staging = transfer_ctx.host_staging orelse return error.PipelineTransferNotInitialized;
             if (byte_count > staging.len) return error.PipelineTransferBufferTooSmall;
             try src.downloadActivation(staging[0..byte_count], byte_count);
             try dst.uploadActivation(staging[0..byte_count], byte_count);
-            xray_bridge.emitActivationHandoffLayerInput(&transfer_ctx.metadata, staging.ptr);
+            try tensor_frame.emitTensorFrame(transfer_ctx.observer, transfer_ctx.observer_mode, &transfer_ctx.metadata);
         }
 
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
@@ -84,7 +88,12 @@ pub fn executeLocalDecodeHandoff(
         config.stage1_input,
         config.activation_byte_count,
         null,
-        .{ .metadata = config.metadata, .host_staging = config.host_staging },
+        .{
+            .metadata = config.metadata,
+            .host_staging = config.host_staging,
+            .observer = config.observer,
+            .observer_mode = config.observer_mode,
+        },
     );
 }
 
@@ -172,7 +181,88 @@ const MockTransfer = struct {
     pub fn deinit(_: *MockTransfer, _: std.mem.Allocator) void {}
 };
 
-test "executeTwoStageForward runs both stages via custom transfer" {
+const observer_test_batch = [_]tensor_frame.TensorFrameBatchEntry{.{
+    .batch_index = 0,
+    .request_id = 42,
+    .slot_id = 7,
+    .sequence_start = 7,
+    .token_count = 1,
+}};
+
+const observer_test_boundaries = [_]tensor_frame.TensorFrameBoundaryRef{.{
+    .boundary_index = 0,
+    .source_stage_id = 0,
+    .target_stage_id = 1,
+    .producer_layer_start = 0,
+    .producer_layer_end = 2,
+    .consumer_layer_start = 2,
+    .consumer_layer_end = 4,
+}};
+
+const mismatched_observer_test_boundaries = [_]tensor_frame.TensorFrameBoundaryRef{.{
+    .boundary_index = 0,
+    .source_stage_id = 0,
+    .target_stage_id = 1,
+    .producer_layer_start = 0,
+    .producer_layer_end = 2,
+    .consumer_layer_start = 2,
+    .consumer_layer_end = 4,
+}};
+
+fn testObserverPlanRef() tensor_frame.TensorFramePlanRef {
+    return .{
+        .allocator = std.testing.allocator,
+        .identity = .{
+            .graph_digest = [_]u8{1} ** 32,
+            .graph_contract_version = 1,
+            .stage_plan_contract_version = 1,
+            .stage_plan_id = .{ .digest = [_]u8{2} ** 32 },
+        },
+        .boundaries = &observer_test_boundaries,
+    };
+}
+
+fn testObserverFrame(plan_ref: *const tensor_frame.TensorFramePlanRef) !tensor_frame.TensorFrameMetadata {
+    const boundary = try plan_ref.boundary(0);
+    const tensor = try tensor_frame.TensorFrameTensorDesc.contiguousActivation(.f32, .{ 1, 1, 8, 0 });
+    return .{
+        .frame_id = try tensor_frame.TensorFrameInstanceId.init(1),
+        .plan = plan_ref.identity,
+        .boundary = boundary,
+        .selected_contract = .{
+            .boundary = boundary,
+            .dtype = .f32,
+            .layout = .row_major,
+            .source = .explicit,
+        },
+        .role = .activation,
+        .step_kind = .decode,
+        .shape_context = .{ .expected_hidden_size = 8 },
+        .tensor = tensor,
+        .batch = .{ .entries = &observer_test_batch },
+        .payload = .{
+            .byte_count = tensor.payload_byte_count,
+            .location_hint = .{ .cuda = 0 },
+            .ownership = .borrowed_until_next_stage_call,
+            .lifetime = .step_scoped,
+        },
+    };
+}
+
+fn mismatchedObserverPlanRef() tensor_frame.TensorFramePlanRef {
+    return .{
+        .allocator = std.testing.allocator,
+        .identity = .{
+            .graph_digest = [_]u8{1} ** 32,
+            .graph_contract_version = 1,
+            .stage_plan_contract_version = 1,
+            .stage_plan_id = .{ .digest = [_]u8{3} ** 32 },
+        },
+        .boundaries = &mismatched_observer_test_boundaries,
+    };
+}
+
+test "inference bridge executeTwoStageForward runs both stages via custom transfer" {
     var log = TestLog{};
     try executeTwoStageForward(
         MockStage,
@@ -196,27 +286,11 @@ test "executeTwoStageForward runs both stages via custom transfer" {
     try std.testing.expectEqual(TestLog.Kind.execute, log.entries[3].kind);
 }
 
-test "executeLocalDecodeHandoff runs stages through metadata validated transfer" {
+test "inference bridge executeLocalDecodeHandoff runs stages through metadata validated transfer" {
     var log = TestLog{};
     var staging: [64]u8 align(64) = undefined;
-    const metadata = try tensor_frame.activationHandoffFrame(.{
-        .frame_id = 1,
-        .graph_id = 2,
-        .request_id = 3,
-        .source = .{ .stage_id = 0, .backend = .cpu },
-        .target = .{ .stage_id = 1, .backend = .cuda },
-        .producer_layer_start = 0,
-        .producer_layer_end = 2,
-        .consumer_layer_start = 2,
-        .consumer_layer_end = 4,
-        .dtype = .f32,
-        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
-        .device = .{ .cuda = 0 },
-        .sequence_start = 7,
-        .sequence_len = 1,
-        .batch_size = 1,
-        .slot_index = 0,
-    });
+    const plan_ref = testObserverPlanRef();
+    const metadata = try testObserverFrame(&plan_ref);
 
     try executeLocalDecodeHandoff(
         MockStage,
@@ -224,6 +298,8 @@ test "executeLocalDecodeHandoff runs stages through metadata validated transfer"
         .{ .id = 0, .log = &log },
         .{ .id = 1, .log = &log },
         .{
+            .plan_ref = &plan_ref,
+            .boundary_index = 0,
             .metadata = metadata,
             .activation_byte_count = 32,
             .host_staging = staging[0..],
@@ -242,53 +318,22 @@ test "executeLocalDecodeHandoff runs stages through metadata validated transfer"
     try std.testing.expectEqual(@as(usize, 5), log.entries[4].arg);
 }
 
-test "executeLocalDecodeHandoff emits xray layer input from bridge metadata when requested" {
-    const trace = @import("xray_pkg").trace;
+test "inference bridge executeLocalDecodeHandoff emits generic observer frame" {
     const Capture = struct {
-        var count: usize = 0;
-        var last: ?trace.TraceEmission = null;
+        count: usize = 0,
 
-        fn handler(emission: trace.TraceEmission) void {
-            count += 1;
-            last = emission;
-        }
-
-        fn reset() void {
-            count = 0;
-            last = null;
+        fn emit(ctx: ?*anyopaque, metadata: *const tensor_frame.TensorFrameMetadata) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            try metadata.validate();
+            self.count += 1;
         }
     };
 
-    Capture.reset();
-    trace.setHandler(&Capture.handler);
-    trace.setActiveBuiltInPointMask(@as(u64, 1) << @intFromEnum(trace.TracePoint.layer_input));
-    trace.setActiveExactEmissionFilter(null);
-    defer {
-        trace.setActiveBuiltInPointMask(0);
-        trace.setActiveExactEmissionFilter(null);
-        trace.setHandler(null);
-    }
-
     var log = TestLog{};
+    var capture = Capture{};
     var staging: [64]u8 align(64) = undefined;
-    const metadata = try tensor_frame.activationHandoffFrame(.{
-        .frame_id = 1,
-        .graph_id = 2,
-        .request_id = 3,
-        .source = .{ .stage_id = 0, .backend = .cpu },
-        .target = .{ .stage_id = 1, .backend = .cuda },
-        .producer_layer_start = 0,
-        .producer_layer_end = 2,
-        .consumer_layer_start = 2,
-        .consumer_layer_end = 4,
-        .dtype = .f32,
-        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
-        .device = .{ .cuda = 0 },
-        .sequence_start = 7,
-        .sequence_len = 1,
-        .batch_size = 1,
-        .slot_index = 0,
-    });
+    const plan_ref = testObserverPlanRef();
+    const frame = try testObserverFrame(&plan_ref);
 
     try executeLocalDecodeHandoff(
         MockStage,
@@ -296,60 +341,35 @@ test "executeLocalDecodeHandoff emits xray layer input from bridge metadata when
         .{ .id = 0, .log = &log },
         .{ .id = 1, .log = &log },
         .{
-            .metadata = metadata,
+            .plan_ref = &plan_ref,
+            .boundary_index = 0,
+            .metadata = frame,
             .activation_byte_count = 32,
             .host_staging = staging[0..],
+            .observer = .{ .ctx = &capture, .emit_fn = Capture.emit },
+            .observer_mode = .strict,
         },
     );
 
-    if (!trace.isEnabled()) {
-        try std.testing.expectEqual(@as(usize, 0), Capture.count);
-        return;
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), Capture.count);
-    const emission = Capture.last.?;
-    try std.testing.expectEqual(trace.TracePoint.layer_input, emission.point);
-    try std.testing.expectEqual(@as(u16, 2), emission.layer);
-    try std.testing.expectEqual(@as(u32, 0), emission.token);
-    try std.testing.expectEqual(@as(u32, 1), emission.position);
-    try std.testing.expectEqual(trace.Backend.cuda, emission.backend);
-    try std.testing.expectEqual(trace.DType.f32, emission.tensor.dtype);
-    try std.testing.expectEqual(@as(u8, 3), emission.tensor.ndim);
-    try std.testing.expectEqual([4]u32{ 1, 1, 8, 0 }, emission.tensor.shape);
-    try std.testing.expectEqual(@as(u64, 32), emission.work_bytes);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
 }
 
-test "executeLocalDecodeHandoff rejects stale byte count before transfer" {
+test "inference bridge executeLocalDecodeHandoff rejects stale byte count before transfer" {
     var log = TestLog{};
     var staging: [64]u8 align(64) = undefined;
-    const metadata = try tensor_frame.activationHandoffFrame(.{
-        .frame_id = 1,
-        .graph_id = 2,
-        .request_id = 3,
-        .source = .{ .stage_id = 0, .backend = .cpu },
-        .target = .{ .stage_id = 1, .backend = .cuda },
-        .producer_layer_start = 0,
-        .producer_layer_end = 2,
-        .consumer_layer_start = 2,
-        .consumer_layer_end = 4,
-        .dtype = .f32,
-        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
-        .device = .{ .cuda = 0 },
-        .sequence_start = 7,
-        .sequence_len = 1,
-        .batch_size = 1,
-        .slot_index = 0,
-    });
+    const plan_ref = testObserverPlanRef();
+    const metadata = try testObserverFrame(&plan_ref);
 
     try std.testing.expectError(
-        error.InvalidTensorByteCount,
+        error.PayloadBufferLengthMismatch,
         executeLocalDecodeHandoff(
             MockStage,
             MockStage,
             .{ .id = 0, .log = &log },
             .{ .id = 1, .log = &log },
             .{
+                .plan_ref = &plan_ref,
+                .boundary_index = 0,
                 .metadata = metadata,
                 .activation_byte_count = 36,
                 .host_staging = staging[0..],
@@ -357,41 +377,27 @@ test "executeLocalDecodeHandoff rejects stale byte count before transfer" {
         ),
     );
 
-    try std.testing.expectEqual(@as(usize, 2), log.count);
-    try std.testing.expectEqual(TestLog.Kind.execute, log.entries[0].kind);
-    try std.testing.expectEqual(TestLog.Kind.sync, log.entries[1].kind);
+    try std.testing.expectEqual(@as(usize, 0), log.count);
 }
 
-test "executeLocalDecodeHandoff rejects unsupported producer layer start" {
+test "inference bridge executeLocalDecodeHandoff rejects unsupported producer layer start" {
     var log = TestLog{};
     var staging: [64]u8 align(64) = undefined;
-    const metadata = try tensor_frame.activationHandoffFrame(.{
-        .frame_id = 1,
-        .graph_id = 2,
-        .request_id = 3,
-        .source = .{ .stage_id = 0, .backend = .cpu },
-        .target = .{ .stage_id = 1, .backend = .cuda },
-        .producer_layer_start = 1,
-        .producer_layer_end = 2,
-        .consumer_layer_start = 2,
-        .consumer_layer_end = 4,
-        .dtype = .f32,
-        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 8, 0 }),
-        .device = .{ .cuda = 0 },
-        .sequence_start = 7,
-        .sequence_len = 1,
-        .batch_size = 1,
-        .slot_index = 0,
-    });
+    const plan_ref = testObserverPlanRef();
+    var metadata = try testObserverFrame(&plan_ref);
+    metadata.boundary.producer_layer_start = 1;
+    metadata.selected_contract.boundary.producer_layer_start = 1;
 
     try std.testing.expectError(
-        error.InvalidLayerRange,
+        error.InvalidProducerLayerRange,
         executeLocalDecodeHandoff(
             MockStage,
             MockStage,
             .{ .id = 0, .log = &log },
             .{ .id = 1, .log = &log },
             .{
+                .plan_ref = &plan_ref,
+                .boundary_index = 0,
                 .metadata = metadata,
                 .activation_byte_count = 32,
                 .host_staging = staging[0..],
@@ -401,7 +407,33 @@ test "executeLocalDecodeHandoff rejects unsupported producer layer start" {
     try std.testing.expectEqual(@as(usize, 0), log.count);
 }
 
-test "executeThreeStageForward runs all stages through both transfers" {
+test "inference bridge executeLocalDecodeHandoff rejects self-consistent fake plan identity" {
+    var log = TestLog{};
+    var staging: [64]u8 align(64) = undefined;
+    const plan_ref = testObserverPlanRef();
+    const fake_plan_ref = mismatchedObserverPlanRef();
+    const metadata = try testObserverFrame(&fake_plan_ref);
+
+    try std.testing.expectError(
+        error.StagePlanIdentityMismatch,
+        executeLocalDecodeHandoff(
+            MockStage,
+            MockStage,
+            .{ .id = 0, .log = &log },
+            .{ .id = 1, .log = &log },
+            .{
+                .plan_ref = &plan_ref,
+                .boundary_index = 0,
+                .metadata = metadata,
+                .activation_byte_count = 32,
+                .host_staging = staging[0..],
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), log.count);
+}
+
+test "inference bridge executeThreeStageForward runs all stages through both transfers" {
     var log = TestLog{};
     var staging01: [64]u8 align(64) = undefined;
     var staging12: [64]u8 align(64) = undefined;

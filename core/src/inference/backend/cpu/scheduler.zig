@@ -3055,6 +3055,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         }
 
         fn bindAndTrackRequestStateBlocks(self: *Self, request_id: u64, slot_index: usize) !void {
+            if (comptime @hasDecl(BackendType, "bindSlotRequestId")) {
+                try self.backend.bindSlotRequestId(slot_index, request_id);
+                errdefer self.backend.unbindSlotRequestId(slot_index);
+            }
+
             var merged: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
             var count: usize = 0;
 
@@ -3090,6 +3095,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         fn releaseRequestStateBlocks(self: *Self, request_id: u64, slot_index: ?usize) void {
             if (slot_index) |slot| {
                 self.backend.unbindSlotStateBlocks(slot);
+                if (comptime @hasDecl(BackendType, "unbindSlotRequestId")) {
+                    self.backend.unbindSlotRequestId(slot);
+                }
             }
             // Free only non-persistent blocks; slot-persistent blocks remain in slot_state_blocks
             if (self.request_state_blocks.fetchRemove(request_id)) |entry| {

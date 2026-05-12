@@ -409,11 +409,19 @@ pub fn decodeTopKStreaming(
 }
 
 pub fn allocSlot(self: anytype) ?usize {
+    const SelfType = @TypeOf(self.*);
     for (self.slot_in_use, 0..) |in_use, i| {
         if (!in_use) {
             self.slot_in_use[i] = true;
             self.slot_positions[i] = 0;
             self.slot_rope_position_deltas[i] = 0;
+            if (comptime @hasField(SelfType, "slot_request_ids") and @hasField(SelfType, "next_slot_request_id")) {
+                if (i < self.slot_request_ids.len) {
+                    self.slot_request_ids[i] = self.next_slot_request_id;
+                    self.next_slot_request_id +%= 1;
+                    if (self.next_slot_request_id == 0) self.next_slot_request_id = 1;
+                }
+            }
             markDecodePointerTablesDirty(self);
             return i;
         }
@@ -422,10 +430,14 @@ pub fn allocSlot(self: anytype) ?usize {
 }
 
 pub fn freeSlot(self: anytype, slot_index: usize) void {
+    const SelfType = @TypeOf(self.*);
     if (!slotIndexSupported(self, slot_index)) return;
     self.slot_in_use[slot_index] = false;
     self.slot_positions[slot_index] = 0;
     self.slot_rope_position_deltas[slot_index] = 0;
+    if (comptime @hasField(SelfType, "slot_request_ids")) {
+        if (slot_index < self.slot_request_ids.len) self.slot_request_ids[slot_index] = null;
+    }
     markDecodePointerTablesDirty(self);
 }
 

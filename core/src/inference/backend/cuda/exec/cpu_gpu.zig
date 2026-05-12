@@ -63,62 +63,103 @@ const resetAttentionCpuStates = resets.resetAttentionCpuStates;
 const ensureGatedDeltaHostStageCapacity = resets.ensureGatedDeltaHostStageCapacity;
 const executeDecodeWithLayerLimit = decode_route.executeDecodeWithLayerLimit;
 
-fn u32FromUsize(value: usize, comptime err: anyerror) !u32 {
-    return std.math.cast(u32, value) orelse return err;
+fn usizeToU64(value: usize, comptime err: anyerror) !u64 {
+    return std.math.cast(u64, value) orelse return err;
 }
 
-fn cpuGpuFrameId(slot_index: u32, position: u32) u64 {
-    return (@as(u64, slot_index) << 32) | @as(u64, position);
+fn cpuGpuFrameId(slot_id: u64, sequence_start: u64) !bridge.TensorFrameInstanceId {
+    const raw = ((slot_id & 0xffff_ffff) << 32) | ((sequence_start +% 1) & 0xffff_ffff);
+    return bridge.TensorFrameInstanceId.init(if (raw == 0) 1 else raw);
 }
 
-fn cpuGpuGraphId(split_layer: u32, total_layers: u32) u64 {
-    return (@as(u64, split_layer) << 32) | @as(u64, total_layers);
-}
-
-fn cpuGpuRequestId(slot_index: u32, token: u32) u64 {
-    return (@as(u64, slot_index) << 32) | @as(u64, token);
-}
-
-fn cpuGpuActivationDevice(self: anytype) !bridge.TensorFrameDevice {
+fn cpuGpuTensorFramePlanRef(self: anytype) !*const bridge.TensorFramePlanRef {
     const SelfType = @TypeOf(self.*);
-    if (comptime !@hasField(SelfType, "device")) return error.InvalidTopologyConfig;
+    if (comptime !@hasField(SelfType, "cpu_gpu_tensor_frame_plan_ref")) return error.InvalidTopologyConfig;
+    if (self.cpu_gpu_tensor_frame_plan_ref) |*plan_ref| return plan_ref;
+    return error.InvalidTopologyConfig;
+}
+
+fn cpuGpuPayloadLocationHint(self: anytype) !?bridge.TensorFramePayloadLocationHint {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasField(SelfType, "device")) return null;
     const ordinal = std.math.cast(u16, self.device.ordinal()) orelse return error.InvalidTopologyConfig;
     return .{ .cuda = ordinal };
 }
 
+fn cpuGpuSlotId(slot_index: usize) !u64 {
+    return std.math.add(u64, try usizeToU64(slot_index, error.InvalidSlotId), 1) catch return error.InvalidSlotId;
+}
+
+fn cpuGpuRequestId(self: anytype, slot_index: usize) !u64 {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasField(SelfType, "slot_request_ids")) return error.InvalidRequestId;
+    if (slot_index >= self.slot_request_ids.len) return error.InvalidSlotId;
+    return self.slot_request_ids[slot_index] orelse error.InvalidRequestId;
+}
+
 fn buildCpuGpuActivationFrame(
     self: anytype,
-    ctx: *const stage_adapters.DecodeContext,
+    step_kind: bridge.TensorFrameStepKind,
+    slot_index: usize,
+    sequence_start: usize,
+    token_count: usize,
+    batch_entries: *[1]bridge.TensorFrameBatchEntry,
 ) !bridge.TensorFrameMetadata {
-    const slot_index_u32 = try u32FromUsize(ctx.slot_index, error.InvalidArgument);
-    const position_u32 = try u32FromUsize(ctx.position, error.InvalidSequenceRange);
-    const split_layer_u32 = try u32FromUsize(self.split_layer, error.InvalidLayerRange);
-    const total_layers = self.split_layer + self.block_runtime.blocks.len;
-    const total_layers_u32 = try u32FromUsize(total_layers, error.InvalidLayerRange);
-    const d_model_u64 = std.math.cast(u64, self.d_model) orelse return error.InvalidTensorShape;
-    const shape = try bridge.TensorFrameShape.contiguous(3, .{ 1, 1, d_model_u64, 0 });
+    const plan_ref = try cpuGpuTensorFramePlanRef(self);
+    const boundary_index: usize = 0;
+    const contract = try bridge.selectedBoundaryTensorContract(
+        plan_ref,
+        boundary_index,
+        self.pipeline_boundary_dtype,
+        self.pipeline_boundary_layout,
+        .negotiated,
+    );
+    const hidden_size = try usizeToU64(self.d_model, error.InvalidHiddenSize);
+    const token_count_u64 = try usizeToU64(token_count, error.InvalidSequenceRange);
+    const tensor_desc = try bridge.TensorFrameTensorDesc.contiguousActivation(
+        self.pipeline_boundary_dtype,
+        .{ 1, token_count_u64, hidden_size, 0 },
+    );
+    const slot_id = try cpuGpuSlotId(slot_index);
+    const sequence_start_u64 = try usizeToU64(sequence_start, error.InvalidSequenceRange);
+    batch_entries[0] = .{
+        .batch_index = 0,
+        .request_id = try cpuGpuRequestId(self, slot_index),
+        .slot_id = slot_id,
+        .sequence_start = sequence_start_u64,
+        .token_count = token_count_u64,
+    };
 
-    return bridge.activationHandoffFrame(.{
-        .frame_id = cpuGpuFrameId(slot_index_u32, position_u32),
-        .graph_id = cpuGpuGraphId(split_layer_u32, total_layers_u32),
-        .request_id = cpuGpuRequestId(slot_index_u32, ctx.token),
-        .source = .{ .stage_id = 0, .backend = .cpu },
-        .target = .{ .stage_id = 1, .backend = .cuda },
-        .producer_layer_start = 0,
-        .producer_layer_end = split_layer_u32,
-        .consumer_layer_start = split_layer_u32,
-        .consumer_layer_end = total_layers_u32,
-        .dtype = self.pipeline_boundary_dtype,
-        .layout = self.pipeline_boundary_layout,
-        .shape = shape,
-        .device = try cpuGpuActivationDevice(self),
-        .sequence_start = position_u32,
-        .sequence_len = 1,
-        .batch_size = 1,
-        .slot_index = slot_index_u32,
-        .ownership = .borrowed_until_next_stage_call,
-        .lifetime = .step_scoped,
-    });
+    const args = bridge.ActivationFrameArgs{
+        .frame_id = try cpuGpuFrameId(slot_id, sequence_start_u64),
+        .plan_ref = plan_ref,
+        .boundary_index = boundary_index,
+        .selected_contract = &contract,
+        .shape_context = .{
+            .expected_hidden_size = hidden_size,
+            .expected_step_kind = step_kind,
+        },
+        .tensor = tensor_desc,
+        .batch = .{ .entries = batch_entries },
+        .payload = .{
+            .byte_count = tensor_desc.payload_byte_count,
+            .location_hint = try cpuGpuPayloadLocationHint(self),
+            .ownership = .borrowed_until_next_stage_call,
+            .lifetime = .step_scoped,
+        },
+    };
+    return switch (step_kind) {
+        .decode => bridge.activationDecodeFrame(args),
+        .prefill => bridge.activationPrefillFrame(args),
+    };
+}
+
+fn buildCpuGpuDecodeFrame(
+    self: anytype,
+    ctx: *const stage_adapters.DecodeContext,
+    batch_entries: *[1]bridge.TensorFrameBatchEntry,
+) !bridge.TensorFrameMetadata {
+    return buildCpuGpuActivationFrame(self, .decode, ctx.slot_index, ctx.position, 1, batch_entries);
 }
 
 pub fn computeBatchedPrefillCpuGpu(
@@ -215,7 +256,12 @@ pub fn computeBatchedPrefillCpuGpu(
         // Upload chunk from CPU host buffer to GPU input_dev.
         const chunk_offset = pos_base * d_model;
         const chunk_f32s = rows * d_model;
-        try self.runtime_buffers.input_dev.upload(&self.device, std.mem.sliceAsBytes(prefill_buffer[chunk_offset..][0..chunk_f32s]));
+        const chunk_bytes = std.mem.sliceAsBytes(prefill_buffer[chunk_offset..][0..chunk_f32s]);
+        var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
+        const activation_metadata = try buildCpuGpuActivationFrame(self, .prefill, slot_index, pos_base, rows, &batch_entries);
+        try bridge.validateTensorFrameForPlanBoundary(&activation_metadata, try cpuGpuTensorFramePlanRef(self), 0);
+        try bridge.validatePayloadBufferLength(&activation_metadata, chunk_bytes.len);
+        try self.runtime_buffers.input_dev.upload(&self.device, chunk_bytes);
 
         const active_rows_u32: u32 = @intCast(rows);
         const seq_len_u32: u32 = @intCast(pos_base + rows);
@@ -408,13 +454,17 @@ pub fn runCpuGpuWithPipelineRuntime(
         .trace_seq_len_u32 = trace_seq_len_u32,
         .trace_pos_offset = trace_pos_offset,
     };
-    const activation_metadata = try buildCpuGpuActivationFrame(self, &ctx);
+    var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
+    const activation_metadata = try buildCpuGpuDecodeFrame(self, &ctx, &batch_entries);
+    const plan_ref = try cpuGpuTensorFramePlanRef(self);
     try bridge.executeLocalDecodeHandoff(
         Stage0,
         Stage1,
         .{ .backend = cpu_stage0_backend, .gpu_backend = self, .ctx = &ctx },
         .{ .backend = self, .ctx = &ctx },
         .{
+            .plan_ref = plan_ref,
+            .boundary_index = 0,
             .metadata = activation_metadata,
             .activation_byte_count = activation_byte_count,
             .host_staging = self.pipeline_host_staging,
@@ -422,27 +472,47 @@ pub fn runCpuGpuWithPipelineRuntime(
     );
 }
 
-test "buildCpuGpuActivationFrame describes cpu cuda decode handoff" {
+test "buildCpuGpuDecodeFrame binds cpu cuda handoff to TensorFramePlanRef" {
     const MockCudaDevice = struct {
         pub fn ordinal(_: *const @This()) usize {
             return 7;
         }
     };
-
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
             blocks: []const u8 = &.{},
         };
 
-        split_layer: usize = 3,
-        d_model: usize = 8,
+        split_layer: usize = 2,
+        d_model: usize = 4,
         pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
         pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        slot_request_ids: [3]?u64 = .{ null, null, 456 },
         block_runtime: BlockRuntimeMock = .{},
         device: MockCudaDevice = .{},
     };
-
+    const plan_boundaries = [_]bridge.TensorFrameBoundaryRef{.{
+        .boundary_index = 0,
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+    }};
+    const plan_ref = bridge.TensorFramePlanRef{
+        .allocator = std.testing.allocator,
+        .identity = .{
+            .graph_digest = [_]u8{1} ** 32,
+            .graph_contract_version = 1,
+            .stage_plan_contract_version = 1,
+            .stage_plan_id = .{ .digest = [_]u8{2} ** 32 },
+        },
+        .boundaries = &plan_boundaries,
+    };
     var backend = MockBackend{
+        .cpu_gpu_tensor_frame_plan_ref = plan_ref,
         .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
     };
     const ctx = stage_adapters.DecodeContext{
@@ -456,55 +526,68 @@ test "buildCpuGpuActivationFrame describes cpu cuda decode handoff" {
         .trace_seq_len_u32 = 10,
         .trace_pos_offset = 9,
     };
+    var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
+    const metadata = try buildCpuGpuDecodeFrame(&backend, &ctx, &batch_entries);
 
-    const metadata = try buildCpuGpuActivationFrame(&backend, &ctx);
+    try bridge.validateTensorFrameForPlanBoundary(&metadata, &plan_ref, 0);
     try std.testing.expectEqual(bridge.TensorFrameRole.activation, metadata.role);
-    try std.testing.expectEqual(@as(u64, 32), metadata.byte_count);
-    try std.testing.expectEqual(@as(u64, 0x0000_0002_0000_0009), metadata.frame_id);
-    try std.testing.expectEqual(@as(u64, 0x0000_0003_0000_0005), metadata.graph_id);
-    try std.testing.expectEqual(@as(u64, 0x0000_0002_0000_007b), metadata.request_id);
-    try std.testing.expectEqual(bridge.TensorFrameDevice{ .cuda = 7 }, metadata.device);
-    try std.testing.expectEqual(@as(u32, 9), metadata.sequence_start);
-    try std.testing.expectEqual(@as(u32, 1), metadata.sequence_len);
-    try std.testing.expectEqual(@as(?u32, 2), metadata.slot_index);
+    try std.testing.expectEqual(bridge.TensorFrameStepKind.decode, metadata.step_kind);
+    try std.testing.expectEqual(@as(u64, 16), metadata.payload.byte_count);
+    try std.testing.expectEqual(@as(u64, 9), metadata.batch.entries[0].sequence_start);
+    try std.testing.expectEqual(@as(u64, 3), metadata.batch.entries[0].slot_id);
+    try std.testing.expectEqual(@as(u64, 456), metadata.batch.entries[0].request_id);
+    try std.testing.expectEqual(bridge.TensorFramePayloadLocationHint{ .cuda = 7 }, metadata.payload.location_hint.?);
 }
 
-test "buildCpuGpuActivationFrame rejects cuda ordinal outside tensor frame range" {
+test "buildCpuGpuActivationFrame validates prefill chunk metadata" {
     const MockCudaDevice = struct {
         pub fn ordinal(_: *const @This()) usize {
-            return @as(usize, std.math.maxInt(u16)) + 1;
+            return 7;
         }
     };
-
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
             blocks: []const u8 = &.{},
         };
 
-        split_layer: usize = 3,
-        d_model: usize = 8,
+        split_layer: usize = 2,
+        d_model: usize = 4,
         pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
         pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        slot_request_ids: [1]?u64 = .{789},
         block_runtime: BlockRuntimeMock = .{},
         device: MockCudaDevice = .{},
     };
-
-    var backend = MockBackend{
-        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+    const plan_boundaries = [_]bridge.TensorFrameBoundaryRef{.{
+        .boundary_index = 0,
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+    }};
+    const plan_ref = bridge.TensorFramePlanRef{
+        .allocator = std.testing.allocator,
+        .identity = .{
+            .graph_digest = [_]u8{1} ** 32,
+            .graph_contract_version = 1,
+            .stage_plan_contract_version = 1,
+            .stage_plan_id = .{ .digest = [_]u8{2} ** 32 },
+        },
+        .boundaries = &plan_boundaries,
     };
-    const ctx = stage_adapters.DecodeContext{
-        .token = 123,
-        .position = 9,
-        .slot_index = 2,
-        .logits_out_opt = null,
-        .compute_logits = false,
-        .download_logits = false,
-        .ensure_kv_capacity = true,
-        .trace_seq_len_u32 = 10,
-        .trace_pos_offset = 9,
-    };
+    var backend = MockBackend{ .cpu_gpu_tensor_frame_plan_ref = plan_ref };
+    var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
+    const metadata = try buildCpuGpuActivationFrame(&backend, .prefill, 0, 4, 3, &batch_entries);
 
-    try std.testing.expectError(error.InvalidTopologyConfig, buildCpuGpuActivationFrame(&backend, &ctx));
+    try bridge.validateTensorFrameForPlanBoundary(&metadata, &plan_ref, 0);
+    try bridge.validatePayloadBufferLength(&metadata, 3 * 4 * @sizeOf(f32));
+    try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, metadata.step_kind);
+    try std.testing.expectEqual(@as(u64, 789), metadata.batch.entries[0].request_id);
+    try std.testing.expectEqual(@as(u64, 4), metadata.batch.entries[0].sequence_start);
+    try std.testing.expectEqual(@as(u64, 3), metadata.batch.entries[0].token_count);
 }
 
 test "runCpuGpuWithPipelineRuntime rejects stale activation byte count before transfer" {
@@ -571,6 +654,8 @@ test "runCpuGpuWithPipelineRuntime rejects stale activation byte count before tr
         pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
         pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
         pipeline_host_staging: ?[]align(64) u8 = null,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        slot_request_ids: [1]?u64 = .{456},
         block_runtime: BlockRuntimeMock = .{},
         device: MockCudaDevice = .{},
 
@@ -624,14 +709,34 @@ test "runCpuGpuWithPipelineRuntime rejects stale activation byte count before tr
     var trace_state = TraceState{};
     var cpu_stage0 = CpuStage0Mock{ .trace_state = &trace_state };
     var staging: [d_model * @sizeOf(f32) + 8]u8 align(64) = undefined;
+    const plan_boundaries = [_]bridge.TensorFrameBoundaryRef{.{
+        .boundary_index = 0,
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+    }};
+    const plan_ref = bridge.TensorFramePlanRef{
+        .allocator = std.testing.allocator,
+        .identity = .{
+            .graph_digest = [_]u8{1} ** 32,
+            .graph_contract_version = 1,
+            .stage_plan_contract_version = 1,
+            .stage_plan_id = .{ .digest = [_]u8{2} ** 32 },
+        },
+        .boundaries = &plan_boundaries,
+    };
     var stage1 = Stage1Mock{
         .trace_state = &trace_state,
         .pipeline_host_staging = staging[0..],
+        .cpu_gpu_tensor_frame_plan_ref = plan_ref,
         .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
     };
 
     try std.testing.expectError(
-        error.InvalidTensorByteCount,
+        error.PayloadBufferLengthMismatch,
         runCpuGpuWithPipelineRuntime(
             &stage1,
             &cpu_stage0,
@@ -647,7 +752,7 @@ test "runCpuGpuWithPipelineRuntime rejects stale activation byte count before tr
             d_model * @sizeOf(f32) + 4,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 1), trace_state.stage0_execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace_state.stage0_execute_calls);
     try std.testing.expectEqual(@as(usize, 0), trace_state.stage0_slot_bytes_calls);
     try std.testing.expectEqual(@as(usize, 0), trace_state.stage1_upload_calls);
     try std.testing.expectEqual(@as(usize, 0), trace_state.stage1_execute_calls);

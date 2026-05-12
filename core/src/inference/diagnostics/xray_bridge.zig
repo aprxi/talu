@@ -8,6 +8,14 @@ const std = @import("std");
 const tensor_frame = @import("../bridge/tensor_frame.zig");
 const trace = @import("xray_pkg").trace;
 
+const test_activation_batch = [_]tensor_frame.TensorFrameBatchEntry{.{
+    .batch_index = 0,
+    .request_id = 3,
+    .slot_id = 7,
+    .sequence_start = 9,
+    .token_count = 1,
+}};
+
 pub const BoundaryTraceError = tensor_frame.TensorFrameValidationError || error{
     UnsupportedTraceBackend,
 };
@@ -29,19 +37,22 @@ pub fn activationHandoffLayerInputTrace(
     metadata: *const tensor_frame.TensorFrameMetadata,
 ) BoundaryTraceError!BoundaryActivationTrace {
     try metadata.validate();
-    if (metadata.role != .activation) return error.InvalidStageBoundary;
+    if (metadata.role != .activation) return error.InvalidActivationRole;
+    if (metadata.payload.location_hint == null) return error.UnsupportedTraceBackend;
+    if (metadata.batch.entries.len != 1) return error.InvalidBatch;
+    const entry = metadata.batch.entries[0];
 
     return .{
         .point = .layer_input,
-        .layer = std.math.cast(u16, metadata.boundary.consumer_layer_start) orelse return error.InvalidLayerRange,
+        .layer = std.math.cast(u16, metadata.boundary.consumer_layer_start) orelse return error.InvalidConsumerLayerRange,
         .token = 0,
-        .position = metadata.sequence_len,
-        .backend = try traceBackend(metadata.boundary.target.backend),
-        .dtype = traceDType(metadata.boundary.dtype),
-        .shape = try traceShape(metadata.shape),
-        .ndim = metadata.shape.rank,
+        .position = std.math.cast(u32, entry.sequence_start) orelse return error.InvalidSequenceRange,
+        .backend = try traceBackend(metadata.payload.location_hint.?),
+        .dtype = traceDType(metadata.tensor.dtype),
+        .shape = try traceShape(metadata.tensor),
+        .ndim = metadata.tensor.rank,
         .kernel_name = "bridge_activation_handoff",
-        .work = .{ .bytes = metadata.byte_count },
+        .work = .{ .bytes = metadata.payload.byte_count },
     };
 }
 
@@ -67,12 +78,12 @@ pub fn emitActivationHandoffLayerInput(
     );
 }
 
-fn traceBackend(backend: tensor_frame.StageBackend) BoundaryTraceError!trace.Backend {
-    return switch (backend) {
+fn traceBackend(location_hint: tensor_frame.TensorFramePayloadLocationHint) BoundaryTraceError!trace.Backend {
+    return switch (location_hint) {
         .cpu => .cpu,
         .cuda => .cuda,
         .metal => .metal,
-        .remote => error.UnsupportedTraceBackend,
+        .opaque_local => error.UnsupportedTraceBackend,
     };
 }
 
@@ -84,44 +95,62 @@ fn traceDType(dtype: tensor_frame.TensorFrameDType) trace.DType {
     };
 }
 
-fn traceShape(shape: tensor_frame.TensorFrameShape) tensor_frame.TensorFrameValidationError![4]u32 {
-    try shape.validate();
+fn traceShape(tensor: tensor_frame.TensorFrameTensorDesc) tensor_frame.TensorFrameValidationError![4]u32 {
     var result = [_]u32{0} ** 4;
-    for (0..shape.rank) |idx| {
-        result[idx] = std.math.cast(u32, shape.dims[idx]) orelse return error.InvalidTensorShape;
+    for (0..tensor.rank) |idx| {
+        result[idx] = std.math.cast(u32, tensor.shape[idx]) orelse return error.InvalidTensorShape;
     }
     return result;
 }
 
-fn testActivationMetadata(target_backend: tensor_frame.StageBackend) !tensor_frame.TensorFrameMetadata {
-    return tensor_frame.activationHandoffFrame(.{
-        .frame_id = 1,
-        .graph_id = 2,
-        .request_id = 3,
-        .source = .{ .stage_id = 0, .backend = .cpu },
-        .target = .{ .stage_id = 1, .backend = target_backend },
+fn testActivationMetadata(location_hint: ?tensor_frame.TensorFramePayloadLocationHint) !tensor_frame.TensorFrameMetadata {
+    const boundary = tensor_frame.TensorFrameBoundaryRef{
+        .boundary_index = 0,
+        .source_stage_id = 0,
+        .target_stage_id = 1,
         .producer_layer_start = 0,
         .producer_layer_end = 4,
         .consumer_layer_start = 4,
         .consumer_layer_end = 12,
-        .dtype = .f32,
-        .shape = try tensor_frame.TensorFrameShape.contiguous(3, .{ 1, 1, 16, 0 }),
-        .device = .{ .cuda = 0 },
-        .sequence_start = 9,
-        .sequence_len = 1,
-        .batch_size = 1,
-        .slot_index = 7,
-    });
+    };
+    const tensor = try tensor_frame.TensorFrameTensorDesc.contiguousActivation(.f32, .{ 1, 1, 16, 0 });
+    return .{
+        .frame_id = try tensor_frame.TensorFrameInstanceId.init(1),
+        .plan = .{
+            .graph_digest = [_]u8{1} ** 32,
+            .graph_contract_version = 1,
+            .stage_plan_contract_version = 1,
+            .stage_plan_id = .{ .digest = [_]u8{2} ** 32 },
+        },
+        .boundary = boundary,
+        .selected_contract = .{
+            .boundary = boundary,
+            .dtype = .f32,
+            .layout = .row_major,
+            .source = .explicit,
+        },
+        .role = .activation,
+        .step_kind = .decode,
+        .shape_context = .{ .expected_hidden_size = 16 },
+        .tensor = tensor,
+        .batch = .{ .entries = &test_activation_batch },
+        .payload = .{
+            .byte_count = tensor.payload_byte_count,
+            .location_hint = location_hint,
+            .ownership = .borrowed_until_next_stage_call,
+            .lifetime = .step_scoped,
+        },
+    };
 }
 
-test "activationHandoffLayerInputTrace maps bridge metadata to xray layer input" {
-    const metadata = try testActivationMetadata(.cuda);
+test "inference diagnostics activationHandoffLayerInputTrace maps bridge metadata to xray layer input" {
+    const metadata = try testActivationMetadata(.{ .cuda = 0 });
     const emission = try activationHandoffLayerInputTrace(&metadata);
 
     try std.testing.expectEqual(trace.TracePoint.layer_input, emission.point);
     try std.testing.expectEqual(@as(u16, 4), emission.layer);
     try std.testing.expectEqual(@as(u32, 0), emission.token);
-    try std.testing.expectEqual(@as(u32, 1), emission.position);
+    try std.testing.expectEqual(@as(u32, 9), emission.position);
     try std.testing.expectEqual(trace.Backend.cuda, emission.backend);
     try std.testing.expectEqual(trace.DType.f32, emission.dtype);
     try std.testing.expectEqual(@as(u8, 3), emission.ndim);
@@ -130,12 +159,37 @@ test "activationHandoffLayerInputTrace maps bridge metadata to xray layer input"
     try std.testing.expectEqualStrings("bridge_activation_handoff", emission.kernel_name);
 }
 
-test "activationHandoffLayerInputTrace rejects remote xray backend" {
-    const metadata = try testActivationMetadata(.remote);
+test "inference diagnostics activationHandoffLayerInputTrace rejects multi-entry frame" {
+    const multi_batch = [_]tensor_frame.TensorFrameBatchEntry{
+        .{
+            .batch_index = 0,
+            .request_id = 3,
+            .slot_id = 7,
+            .sequence_start = 9,
+            .token_count = 1,
+        },
+        .{
+            .batch_index = 1,
+            .request_id = 4,
+            .slot_id = 8,
+            .sequence_start = 12,
+            .token_count = 1,
+        },
+    };
+    var metadata = try testActivationMetadata(.{ .cuda = 0 });
+    metadata.tensor = try tensor_frame.TensorFrameTensorDesc.contiguousActivation(.f32, .{ 2, 1, 16, 0 });
+    metadata.batch = .{ .entries = &multi_batch };
+    metadata.payload.byte_count = metadata.tensor.payload_byte_count;
+
+    try std.testing.expectError(error.InvalidBatch, activationHandoffLayerInputTrace(&metadata));
+}
+
+test "inference diagnostics activationHandoffLayerInputTrace rejects unsupported xray backend" {
+    const metadata = try testActivationMetadata(.{ .opaque_local = 42 });
     try std.testing.expectError(error.UnsupportedTraceBackend, activationHandoffLayerInputTrace(&metadata));
 }
 
-test "emitActivationHandoffLayerInput no-ops when layer input trace point is inactive" {
+test "inference diagnostics emitActivationHandoffLayerInput no-ops when layer input trace point is inactive" {
     const Capture = struct {
         var count: usize = 0;
 
@@ -158,7 +212,7 @@ test "emitActivationHandoffLayerInput no-ops when layer input trace point is ina
         trace.setHandler(null);
     }
 
-    const metadata = try testActivationMetadata(.cuda);
+    const metadata = try testActivationMetadata(.{ .cuda = 0 });
     var payload = [_]u8{0} ** 64;
     emitActivationHandoffLayerInput(&metadata, payload[0..].ptr);
     try std.testing.expectEqual(@as(usize, 0), Capture.count);

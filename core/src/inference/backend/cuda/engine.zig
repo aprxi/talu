@@ -472,6 +472,8 @@ pub const CudaBackend = struct {
     rope_dim: usize,
     attention_scale: f32,
     norm_eps: f32,
+    slot_request_ids: []?u64,
+    next_slot_request_id: u64 = 1,
     cpu_rope_global: ?*cpu_kernels.RoPE = null,
     cpu_rope_local: ?*cpu_kernels.RoPE = null,
     /// Pipeline topology mode. `.single` for one device, `.pipeline2` for two.
@@ -500,6 +502,8 @@ pub const CudaBackend = struct {
     pipeline_boundary_layout_stage12: bridge.BoundaryLayout = .row_major,
     pipeline_stage1_boundary_conversion_stage12: bool = false,
     pipeline_stage2_boundary_conversion_stage12: bool = false,
+    cpu_gpu_stage_plan: ?models.stage_plan.StagePlan = null,
+    cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
 
     kv_storage_mode: KvCacheStorageMode = .device,
     kv_init_tokens: usize = initial_kv_cache_tokens,
@@ -734,6 +738,8 @@ pub const CudaBackend = struct {
             .kv_init_tokens = resolved_kv_init_tokens,
             .prefill_chunk_rows_cap = staged_prefill_chunk_rows_cap,
             .max_batch_size = max_batch_size,
+            .slot_request_ids = &.{},
+            .next_slot_request_id = 1,
             .fixed_alloc_mode = resolveCudaFixedAllocMode(),
             .require_fit_check = resolved_require_fit_check,
             .strict_memory_mode = resolved_strict_memory_mode,
@@ -898,6 +904,9 @@ pub const CudaBackend = struct {
         backend.slot_rope_position_deltas = try allocator.alloc(isize, backend.max_batch_size);
         errdefer allocator.free(backend.slot_rope_position_deltas);
         @memset(backend.slot_rope_position_deltas, 0);
+        backend.slot_request_ids = try allocator.alloc(?u64, backend.max_batch_size);
+        errdefer allocator.free(backend.slot_request_ids);
+        @memset(backend.slot_request_ids, null);
         backend.decode_ptr_tables_cached_slots = try allocator.alloc(usize, backend.max_batch_size);
         errdefer allocator.free(backend.decode_ptr_tables_cached_slots);
         backend.decode_ptr_tables_cached_rows = 0;
@@ -1427,6 +1436,8 @@ pub const CudaBackend = struct {
                     allocator.free(backend.pipeline_host_staging.?);
                     backend.pipeline_host_staging = null;
                 }
+                try backend.initCpuGpuTensorFrameContract(split, total_layers);
+                errdefer backend.deinitCpuGpuTensorFrameContract();
                 backend.pipeline_transfer_mode = .host_staged;
                 init_options.progress.updateLine(1, @intCast(total_layers), null);
 
@@ -1828,6 +1839,7 @@ pub const CudaBackend = struct {
         if (self.slot_in_use.len > 0) self.allocator.free(self.slot_in_use);
         if (self.slot_positions.len > 0) self.allocator.free(self.slot_positions);
         if (self.slot_rope_position_deltas.len > 0) self.allocator.free(self.slot_rope_position_deltas);
+        if (self.slot_request_ids.len > 0) self.allocator.free(self.slot_request_ids);
         self.deinitSlotKvStates();
         self.deinitLayerProgramSlotBuffers();
         if (self.layer_program_instruction_handle_scratch.len > 0) {
@@ -1857,6 +1869,7 @@ pub const CudaBackend = struct {
             self.allocator.destroy(stage0_cpu);
             self.pipeline_backend0_cpu = null;
         }
+        self.deinitCpuGpuTensorFrameContract();
         // Pipeline2: release stage 1 resources before stage 0 (reverse init order).
         if (self.pipeline_host_staging_stage12) |buf| {
             self.allocator.free(buf);
@@ -1928,12 +1941,78 @@ pub const CudaBackend = struct {
         return self.split_layer_stage2;
     }
 
+    pub fn bindSlotRequestId(self: *CudaBackend, slot_index: usize, request_id: u64) !void {
+        if (request_id == 0 or slot_index >= self.slot_request_ids.len) return error.InvalidArgument;
+        self.slot_request_ids[slot_index] = request_id;
+    }
+
+    pub fn unbindSlotRequestId(self: *CudaBackend, slot_index: usize) void {
+        if (slot_index >= self.slot_request_ids.len) return;
+        self.slot_request_ids[slot_index] = null;
+    }
+
     pub fn pipelineActivationByteCount(self: *const CudaBackend) !usize {
         const element_bytes: usize = switch (self.pipeline_boundary_dtype) {
             .bf16, .f16 => @sizeOf(u16),
             .f32 => @sizeOf(f32),
         };
         return std.math.mul(usize, self.d_model, element_bytes) catch error.InvalidArgument;
+    }
+
+    fn initCpuGpuTensorFrameContract(
+        self: *CudaBackend,
+        split_layer: usize,
+        total_layers: usize,
+    ) !void {
+        if (self.cpu_gpu_stage_plan != null or self.cpu_gpu_tensor_frame_plan_ref != null) {
+            return error.InvalidTopologyConfig;
+        }
+        const model_manifest = self.loaded.manifestPtr() orelse return error.MissingManifest;
+        const architecture = models.registry.runtimeArchitectureById(model_manifest.architecture_id) orelse return error.UnsupportedModel;
+        const split_points = [_]usize{split_layer};
+        const stateful_dependency = [_]models.stage_plan.DependencyOverride{.{
+            .source_stage_id = 0,
+            .target_stage_id = 1,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        }};
+        const dependency_overrides: []const models.stage_plan.DependencyOverride =
+            if (models.stage_plan.requiresBoundaryDependenciesFor(architecture, &self.loaded.config))
+                &stateful_dependency
+            else
+                &.{};
+        var plan = try models.stage_plan.buildStagePlan(self.allocator, .{
+            .n_layers = total_layers,
+            .split_points = &split_points,
+            .architecture = architecture,
+            .model_config = &self.loaded.config,
+            .manifest = model_manifest,
+            .load_semantics = models.stage_plan.LoadSemantics.fromLoadOptions(
+                backend_root.defaultModelLoadOptions(.{ .selection = .cuda }),
+            ),
+            .partition_constraints = .{
+                .decoder_cuts_allowed = true,
+                .dependency_overrides = dependency_overrides,
+            },
+        });
+        errdefer plan.deinit();
+
+        var plan_ref = try bridge.TensorFramePlanRef.fromStagePlan(self.allocator, &plan);
+        errdefer plan_ref.deinit();
+
+        self.cpu_gpu_stage_plan = plan;
+        self.cpu_gpu_tensor_frame_plan_ref = plan_ref;
+    }
+
+    fn deinitCpuGpuTensorFrameContract(self: *CudaBackend) void {
+        if (self.cpu_gpu_tensor_frame_plan_ref) |*plan_ref| {
+            plan_ref.deinit();
+            self.cpu_gpu_tensor_frame_plan_ref = null;
+        }
+        if (self.cpu_gpu_stage_plan) |*plan| {
+            plan.deinit();
+            self.cpu_gpu_stage_plan = null;
+        }
     }
 
     fn probePipelinePeerCopy(self: *CudaBackend, dst: *CudaBackend) bool {
