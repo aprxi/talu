@@ -1463,8 +1463,8 @@ pub fn build(b: *std.Build) void {
     // ensure deterministic behavior across host GPU setups.
     const integration_build_options = b.addOptions();
     integration_build_options.addOption(bool, "enable_metal", false);
-    integration_build_options.addOption(bool, "enable_cuda", enable_cuda);
-    integration_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
+    integration_build_options.addOption(bool, "enable_cuda", false);
+    integration_build_options.addOption(bool, "cuda_startup_selftests", false);
     integration_build_options.addOption(bool, "debug_matmul", debug_matmul);
     integration_build_options.addOption(bool, "dump_tensors", dump_tensors);
     integration_build_options.addOption(bool, "xray_bridge", xray_bridge);
@@ -1528,8 +1528,8 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos and enable_metal) {
         const integration_metal_build_options = b.addOptions();
         integration_metal_build_options.addOption(bool, "enable_metal", true);
-        integration_metal_build_options.addOption(bool, "enable_cuda", enable_cuda);
-        integration_metal_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
+        integration_metal_build_options.addOption(bool, "enable_cuda", false);
+        integration_metal_build_options.addOption(bool, "cuda_startup_selftests", false);
         integration_metal_build_options.addOption(bool, "debug_matmul", debug_matmul);
         integration_metal_build_options.addOption(bool, "dump_tensors", dump_tensors);
         integration_metal_build_options.addOption(bool, "xray_bridge", xray_bridge);
