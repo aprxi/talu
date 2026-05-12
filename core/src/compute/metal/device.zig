@@ -4,6 +4,7 @@
 //! and synchronization primitives for macOS GPU compute.
 
 const std = @import("std");
+const copy_cast = @import("../copy_cast.zig");
 
 /// Opaque Metal device handle.
 pub const MetalDevice = opaque {};
@@ -65,12 +66,30 @@ pub const Buffer = struct {
         metal_buffer_destroy(self.handle);
     }
 
-    pub fn upload(self: *Buffer, data: []const u8) void {
-        metal_buffer_upload(self.handle, data.ptr, @min(data.len, self.size));
+    pub fn upload(self: *Buffer, data: []const u8) !void {
+        if (data.len == 0) return;
+        _ = try copy_cast.validateRawCopyBuffers(.{
+            .backend = .metal,
+            .src_device = copy_cast.Device.cpu(),
+            .dst_device = copy_cast.Device.metal(0),
+            .byte_count = data.len,
+            .src_size = data.len,
+            .dst_size = self.size,
+        });
+        metal_buffer_upload(self.handle, data.ptr, data.len);
     }
 
-    pub fn download(self: *Buffer, data: []u8) void {
-        metal_buffer_download(self.handle, data.ptr, @min(data.len, self.size));
+    pub fn download(self: *Buffer, data: []u8) !void {
+        if (data.len == 0) return;
+        _ = try copy_cast.validateRawCopyBuffers(.{
+            .backend = .metal,
+            .src_device = copy_cast.Device.metal(0),
+            .dst_device = copy_cast.Device.cpu(),
+            .byte_count = data.len,
+            .src_size = self.size,
+            .dst_size = data.len,
+        });
+        metal_buffer_download(self.handle, data.ptr, data.len);
     }
 
     pub fn contents(self: *Buffer) ?*anyopaque {
@@ -130,14 +149,14 @@ test "Device synchronize after buffer operations" {
     defer buffer.deinit();
 
     const input = [_]u8{0xAB} ** 256;
-    buffer.upload(&input);
+    try buffer.upload(&input);
 
     // Synchronize to ensure upload completes
     device.synchronize();
 
     // Verify data after sync
     var output: [256]u8 = undefined;
-    buffer.download(&output);
+    try buffer.download(&output);
     try std.testing.expectEqualSlices(u8, &input, &output);
 }
 
@@ -158,10 +177,10 @@ test "Buffer upload and download preserve data" {
     defer buffer.deinit();
 
     const input = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-    buffer.upload(&input);
+    try buffer.upload(&input);
 
     var output: [16]u8 = undefined;
-    buffer.download(&output);
+    try buffer.download(&output);
     try std.testing.expectEqualSlices(u8, &input, &output);
 }
 

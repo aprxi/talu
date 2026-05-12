@@ -2022,10 +2022,9 @@ pub const CudaBackend = struct {
         if (min_size == 0) return false;
         const probe_bytes = @min(min_size, @as(usize, 256));
         self.device.memcpyPeerAsync(
-            dst.runtime_buffers.input_dev.pointer,
-            dst.device.context,
-            self.runtime_buffers.input_dev.pointer,
-            self.device.context,
+            &dst.device,
+            &dst.runtime_buffers.input_dev,
+            &self.runtime_buffers.input_dev,
             probe_bytes,
             self.compute_stream,
         ) catch return false;
@@ -2052,20 +2051,18 @@ pub const CudaBackend = struct {
                     // Issue P2P copy on GPU1's stream (ordered after the wait).
                     try dst.device.makeCurrent();
                     try self.device.memcpyPeerAsync(
-                        dst.runtime_buffers.input_dev.pointer,
-                        dst.device.context,
-                        self.runtime_buffers.input_dev.pointer,
-                        self.device.context,
+                        &dst.device,
+                        &dst.runtime_buffers.input_dev,
+                        &self.runtime_buffers.input_dev,
                         byte_count,
                         dst.compute_stream,
                     );
                 } else {
                     // Blocking sync path when event support is unavailable.
                     try self.device.memcpyPeerAsync(
-                        dst.runtime_buffers.input_dev.pointer,
-                        dst.device.context,
-                        self.runtime_buffers.input_dev.pointer,
-                        self.device.context,
+                        &dst.device,
+                        &dst.runtime_buffers.input_dev,
+                        &self.runtime_buffers.input_dev,
                         byte_count,
                         self.compute_stream,
                     );

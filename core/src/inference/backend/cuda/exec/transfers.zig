@@ -121,19 +121,17 @@ pub fn transferPipelineActivationMultiRow(self: anytype, dst: anytype, total_byt
                 try dst.device.streamWaitEvent(dst.compute_stream, event);
                 try dst.device.makeCurrent();
                 try self.device.memcpyPeerAsync(
-                    dst.runtime_buffers.input_dev.pointer,
-                    dst.device.context,
-                    self.runtime_buffers.input_dev.pointer,
-                    self.device.context,
+                    &dst.device,
+                    &dst.runtime_buffers.input_dev,
+                    &self.runtime_buffers.input_dev,
                     total_bytes,
                     dst.compute_stream,
                 );
             } else {
                 try self.device.memcpyPeerAsync(
-                    dst.runtime_buffers.input_dev.pointer,
-                    dst.device.context,
-                    self.runtime_buffers.input_dev.pointer,
-                    self.device.context,
+                    &dst.device,
+                    &dst.runtime_buffers.input_dev,
+                    &self.runtime_buffers.input_dev,
                     total_bytes,
                     self.compute_stream,
                 );
@@ -169,10 +167,9 @@ pub fn transferPipelineActivationStage12MultiRow(self: anytype, src: anytype, to
         self.device.enablePeerAccess(&src.device) catch {};
         src.device.enablePeerAccess(&self.device) catch {};
         const peer_copy_started = if (src.device.memcpyPeerAsync(
-            self.runtime_buffers.input_dev.pointer,
-            self.device.context,
-            src.runtime_buffers.input_dev.pointer,
-            src.device.context,
+            &self.device,
+            &self.runtime_buffers.input_dev,
+            &src.runtime_buffers.input_dev,
             total_bytes,
             src.compute_stream,
         )) true else |_| false;

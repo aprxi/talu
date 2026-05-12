@@ -63,6 +63,8 @@ fn validateArgs(src: *const device_mod.Buffer, dst: *device_mod.Buffer, count: u
         .element_count = @intCast(count),
         .src_size = src.size,
         .dst_size = dst.size,
+        .src_address = @intCast(src.pointer),
+        .dst_address = @intCast(dst.pointer),
     });
 }
 
@@ -88,9 +90,15 @@ test "run rejects zero count" {
 }
 
 test "validateArgs rejects undersized destination buffer" {
-    const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
-    var dst = device_mod.Buffer{ .pointer = 0, .size = 12 };
+    const src = device_mod.Buffer{ .pointer = 0x1000, .size = 16 };
+    var dst = device_mod.Buffer{ .pointer = 0x2000, .size = 12 };
     try std.testing.expectError(error.BufferTooSmall, validateArgs(&src, &dst, 4));
+}
+
+test "validateArgs rejects misaligned f32 copy buffers" {
+    const src = device_mod.Buffer{ .pointer = 0x1002, .size = 16 };
+    var dst = device_mod.Buffer{ .pointer = 0x2000, .size = 16 };
+    try std.testing.expectError(error.AlignmentMismatch, validateArgs(&src, &dst, 4));
 }
 
 test "ceilDiv computes expected block count" {

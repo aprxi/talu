@@ -70,11 +70,15 @@ Generic byte validators reject `opaque_backend`. Backend-native paths must opt i
 Block-quantized dtypes such as grouped-affine and MXFP4 do not have a generic dense element byte count. Callers must validate declared physical storage bytes explicitly.
 
 ### Backend Capability Contract
-`compute/capability.zig` defines static query types for backend, primitive, dtype, layout, copy direction, cast pair, rank limits, and alignment requirements. CPU, CUDA, and Metal capability modules publish table-driven facts for their current primitive, copy, and cast surfaces.
+`compute/capability.zig` defines static query types for backend, primitive name, primitive input dtype, primitive output dtype, layout, raw byte-copy devices, typed copy direction, cast pair, rank limits, and alignment requirements. CPU, CUDA, and Metal capability modules publish table-driven facts for their current primitive, raw copy, typed copy, and cast surfaces.
 
 Unknown support defaults to unsupported. Capability declarations must stay compute-generic: no model ids, layer ranges, stages, request state, scheduler slots, placement, transport, or orchestration concepts.
 
-Copy and cast helpers use `compute/copy_cast.zig` validators before destination mutation or kernel argument packing wherever signatures expose dtype, layout, element count, and buffer sizes. Unsupported copy directions, cast pairs, dtypes, layouts, devices, buffer sizes, and alignment mismatches fail with typed errors.
+Primitive queries must provide both input and output dtype. Same-dtype primitives declare matching input/output sets; conversion, dequantization, matvec, and attention descriptors declare the source/storage dtype separately from the produced dtype so output mismatches fail closed.
+
+CUDA primitive facts are derived from `compute/cuda/descriptors.zig`. Descriptors reference module-owned `op_name*` constants, and root tests audit both directions: every exported CUDA op name has exactly one capability entry, and every capability entry resolves through one descriptor-backed exported implementation.
+
+Raw copy facts describe byte movement only. They do not imply dtype-specific copy kernels. Raw-copy validators derive the direction from source and destination `Device` values, then enforce backend/device constraints for CPU host copies, CUDA host/device and device/device copies, CUDA peer copies, and Metal host/device copies. Typed copy and cast helpers use `compute/copy_cast.zig` validators before destination mutation or kernel argument packing wherever signatures expose dtype, layout, element count, and buffer sizes. Unsupported copy directions, cast pairs, dtypes, layouts, devices, buffer sizes, and alignment mismatches fail with typed errors.
 
 ---
 

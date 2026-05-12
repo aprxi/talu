@@ -3,7 +3,10 @@
 //! Current phase includes runtime probing, device/buffer lifecycle,
 //! cuBLAS matmul, and modular kernel runtime scaffolding.
 
+const std = @import("std");
+
 pub const capabilities = @import("capabilities.zig");
+pub const descriptors = @import("descriptors.zig");
 pub const device = @import("device.zig");
 pub const matmul = @import("matmul.zig");
 pub const args = @import("args.zig");
@@ -134,6 +137,7 @@ pub const Registry = registry.Registry;
 
 test {
     _ = capabilities;
+    _ = descriptors;
     _ = device;
     _ = matmul;
     _ = args;
@@ -237,4 +241,57 @@ test {
     _ = gated_delta_rmsnorm_silu_mul;
     _ = gated_delta_rmsnorm_silu_mul_rows;
     _ = matmul_u16;
+}
+
+test "compute CUDA root exported op_name declarations have capability entries" {
+    const Root = @This();
+    inline for (@typeInfo(Root).@"struct".decls) |decl| {
+        const namespace = @field(Root, decl.name);
+        if (@TypeOf(namespace) == type and @typeInfo(namespace) == .@"struct") {
+            inline for (@typeInfo(namespace).@"struct".decls) |namespace_decl| {
+                if (isOpNameDecl(namespace_decl.name)) {
+                    const op_name = @field(namespace, namespace_decl.name);
+                    try expectCapabilityEntry(op_name);
+                    try std.testing.expectEqual(@as(usize, 1), descriptors.descriptorCount(op_name));
+                }
+            }
+        }
+    }
+}
+
+test "compute CUDA primitive capability entries resolve to root exported descriptors" {
+    for (capabilities.primitive_capabilities) |entry| {
+        try std.testing.expectEqual(@as(usize, 1), descriptors.descriptorCount(entry.name));
+        try std.testing.expectEqual(@as(usize, 1), exportedOpNameCount(entry.name));
+    }
+}
+
+fn expectCapabilityEntry(name: []const u8) !void {
+    var count: usize = 0;
+    for (capabilities.primitive_capabilities) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+fn exportedOpNameCount(name: []const u8) usize {
+    const Root = @This();
+    var count: usize = 0;
+    inline for (@typeInfo(Root).@"struct".decls) |decl| {
+        const namespace = @field(Root, decl.name);
+        if (@TypeOf(namespace) == type and @typeInfo(namespace) == .@"struct") {
+            inline for (@typeInfo(namespace).@"struct".decls) |namespace_decl| {
+                if (isOpNameDecl(namespace_decl.name)) {
+                    if (std.mem.eql(u8, @field(namespace, namespace_decl.name), name)) count += 1;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+fn isOpNameDecl(comptime name: []const u8) bool {
+    return std.mem.eql(u8, name, "op_name") or
+        std.mem.startsWith(u8, name, "op_name_") or
+        std.mem.endsWith(u8, name, "_op_name");
 }

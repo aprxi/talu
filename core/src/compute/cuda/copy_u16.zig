@@ -45,6 +45,8 @@ fn validateArgs(src: *const device_mod.Buffer, dst: *device_mod.Buffer, count: u
         .element_count = @intCast(count),
         .src_size = src.size,
         .dst_size = dst.size,
+        .src_address = @intCast(src.pointer),
+        .dst_address = @intCast(dst.pointer),
     });
 }
 
@@ -59,9 +61,15 @@ test "validateArgs rejects zero count" {
 }
 
 test "validateArgs rejects undersized destination buffer" {
-    const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
-    var dst = device_mod.Buffer{ .pointer = 0, .size = 6 };
+    const src = device_mod.Buffer{ .pointer = 0x1000, .size = 16 };
+    var dst = device_mod.Buffer{ .pointer = 0x2000, .size = 6 };
     try std.testing.expectError(error.BufferTooSmall, validateArgs(&src, &dst, 4));
+}
+
+test "validateArgs rejects misaligned u16 copy buffers" {
+    const src = device_mod.Buffer{ .pointer = 0x1001, .size = 8 };
+    var dst = device_mod.Buffer{ .pointer = 0x2000, .size = 8 };
+    try std.testing.expectError(error.AlignmentMismatch, validateArgs(&src, &dst, 4));
 }
 
 test "validateArgs runWithFunction rejects undersized destination before mutating arg pack" {
@@ -72,8 +80,8 @@ test "validateArgs runWithFunction rejects undersized destination before mutatin
 
     var fake_device: device_mod.Device = undefined;
     const fake_function = module_mod.Function{ .handle = @ptrFromInt(1) };
-    const src = device_mod.Buffer{ .pointer = 0, .size = 16 };
-    var dst = device_mod.Buffer{ .pointer = 0, .size = 6 };
+    const src = device_mod.Buffer{ .pointer = 0x1000, .size = 16 };
+    var dst = device_mod.Buffer{ .pointer = 0x2000, .size = 6 };
     try std.testing.expectError(error.BufferTooSmall, runWithFunction(&arg_pack, &fake_device, fake_function, &src, &dst, 4));
     try std.testing.expectEqual(before_len, arg_pack.len());
 }

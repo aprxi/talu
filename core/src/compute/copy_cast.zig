@@ -31,6 +31,17 @@ pub const CopyBufferSpec = struct {
     dst_address: ?usize = null,
 };
 
+pub const RawCopyBufferSpec = struct {
+    backend: Backend,
+    src_device: Device,
+    dst_device: Device,
+    byte_count: usize,
+    src_size: usize,
+    dst_size: usize,
+    src_address: ?usize = null,
+    dst_address: ?usize = null,
+};
+
 pub const CastBufferSpec = struct {
     backend: Backend,
     src_dtype: DType,
@@ -44,14 +55,23 @@ pub const CastBufferSpec = struct {
 };
 
 pub fn inferCopyDirection(src: Device, dst: Device) !CopyDirection {
-    const src_backend = try capability.backendFromDevice(src);
-    const dst_backend = try capability.backendFromDevice(dst);
+    return capability.inferCopyDirection(src, dst);
+}
 
-    if (src_backend == .cpu and dst_backend == .cpu) return .host_to_host;
-    if (src_backend == .cpu and dst_backend != .cpu) return .host_to_device;
-    if (src_backend != .cpu and dst_backend == .cpu) return .device_to_host;
-    if (src_backend == dst_backend and src.device_id == dst.device_id) return .device_to_device;
-    return .peer_device_to_device;
+pub fn validateRawCopyBuffers(spec: RawCopyBufferSpec) !usize {
+    if (spec.byte_count == 0) return error.InvalidShape;
+
+    const alignment_bytes = try minimumAlignment(spec.src_address, spec.dst_address);
+    try capability.validateRawCopy(rawCopyCapabilities(spec.backend), .{
+        .backend = spec.backend,
+        .src_device = spec.src_device,
+        .dst_device = spec.dst_device,
+        .byte_count = spec.byte_count,
+        .alignment_bytes = alignment_bytes,
+    });
+
+    if (spec.src_size < spec.byte_count or spec.dst_size < spec.byte_count) return error.BufferTooSmall;
+    return spec.byte_count;
 }
 
 pub fn validateCopyBuffers(spec: CopyBufferSpec) !usize {
@@ -92,6 +112,14 @@ pub fn validateCastBuffers(spec: CastBufferSpec) !struct { src_bytes: usize, dst
     const dst_bytes = std.math.mul(usize, spec.element_count, dst_elem_size) catch return error.ByteCountOverflow;
     if (spec.src_size < src_bytes or spec.dst_size < dst_bytes) return error.BufferTooSmall;
     return .{ .src_bytes = src_bytes, .dst_bytes = dst_bytes };
+}
+
+fn rawCopyCapabilities(backend: Backend) []const capability.RawCopyCapability {
+    return switch (backend) {
+        .cpu => &cpu_capabilities.raw_copy_capabilities,
+        .cuda => &cuda_capabilities.raw_copy_capabilities,
+        .metal => &metal_capabilities.raw_copy_capabilities,
+    };
 }
 
 fn copyCapabilities(backend: Backend) []const capability.CopyCapability {
@@ -154,7 +182,68 @@ test "compute validateCopyBuffers returns required bytes and rejects small buffe
     }));
 }
 
-test "compute validateCopyBuffers rejects unsupported copy direction and layout" {
+test "compute validateRawCopyBuffers validates byte movement separately from typed copy" {
+    const required = try validateRawCopyBuffers(.{
+        .backend = .cuda,
+        .src_device = Device.cpu(),
+        .dst_device = Device.cuda(0),
+        .byte_count = 16,
+        .src_size = 16,
+        .dst_size = 16,
+    });
+    try std.testing.expectEqual(@as(usize, 16), required);
+
+    const peer_required = try validateRawCopyBuffers(.{
+        .backend = .cuda,
+        .src_device = Device.cuda(0),
+        .dst_device = Device.cuda(1),
+        .byte_count = 16,
+        .src_size = 16,
+        .dst_size = 16,
+    });
+    try std.testing.expectEqual(@as(usize, 16), peer_required);
+
+    try std.testing.expectError(error.InvalidShape, validateRawCopyBuffers(.{
+        .backend = .cuda,
+        .src_device = Device.cuda(0),
+        .dst_device = Device.cuda(1),
+        .byte_count = 0,
+        .src_size = 16,
+        .dst_size = 16,
+        .src_address = 0,
+        .dst_address = 0,
+    }));
+
+    try std.testing.expectError(error.BufferTooSmall, validateRawCopyBuffers(.{
+        .backend = .cuda,
+        .src_device = Device.cpu(),
+        .dst_device = Device.cuda(0),
+        .byte_count = 16,
+        .src_size = 12,
+        .dst_size = 16,
+    }));
+
+    try std.testing.expectError(error.UnsupportedCopyDirection, validateRawCopyBuffers(.{
+        .backend = .metal,
+        .src_device = Device.metal(0),
+        .dst_device = Device.metal(0),
+        .byte_count = 16,
+        .src_size = 16,
+        .dst_size = 16,
+    }));
+
+    try std.testing.expectError(error.UnsupportedCopyDirection, validateCopyBuffers(.{
+        .backend = .cuda,
+        .direction = .host_to_device,
+        .dtype = .f32,
+        .layout = .row_major_contiguous,
+        .element_count = 4,
+        .src_size = 16,
+        .dst_size = 16,
+    }));
+}
+
+test "compute validateCopyBuffers rejects unsupported copy direction layout and alignment" {
     try std.testing.expectError(error.UnsupportedCopyDirection, validateCopyBuffers(.{
         .backend = .cuda,
         .direction = .host_to_host,
@@ -173,6 +262,18 @@ test "compute validateCopyBuffers rejects unsupported copy direction and layout"
         .element_count = 4,
         .src_size = 16,
         .dst_size = 16,
+    }));
+
+    try std.testing.expectError(error.AlignmentMismatch, validateCopyBuffers(.{
+        .backend = .cuda,
+        .direction = .device_to_device,
+        .dtype = .f32,
+        .layout = .row_major_contiguous,
+        .element_count = 4,
+        .src_size = 16,
+        .dst_size = 16,
+        .src_address = 0x1002,
+        .dst_address = 0x2000,
     }));
 }
 

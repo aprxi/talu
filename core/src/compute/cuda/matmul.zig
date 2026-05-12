@@ -23,6 +23,16 @@ const cuda_r_16bf: c_int = 14;
 const cuda_r_8f_e4m3: c_int = 28;
 const cuda_r_4f_e2m1: c_int = 33;
 
+pub const op_name_cublas_matmul_f32: []const u8 = "cublas_matmul_f32";
+pub const op_name_cublas_matmul_u16_f32: []const u8 = "cublas_matmul_u16_f32";
+pub const op_name_cublas_matmul_u16_u16_f32: []const u8 = "cublas_matmul_u16_u16_f32";
+pub const op_name_cublas_matmul_i8_i8_i32: []const u8 = "cublas_matmul_i8_i8_i32";
+pub const op_name_cublas_matmul_fp8_fp8_f32: []const u8 = "cublas_matmul_fp8_fp8_f32";
+pub const op_name_cublas_gemm_u16_strided_batched: []const u8 = "cublas_gemm_u16_strided_batched";
+pub const op_name_cublas_gemm_u16: []const u8 = "cublas_gemm_u16";
+pub const op_name_cublaslt_matmul_mxfp8: []const u8 = "cublaslt_matmul_mxfp8";
+pub const op_name_cublaslt_matmul_nvfp4: []const u8 = "cublaslt_matmul_nvfp4";
+
 const CublasCreateFn = *const fn (*?*anyopaque) callconv(.c) c_int;
 const CublasDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CublasSetMathModeFn = *const fn (?*anyopaque, c_int) callconv(.c) c_int;

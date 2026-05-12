@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const log = @import("log_pkg");
+const copy_cast = @import("../copy_cast.zig");
 
 const cuda_success: c_int = 0;
 const cuda_error_out_of_memory: c_int = 2;
@@ -901,20 +902,35 @@ pub const Device = struct {
         if (rc != cuda_success and rc != 704) return error.CudaPeerAccessFailed;
     }
 
-    /// Async copy between two device contexts. The copy is enqueued on the given stream
-    /// (which must belong to the source context).
+    /// Async copy between two CUDA device buffers.
+    ///
+    /// The copy is validated as raw byte movement before it is enqueued.
+    /// Callers choose the stream that matches their transfer ordering.
     pub fn memcpyPeerAsync(
         self: *Device,
-        dst_ptr: u64,
-        dst_context: ?*anyopaque,
-        src_ptr: u64,
-        src_context: ?*anyopaque,
+        dst_device: *Device,
+        dst: *const Buffer,
+        src: *const Buffer,
         byte_count: usize,
         stream: ?StreamHandle,
     ) !void {
+        if (byte_count == 0) return error.InvalidShape;
+        const src_descriptor = try computeDeviceDescriptor(self);
+        const dst_descriptor = try computeDeviceDescriptor(dst_device);
+        _ = try copy_cast.validateRawCopyBuffers(.{
+            .backend = .cuda,
+            .src_device = src_descriptor,
+            .dst_device = dst_descriptor,
+            .byte_count = byte_count,
+            .src_size = src.size,
+            .dst_size = dst.size,
+            .src_address = @intCast(src.pointer),
+            .dst_address = @intCast(dst.pointer),
+        });
+
         const cu_fn = self.api.cu_memcpy_peer_async orelse return error.CudaPeerAccessUnavailable;
         try self.makeCurrent();
-        if (cu_fn(dst_ptr, dst_context, src_ptr, src_context, byte_count, if (stream) |s| s else null) != cuda_success) {
+        if (cu_fn(dst.pointer, dst_device.context, src.pointer, self.context, byte_count, if (stream) |s| s else null) != cuda_success) {
             return error.CudaCopyFailed;
         }
     }
@@ -941,8 +957,18 @@ pub const Buffer = struct {
     }
 
     pub fn upload(self: *const Buffer, device: *Device, data: []const u8) !void {
-        if (data.len > self.size) return error.InvalidArgument;
         if (data.len == 0) return;
+        const cuda_device = try computeDeviceDescriptor(device);
+        _ = try copy_cast.validateRawCopyBuffers(.{
+            .backend = .cuda,
+            .src_device = copy_cast.Device.cpu(),
+            .dst_device = cuda_device,
+            .byte_count = data.len,
+            .src_size = data.len,
+            .dst_size = self.size,
+            .src_address = @intFromPtr(data.ptr),
+            .dst_address = @intCast(self.pointer),
+        });
 
         try device.makeCurrent();
         // Use async upload when a launch stream is set (required during graph
@@ -961,8 +987,19 @@ pub const Buffer = struct {
     }
 
     pub fn copyFrom(self: *const Buffer, device: *Device, src: *const Buffer, byte_count: usize) !void {
-        if (byte_count > self.size or byte_count > src.size) return error.InvalidArgument;
         if (byte_count == 0) return;
+        const cuda_device = try computeDeviceDescriptor(device);
+        _ = try copy_cast.validateRawCopyBuffers(.{
+            .backend = .cuda,
+            .src_device = cuda_device,
+            .dst_device = cuda_device,
+            .byte_count = byte_count,
+            .src_size = src.size,
+            .dst_size = self.size,
+            .src_address = @intCast(src.pointer),
+            .dst_address = @intCast(self.pointer),
+        });
+
         try device.makeCurrent();
         // Use async copy when a launch stream is set (required during graph
         // capture; also safe in normal execution since stream ordering
@@ -981,7 +1018,6 @@ pub const Buffer = struct {
     }
 
     pub fn download(self: *const Buffer, device: *Device, data: []u8) !void {
-        if (data.len > self.size) return error.InvalidArgument;
         if (data.len == 0) return;
 
         try device.makeCurrent();
@@ -994,8 +1030,18 @@ pub const Buffer = struct {
     /// Download bytes from device buffer without synchronizing launch stream.
     /// Caller must ensure producer work is complete before calling.
     pub fn downloadNoSync(self: *const Buffer, device: *Device, data: []u8) !void {
-        if (data.len > self.size) return error.InvalidArgument;
         if (data.len == 0) return;
+        const cuda_device = try computeDeviceDescriptor(device);
+        _ = try copy_cast.validateRawCopyBuffers(.{
+            .backend = .cuda,
+            .src_device = cuda_device,
+            .dst_device = copy_cast.Device.cpu(),
+            .byte_count = data.len,
+            .src_size = self.size,
+            .dst_size = data.len,
+            .src_address = @intCast(self.pointer),
+            .dst_address = @intFromPtr(data.ptr),
+        });
 
         try device.makeCurrent();
         if (device.api.cu_memcpy_dtoh(@ptrCast(data.ptr), self.pointer, data.len) != cuda_success) {
@@ -1003,6 +1049,11 @@ pub const Buffer = struct {
         }
     }
 };
+
+fn computeDeviceDescriptor(device: *const Device) !copy_cast.Device {
+    const device_id = std.math.cast(i32, device.ordinal_index) orelse return error.UnsupportedDevice;
+    return copy_cast.Device.cuda(device_id);
+}
 
 fn openDriverLibrary() !std.DynLib {
     const names: []const []const u8 = switch (builtin.os.tag) {
@@ -1077,12 +1128,12 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_device_can_access_peer = lookupOptional(CuDeviceCanAccessPeerFn, lib, "cuDeviceCanAccessPeer"),
         .cu_ctx_enable_peer_access = lookupOptional(CuCtxEnablePeerAccessFn, lib, "cuCtxEnablePeerAccess"),
         .cu_memcpy_peer_async = lookupOptionalAny(CuMemcpyPeerAsyncFn, lib, &.{ "cuMemcpyPeerAsync_v2", "cuMemcpyPeerAsync" }),
-        .cu_event_create = lookupOptionalAny(CuEventCreateFn, lib, &.{ "cuEventCreate" }),
+        .cu_event_create = lookupOptionalAny(CuEventCreateFn, lib, &.{"cuEventCreate"}),
         .cu_event_destroy = lookupOptionalAny(CuEventDestroyFn, lib, &.{ "cuEventDestroy_v2", "cuEventDestroy" }),
-        .cu_event_record = lookupOptionalAny(CuEventRecordFn, lib, &.{ "cuEventRecord" }),
-        .cu_event_synchronize = lookupOptionalAny(CuEventSynchronizeFn, lib, &.{ "cuEventSynchronize" }),
-        .cu_event_elapsed_time = lookupOptionalAny(CuEventElapsedTimeFn, lib, &.{ "cuEventElapsedTime" }),
-        .cu_stream_wait_event = lookupOptionalAny(CuStreamWaitEventFn, lib, &.{ "cuStreamWaitEvent" }),
+        .cu_event_record = lookupOptionalAny(CuEventRecordFn, lib, &.{"cuEventRecord"}),
+        .cu_event_synchronize = lookupOptionalAny(CuEventSynchronizeFn, lib, &.{"cuEventSynchronize"}),
+        .cu_event_elapsed_time = lookupOptionalAny(CuEventElapsedTimeFn, lib, &.{"cuEventElapsedTime"}),
+        .cu_stream_wait_event = lookupOptionalAny(CuStreamWaitEventFn, lib, &.{"cuStreamWaitEvent"}),
     };
 }
 
@@ -1128,6 +1179,34 @@ test "Device.allocBuffer Buffer.upload Buffer.download Buffer.deinit roundtrip" 
     var output: [32]u8 = undefined;
     try buffer.download(&device, &output);
     try std.testing.expectEqualSlices(u8, &input, &output);
+}
+
+test "Buffer upload download and copyFrom validate raw sizes before CUDA calls" {
+    var fake_device: Device = undefined;
+    fake_device.ordinal_index = 0;
+
+    const src = Buffer{ .pointer = 0x1000, .size = 4 };
+    var dst = Buffer{ .pointer = 0x2000, .size = 4 };
+    const oversized = [_]u8{0} ** 8;
+    var host_out: [8]u8 = undefined;
+
+    try std.testing.expectError(error.BufferTooSmall, dst.upload(&fake_device, &oversized));
+    try std.testing.expectError(error.BufferTooSmall, src.download(&fake_device, &host_out));
+    try std.testing.expectError(error.BufferTooSmall, dst.copyFrom(&fake_device, &src, 8));
+}
+
+test "Device.memcpyPeerAsync validates raw peer buffers before CUDA calls" {
+    var src_device: Device = undefined;
+    src_device.ordinal_index = 0;
+    var dst_device: Device = undefined;
+    dst_device.ordinal_index = 1;
+
+    const src = Buffer{ .pointer = 0x1000, .size = 4 };
+    const dst = Buffer{ .pointer = 0x2000, .size = 4 };
+    const misaligned = Buffer{ .pointer = 0x2001, .size = 4 };
+
+    try std.testing.expectError(error.BufferTooSmall, src_device.memcpyPeerAsync(&dst_device, &dst, &src, 8, null));
+    try std.testing.expectError(error.AlignmentMismatch, src_device.memcpyPeerAsync(&dst_device, &misaligned, &src, 4, null));
 }
 
 test "Device.totalMemory reports non-zero bytes when available" {
