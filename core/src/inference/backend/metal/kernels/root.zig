@@ -1,10 +1,10 @@
 const cpu_kernels = @import("../../cpu/kernels/root.zig");
+const compute_cpu_embedding = @import("compute_pkg").cpu.embedding;
 
 pub const support = cpu_kernels.support;
 
 pub const attention = cpu_kernels.attention;
 pub const describe_fmt = cpu_kernels.describe_fmt;
-pub const embedding = cpu_kernels.embedding;
 pub const ffn = cpu_kernels.ffn;
 pub const fused_attention = cpu_kernels.fused_attention;
 pub const gated_delta = cpu_kernels.gated_delta;
@@ -24,7 +24,8 @@ pub const RMSNorm = cpu_kernels.RMSNorm;
 pub const GatedDeltaKernel = cpu_kernels.GatedDeltaKernel;
 pub const ShortConvKernel = cpu_kernels.ShortConvKernel;
 pub const MoEFFN = cpu_kernels.MoEFFN;
-pub const EmbeddingLookup = cpu_kernels.EmbeddingLookup;
+pub const EmbeddingLookup = compute_cpu_embedding.EmbeddingLookup;
+pub const gatherEmbeddings = compute_cpu_embedding.gatherEmbeddings;
 pub const KVCache = cpu_kernels.KVCache;
 pub const FusedAttention = cpu_kernels.FusedAttention;
 pub const RotaryEmbedding = cpu_kernels.RotaryEmbedding;

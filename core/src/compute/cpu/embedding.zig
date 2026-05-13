@@ -1,17 +1,16 @@
 //! CPU Embedding Kernel
 //! Token embedding lookup for various quantization formats
 //!
-//! This module provides embedding lookup operations for CPU inference.
+//! This module provides embedding lookup operations for CPU compute.
 //! Supports F32, BF16, F16, grouped-affine u4/u8, and MXFP8 formats.
 
 pub const supported = true;
 
 const std = @import("std");
-const tensor = @import("compute_pkg").tensor;
-const dtype = @import("compute_pkg").dtype;
-const compute = @import("compute_pkg");
-const cpu_quant_decode = compute.cpu.quant_decode;
-const cpu_memory = compute.cpu.memory;
+const tensor = @import("../tensor.zig");
+const dtype = @import("../dtype.zig");
+const cpu_quant_decode = @import("quant_decode.zig");
+const cpu_memory = @import("memory.zig");
 
 const Tensor = tensor.Tensor;
 
@@ -145,7 +144,7 @@ pub const EmbeddingLookup = struct {
 // Tests
 // ============================================================================
 
-test "gatherEmbeddings f32 basic" {
+test "compute gatherEmbeddings f32 basic" {
     const allocator = std.testing.allocator;
 
     // Create a simple embedding table: 4 tokens x 8 dims
@@ -190,7 +189,7 @@ test "gatherEmbeddings f32 basic" {
     }
 }
 
-test "gatherEmbeddings f32 boundary tokens" {
+test "compute gatherEmbeddings f32 boundary tokens" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 100;
@@ -227,7 +226,7 @@ test "gatherEmbeddings f32 boundary tokens" {
     }
 }
 
-test "gatherEmbeddings f16 dtype" {
+test "compute gatherEmbeddings f16 dtype" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 3;
@@ -264,7 +263,7 @@ test "gatherEmbeddings f16 dtype" {
     }
 }
 
-test "gatherEmbeddings bf16 dtype" {
+test "compute gatherEmbeddings bf16 dtype" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 2;
@@ -298,7 +297,7 @@ test "gatherEmbeddings bf16 dtype" {
     }
 }
 
-test "EmbeddingLookup.forward delegates to gatherEmbeddings" {
+test "compute EmbeddingLookup.forward delegates to gatherEmbeddings" {
     const allocator = std.testing.allocator;
 
     var embed_tensor = try tensor.OwnedTensor.init(allocator, .f32, &.{ 3, 2 });
@@ -323,7 +322,7 @@ test "EmbeddingLookup.forward delegates to gatherEmbeddings" {
     try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0 }, output_tensor.asSlice(f32));
 }
 
-test "gatherEmbeddings invalid token" {
+test "compute gatherEmbeddings invalid token" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 10;
@@ -342,7 +341,7 @@ test "gatherEmbeddings invalid token" {
     try std.testing.expectError(error.InvalidTokenId, result);
 }
 
-test "gatherEmbeddings dimension validation" {
+test "compute gatherEmbeddings dimension validation" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 10;
@@ -362,7 +361,7 @@ test "gatherEmbeddings dimension validation" {
     try std.testing.expectError(error.InvalidShape, result);
 }
 
-test "gatherEmbeddings single element" {
+test "compute gatherEmbeddings single element" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 5;
@@ -390,7 +389,7 @@ test "gatherEmbeddings single element" {
     try std.testing.expectApproxEqAbs(40.0, output_values[2], 0.001);
 }
 
-test "gatherEmbeddings large vocab" {
+test "compute gatherEmbeddings large vocab" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 50000; // Realistic vocab size
@@ -420,7 +419,7 @@ test "gatherEmbeddings large vocab" {
     }
 }
 
-test "gatherEmbeddings multiple sequences" {
+test "compute gatherEmbeddings multiple sequences" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 10;
@@ -456,7 +455,7 @@ test "gatherEmbeddings multiple sequences" {
     }
 }
 
-test "gatherEmbeddings f16 special values" {
+test "compute gatherEmbeddings f16 special values" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 1;
@@ -487,7 +486,7 @@ test "gatherEmbeddings f16 special values" {
     try std.testing.expect(output_values[3] > 60000.0 and output_values[3] < 70000.0);
 }
 
-test "gatherEmbeddings empty sequence" {
+test "compute gatherEmbeddings empty sequence" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 10;
@@ -507,7 +506,7 @@ test "gatherEmbeddings empty sequence" {
     // Should succeed with no embeddings gathered
 }
 
-test "gatherEmbeddings duplicate tokens" {
+test "compute gatherEmbeddings duplicate tokens" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 5;
@@ -549,7 +548,7 @@ test "gatherEmbeddings duplicate tokens" {
     }
 }
 
-test "gatherEmbeddings large dimension" {
+test "compute gatherEmbeddings large dimension" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 2;
@@ -581,7 +580,7 @@ test "gatherEmbeddings large dimension" {
     try std.testing.expectApproxEqAbs(4.0, output_values[2 * embed_dim - 1], 0.001);
 }
 
-test "gatherEmbeddings all zeros" {
+test "compute gatherEmbeddings all zeros" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 3;
@@ -608,7 +607,7 @@ test "gatherEmbeddings all zeros" {
     }
 }
 
-test "gatherEmbeddings extreme f32" {
+test "compute gatherEmbeddings extreme f32" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 1;
@@ -647,7 +646,7 @@ test "gatherEmbeddings extreme f32" {
     try std.testing.expectApproxEqAbs(1.234567e20, output_values[7], 1.0e12);
 }
 
-test "gatherEmbeddings sequential tokens" {
+test "compute gatherEmbeddings sequential tokens" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 100;
@@ -682,7 +681,7 @@ test "gatherEmbeddings sequential tokens" {
     }
 }
 
-test "gatherEmbeddings reverse order" {
+test "compute gatherEmbeddings reverse order" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 10;
@@ -717,7 +716,7 @@ test "gatherEmbeddings reverse order" {
     }
 }
 
-test "gatherEmbeddings bf16 multiple tokens" {
+test "compute gatherEmbeddings bf16 multiple tokens" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 5;
@@ -756,7 +755,7 @@ test "gatherEmbeddings bf16 multiple tokens" {
     }
 }
 
-test "gatherEmbeddings f16 negative positive" {
+test "compute gatherEmbeddings f16 negative positive" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 2;
@@ -799,7 +798,7 @@ test "gatherEmbeddings f16 negative positive" {
     }
 }
 
-test "gatherEmbeddings wrong dtype" {
+test "compute gatherEmbeddings wrong dtype" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 10;
@@ -819,7 +818,7 @@ test "gatherEmbeddings wrong dtype" {
     try std.testing.expectError(error.InvalidDType, result);
 }
 
-test "gatherEmbeddings mismatched length" {
+test "compute gatherEmbeddings mismatched length" {
     const allocator = std.testing.allocator;
 
     const vocab_size = 10;

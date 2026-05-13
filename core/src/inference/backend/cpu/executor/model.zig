@@ -27,7 +27,7 @@ const state_bindings = @import("../state_bindings.zig");
 const dump = if (build_options.dump_tensors) @import("xray_pkg").dump.capture else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
-const embedding_kernel = @import("../kernels/embedding.zig");
+const embedding_kernel = compute.cpu.embedding;
 const attn_kernel = @import("../kernels/attention.zig");
 const norm_kernel = @import("../kernels/norm.zig");
 const per_layer_branch_kernel = @import("../kernels/per_layer_branch.zig");

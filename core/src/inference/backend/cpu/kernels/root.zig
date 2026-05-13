@@ -22,11 +22,11 @@ pub const support = .{
 };
 
 const block_kernels = @import("../executor/weights.zig");
+const compute_cpu_embedding = @import("compute_pkg").cpu.embedding;
 const moe_kernels = @import("moe.zig");
 pub const kv_cache = @import("kv_cache.zig");
 pub const attention = @import("attention.zig");
 pub const describe_fmt = @import("describe_fmt.zig");
-pub const embedding = @import("embedding.zig");
 pub const ffn = @import("ffn.zig");
 pub const gated_delta = @import("gated_delta.zig");
 pub const fused_attention = attention;
@@ -42,7 +42,7 @@ pub const weights = @import("weights.zig");
 // Block containers + scratch
 pub const TransformerBlock = block_kernels.TransformerBlock;
 pub const ScratchBuffer = block_kernels.ScratchBuffer;
-pub const EmbeddingLookup = embedding.EmbeddingLookup;
+pub const EmbeddingLookup = compute_cpu_embedding.EmbeddingLookup;
 pub const KVCache = kv_cache.KVCache;
 pub const FusedAttention = fused_attention.FusedAttention;
 pub const RotaryEmbedding = rope.RotaryEmbedding;
@@ -60,7 +60,7 @@ pub const RoPE = block_kernels.RoPE;
 
 // Common CPU kernel entrypoints
 pub const rmsnormForward = block_kernels.rmsnormForward;
-pub const gatherEmbeddings = block_kernels.gatherEmbeddings;
+pub const gatherEmbeddings = compute_cpu_embedding.gatherEmbeddings;
 
 // MoE kernel exports
 pub const MoEFFN = moe_kernels.MoEFFN;

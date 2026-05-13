@@ -84,6 +84,20 @@ fn requireBoolField(comptime S: type, comptime owner_name: []const u8, comptime 
     }
 }
 
+fn isEmbeddingKernel(comptime kernel_name: []const u8) bool {
+    return std.mem.eql(u8, kernel_name, "embedding");
+}
+
+fn assertEmbeddingRootContract(comptime K: type, comptime backend_name: []const u8) void {
+    const owner = backend_name ++ ".kernels";
+    requireLayoutDecl(K, owner, "EmbeddingLookup");
+    requireLayoutDecl(K.EmbeddingLookup, owner ++ ".EmbeddingLookup", "ForwardParams");
+    requireStructField(K.EmbeddingLookup.ForwardParams, owner ++ ".EmbeddingLookup.ForwardParams", "token_ids");
+    requireStructField(K.EmbeddingLookup.ForwardParams, owner ++ ".EmbeddingLookup.ForwardParams", "output_tensor");
+    requireMethodArity(K.EmbeddingLookup, owner ++ ".EmbeddingLookup", "forward", 3);
+    requireCallableDecl(K, owner, "gatherEmbeddings");
+}
+
 fn requireMethodArity(comptime M: type, comptime owner_name: []const u8, comptime name: []const u8, comptime arity: usize) void {
     requireCallableDecl(M, owner_name, name);
     const decl = @field(M, name);
@@ -135,7 +149,11 @@ fn assertKernelSupportShape(comptime K: type, comptime backend_name: []const u8)
 
     inline for (required_kernel_names) |kernel_name| {
         requireBoolField(S, owner, kernel_name);
-        requireLayoutDecl(K, backend_name, kernel_name);
+        if (isEmbeddingKernel(kernel_name) and @field(K.support, kernel_name)) {
+            assertEmbeddingRootContract(K, backend_name);
+        } else {
+            requireLayoutDecl(K, backend_name, kernel_name);
+        }
     }
 
     const support_fields = std.meta.fields(S);
@@ -153,7 +171,9 @@ fn assertKernelSupportShape(comptime K: type, comptime backend_name: []const u8)
                 "Kernel support map for '" ++ backend_name ++ "' field '" ++ field.name ++ "' must be bool",
             );
         }
-        if (!@hasDecl(K, field.name)) {
+        if (isEmbeddingKernel(field.name) and @field(K.support, field.name)) {
+            assertEmbeddingRootContract(K, backend_name);
+        } else if (!@hasDecl(K, field.name)) {
             @compileError("Kernel module layout for '" ++ backend_name ++ "' missing module '" ++ field.name ++ "'");
         }
     }
@@ -282,7 +302,11 @@ pub fn assertKernelSupportMap(comptime K: type, comptime backend_name: []const u
         for (std.meta.fields(S)) |field| {
             const kernel_name = field.name;
             const expected = @field(K.support, kernel_name);
-            assertKernelSupportDeclMatches(@field(K, kernel_name), backend_name, kernel_name, expected);
+            if (isEmbeddingKernel(kernel_name) and expected) {
+                assertEmbeddingRootContract(K, backend_name);
+            } else {
+                assertKernelSupportDeclMatches(@field(K, kernel_name), backend_name, kernel_name, expected);
+            }
         }
     }
 }
@@ -318,6 +342,11 @@ pub fn assertKernelSymbolLayout(comptime K: type, comptime backend_name: []const
 }
 
 fn assertKernelContract(comptime K: type, comptime backend_name: []const u8, comptime kernel_name: []const u8) void {
+    if (isEmbeddingKernel(kernel_name)) {
+        assertEmbeddingRootContract(K, backend_name);
+        return;
+    }
+
     const Module = @field(K, kernel_name);
     const owner = backend_name ++ ".kernels." ++ kernel_name;
 
@@ -371,12 +400,6 @@ fn assertKernelContract(comptime K: type, comptime backend_name: []const u8, com
         requireStructField(Module.MoEFFN.ForwardParams, owner ++ ".MoEFFN.ForwardParams", "scratch");
         requireStructField(Module.MoEFFN.ForwardParams, owner ++ ".MoEFFN.ForwardParams", "matmul_scratch");
         requireMethodArity(Module.MoEFFN, owner ++ ".MoEFFN", "forward", 5);
-    } else if (std.mem.eql(u8, kernel_name, "embedding")) {
-        requireLayoutDecl(Module, owner, "EmbeddingLookup");
-        requireLayoutDecl(Module.EmbeddingLookup, owner ++ ".EmbeddingLookup", "ForwardParams");
-        requireStructField(Module.EmbeddingLookup.ForwardParams, owner ++ ".EmbeddingLookup.ForwardParams", "token_ids");
-        requireStructField(Module.EmbeddingLookup.ForwardParams, owner ++ ".EmbeddingLookup.ForwardParams", "output_tensor");
-        requireMethodArity(Module.EmbeddingLookup, owner ++ ".EmbeddingLookup", "forward", 3);
     } else if (std.mem.eql(u8, kernel_name, "kv_cache")) {
         requireLayoutDecl(Module, owner, "KVCache");
         requireLayoutDecl(Module.KVCache, owner ++ ".KVCache", "ForwardParams");
