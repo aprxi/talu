@@ -193,26 +193,8 @@ pub fn resolveCudaMaxSeqLen(model_max_seq_len: usize) usize {
     return resolved;
 }
 
-pub fn resolveSharedKvSourceLayer(config: models.config.ModelConfig, layer_idx: usize) ?usize {
-    if (config.num_kv_shared_layers <= 0) return null;
-    const layer_types = config.layer_types orelse return null;
-    const n_layers: usize = @intCast(config.n_layers);
-    if (layer_types.len != n_layers) return null;
-    if (layer_idx >= n_layers) return null;
-
-    const shared_count: usize = @min(@as(usize, @intCast(config.num_kv_shared_layers)), n_layers);
-    if (shared_count == 0 or shared_count == n_layers) return null;
-    const first_shared_layer = n_layers - shared_count;
-    if (layer_idx < first_shared_layer or first_shared_layer == 0) return null;
-
-    const target_layer_type = layer_types[layer_idx];
-    var src = first_shared_layer;
-    while (src > 0) {
-        src -= 1;
-        if (layer_types[src] == target_layer_type) return src;
-    }
-    return null;
-}
+pub const resolveSharedKvSourceLayer = models.block_geometry.resolveSharedKvSourceLayer;
+pub const resolveRuntimeAttentionScale = models.block_geometry.resolveRuntimeAttentionScale;
 
 /// For multi-GPU topologies, ensure the split point between GPU stages does
 /// not separate KV-shared layers from their source layers. Returns the
@@ -223,7 +205,7 @@ pub fn adjustSplitForKvSharing(config: models.config.ModelConfig, proposed_split
     var min_source = proposed_split;
     var layer_idx = proposed_split;
     while (layer_idx < total_layers) : (layer_idx += 1) {
-        if (resolveSharedKvSourceLayer(config, layer_idx)) |src| {
+        if (models.block_geometry.resolveSharedKvSourceLayer(config, layer_idx)) |src| {
             min_source = @min(min_source, src);
         }
     }

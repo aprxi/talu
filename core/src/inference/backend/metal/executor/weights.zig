@@ -892,7 +892,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
     // Scaling multipliers from config.json (used by Granite and other models)
     weight_handles.embedding_multiplier = loaded.config.embedding_multiplier;
-    weight_handles.attention_multiplier = loaded.config.attention_multiplier;
+    weight_handles.attention_multiplier = models.block_geometry.resolveAttentionScaleOverride(loaded.config, @intCast(loaded.config.head_dim));
     weight_handles.residual_multiplier = loaded.config.residual_multiplier;
     weight_handles.logits_scaling = loaded.config.logits_scaling;
 

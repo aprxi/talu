@@ -821,12 +821,7 @@ pub const CudaBackend = struct {
         if (backend.rope_dim == 0 or backend.rope_dim > backend.head_dim or (backend.rope_dim & 1) != 0) {
             return error.UnsupportedModel;
         }
-        backend.attention_scale = if (loaded.config.attention_multiplier > 0.0)
-            loaded.config.attention_multiplier
-        else if (loaded.config.query_pre_attn_scalar > 0.0)
-            1.0 / std.math.sqrt(loaded.config.query_pre_attn_scalar)
-        else
-            1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
+        backend.attention_scale = models.block_geometry.resolveAttentionScale(loaded.config, backend.head_dim);
         backend.kv_cache_dtype = resolveKvCacheDtype();
         kv_dtype_guard: {
             if (backend.kv_cache_dtype != .fp8) break :kv_dtype_guard;

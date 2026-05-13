@@ -83,12 +83,7 @@ const engine_mixers = @import("../operators/root.zig");
 const engine_weights = @import("../weights/root.zig");
 const bufferSlice = engine_weights.bufferSlice;
 
-const ResolvedAttentionShape = struct {
-    head_dim_u32: u32,
-    rope_dim_u32: u32,
-    n_heads_u32: u32,
-    n_kv_heads_u32: u32,
-};
+const ResolvedAttentionShape = models.block_geometry.InstructionAttentionShape;
 
 fn resolveAttentionShapeForInstruction(
     cfg: *const LayerAttentionExecConfig,
@@ -96,46 +91,18 @@ fn resolveAttentionShapeForInstruction(
     k_norm_weight: ?*const DeviceTensor,
     ctx: *const LayerProgramExecutionContext,
 ) !ResolvedAttentionShape {
-    var head_dim_u32 = ctx.head_dim_u32;
-    if (q_norm_weight) |q_norm| {
-        head_dim_u32 = @intCast(q_norm.rows);
-    } else if (k_norm_weight) |k_norm| {
-        head_dim_u32 = @intCast(k_norm.rows);
-    }
-    if (head_dim_u32 == 0) return error.InvalidInstructionBinding;
-    const head_dim_usize: usize = @intCast(head_dim_u32);
-
-    var n_heads_u32 = ctx.n_heads_u32;
-    if ((cfg.q_dim % head_dim_usize) == 0) {
-        n_heads_u32 = @intCast(cfg.q_dim / head_dim_usize);
-    } else if (q_norm_weight != null) {
-        return error.InvalidInstructionBinding;
-    }
-
-    var n_kv_heads_u32 = ctx.n_kv_heads_u32;
-    if ((cfg.kv_dim % head_dim_usize) == 0) {
-        n_kv_heads_u32 = @intCast(cfg.kv_dim / head_dim_usize);
-    } else if (k_norm_weight != null) {
-        return error.InvalidInstructionBinding;
-    }
-    if (n_heads_u32 == 0 or n_kv_heads_u32 == 0 or (n_heads_u32 % n_kv_heads_u32) != 0) {
-        return error.InvalidInstructionBinding;
-    }
-
-    var rope_dim_u32 = @min(ctx.rope_dim_u32, head_dim_u32);
-    // Mixed-attention models use proportional rotary width for full-attention
-    // layers, but sliding-window layers run local RoPE across the full per-head
-    // width.
-    if (cfg.sliding_window > 0 and ctx.backend.loaded.config.global_head_dim > 0) {
-        rope_dim_u32 = head_dim_u32;
-    }
-
-    return .{
-        .head_dim_u32 = head_dim_u32,
-        .rope_dim_u32 = rope_dim_u32,
-        .n_heads_u32 = n_heads_u32,
-        .n_kv_heads_u32 = n_kv_heads_u32,
-    };
+    return models.block_geometry.resolveInstructionAttentionShape(.{
+        .q_dim = cfg.q_dim,
+        .kv_dim = cfg.kv_dim,
+        .sliding_window = cfg.sliding_window,
+        .default_head_dim = ctx.head_dim_u32,
+        .default_rope_dim = ctx.rope_dim_u32,
+        .default_n_heads = ctx.n_heads_u32,
+        .default_n_kv_heads = ctx.n_kv_heads_u32,
+        .global_head_dim = ctx.backend.loaded.config.global_head_dim,
+        .q_norm_rows = if (q_norm_weight) |q_norm| q_norm.rows else null,
+        .k_norm_rows = if (k_norm_weight) |k_norm| k_norm.rows else null,
+    }) catch return error.InvalidInstructionBinding;
 }
 
 const handles = @import("handles.zig");

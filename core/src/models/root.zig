@@ -16,6 +16,7 @@ pub const perf_hints = @import("perf_hints.zig");
 pub const manifest = @import("manifest.zig");
 pub const stage_plan = @import("stage_plan.zig");
 pub const runtime_blocks = @import("runtime_blocks.zig");
+pub const block_geometry = @import("block_geometry.zig");
 pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");
 pub const vision_program = @import("vision_program.zig");
@@ -126,4 +127,20 @@ test "vision_program module contract tests" {
     _ = vision_program.parseVisionProgram;
     _ = vision_program.compileVisionStagePlans;
     _ = vision_program.deinitVisionStagePlans;
+}
+
+test "block_geometry InstructionAttentionShapeInput inferAttentionShape inferAttentionDff resolveAttentionScale resolveRuntimeAttentionScale resolveAttentionScaleOverride resolveSharedKvSourceLayer resolveMinSharedKvSourceLayer resolveInstructionAttentionShape runContractTests" {
+    _ = @import("block_geometry.zig");
+    _ = block_geometry.AttentionShape;
+    _ = block_geometry.InstructionAttentionShape;
+    _ = block_geometry.InstructionAttentionShapeInput;
+    _ = block_geometry.inferAttentionShape;
+    _ = block_geometry.inferAttentionDff;
+    _ = block_geometry.resolveAttentionScale;
+    _ = block_geometry.resolveRuntimeAttentionScale;
+    _ = block_geometry.resolveAttentionScaleOverride;
+    _ = block_geometry.resolveSharedKvSourceLayer;
+    _ = block_geometry.resolveMinSharedKvSourceLayer;
+    _ = block_geometry.resolveInstructionAttentionShape;
+    try block_geometry.testing.runContractTests();
 }

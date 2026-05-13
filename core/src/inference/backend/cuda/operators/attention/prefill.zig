@@ -391,11 +391,7 @@ fn effectiveLayerRopeTheta(
 }
 
 fn attentionScaleForHeadDim(self: anytype, head_dim_u32: u32) f32 {
-    if (self.loaded.config.attention_multiplier > 0.0 or self.loaded.config.query_pre_attn_scalar > 0.0) {
-        return self.attention_scale;
-    }
-    if (head_dim_u32 == 0) return self.attention_scale;
-    return 1.0 / std.math.sqrt(@as(f32, @floatFromInt(head_dim_u32)));
+    return engine_types.resolveRuntimeAttentionScale(self.loaded.config, self.attention_scale, @intCast(head_dim_u32));
 }
 
 fn applyValueNormInPlace(

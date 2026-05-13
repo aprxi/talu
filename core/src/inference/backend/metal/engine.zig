@@ -1038,7 +1038,7 @@ pub const MetalBackend = struct {
             .allow_norm_shift = if (loaded.runtime.norm_weights_pre_shifted) 0 else 1,
             .use_v_norm = if (loaded.config.use_v_norm) 1 else 0,
             .embedding_multiplier = loaded.config.embedding_multiplier,
-            .attention_multiplier = loaded.config.attention_multiplier,
+            .attention_multiplier = models.block_geometry.resolveAttentionScaleOverride(loaded.config, @intCast(loaded.config.head_dim)),
         };
         const ctx = mlx_create_with_flags(model_id_z.ptr, model_path_z.ptr, seed, &model_flags) orelse {
             const mlx_error = resolveLastError();

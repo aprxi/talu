@@ -1376,6 +1376,16 @@ pub fn build(b: *std.Build) void {
         "addEosTokenId",
         "loadPreprocessorConfig",
         "manifest",
+        "block_geometry",
+        "InstructionAttentionShapeInput",
+        "inferAttentionShape",
+        "inferAttentionDff",
+        "resolveAttentionScale",
+        "resolveRuntimeAttentionScale",
+        "resolveAttentionScaleOverride",
+        "resolveSharedKvSourceLayer",
+        "resolveMinSharedKvSourceLayer",
+        "resolveInstructionAttentionShape",
     });
     ut.addLazy("responses", b.path("core/src/lib_dev.zig"), &.{
         "TableAdapter",

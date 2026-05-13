@@ -11,7 +11,6 @@ const models = @import("models_pkg");
 const log = @import("log_pkg");
 const tensor = @import("compute_pkg").tensor;
 
-const ModelConfig = models.config.ModelConfig;
 const LoadedModel = models.LoadedModel;
 const has_cuda = build_options.enable_cuda and (builtin.os.tag == .linux or builtin.os.tag == .windows);
 
@@ -714,41 +713,6 @@ pub fn autoDetectTopologyForModel(
     return result;
 }
 
-/// Find the minimum KV shared source layer index across all shared layers.
-///
-/// For models with KV sharing, later layers reuse the KV cache
-/// from earlier "source" layers. Returns the lowest such source layer index,
-/// or null if the model has no KV sharing.
-///
-/// Used to detect when cpu_gpu_gpu topology is infeasible (source layers in
-/// CPU range means no valid GPU1/GPU2 split exists).
-fn minKvSharedSourceLayer(config: ModelConfig) ?usize {
-    if (config.num_kv_shared_layers <= 0) return null;
-    const n_layers: usize = @intCast(config.n_layers);
-    const layer_types = config.layer_types orelse return null;
-    if (layer_types.len != n_layers) return null;
-    const shared_count: usize = @min(@as(usize, @intCast(config.num_kv_shared_layers)), n_layers);
-    if (shared_count == 0 or shared_count >= n_layers) return null;
-    const first_shared = n_layers - shared_count;
-    if (first_shared == 0) return null;
-
-    // Mirrors resolveSharedKvSourceLayer: search backward for matching layer_type.
-    var min_src: usize = first_shared;
-    var idx = first_shared;
-    while (idx < n_layers) : (idx += 1) {
-        const target_type = layer_types[idx];
-        var src = first_shared;
-        while (src > 0) {
-            src -= 1;
-            if (layer_types[src] == target_type) {
-                min_src = @min(min_src, src);
-                break;
-            }
-        }
-    }
-    return if (min_src < first_shared) min_src else null;
-}
-
 /// Pure-logic topology selection from a requested CPU layer count.
 ///
 /// CPU runs layers [0, cpu_layers), GPU(s) run [cpu_layers, total_layers).
@@ -945,7 +909,7 @@ pub fn resolveCpuLayersTopology(
     // When sources are in the CPU range, use cpu_gpu so cross-device KV
     // replication handles them.
     if (result.mode == .cpu_gpu_gpu) {
-        if (minKvSharedSourceLayer(loaded.config)) |min_src| {
+        if (models.block_geometry.resolveMinSharedKvSourceLayer(loaded.config)) |min_src| {
             if (cpu_layers >= min_src) {
                 result = .{
                     .mode = .cpu_gpu,
