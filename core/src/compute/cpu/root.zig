@@ -19,6 +19,7 @@ pub const memory = @import("memory.zig");
 pub const recurrence = @import("recurrence.zig");
 pub const indexing = @import("indexing.zig");
 pub const embedding = @import("embedding.zig");
+pub const tensor_convert = @import("tensor_convert.zig");
 
 pub const activation = @import("activation.zig");
 pub const gated_attention = @import("gated_attention.zig");
@@ -57,6 +58,7 @@ test {
     _ = recurrence;
     _ = indexing;
     _ = embedding;
+    _ = tensor_convert;
     _ = activation;
     _ = gated_attention;
     _ = gated_delta;

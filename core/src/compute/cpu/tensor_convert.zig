@@ -1,8 +1,8 @@
-//! Shared tensor conversion helpers for inference vision runtimes.
+//! Tensor conversion helpers for CPU compute users.
 
 const std = @import("std");
-const tensor = @import("compute_pkg").tensor;
-const dtype_mod = @import("compute_pkg").dtype;
+const tensor = @import("../tensor.zig");
+const dtype_mod = @import("../dtype.zig");
 
 const Tensor = tensor.Tensor;
 
@@ -30,7 +30,7 @@ pub fn tensorToOwnedF32(allocator: std.mem.Allocator, t: Tensor) ![]f32 {
     return out;
 }
 
-test "tensorToOwnedF32 converts f32 and bf16 tensors" {
+test "compute tensorToOwnedF32 converts f32 and bf16 tensors" {
     const allocator = std.testing.allocator;
 
     var f32_data = [_]f32{ 1.0, 2.0 };

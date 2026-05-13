@@ -19,7 +19,7 @@ const runtime_contract = @import("runtime_contract_pkg");
 const cpu_blocks = @import("../executor/weights.zig");
 const exec_block = @import("../executor/block.zig");
 const common_vision = @import("types.zig");
-const vision_tensor_convert = @import("tensor_convert.zig");
+const vision_tensor_convert = compute.cpu.tensor_convert;
 const vision_program_mod = models.vision_program;
 const vision_adapters = @import("../../../vision_program_adapters.zig");
 
