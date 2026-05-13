@@ -1374,6 +1374,7 @@ pub fn build(b: *std.Build) void {
         "getChatTemplateSource",
         "isEosToken",
         "addEosTokenId",
+        "loadPreprocessorConfig",
         "manifest",
     });
     ut.addLazy("responses", b.path("core/src/lib_dev.zig"), &.{

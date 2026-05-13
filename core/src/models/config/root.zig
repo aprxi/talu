@@ -9,6 +9,8 @@ const model_types = @import("models_pkg").op_types;
 const registry = @import("models_pkg").registry;
 const types = @import("types.zig");
 
+pub const preprocessor = @import("preprocessor.zig");
+
 pub const QuantMethod = types.QuantMethod;
 pub const RopeScaling = types.RopeScaling;
 pub const ModelArch = types.ModelArch;

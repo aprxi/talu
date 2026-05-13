@@ -19,4 +19,3 @@ pub const bridge = root.bridge;
 pub const diagnostics = root.diagnostics;
 
 pub const backend = @import("backend/root.zig");
-pub const preprocessor_config = @import("config/preprocessor.zig");

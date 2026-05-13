@@ -2,8 +2,8 @@
 //!
 //! Loads image preprocessing parameters from preprocessor_config.json.
 //! This file specifies pixel limits for smart resize — the model author's
-//! intended resolution range.  Downstream code clamps these raw values to
-//! the vision encoder's hardware limit (see Backend.visionMaxPixels).
+//! intended resolution range.  Runtime callers clamp these raw values to
+//! their execution limits.
 
 const std = @import("std");
 const json = @import("io_pkg").json;
@@ -158,10 +158,12 @@ fn tmpDirPath(tmp_dir: std.testing.TmpDir, buf: *[std.fs.max_path_bytes]u8) []co
 }
 
 // Test 1: LFM2-VL schema — size.height × size.width
-test "loadPreprocessorConfig: LFM2-VL schema" {
+test "models loadPreprocessorConfig: LFM2-VL schema" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    writeTmpConfig(tmp, @embedFile("testdata/preproc_lfm2.json"));
+    writeTmpConfig(tmp,
+        \\{"size":{"height":512,"width":512},"patch_size":16,"tile_size":512,"max_tiles":10}
+    );
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const result = loadPreprocessorConfig(testing.allocator, tmpDirPath(tmp, &buf));
     try testing.expectEqual(@as(u64, 512 * 512), result.max_pixels);
@@ -169,10 +171,12 @@ test "loadPreprocessorConfig: LFM2-VL schema" {
 }
 
 // Test 2: Qwen3-VL schema — size.longest_edge / size.shortest_edge
-test "loadPreprocessorConfig: Qwen3-VL schema" {
+test "models loadPreprocessorConfig: Qwen3-VL schema" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    writeTmpConfig(tmp, @embedFile("testdata/preproc_qwen3.json"));
+    writeTmpConfig(tmp,
+        \\{"size":{"longest_edge":16777216,"shortest_edge":65536},"patch_size":16,"merge_size":2}
+    );
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const result = loadPreprocessorConfig(testing.allocator, tmpDirPath(tmp, &buf));
     try testing.expectEqual(@as(u64, 16777216), result.max_pixels);
@@ -180,10 +184,12 @@ test "loadPreprocessorConfig: Qwen3-VL schema" {
 }
 
 // Test 3: Qwen2-VL schema — root min_pixels / max_pixels
-test "loadPreprocessorConfig: Qwen2-VL schema" {
+test "models loadPreprocessorConfig: Qwen2-VL schema" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    writeTmpConfig(tmp, @embedFile("testdata/preproc_qwen2.json"));
+    writeTmpConfig(tmp,
+        \\{"min_pixels":3136,"max_pixels":12845056,"patch_size":14}
+    );
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const result = loadPreprocessorConfig(testing.allocator, tmpDirPath(tmp, &buf));
     try testing.expectEqual(@as(u64, 12845056), result.max_pixels);
@@ -191,7 +197,7 @@ test "loadPreprocessorConfig: Qwen2-VL schema" {
 }
 
 // Test 4: longest_edge treated as area directly
-test "loadPreprocessorConfig: longest_edge treated as area" {
+test "models loadPreprocessorConfig: longest_edge treated as area" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     writeTmpConfig(tmp,
@@ -203,7 +209,7 @@ test "loadPreprocessorConfig: longest_edge treated as area" {
 }
 
 // Test 5: Missing file returns defaults
-test "loadPreprocessorConfig: missing file returns defaults" {
+test "models loadPreprocessorConfig: missing file returns defaults" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -214,7 +220,7 @@ test "loadPreprocessorConfig: missing file returns defaults" {
 }
 
 // Test 6: Bad JSON returns defaults
-test "loadPreprocessorConfig: bad JSON returns defaults" {
+test "models loadPreprocessorConfig: bad JSON returns defaults" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     writeTmpConfig(tmp, "{{{");
@@ -225,7 +231,7 @@ test "loadPreprocessorConfig: bad JSON returns defaults" {
 }
 
 // Test 7: Partial fields — only max_pixels
-test "loadPreprocessorConfig: partial fields" {
+test "models loadPreprocessorConfig: partial fields" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     writeTmpConfig(tmp,
@@ -238,7 +244,7 @@ test "loadPreprocessorConfig: partial fields" {
 }
 
 // Test 8: patch_size extraction
-test "loadPreprocessorConfig: patch_size extraction" {
+test "models loadPreprocessorConfig: patch_size extraction" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     writeTmpConfig(tmp,
