@@ -18,6 +18,7 @@ pub const stage_plan = @import("stage_plan.zig");
 pub const runtime_blocks = @import("runtime_blocks.zig");
 pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");
+pub const vision_program = @import("vision_program.zig");
 pub const per_layer_branch = @import("per_layer_branch.zig");
 pub const plan = @import("plan/root.zig");
 pub const config = @import("config/root.zig");
@@ -117,4 +118,12 @@ test "models root exports stage_plan module" {
 
 test "stage_plan module contract tests" {
     _ = @import("stage_plan.zig");
+}
+
+test "vision_program module contract tests" {
+    _ = vision_program.ParsedVisionProgram;
+    _ = vision_program.VisionStagePlans;
+    _ = vision_program.parseVisionProgram;
+    _ = vision_program.compileVisionStagePlans;
+    _ = vision_program.deinitVisionStagePlans;
 }

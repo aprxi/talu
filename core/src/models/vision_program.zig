@@ -4,9 +4,9 @@
 //! vision pipeline metadata.
 
 const std = @import("std");
-const layer_ops = @import("models_pkg").layer_ops;
+const layer_ops = @import("layer_ops.zig");
 const runtime_contract = @import("runtime_contract_pkg");
-const plan_compiler = @import("models_pkg").plan.compiler;
+const plan_compiler = @import("plan/compiler.zig");
 
 pub const ParsedVisionProgram = struct {
     spatial_merge_size: usize,

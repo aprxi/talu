@@ -20,7 +20,7 @@ const cpu_blocks = @import("../executor/weights.zig");
 const exec_block = @import("../executor/block.zig");
 const common_vision = @import("types.zig");
 const vision_tensor_convert = @import("tensor_convert.zig");
-const vision_program_mod = @import("../../../vision_program.zig");
+const vision_program_mod = models.vision_program;
 const vision_adapters = @import("../../../vision_program_adapters.zig");
 
 const Tensor = tensor.Tensor;
