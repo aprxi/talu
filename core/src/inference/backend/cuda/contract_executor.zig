@@ -34,8 +34,6 @@ pub const block = struct {
             return error.UnsupportedModel;
         }
     };
-
-    pub const Block = @This().TransformerBlock;
 };
 
 pub const Model = model.Model;

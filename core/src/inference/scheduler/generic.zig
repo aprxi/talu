@@ -1256,7 +1256,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Metal's single-request streaming CLI depends on the backend-owned
             // tail loop staying in control after the first token. That path keeps
             // decode/sampling chunked inside the backend; replacing it with the
-            // per-token candidate fallback regresses output throughput.
+            // per-token candidate route regresses output throughput.
             if (try self.tryRunDecodeLoopBackendStreamingRoute(
                 re,
                 request_id,
