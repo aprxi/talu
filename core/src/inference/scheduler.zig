@@ -23,8 +23,7 @@ pub const PrefillBatchRequest = contracts.PrefillBatchRequest;
 pub const Request = contracts.Request;
 pub const FinishReason = contracts.FinishReason;
 pub const TokenizerView = contracts.TokenizerView;
-pub const SchedulerSingleDecodeRoute = contracts.SchedulerSingleDecodeRoute;
-pub const SchedulerSingleDecodeRoutePlan = contracts.SchedulerSingleDecodeRoutePlan;
+pub const SchedulerTopKCandidateRoutePlan = contracts.SchedulerTopKCandidateRoutePlan;
 pub const SchedulerBatchedTopKRoutePlan = contracts.SchedulerBatchedTopKRoutePlan;
 
 test "scheduler facade preserves neutral contracts and concrete scheduler exports" {

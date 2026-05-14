@@ -215,25 +215,10 @@ pub const SchedulerConfig = struct {
     state_descriptors: []const runtime_contract.StateDescriptor = &.{},
 };
 
-/// Backend-planned route for single-request `generateSync` decode.
-pub const SchedulerSingleDecodeRoute = enum {
-    queued,
-    backend_streaming,
-    top_k_candidate,
-};
-
-/// Semantic eligibility context for backend single-request decode planning.
-pub const SchedulerSingleDecodeRoutePlan = struct {
+/// Backend policy context for single-request candidate-logit decode.
+pub const SchedulerTopKCandidateRoutePlan = struct {
     sampling_config: *const sampling.SamplingConfig,
-    decode_batch_size: usize,
     has_callback: bool,
-    capture_final_logits: bool,
-    has_grammar_sampler: bool,
-    prompt_token_count: usize,
-    backend_streaming_semantic_eligible: bool,
-    top_k_candidate_semantic_eligible: bool,
-    backend_streaming_backend_supported: bool,
-    top_k_candidate_backend_supported: bool,
 };
 
 /// Context for backend-owned batched top-k route selection in queued decode.
@@ -319,21 +304,12 @@ test "TokenizerView.fromTokenizer forwards tokenizer methods" {
     try std.testing.expectEqual(@as(usize, 5), view.getVocabSize());
 }
 
-test "SchedulerSingleDecodeRoutePlan stores route eligibility" {
+test "SchedulerTopKCandidateRoutePlan stores backend policy context" {
     const sampling_config = sampling.SamplingConfig{ .strategy = .top_k, .top_k = 4 };
-    const plan = SchedulerSingleDecodeRoutePlan{
+    const plan = SchedulerTopKCandidateRoutePlan{
         .sampling_config = &sampling_config,
-        .decode_batch_size = 1,
         .has_callback = true,
-        .capture_final_logits = false,
-        .has_grammar_sampler = false,
-        .prompt_token_count = 8,
-        .backend_streaming_semantic_eligible = true,
-        .top_k_candidate_semantic_eligible = true,
-        .backend_streaming_backend_supported = true,
-        .top_k_candidate_backend_supported = true,
     };
     try std.testing.expectEqual(sampling.SamplingStrategy.top_k, plan.sampling_config.strategy);
-    try std.testing.expect(plan.backend_streaming_semantic_eligible);
-    try std.testing.expect(plan.top_k_candidate_backend_supported);
+    try std.testing.expect(plan.has_callback);
 }

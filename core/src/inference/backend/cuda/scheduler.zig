@@ -16,8 +16,7 @@ pub const DecodeResult = contracts.DecodeResult;
 pub const PrefillBatchRequest = contracts.PrefillBatchRequest;
 pub const TokenizerView = contracts.TokenizerView;
 pub const SchedulerConfig = contracts.SchedulerConfig;
-pub const SchedulerSingleDecodeRoute = contracts.SchedulerSingleDecodeRoute;
-pub const SchedulerSingleDecodeRoutePlan = contracts.SchedulerSingleDecodeRoutePlan;
+pub const SchedulerTopKCandidateRoutePlan = contracts.SchedulerTopKCandidateRoutePlan;
 pub const SchedulerBatchedTopKRoutePlan = contracts.SchedulerBatchedTopKRoutePlan;
 
 pub const GenericScheduler = generic.GenericScheduler;

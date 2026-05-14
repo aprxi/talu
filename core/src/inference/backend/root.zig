@@ -152,14 +152,6 @@ const resolveCudaTopology = topology_mod.resolveCudaTopology;
 const autoDetectTopologyForModel = topology_mod.autoDetectTopologyForModel;
 const resolveCpuLayersTopology = topology_mod.resolveCpuLayersTopology;
 
-fn defaultSchedulerSingleDecodeRoute(
-    plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
-) shared_scheduler.SchedulerSingleDecodeRoute {
-    if (plan.backend_streaming_semantic_eligible and plan.backend_streaming_backend_supported) return .backend_streaming;
-    if (plan.top_k_candidate_semantic_eligible and plan.top_k_candidate_backend_supported) return .top_k_candidate;
-    return .queued;
-}
-
 /// Backend initialization options selected at startup/config layer.
 pub const InitOptions = struct {
     pub const MetalConfig = struct {
@@ -483,39 +475,20 @@ pub const Backend = union(enum) {
         }
     }
 
-    pub fn supportsSchedulerBackendTopKDecodeRoute(
+    pub fn shouldUseSchedulerTopKCandidateRoute(
         self: *const Backend,
-        sampling_config: *const cpu.sampling.SamplingConfig,
+        plan: *const shared_scheduler.SchedulerTopKCandidateRoutePlan,
     ) bool {
         return switch (self.*) {
             .cpu => false,
-            .metal => |*b| if (has_metal) b.supportsSchedulerBackendTopKDecodeRoute(sampling_config) else unreachable,
-            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendTopKDecodeRoute"))
-                b.supportsSchedulerBackendTopKDecodeRoute(sampling_config)
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "shouldUseSchedulerTopKCandidateRoute"))
+                b.shouldUseSchedulerTopKCandidateRoute(plan)
             else
                 false,
-        };
-    }
-
-    pub fn planSchedulerSingleDecodeRoute(
-        self: *const Backend,
-        plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
-    ) shared_scheduler.SchedulerSingleDecodeRoute {
-        return switch (self.*) {
-            // CPU intentionally stays on the queued scheduler path until it
-            // advertises explicit fast-path support through the backend
-            // support methods. The backend union itself exposes a planner, so
-            // using the default helper here would incorrectly trust planner
-            // probe flags that are only meaningful for GPU backends.
-            .cpu => .queued,
-            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "planSchedulerSingleDecodeRoute"))
-                b.planSchedulerSingleDecodeRoute(plan)
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "shouldUseSchedulerTopKCandidateRoute"))
+                b.shouldUseSchedulerTopKCandidateRoute(plan)
             else
-                defaultSchedulerSingleDecodeRoute(plan),
-            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "planSchedulerSingleDecodeRoute"))
-                b.planSchedulerSingleDecodeRoute(plan)
-            else
-                defaultSchedulerSingleDecodeRoute(plan),
+                false,
         };
     }
 
@@ -1742,7 +1715,7 @@ test "decodeSchedulerStreaming: cuda returns unsupported route error" {
     try std.testing.expectEqual(@as(u64, 99), decode_ns);
 }
 
-test "supportsSchedulerBackendTopKDecodeRoute: cpu disabled" {
+test "shouldUseSchedulerTopKCandidateRoute: cpu disabled" {
     const cpu_backend: Backend = .{ .cpu = undefined };
     const sampling_config = cpu.sampling.SamplingConfig{
         .strategy = .top_k,
@@ -1750,35 +1723,13 @@ test "supportsSchedulerBackendTopKDecodeRoute: cpu disabled" {
         .temperature = 0.7,
         .min_p = 0.0,
     };
-    try std.testing.expectEqual(false, cpu_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
-}
-
-test "planSchedulerSingleDecodeRoute: cpu keeps unsupported fast paths queued" {
-    const cpu_backend: Backend = .{ .cpu = undefined };
-    const sampling_config = cpu.sampling.SamplingConfig{
-        .strategy = .top_k,
-        .top_k = 20,
-        .temperature = 1.0,
-        .top_p = 0.95,
-    };
-
-    const route = cpu_backend.planSchedulerSingleDecodeRoute(&.{
+    try std.testing.expectEqual(false, cpu_backend.shouldUseSchedulerTopKCandidateRoute(&.{
         .sampling_config = &sampling_config,
-        .decode_batch_size = 1,
         .has_callback = true,
-        .capture_final_logits = false,
-        .has_grammar_sampler = false,
-        .prompt_token_count = 8,
-        .backend_streaming_semantic_eligible = true,
-        .top_k_candidate_semantic_eligible = true,
-        .backend_streaming_backend_supported = true,
-        .top_k_candidate_backend_supported = true,
-    });
-
-    try std.testing.expectEqual(shared_scheduler.SchedulerSingleDecodeRoute.queued, route);
+    }));
 }
 
-test "supportsSchedulerBackendTopKDecodeRoute: cuda disabled" {
+test "shouldUseSchedulerTopKCandidateRoute: cuda disabled" {
     if (!has_cuda) return;
     const cuda_backend: Backend = .{ .cuda = undefined };
     const sampling_config = cpu.sampling.SamplingConfig{
@@ -1787,7 +1738,10 @@ test "supportsSchedulerBackendTopKDecodeRoute: cuda disabled" {
         .temperature = 0.7,
         .min_p = 0.0,
     };
-    try std.testing.expectEqual(false, cuda_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
+    try std.testing.expectEqual(false, cuda_backend.shouldUseSchedulerTopKCandidateRoute(&.{
+        .sampling_config = &sampling_config,
+        .has_callback = true,
+    }));
 }
 
 test "supportsSchedulerBackendBatchedTopKDecodeRoute: cpu disabled" {

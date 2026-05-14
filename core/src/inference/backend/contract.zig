@@ -212,8 +212,7 @@ pub fn assertSchedulerModuleLayout(comptime S: type, comptime backend_name: []co
         requireLayoutDecl(S, backend_name ++ ".scheduler", "PrefillBatchRequest");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "TokenizerView");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerConfig");
-        requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerSingleDecodeRoute");
-        requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerSingleDecodeRoutePlan");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerTopKCandidateRoutePlan");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerBatchedTopKRoutePlan");
         requireCallableDecl(S, backend_name ++ ".scheduler", "GenericScheduler");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "Scheduler");

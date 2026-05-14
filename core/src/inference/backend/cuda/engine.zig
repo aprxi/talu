@@ -2972,22 +2972,18 @@ pub const CudaBackend = struct {
         };
     }
 
-    fn prefersSingleRowTopKCandidate(
+    pub fn shouldUseSchedulerTopKCandidateRoute(
         self: *const CudaBackend,
-        sampling_config: *const sampling_mod.SamplingConfig,
+        plan: *const shared_scheduler.SchedulerTopKCandidateRoutePlan,
     ) bool {
-        return self.prefersSingleRowTopKCandidateWithContext(sampling_config, false);
-    }
-
-    pub fn planSchedulerSingleDecodeRoute(
-        self: *const CudaBackend,
-        plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
-    ) shared_scheduler.SchedulerSingleDecodeRoute {
-        if (plan.top_k_candidate_semantic_eligible and supportsCudaTopKCandidateRoute(self, plan.sampling_config)) {
-            if (plan.decode_batch_size == 1 and !self.prefersSingleRowTopKCandidateWithContext(plan.sampling_config, plan.has_callback)) return .queued;
-            return .top_k_candidate;
-        }
-        return .queued;
+        if (!supportsCudaTopKCandidateRoute(self, plan.sampling_config)) return false;
+        // Single-row CUDA top-k candidate route currently targets low-bit KV
+        // decode to reduce host-side full-logits overhead without regressing
+        // established f16 single-request behavior.
+        return switch (self.kv_cache_dtype) {
+            .i8, .fp8 => self.prefersSingleRowTopKCandidateWithContext(plan.sampling_config, plan.has_callback),
+            .f16 => false,
+        };
     }
 
     pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
@@ -2999,20 +2995,6 @@ pub const CudaBackend = struct {
         // should use decodeTopKCandidates() directly to avoid batched plumbing.
         if (plan.decode_batch_size >= 2) return true;
         return false;
-    }
-
-    pub fn supportsSchedulerBackendTopKDecodeRoute(
-        self: *const CudaBackend,
-        sampling_config: *const sampling_mod.SamplingConfig,
-    ) bool {
-        if (!supportsCudaTopKCandidateRoute(self, sampling_config)) return false;
-        // Single-row CUDA top-k candidate route currently targets low-bit KV
-        // decode to reduce host-side full-logits overhead without regressing
-        // established f16 single-request behavior.
-        return switch (self.kv_cache_dtype) {
-            .i8, .fp8 => self.prefersSingleRowTopKCandidate(sampling_config),
-            .f16 => false,
-        };
     }
 
     pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(

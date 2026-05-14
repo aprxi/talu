@@ -1343,19 +1343,6 @@ pub const MetalBackend = struct {
         };
     }
 
-    pub fn planSchedulerSingleDecodeRoute(
-        self: *const MetalBackend,
-        plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
-    ) shared_scheduler.SchedulerSingleDecodeRoute {
-        if (plan.backend_streaming_semantic_eligible and self.supportsSchedulerBackendStreamingRoute(plan.sampling_config)) {
-            return .backend_streaming;
-        }
-        if (plan.top_k_candidate_semantic_eligible and self.supportsSchedulerBackendTopKDecodeRoute(plan.sampling_config)) {
-            return .top_k_candidate;
-        }
-        return .queued;
-    }
-
     fn hasTopKStreamingRegression(self: *const MetalBackend) bool {
         // Models with per-layer-input branches require non-streaming TopK.
         if (self.model_config.hidden_size_per_layer_input > 0) return true;
@@ -1365,13 +1352,21 @@ pub const MetalBackend = struct {
         return false;
     }
 
-    pub fn supportsSchedulerBackendTopKDecodeRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
+    fn supportsTopKCandidateConfig(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
         if (sampling_config.strategy == .top_k and self.hasTopKStreamingRegression()) return false;
         return sampling_policy.isTopKOrGreedyCandidateRoute(sampling_config, topk_route_candidate_capacity);
     }
 
+    pub fn shouldUseSchedulerTopKCandidateRoute(
+        self: *const MetalBackend,
+        plan: *const shared_scheduler.SchedulerTopKCandidateRoutePlan,
+    ) bool {
+        _ = plan.has_callback;
+        return self.supportsTopKCandidateConfig(plan.sampling_config);
+    }
+
     pub fn supportsSchedulerBackendTopKCandidateSamplingRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
-        return supportsSchedulerBackendTopKDecodeRoute(self, sampling_config);
+        return self.supportsTopKCandidateConfig(sampling_config);
     }
 
     pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
@@ -2054,7 +2049,7 @@ test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute validates top_
     try std.testing.expect(!backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&too_large_cfg));
 }
 
-test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute allows safe greedy path" {
+test "MetalBackend.shouldUseSchedulerTopKCandidateRoute allows safe greedy path" {
     var backend = routeTestBackend();
     const greedy_ok = sampling.SamplingConfig{
         .strategy = .greedy,
@@ -2064,11 +2059,17 @@ test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute allows safe greedy pa
         .repetition_penalty = 1.2,
     };
 
-    try std.testing.expect(backend.supportsSchedulerBackendTopKDecodeRoute(&greedy_ok));
-    try std.testing.expect(!backend.supportsSchedulerBackendTopKDecodeRoute(&greedy_with_penalty));
+    try std.testing.expect(backend.shouldUseSchedulerTopKCandidateRoute(&.{
+        .sampling_config = &greedy_ok,
+        .has_callback = false,
+    }));
+    try std.testing.expect(!backend.shouldUseSchedulerTopKCandidateRoute(&.{
+        .sampling_config = &greedy_with_penalty,
+        .has_callback = false,
+    }));
 }
 
-test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute accepts bounded top_k strategy" {
+test "MetalBackend.shouldUseSchedulerTopKCandidateRoute accepts bounded top_k strategy" {
     var backend = routeTestBackend();
     const topk_ok = sampling.SamplingConfig{
         .strategy = .top_k,
@@ -2083,9 +2084,18 @@ test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute accepts bounded top_k
         .top_k = topk_route_candidate_capacity + 1,
     };
 
-    try std.testing.expect(backend.supportsSchedulerBackendTopKDecodeRoute(&topk_ok));
-    try std.testing.expect(!backend.supportsSchedulerBackendTopKDecodeRoute(&topk_zero));
-    try std.testing.expect(!backend.supportsSchedulerBackendTopKDecodeRoute(&topk_too_large));
+    try std.testing.expect(backend.shouldUseSchedulerTopKCandidateRoute(&.{
+        .sampling_config = &topk_ok,
+        .has_callback = false,
+    }));
+    try std.testing.expect(!backend.shouldUseSchedulerTopKCandidateRoute(&.{
+        .sampling_config = &topk_zero,
+        .has_callback = false,
+    }));
+    try std.testing.expect(!backend.shouldUseSchedulerTopKCandidateRoute(&.{
+        .sampling_config = &topk_too_large,
+        .has_callback = false,
+    }));
 }
 
 test "MetalBackend.supportsSchedulerBackendStreamingRoute accepts greedy and penalized top_k configs" {
