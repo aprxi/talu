@@ -188,7 +188,7 @@ pub const CudaBackend = struct {
     pub const capabilities: contract.Capabilities = .{
         .vision_prefill = true,
         .decode_batch = true,
-        .decode_streaming = true,
+        .decode_streaming = false,
         .embedding = false,
         .warmup = false,
     };
@@ -2919,63 +2919,6 @@ pub const CudaBackend = struct {
         return decode_mod.decode(self, token, position, logits_out);
     }
 
-    pub fn decodeStreaming(
-        self: *CudaBackend,
-        first_token: u32,
-        start_position: usize,
-        max_tokens: usize,
-        eos_token_ids: []const u32,
-        output_tokens: []u32,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-        callback_data: ?*anyopaque,
-    ) !usize {
-        try self.ensureSlotStateBlocksBoundForScheduler(0);
-        return decode_mod.decodeStreaming(
-            self,
-            first_token,
-            start_position,
-            max_tokens,
-            eos_token_ids,
-            output_tokens,
-            callback,
-            callback_data,
-        );
-    }
-
-    pub fn decodeTopKStreaming(
-        self: *CudaBackend,
-        first_token: u32,
-        start_position: usize,
-        max_tokens: usize,
-        eos_token_ids: []const u32,
-        sampling_config: *const sampling_mod.SamplingConfig,
-        output_tokens: []u32,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-        callback_data: ?*anyopaque,
-        decode_ns_out: ?*u64,
-    ) !usize {
-        try self.ensureSlotStateBlocksBoundForScheduler(0);
-        return decode_mod.decodeTopKStreaming(
-            self,
-            first_token,
-            start_position,
-            max_tokens,
-            eos_token_ids,
-            sampling_config,
-            output_tokens,
-            callback,
-            callback_data,
-            decode_ns_out,
-        );
-    }
-
-    pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const CudaBackend) bool {
-        _ = self;
-        // Parity mode: force n=1 and n>1 through queued decodeBatch.
-        // Do not take single-request streaming shortcut route.
-        return false;
-    }
-
     fn supportsCudaTopKCandidateRoute(
         self: *const CudaBackend,
         sampling_config: *const sampling_mod.SamplingConfig,
@@ -2988,18 +2931,6 @@ pub const CudaBackend = struct {
                 sampling_config.top_p == 1.0 and
                 sampling_config.min_p == 0.0,
             else => false,
-        };
-    }
-
-    fn supportsCudaTopKStreamingRoute(
-        self: *const CudaBackend,
-        sampling_config: *const sampling_mod.SamplingConfig,
-    ) bool {
-        if (!supportsCudaTopKCandidateRoute(self, sampling_config)) return false;
-        if (!sampling_policy.isTopKStreamingWithoutMutations(sampling_config, 256)) return false;
-        return switch (self.kv_cache_dtype) {
-            .i8, .fp8 => self.prefersSingleRowTopKCandidate(sampling_config),
-            .f16 => false,
         };
     }
 
@@ -3056,9 +2987,6 @@ pub const CudaBackend = struct {
             if (plan.decode_batch_size == 1 and !self.prefersSingleRowTopKCandidateWithContext(plan.sampling_config, plan.has_callback)) return .queued;
             return .top_k_candidate;
         }
-        if (plan.top_k_streaming_semantic_eligible and supportsCudaTopKStreamingRoute(self, plan.sampling_config)) {
-            return .top_k_streaming;
-        }
         return .queued;
     }
 
@@ -3085,13 +3013,6 @@ pub const CudaBackend = struct {
             .i8, .fp8 => self.prefersSingleRowTopKCandidate(sampling_config),
             .f16 => false,
         };
-    }
-
-    pub fn supportsSchedulerBackendTopKStreamingRoute(
-        self: *const CudaBackend,
-        sampling_config: *const sampling_mod.SamplingConfig,
-    ) bool {
-        return supportsCudaTopKStreamingRoute(self, sampling_config);
     }
 
     pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(

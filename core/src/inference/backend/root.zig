@@ -322,15 +322,14 @@ pub const Backend = union(enum) {
         return .scheduler;
     }
 
-    /// Whether scheduler should route decode-tail token generation through
-    /// backend `decodeStreaming`.
+    /// Whether scheduler should route greedy decode tails through backend-owned
+    /// `decodeStreaming`.
     pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const Backend) bool {
         switch (self.*) {
             .cpu => return false,
             .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "supportsSchedulerBackendDecodeStreamingRoute"))
                 return b.supportsSchedulerBackendDecodeStreamingRoute(),
-            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendDecodeStreamingRoute"))
-                return b.supportsSchedulerBackendDecodeStreamingRoute(),
+            .cuda => return false,
         }
         return false;
     }
@@ -467,15 +466,7 @@ pub const Backend = union(enum) {
         callback_data: ?*anyopaque,
     ) !usize {
         switch (self.*) {
-            .cpu => |*b| return b.decodeStreaming(
-                first_token,
-                start_position,
-                max_tokens,
-                eos_token_ids,
-                output_tokens,
-                callback,
-                callback_data,
-            ),
+            .cpu => return error.UnsupportedModel,
             .metal => |*b| if (has_metal) {
                 return b.decodeStreaming(
                     first_token,
@@ -487,17 +478,7 @@ pub const Backend = union(enum) {
                     callback_data,
                 );
             } else unreachable,
-            .cuda => |*b| if (has_cuda) {
-                return b.decodeStreaming(
-                    first_token,
-                    start_position,
-                    max_tokens,
-                    eos_token_ids,
-                    output_tokens,
-                    callback,
-                    callback_data,
-                );
-            } else unreachable,
+            .cuda => return error.UnsupportedModel,
         }
     }
 
@@ -561,10 +542,7 @@ pub const Backend = union(enum) {
                 b.supportsSchedulerBackendTopKStreamingRoute(sampling_config)
             else
                 false,
-            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendTopKStreamingRoute"))
-                b.supportsSchedulerBackendTopKStreamingRoute(sampling_config)
-            else
-                false,
+            .cuda => false,
         };
     }
 
@@ -613,7 +591,7 @@ pub const Backend = union(enum) {
         decode_ns_out: ?*u64,
     ) !usize {
         return switch (self.*) {
-            .cpu => error.InvalidArgument,
+            .cpu => error.UnsupportedModel,
             .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "decodeTopKStreaming"))
                 b.decodeTopKStreaming(
                     first_token,
@@ -627,21 +605,8 @@ pub const Backend = union(enum) {
                     decode_ns_out,
                 )
             else
-                error.InvalidArgument,
-            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "decodeTopKStreaming"))
-                b.decodeTopKStreaming(
-                    first_token,
-                    start_position,
-                    max_tokens,
-                    eos_token_ids,
-                    sampling_config,
-                    output_tokens,
-                    callback,
-                    callback_data,
-                    decode_ns_out,
-                )
-            else
-                error.InvalidArgument,
+                error.UnsupportedModel,
+            .cuda => error.UnsupportedModel,
         };
     }
 
@@ -1774,6 +1739,41 @@ test "supportsSchedulerBackendDecodeStreamingRoute: cuda disabled" {
     try std.testing.expectEqual(false, cuda_backend.supportsSchedulerBackendDecodeStreamingRoute());
 }
 
+test "decodeStreaming: cpu returns unsupported route error" {
+    var cpu_backend: Backend = .{ .cpu = undefined };
+    var output_tokens: [2]u32 = undefined;
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        cpu_backend.decodeStreaming(
+            1,
+            0,
+            output_tokens.len,
+            &.{},
+            output_tokens[0..],
+            null,
+            null,
+        ),
+    );
+}
+
+test "decodeStreaming: cuda returns unsupported route error" {
+    if (!has_cuda) return;
+    var cuda_backend: Backend = .{ .cuda = undefined };
+    var output_tokens: [2]u32 = undefined;
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        cuda_backend.decodeStreaming(
+            1,
+            0,
+            output_tokens.len,
+            &.{},
+            output_tokens[0..],
+            null,
+            null,
+        ),
+    );
+}
+
 test "supportsSchedulerBackendTopKDecodeRoute: cpu disabled" {
     const cpu_backend: Backend = .{ .cpu = undefined };
     const sampling_config = cpu.sampling.SamplingConfig{
@@ -1783,6 +1783,59 @@ test "supportsSchedulerBackendTopKDecodeRoute: cpu disabled" {
         .min_p = 0.0,
     };
     try std.testing.expectEqual(false, cpu_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
+}
+
+test "decodeTopKStreaming: cpu returns unsupported route error" {
+    var cpu_backend: Backend = .{ .cpu = undefined };
+    const sampling_config = cpu.sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 4,
+        .temperature = 0.7,
+    };
+    var output_tokens: [2]u32 = undefined;
+    var decode_ns: u64 = 99;
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        cpu_backend.decodeTopKStreaming(
+            1,
+            0,
+            output_tokens.len,
+            &.{},
+            &sampling_config,
+            output_tokens[0..],
+            null,
+            null,
+            &decode_ns,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 99), decode_ns);
+}
+
+test "decodeTopKStreaming: cuda returns unsupported route error" {
+    if (!has_cuda) return;
+    var cuda_backend: Backend = .{ .cuda = undefined };
+    const sampling_config = cpu.sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 4,
+        .temperature = 0.7,
+    };
+    var output_tokens: [2]u32 = undefined;
+    var decode_ns: u64 = 99;
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        cuda_backend.decodeTopKStreaming(
+            1,
+            0,
+            output_tokens.len,
+            &.{},
+            &sampling_config,
+            output_tokens[0..],
+            null,
+            null,
+            &decode_ns,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 99), decode_ns);
 }
 
 test "planSchedulerSingleDecodeRoute: cpu keeps unsupported fast paths queued" {

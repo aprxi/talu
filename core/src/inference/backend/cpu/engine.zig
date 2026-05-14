@@ -47,7 +47,6 @@ const cpu_blocks = cpu_executor.weights;
 const runtime_contract = @import("runtime_contract_pkg");
 const common_mrope = @import("vision/mrope.zig");
 const trace = @import("xray_pkg").trace;
-const xray = @import("xray_pkg");
 const PoolingStrategy = contract.PoolingStrategy;
 const LoadedModel = models.LoadedModel;
 const kernels = @import("kernels/root.zig");
@@ -72,7 +71,7 @@ pub const FusedCpuBackend = struct {
     pub const capabilities: contract.Capabilities = .{
         .vision_prefill = true,
         .decode_batch = true,
-        .decode_streaming = true,
+        .decode_streaming = false,
         .embedding = true,
         .warmup = true,
     };
@@ -1058,88 +1057,6 @@ pub const FusedCpuBackend = struct {
 
         // 4. Compute logits
         try self.computeLogitsFromHiddenRows(hidden_buffer, 1, logits_out);
-    }
-
-    /// Streaming token generation with callback support.
-    /// Uses graph-based model.forwardWithBatchedCache for architecture coverage.
-    pub fn decodeStreaming(
-        self: *FusedCpuBackend,
-        first_token: u32,
-        start_position: usize,
-        max_tokens: usize,
-        eos_token_ids: []const u32,
-        tokens_out: []u32,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-        callback_data: ?*anyopaque,
-    ) !usize {
-        try self.ensureFullModelRoute();
-        try self.ensureSlotStateBlocksBound(0);
-        try self.scratch.ensureForMode(.decode, 1);
-        _ = start_position; // Position tracked internally
-
-        var current_token = first_token;
-        var generated_count: usize = 0;
-        self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[0]);
-        defer self.setPositionDeltaForTextLayers(0);
-
-        const model_dim = self.d_model;
-        const hidden_buffer = self.getHiddenBuffer(0);
-        const logits_buffer = self.getLogitsBuffer(0);
-
-        while (generated_count < max_tokens) {
-            if (xray.isVerifyStopRequested()) break;
-            const token_ids = &[_]u32{current_token};
-
-            // 1. Get embedding
-            var hidden_view_3d = Tensor.view3D(
-                std.mem.sliceAsBytes(hidden_buffer),
-                1,
-                model_dim,
-            );
-            try self.model.embed_tokens.forward(token_ids, &hidden_view_3d);
-            cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
-
-            // 2. Forward through transformer layers with batched cache
-            try self.model.forwardWithBatchedCacheTokenIds(
-                &hidden_view_3d,
-                &hidden_view_3d,
-                &self.scratch,
-                self.slotStateBlocks(0),
-                0,
-                token_ids,
-                true,
-            );
-
-            // 3. Final layer norm
-            if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
-
-            // 4. Compute logits
-            try self.computeLogitsFromHiddenRows(hidden_buffer, 1, logits_buffer);
-
-            // 5. Greedy sample next token
-            const max_logit_index = cpu_reduction.argmaxIndex(logits_buffer);
-            const next_token: u32 = @intCast(max_logit_index);
-
-            // Store token
-            tokens_out[generated_count] = next_token;
-            generated_count += 1;
-
-            // Invoke callback
-            if (callback) |cb| {
-                cb(next_token, callback_data);
-            }
-
-            // Check for EOS
-            for (eos_token_ids) |eos_id| {
-                if (next_token == eos_id) {
-                    return generated_count;
-                }
-            }
-
-            current_token = next_token;
-        }
-
-        return generated_count;
     }
 
     /// Single-step decode for one slot, returning logits for sampling.

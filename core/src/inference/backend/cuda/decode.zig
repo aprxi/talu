@@ -3,8 +3,6 @@
 const std = @import("std");
 const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
-const sampling_mod = @import("../../sampling.zig");
-const sampling_policy = sampling_mod.policy;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 
@@ -208,196 +206,6 @@ pub fn decodeBatch(
     }
 }
 
-pub fn decodeStreaming(
-    self: anytype,
-    first_token: u32,
-    start_position: usize,
-    max_tokens: usize,
-    eos_token_ids: []const u32,
-    output_tokens: []u32,
-    callback: ?*const fn (u32, ?*anyopaque) void,
-    callback_data: ?*anyopaque,
-) !usize {
-    const prev_backend = trace.setBackendContext(.cuda);
-    defer _ = trace.setBackendContext(prev_backend);
-    const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
-        try self.ensureSlotStateBlocksBoundForScheduler(0);
-    }
-    if (max_tokens == 0 or output_tokens.len == 0) return 0;
-    if (!self.slot_in_use[0]) {
-        self.slot_in_use[0] = true;
-        self.slot_positions[0] = start_position;
-    }
-
-    var current_token = first_token;
-    var generated: usize = 0;
-    var position = self.slot_positions[0];
-    const budget = @min(max_tokens, output_tokens.len);
-    log.info("inference", "CUDA decodeStreaming start", .{
-        .slot_position = position,
-        .start_position = start_position,
-        .budget = budget,
-        .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[0])),
-    });
-    if (comptime @hasDecl(SelfType, "ensureKvCapacity")) {
-        if (budget > 0) {
-            const required_capacity = std.math.add(usize, position, budget) catch return error.InvalidArgument;
-            try self.ensureKvCapacity(required_capacity);
-        }
-    }
-    while (generated < budget) : (generated += 1) {
-        const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[0]);
-        self.executeDecodeWithLayerLimit(
-            current_token,
-            effective_position,
-            0,
-            null,
-            self.block_runtime.blocks.len,
-            true,
-            false,
-            false,
-            1,
-            position,
-            null,
-            null,
-            null,
-            false,
-        ) catch |err| {
-            log.warn("inference", "CUDA decodeStreaming step failed", .{
-                .generated = generated,
-                .position = position,
-                .effective_position = effective_position,
-                .reason = @errorName(err),
-            });
-            return err;
-        };
-        const next_token = try self.selectNextTokenFromDeviceLogitsImpl();
-        trace.emitFinal(
-            .token_select,
-            0,
-            @intCast(position + 1),
-            @ptrCast(std.mem.asBytes(&next_token).ptr),
-            .u32,
-            .{ 1, 0, 0, 0 },
-            1,
-            "gpu_argmax",
-        );
-        output_tokens[generated] = next_token;
-        position += 1;
-        self.slot_positions[0] = position;
-        if (callback) |cb| cb(next_token, callback_data);
-
-        for (eos_token_ids) |eos_id| {
-            if (next_token == eos_id) {
-                return generated + 1;
-            }
-        }
-        current_token = next_token;
-    }
-    return generated;
-}
-
-fn supportsTopKStreamingSamplingConfig(sampling_config: *const sampling_mod.SamplingConfig) bool {
-    // Backend-owned top-k streaming path currently assumes candidate-space
-    // sampling only (no full-logits penalties/bias mutation).
-    return sampling_policy.isTopKStreamingWithoutMutations(sampling_config, 256);
-}
-
-pub fn decodeTopKStreaming(
-    self: anytype,
-    first_token: u32,
-    start_position: usize,
-    max_tokens: usize,
-    eos_token_ids: []const u32,
-    sampling_config: *const sampling_mod.SamplingConfig,
-    output_tokens: []u32,
-    callback: ?*const fn (u32, ?*anyopaque) void,
-    callback_data: ?*anyopaque,
-    decode_ns_out: ?*u64,
-) !usize {
-    const prev_backend = trace.setBackendContext(.cuda);
-    defer _ = trace.setBackendContext(prev_backend);
-    var measured_decode_ns: u64 = 0;
-    if (decode_ns_out) |out| out.* = 0;
-    defer {
-        if (decode_ns_out) |out| out.* = measured_decode_ns;
-    }
-
-    const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
-        try self.ensureSlotStateBlocksBoundForScheduler(0);
-    }
-    if (!supportsTopKStreamingSamplingConfig(sampling_config)) return error.NotEligible;
-    if (max_tokens == 0 or output_tokens.len == 0) return 0;
-
-    if (!self.slot_in_use[0]) {
-        self.slot_in_use[0] = true;
-        self.slot_positions[0] = start_position;
-    }
-
-    const budget = @min(max_tokens, output_tokens.len);
-    if (comptime @hasDecl(SelfType, "ensureKvCapacity")) {
-        if (budget > 0) {
-            const required_capacity = std.math.add(usize, self.slot_positions[0], budget) catch return error.InvalidArgument;
-            try self.ensureKvCapacity(required_capacity);
-        }
-    }
-
-    const candidate_capacity = @min(sampling_config.top_k, self.vocab_size);
-    if (candidate_capacity == 0) return error.InvalidArgument;
-    var candidate_logits = try self.allocator.alloc(f32, candidate_capacity);
-    defer self.allocator.free(candidate_logits);
-    const candidate_ids = try self.allocator.alloc(u32, candidate_capacity);
-    defer self.allocator.free(candidate_ids);
-
-    const seeded_prng = if (sampling_config.seed != 0)
-        sampling_config.seed
-    else
-        std.crypto.random.int(u64);
-    var sampler = try sampling_mod.Sampler.init(self.allocator, seeded_prng, candidate_capacity);
-    defer sampler.deinit();
-
-    var generated: usize = 0;
-    var current_token: u32 = first_token;
-    while (generated < budget) {
-        var decode_timer = std.time.Timer.start() catch unreachable;
-        const candidate_count = try self.decodeTopKCandidates(
-            0,
-            current_token,
-            candidate_capacity,
-            candidate_logits,
-            candidate_ids,
-        );
-        const host_decode_ns = decode_timer.read();
-        const decode_step_ns = if (comptime @hasDecl(SelfType, "lastDecodeComputeNs"))
-            self.lastDecodeComputeNs() orelse host_decode_ns
-        else
-            host_decode_ns;
-        measured_decode_ns +|= decode_step_ns;
-        if (candidate_count == 0) return error.InvalidArgument;
-
-        var next_token: u32 = candidate_ids[0];
-        if (candidate_count > 1) {
-            var cfg = sampling_config.*;
-            cfg.top_k = @min(cfg.top_k, candidate_count);
-            cfg.context_tokens = null;
-            const sampled_rank = try sampler.sample(candidate_logits[0..candidate_count], cfg);
-            if (sampled_rank >= candidate_count) return error.InvalidState;
-            next_token = candidate_ids[sampled_rank];
-        }
-
-        output_tokens[generated] = next_token;
-        generated += 1;
-        if (callback) |cb| cb(next_token, callback_data);
-        for (eos_token_ids) |eos_id| {
-            if (next_token == eos_id) return generated;
-        }
-        current_token = next_token;
-    }
-    return generated;
-}
-
 pub fn allocSlot(self: anytype) ?usize {
     const SelfType = @TypeOf(self.*);
     for (self.slot_in_use, 0..) |in_use, i| {
@@ -461,7 +269,6 @@ const MockDecodeBackend = struct {
     ensure_state_binding_calls: usize = 0,
     slot_state_bound: bool = true,
     compute_calls: usize = 0,
-    next_token: u32 = 7,
 
     fn init() MockDecodeBackend {
         var backend = MockDecodeBackend{};
@@ -536,10 +343,6 @@ const MockDecodeBackend = struct {
             }
         }
     }
-
-    fn selectNextTokenFromDeviceLogitsImpl(self: *MockDecodeBackend) !u32 {
-        return self.next_token;
-    }
 };
 
 test "decode enforces state binding guard" {
@@ -550,28 +353,6 @@ test "decode enforces state binding guard" {
     try testing.expectError(
         error.InvalidStateDescriptorBinding,
         decode(&backend, 1, 0, logits_out[0..]),
-    );
-    try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
-    try testing.expectEqual(@as(usize, 0), backend.compute_calls);
-}
-
-test "decodeStreaming enforces state binding guard" {
-    var backend = MockDecodeBackend.init();
-    backend.slot_state_bound = false;
-    var output_tokens: [4]u32 = undefined;
-
-    try testing.expectError(
-        error.InvalidStateDescriptorBinding,
-        decodeStreaming(
-            &backend,
-            1,
-            0,
-            output_tokens.len,
-            &[_]u32{2},
-            output_tokens[0..],
-            null,
-            null,
-        ),
     );
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 0), backend.compute_calls);
