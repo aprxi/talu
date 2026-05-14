@@ -6,6 +6,7 @@
 const std = @import("std");
 const topology = @import("models_pkg").op_types;
 const runtime_contract = @import("runtime_contract_pkg");
+const scheduler_contracts = @import("../scheduler/contracts.zig");
 
 /// Pooling strategy for embedding extraction.
 pub const PoolingStrategy = enum(u8) {
@@ -25,24 +26,12 @@ pub const Capabilities = struct {
     warmup: bool = false,
 };
 
-/// Request for one token decode step in scheduler/batched mode.
-pub const DecodeRequest = struct {
-    slot_index: usize,
-    token: u32,
-};
-
-/// Request for one prefill step in scheduler/batched mode.
-pub const PrefillBatchRequest = struct {
-    slot_index: usize,
-    prompt_tokens: []const u32,
-    logits_out: []f32,
-};
-
-/// Decoded logits output for one scheduler slot.
-pub const DecodeResult = struct {
-    slot_index: usize,
-    logits: []f32,
-};
+/// Scheduler request/result contracts are owned by `inference/scheduler/`.
+/// Backend contract re-exports them so backend method signatures keep a single
+/// boundary type without making the generic scheduler depend on backend code.
+pub const DecodeRequest = scheduler_contracts.DecodeRequest;
+pub const PrefillBatchRequest = scheduler_contracts.PrefillBatchRequest;
+pub const DecodeResult = scheduler_contracts.DecodeResult;
 
 fn requireDecl(comptime T: type, comptime name: []const u8) void {
     if (!@hasDecl(T, name)) {
@@ -217,7 +206,14 @@ pub fn assertSchedulerModuleLayout(comptime S: type, comptime backend_name: []co
         requireLayoutDecl(S, backend_name ++ ".scheduler", "Request");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "FinishReason");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "TokenEvent");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "DecodeRequest");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "DecodeResult");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "PrefillBatchRequest");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "TokenizerView");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerConfig");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerSingleDecodeRoute");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerSingleDecodeRoutePlan");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerBatchedTopKRoutePlan");
         requireCallableDecl(S, backend_name ++ ".scheduler", "GenericScheduler");
         requireLayoutDecl(S, backend_name ++ ".scheduler", "Scheduler");
     }

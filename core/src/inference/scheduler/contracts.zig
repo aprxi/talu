@@ -5,6 +5,25 @@ const validate = @import("validate_pkg");
 const runtime_contract = @import("runtime_contract_pkg");
 const sampling = @import("../sampling/contracts.zig");
 
+/// Request for one token decode step in scheduler/batched mode.
+pub const DecodeRequest = struct {
+    slot_index: usize,
+    token: u32,
+};
+
+/// Request for one prefill step in scheduler/batched mode.
+pub const PrefillBatchRequest = struct {
+    slot_index: usize,
+    prompt_tokens: []const u32,
+    logits_out: []f32,
+};
+
+/// Decoded logits output for one scheduler slot.
+pub const DecodeResult = struct {
+    slot_index: usize,
+    logits: []f32,
+};
+
 /// Request state in the scheduler.
 pub const RequestState = enum {
     /// Waiting for a slot to become available.

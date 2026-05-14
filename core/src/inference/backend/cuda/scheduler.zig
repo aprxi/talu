@@ -1,16 +1,24 @@
 //! CUDA backend scheduler module.
 //!
-//! Scheduler is backend-agnostic host orchestration. CUDA backend uses the
-//! shared production scheduler instantiated for `CudaBackend`.
+//! Scheduler is backend-neutral host orchestration. This module only binds the
+//! shared scheduler implementation to `CudaBackend`.
 
 const engine = @import("engine.zig");
-const shared_scheduler = @import("../../scheduler.zig");
+const contracts = @import("../../scheduler/contracts.zig");
+const generic = @import("../../scheduler/generic.zig");
 
-pub const RequestState = shared_scheduler.RequestState;
-pub const Request = shared_scheduler.Request;
-pub const FinishReason = shared_scheduler.FinishReason;
-pub const TokenEvent = shared_scheduler.TokenEvent;
-pub const SchedulerConfig = shared_scheduler.SchedulerConfig;
+pub const RequestState = contracts.RequestState;
+pub const Request = contracts.Request;
+pub const FinishReason = contracts.FinishReason;
+pub const TokenEvent = contracts.TokenEvent;
+pub const DecodeRequest = contracts.DecodeRequest;
+pub const DecodeResult = contracts.DecodeResult;
+pub const PrefillBatchRequest = contracts.PrefillBatchRequest;
+pub const TokenizerView = contracts.TokenizerView;
+pub const SchedulerConfig = contracts.SchedulerConfig;
+pub const SchedulerSingleDecodeRoute = contracts.SchedulerSingleDecodeRoute;
+pub const SchedulerSingleDecodeRoutePlan = contracts.SchedulerSingleDecodeRoutePlan;
+pub const SchedulerBatchedTopKRoutePlan = contracts.SchedulerBatchedTopKRoutePlan;
 
-pub const GenericScheduler = shared_scheduler.GenericScheduler;
+pub const GenericScheduler = generic.GenericScheduler;
 pub const Scheduler = GenericScheduler(engine.CudaBackend);

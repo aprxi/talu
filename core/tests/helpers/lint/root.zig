@@ -659,7 +659,7 @@ test "lintSource rejects runtime contract import in compute" {
 test "lintSource rejects bridge and scheduler imports in compute" {
     const src =
         \\const bad_bridge = @import("../../responses/inference_bridge.zig");
-        \\const bad_scheduler = @import("../../inference/backend/cpu/scheduler.zig");
+        \\const bad_scheduler = @import("../../inference/scheduler/generic.zig");
     ;
     try std.testing.expectEqual(@as(usize, 2), try lintSource(std.testing.allocator, "core/src/compute/cuda/capabilities.zig", src, false));
 }

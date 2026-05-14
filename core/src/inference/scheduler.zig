@@ -1,19 +1,25 @@
 //! Inference scheduler module.
 //!
-//! Neutral contracts live under `scheduler/`; the current concrete
-//! `GenericScheduler` implementation remains shared from the CPU backend.
+//! Backend-neutral scheduler contracts and implementation live under
+//! `scheduler/`. Backend modules instantiate `GenericScheduler` with their
+//! concrete backend type. The facade keeps `Scheduler` as the default CPU
+//! scheduler alias for existing callers.
 
 const std = @import("std");
 
 pub const contracts = @import("scheduler/contracts.zig");
-const cpu_scheduler = @import("backend/cpu/scheduler.zig");
+pub const generic = @import("scheduler/generic.zig");
+const default_cpu_scheduler = @import("backend/cpu/scheduler.zig");
 
-pub const Scheduler = cpu_scheduler.Scheduler;
-pub const GenericScheduler = cpu_scheduler.GenericScheduler;
+pub const Scheduler = default_cpu_scheduler.Scheduler;
+pub const GenericScheduler = generic.GenericScheduler;
 
 pub const SchedulerConfig = contracts.SchedulerConfig;
 pub const RequestState = contracts.RequestState;
 pub const TokenEvent = contracts.TokenEvent;
+pub const DecodeRequest = contracts.DecodeRequest;
+pub const DecodeResult = contracts.DecodeResult;
+pub const PrefillBatchRequest = contracts.PrefillBatchRequest;
 pub const Request = contracts.Request;
 pub const FinishReason = contracts.FinishReason;
 pub const TokenizerView = contracts.TokenizerView;
