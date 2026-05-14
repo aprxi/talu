@@ -36,16 +36,7 @@ const DeviceTensor = engine_types.DeviceTensor;
 const MoEWeightRefs = engine_types.MoEWeightRefs;
 const MoEWeights = models.runtime_blocks.MoEWeights;
 
-pub fn bufferSlice(buffer: *const compute.cuda.Buffer, byte_offset: usize, byte_len: usize) !compute.cuda.Buffer {
-    if (byte_offset > buffer.size) return error.InvalidArgument;
-    const end = std.math.add(usize, byte_offset, byte_len) catch return error.InvalidArgument;
-    if (end > buffer.size) return error.InvalidArgument;
-    const ptr = std.math.add(u64, buffer.pointer, @intCast(byte_offset)) catch return error.InvalidArgument;
-    return .{
-        .pointer = ptr,
-        .size = byte_len,
-    };
-}
+pub const bufferSlice = compute.cuda.linear.bufferSlice;
 
 /// Device KV pair allocation seam.
 ///

@@ -15,6 +15,7 @@ pub const launch = @import("launch.zig");
 pub const manifest = @import("manifest.zig");
 pub const sideload = @import("sideload.zig");
 pub const registry = @import("registry.zig");
+pub const linear = @import("linear/root.zig");
 pub const vector_add = @import("vector_add.zig");
 pub const vector_add_scaled = @import("vector_add_scaled.zig");
 pub const vector_add_rows_strided = @import("vector_add_rows_strided.zig");
@@ -146,6 +147,7 @@ test {
     _ = manifest;
     _ = sideload;
     _ = registry;
+    _ = linear;
     _ = vector_add;
     _ = vector_add_scaled;
     _ = vector_add_rows_strided;

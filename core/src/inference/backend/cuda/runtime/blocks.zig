@@ -113,38 +113,8 @@ pub fn tensorProjectionOutputDim(weight: *const Tensor, input_dim: usize) !usize
     return dim0;
 }
 
-pub fn bufferF32RowCount(buffer: *const compute.cuda.Buffer, width: usize) !usize {
-    if (width == 0) return error.InvalidArgument;
-    const row_bytes = std.math.mul(usize, width, @sizeOf(f32)) catch return error.InvalidArgument;
-    if (row_bytes == 0) return error.InvalidArgument;
-    const rows = std.math.divExact(usize, buffer.size, row_bytes) catch return error.InvalidArgument;
-    if (rows == 0) return error.InvalidArgument;
-    return rows;
-}
-
-pub fn logicalF32RowSlice(
-    buffer: *const compute.cuda.Buffer,
-    rows: usize,
-    row_index: usize,
-    logical_width: usize,
-) !compute.cuda.Buffer {
-    if (rows == 0 or logical_width == 0 or row_index >= rows) return error.InvalidArgument;
-    const row_bytes = std.math.mul(usize, logical_width, @sizeOf(f32)) catch return error.InvalidArgument;
-    const packed_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
-    if (buffer.size < packed_bytes) return error.InvalidInstructionBinding;
-
-    const row_stride = if (buffer.size == packed_bytes)
-        row_bytes
-    else blk: {
-        if (buffer.size % rows != 0) return error.InvalidInstructionBinding;
-        const stride = buffer.size / rows;
-        if (stride < row_bytes) return error.InvalidInstructionBinding;
-        break :blk stride;
-    };
-
-    const row_offset = std.math.mul(usize, row_index, row_stride) catch return error.InvalidArgument;
-    return bufferSlice(buffer, row_offset, row_bytes);
-}
+pub const bufferF32RowCount = compute.cuda.linear.bufferF32RowCount;
+pub const logicalF32RowSlice = compute.cuda.linear.logicalF32RowSlice;
 
 pub const QkvI8ConcatRef = struct {
     i8_buf: compute.cuda.Buffer,

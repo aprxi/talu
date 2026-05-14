@@ -52,17 +52,8 @@ pub const attention_policy_config = attention_policy.Config{
 pub const run_startup_selftests = build_options.cuda_startup_selftests;
 pub const gaffine_scales_dtype_f16 = compute.cuda.gaffine_u4_matvec.scales_dtype_f16;
 pub const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
-pub const DenseU16Dtype = enum(u8) {
-    f16,
-    bf16,
-};
-
-pub const EmbeddingLookupKind = enum(u8) {
-    f32,
-    f16,
-    bf16,
-    gaffine_u4,
-};
+pub const DenseU16Dtype = compute.cuda.linear.DenseU16Dtype;
+pub const EmbeddingLookupKind = compute.cuda.linear.EmbeddingLookupKind;
 
 pub fn saturatingU64FromU128(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
