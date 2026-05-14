@@ -17,6 +17,7 @@ pub const boundary_byte_image = @import("boundary_byte_image.zig");
 pub const stage_frame_header = @import("stage_frame_header.zig");
 pub const stage_byte_harness = @import("stage_byte_harness.zig");
 pub const stage_transfer_mode = @import("stage_transfer_mode.zig");
+pub const stage_transport = @import("stage_transport.zig");
 
 pub const BoundaryDType = pipeline.BoundaryDType;
 pub const BoundaryByteImageContractVersion = boundary_byte_image.BoundaryByteImageContractVersion;
@@ -40,6 +41,12 @@ pub const StageTransferModeError = stage_transfer_mode.StageTransferModeError;
 pub const StageTransferMode = stage_transfer_mode.StageTransferMode;
 pub const StageTransferModeRequest = stage_transfer_mode.StageTransferModeRequest;
 pub const StageTransferModeDecision = stage_transfer_mode.StageTransferModeDecision;
+pub const StageTransportContractVersion = stage_transport.StageTransportContractVersion;
+pub const stage_transport_contract_version = stage_transport.stage_transport_contract_version;
+pub const StageTransportError = stage_transport.StageTransportError;
+pub const StageTransportEnvelopeKind = stage_transport.StageTransportEnvelopeKind;
+pub const StageTransportEnvelope = stage_transport.StageTransportEnvelope;
+pub const StageTransportActivationRequest = stage_transport.StageTransportActivationRequest;
 pub const negotiateBoundaryContract = pipeline.negotiateBoundaryContract;
 
 pub const ActivationFrameArgs = tensor_frame.ActivationFrameArgs;
@@ -246,6 +253,12 @@ pub const validateStageFrameHeaderForMetadata = stage_frame_header.validateStage
 pub const writeStageFrameBytes = stage_byte_harness.writeStageFrameBytes;
 pub const readStageFrameBytes = stage_byte_harness.readStageFrameBytes;
 pub const chooseStageTransferMode = stage_transfer_mode.chooseStageTransferMode;
+pub const buildStageTransportActivationEnvelope = stage_transport.buildStageTransportActivationEnvelope;
+pub const buildStageTransportFailureEnvelope = stage_transport.buildStageTransportFailureEnvelope;
+pub const buildStageTransportCancellationEnvelope = stage_transport.buildStageTransportCancellationEnvelope;
+pub const validateStageTransportEnvelope = stage_transport.validateStageTransportEnvelope;
+pub const writeStageTransportEnvelopeLocal = stage_transport.writeStageTransportEnvelopeLocal;
+pub const readStageTransportEnvelopeLocal = stage_transport.readStageTransportEnvelopeLocal;
 
 test "inference bridge root exports state_ownership contract" {
     _ = state_ownership.StageStateOwnershipPlan;
@@ -325,4 +338,20 @@ test "inference bridge root exports stage_transfer_mode contract" {
     _ = StageTransferModeRequest;
     _ = StageTransferModeDecision;
     _ = chooseStageTransferMode;
+}
+
+test "inference bridge root exports stage_transport contract" {
+    _ = stage_transport.StageTransportEnvelope;
+    _ = StageTransportContractVersion;
+    _ = stage_transport_contract_version;
+    _ = StageTransportError;
+    _ = StageTransportEnvelopeKind;
+    _ = StageTransportEnvelope;
+    _ = StageTransportActivationRequest;
+    _ = buildStageTransportActivationEnvelope;
+    _ = buildStageTransportFailureEnvelope;
+    _ = buildStageTransportCancellationEnvelope;
+    _ = validateStageTransportEnvelope;
+    _ = writeStageTransportEnvelopeLocal;
+    _ = readStageTransportEnvelopeLocal;
 }
