@@ -17,3 +17,8 @@ pub const executor = @import("contract_executor.zig");
 pub const kernels = @import("contract_kernels.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const sampling = @import("../../sampling.zig");
+
+test "inference.backend.cuda fused projection wrapper tag policies" {
+    try @import("operators/ffn/fused_gate_up.zig").testing.expectSplitWrapperTagPolicy();
+    try @import("operators/qkv/fused.zig").testing.expectWrapperTagPolicy();
+}

@@ -2,6 +2,7 @@
 
 pub const weights = @import("weights.zig");
 pub const executor = @import("executor.zig");
+pub const fused = @import("fused.zig");
 
 pub const DenseU16Dtype = weights.DenseU16Dtype;
 pub const EmbeddingLookupKind = weights.EmbeddingLookupKind;
@@ -28,7 +29,17 @@ pub const Context = executor.Context;
 pub const execute = executor.execute;
 pub const executeRows = executor.executeRows;
 
+pub const FusedContext = fused.FusedContext;
+pub const FusedDiagnostics = fused.Diagnostics;
+pub const FusedCapabilityFlags = fused.CapabilityFlags;
+pub const FusedPairOutputs = fused.PairOutputs;
+pub const FusedTripleOutputs = fused.TripleOutputs;
+pub const FusedPairActivation = fused.PairActivation;
+pub const FusedConcatI8TripleWeight = fused.ConcatI8TripleWeight;
+pub const FusedNvfp4RouteKind = fused.Nvfp4RouteKind;
+
 test {
     _ = weights;
     _ = executor;
+    _ = fused;
 }
