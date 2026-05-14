@@ -16,6 +16,7 @@ pub const local_stage_runner = @import("local_stage_runner.zig");
 pub const boundary_byte_image = @import("boundary_byte_image.zig");
 pub const stage_frame_header = @import("stage_frame_header.zig");
 pub const stage_byte_harness = @import("stage_byte_harness.zig");
+pub const stage_transfer_mode = @import("stage_transfer_mode.zig");
 
 pub const BoundaryDType = pipeline.BoundaryDType;
 pub const BoundaryByteImageContractVersion = boundary_byte_image.BoundaryByteImageContractVersion;
@@ -35,6 +36,10 @@ pub const StageFrameHeaderOptions = stage_frame_header.StageFrameHeaderOptions;
 pub const StageFrameHeader = stage_frame_header.StageFrameHeader;
 pub const StageByteHarnessError = stage_byte_harness.StageByteHarnessError;
 pub const StageFrameReadResult = stage_byte_harness.StageFrameReadResult;
+pub const StageTransferModeError = stage_transfer_mode.StageTransferModeError;
+pub const StageTransferMode = stage_transfer_mode.StageTransferMode;
+pub const StageTransferModeRequest = stage_transfer_mode.StageTransferModeRequest;
+pub const StageTransferModeDecision = stage_transfer_mode.StageTransferModeDecision;
 pub const negotiateBoundaryContract = pipeline.negotiateBoundaryContract;
 
 pub const ActivationFrameArgs = tensor_frame.ActivationFrameArgs;
@@ -240,6 +245,7 @@ pub const decodeStageFrameHeader = stage_frame_header.decodeStageFrameHeader;
 pub const validateStageFrameHeaderForMetadata = stage_frame_header.validateStageFrameHeaderForMetadata;
 pub const writeStageFrameBytes = stage_byte_harness.writeStageFrameBytes;
 pub const readStageFrameBytes = stage_byte_harness.readStageFrameBytes;
+pub const chooseStageTransferMode = stage_transfer_mode.chooseStageTransferMode;
 
 test "inference bridge root exports state_ownership contract" {
     _ = state_ownership.StageStateOwnershipPlan;
@@ -310,4 +316,13 @@ test "inference bridge root exports stage_byte_harness contract" {
     _ = StageFrameReadResult;
     _ = writeStageFrameBytes;
     _ = readStageFrameBytes;
+}
+
+test "inference bridge root exports stage_transfer_mode contract" {
+    _ = stage_transfer_mode.StageTransferModeDecision;
+    _ = StageTransferModeError;
+    _ = StageTransferMode;
+    _ = StageTransferModeRequest;
+    _ = StageTransferModeDecision;
+    _ = chooseStageTransferMode;
 }
