@@ -13,8 +13,15 @@ pub const state_ownership = @import("state_ownership.zig");
 pub const host_capability = @import("host_capability.zig");
 pub const staged_error = @import("staged_error.zig");
 pub const local_stage_runner = @import("local_stage_runner.zig");
+pub const boundary_byte_image = @import("boundary_byte_image.zig");
 
 pub const BoundaryDType = pipeline.BoundaryDType;
+pub const BoundaryByteImageContractVersion = boundary_byte_image.BoundaryByteImageContractVersion;
+pub const boundary_byte_image_contract_version = boundary_byte_image.boundary_byte_image_contract_version;
+pub const BoundaryByteImageError = boundary_byte_image.BoundaryByteImageError;
+pub const BoundaryByteImageReadiness = boundary_byte_image.BoundaryByteImageReadiness;
+pub const BoundaryByteImageRef = boundary_byte_image.BoundaryByteImageRef;
+pub const BoundaryByteImageValidationOptions = boundary_byte_image.BoundaryByteImageValidationOptions;
 pub const BoundaryLayout = pipeline.BoundaryLayout;
 pub const BoundaryNegotiationRequest = pipeline.BoundaryNegotiationRequest;
 pub const BoundaryNegotiationResult = pipeline.BoundaryNegotiationResult;
@@ -215,6 +222,8 @@ pub const validateStagedCleanupReport = staged_error.validateStagedCleanupReport
 pub const validateStagedErrorReport = staged_error.validateStagedErrorReport;
 pub const validateStagedFailure = staged_error.validateStagedFailure;
 pub const validateLocalStageRunnerPlanRef = local_stage_runner.validateLocalStageRunnerPlanRef;
+pub const validateBoundaryByteImage = boundary_byte_image.validateBoundaryByteImage;
+pub const boundaryByteImageIsRemoteReadable = boundary_byte_image.boundaryByteImageIsRemoteReadable;
 
 test "inference bridge root exports state_ownership contract" {
     _ = state_ownership.StageStateOwnershipPlan;
@@ -252,4 +261,15 @@ test "inference bridge root exports local_stage_runner contract" {
     _ = validateLocalStageRunnerPlanRef;
     _ = executeLocalStageBoundary;
     _ = localStageRunnerPlanIdEql;
+}
+
+test "inference bridge root exports boundary_byte_image contract" {
+    _ = boundary_byte_image.BoundaryByteImageRef;
+    _ = BoundaryByteImageContractVersion;
+    _ = boundary_byte_image_contract_version;
+    _ = BoundaryByteImageError;
+    _ = BoundaryByteImageReadiness;
+    _ = BoundaryByteImageValidationOptions;
+    _ = validateBoundaryByteImage;
+    _ = boundaryByteImageIsRemoteReadable;
 }
