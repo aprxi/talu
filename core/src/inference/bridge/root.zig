@@ -12,6 +12,7 @@ pub const tensor_frame = @import("tensor_frame.zig");
 pub const state_ownership = @import("state_ownership.zig");
 pub const host_capability = @import("host_capability.zig");
 pub const staged_error = @import("staged_error.zig");
+pub const local_stage_runner = @import("local_stage_runner.zig");
 
 pub const BoundaryDType = pipeline.BoundaryDType;
 pub const BoundaryLayout = pipeline.BoundaryLayout;
@@ -20,7 +21,19 @@ pub const BoundaryNegotiationResult = pipeline.BoundaryNegotiationResult;
 pub const negotiateBoundaryContract = pipeline.negotiateBoundaryContract;
 
 pub const ActivationFrameArgs = tensor_frame.ActivationFrameArgs;
-pub const LocalDecodeHandoffConfig = orchestrator.LocalDecodeHandoffConfig;
+pub const LocalStageBoundaryRunRequest = local_stage_runner.LocalStageBoundaryRunRequest;
+pub const LocalStageBoundaryStep = local_stage_runner.LocalStageBoundaryStep;
+pub const LocalStageFailureReport = local_stage_runner.LocalStageFailureReport;
+pub const LocalStageRunResult = local_stage_runner.LocalStageRunResult;
+pub const LocalStageRunSuccess = local_stage_runner.LocalStageRunSuccess;
+pub const LocalStageRunnerBoundaryProfile = local_stage_runner.LocalStageRunnerBoundaryProfile;
+pub const LocalStageRunnerBoundaryRef = local_stage_runner.LocalStageRunnerBoundaryRef;
+pub const LocalStageRunnerError = local_stage_runner.LocalStageRunnerError;
+pub const LocalStageRunnerPlanId = local_stage_runner.LocalStageRunnerPlanId;
+pub const LocalStageRunnerPlanRef = local_stage_runner.LocalStageRunnerPlanRef;
+pub const LocalStageRunnerPlanRequest = local_stage_runner.LocalStageRunnerPlanRequest;
+pub const LocalStageRunnerStageRef = local_stage_runner.LocalStageRunnerStageRef;
+pub const LocalStageTouchedRef = local_stage_runner.LocalStageTouchedRef;
 pub const PipelineRuntime = pipeline.PipelineRuntime;
 pub const PipelineRuntime3 = pipeline.PipelineRuntime3;
 pub const StageStateBindingReport = state_ownership.StageStateBindingReport;
@@ -131,6 +144,7 @@ pub const buildHostCapability = host_capability.buildHostCapability;
 pub const buildHostResidencySnapshot = host_capability.buildHostResidencySnapshot;
 pub const buildPlacementPlan = host_capability.buildPlacementPlan;
 pub const buildStageStatePlacementRef = host_capability.buildStageStatePlacementRef;
+pub const buildLocalStageRunnerPlanRef = local_stage_runner.buildLocalStageRunnerPlanRef;
 pub const buildStateCleanupObligations = state_ownership.buildStateCleanupObligations;
 pub const boundaryRefFromPlanRef = tensor_frame.boundaryRefFromPlanRef;
 pub const descriptorSetForStage = state_ownership.descriptorSetForStage;
@@ -138,13 +152,14 @@ pub const dtypeByteSize = tensor_frame.dtypeByteSize;
 pub const emitTensorFrame = tensor_frame.emitTensorFrame;
 pub const executeTwoStageForward = orchestrator.executeTwoStageForward;
 pub const executeThreeStageForward = orchestrator.executeThreeStageForward;
-pub const executeLocalDecodeHandoff = orchestrator.executeLocalDecodeHandoff;
+pub const executeLocalStageBoundary = local_stage_runner.executeLocalStageBoundary;
 pub const fromComputeDType = tensor_frame.fromComputeDType;
 pub const selectedBoundaryTensorContract = tensor_frame.selectedBoundaryTensorContract;
 pub const bindingForStage = host_capability.bindingForStage;
 pub const hostCapabilityIdEql = host_capability.hostCapabilityIdEql;
 pub const hostResidencySnapshotIdEql = host_capability.hostResidencySnapshotIdEql;
 pub const hostSummaryForStage = host_capability.hostSummaryForStage;
+pub const localStageRunnerPlanIdEql = local_stage_runner.localStageRunnerPlanIdEql;
 pub const placementPlanIdEql = host_capability.placementPlanIdEql;
 pub const placement_contract_version = host_capability.placement_contract_version;
 pub const shouldZeroStateDescriptorForLifecycleAction = state_ownership.shouldZeroStateDescriptorForLifecycleAction;
@@ -171,6 +186,7 @@ pub const stagedCleanupPlanIdEql = staged_error.stagedCleanupPlanIdEql;
 pub const stagedCleanupReportIdEql = staged_error.stagedCleanupReportIdEql;
 pub const stagedCleanupRequired = staged_error.stagedCleanupRequired;
 pub const staged_error_contract_version = staged_error.staged_error_contract_version;
+pub const local_stage_runner_contract_version = local_stage_runner.local_stage_runner_contract_version;
 pub const validatePayloadBufferLength = tensor_frame.validatePayloadBufferLength;
 pub const validateDecodeTransition = state_ownership.validateDecodeTransition;
 pub const validateBoundaryFrameProfileCardinality = host_capability.validateBoundaryFrameProfileCardinality;
@@ -198,6 +214,7 @@ pub const validateStagedCleanupPlan = staged_error.validateStagedCleanupPlan;
 pub const validateStagedCleanupReport = staged_error.validateStagedCleanupReport;
 pub const validateStagedErrorReport = staged_error.validateStagedErrorReport;
 pub const validateStagedFailure = staged_error.validateStagedFailure;
+pub const validateLocalStageRunnerPlanRef = local_stage_runner.validateLocalStageRunnerPlanRef;
 
 test "inference bridge root exports state_ownership contract" {
     _ = state_ownership.StageStateOwnershipPlan;
@@ -225,4 +242,14 @@ test "inference bridge root exports staged_error contract" {
     _ = buildStagedFailure;
     _ = buildStagedCleanupPlan;
     _ = validateStagedCleanupReport;
+}
+
+test "inference bridge root exports local_stage_runner contract" {
+    _ = local_stage_runner.LocalStageRunnerPlanRef;
+    _ = LocalStageBoundaryRunRequest;
+    _ = LocalStageRunnerPlanId;
+    _ = buildLocalStageRunnerPlanRef;
+    _ = validateLocalStageRunnerPlanRef;
+    _ = executeLocalStageBoundary;
+    _ = localStageRunnerPlanIdEql;
 }

@@ -44,6 +44,55 @@ const GateUpLayout = models.runtime_blocks.GateUpLayout;
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 
+fn countCpuGpuStatefulDependencies(plan: *const models.stage_plan.StagePlan) usize {
+    var count: usize = 0;
+    for (plan.dependencies) |dependency| {
+        if (dependency.reason == .stateful_decoder) count += 1;
+    }
+    return count;
+}
+
+fn cpuGpuBoundaryIndexForDependency(
+    plan: *const models.stage_plan.StagePlan,
+    dependency: models.stage_plan.StageDependency,
+) ?usize {
+    for (plan.boundaries, 0..) |boundary, index| {
+        if (boundary.source_stage_id == dependency.source_stage_id and
+            boundary.target_stage_id == dependency.target_stage_id)
+        {
+            return index;
+        }
+    }
+    return null;
+}
+
+fn cpuGpuResidentEntryFromStage(
+    stage: models.stage_plan.StagePlanStage,
+    state_ref: ?*const bridge.StageStatePlacementRef,
+) bridge.ResidentStageEntry {
+    var entry = bridge.ResidentStageEntry{
+        .stage_id = stage.id,
+        .layer_start = stage.layer_start,
+        .layer_end = stage.layer_end,
+        .owned_roles = stage.owned_roles,
+        .residency = stage.residency,
+    };
+    if (state_ref) |ref| {
+        for (ref.stage_summaries) |summary| {
+            if (summary.stage_id != stage.id or !summary.owns_runtime_state) continue;
+            entry.state_summary = .{
+                .state_ownership_contract_version = ref.state_ownership_contract_version,
+                .state_ownership_plan_id = ref.state_ownership_plan_id,
+                .stage_id = summary.stage_id,
+                .descriptor_count = summary.descriptors.len,
+                .descriptors = summary.descriptors,
+            };
+            break;
+        }
+    }
+    return entry;
+}
+
 // --- Re-exported types from engine_types.zig ---
 const engine_types = @import("runtime/root.zig");
 const default_norm_eps = engine_types.default_norm_eps;
@@ -504,6 +553,10 @@ pub const CudaBackend = struct {
     pipeline_stage2_boundary_conversion_stage12: bool = false,
     cpu_gpu_stage_plan: ?models.stage_plan.StagePlan = null,
     cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+    cpu_gpu_state_ownership_plan: ?bridge.StageStateOwnershipPlan = null,
+    cpu_gpu_state_placement_ref: ?bridge.StageStatePlacementRef = null,
+    cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+    cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
 
     kv_storage_mode: KvCacheStorageMode = .device,
     kv_init_tokens: usize = initial_kv_cache_tokens,
@@ -1959,12 +2012,161 @@ pub const CudaBackend = struct {
         return std.math.mul(usize, self.d_model, element_bytes) catch error.InvalidArgument;
     }
 
+    fn buildCpuGpuStateOwnershipPlan(
+        self: *CudaBackend,
+        plan: *const models.stage_plan.StagePlan,
+    ) !bridge.StageStateOwnershipPlan {
+        const descriptor_sets = try self.allocator.alloc(bridge.StageStateDescriptorSet, plan.stages.len);
+        defer self.allocator.free(descriptor_sets);
+        for (plan.stages, 0..) |stage, index| {
+            descriptor_sets[index] = .{ .stage_id = stage.id, .descriptors = &.{} };
+        }
+
+        const fact_count = countCpuGpuStatefulDependencies(plan);
+        const facts = try self.allocator.alloc(bridge.StageStatePartitionFact, fact_count);
+        defer self.allocator.free(facts);
+        var fact_index: usize = 0;
+        for (plan.dependencies) |dependency| {
+            if (dependency.reason != .stateful_decoder) continue;
+            facts[fact_index] = .{
+                .boundary_index = cpuGpuBoundaryIndexForDependency(plan, dependency) orelse return error.InvalidTopologyConfig,
+                .source_stage_id = dependency.source_stage_id,
+                .target_stage_id = dependency.target_stage_id,
+                .reason = .stateful_decoder,
+                .ownership_mode = .stage_level_dependency_only,
+            };
+            fact_index += 1;
+        }
+
+        return bridge.buildStageStateOwnershipPlan(self.allocator, .{
+            .plan = plan,
+            .descriptor_sets = descriptor_sets,
+            .partition_facts = facts,
+        });
+    }
+
+    fn buildCpuGpuPlacementPlan(
+        self: *CudaBackend,
+        plan: *const models.stage_plan.StagePlan,
+        state_ref: ?*const bridge.StageStatePlacementRef,
+    ) !bridge.PlacementPlan {
+        if (plan.stages.len != 2 or plan.boundaries.len != 1) return error.InvalidTopologyConfig;
+
+        const activation_bytes = try self.pipelineActivationByteCount();
+        const activation_bytes_u64 = std.math.cast(u64, activation_bytes) orelse return error.InvalidArgument;
+        const cpu_host_id = bridge.HostId{ .value = 1 };
+        const cuda_host_id = bridge.HostId{ .value = 2 };
+        const state_versions: []const u32 = if (state_ref != null)
+            &.{bridge.state_ownership_contract_version}
+        else
+            &.{};
+
+        const cpu_frames = [_]bridge.HostFrameCapability{.{
+            .endpoint_role = .producer,
+            .step_kind = .decode,
+            .dtype = self.pipeline_boundary_dtype,
+            .layout = self.pipeline_boundary_layout,
+            .handoff_mode = .local_in_process,
+            .max_batch_entries = 1,
+            .max_token_count_per_frame = 1,
+            .max_activation_payload_bytes = activation_bytes_u64,
+        }};
+        const cuda_frames = [_]bridge.HostFrameCapability{.{
+            .endpoint_role = .consumer,
+            .step_kind = .decode,
+            .dtype = self.pipeline_boundary_dtype,
+            .layout = self.pipeline_boundary_layout,
+            .handoff_mode = .local_in_process,
+            .max_batch_entries = 1,
+            .max_token_count_per_frame = 1,
+            .max_activation_payload_bytes = activation_bytes_u64,
+        }};
+        var cpu_capability = try bridge.buildHostCapability(self.allocator, .{
+            .host_id = cpu_host_id,
+            .backend_kind = .cpu,
+            .reachability_kind = .local_in_process,
+            .supported_graph_contract_versions = &.{plan.graph_identity.graph_contract_version},
+            .supported_stage_plan_contract_versions = &.{plan.stage_contract_version},
+            .supported_state_ownership_contract_versions = state_versions,
+            .frame_capabilities = &cpu_frames,
+        });
+        defer cpu_capability.deinit();
+        var cuda_capability = try bridge.buildHostCapability(self.allocator, .{
+            .host_id = cuda_host_id,
+            .backend_kind = .cuda,
+            .reachability_kind = .local_in_process,
+            .supported_graph_contract_versions = &.{plan.graph_identity.graph_contract_version},
+            .supported_stage_plan_contract_versions = &.{plan.stage_contract_version},
+            .supported_state_ownership_contract_versions = state_versions,
+            .frame_capabilities = &cuda_frames,
+        });
+        defer cuda_capability.deinit();
+
+        const state_contract_version: ?u32 = if (state_ref) |ref| ref.state_ownership_contract_version else null;
+        const state_plan_id: ?bridge.StageStateOwnershipPlanId = if (state_ref) |ref| ref.state_ownership_plan_id else null;
+        const cpu_resident = [_]bridge.ResidentStageEntry{cpuGpuResidentEntryFromStage(plan.stages[0], state_ref)};
+        const cuda_resident = [_]bridge.ResidentStageEntry{cpuGpuResidentEntryFromStage(plan.stages[1], state_ref)};
+        var cpu_residency = try bridge.buildHostResidencySnapshot(self.allocator, .{
+            .host_id = cpu_host_id,
+            .plan = plan,
+            .state_ownership_contract_version = state_contract_version,
+            .state_ownership_plan_id = state_plan_id,
+            .resident_stages = &cpu_resident,
+        });
+        defer cpu_residency.deinit();
+        var cuda_residency = try bridge.buildHostResidencySnapshot(self.allocator, .{
+            .host_id = cuda_host_id,
+            .plan = plan,
+            .state_ownership_contract_version = state_contract_version,
+            .state_ownership_plan_id = state_plan_id,
+            .resident_stages = &cuda_resident,
+        });
+        defer cuda_residency.deinit();
+
+        const boundary = plan.boundaries[0];
+        const bindings = [_]bridge.StageHostBinding{
+            .{ .stage_id = 0, .host_id = cpu_host_id },
+            .{ .stage_id = 1, .host_id = cuda_host_id },
+        };
+        const profiles = [_]bridge.BoundaryFrameProfile{.{
+            .boundary_index = 0,
+            .source_stage_id = boundary.source_stage_id,
+            .target_stage_id = boundary.target_stage_id,
+            .step_kind = .decode,
+            .dtype = self.pipeline_boundary_dtype,
+            .layout = self.pipeline_boundary_layout,
+            .max_batch_entries = 1,
+            .max_token_count_per_frame = 1,
+            .max_activation_payload_bytes = activation_bytes_u64,
+            .handoff_mode = .local_in_process,
+        }};
+
+        return bridge.buildPlacementPlan(self.allocator, .{
+            .plan = plan,
+            .required_step_kinds = &.{.decode},
+            .host_capabilities = &.{ cpu_capability, cuda_capability },
+            .host_residency_snapshots = &.{ cpu_residency, cuda_residency },
+            .stage_host_bindings = &bindings,
+            .boundary_frame_profiles = &profiles,
+            .state_placement_mode = if (state_ref != null) .validate_ref else .stateless_only,
+            .state_placement_ref = state_ref,
+            .allowed_reachability = &.{.local_in_process},
+            .stateful_execution_required = state_ref != null,
+        });
+    }
+
     fn initCpuGpuTensorFrameContract(
         self: *CudaBackend,
         split_layer: usize,
         total_layers: usize,
     ) !void {
-        if (self.cpu_gpu_stage_plan != null or self.cpu_gpu_tensor_frame_plan_ref != null) {
+        if (self.cpu_gpu_stage_plan != null or
+            self.cpu_gpu_tensor_frame_plan_ref != null or
+            self.cpu_gpu_state_ownership_plan != null or
+            self.cpu_gpu_state_placement_ref != null or
+            self.cpu_gpu_placement_plan != null or
+            self.cpu_gpu_local_stage_runner_plan_ref != null)
+        {
             return error.InvalidTopologyConfig;
         }
         const model_manifest = self.loaded.manifestPtr() orelse return error.MissingManifest;
@@ -2000,11 +2202,56 @@ pub const CudaBackend = struct {
         var plan_ref = try bridge.TensorFramePlanRef.fromStagePlan(self.allocator, &plan);
         errdefer plan_ref.deinit();
 
+        var state_plan_opt: ?bridge.StageStateOwnershipPlan = null;
+        errdefer if (state_plan_opt) |*state_plan| state_plan.deinit();
+        var state_ref_opt: ?bridge.StageStatePlacementRef = null;
+        errdefer if (state_ref_opt) |*state_ref| state_ref.deinit();
+        if (countCpuGpuStatefulDependencies(&plan) > 0) {
+            state_plan_opt = try self.buildCpuGpuStateOwnershipPlan(&plan);
+            if (state_plan_opt) |*state_plan| {
+                state_ref_opt = try bridge.buildStageStatePlacementRef(self.allocator, state_plan);
+            }
+        }
+
+        const state_ref_ptr: ?*const bridge.StageStatePlacementRef = if (state_ref_opt) |*state_ref| state_ref else null;
+        const state_plan_ptr: ?*const bridge.StageStateOwnershipPlan = if (state_plan_opt) |*state_plan| state_plan else null;
+        var placement = try self.buildCpuGpuPlacementPlan(&plan, state_ref_ptr);
+        errdefer placement.deinit();
+        var runner_plan_ref = try bridge.buildLocalStageRunnerPlanRef(self.allocator, .{
+            .stage_plan = &plan,
+            .tensor_frame_plan_ref = &plan_ref,
+            .placement_plan = &placement,
+            .state_ownership_plan = state_plan_ptr,
+        });
+        errdefer runner_plan_ref.deinit();
+
         self.cpu_gpu_stage_plan = plan;
         self.cpu_gpu_tensor_frame_plan_ref = plan_ref;
+        self.cpu_gpu_state_ownership_plan = state_plan_opt;
+        state_plan_opt = null;
+        self.cpu_gpu_state_placement_ref = state_ref_opt;
+        state_ref_opt = null;
+        self.cpu_gpu_placement_plan = placement;
+        self.cpu_gpu_local_stage_runner_plan_ref = runner_plan_ref;
     }
 
     fn deinitCpuGpuTensorFrameContract(self: *CudaBackend) void {
+        if (self.cpu_gpu_local_stage_runner_plan_ref) |*plan_ref| {
+            plan_ref.deinit();
+            self.cpu_gpu_local_stage_runner_plan_ref = null;
+        }
+        if (self.cpu_gpu_placement_plan) |*plan| {
+            plan.deinit();
+            self.cpu_gpu_placement_plan = null;
+        }
+        if (self.cpu_gpu_state_placement_ref) |*state_ref| {
+            state_ref.deinit();
+            self.cpu_gpu_state_placement_ref = null;
+        }
+        if (self.cpu_gpu_state_ownership_plan) |*state_plan| {
+            state_plan.deinit();
+            self.cpu_gpu_state_ownership_plan = null;
+        }
         if (self.cpu_gpu_tensor_frame_plan_ref) |*plan_ref| {
             plan_ref.deinit();
             self.cpu_gpu_tensor_frame_plan_ref = null;

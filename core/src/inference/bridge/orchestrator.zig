@@ -7,7 +7,7 @@ const std = @import("std");
 const pipeline = @import("pipeline.zig");
 const tensor_frame = @import("tensor_frame.zig");
 
-pub const LocalDecodeHandoffConfig = struct {
+const LocalDecodeHandoffConfig = struct {
     plan_ref: *const tensor_frame.TensorFramePlanRef,
     boundary_index: usize,
     metadata: tensor_frame.TensorFrameMetadata,
@@ -45,7 +45,7 @@ pub fn executeTwoStageForward(
     try runtime.executeForward(stage0_input, stage1_input, activation_byte_count);
 }
 
-pub fn executeLocalDecodeHandoff(
+fn executeLocalDecodeHandoff(
     comptime Stage0Type: type,
     comptime Stage1Type: type,
     stage0: Stage0Type,
