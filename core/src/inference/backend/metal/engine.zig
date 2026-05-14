@@ -5,11 +5,10 @@ const models = @import("models_pkg");
 const safetensors_root = @import("io_pkg").safetensors.root;
 const log = @import("log_pkg");
 const metal_vision = @import("vision/root.zig");
-const sampling = @import("../cpu/sampling.zig");
+const sampling = @import("../../sampling.zig");
+const sampling_policy = sampling.policy;
 const shared_scheduler = @import("../../scheduler/contracts.zig");
-const compute = @import("compute_pkg");
 const trace = @import("xray_pkg").trace;
-const cpu_sampling_ops = compute.cpu.sampling_ops;
 const ModelConfig = models.config.ModelConfig;
 const ModelRuntime = models.config.ModelRuntime;
 
@@ -639,29 +638,6 @@ pub const MetalBackend = struct {
             if (count < top_k) count += 1;
         }
         return count;
-    }
-
-    fn applySamplingMutationsToLogits(
-        logits: []f32,
-        sampling_config: *const sampling.SamplingConfig,
-    ) void {
-        const context_tokens = sampling_config.context_tokens orelse &.{};
-        if (context_tokens.len == 0) return;
-        if (sampling_config.repetition_penalty != 1.0) {
-            cpu_sampling_ops.applyIndexPenalty(
-                logits,
-                context_tokens,
-                sampling_config.repetition_penalty,
-            );
-        }
-        if (sampling_config.presence_penalty != 0.0 or sampling_config.frequency_penalty != 0.0) {
-            cpu_sampling_ops.applyAdditivePenalties(
-                logits,
-                context_tokens,
-                sampling_config.presence_penalty,
-                sampling_config.frequency_penalty,
-            );
-        }
     }
 
     fn ensureSlotTokenScratch(self: *MetalBackend, slot_index: usize, len: usize) ![]i32 {
@@ -1321,7 +1297,7 @@ pub const MetalBackend = struct {
                 var decode_timer = std.time.Timer.start() catch unreachable;
                 try self.decodeLogits(ctx, current_token, logits_buf);
                 measured_decode_ns +|= decode_timer.read();
-                applySamplingMutationsToLogits(logits_buf[0..self.vocab_size], sampling_config);
+                sampling_policy.applyLogitMutations(logits_buf[0..self.vocab_size], sampling_config);
                 const candidate_count = @min(sampling_config.top_k, self.vocab_size);
                 const candidate_logits = try self.allocator.alloc(f32, candidate_count);
                 defer self.allocator.free(candidate_logits);
@@ -1391,15 +1367,7 @@ pub const MetalBackend = struct {
 
     pub fn supportsSchedulerBackendTopKDecodeRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
         if (sampling_config.strategy == .top_k and self.hasTopKStreamingRegression()) return false;
-        return switch (sampling_config.strategy) {
-            .top_k => sampling_config.top_k > 0 and
-                sampling_config.top_k <= topk_route_candidate_capacity,
-            .greedy => sampling_config.repetition_penalty == 1.0 and
-                sampling_config.presence_penalty == 0.0 and
-                sampling_config.frequency_penalty == 0.0 and
-                sampling_config.logit_bias == null,
-            else => false,
-        };
+        return sampling_policy.isTopKOrGreedyCandidateRoute(sampling_config, topk_route_candidate_capacity);
     }
 
     pub fn supportsSchedulerBackendTopKCandidateSamplingRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
@@ -1411,16 +1379,7 @@ pub const MetalBackend = struct {
         sampling_config: *const sampling.SamplingConfig,
     ) bool {
         if (self.hasTopKStreamingRegression()) return false;
-        return sampling_config.strategy == .top_k and
-            sampling_config.top_k > 0 and
-            sampling_config.top_k <= topk_route_candidate_capacity and
-            sampling_config.temperature >= 0.0 and
-            sampling_config.top_p >= 0.0 and
-            sampling_config.top_p <= 1.0 and
-            sampling_config.min_p >= 0.0 and
-            sampling_config.min_p <= 1.0 and
-            sampling_config.repetition_penalty > 0.0 and
-            sampling_config.logit_bias == null;
+        return sampling_policy.isTopKStreamingWithPenaltyMutations(sampling_config, topk_route_candidate_capacity);
     }
 
     pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
@@ -1428,15 +1387,7 @@ pub const MetalBackend = struct {
         sampling_config: *const sampling.SamplingConfig,
     ) bool {
         _ = self;
-        return switch (sampling_config.strategy) {
-            .top_k => sampling_config.top_k > 0 and
-                sampling_config.top_k <= topk_route_candidate_capacity,
-            .greedy => sampling_config.repetition_penalty == 1.0 and
-                sampling_config.presence_penalty == 0.0 and
-                sampling_config.frequency_penalty == 0.0 and
-                sampling_config.logit_bias == null,
-            else => false,
-        };
+        return sampling_policy.isTopKOrGreedyCandidateRoute(sampling_config, topk_route_candidate_capacity);
     }
 
     pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
@@ -2086,39 +2037,14 @@ pub const MetalBackend = struct {
     }
 };
 
-test "MetalBackend.applySamplingMutationsToLogits applies repetition penalty" {
-    var logits = [_]f32{ 2.0, -2.0, 1.0, 0.5 };
-    const context_tokens = [_]u32{ 0, 1 };
-    const cfg = sampling.SamplingConfig{
-        .strategy = .top_k,
-        .top_k = 2,
-        .repetition_penalty = 2.0,
-        .context_tokens = context_tokens[0..],
-    };
-    MetalBackend.applySamplingMutationsToLogits(logits[0..], &cfg);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -4.0), logits[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[2], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), logits[3], 1e-6);
-}
-
-test "MetalBackend.applySamplingMutationsToLogits applies additive penalties" {
-    var logits = [_]f32{ 10.0, 10.0, 10.0 };
-    const context_tokens = [_]u32{ 0, 1, 0 };
-    const cfg = sampling.SamplingConfig{
-        .strategy = .top_k,
-        .top_k = 2,
-        .presence_penalty = 1.0,
-        .frequency_penalty = 0.5,
-        .context_tokens = context_tokens[0..],
-    };
-    MetalBackend.applySamplingMutationsToLogits(logits[0..], &cfg);
-    try std.testing.expectApproxEqAbs(@as(f32, 8.0), logits[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 8.5), logits[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), logits[2], 1e-6);
+fn routeTestBackend() MetalBackend {
+    var backend = std.mem.zeroes(MetalBackend);
+    backend.model_config.embedding_multiplier = 1.0;
+    return backend;
 }
 
 test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute validates top_k bounds" {
+    var backend = routeTestBackend();
     const valid_cfg = sampling.SamplingConfig{
         .strategy = .top_k,
         .top_k = 64,
@@ -2132,12 +2058,13 @@ test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute validates top_
         .top_k = topk_route_candidate_capacity + 1,
     };
 
-    try std.testing.expect(MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &valid_cfg));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &zero_cfg));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &too_large_cfg));
+    try std.testing.expect(backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&valid_cfg));
+    try std.testing.expect(!backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&zero_cfg));
+    try std.testing.expect(!backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&too_large_cfg));
 }
 
 test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute allows safe greedy path" {
+    var backend = routeTestBackend();
     const greedy_ok = sampling.SamplingConfig{
         .strategy = .greedy,
     };
@@ -2146,11 +2073,12 @@ test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute allows safe greedy pa
         .repetition_penalty = 1.2,
     };
 
-    try std.testing.expect(MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &greedy_ok));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &greedy_with_penalty));
+    try std.testing.expect(backend.supportsSchedulerBackendTopKDecodeRoute(&greedy_ok));
+    try std.testing.expect(!backend.supportsSchedulerBackendTopKDecodeRoute(&greedy_with_penalty));
 }
 
 test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute accepts bounded top_k strategy" {
+    var backend = routeTestBackend();
     const topk_ok = sampling.SamplingConfig{
         .strategy = .top_k,
         .top_k = 64,
@@ -2164,12 +2092,13 @@ test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute accepts bounded top_k
         .top_k = topk_route_candidate_capacity + 1,
     };
 
-    try std.testing.expect(MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &topk_ok));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &topk_zero));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &topk_too_large));
+    try std.testing.expect(backend.supportsSchedulerBackendTopKDecodeRoute(&topk_ok));
+    try std.testing.expect(!backend.supportsSchedulerBackendTopKDecodeRoute(&topk_zero));
+    try std.testing.expect(!backend.supportsSchedulerBackendTopKDecodeRoute(&topk_too_large));
 }
 
 test "MetalBackend.supportsSchedulerBackendTopKStreamingRoute accepts penalized top_k and rejects invalid config" {
+    var backend = routeTestBackend();
     const valid_cfg = sampling.SamplingConfig{
         .strategy = .top_k,
         .top_k = 64,
@@ -2196,13 +2125,14 @@ test "MetalBackend.supportsSchedulerBackendTopKStreamingRoute accepts penalized 
         .logit_bias = &.{.{ .token_id = 42, .bias = 1.5 }},
     };
 
-    try std.testing.expect(MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &valid_cfg));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &invalid_rep_penalty));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &invalid_top_p));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &invalid_logit_bias));
+    try std.testing.expect(backend.supportsSchedulerBackendTopKStreamingRoute(&valid_cfg));
+    try std.testing.expect(!backend.supportsSchedulerBackendTopKStreamingRoute(&invalid_rep_penalty));
+    try std.testing.expect(!backend.supportsSchedulerBackendTopKStreamingRoute(&invalid_top_p));
+    try std.testing.expect(!backend.supportsSchedulerBackendTopKStreamingRoute(&invalid_logit_bias));
 }
 
 test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute allows safe greedy path" {
+    var backend = routeTestBackend();
     const greedy_ok = sampling.SamplingConfig{
         .strategy = .greedy,
     };
@@ -2211,6 +2141,6 @@ test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute allows safe gr
         .logit_bias = &.{.{ .token_id = 42, .bias = -2.0 }},
     };
 
-    try std.testing.expect(MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &greedy_ok));
-    try std.testing.expect(!MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &greedy_with_logit_bias));
+    try std.testing.expect(backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&greedy_ok));
+    try std.testing.expect(!backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&greedy_with_logit_bias));
 }

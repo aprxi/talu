@@ -1,7 +1,0 @@
-const cpu_sampling = @import("../cpu/sampling.zig");
-
-pub const SamplingStrategy = cpu_sampling.SamplingStrategy;
-pub const LogitBiasEntry = cpu_sampling.LogitBiasEntry;
-pub const SamplingConfig = cpu_sampling.SamplingConfig;
-pub const Workspace = cpu_sampling.Workspace;
-pub const Sampler = cpu_sampling.Sampler;

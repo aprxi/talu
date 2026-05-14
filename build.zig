@@ -658,7 +658,11 @@ const UnitTestCfg = struct {
         });
         linkCDependencies(self.b, test_artifact, self.pcre2, false);
         const run = self.b.addRunArtifact(test_artifact);
-        const step = self.b.step("test-" ++ name, "Run " ++ name ++ " unit tests");
+        const step_name = "test-" ++ name;
+        const step = if (self.b.top_level_steps.get(step_name)) |top_level|
+            &top_level.step
+        else
+            self.b.step(step_name, "Run " ++ name ++ " unit tests");
         step.dependOn(&run.step);
     }
 
@@ -1425,6 +1429,9 @@ pub fn build(b: *std.Build) void {
         "Scheduler",
         "Vision",
         "layer program",
+    });
+    ut.addLazy("inference", b.path("core/src/inference/sampling.zig"), &.{
+        "inference sampling",
     });
     ut.addLazy("inference-cpu", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.cpu",

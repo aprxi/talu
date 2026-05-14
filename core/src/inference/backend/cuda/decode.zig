@@ -3,7 +3,8 @@
 const std = @import("std");
 const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
-const sampling_mod = @import("sampling.zig");
+const sampling_mod = @import("../../sampling.zig");
+const sampling_policy = sampling_mod.policy;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 
@@ -300,18 +301,7 @@ pub fn decodeStreaming(
 fn supportsTopKStreamingSamplingConfig(sampling_config: *const sampling_mod.SamplingConfig) bool {
     // Backend-owned top-k streaming path currently assumes candidate-space
     // sampling only (no full-logits penalties/bias mutation).
-    return sampling_config.strategy == .top_k and
-        sampling_config.top_k > 0 and
-        sampling_config.top_k <= 256 and
-        sampling_config.temperature > 0.0 and
-        sampling_config.top_p >= 0.0 and
-        sampling_config.top_p <= 1.0 and
-        sampling_config.min_p >= 0.0 and
-        sampling_config.min_p <= 1.0 and
-        sampling_config.repetition_penalty == 1.0 and
-        sampling_config.presence_penalty == 0.0 and
-        sampling_config.frequency_penalty == 0.0 and
-        sampling_config.logit_bias == null;
+    return sampling_policy.isTopKStreamingWithoutMutations(sampling_config, 256);
 }
 
 pub fn decodeTopKStreaming(

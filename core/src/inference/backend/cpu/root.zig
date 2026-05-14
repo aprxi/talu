@@ -23,5 +23,5 @@ pub const executor = @import("executor/root.zig");
 pub const kernels = @import("kernels/root.zig");
 pub const stage_capabilities = @import("stage_capabilities.zig");
 pub const scheduler = @import("scheduler.zig");
-pub const sampling = @import("sampling.zig");
+pub const sampling = @import("../../sampling.zig");
 pub const primitive_capabilities = compute.cpu.capabilities.support;
