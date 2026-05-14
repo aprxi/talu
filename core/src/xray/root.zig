@@ -19,6 +19,7 @@ pub const stats = @import("stats.zig");
 pub const reference = @import("reference.zig");
 pub const verify = @import("verify.zig");
 pub const teacher_forcing = @import("teacher_forcing.zig");
+pub const staged_frame = @import("staged_frame.zig");
 
 // Re-export commonly used types for tensor inspection
 pub const TracePoint = trace.TracePoint;
@@ -30,6 +31,17 @@ pub const TraceCaptureConfig = capture.TraceCaptureConfig;
 pub const TraceCaptureMode = capture.TraceCaptureMode;
 pub const TracePointSet = capture.TracePointSet;
 pub const CaptureQuery = query.CaptureQuery;
+pub const StagedFrameCapture = staged_frame.StagedFrameCapture;
+pub const StagedFrameDType = staged_frame.StagedFrameDType;
+pub const StagedFrameLayout = staged_frame.StagedFrameLayout;
+pub const StagedFramePayloadLocation = staged_frame.StagedFramePayloadLocation;
+pub const StagedFrameRecord = staged_frame.StagedFrameRecord;
+pub const StagedFrameSequenceError = staged_frame.StagedFrameSequenceError;
+pub const StagedFrameStepKind = staged_frame.StagedFrameStepKind;
+pub const stagedFrameRecordEql = staged_frame.stagedFrameRecordEql;
+pub const validateExpectedSequence = staged_frame.validateExpectedSequence;
+pub const validateAdjacentBoundarySequence = staged_frame.validateAdjacentBoundarySequence;
+pub const writeStagedFrameTsv = staged_frame.writeStagedFrameTsv;
 
 // Reference system types
 pub const ReferenceData = reference.ReferenceData;

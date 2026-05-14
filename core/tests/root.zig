@@ -41,6 +41,7 @@ pub const xray_execution_plan = @import("xray/execution_plan_test.zig");
 pub const xray_matmul_kernel = @import("xray/matmul_kernel_test.zig");
 pub const xray_attention_type = @import("xray/attention_type_test.zig");
 pub const xray_ffn_type = @import("xray/ffn_type_test.zig");
+pub const xray_staged_frame = @import("xray/staged_frame_test.zig");
 pub const xray_dump = @import("xray/dump/root.zig");
 
 // compute
