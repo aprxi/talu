@@ -74,7 +74,7 @@ pub const SchedulerBatchedTopKRoutePlan = scheduler_contracts.SchedulerBatchedTo
 /// - `prefillSlot(*T, usize, []const u32, []f32) !void` - prefill
 /// - optional: `prefillSlotWithVision(*T, usize, []const u32, ?*const PrefillVisionInput, []f32) !void`
 /// - optional: `prefillBatch(*T, []const PrefillBatchRequest) !void`
-/// - optional: backend-owned tail streaming via `supportsSchedulerBackendDecodeStreamingRoute`/`decodeStreaming` or `supportsSchedulerBackendTopKStreamingRoute`/`decodeTopKStreaming`
+/// - optional: backend-owned tail streaming via `supportsSchedulerBackendStreamingRoute`/`decodeSchedulerStreaming`
 /// - optional: candidate logits via `supportsSchedulerBackendTopKDecodeRoute`/`decodeTopKCandidates`
 /// - optional: `planSchedulerSingleDecodeRoute(*const T, *const SchedulerSingleDecodeRoutePlan) SchedulerSingleDecodeRoute`
 /// - optional: batched candidate logits via `decodeBatchTopKCandidates` and `shouldUseSchedulerBatchedTopKDecodeRoute`
@@ -1039,11 +1039,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                             .capture_final_logits = request_entry.capture_final_logits,
                             .has_grammar_sampler = request_entry.grammar_sampler != null,
                             .prompt_token_count = request_entry.prompt_tokens.len,
-                            .greedy_streaming_semantic_eligible = false,
-                            .top_k_streaming_semantic_eligible = false,
+                            .backend_streaming_semantic_eligible = false,
                             .top_k_candidate_semantic_eligible = topk_candidate_semantic_eligible,
-                            .greedy_streaming_backend_supported = false,
-                            .top_k_streaming_backend_supported = false,
+                            .backend_streaming_backend_supported = false,
                             .top_k_candidate_backend_supported = topk_candidate_backend_supported,
                         });
 
@@ -1372,35 +1370,23 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         ) !GenerateSyncResult {
             const submit_config = options orelse SubmitOptions{};
             const effective_sampling = submit_config.sampling orelse self.config.default_sampling;
-            const backend_has_decode_streaming = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeStreaming")) break :blk false;
+            const backend_has_streaming = comptime blk: {
+                if (!@hasDecl(BackendType, "decodeSchedulerStreaming")) break :blk false;
                 break :blk true;
             };
             const backend_has_top_k_candidates = comptime blk: {
                 if (!@hasDecl(BackendType, "decodeTopKCandidates")) break :blk false;
                 break :blk true;
             };
-            const backend_has_top_k_streaming = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeTopKStreaming")) break :blk false;
-                break :blk true;
-            };
-            // Greedy streaming uses argmax without any sampler — penalties cannot
-            // be applied. The top-k candidate route handles penalties via
-            // candidate-logit mutation, so it doesn't need this gate.
-            const has_sampling_adjustments = sampling_policy.hasLogitMutations(effective_sampling);
-            const backend_supports_greedy_streaming = comptime blk: {
-                if (!@hasDecl(BackendType, "supportsSchedulerBackendDecodeStreamingRoute")) break :blk false;
-                break :blk true;
-            };
-            const backend_supports_top_k_streaming = comptime blk: {
-                if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKStreamingRoute")) break :blk false;
+            const backend_supports_streaming = comptime blk: {
+                if (!@hasDecl(BackendType, "supportsSchedulerBackendStreamingRoute")) break :blk false;
                 break :blk true;
             };
             const backend_supports_top_k_candidates = comptime blk: {
                 if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute")) break :blk false;
                 break :blk true;
             };
-            const greedy_streaming_semantic_eligible = prompt_tokens.len > 0 and
+            const backend_streaming_semantic_eligible = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
                 submit_config.vision_input == null and
@@ -1408,36 +1394,20 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
                 submit_config.max_thinking_tokens == 0 and // thinking budget needs per-token control
-                effective_sampling.strategy == .greedy and
-                !has_sampling_adjustments and
                 !xray.isTeacherForcingEnabled() and
-                backend_has_decode_streaming;
-            const top_k_streaming_semantic_eligible = prompt_tokens.len > 0 and
-                self.active_requests.items.len == 0 and
-                self.pending_queue.items.len == 0 and
-                submit_config.vision_input == null and
-                submit_config.stop_sequences.len == 0 and
-                submit_config.grammar_sampler == null and
-                !submit_config.return_final_logits and
-                submit_config.max_thinking_tokens == 0 and
-                !xray.isTeacherForcingEnabled() and
-                backend_has_top_k_streaming;
+                backend_has_streaming;
             const top_k_candidate_semantic_eligible = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
-                // Candidate route supports callbacks and should remain available
-                // even when a backend doesn't expose decodeTopKStreaming.
+                // Candidate route supports callbacks and remains available when
+                // backend-owned tail streaming is unavailable for the config.
                 submit_config.vision_input == null and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
                 sampling_policy.isTopKOrGreedyCandidateRoute(&effective_sampling, 256) and
                 backend_has_top_k_candidates;
-            const greedy_streaming_backend_supported = if (backend_supports_greedy_streaming)
-                self.backend.supportsSchedulerBackendDecodeStreamingRoute()
-            else
-                false;
-            const top_k_streaming_backend_supported = if (backend_supports_top_k_streaming)
-                self.backend.supportsSchedulerBackendTopKStreamingRoute(&effective_sampling)
+            const backend_streaming_backend_supported = if (backend_supports_streaming)
+                self.backend.supportsSchedulerBackendStreamingRoute(&effective_sampling)
             else
                 false;
             const top_k_candidate_backend_supported = if (backend_supports_top_k_candidates)
@@ -1452,27 +1422,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .capture_final_logits = submit_config.return_final_logits,
                 .has_grammar_sampler = submit_config.grammar_sampler != null,
                 .prompt_token_count = prompt_tokens.len,
-                .greedy_streaming_semantic_eligible = greedy_streaming_semantic_eligible,
-                .top_k_streaming_semantic_eligible = top_k_streaming_semantic_eligible,
+                .backend_streaming_semantic_eligible = backend_streaming_semantic_eligible,
                 .top_k_candidate_semantic_eligible = top_k_candidate_semantic_eligible,
-                .greedy_streaming_backend_supported = greedy_streaming_backend_supported,
-                .top_k_streaming_backend_supported = top_k_streaming_backend_supported,
+                .backend_streaming_backend_supported = backend_streaming_backend_supported,
                 .top_k_candidate_backend_supported = top_k_candidate_backend_supported,
             });
             switch (planned_route) {
-                .greedy_streaming => if (greedy_streaming_semantic_eligible and greedy_streaming_backend_supported) {
+                .backend_streaming => if (backend_streaming_semantic_eligible and backend_streaming_backend_supported) {
                     log.debug("inference", "Scheduler decode route selected", .{
-                        .route = "greedy_streaming",
-                        .strategy = @tagName(effective_sampling.strategy),
-                        .top_k = effective_sampling.top_k,
-                        .temperature = effective_sampling.temperature,
-                        .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
-                    }, @src());
-                    return self.generateSyncStreamingRoute(.greedy, prompt_tokens, max_tokens, &submit_config, &effective_sampling);
-                },
-                .top_k_streaming => if (top_k_streaming_semantic_eligible and top_k_streaming_backend_supported) {
-                    log.debug("inference", "Scheduler decode route selected", .{
-                        .route = "topk_streaming",
+                        .route = "backend_streaming",
                         .strategy = @tagName(effective_sampling.strategy),
                         .top_k = effective_sampling.top_k,
                         .temperature = effective_sampling.temperature,
@@ -1484,7 +1442,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                         .frequency_penalty = effective_sampling.frequency_penalty,
                         .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
                     }, @src());
-                    return self.generateSyncStreamingRoute(.top_k, prompt_tokens, max_tokens, &submit_config, &effective_sampling);
+                    return self.generateSyncBackendStreamingRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
                 },
                 .top_k_candidate => if (top_k_candidate_semantic_eligible and top_k_candidate_backend_supported) {
                     log.debug("inference", "Scheduler decode route selected", .{
@@ -1700,9 +1658,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             };
         }
 
-        fn generateSyncStreamingRoute(
+        fn generateSyncBackendStreamingRoute(
             self: *Self,
-            comptime route: SyncStreamingRoute,
             prompt_tokens: []const u32,
             max_tokens: usize,
             submit_config: *const SubmitOptions,
@@ -1758,42 +1715,21 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             var decode_ns: u64 = 0;
-            const tail_count = switch (route) {
-                .greedy => blk: {
-                    var decode_timer = std.time.Timer.start() catch unreachable;
-                    const count = try self.backend.decodeStreaming(
-                        current_token,
-                        generated.items.len + 1,
-                        remaining_token_budget,
-                        eos_token_ids,
-                        generated_tail,
-                        backend_stream_cb,
-                        backend_stream_cb_data,
-                    );
-                    decode_ns = decode_timer.read();
-                    break :blk count;
-                },
-                .top_k => blk: {
-                    var backend_decode_ns: u64 = 0;
-                    const count = try self.backend.decodeTopKStreaming(
-                        current_token,
-                        generated.items.len + 1,
-                        remaining_token_budget,
-                        eos_token_ids,
-                        sampling_config,
-                        generated_tail,
-                        backend_stream_cb,
-                        backend_stream_cb_data,
-                        &backend_decode_ns,
-                    );
-                    decode_ns = backend_decode_ns;
-                    break :blk count;
-                },
-            };
+            const tail_count = try self.backend.decodeSchedulerStreaming(
+                current_token,
+                generated.items.len + 1,
+                remaining_token_budget,
+                eos_token_ids,
+                sampling_config,
+                generated_tail,
+                backend_stream_cb,
+                backend_stream_cb_data,
+                &decode_ns,
+            );
             try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
 
             var finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
-            if (route == .greedy and submit_config.stop_sequences.len > 0) {
+            if (sampling_config.strategy == .greedy and submit_config.stop_sequences.len > 0) {
                 var stop_at: ?usize = null;
                 for (submit_config.stop_sequences) |stop_seq| {
                     if (stop_seq.len == 0 or generated.items.len < stop_seq.len) continue;
@@ -1991,11 +1927,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             generated: std.ArrayList(u32),
             token: u32,
             finish_reason: FinishReason,
-        };
-
-        const SyncStreamingRoute = enum {
-            greedy,
-            top_k,
         };
 
         const SyncStreamCallbackContext = struct {
@@ -4026,7 +3957,7 @@ const MockStreamingBackend = struct {
     decode_batch_calls: usize = 0,
     decode_batch_top_k_calls: usize = 0,
     decode_streaming_calls: usize = 0,
-    decode_top_k_streaming_calls: usize = 0,
+    decode_backend_streaming_top_k_calls: usize = 0,
     decode_top_k_calls: usize = 0,
     allow_top_k_decode_route: bool = true,
     allow_batched_top_k_decode_route: bool = false,
@@ -4063,11 +3994,6 @@ const MockStreamingBackend = struct {
         return self.vocab_size;
     }
 
-    fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MockStreamingBackend) bool {
-        _ = self;
-        return true;
-    }
-
     fn supportsSchedulerBackendTopKDecodeRoute(
         self: *const MockStreamingBackend,
         sampling_config: *const sampling.SamplingConfig,
@@ -4090,19 +4016,22 @@ const MockStreamingBackend = struct {
             sampling_config.min_p == 0.0;
     }
 
-    fn supportsSchedulerBackendTopKStreamingRoute(
+    fn supportsSchedulerBackendStreamingRoute(
         self: *const MockStreamingBackend,
         sampling_config: *const sampling.SamplingConfig,
     ) bool {
         _ = self;
-        return sampling_config.strategy == .top_k and
-            sampling_config.top_k > 0 and
-            sampling_config.temperature > 0.0 and
-            sampling_config.min_p == 0.0 and
-            sampling_config.repetition_penalty == 1.0 and
-            sampling_config.presence_penalty == 0.0 and
-            sampling_config.frequency_penalty == 0.0 and
-            sampling_config.logit_bias == null;
+        return switch (sampling_config.strategy) {
+            .greedy => !sampling_policy.hasLogitMutations(sampling_config.*),
+            .top_k => sampling_config.top_k > 0 and
+                sampling_config.temperature > 0.0 and
+                sampling_config.min_p == 0.0 and
+                sampling_config.repetition_penalty == 1.0 and
+                sampling_config.presence_penalty == 0.0 and
+                sampling_config.frequency_penalty == 0.0 and
+                sampling_config.logit_bias == null,
+            else => false,
+        };
     }
 
     fn planSchedulerSingleDecodeRoute(
@@ -4111,11 +4040,8 @@ const MockStreamingBackend = struct {
     ) SchedulerSingleDecodeRoute {
         if (self.force_single_decode_route_queued) return .queued;
         if (self.force_single_decode_route_top_k_candidate) return .top_k_candidate;
-        if (plan.greedy_streaming_semantic_eligible and self.supportsSchedulerBackendDecodeStreamingRoute()) {
-            return .greedy_streaming;
-        }
-        if (plan.top_k_streaming_semantic_eligible and self.supportsSchedulerBackendTopKStreamingRoute(plan.sampling_config)) {
-            return .top_k_streaming;
+        if (plan.backend_streaming_semantic_eligible and self.supportsSchedulerBackendStreamingRoute(plan.sampling_config)) {
+            return .backend_streaming;
         }
         if (plan.top_k_candidate_semantic_eligible and self.supportsSchedulerBackendTopKDecodeRoute(plan.sampling_config)) {
             return .top_k_candidate;
@@ -4201,26 +4127,7 @@ const MockStreamingBackend = struct {
         }
     }
 
-    fn decodeStreaming(
-        self: *MockStreamingBackend,
-        first_token: u32,
-        start_position: usize,
-        max_tokens: usize,
-        eos_token_ids: []const u32,
-        output_tokens: []u32,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-        callback_data: ?*anyopaque,
-    ) !usize {
-        _ = eos_token_ids;
-        self.decode_streaming_calls += 1;
-        for (output_tokens[0..max_tokens], 0..) |*out_token, idx| {
-            out_token.* = first_token + @as(u32, @intCast(start_position + idx));
-            if (callback) |cb| cb(out_token.*, callback_data);
-        }
-        return max_tokens;
-    }
-
-    fn decodeTopKStreaming(
+    fn decodeSchedulerStreaming(
         self: *MockStreamingBackend,
         first_token: u32,
         start_position: usize,
@@ -4233,8 +4140,11 @@ const MockStreamingBackend = struct {
         decode_ns_out: ?*u64,
     ) !usize {
         _ = eos_token_ids;
-        _ = sampling_config;
-        self.decode_top_k_streaming_calls += 1;
+        switch (sampling_config.strategy) {
+            .greedy => self.decode_streaming_calls += 1,
+            .top_k => self.decode_backend_streaming_top_k_calls += 1,
+            else => return error.InvalidArgument,
+        }
         if (decode_ns_out) |out| out.* = @intCast(max_tokens);
         for (output_tokens[0..max_tokens], 0..) |*out_token, idx| {
             out_token.* = first_token + @as(u32, @intCast(start_position + idx));
@@ -4490,7 +4400,7 @@ test "generateSync uses backend top-k streaming route for top_k sampling without
     });
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), backend.decode_top_k_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 1), backend.decode_backend_streaming_top_k_calls);
     try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_calls);
     try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
     try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
@@ -4544,7 +4454,7 @@ test "runDecodeLoop uses candidate route for top_k tail" {
 
     try scheduler.runDecodeLoop(request_id, null, callback, &callback_data);
 
-    try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_backend_streaming_top_k_calls);
     try std.testing.expectEqual(@as(usize, 3), backend.decode_top_k_calls);
     try std.testing.expectEqual(@as(usize, 3), callback_data.token_count);
     try std.testing.expectEqual(@as(usize, 1), callback_data.final_count);

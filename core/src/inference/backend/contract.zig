@@ -7,6 +7,7 @@ const std = @import("std");
 const topology = @import("models_pkg").op_types;
 const runtime_contract = @import("runtime_contract_pkg");
 const scheduler_contracts = @import("../scheduler/contracts.zig");
+const sampling_contracts = @import("../sampling/contracts.zig");
 
 /// Pooling strategy for embedding extraction.
 pub const PoolingStrategy = enum(u8) {
@@ -500,10 +501,12 @@ pub fn assertBackendType(comptime T: type) void {
         _ = @as(fn (*T, usize) void, T.unbindSlotStateBlocks);
 
         if (caps.decode_streaming) {
-            requireDecl(T, "decodeStreaming");
+            requireDecl(T, "supportsSchedulerBackendStreamingRoute");
+            requireDecl(T, "decodeSchedulerStreaming");
+            _ = @as(fn (*const T, *const sampling_contracts.SamplingConfig) bool, T.supportsSchedulerBackendStreamingRoute);
             _ = @as(
-                fn (*T, u32, usize, usize, []const u32, []u32, ?*const fn (u32, ?*anyopaque) void, ?*anyopaque) anyerror!usize,
-                T.decodeStreaming,
+                fn (*T, u32, usize, usize, []const u32, *const sampling_contracts.SamplingConfig, []u32, ?*const fn (u32, ?*anyopaque) void, ?*anyopaque, ?*u64) anyerror!usize,
+                T.decodeSchedulerStreaming,
             );
         }
         if (caps.embedding) {

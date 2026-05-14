@@ -218,8 +218,7 @@ pub const SchedulerConfig = struct {
 /// Backend-planned route for single-request `generateSync` decode.
 pub const SchedulerSingleDecodeRoute = enum {
     queued,
-    greedy_streaming,
-    top_k_streaming,
+    backend_streaming,
     top_k_candidate,
 };
 
@@ -231,11 +230,9 @@ pub const SchedulerSingleDecodeRoutePlan = struct {
     capture_final_logits: bool,
     has_grammar_sampler: bool,
     prompt_token_count: usize,
-    greedy_streaming_semantic_eligible: bool,
-    top_k_streaming_semantic_eligible: bool,
+    backend_streaming_semantic_eligible: bool,
     top_k_candidate_semantic_eligible: bool,
-    greedy_streaming_backend_supported: bool,
-    top_k_streaming_backend_supported: bool,
+    backend_streaming_backend_supported: bool,
     top_k_candidate_backend_supported: bool,
 };
 
@@ -331,14 +328,12 @@ test "SchedulerSingleDecodeRoutePlan stores route eligibility" {
         .capture_final_logits = false,
         .has_grammar_sampler = false,
         .prompt_token_count = 8,
-        .greedy_streaming_semantic_eligible = false,
-        .top_k_streaming_semantic_eligible = true,
+        .backend_streaming_semantic_eligible = true,
         .top_k_candidate_semantic_eligible = true,
-        .greedy_streaming_backend_supported = false,
-        .top_k_streaming_backend_supported = true,
+        .backend_streaming_backend_supported = true,
         .top_k_candidate_backend_supported = true,
     };
     try std.testing.expectEqual(sampling.SamplingStrategy.top_k, plan.sampling_config.strategy);
-    try std.testing.expect(plan.top_k_streaming_semantic_eligible);
+    try std.testing.expect(plan.backend_streaming_semantic_eligible);
     try std.testing.expect(plan.top_k_candidate_backend_supported);
 }

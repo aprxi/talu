@@ -1208,60 +1208,7 @@ pub const MetalBackend = struct {
         self.slot_positions[0] = position + 1;
     }
 
-    pub fn decodeStreaming(
-        self: *MetalBackend,
-        first_token: u32,
-        start_position: usize,
-        max_tokens: usize,
-        eos_token_ids: []const u32,
-        output_tokens: []u32,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-        callback_data: ?*anyopaque,
-    ) !usize {
-        if (!self.slot_in_use[0]) return error.InvalidArgument;
-        try self.ensureSlotStateBlocksBoundForExecution(0);
-        const budget = @min(max_tokens, output_tokens.len);
-        const ctx = try self.ensureSlotCtx(0);
-
-        if (callback != null) {
-            // Per-token decode loop: fire callback after each token for true
-            // streaming. The bulk bridge path (mlx_decode_stream) generates all
-            // tokens internally and cannot call back per-token.
-            var produced: usize = 0;
-            var current_token = first_token;
-            const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
-            defer self.allocator.free(logits_buf);
-            while (produced < budget) {
-                try self.decodeLogits(ctx, current_token, logits_buf);
-                var best_idx: usize = 0;
-                var best_val: f32 = -std.math.inf(f32);
-                for (logits_buf, 0..) |value, idx| {
-                    if (value > best_val) {
-                        best_val = value;
-                        best_idx = idx;
-                    }
-                }
-                current_token = @intCast(best_idx);
-                output_tokens[produced] = current_token;
-                produced += 1;
-                if (callback) |cb| cb(current_token, callback_data);
-                for (eos_token_ids) |eos_id| {
-                    if (current_token == eos_id) {
-                        self.slot_positions[0] = start_position + produced;
-                        return produced;
-                    }
-                }
-            }
-            self.slot_positions[0] = start_position + produced;
-            return produced;
-        }
-
-        const produced = try self.decodeStream(ctx, first_token, budget, eos_token_ids, output_tokens);
-        self.slot_positions[0] = start_position + produced;
-        return produced;
-    }
-
-    pub fn decodeTopKStreaming(
+    pub fn decodeSchedulerStreaming(
         self: *MetalBackend,
         first_token: u32,
         start_position: usize,
@@ -1281,74 +1228,127 @@ pub const MetalBackend = struct {
 
         if (!self.slot_in_use[0]) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForExecution(0);
-
         const budget = @min(max_tokens, output_tokens.len);
         const ctx = try self.ensureSlotCtx(0);
 
-        if (callback != null) {
-            // Per-token decode loop with host-side TopK sampling for true
-            // streaming. The bulk bridge path (mlx_decode_topk_stream) generates
-            // all tokens internally and cannot call back per-token.
-            var produced: usize = 0;
-            var current_token = first_token;
-            const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
-            defer self.allocator.free(logits_buf);
-            while (produced < budget) {
-                var decode_timer = std.time.Timer.start() catch unreachable;
-                try self.decodeLogits(ctx, current_token, logits_buf);
-                measured_decode_ns +|= decode_timer.read();
-                sampling_policy.applyLogitMutations(logits_buf[0..self.vocab_size], sampling_config);
-                const candidate_count = @min(sampling_config.top_k, self.vocab_size);
-                const candidate_logits = try self.allocator.alloc(f32, candidate_count);
-                defer self.allocator.free(candidate_logits);
-                const candidate_ids = try self.allocator.alloc(u32, candidate_count);
-                defer self.allocator.free(candidate_ids);
-                const n = fillTopKFromLogits(logits_buf[0..self.vocab_size], candidate_count, candidate_logits, candidate_ids);
-                if (n == 0) return error.InvalidArgument;
-                // Greedy from top-k candidates (temperature/top-p applied by scheduler).
-                current_token = candidate_ids[0];
-                output_tokens[produced] = current_token;
-                produced += 1;
-                if (callback) |cb| cb(current_token, callback_data);
-                for (eos_token_ids) |eos_id| {
-                    if (current_token == eos_id) {
-                        self.slot_positions[0] = start_position + produced;
-                        return produced;
+        switch (sampling_config.strategy) {
+            .greedy => {
+                if (sampling_policy.hasLogitMutations(sampling_config.*)) return error.InvalidArgument;
+                if (callback != null) {
+                    // Per-token decode loop: fire callback after each token for true
+                    // streaming. The bulk bridge path generates all tokens internally.
+                    var decode_timer = std.time.Timer.start() catch unreachable;
+                    var produced: usize = 0;
+                    var current_token = first_token;
+                    const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
+                    defer self.allocator.free(logits_buf);
+                    while (produced < budget) {
+                        try self.decodeLogits(ctx, current_token, logits_buf);
+                        var best_idx: usize = 0;
+                        var best_val: f32 = -std.math.inf(f32);
+                        for (logits_buf, 0..) |value, idx| {
+                            if (value > best_val) {
+                                best_val = value;
+                                best_idx = idx;
+                            }
+                        }
+                        current_token = @intCast(best_idx);
+                        output_tokens[produced] = current_token;
+                        produced += 1;
+                        if (callback) |cb| cb(current_token, callback_data);
+                        for (eos_token_ids) |eos_id| {
+                            if (current_token == eos_id) {
+                                self.slot_positions[0] = start_position + produced;
+                                measured_decode_ns = decode_timer.read();
+                                return produced;
+                            }
+                        }
                     }
+                    self.slot_positions[0] = start_position + produced;
+                    measured_decode_ns = decode_timer.read();
+                    return produced;
                 }
-            }
-            self.slot_positions[0] = start_position + produced;
-            return produced;
-        }
+                var decode_timer = std.time.Timer.start() catch unreachable;
+                const produced = try self.decodeStream(ctx, first_token, budget, eos_token_ids, output_tokens);
+                measured_decode_ns = decode_timer.read();
+                self.slot_positions[0] = start_position + produced;
+                return produced;
+            },
+            .top_k => {
+                if (!self.supportsSchedulerBackendStreamingRoute(sampling_config)) return error.InvalidArgument;
+                if (callback != null) {
+                    // Per-token decode loop with host-side TopK sampling for true
+                    // streaming. The bulk bridge path generates all tokens internally.
+                    var produced: usize = 0;
+                    var current_token = first_token;
+                    const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
+                    defer self.allocator.free(logits_buf);
+                    const candidate_count = @min(sampling_config.top_k, self.vocab_size);
+                    if (candidate_count == 0) return error.InvalidArgument;
+                    const candidate_logits = try self.allocator.alloc(f32, candidate_count);
+                    defer self.allocator.free(candidate_logits);
+                    const candidate_ids = try self.allocator.alloc(u32, candidate_count);
+                    defer self.allocator.free(candidate_ids);
+                    while (produced < budget) {
+                        var decode_timer = std.time.Timer.start() catch unreachable;
+                        try self.decodeLogits(ctx, current_token, logits_buf);
+                        measured_decode_ns +|= decode_timer.read();
+                        sampling_policy.applyLogitMutations(logits_buf[0..self.vocab_size], sampling_config);
+                        const n = fillTopKFromLogits(logits_buf[0..self.vocab_size], candidate_count, candidate_logits, candidate_ids);
+                        if (n == 0) return error.InvalidArgument;
+                        // Preserve the existing callback path semantics: callbacks
+                        // need a host token boundary, so this route reports the best
+                        // candidate at each step instead of calling the bulk sampler.
+                        current_token = candidate_ids[0];
+                        output_tokens[produced] = current_token;
+                        produced += 1;
+                        if (callback) |cb| cb(current_token, callback_data);
+                        for (eos_token_ids) |eos_id| {
+                            if (current_token == eos_id) {
+                                self.slot_positions[0] = start_position + produced;
+                                return produced;
+                            }
+                        }
+                    }
+                    self.slot_positions[0] = start_position + produced;
+                    return produced;
+                }
 
-        var decode_timer = std.time.Timer.start() catch unreachable;
-        const produced = try self.decodeTopKStream(
-            ctx,
-            first_token,
-            budget,
-            eos_token_ids,
-            sampling_config,
-            output_tokens,
-        );
-        measured_decode_ns +|= decode_timer.read();
-        self.slot_positions[0] = start_position + produced;
-        return produced;
+                var decode_timer = std.time.Timer.start() catch unreachable;
+                const produced = try self.decodeTopKStream(
+                    ctx,
+                    first_token,
+                    budget,
+                    eos_token_ids,
+                    sampling_config,
+                    output_tokens,
+                );
+                measured_decode_ns +|= decode_timer.read();
+                self.slot_positions[0] = start_position + produced;
+                return produced;
+            },
+            else => return error.InvalidArgument,
+        }
     }
 
-    pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MetalBackend) bool {
-        _ = self;
-        return true;
+    pub fn supportsSchedulerBackendStreamingRoute(
+        self: *const MetalBackend,
+        sampling_config: *const sampling.SamplingConfig,
+    ) bool {
+        return switch (sampling_config.strategy) {
+            .greedy => !sampling_policy.hasLogitMutations(sampling_config.*),
+            .top_k => !self.hasTopKStreamingRegression() and
+                sampling_policy.isTopKStreamingWithPenaltyMutations(sampling_config, topk_route_candidate_capacity),
+            else => false,
+        };
     }
 
     pub fn planSchedulerSingleDecodeRoute(
         self: *const MetalBackend,
         plan: *const shared_scheduler.SchedulerSingleDecodeRoutePlan,
     ) shared_scheduler.SchedulerSingleDecodeRoute {
-        if (plan.greedy_streaming_semantic_eligible and self.supportsSchedulerBackendDecodeStreamingRoute()) {
-            return .greedy_streaming;
-        }
-        if (plan.top_k_streaming_semantic_eligible and self.supportsSchedulerBackendTopKStreamingRoute(plan.sampling_config)) {
-            return .top_k_streaming;
+        if (plan.backend_streaming_semantic_eligible and self.supportsSchedulerBackendStreamingRoute(plan.sampling_config)) {
+            return .backend_streaming;
         }
         if (plan.top_k_candidate_semantic_eligible and self.supportsSchedulerBackendTopKDecodeRoute(plan.sampling_config)) {
             return .top_k_candidate;
@@ -1374,14 +1374,6 @@ pub const MetalBackend = struct {
         return supportsSchedulerBackendTopKDecodeRoute(self, sampling_config);
     }
 
-    pub fn supportsSchedulerBackendTopKStreamingRoute(
-        self: *const MetalBackend,
-        sampling_config: *const sampling.SamplingConfig,
-    ) bool {
-        if (self.hasTopKStreamingRegression()) return false;
-        return sampling_policy.isTopKStreamingWithPenaltyMutations(sampling_config, topk_route_candidate_capacity);
-    }
-
     pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
         self: *const MetalBackend,
         sampling_config: *const sampling.SamplingConfig,
@@ -1389,7 +1381,6 @@ pub const MetalBackend = struct {
         _ = self;
         return sampling_policy.isTopKOrGreedyCandidateRoute(sampling_config, topk_route_candidate_capacity);
     }
-
     pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
         self: *const MetalBackend,
         plan: *const shared_scheduler.SchedulerBatchedTopKRoutePlan,
@@ -2097,8 +2088,9 @@ test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute accepts bounded top_k
     try std.testing.expect(!backend.supportsSchedulerBackendTopKDecodeRoute(&topk_too_large));
 }
 
-test "MetalBackend.supportsSchedulerBackendTopKStreamingRoute accepts penalized top_k and rejects invalid config" {
+test "MetalBackend.supportsSchedulerBackendStreamingRoute accepts greedy and penalized top_k configs" {
     var backend = routeTestBackend();
+    const greedy_cfg = sampling.SamplingConfig{ .strategy = .greedy };
     const valid_cfg = sampling.SamplingConfig{
         .strategy = .top_k,
         .top_k = 64,
@@ -2125,10 +2117,11 @@ test "MetalBackend.supportsSchedulerBackendTopKStreamingRoute accepts penalized 
         .logit_bias = &.{.{ .token_id = 42, .bias = 1.5 }},
     };
 
-    try std.testing.expect(backend.supportsSchedulerBackendTopKStreamingRoute(&valid_cfg));
-    try std.testing.expect(!backend.supportsSchedulerBackendTopKStreamingRoute(&invalid_rep_penalty));
-    try std.testing.expect(!backend.supportsSchedulerBackendTopKStreamingRoute(&invalid_top_p));
-    try std.testing.expect(!backend.supportsSchedulerBackendTopKStreamingRoute(&invalid_logit_bias));
+    try std.testing.expect(backend.supportsSchedulerBackendStreamingRoute(&greedy_cfg));
+    try std.testing.expect(backend.supportsSchedulerBackendStreamingRoute(&valid_cfg));
+    try std.testing.expect(!backend.supportsSchedulerBackendStreamingRoute(&invalid_rep_penalty));
+    try std.testing.expect(!backend.supportsSchedulerBackendStreamingRoute(&invalid_top_p));
+    try std.testing.expect(!backend.supportsSchedulerBackendStreamingRoute(&invalid_logit_bias));
 }
 
 test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute allows safe greedy path" {
