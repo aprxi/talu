@@ -1369,20 +1369,14 @@ pub const MetalBackend = struct {
         return self.supportsTopKCandidateConfig(sampling_config);
     }
 
-    pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
-        self: *const MetalBackend,
-        sampling_config: *const sampling.SamplingConfig,
-    ) bool {
-        _ = self;
-        return sampling_policy.isTopKOrGreedyCandidateRoute(sampling_config, topk_route_candidate_capacity);
-    }
     pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
         self: *const MetalBackend,
         plan: *const shared_scheduler.SchedulerBatchedTopKRoutePlan,
     ) bool {
+        _ = self;
         _ = plan.route_top_k;
         // Keep this policy backend-owned and deterministic (no env toggle).
-        return self.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config);
+        return sampling_policy.isTopKOrGreedyCandidateRoute(plan.sampling_config, topk_route_candidate_capacity);
     }
 
     pub fn supportsSchedulerBackendInPlaceSamplingMutation(self: *const MetalBackend) bool {
@@ -2029,7 +2023,7 @@ fn routeTestBackend() MetalBackend {
     return backend;
 }
 
-test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute validates top_k bounds" {
+test "MetalBackend.shouldUseSchedulerBatchedTopKDecodeRoute validates top_k bounds" {
     var backend = routeTestBackend();
     const valid_cfg = sampling.SamplingConfig{
         .strategy = .top_k,
@@ -2044,9 +2038,21 @@ test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute validates top_
         .top_k = topk_route_candidate_capacity + 1,
     };
 
-    try std.testing.expect(backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&valid_cfg));
-    try std.testing.expect(!backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&zero_cfg));
-    try std.testing.expect(!backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&too_large_cfg));
+    try std.testing.expect(backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = 64,
+        .sampling_config = &valid_cfg,
+    }));
+    try std.testing.expect(!backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = 0,
+        .sampling_config = &zero_cfg,
+    }));
+    try std.testing.expect(!backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = topk_route_candidate_capacity + 1,
+        .sampling_config = &too_large_cfg,
+    }));
 }
 
 test "MetalBackend.shouldUseSchedulerTopKCandidateRoute allows safe greedy path" {
@@ -2134,7 +2140,7 @@ test "MetalBackend.supportsSchedulerBackendStreamingRoute accepts greedy and pen
     try std.testing.expect(!backend.supportsSchedulerBackendStreamingRoute(&invalid_logit_bias));
 }
 
-test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute allows safe greedy path" {
+test "MetalBackend.shouldUseSchedulerBatchedTopKDecodeRoute allows safe greedy path" {
     var backend = routeTestBackend();
     const greedy_ok = sampling.SamplingConfig{
         .strategy = .greedy,
@@ -2144,6 +2150,14 @@ test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute allows safe gr
         .logit_bias = &.{.{ .token_id = 42, .bias = -2.0 }},
     };
 
-    try std.testing.expect(backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&greedy_ok));
-    try std.testing.expect(!backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&greedy_with_logit_bias));
+    try std.testing.expect(backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = 1,
+        .sampling_config = &greedy_ok,
+    }));
+    try std.testing.expect(!backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = 1,
+        .sampling_config = &greedy_with_logit_bias,
+    }));
 }

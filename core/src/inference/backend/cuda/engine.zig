@@ -28,6 +28,7 @@ const attention_policy = @import("attention_policy.zig");
 const attention_mod = @import("attention_path.zig");
 const decode_mod = @import("decode.zig");
 const prefill_mod = @import("prefill.zig");
+const preflight = @import("route_preflight.zig");
 const cpu_backend = @import("../cpu/root.zig");
 const cuda_stage_capabilities = @import("stage_capabilities.zig");
 const cpu_stage_capabilities = @import("../cpu/stage_capabilities.zig");
@@ -2997,13 +2998,6 @@ pub const CudaBackend = struct {
         return false;
     }
 
-    pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
-        self: *const CudaBackend,
-        sampling_config: *const sampling_mod.SamplingConfig,
-    ) bool {
-        return supportsCudaTopKCandidateRoute(self, sampling_config);
-    }
-
     fn ensureDecodeMetricEvents(self: *CudaBackend) bool {
         if (self.topology_mode != .single) return false;
         if (!self.device.supportsEventTiming()) return false;
@@ -3099,20 +3093,20 @@ pub const CudaBackend = struct {
         candidate_ids_out: []u32,
         candidate_counts_out: []usize,
     ) !void {
-        if (batch_rows == 0) return error.InvalidArgument;
-        if (top_k == 0) return error.InvalidArgument;
-        if (candidate_counts_out.len < batch_rows) return error.InvalidArgument;
-        const total_candidates = std.math.mul(usize, batch_rows, top_k) catch return error.InvalidArgument;
-        if (candidate_logits_out.len < total_candidates or candidate_ids_out.len < total_candidates) {
-            return error.InvalidArgument;
-        }
+        const topk_shape = try preflight.requireTopKCandidateBuffers(
+            batch_rows,
+            top_k,
+            candidate_logits_out.len,
+            candidate_ids_out.len,
+            candidate_counts_out.len,
+            256,
+        );
 
         const vocab = self.runtime_buffers.projected_vocab;
         if (vocab == 0) return error.InvalidArgument;
         const per_row_count = @min(top_k, vocab);
         const logits_scaling = self.loaded.config.logits_scaling;
         if (logits_scaling <= 0.0) return error.UnsupportedModel;
-        if (top_k > 256) return error.InvalidArgument;
 
         const total_logits = std.math.mul(usize, batch_rows, vocab) catch return error.InvalidArgument;
         const total_logits_bytes = std.math.mul(usize, total_logits, @sizeOf(f32)) catch return error.InvalidArgument;
@@ -3185,9 +3179,8 @@ pub const CudaBackend = struct {
             topk_kernel_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
         }
 
-        const topk_total = std.math.mul(usize, batch_rows, top_k) catch return error.InvalidArgument;
-        const topk_total_logits = candidate_logits_out[0..topk_total];
-        const topk_total_ids = candidate_ids_out[0..topk_total];
+        const topk_total_logits = candidate_logits_out[0..topk_shape.total_candidates];
+        const topk_total_ids = candidate_ids_out[0..topk_shape.total_candidates];
         // Synchronize once before host candidate downloads. This avoids
         // issuing two stream synchronizations (values + ids) per decode step.
         if (self.device.launch_stream) |stream| {
@@ -3261,13 +3254,16 @@ pub const CudaBackend = struct {
         candidate_ids_out: []u32,
         candidate_counts_out: []usize,
     ) !void {
-        if (requests.len == 0) return error.InvalidArgument;
-        if (top_k == 0) return error.InvalidArgument;
-        if (top_k > 256) return error.InvalidArgument;
+        const topk_shape = try preflight.requireTopKCandidateBuffers(
+            requests.len,
+            top_k,
+            candidate_logits_out.len,
+            candidate_ids_out.len,
+            candidate_counts_out.len,
+            256,
+        );
         if (self.loaded.config.logits_scaling <= 0.0) return error.UnsupportedModel;
-        if (candidate_counts_out.len < requests.len) return error.InvalidArgument;
         if (requests.len == 1) {
-            if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
             const count = try self.decodeTopKCandidates(
                 requests[0].slot_index,
                 requests[0].token,
@@ -3278,12 +3274,7 @@ pub const CudaBackend = struct {
             candidate_counts_out[0] = count;
             return;
         }
-        const needed_candidates = std.math.mul(usize, requests.len, top_k) catch return error.InvalidArgument;
-        if (candidate_logits_out.len < needed_candidates or
-            candidate_ids_out.len < needed_candidates)
-        {
-            return error.InvalidArgument;
-        }
+        _ = topk_shape;
         const max_n = 128;
         if (requests.len > max_n) return error.InvalidArgument;
 
@@ -3291,21 +3282,15 @@ pub const CudaBackend = struct {
         var slot_indices_buf: [max_n]usize = undefined;
         var positions_buf: [max_n]usize = undefined;
         var raw_positions_buf: [max_n]usize = undefined;
-        for (requests, 0..) |req, i| {
-            if (!self.slotIndexSupported(req.slot_index) or !self.slot_in_use[req.slot_index]) {
-                return error.InvalidArgument;
-            }
-            try self.ensureSlotStateBlocksBoundForScheduler(req.slot_index);
-            const raw_position = self.slot_positions[req.slot_index];
-            const effective_position = try common_mrope.applyPositionDelta(
-                raw_position,
-                self.slot_rope_position_deltas[req.slot_index],
-            );
-            tokens_buf[i] = req.token;
-            slot_indices_buf[i] = req.slot_index;
-            positions_buf[i] = effective_position;
-            raw_positions_buf[i] = raw_position;
-        }
+        try preflight.prepareDecodeRowsWithRaw(
+            "decodeBatchTopKCandidates",
+            self,
+            requests,
+            tokens_buf[0..],
+            slot_indices_buf[0..],
+            positions_buf[0..],
+            raw_positions_buf[0..],
+        );
         self.computeBatchedDecodeLogitsDeviceOnly(
             tokens_buf[0..requests.len],
             slot_indices_buf[0..requests.len],
@@ -3325,15 +3310,6 @@ pub const CudaBackend = struct {
         };
         for (requests, 0..) |req, i| {
             self.slot_positions[req.slot_index] = raw_positions_buf[i] + 1;
-        }
-
-        // Greedy single-request fast path: avoid full-vocab top-k extraction
-        // when only one candidate is needed.
-        if (top_k == 1 and requests.len == 1) {
-            candidate_ids_out[0] = try self.selectNextTokenFromDeviceLogitsImpl();
-            candidate_logits_out[0] = 0.0;
-            candidate_counts_out[0] = 1;
-            return;
         }
 
         var topk_source_backend: *CudaBackend = self;
@@ -3358,12 +3334,9 @@ pub const CudaBackend = struct {
         candidate_logits_out: []f32,
         candidate_ids_out: []u32,
     ) !usize {
-        if (top_k == 0) return error.InvalidArgument;
-        if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
-        if (!self.slotIndexSupported(slot_index) or !self.slot_in_use[slot_index]) {
-            return error.InvalidArgument;
-        }
-        try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
+        try preflight.requireTopKCandidateRowBuffers(top_k, candidate_logits_out.len, candidate_ids_out.len, 256);
+        try preflight.requireStateBlocksBoundIfPresent(self, slot_index);
+        try preflight.requireSlotInUse("decodeTopKCandidates", self, slot_index);
 
         const raw_position = self.slot_positions[slot_index];
         const effective_position = try common_mrope.applyPositionDelta(
@@ -3772,33 +3745,7 @@ pub const CudaBackend = struct {
         logits_out: []f32,
     ) !void {
         if (vision_input == null) return self.prefillSlot(slot_index, tokens, logits_out);
-        try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
-
-        if (tokens.len == 0) {
-            log.warn("inference", "CUDA prefillSlotWithVision invalid args", .{
-                .reason = "empty_tokens",
-                .slot_index = slot_index,
-            });
-            return error.InvalidArgument;
-        }
-        if (logits_out.len != self.vocab_size) {
-            log.warn("inference", "CUDA prefillSlotWithVision invalid args", .{
-                .reason = "logits_len_mismatch",
-                .slot_index = slot_index,
-                .logits_len = logits_out.len,
-                .vocab_size = self.vocab_size,
-            });
-            return error.InvalidArgument;
-        }
-        if (!self.slot_in_use[slot_index] or !self.slotIndexSupported(slot_index)) {
-            log.warn("inference", "CUDA prefillSlotWithVision invalid args", .{
-                .reason = "slot_state",
-                .slot_index = slot_index,
-                .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[slot_index])),
-            });
-            return error.InvalidArgument;
-        }
-        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+        try preflight.requirePrefillSlotRequest("prefillSlotWithVision", self, slot_index, tokens, logits_out.len);
 
         const vision = if (self.vision_runtime) |*rt|
             rt

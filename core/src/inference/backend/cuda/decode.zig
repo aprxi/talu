@@ -4,15 +4,8 @@ const std = @import("std");
 const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
 const log = @import("log_pkg");
+const preflight = @import("route_preflight.zig");
 const trace = @import("xray_pkg").trace;
-
-fn slotIndexSupported(self: anytype, slot_index: usize) bool {
-    const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "slotIndexSupported")) return self.slotIndexSupported(slot_index);
-    if (comptime @hasField(SelfType, "max_batch_size")) return slot_index < self.max_batch_size;
-    if (comptime @hasDecl(SelfType, "max_batch_size")) return slot_index < SelfType.max_batch_size;
-    return slot_index == 0;
-}
 
 fn markDecodePointerTablesDirty(self: anytype) void {
     const SelfType = @TypeOf(self.*);
@@ -33,18 +26,7 @@ fn markDecodePointerTablesDirty(self: anytype) void {
 pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !void {
     const prev_backend = trace.setBackendContext(.cuda);
     defer _ = trace.setBackendContext(prev_backend);
-    const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
-        try self.ensureSlotStateBlocksBoundForScheduler(0);
-    }
-    if (logits_out.len != self.vocab_size) {
-        log.warn("inference", "CUDA decode invalid args", .{
-            .reason = "logits_len_mismatch",
-            .logits_len = logits_out.len,
-            .vocab_size = self.vocab_size,
-        });
-        return error.InvalidArgument;
-    }
+    try preflight.requireDecodeRequest("decode", self, 0, logits_out.len);
     const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[0]);
     try self.executeDecode(token, effective_position, logits_out);
     trace.emitFinal(
@@ -68,30 +50,9 @@ pub fn decodeBatch(
     const prev_backend = trace.setBackendContext(.cuda);
     defer _ = trace.setBackendContext(prev_backend);
     const SelfType = @TypeOf(self.*);
-    if (results.len < requests.len) {
-        log.warn("inference", "CUDA decodeBatch invalid args", .{
-            .reason = "results_short",
-            .requests = requests.len,
-            .results = results.len,
-        });
-        return error.InvalidArgument;
-    }
+    try preflight.requireDecodeBatchResultCapacity("decodeBatch", requests.len, results.len);
     if (requests.len == 0) return;
-
-    // Validate all slots upfront.
-    for (requests) |req| {
-        if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
-            try self.ensureSlotStateBlocksBoundForScheduler(req.slot_index);
-        }
-        if (!self.slot_in_use[req.slot_index] or !slotIndexSupported(self, req.slot_index)) {
-            log.warn("inference", "CUDA decodeBatch invalid args", .{
-                .reason = "slot_state",
-                .slot_index = req.slot_index,
-                .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[req.slot_index])),
-            });
-            return error.InvalidArgument;
-        }
-    }
+    try preflight.requireDecodeRows("decodeBatch", self, requests);
 
     // Canonical path: use batched decode implementation for all batch sizes,
     // including N=1, so decode behavior stays on one route.
@@ -102,13 +63,7 @@ pub fn decodeBatch(
         var tokens_buf: [max_n]u32 = undefined;
         var slot_indices_buf: [max_n]usize = undefined;
         var positions_buf: [max_n]usize = undefined;
-        for (requests, 0..) |req, i| {
-            const position = self.slot_positions[req.slot_index];
-            const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[req.slot_index]);
-            tokens_buf[i] = req.token;
-            slot_indices_buf[i] = req.slot_index;
-            positions_buf[i] = effective_position;
-        }
+        try preflight.fillDecodeRows(self, requests, tokens_buf[0..], slot_indices_buf[0..], positions_buf[0..]);
         self.computeBatchedDecodeLogits(
             tokens_buf[0..requests.len],
             slot_indices_buf[0..requests.len],
@@ -229,7 +184,7 @@ pub fn allocSlot(self: anytype) ?usize {
 
 pub fn freeSlot(self: anytype, slot_index: usize) void {
     const SelfType = @TypeOf(self.*);
-    if (!slotIndexSupported(self, slot_index)) return;
+    if (!preflight.slotIndexSupported(self, slot_index)) return;
     self.slot_in_use[slot_index] = false;
     self.slot_positions[slot_index] = 0;
     self.slot_rope_position_deltas[slot_index] = 0;
@@ -240,14 +195,14 @@ pub fn freeSlot(self: anytype, slot_index: usize) void {
 }
 
 pub fn resetSlot(self: anytype, slot_index: usize) void {
-    if (!slotIndexSupported(self, slot_index)) return;
+    if (!preflight.slotIndexSupported(self, slot_index)) return;
     self.slot_positions[slot_index] = 0;
     self.slot_rope_position_deltas[slot_index] = 0;
     markDecodePointerTablesDirty(self);
 }
 
 pub fn getPosition(self: anytype, slot_index: usize) usize {
-    if (!slotIndexSupported(self, slot_index)) return 0;
+    if (!preflight.slotIndexSupported(self, slot_index)) return 0;
     return self.slot_positions[slot_index];
 }
 

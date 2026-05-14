@@ -2,38 +2,13 @@
 
 const std = @import("std");
 const log = @import("log_pkg");
+const preflight = @import("route_preflight.zig");
 const trace = @import("xray_pkg").trace;
-
-fn slotIndexSupported(self: anytype, slot_index: usize) bool {
-    const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "slotIndexSupported")) return self.slotIndexSupported(slot_index);
-    if (comptime @hasField(SelfType, "max_batch_size")) return slot_index < self.max_batch_size;
-    if (comptime @hasDecl(SelfType, "max_batch_size")) return slot_index < SelfType.max_batch_size;
-    return slot_index == 0;
-}
 
 pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     const prev_backend = trace.setBackendContext(.cuda);
     defer _ = trace.setBackendContext(prev_backend);
-    const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
-        try self.ensureSlotStateBlocksBoundForScheduler(0);
-    }
-    if (tokens.len == 0) {
-        log.warn("inference", "CUDA prefill invalid args", .{
-            .reason = "empty_tokens",
-        });
-        return error.InvalidArgument;
-    }
-    if (logits_out.len != self.vocab_size) {
-        log.warn("inference", "CUDA prefill invalid args", .{
-            .reason = "logits_len_mismatch",
-            .logits_len = logits_out.len,
-            .vocab_size = self.vocab_size,
-        });
-        return error.InvalidArgument;
-    }
-    if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+    try preflight.requirePrefillRequest("prefill", self, tokens, logits_out.len);
     self.slot_rope_position_deltas[0] = 0;
     try self.beginParityPrefillCapture(tokens.len);
     defer self.endParityPrefillCapture();
@@ -81,34 +56,7 @@ pub fn prefillSlot(
     const prev_backend = trace.setBackendContext(.cuda);
     defer _ = trace.setBackendContext(prev_backend);
     const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
-        try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
-    }
-    if (tokens.len == 0) {
-        log.warn("inference", "CUDA prefillSlot invalid args", .{
-            .reason = "empty_tokens",
-            .slot_index = slot_index,
-        });
-        return error.InvalidArgument;
-    }
-    if (logits_out.len != self.vocab_size) {
-        log.warn("inference", "CUDA prefillSlot invalid args", .{
-            .reason = "logits_len_mismatch",
-            .slot_index = slot_index,
-            .logits_len = logits_out.len,
-            .vocab_size = self.vocab_size,
-        });
-        return error.InvalidArgument;
-    }
-    if (!self.slot_in_use[slot_index] or !slotIndexSupported(self, slot_index)) {
-        log.warn("inference", "CUDA prefillSlot invalid args", .{
-            .reason = "slot_state",
-            .slot_index = slot_index,
-            .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[slot_index])),
-        });
-        return error.InvalidArgument;
-    }
-    if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+    try preflight.requirePrefillSlotRequest("prefillSlot", self, slot_index, tokens, logits_out.len);
     self.slot_rope_position_deltas[slot_index] = 0;
     if (comptime @hasDecl(SelfType, "activateKvSlot")) {
         self.activateKvSlot(slot_index);
@@ -203,7 +151,7 @@ const MockBackend = struct {
 
     fn ensureSlotStateBlocksBoundForScheduler(self: *MockBackend, slot_index: usize) !void {
         self.ensure_state_binding_calls += 1;
-        if (!slotIndexSupported(self, slot_index)) return error.InvalidArgument;
+        if (!preflight.slotIndexSupported(self, slot_index)) return error.InvalidArgument;
         if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
     }
 

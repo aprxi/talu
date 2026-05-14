@@ -562,23 +562,6 @@ pub const Backend = union(enum) {
         };
     }
 
-    pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
-        self: *const Backend,
-        sampling_config: *const cpu.sampling.SamplingConfig,
-    ) bool {
-        return switch (self.*) {
-            .cpu => false,
-            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
-                b.supportsSchedulerBackendBatchedTopKDecodeRoute(sampling_config)
-            else
-                false,
-            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
-                b.supportsSchedulerBackendBatchedTopKDecodeRoute(sampling_config)
-            else
-                false,
-        };
-    }
-
     pub fn shouldUseSchedulerBatchedTopKDecodeRoute(
         self: *const Backend,
         plan: *const shared_scheduler.SchedulerBatchedTopKRoutePlan,
@@ -587,14 +570,10 @@ pub const Backend = union(enum) {
             .cpu => false,
             .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute"))
                 b.shouldUseSchedulerBatchedTopKDecodeRoute(plan)
-            else if (has_metal)
-                plan.decode_batch_size >= 2 and b.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config)
             else
                 false,
             .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute"))
                 b.shouldUseSchedulerBatchedTopKDecodeRoute(plan)
-            else if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
-                plan.decode_batch_size >= 2 and b.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config)
             else
                 false,
         };
@@ -1744,16 +1723,20 @@ test "shouldUseSchedulerTopKCandidateRoute: cuda disabled" {
     }));
 }
 
-test "supportsSchedulerBackendBatchedTopKDecodeRoute: cpu disabled" {
+test "shouldUseSchedulerBatchedTopKDecodeRoute: cpu disabled" {
     const cpu_backend: Backend = .{ .cpu = undefined };
     const sampling_config = cpu.sampling.SamplingConfig{
         .strategy = .top_k,
         .top_k = 40,
     };
-    try std.testing.expectEqual(false, cpu_backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&sampling_config));
+    try std.testing.expectEqual(false, cpu_backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = 40,
+        .sampling_config = &sampling_config,
+    }));
 }
 
-test "supportsSchedulerBackendBatchedTopKDecodeRoute: metal delegated" {
+test "shouldUseSchedulerBatchedTopKDecodeRoute: metal delegated" {
     if (!has_metal) return;
     const metal_backend: Backend = .{ .metal = undefined };
     const valid_sampling = cpu.sampling.SamplingConfig{
@@ -1764,8 +1747,16 @@ test "supportsSchedulerBackendBatchedTopKDecodeRoute: metal delegated" {
         .strategy = .top_k,
         .top_k = 0,
     };
-    try std.testing.expect(metal_backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&valid_sampling));
-    try std.testing.expect(!metal_backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&invalid_sampling));
+    try std.testing.expect(metal_backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = 64,
+        .sampling_config = &valid_sampling,
+    }));
+    try std.testing.expect(!metal_backend.shouldUseSchedulerBatchedTopKDecodeRoute(&.{
+        .decode_batch_size = 1,
+        .route_top_k = 0,
+        .sampling_config = &invalid_sampling,
+    }));
 }
 
 test "metal module surface keeps runtime graph internals private" {

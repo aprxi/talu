@@ -1774,7 +1774,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             defer self.allocator.free(candidate_ids);
             const use_batched_topk_single = comptime blk: {
                 if (!@hasDecl(BackendType, "decodeBatchTopKCandidates")) break :blk false;
-                if (!@hasDecl(BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute")) break :blk false;
+                if (!@hasDecl(BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute")) break :blk false;
                 break :blk true;
             };
             const use_topk_candidate_sampling_single = comptime blk: {
@@ -1782,11 +1782,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKCandidateSamplingRoute")) break :blk false;
                 break :blk true;
             };
-            const can_use_batched_topk_single = use_batched_topk_single and
-                self.backend.supportsSchedulerBackendBatchedTopKDecodeRoute(sampling_config);
             const can_use_topk_candidate_sampling_single = use_topk_candidate_sampling_single and
                 self.backend.supportsSchedulerBackendTopKCandidateSamplingRoute(sampling_config);
-            const use_batched_topk_for_single = can_use_batched_topk_single and
+            const use_batched_topk_for_single = use_batched_topk_single and
                 self.backendAllowsBatchedTopKRoute(&.{
                     .decode_batch_size = 1,
                     .route_top_k = max_candidate_count,
@@ -3976,17 +3974,6 @@ const MockStreamingBackend = struct {
             sampling_config.min_p == 0.0;
     }
 
-    fn supportsSchedulerBackendBatchedTopKDecodeRoute(
-        self: *const MockStreamingBackend,
-        sampling_config: *const sampling.SamplingConfig,
-    ) bool {
-        if (!self.allow_batched_top_k_decode_route) return false;
-        return sampling_config.strategy == .top_k and
-            sampling_config.top_k > 0 and
-            sampling_config.temperature > 0.0 and
-            sampling_config.min_p == 0.0;
-    }
-
     fn supportsSchedulerBackendStreamingRoute(
         self: *const MockStreamingBackend,
         sampling_config: *const sampling.SamplingConfig,
@@ -4010,7 +3997,11 @@ const MockStreamingBackend = struct {
         plan: *const SchedulerBatchedTopKRoutePlan,
     ) bool {
         _ = plan.route_top_k;
-        if (!self.supportsSchedulerBackendBatchedTopKDecodeRoute(plan.sampling_config)) return false;
+        if (!self.allow_batched_top_k_decode_route) return false;
+        if (!(plan.sampling_config.strategy == .top_k and
+            plan.sampling_config.top_k > 0 and
+            plan.sampling_config.temperature > 0.0 and
+            plan.sampling_config.min_p == 0.0)) return false;
         if (plan.decode_batch_size >= 2) return true;
         return self.allow_single_row_batched_top_k_decode_route;
     }
