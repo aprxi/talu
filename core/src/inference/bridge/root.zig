@@ -14,6 +14,7 @@ pub const host_capability = @import("host_capability.zig");
 pub const staged_error = @import("staged_error.zig");
 pub const local_stage_runner = @import("local_stage_runner.zig");
 pub const boundary_byte_image = @import("boundary_byte_image.zig");
+pub const stage_frame_header = @import("stage_frame_header.zig");
 
 pub const BoundaryDType = pipeline.BoundaryDType;
 pub const BoundaryByteImageContractVersion = boundary_byte_image.BoundaryByteImageContractVersion;
@@ -25,6 +26,12 @@ pub const BoundaryByteImageValidationOptions = boundary_byte_image.BoundaryByteI
 pub const BoundaryLayout = pipeline.BoundaryLayout;
 pub const BoundaryNegotiationRequest = pipeline.BoundaryNegotiationRequest;
 pub const BoundaryNegotiationResult = pipeline.BoundaryNegotiationResult;
+pub const stage_frame_header_magic = stage_frame_header.stage_frame_header_magic;
+pub const stage_frame_header_contract_version = stage_frame_header.stage_frame_header_contract_version;
+pub const stage_frame_header_encoded_len = stage_frame_header.stage_frame_header_encoded_len;
+pub const StageFrameHeaderError = stage_frame_header.StageFrameHeaderError;
+pub const StageFrameHeaderOptions = stage_frame_header.StageFrameHeaderOptions;
+pub const StageFrameHeader = stage_frame_header.StageFrameHeader;
 pub const negotiateBoundaryContract = pipeline.negotiateBoundaryContract;
 
 pub const ActivationFrameArgs = tensor_frame.ActivationFrameArgs;
@@ -224,6 +231,10 @@ pub const validateStagedFailure = staged_error.validateStagedFailure;
 pub const validateLocalStageRunnerPlanRef = local_stage_runner.validateLocalStageRunnerPlanRef;
 pub const validateBoundaryByteImage = boundary_byte_image.validateBoundaryByteImage;
 pub const boundaryByteImageIsRemoteReadable = boundary_byte_image.boundaryByteImageIsRemoteReadable;
+pub const stageFrameHeaderFromMetadata = stage_frame_header.stageFrameHeaderFromMetadata;
+pub const encodeStageFrameHeader = stage_frame_header.encodeStageFrameHeader;
+pub const decodeStageFrameHeader = stage_frame_header.decodeStageFrameHeader;
+pub const validateStageFrameHeaderForMetadata = stage_frame_header.validateStageFrameHeaderForMetadata;
 
 test "inference bridge root exports state_ownership contract" {
     _ = state_ownership.StageStateOwnershipPlan;
@@ -272,4 +283,18 @@ test "inference bridge root exports boundary_byte_image contract" {
     _ = BoundaryByteImageValidationOptions;
     _ = validateBoundaryByteImage;
     _ = boundaryByteImageIsRemoteReadable;
+}
+
+test "inference bridge root exports stage_frame_header contract" {
+    _ = stage_frame_header.StageFrameHeader;
+    _ = StageFrameHeader;
+    _ = StageFrameHeaderError;
+    _ = StageFrameHeaderOptions;
+    _ = stage_frame_header_magic;
+    _ = stage_frame_header_contract_version;
+    _ = stage_frame_header_encoded_len;
+    _ = stageFrameHeaderFromMetadata;
+    _ = encodeStageFrameHeader;
+    _ = decodeStageFrameHeader;
+    _ = validateStageFrameHeaderForMetadata;
 }
