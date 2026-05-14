@@ -34,7 +34,8 @@ const scheduler_contracts = @import("../../scheduler/contracts.zig");
 const FusedCpuBackend = cpu_engine.FusedCpuBackend;
 const DecodeRequest = contract.DecodeRequest;
 const DecodeResult = contract.DecodeResult;
-const sampling = @import("sampling.zig");
+const sampling = @import("../../sampling.zig");
+const sampling_policy = sampling.policy;
 const log = @import("log_pkg");
 const validate = @import("validate_pkg");
 const runtime_contract = @import("runtime_contract_pkg");
@@ -495,12 +496,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const working_logits = self.logits_buffer[0..candidate_logits.len];
             @memcpy(working_logits, candidate_logits);
 
-            // Apply sampling penalties to the candidate subset. Penalties only
+            // Apply sampling mutations to the candidate subset. Penalties only
             // affect tokens present in context — for top-k candidates (k ≤ 256)
             // this is exact for all tokens that could be sampled. The only
             // theoretical gap is promoting a non-top-k token above all candidates,
             // which is vanishingly unlikely with reasonable penalty values.
-            applyCandidatePenalties(working_logits, candidate_ids, sampling_config);
+            try sampling_policy.applyCandidateLogitMutations(working_logits, candidate_ids, &sampling_config);
 
             var candidate_sampling = sampling_config;
             candidate_sampling.top_k = @min(candidate_sampling.top_k, candidate_logits.len);
@@ -778,22 +779,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
         }
 
-        /// Returns true when greedy-streaming / argmax routes cannot honour
-        /// the requested sampling adjustments (they bypass the sampler entirely).
-        /// The top-k candidate route handles these via applyCandidatePenalties.
-        fn samplingRequiresFullLogits(sampling_cfg: sampling.SamplingConfig) bool {
-            return sampling_cfg.repetition_penalty != 1.0 or
-                sampling_cfg.presence_penalty != 0.0 or
-                sampling_cfg.frequency_penalty != 0.0 or
-                sampling_cfg.logit_bias != null;
-        }
-
-        fn canUseDirectGreedyCandidate(sampling_cfg: sampling.SamplingConfig, candidate_count: usize) bool {
-            if (candidate_count == 0) return false;
-            if (sampling_cfg.strategy != .greedy) return false;
-            return !samplingRequiresFullLogits(sampling_cfg);
-        }
-
         fn defaultSingleDecodeRouteFromPlan(plan: *const SchedulerSingleDecodeRoutePlan) SchedulerSingleDecodeRoute {
             if (plan.greedy_streaming_semantic_eligible and plan.greedy_streaming_backend_supported) return .greedy_streaming;
             if (plan.top_k_streaming_semantic_eligible and plan.top_k_streaming_backend_supported) return .top_k_streaming;
@@ -830,54 +815,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return host_elapsed_ns;
         }
 
-        /// Apply repetition, presence, frequency penalties and logit bias to
-        /// the top-k candidate logits in-place. For each candidate token,
-        /// scan context_tokens to compute occurrence count, then apply the
-        /// same transformations as sampleMut/applyIndexPenalty/applyAdditivePenalties.
-        fn applyCandidatePenalties(
-            working_logits: []f32,
-            candidate_ids: []const u32,
-            cfg: sampling.SamplingConfig,
-        ) void {
-            // Repetition penalty (multiplicative, per-token in context).
-            if (cfg.repetition_penalty != 1.0) {
-                if (cfg.context_tokens) |ctx| {
-                    for (ctx) |ctx_id| {
-                        for (candidate_ids, 0..) |cand_id, idx| {
-                            if (cand_id == ctx_id) {
-                                const s = working_logits[idx];
-                                working_logits[idx] = if (s > 0) s / cfg.repetition_penalty else s * cfg.repetition_penalty;
-                            }
-                        }
-                    }
-                }
-            }
-            // Presence + frequency penalties (additive, once/count per unique token).
-            if (cfg.presence_penalty != 0.0 or cfg.frequency_penalty != 0.0) {
-                if (cfg.context_tokens) |ctx| {
-                    for (candidate_ids, 0..) |cand_id, idx| {
-                        var count: f32 = 0;
-                        for (ctx) |ctx_id| {
-                            if (ctx_id == cand_id) count += 1;
-                        }
-                        if (count > 0) {
-                            working_logits[idx] -= cfg.presence_penalty + cfg.frequency_penalty * count;
-                        }
-                    }
-                }
-            }
-            // Logit bias (additive, per bias entry).
-            if (cfg.logit_bias) |bias_entries| {
-                for (bias_entries) |entry| {
-                    for (candidate_ids, 0..) |cand_id, idx| {
-                        if (cand_id == entry.token_id) {
-                            working_logits[idx] += entry.bias;
-                        }
-                    }
-                }
-            }
-        }
-
         fn resolveBatchedTopKRoute(self: *Self, decode_batch_size: usize) ?usize {
             const use_batched_topk = comptime blk: {
                 if (!@hasDecl(BackendType, "decodeBatchTopKCandidates")) break :blk false;
@@ -900,20 +837,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (request_entry.slot_index == null or request_entry.slot_index.? != req.slot_index) return null;
                 if (request_entry.grammar_sampler != null) return null;
                 if (request_entry.capture_final_logits) return null;
-                const route_top_k = switch (request_entry.sampling_config.strategy) {
-                    .top_k => blk: {
-                        if (request_entry.sampling_config.top_k == 0 or request_entry.sampling_config.top_k > 256) {
-                            return null;
-                        }
-                        break :blk request_entry.sampling_config.top_k;
-                    },
-                    .greedy => blk: {
-                        // Greedy can use the same candidate route with k=1, but
-                        // only when no sampling mutations are requested.
-                        if (samplingRequiresFullLogits(request_entry.sampling_config)) return null;
-                        break :blk @as(usize, 1);
-                    },
-                    else => return null,
+                if (!sampling_policy.isTopKOrGreedyCandidateRoute(&request_entry.sampling_config, 256)) return null;
+                const route_top_k: usize = switch (request_entry.sampling_config.strategy) {
+                    .top_k => request_entry.sampling_config.top_k,
+                    .greedy => 1,
+                    else => unreachable,
                 };
                 const plan = SchedulerBatchedTopKRoutePlan{
                     .decode_batch_size = decode_batch_size,
@@ -988,7 +916,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 const row_end = std.math.add(usize, row_start, candidate_count) catch return error.InvalidArgument;
                 var sample_cfg = request_entry.sampling_config;
                 sample_cfg.context_tokens = request_entry.generated_tokens.items;
-                var next_token: u32 = if (canUseDirectGreedyCandidate(sample_cfg, candidate_count))
+                var next_token: u32 = if (sampling_policy.canUseDirectGreedyCandidate(sample_cfg, candidate_count))
                     self.decode_candidate_ids[row_start]
                 else
                     self.sampleTopKCandidateToken(
@@ -1201,8 +1129,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     if (topk_request) |request_entry| {
                         const topk_candidate_semantic_eligible = request_entry.grammar_sampler == null and
                             !request_entry.capture_final_logits and
-                            request_entry.sampling_config.top_k > 0 and
-                            request_entry.sampling_config.top_k <= 256;
+                            sampling_policy.isTopKOrGreedyCandidateRoute(&request_entry.sampling_config, 256);
 
                         const planned_route = self.backendPlanSingleDecodeRoute(&.{
                             .sampling_config = &request_entry.sampling_config,
@@ -1463,7 +1390,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Sample from the K candidates (penalties applied to K entries only).
             var sample_cfg = request_entry.sampling_config;
             sample_cfg.context_tokens = request_entry.generated_tokens.items;
-            var next_token: u32 = if (canUseDirectGreedyCandidate(sample_cfg, candidate_count))
+            var next_token: u32 = if (sampling_policy.canUseDirectGreedyCandidate(sample_cfg, candidate_count))
                 candidate_ids_buf[0]
             else
                 try self.sampleTopKCandidateToken(
@@ -1672,7 +1599,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 } else {
                     var sample_cfg = re.sampling_config;
                     sample_cfg.context_tokens = re.generated_tokens.items;
-                    next_token = if (canUseDirectGreedyCandidate(sample_cfg, count))
+                    next_token = if (sampling_policy.canUseDirectGreedyCandidate(sample_cfg, count))
                         candidate_ids[0]
                     else
                         try self.sampleTopKCandidateToken(
@@ -1900,8 +1827,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             };
             // Greedy streaming uses argmax without any sampler — penalties cannot
             // be applied. The top-k candidate route handles penalties via
-            // applyCandidatePenalties, so it doesn't need this gate.
-            const has_sampling_adjustments = samplingRequiresFullLogits(effective_sampling);
+            // candidate-logit mutation, so it doesn't need this gate.
+            const has_sampling_adjustments = sampling_policy.hasLogitMutations(effective_sampling);
             const backend_supports_greedy_streaming = comptime blk: {
                 if (!@hasDecl(BackendType, "supportsSchedulerBackendDecodeStreamingRoute")) break :blk false;
                 break :blk true;
@@ -1945,6 +1872,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 submit_config.vision_input == null and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
+                sampling_policy.isTopKOrGreedyCandidateRoute(&effective_sampling, 256) and
                 backend_has_top_k_candidates;
 
             const planned_route = self.backendPlanSingleDecodeRoute(&.{
@@ -2786,7 +2714,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 topk_sample_cfg.context_tokens = generated.items;
                 const use_backend_penalty_path = can_use_topk_candidate_sampling_single and
-                    samplingRequiresFullLogits(topk_sample_cfg) and
+                    sampling_policy.hasLogitMutations(topk_sample_cfg) and
                     topk_sample_cfg.logit_bias == null;
                 // Run forward pass (updates KV cache with current_token).
                 var candidate_count: usize = 0;
@@ -2836,7 +2764,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     }
                 } else {
                     // Normal sampling.
-                    current_token = if (canUseDirectGreedyCandidate(topk_sample_cfg, candidate_count))
+                    current_token = if (sampling_policy.canUseDirectGreedyCandidate(topk_sample_cfg, candidate_count))
                         candidate_ids[0]
                     else if (use_backend_penalty_path)
                         try self.sampleTopKCandidateTokenPrePenalized(
@@ -5157,7 +5085,7 @@ test "generateSync uses top-k candidate route with additive penalties" {
     });
     defer result.deinit(alloc);
 
-    // Top-k route handles penalties via applyCandidatePenalties.
+    // Top-k route handles penalties via candidate-logit mutation.
     try std.testing.expect(backend.decode_top_k_calls > 0);
     try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
     try std.testing.expectEqual(@as(usize, 3), result.tokens.len);
@@ -5323,7 +5251,7 @@ test "generateSync uses top-k candidate route with logit bias" {
     });
     defer result.deinit(alloc);
 
-    // Top-k route handles logit bias via applyCandidatePenalties.
+    // Top-k route handles logit bias via candidate-logit mutation.
     try std.testing.expect(backend.decode_top_k_calls > 0);
     try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
     try std.testing.expectEqual(@as(usize, 3), result.tokens.len);

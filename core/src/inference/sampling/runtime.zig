@@ -10,7 +10,8 @@ const cpu_softmax = compute.cpu.softmax;
 const cpu_sampling_ops = compute.cpu.sampling_ops;
 const cpu_topk = compute.cpu.topk;
 const cpu_reduction = compute.cpu.reduction;
-const sampling_contracts = @import("../../sampling/contracts.zig");
+const sampling_contracts = @import("contracts.zig");
+const sampling_policy = @import("policy.zig");
 
 pub const SamplingStrategy = sampling_contracts.SamplingStrategy;
 pub const LogitBiasEntry = sampling_contracts.LogitBiasEntry;
@@ -89,30 +90,7 @@ pub const Sampler = struct {
     /// Sample from mutable logits with repetition penalty and logit bias support.
     /// Modifies logits in-place to apply penalties and biases before sampling.
     pub fn sampleMut(self: *Sampler, logits: []f32, config: SamplingConfig) !usize {
-        // Apply repetition penalty if configured
-        if (config.repetition_penalty != 1.0) {
-            if (config.context_tokens) |tokens| {
-                cpu_sampling_ops.applyIndexPenalty(logits, tokens, config.repetition_penalty);
-            }
-        }
-
-        // Apply logit bias if configured
-        if (config.logit_bias) |bias_entries| {
-            cpu_sampling_ops.applyIndexBias(logits, bias_entries);
-        }
-
-        // Apply additive penalties (presence + frequency) if configured
-        if (config.presence_penalty != 0.0 or config.frequency_penalty != 0.0) {
-            if (config.context_tokens) |tokens| {
-                cpu_sampling_ops.applyAdditivePenalties(
-                    logits,
-                    tokens,
-                    config.presence_penalty,
-                    config.frequency_penalty,
-                );
-            }
-        }
-
+        sampling_policy.applyLogitMutations(logits, &config);
         return self.sampleImpl(logits, config);
     }
 
@@ -161,10 +139,7 @@ pub const Sampler = struct {
         if (logits.len == 0) return error.InvalidInput;
         if (logits.len > self.workspace.probabilities.len) return error.InvalidInput;
 
-        // Validate sampling parameters
-        if (config.temperature < 0) return error.InvalidTemperature;
-        if (config.top_p < 0 or config.top_p > 1.0) return error.InvalidTopP;
-        if (config.min_p < 0 or config.min_p > 1.0) return error.InvalidMinP;
+        try sampling_policy.validateSamplerConfigBounds(&config);
 
         if (config.strategy == .greedy) {
             const selected_index = cpu_reduction.argmaxIndex(logits);
@@ -316,11 +291,13 @@ pub const Sampler = struct {
     }
 };
 
+pub const sample = Sampler.sample;
+
 fn byProbabilityDesc(_: void, a: IndexValue, b: IndexValue) bool {
     return cpu_topk.byValueDesc({}, a, b);
 }
 
-test "sample greedy picks max" {
+test "inference sampling sample greedy picks max" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1, 16);
     defer sampler_state.deinit();
     const config = SamplingConfig{ .strategy = .greedy };
@@ -337,7 +314,7 @@ test "sample greedy picks max" {
     }
 }
 
-test "sample top_k limits choices" {
+test "inference sampling sample top_k limits choices" {
     var sampler_state = try Sampler.init(std.testing.allocator, 123, 16);
     defer sampler_state.deinit();
     const logits = [_]f32{ 10.0, 9.0, 1.0 };
@@ -348,7 +325,7 @@ test "sample top_k limits choices" {
     }
 }
 
-test "sample top_k applies top_p cutoff" {
+test "inference sampling sample top_k applies top_p cutoff" {
     var sampler_state = try Sampler.init(std.testing.allocator, 321, 16);
     defer sampler_state.deinit();
 
@@ -377,7 +354,7 @@ test "sample top_k applies top_p cutoff" {
 
 // Test top_p sampling with cumulative probability cutoff at 0.9.
 // Should only sample from tokens whose cumulative probability <= 0.9.
-test "sample top_p cutoff" {
+test "inference sampling sample top_p cutoff" {
     var sampler_state = try Sampler.init(std.testing.allocator, 42, 16);
     defer sampler_state.deinit();
 
@@ -398,7 +375,7 @@ test "sample top_p cutoff" {
     try std.testing.expectEqual(@as(usize, 0), counts[3]);
 }
 
-test "sample top_p with p=1.0 includes all" {
+test "inference sampling sample top_p with p=1.0 includes all" {
     var sampler_state = try Sampler.init(std.testing.allocator, 456, 16);
     defer sampler_state.deinit();
 
@@ -419,7 +396,7 @@ test "sample top_p with p=1.0 includes all" {
 }
 
 // Test top_p with very small p value (should sample only top token).
-test "sample top_p with very small p" {
+test "inference sampling sample top_p with very small p" {
     var sampler_state = try Sampler.init(std.testing.allocator, 789, 16);
     defer sampler_state.deinit();
 
@@ -437,7 +414,7 @@ test "sample top_p with very small p" {
 // Temperature scaling tests
 // ----------------------------------------------------------------------------
 
-test "sample high temperature uniform" {
+test "inference sampling sample high temperature uniform" {
     var sampler_state = try Sampler.init(std.testing.allocator, 111, 16);
     defer sampler_state.deinit();
 
@@ -464,7 +441,7 @@ test "sample high temperature uniform" {
 
 // Test that low temperature makes distribution more peaked (greedy-like).
 // At temperature → 0, should always pick the argmax.
-test "sample low temperature peaked" {
+test "inference sampling sample low temperature peaked" {
     var sampler_state = try Sampler.init(std.testing.allocator, 222, 16);
     defer sampler_state.deinit();
 
@@ -484,7 +461,7 @@ test "sample low temperature peaked" {
 }
 
 // Test temperature = 1.0 produces expected softmax distribution.
-test "sample temperature 1.0 standard softmax" {
+test "inference sampling sample temperature 1.0 standard softmax" {
     var sampler_state = try Sampler.init(std.testing.allocator, 333, 16);
     defer sampler_state.deinit();
 
@@ -509,7 +486,7 @@ test "sample temperature 1.0 standard softmax" {
 
 // Test that repetition penalty reduces probability of repeated tokens.
 // Penalty > 1.0 should discourage tokens in context.
-test "sample repetition penalty" {
+test "inference sampling sample repetition penalty" {
     var sampler_state = try Sampler.init(std.testing.allocator, 444, 16);
     defer sampler_state.deinit();
 
@@ -539,7 +516,7 @@ test "sample repetition penalty" {
 
 // Test repetition penalty with positive and negative logits.
 // Positive logits are divided by penalty, negative logits are multiplied.
-test "sample repetition penalty positive negative" {
+test "inference sampling sample repetition penalty positive negative" {
     var logits = [_]f32{ 2.0, -2.0, 1.0, -1.0 };
     const context_tokens = [_]u32{ 0, 1 };
     const penalty: f32 = 2.0;
@@ -558,7 +535,7 @@ test "sample repetition penalty positive negative" {
 }
 
 // Test that repetition penalty = 1.0 has no effect.
-test "sample repetition penalty 1.0 noop" {
+test "inference sampling sample repetition penalty 1.0 noop" {
     var logits = [_]f32{ 2.0, 1.0, 0.5, -1.0 };
     const original_logits = logits;
     const context_tokens = [_]u32{ 0, 1, 2 };
@@ -572,7 +549,7 @@ test "sample repetition penalty 1.0 noop" {
     }
 }
 
-test "sampleMut modifies logits in place" {
+test "inference sampling sampleMut modifies logits in place" {
     var sampler_state = try Sampler.init(std.testing.allocator, 5555, 16);
     defer sampler_state.deinit();
 
@@ -611,7 +588,7 @@ test "sampleMut modifies logits in place" {
 // ----------------------------------------------------------------------------
 
 // Test that logit bias modifies specific tokens.
-test "sample logit bias modifies" {
+test "inference sampling sample logit bias modifies" {
     var logits = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const bias_entries = [_]LogitBiasEntry{
         .{ .token_id = 0, .bias = 10.0 }, // Boost token 0
@@ -627,7 +604,7 @@ test "sample logit bias modifies" {
 }
 
 // Test that negative bias can effectively ban tokens.
-test "sample logit bias large negative bans" {
+test "inference sampling sample logit bias large negative bans" {
     var sampler_state = try Sampler.init(std.testing.allocator, 999, 16);
     defer sampler_state.deinit();
 
@@ -654,7 +631,7 @@ test "sample logit bias large negative bans" {
 }
 
 // Test that positive bias can force token selection.
-test "sample logit bias large positive forces" {
+test "inference sampling sample logit bias large positive forces" {
     var sampler_state = try Sampler.init(std.testing.allocator, 888, 16);
     defer sampler_state.deinit();
 
@@ -675,7 +652,7 @@ test "sample logit bias large positive forces" {
 }
 
 // Test that out-of-bounds token IDs are ignored safely.
-test "sample logit bias ignores out-of-bounds" {
+test "inference sampling sample logit bias ignores out-of-bounds" {
     var logits = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const original_logits = logits;
     const bias_entries = [_]LogitBiasEntry{
@@ -697,7 +674,7 @@ test "sample logit bias ignores out-of-bounds" {
 
 // Test sampling with very large logits (overflow resistance).
 // Should handle logits near f32 max without overflow.
-test "sample numerical stability large" {
+test "inference sampling sample numerical stability large" {
     var sampler_state = try Sampler.init(std.testing.allocator, 555, 16);
     defer sampler_state.deinit();
 
@@ -712,7 +689,7 @@ test "sample numerical stability large" {
 
 // Test sampling with very small logits (underflow resistance).
 // Should handle very negative logits without underflow issues.
-test "sample numerical stability small" {
+test "inference sampling sample numerical stability small" {
     var sampler_state = try Sampler.init(std.testing.allocator, 666, 16);
     defer sampler_state.deinit();
 
@@ -727,7 +704,7 @@ test "sample numerical stability small" {
 
 // Test sampling when all logits are identical.
 // Should produce uniform distribution.
-test "sample numerical stability same" {
+test "inference sampling sample numerical stability same" {
     var sampler_state = try Sampler.init(std.testing.allocator, 777, 16);
     defer sampler_state.deinit();
 
@@ -749,7 +726,7 @@ test "sample numerical stability same" {
 }
 
 // Test that very large differences in logits don't cause numerical issues.
-test "sample numerical stability large differences" {
+test "inference sampling sample numerical stability large differences" {
     var sampler_state = try Sampler.init(std.testing.allocator, 888, 16);
     defer sampler_state.deinit();
 
@@ -769,7 +746,7 @@ test "sample numerical stability large differences" {
 // ----------------------------------------------------------------------------
 
 // Test sampling with single token vocabulary.
-test "sample single token vocab" {
+test "inference sampling sample single token vocab" {
     var sampler_state = try Sampler.init(std.testing.allocator, 999, 16);
     defer sampler_state.deinit();
 
@@ -789,7 +766,7 @@ test "sample single token vocab" {
 }
 
 // Test that empty logits array returns an error.
-test "sample empty logits handling" {
+test "inference sampling sample empty logits handling" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1111, 16);
     defer sampler_state.deinit();
 
@@ -801,7 +778,7 @@ test "sample empty logits handling" {
 }
 
 // Test two-token vocabulary edge case.
-test "sample two token vocab" {
+test "inference sampling sample two token vocab" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1212, 16);
     defer sampler_state.deinit();
 
@@ -823,7 +800,7 @@ test "sample two token vocab" {
 // ----------------------------------------------------------------------------
 
 // Test top_k = 1 (should behave like greedy sampling).
-test "sample top_k k=1 is greedy" {
+test "inference sampling sample top_k k=1 is greedy" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1313, 16);
     defer sampler_state.deinit();
 
@@ -838,7 +815,7 @@ test "sample top_k k=1 is greedy" {
 }
 
 // Test top_k > vocab_size (should include all tokens).
-test "sample top_k k greater than vocab" {
+test "inference sampling sample top_k k greater than vocab" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1414, 16);
     defer sampler_state.deinit();
 
@@ -859,7 +836,7 @@ test "sample top_k k greater than vocab" {
 }
 
 // Test top_k = 0 edge case.
-test "sample top_k k=0" {
+test "inference sampling sample top_k k=0" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1515, 16);
     defer sampler_state.deinit();
 
@@ -871,7 +848,7 @@ test "sample top_k k=0" {
 }
 
 // Test top_k with equal probabilities.
-test "sample top_k with equal probabilities" {
+test "inference sampling sample top_k with equal probabilities" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1616, 16);
     defer sampler_state.deinit();
 
@@ -897,7 +874,7 @@ test "sample top_k with equal probabilities" {
 // ----------------------------------------------------------------------------
 
 // Test invalid temperature (negative) returns error.
-test "sample invalid negative temp" {
+test "inference sampling sample invalid negative temp" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1717, 16);
     defer sampler_state.deinit();
 
@@ -908,7 +885,7 @@ test "sample invalid negative temp" {
 }
 
 // Test invalid top_p (< 0) returns error.
-test "sample invalid negative top_p" {
+test "inference sampling sample invalid negative top_p" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1818, 16);
     defer sampler_state.deinit();
 
@@ -919,7 +896,7 @@ test "sample invalid negative top_p" {
 }
 
 // Test invalid top_p (> 1.0) returns error.
-test "sample invalid top_p greater than 1.0" {
+test "inference sampling sample invalid top_p greater than 1.0" {
     var sampler_state = try Sampler.init(std.testing.allocator, 1919, 16);
     defer sampler_state.deinit();
 
@@ -930,7 +907,7 @@ test "sample invalid top_p greater than 1.0" {
 }
 
 // Test zero temperature with non-greedy strategy returns error.
-test "sample invalid zero temp non-greedy" {
+test "inference sampling sample invalid zero temp non-greedy" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2020, 16);
     defer sampler_state.deinit();
 
@@ -941,7 +918,7 @@ test "sample invalid zero temp non-greedy" {
 }
 
 // Test invalid min_p (< 0) returns error.
-test "sample invalid negative min_p" {
+test "inference sampling sample invalid negative min_p" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2121, 16);
     defer sampler_state.deinit();
 
@@ -952,7 +929,7 @@ test "sample invalid negative min_p" {
 }
 
 // Test invalid min_p (> 1.0) returns error.
-test "sample invalid min_p greater than 1.0" {
+test "inference sampling sample invalid min_p greater than 1.0" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2222, 16);
     defer sampler_state.deinit();
 
@@ -963,7 +940,7 @@ test "sample invalid min_p greater than 1.0" {
 }
 
 // Test logits larger than workspace returns error.
-test "sample invalid logits exceed workspace" {
+test "inference sampling sample invalid logits exceed workspace" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2323, 4);
     defer sampler_state.deinit();
 
@@ -978,7 +955,7 @@ test "sample invalid logits exceed workspace" {
 // Workspace lifecycle tests
 // ----------------------------------------------------------------------------
 
-test "workspace init and deinit" {
+test "inference sampling workspace init and deinit" {
     var workspace = try Workspace.init(std.testing.allocator, 100);
     defer workspace.deinit();
 
@@ -986,7 +963,7 @@ test "workspace init and deinit" {
     try std.testing.expectEqual(@as(usize, 100), workspace.sorted_entries.len);
 }
 
-test "Workspace.init large vocab size" {
+test "inference sampling Workspace.init large vocab size" {
     var workspace = try Workspace.init(std.testing.allocator, 50000);
     defer workspace.deinit();
 
@@ -994,7 +971,7 @@ test "Workspace.init large vocab size" {
     try std.testing.expectEqual(@as(usize, 50000), workspace.sorted_entries.len);
 }
 
-test "Workspace.init minimal vocab size" {
+test "inference sampling Workspace.init minimal vocab size" {
     var workspace = try Workspace.init(std.testing.allocator, 1);
     defer workspace.deinit();
 
@@ -1006,7 +983,7 @@ test "Workspace.init minimal vocab size" {
 // Sampler lifecycle tests
 // ----------------------------------------------------------------------------
 
-test "sampler init and deinit" {
+test "inference sampling sampler init and deinit" {
     var sampler_state = try Sampler.init(std.testing.allocator, 42, 100);
     defer sampler_state.deinit();
 
@@ -1014,7 +991,7 @@ test "sampler init and deinit" {
     try std.testing.expectEqual(@as(usize, 100), sampler_state.workspace.sorted_entries.len);
 }
 
-test "Sampler.sample deterministic seed" {
+test "inference sampling Sampler.sample deterministic seed" {
     const seed: u64 = 12345;
     var sampler1 = try Sampler.init(std.testing.allocator, seed, 16);
     defer sampler1.deinit();
@@ -1033,7 +1010,7 @@ test "Sampler.sample deterministic seed" {
     }
 }
 
-test "Sampler.sample different seeds" {
+test "inference sampling Sampler.sample different seeds" {
     var sampler1 = try Sampler.init(std.testing.allocator, 111, 16);
     defer sampler1.deinit();
 
@@ -1064,7 +1041,7 @@ test "Sampler.sample different seeds" {
 // min_p filtering tests
 // ----------------------------------------------------------------------------
 
-test "sample min_p filters low probability" {
+test "inference sampling sample min_p filters low probability" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2424, 16);
     defer sampler_state.deinit();
 
@@ -1083,7 +1060,7 @@ test "sample min_p filters low probability" {
     try std.testing.expect(counts[0] > counts[3]);
 }
 
-test "sample min_p with 0.0 has no effect" {
+test "inference sampling sample min_p with 0.0 has no effect" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2525, 16);
     defer sampler_state.deinit();
 
@@ -1102,7 +1079,7 @@ test "sample min_p with 0.0 has no effect" {
     }
 }
 
-test "sample min_p with 1.0 only max" {
+test "inference sampling sample min_p with 1.0 only max" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2626, 16);
     defer sampler_state.deinit();
 
@@ -1117,7 +1094,7 @@ test "sample min_p with 1.0 only max" {
     }
 }
 
-test "sample min_p combined with top_p" {
+test "inference sampling sample min_p combined with top_p" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2727, 16);
     defer sampler_state.deinit();
 
@@ -1139,7 +1116,7 @@ test "sample min_p combined with top_p" {
     try std.testing.expect(counts[4] < 10);
 }
 
-test "sample min_p combined with top_k" {
+test "inference sampling sample min_p combined with top_k" {
     var sampler_state = try Sampler.init(std.testing.allocator, 2828, 16);
     defer sampler_state.deinit();
 
@@ -1165,7 +1142,7 @@ test "sample min_p combined with top_k" {
 // Internal function tests: byProbabilityDesc
 // ----------------------------------------------------------------------------
 
-test "Sampler.sample byProbabilityDesc descending" {
+test "inference sampling Sampler.sample byProbabilityDesc descending" {
     const a = IndexValue.init(0, 5.0);
     const b = IndexValue.init(1, 10.0);
     const c = IndexValue.init(2, 3.0);
@@ -1179,7 +1156,7 @@ test "Sampler.sample byProbabilityDesc descending" {
     try std.testing.expect(!byProbabilityDesc({}, a, b)); // 5.0 not > 10.0
 }
 
-test "Sampler.sample byProbabilityDesc equal values" {
+test "inference sampling Sampler.sample byProbabilityDesc equal values" {
     const a = IndexValue.init(0, 5.0);
     const b = IndexValue.init(1, 5.0);
 
@@ -1188,7 +1165,7 @@ test "Sampler.sample byProbabilityDesc equal values" {
     try std.testing.expect(!byProbabilityDesc({}, b, a));
 }
 
-test "Sampler.sample byProbabilityDesc negative values" {
+test "inference sampling Sampler.sample byProbabilityDesc negative values" {
     const a = IndexValue.init(0, -1.0);
     const b = IndexValue.init(1, -5.0);
 
@@ -1211,7 +1188,7 @@ fn makeIndexValues(comptime pairs: anytype) [pairs.len]IndexValue {
     return result;
 }
 
-test "Sampler.sample quickSelectTopK partitions" {
+test "inference sampling Sampler.sample quickSelectTopK partitions" {
     var items = makeIndexValues(.{
         .{ 0, 5.0 },
         .{ 1, 10.0 },
@@ -1239,13 +1216,13 @@ test "Sampler.sample quickSelectTopK partitions" {
     try std.testing.expect(min_top >= max_rest);
 }
 
-test "Sampler.sample quickSelectTopK k=1" {
+test "inference sampling Sampler.sample quickSelectTopK k=1" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 }, .{ 2, 1.0 }, .{ 3, 5.0 } });
     cpu_topk.quickSelectTopK(&items, 1);
     try std.testing.expectEqual(@as(f32, 7.0), items[0].value);
 }
 
-test "Sampler.sample quickSelectTopK k=size" {
+test "inference sampling Sampler.sample quickSelectTopK k=size" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 }, .{ 2, 1.0 } });
     const original_items = items;
     cpu_topk.quickSelectTopK(&items, 3);
@@ -1262,19 +1239,19 @@ test "Sampler.sample quickSelectTopK k=size" {
     for (found) |was_found| try std.testing.expect(was_found);
 }
 
-test "Sampler.sample quickSelectTopK k=0" {
+test "inference sampling Sampler.sample quickSelectTopK k=0" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 } });
     cpu_topk.quickSelectTopK(&items, 0);
     try std.testing.expect(items.len == 2);
 }
 
-test "Sampler.sample quickSelectTopK single element" {
+test "inference sampling Sampler.sample quickSelectTopK single element" {
     var items = makeIndexValues(.{.{ 0, 5.0 }});
     cpu_topk.quickSelectTopK(&items, 1);
     try std.testing.expectEqual(@as(f32, 5.0), items[0].value);
 }
 
-test "Sampler.sample quickSelectTopK duplicates" {
+test "inference sampling Sampler.sample quickSelectTopK duplicates" {
     var items = makeIndexValues(.{
         .{ 0, 5.0 },
         .{ 1, 5.0 },
@@ -1291,19 +1268,19 @@ test "Sampler.sample quickSelectTopK duplicates" {
     }
 }
 
-test "Sampler.sample quickSelectTopK descending input" {
+test "inference sampling Sampler.sample quickSelectTopK descending input" {
     var items = makeIndexValues(.{ .{ 0, 10.0 }, .{ 1, 9.0 }, .{ 2, 8.0 }, .{ 3, 7.0 }, .{ 4, 6.0 } });
     cpu_topk.quickSelectTopK(&items, 3);
     for (items[0..3]) |item| try std.testing.expect(item.value >= 8.0);
 }
 
-test "Sampler.sample quickSelectTopK ascending input" {
+test "inference sampling Sampler.sample quickSelectTopK ascending input" {
     var items = makeIndexValues(.{ .{ 0, 1.0 }, .{ 1, 2.0 }, .{ 2, 3.0 }, .{ 3, 4.0 }, .{ 4, 5.0 } });
     cpu_topk.quickSelectTopK(&items, 2);
     for (items[0..2]) |item| try std.testing.expect(item.value >= 4.0);
 }
 
-test "Sampler.sample quickSelectTopK large k" {
+test "inference sampling Sampler.sample quickSelectTopK large k" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 }, .{ 2, 1.0 } });
     cpu_topk.quickSelectTopK(&items, 100);
     try std.testing.expect(items.len == 3);
@@ -1313,7 +1290,7 @@ test "Sampler.sample quickSelectTopK large k" {
 // Internal function tests: renormalizeSubset
 // ----------------------------------------------------------------------------
 
-test "Sampler.sample renormalizeSubset basic" {
+test "inference sampling Sampler.sample renormalizeSubset basic" {
     var probabilities = [_]f32{ 0.5, 0.3, 0.2, 0.1 };
     const sorted_subset = makeIndexValues(.{ .{ 0, 0.5 }, .{ 1, 0.3 } });
     cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 0.8);
@@ -1323,7 +1300,7 @@ test "Sampler.sample renormalizeSubset basic" {
     try std.testing.expectEqual(@as(f32, 0.0), probabilities[3]);
 }
 
-test "Sampler.sample renormalizeSubset single" {
+test "inference sampling Sampler.sample renormalizeSubset single" {
     var probabilities = [_]f32{ 0.5, 0.3, 0.2 };
     const sorted_subset = makeIndexValues(.{.{ 1, 0.3 }});
     cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 0.3);
@@ -1332,7 +1309,7 @@ test "Sampler.sample renormalizeSubset single" {
     try std.testing.expectEqual(@as(f32, 0.0), probabilities[2]);
 }
 
-test "Sampler.sample renormalizeSubset all" {
+test "inference sampling Sampler.sample renormalizeSubset all" {
     var probabilities = [_]f32{ 0.4, 0.3, 0.2, 0.1 };
     const sorted_subset = makeIndexValues(.{ .{ 0, 0.4 }, .{ 1, 0.3 }, .{ 2, 0.2 }, .{ 3, 0.1 } });
     cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 1.0);
@@ -1341,7 +1318,7 @@ test "Sampler.sample renormalizeSubset all" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 0.001);
 }
 
-test "Sampler.sample renormalizeSubset proportions" {
+test "inference sampling Sampler.sample renormalizeSubset proportions" {
     var probabilities = [_]f32{ 0.6, 0.4, 0.2, 0.1 };
     const sorted_subset = makeIndexValues(.{ .{ 0, 0.6 }, .{ 1, 0.4 } });
     cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 1.0);
@@ -1353,7 +1330,7 @@ test "Sampler.sample renormalizeSubset proportions" {
 // Integration tests: Complex scenarios
 // ----------------------------------------------------------------------------
 
-test "Sampler.sample repetition penalty with bias" {
+test "inference sampling Sampler.sample repetition penalty with bias" {
     var sampler_state = try Sampler.init(std.testing.allocator, 3030, 16);
     defer sampler_state.deinit();
 
@@ -1387,7 +1364,7 @@ test "Sampler.sample repetition penalty with bias" {
     try std.testing.expect(counts[3] > counts[2]);
 }
 
-test "Sampler.sample top_p min_p temperature" {
+test "inference sampling Sampler.sample top_p min_p temperature" {
     var sampler_state = try Sampler.init(std.testing.allocator, 3131, 16);
     defer sampler_state.deinit();
 
@@ -1412,7 +1389,7 @@ test "Sampler.sample top_p min_p temperature" {
     try std.testing.expect(counts[5] < 10);
 }
 
-test "Sampler.sample greedy with repetition" {
+test "inference sampling Sampler.sample greedy with repetition" {
     var sampler_state = try Sampler.init(std.testing.allocator, 3232, 16);
     defer sampler_state.deinit();
 
@@ -1432,7 +1409,7 @@ test "Sampler.sample greedy with repetition" {
     try std.testing.expectEqual(@as(usize, 1), sampled_index);
 }
 
-test "Sampler.sample top_k all filters" {
+test "inference sampling Sampler.sample top_k all filters" {
     var sampler_state = try Sampler.init(std.testing.allocator, 3333, 16);
     defer sampler_state.deinit();
 
@@ -1470,7 +1447,7 @@ test "Sampler.sample top_k all filters" {
 // Boundary and stress tests
 // ----------------------------------------------------------------------------
 
-test "Sampler.sample stress large vocab" {
+test "inference sampling Sampler.sample stress large vocab" {
     var sampler_state = try Sampler.init(std.testing.allocator, 4040, 10000);
     defer sampler_state.deinit();
 
@@ -1490,7 +1467,7 @@ test "Sampler.sample stress large vocab" {
     try std.testing.expect(sampled_index < 10000);
 }
 
-test "Sampler.sample stress many samples" {
+test "inference sampling Sampler.sample stress many samples" {
     var sampler_state = try Sampler.init(std.testing.allocator, 4141, 16);
     defer sampler_state.deinit();
 
@@ -1504,7 +1481,7 @@ test "Sampler.sample stress many samples" {
     }
 }
 
-test "Sampler.sample boundary infinities" {
+test "inference sampling Sampler.sample boundary infinities" {
     var sampler_state = try Sampler.init(std.testing.allocator, 4242, 16);
     defer sampler_state.deinit();
 
@@ -1516,7 +1493,7 @@ test "Sampler.sample boundary infinities" {
     try std.testing.expectEqual(@as(usize, 1), sampled_index);
 }
 
-test "Sampler.sample boundary negative infinity" {
+test "inference sampling Sampler.sample boundary negative infinity" {
     var sampler_state = try Sampler.init(std.testing.allocator, 4343, 16);
     defer sampler_state.deinit();
 
@@ -1528,7 +1505,7 @@ test "Sampler.sample boundary negative infinity" {
     try std.testing.expectEqual(@as(usize, 3), sampled_index);
 }
 
-test "Sampler.sample boundary zero logits" {
+test "inference sampling Sampler.sample boundary zero logits" {
     var sampler_state = try Sampler.init(std.testing.allocator, 4444, 16);
     defer sampler_state.deinit();
 
@@ -1549,7 +1526,7 @@ test "Sampler.sample boundary zero logits" {
     }
 }
 
-test "Sampler.sample boundary out-of-bounds" {
+test "inference sampling Sampler.sample boundary out-of-bounds" {
     var logits = [_]f32{ 2.0, 2.0, 2.0, 2.0 };
     const context_tokens = [_]u32{ 0, 1, 100, 999 }; // Some out of bounds
     const penalty: f32 = 2.0;
@@ -1569,21 +1546,21 @@ test "Sampler.sample boundary out-of-bounds" {
 // Internal function tests: partition
 // ----------------------------------------------------------------------------
 
-test "Sampler.sample partition equal values" {
+test "inference sampling Sampler.sample partition equal values" {
     var items = makeIndexValues(.{ .{ 0, 5.0 }, .{ 1, 5.0 }, .{ 2, 5.0 }, .{ 3, 5.0 } });
     const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     try std.testing.expect(pivot_idx < items.len);
     for (items) |item| try std.testing.expectEqual(@as(f32, 5.0), item.value);
 }
 
-test "Sampler.sample partition two elements" {
+test "inference sampling Sampler.sample partition two elements" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 } });
     const pivot_idx = cpu_topk.partition(&items, 0, 1);
     try std.testing.expect(items[0].value >= items[1].value);
     try std.testing.expect(pivot_idx <= 1);
 }
 
-test "Sampler.sample partition sorted descending" {
+test "inference sampling Sampler.sample partition sorted descending" {
     var items = makeIndexValues(.{ .{ 0, 10.0 }, .{ 1, 8.0 }, .{ 2, 6.0 }, .{ 3, 4.0 }, .{ 4, 2.0 } });
     const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
@@ -1591,7 +1568,7 @@ test "Sampler.sample partition sorted descending" {
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
 }
 
-test "Sampler.sample partition sorted ascending" {
+test "inference sampling Sampler.sample partition sorted ascending" {
     var items = makeIndexValues(.{ .{ 0, 2.0 }, .{ 1, 4.0 }, .{ 2, 6.0 }, .{ 3, 8.0 }, .{ 4, 10.0 } });
     const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
@@ -1599,7 +1576,7 @@ test "Sampler.sample partition sorted ascending" {
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
 }
 
-test "Sampler.sample partition negative values" {
+test "inference sampling Sampler.sample partition negative values" {
     var items = makeIndexValues(.{ .{ 0, -2.0 }, .{ 1, -8.0 }, .{ 2, -4.0 }, .{ 3, -1.0 } });
     const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
@@ -1607,7 +1584,7 @@ test "Sampler.sample partition negative values" {
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
 }
 
-test "Sampler.sample partition mixed values" {
+test "inference sampling Sampler.sample partition mixed values" {
     var items = makeIndexValues(.{ .{ 0, 5.0 }, .{ 1, -3.0 }, .{ 2, 2.0 }, .{ 3, -7.0 }, .{ 4, 0.0 } });
     const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
@@ -1615,7 +1592,7 @@ test "Sampler.sample partition mixed values" {
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
 }
 
-test "Sampler.sample partition preserves elements" {
+test "inference sampling Sampler.sample partition preserves elements" {
     var items = makeIndexValues(.{ .{ 0, 5.0 }, .{ 1, 10.0 }, .{ 2, 3.0 }, .{ 3, 8.0 } });
     const original_indices = [_]u32{ 0, 1, 2, 3 };
     const original_values = [_]f32{ 5.0, 10.0, 3.0, 8.0 };
@@ -1632,7 +1609,7 @@ test "Sampler.sample partition preserves elements" {
     }
 }
 
-test "Sampler.sample partition subrange" {
+test "inference sampling Sampler.sample partition subrange" {
     var items = makeIndexValues(.{ .{ 0, 1.0 }, .{ 1, 9.0 }, .{ 2, 5.0 }, .{ 3, 3.0 }, .{ 4, 7.0 }, .{ 5, 2.0 } });
 
     // Partition only middle elements (indices 1-4)
@@ -1659,7 +1636,7 @@ test "Sampler.sample partition subrange" {
 // Presence penalty tests
 // ----------------------------------------------------------------------------
 
-test "sampleMut presence penalty shifts distribution away from penalized tokens" {
+test "inference sampling sampleMut presence penalty shifts distribution away from penalized tokens" {
     var sampler_state = try Sampler.init(std.testing.allocator, 5050, 16);
     defer sampler_state.deinit();
 
@@ -1688,7 +1665,7 @@ test "sampleMut presence penalty shifts distribution away from penalized tokens"
 // Frequency penalty tests
 // ----------------------------------------------------------------------------
 
-test "sampleMut frequency penalty proportional to count" {
+test "inference sampling sampleMut frequency penalty proportional to count" {
     var sampler_state = try Sampler.init(std.testing.allocator, 5151, 16);
     defer sampler_state.deinit();
 
@@ -1720,7 +1697,7 @@ test "sampleMut frequency penalty proportional to count" {
 // Combined penalty tests
 // ----------------------------------------------------------------------------
 
-test "sampleMut combined presence frequency and repetition penalties" {
+test "inference sampling sampleMut combined presence frequency and repetition penalties" {
     var sampler_state = try Sampler.init(std.testing.allocator, 5252, 16);
     defer sampler_state.deinit();
 

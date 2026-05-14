@@ -26,7 +26,7 @@ pub const contract_kernels = @import("contract_kernels.zig");
 pub const executor = contract_executor;
 pub const kernels = contract_kernels;
 pub const scheduler = @import("scheduler.zig");
-pub const sampling = @import("sampling.zig");
+pub const sampling = @import("../../sampling.zig");
 pub const selftest = @import("selftest.zig");
 pub const smoke_checks = selftest;
 

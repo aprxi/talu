@@ -11,6 +11,6 @@ pub const vision = @import("vision/root.zig");
 pub const executor = @import("executor/root.zig");
 pub const kernels = @import("kernels/root.zig");
 pub const scheduler = @import("scheduler.zig");
-pub const sampling = @import("sampling.zig");
+pub const sampling = @import("../../sampling.zig");
 
 pub const isAvailable = engine_mod.MetalBackend.isAvailable;

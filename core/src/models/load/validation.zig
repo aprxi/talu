@@ -6,6 +6,7 @@ const std = @import("std");
 const weights = @import("weights.zig");
 const tensor = @import("compute_pkg").tensor;
 const config_types = @import("../config/types.zig");
+const block_geometry = @import("../block_geometry.zig");
 const log = @import("log_pkg");
 const op_types = @import("models_pkg").op_types;
 const manifest_mod = @import("../manifest.zig");
@@ -185,9 +186,6 @@ fn shapeOnlyTensor2D(dim0: usize, dim1: usize) tensor.Tensor {
 fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void {
     const d_model: usize = @intCast(loaded_model.config.d_model);
     const d_ff: usize = @intCast(loaded_model.config.d_ff);
-    const head_dim: usize = @intCast(loaded_model.config.head_dim);
-    const n_heads: usize = @intCast(loaded_model.config.n_heads);
-    const n_kv_groups: usize = @intCast(loaded_model.config.n_kv_groups);
     const vocab_size: usize = @intCast(loaded_model.config.vocab_size);
 
     if (loaded_model.token_embeddings.n_dims != 2) return reporter.reportError("token_embeddings not 2D (n_dims={})", .{loaded_model.token_embeddings.n_dims});
@@ -218,11 +216,11 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                         layer_idx, block.ln2_weight.n_dims, block.ln2_weight.shape[0], d_model,
                     });
 
-                const inferred_shape = inferAttentionShapeForValidation(block, d_model, n_heads, n_kv_groups, head_dim);
+                const inferred_shape = block_geometry.inferAttentionShape(loaded_model.config, block);
                 const layer_n_heads = inferred_shape.n_heads;
                 const layer_n_kv_heads = inferred_shape.n_kv_heads;
                 const layer_head_dim = inferred_shape.head_dim;
-                const layer_d_ff = inferAttentionDffForValidation(block, d_model, d_ff);
+                const layer_d_ff = block_geometry.inferAttentionDff(loaded_model.config, block);
                 const q_out: usize = layer_n_heads * layer_head_dim;
                 const kv_out: usize = layer_n_kv_heads * layer_head_dim;
 
@@ -233,18 +231,19 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                     // Shape validation for MLA weights is model-specific (handled by expected_shape in architecture metadata)
                 } else if (block.fused.qkv_proj) |qkv| {
                     const qkv_out: usize = q_out + 2 * kv_out;
-                    if (!is2DShapeMatch(&qkv, d_model, qkv_out))
+                    const gated_qkv_out: usize = q_out * 2 + 2 * kv_out;
+                    const expected_qkv_out = if (block.attention_config.query_gate) gated_qkv_out else qkv_out;
+                    if (!is2DShapeMatch(&qkv, d_model, expected_qkv_out))
                         return reporter.reportError("layer {} qkv_proj shape mismatch (shape=[{},{}], expected=[{},{}])", .{
-                            layer_idx, qkv.shape[0], qkv.shape[1], d_model, qkv_out,
+                            layer_idx, qkv.shape[0], qkv.shape[1], d_model, expected_qkv_out,
                         });
                 } else {
                     if (block.q_proj == null or block.k_proj == null or block.v_proj == null)
                         return reporter.reportError("layer {} missing q/k/v weights without fused qkv", .{layer_idx});
-                    const q_proj_matches_standard = is2DShapeMatch(block.q_proj.?, d_model, q_out);
-                    const q_proj_matches_gated = is2DShapeMatch(block.q_proj.?, d_model, q_out * 2);
-                    if (!q_proj_matches_standard and !q_proj_matches_gated)
+                    const expected_q_proj_out = if (block.attention_config.query_gate) q_out * 2 else q_out;
+                    if (!is2DShapeMatch(block.q_proj.?, d_model, expected_q_proj_out))
                         return reporter.reportError("layer {} q_proj shape mismatch (shape=[{},{}], expected=[{},{}])", .{
-                            layer_idx, block.q_proj.?.shape[0], block.q_proj.?.shape[1], d_model, q_out,
+                            layer_idx, block.q_proj.?.shape[0], block.q_proj.?.shape[1], d_model, expected_q_proj_out,
                         });
                     if (!is2DShapeMatch(block.k_proj.?, d_model, kv_out))
                         return reporter.reportError("layer {} k_proj shape mismatch (shape=[{},{}], expected=[{},{}])", .{
@@ -453,107 +452,6 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
 
 fn is2DShapeMatch(tensor_view: *const tensor.Tensor, dim_a: usize, dim_b: usize) bool {
     return tensor_view.n_dims == 2 and ((tensor_view.shape[0] == dim_a and tensor_view.shape[1] == dim_b) or (tensor_view.shape[0] == dim_b and tensor_view.shape[1] == dim_a));
-}
-
-const AttentionShape = struct {
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-};
-
-fn vectorDim(tensor_view: *const tensor.Tensor) ?usize {
-    if (tensor_view.n_dims == 1) return @intCast(tensor_view.shape[0]);
-    if (tensor_view.n_dims == 2) {
-        if (tensor_view.shape[0] == 1 and tensor_view.shape[1] > 0) return @intCast(tensor_view.shape[1]);
-        if (tensor_view.shape[1] == 1 and tensor_view.shape[0] > 0) return @intCast(tensor_view.shape[0]);
-    }
-    return null;
-}
-
-fn projectedOutDim(tensor_view: *const tensor.Tensor, d_model: usize) ?usize {
-    if (tensor_view.n_dims != 2) return null;
-    const a: usize = @intCast(tensor_view.shape[0]);
-    const b: usize = @intCast(tensor_view.shape[1]);
-    if (a == d_model and b > 0) return b;
-    if (b == d_model and a > 0) return a;
-    return null;
-}
-
-fn inferAttentionShapeForValidation(
-    block: weights.blocks.AttentionMlpWeights,
-    d_model: usize,
-    default_n_heads: usize,
-    default_n_kv_heads: usize,
-    default_head_dim: usize,
-) AttentionShape {
-    var shape = AttentionShape{
-        .n_heads = default_n_heads,
-        .n_kv_heads = default_n_kv_heads,
-        .head_dim = default_head_dim,
-    };
-
-    if (block.q_norm) |q_norm| {
-        if (vectorDim(q_norm)) |dim| shape.head_dim = dim;
-    } else if (block.k_norm) |k_norm| {
-        if (vectorDim(k_norm)) |dim| shape.head_dim = dim;
-    }
-
-    const q_out_opt = projectedOutDim(block.o_proj, d_model);
-    if (q_out_opt) |q_out| {
-        if (shape.head_dim > 0 and (q_out % shape.head_dim) == 0) {
-            shape.n_heads = q_out / shape.head_dim;
-        }
-    }
-
-    if (block.k_proj) |k_proj| {
-        if (projectedOutDim(k_proj, d_model)) |kv_out| {
-            if (shape.head_dim > 0 and (kv_out % shape.head_dim) == 0) {
-                shape.n_kv_heads = kv_out / shape.head_dim;
-            }
-        }
-    } else if (block.fused.qkv_proj) |qkv_proj| {
-        if (q_out_opt) |q_out| {
-            if (projectedOutDim(&qkv_proj, d_model)) |qkv_out| {
-                if (qkv_out >= q_out) {
-                    const kv_pair_out = qkv_out - q_out;
-                    if ((kv_pair_out % 2) == 0) {
-                        const kv_out = kv_pair_out / 2;
-                        if (shape.head_dim > 0 and (kv_out % shape.head_dim) == 0) {
-                            shape.n_kv_heads = kv_out / shape.head_dim;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (shape.n_heads == 0) shape.n_heads = 1;
-    if (shape.n_kv_heads == 0) shape.n_kv_heads = 1;
-    if (shape.head_dim == 0) shape.head_dim = 1;
-    return shape;
-}
-
-fn inferAttentionDffForValidation(
-    block: weights.blocks.AttentionMlpWeights,
-    d_model: usize,
-    default_d_ff: usize,
-) usize {
-    if (block.fused.gate_up) |gate_up| {
-        if (projectedOutDim(&gate_up, d_model)) |gate_up_out| {
-            if ((gate_up_out % 2) == 0 and gate_up_out > 0) return gate_up_out / 2;
-        }
-    }
-    if (block.w1) |w1| {
-        if (projectedOutDim(w1, d_model)) |w1_out| {
-            if (w1_out > 0) return w1_out;
-        }
-    }
-    if (block.w2) |w2| {
-        if (projectedOutDim(w2, d_model)) |w2_out| {
-            if (w2_out > 0) return w2_out;
-        }
-    }
-    return default_d_ff;
 }
 
 fn isProjected2DShapeMatch(tensor_view: *const tensor.Tensor, d_model: usize, out_dim: usize) bool {

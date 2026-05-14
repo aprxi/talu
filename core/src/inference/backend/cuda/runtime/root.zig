@@ -42,6 +42,7 @@ pub const resolveCudaMemoryReserveBytes = config.resolveCudaMemoryReserveBytes;
 pub const resolveCudaExternalOverheadCapBytes = config.resolveCudaExternalOverheadCapBytes;
 pub const resolveCudaMaxSeqLen = config.resolveCudaMaxSeqLen;
 pub const resolveSharedKvSourceLayer = config.resolveSharedKvSourceLayer;
+pub const resolveRuntimeAttentionScale = config.resolveRuntimeAttentionScale;
 pub const adjustSplitForKvSharing = config.adjustSplitForKvSharing;
 pub const resolveCudaInitialKvCacheTokens = config.resolveCudaInitialKvCacheTokens;
 pub const resolveCudaPrefillChunkRowsCap = config.resolveCudaPrefillChunkRowsCap;

@@ -33,7 +33,8 @@ const cuda_stage_capabilities = @import("stage_capabilities.zig");
 const cpu_stage_capabilities = @import("../cpu/stage_capabilities.zig");
 const shared_scheduler = @import("../../scheduler/contracts.zig");
 const progress_mod = @import("progress_pkg");
-const sampling_mod = @import("sampling.zig");
+const sampling_mod = @import("../../sampling.zig");
+const sampling_policy = sampling_mod.policy;
 const vision_runtime_mod = @import("vision.zig");
 const cpu_kernels = @import("../cpu/kernels/root.zig");
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
@@ -874,12 +875,7 @@ pub const CudaBackend = struct {
         if (backend.rope_dim == 0 or backend.rope_dim > backend.head_dim or (backend.rope_dim & 1) != 0) {
             return error.UnsupportedModel;
         }
-        backend.attention_scale = if (loaded.config.attention_multiplier > 0.0)
-            loaded.config.attention_multiplier
-        else if (loaded.config.query_pre_attn_scalar > 0.0)
-            1.0 / std.math.sqrt(loaded.config.query_pre_attn_scalar)
-        else
-            1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
+        backend.attention_scale = models.block_geometry.resolveAttentionScale(loaded.config, backend.head_dim);
         backend.kv_cache_dtype = resolveKvCacheDtype();
         kv_dtype_guard: {
             if (backend.kv_cache_dtype != .fp8) break :kv_dtype_guard;
@@ -2986,13 +2982,9 @@ pub const CudaBackend = struct {
     ) bool {
         if (self.loaded.config.logits_scaling <= 0.0) return false;
         return switch (sampling_config.strategy) {
-            .top_k => sampling_config.top_k > 0 and
-                sampling_config.top_k <= 256 and
+            .top_k => sampling_policy.isBoundedTopKRoute(sampling_config, 256) and
                 sampling_config.temperature > 0.0,
-            .greedy => sampling_config.repetition_penalty == 1.0 and
-                sampling_config.presence_penalty == 0.0 and
-                sampling_config.frequency_penalty == 0.0 and
-                sampling_config.logit_bias == null and
+            .greedy => sampling_policy.canUseDirectGreedyCandidate(sampling_config.*, 1) and
                 sampling_config.top_p == 1.0 and
                 sampling_config.min_p == 0.0,
             else => false,
@@ -3004,13 +2996,7 @@ pub const CudaBackend = struct {
         sampling_config: *const sampling_mod.SamplingConfig,
     ) bool {
         if (!supportsCudaTopKCandidateRoute(self, sampling_config)) return false;
-        if (sampling_config.strategy != .top_k) return false;
-        if (sampling_config.repetition_penalty != 1.0) return false;
-        if (sampling_config.presence_penalty != 0.0) return false;
-        if (sampling_config.frequency_penalty != 0.0) return false;
-        if (sampling_config.logit_bias != null) return false;
-        if (sampling_config.top_p < 0.0 or sampling_config.top_p > 1.0) return false;
-        if (sampling_config.min_p < 0.0 or sampling_config.min_p > 1.0) return false;
+        if (!sampling_policy.isTopKStreamingWithoutMutations(sampling_config, 256)) return false;
         return switch (self.kv_cache_dtype) {
             .i8, .fp8 => self.prefersSingleRowTopKCandidate(sampling_config),
             .f16 => false,

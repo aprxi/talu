@@ -1,24 +1,31 @@
 //! Inference sampling policy module.
 //!
-//! Sampling request configuration is backend-neutral. The concrete production
-//! sampler implementation is currently shared from the CPU backend module.
+//! Sampling request configuration and host-side sampler runtime are
+//! backend-neutral inference policy.
 
 const std = @import("std");
 
 pub const contracts = @import("sampling/contracts.zig");
-const cpu_sampling = @import("backend/cpu/sampling.zig");
+pub const policy = @import("sampling/policy.zig");
+pub const runtime = @import("sampling/runtime.zig");
 
-pub const Sampler = cpu_sampling.Sampler;
 pub const SamplingConfig = contracts.SamplingConfig;
 pub const SamplingStrategy = contracts.SamplingStrategy;
-pub const Workspace = cpu_sampling.Workspace;
 pub const LogitBiasEntry = contracts.LogitBiasEntry;
-pub const sample = cpu_sampling.sample;
+pub const Sampler = runtime.Sampler;
+pub const Workspace = runtime.Workspace;
+pub const sample = runtime.sample;
 
-test "sampling facade preserves neutral config and concrete sampler exports" {
+test "inference sampling facade preserves neutral config and concrete sampler exports" {
     try std.testing.expect(SamplingConfig == contracts.SamplingConfig);
     try std.testing.expect(LogitBiasEntry == contracts.LogitBiasEntry);
+    try std.testing.expect(@hasDecl(@This(), "policy"));
     try std.testing.expect(@hasDecl(@This(), "Sampler"));
     try std.testing.expect(@hasDecl(@This(), "Workspace"));
     try std.testing.expect(@hasDecl(@This(), "sample"));
+
+    var sampler_state = try Sampler.init(std.testing.allocator, 1, 4);
+    defer sampler_state.deinit();
+    const logits = [_]f32{ 0.0, 1.0 };
+    try std.testing.expectEqual(@as(usize, 1), try sample(&sampler_state, &logits, .{}));
 }
