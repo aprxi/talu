@@ -28,6 +28,31 @@ pub const StagedFramePayloadLocation = union(enum) {
     opaque_local: u32,
 };
 
+pub const StagedFrameByteImageReadiness = enum(u8) {
+    unknown,
+    host_readable_now,
+    producer_sync_required,
+    device_download_required,
+    local_only_opaque,
+};
+
+pub const StagedFrameTransferMode = enum(u8) {
+    unknown,
+    borrow_in_process,
+    copy_in_process,
+    device_download_then_copy,
+    remote_stream,
+    device_download_then_remote_stream,
+};
+
+pub const StagedFrameByteImageFacts = struct {
+    readiness: StagedFrameByteImageReadiness = .unknown,
+    transfer_mode: StagedFrameTransferMode = .unknown,
+    host_readable: bool = false,
+    remote_readable: bool = false,
+    device_download_required: bool = false,
+};
+
 pub const StagedFrameRecord = struct {
     graph_digest: [32]u8,
     graph_contract_version: u32,
@@ -53,6 +78,11 @@ pub const StagedFrameRecord = struct {
     sequence_start: u64,
     token_count: u64,
     payload_location: StagedFramePayloadLocation,
+    byte_image_readiness: StagedFrameByteImageReadiness = .unknown,
+    transfer_mode: StagedFrameTransferMode = .unknown,
+    host_readable: bool = false,
+    remote_readable: bool = false,
+    device_download_required: bool = false,
 };
 
 pub const StagedFrameCapture = struct {
@@ -128,7 +158,12 @@ pub fn stagedFrameRecordEql(lhs: StagedFrameRecord, rhs: StagedFrameRecord) bool
         lhs.slot_id == rhs.slot_id and
         lhs.sequence_start == rhs.sequence_start and
         lhs.token_count == rhs.token_count and
-        payloadLocationEql(lhs.payload_location, rhs.payload_location);
+        payloadLocationEql(lhs.payload_location, rhs.payload_location) and
+        lhs.byte_image_readiness == rhs.byte_image_readiness and
+        lhs.transfer_mode == rhs.transfer_mode and
+        lhs.host_readable == rhs.host_readable and
+        lhs.remote_readable == rhs.remote_readable and
+        lhs.device_download_required == rhs.device_download_required;
 }
 
 pub fn validateExpectedSequence(
@@ -176,7 +211,7 @@ pub fn writeStagedFrameTsv(
     writer: anytype,
     records_slice: []const StagedFrameRecord,
 ) !void {
-    try writer.writeAll("frame_id\tboundary_index\tsource_stage_id\ttarget_stage_id\tproducer_layer_start\tproducer_layer_end\tconsumer_layer_start\tconsumer_layer_end\tstep_kind\tdtype\tlayout\trank\tshape0\tshape1\tshape2\tshape3\tpayload_byte_count\tbatch_index\trequest_id\tslot_id\tsequence_start\ttoken_count\tpayload_location\n");
+    try writer.writeAll("frame_id\tboundary_index\tsource_stage_id\ttarget_stage_id\tproducer_layer_start\tproducer_layer_end\tconsumer_layer_start\tconsumer_layer_end\tstep_kind\tdtype\tlayout\trank\tshape0\tshape1\tshape2\tshape3\tpayload_byte_count\tbatch_index\trequest_id\tslot_id\tsequence_start\ttoken_count\tpayload_location\tbyte_image_readiness\ttransfer_mode\thost_readable\tremote_readable\tdevice_download_required\n");
     for (records_slice) |record| {
         try writer.print(
             "{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t",
@@ -206,7 +241,16 @@ pub fn writeStagedFrameTsv(
             },
         );
         try writePayloadLocation(writer, record.payload_location);
-        try writer.writeByte('\n');
+        try writer.print(
+            "\t{s}\t{s}\t{s}\t{s}\t{s}\n",
+            .{
+                byteImageReadinessName(record.byte_image_readiness),
+                transferModeName(record.transfer_mode),
+                boolName(record.host_readable),
+                boolName(record.remote_readable),
+                boolName(record.device_download_required),
+            },
+        );
     }
 }
 
@@ -259,6 +303,31 @@ fn writePayloadLocation(writer: anytype, location: StagedFramePayloadLocation) !
         .metal => |ordinal| try writer.print("metal:{d}", .{ordinal}),
         .opaque_local => |value| try writer.print("opaque_local:{d}", .{value}),
     }
+}
+
+fn byteImageReadinessName(readiness: StagedFrameByteImageReadiness) []const u8 {
+    return switch (readiness) {
+        .unknown => "unknown",
+        .host_readable_now => "host_readable_now",
+        .producer_sync_required => "producer_sync_required",
+        .device_download_required => "device_download_required",
+        .local_only_opaque => "local_only_opaque",
+    };
+}
+
+fn transferModeName(mode: StagedFrameTransferMode) []const u8 {
+    return switch (mode) {
+        .unknown => "unknown",
+        .borrow_in_process => "borrow_in_process",
+        .copy_in_process => "copy_in_process",
+        .device_download_then_copy => "device_download_then_copy",
+        .remote_stream => "remote_stream",
+        .device_download_then_remote_stream => "device_download_then_remote_stream",
+    };
+}
+
+fn boolName(value: bool) []const u8 {
+    return if (value) "true" else "false";
 }
 
 fn testRecord(boundary_index: usize) StagedFrameRecord {
@@ -383,6 +452,26 @@ test "xray staged_frame stagedFrameRecordEql compares all record facts" {
     try std.testing.expect(!stagedFrameRecordEql(base, changed));
 }
 
+test "xray staged_frame stagedFrameRecordEql compares byte image readiness and transfer mode facts" {
+    const base = testRecord(0);
+
+    var changed = base;
+    changed.byte_image_readiness = .host_readable_now;
+    try std.testing.expect(!stagedFrameRecordEql(base, changed));
+    changed = base;
+    changed.transfer_mode = .copy_in_process;
+    try std.testing.expect(!stagedFrameRecordEql(base, changed));
+    changed = base;
+    changed.host_readable = true;
+    try std.testing.expect(!stagedFrameRecordEql(base, changed));
+    changed = base;
+    changed.remote_readable = true;
+    try std.testing.expect(!stagedFrameRecordEql(base, changed));
+    changed = base;
+    changed.device_download_required = true;
+    try std.testing.expect(!stagedFrameRecordEql(base, changed));
+}
+
 test "xray staged_frame validateExpectedSequence accepts exact records and rejects mismatch" {
     const expected = [_]StagedFrameRecord{ testRecord(0), testRecord(1) };
     const actual = expected;
@@ -430,8 +519,50 @@ test "xray staged_frame writeStagedFrameTsv writes deterministic tsv report" {
     try writeStagedFrameTsv(stream.writer(), &records_buf);
 
     const expected =
-        "frame_id\tboundary_index\tsource_stage_id\ttarget_stage_id\tproducer_layer_start\tproducer_layer_end\tconsumer_layer_start\tconsumer_layer_end\tstep_kind\tdtype\tlayout\trank\tshape0\tshape1\tshape2\tshape3\tpayload_byte_count\tbatch_index\trequest_id\tslot_id\tsequence_start\ttoken_count\tpayload_location\n" ++
-        "10\t0\t0\t1\t0\t4\t4\t8\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\n" ++
-        "11\t1\t1\t2\t4\t8\t8\t12\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tcuda:3\n";
+        "frame_id\tboundary_index\tsource_stage_id\ttarget_stage_id\tproducer_layer_start\tproducer_layer_end\tconsumer_layer_start\tconsumer_layer_end\tstep_kind\tdtype\tlayout\trank\tshape0\tshape1\tshape2\tshape3\tpayload_byte_count\tbatch_index\trequest_id\tslot_id\tsequence_start\ttoken_count\tpayload_location\tbyte_image_readiness\ttransfer_mode\thost_readable\tremote_readable\tdevice_download_required\n" ++
+        "10\t0\t0\t1\t0\t4\t4\t8\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tunknown\tunknown\tfalse\tfalse\tfalse\n" ++
+        "11\t1\t1\t2\t4\t8\t8\t12\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tcuda:3\tunknown\tunknown\tfalse\tfalse\tfalse\n";
+    try std.testing.expectEqualStrings(expected, stream.getWritten());
+}
+
+test "xray staged_frame writeStagedFrameTsv writes byte image readiness and transfer mode columns" {
+    var records_buf = [_]StagedFrameRecord{
+        testRecord(0),
+        testRecord(1),
+        testRecord(2),
+        testRecord(3),
+        testRecord(4),
+        testRecord(5),
+    };
+    records_buf[0].byte_image_readiness = .unknown;
+    records_buf[0].transfer_mode = .unknown;
+    records_buf[1].byte_image_readiness = .host_readable_now;
+    records_buf[1].transfer_mode = .borrow_in_process;
+    records_buf[1].host_readable = true;
+    records_buf[1].remote_readable = true;
+    records_buf[2].byte_image_readiness = .producer_sync_required;
+    records_buf[2].transfer_mode = .copy_in_process;
+    records_buf[3].byte_image_readiness = .device_download_required;
+    records_buf[3].transfer_mode = .device_download_then_copy;
+    records_buf[3].device_download_required = true;
+    records_buf[4].byte_image_readiness = .local_only_opaque;
+    records_buf[4].transfer_mode = .remote_stream;
+    records_buf[5].byte_image_readiness = .host_readable_now;
+    records_buf[5].transfer_mode = .device_download_then_remote_stream;
+    records_buf[5].host_readable = true;
+    records_buf[5].remote_readable = true;
+
+    var buffer: [4096]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    try writeStagedFrameTsv(stream.writer(), &records_buf);
+
+    const expected =
+        "frame_id\tboundary_index\tsource_stage_id\ttarget_stage_id\tproducer_layer_start\tproducer_layer_end\tconsumer_layer_start\tconsumer_layer_end\tstep_kind\tdtype\tlayout\trank\tshape0\tshape1\tshape2\tshape3\tpayload_byte_count\tbatch_index\trequest_id\tslot_id\tsequence_start\ttoken_count\tpayload_location\tbyte_image_readiness\ttransfer_mode\thost_readable\tremote_readable\tdevice_download_required\n" ++
+        "10\t0\t0\t1\t0\t4\t4\t8\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tunknown\tunknown\tfalse\tfalse\tfalse\n" ++
+        "11\t1\t1\t2\t4\t8\t8\t12\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\thost_readable_now\tborrow_in_process\ttrue\ttrue\tfalse\n" ++
+        "12\t2\t2\t3\t8\t12\t12\t16\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tproducer_sync_required\tcopy_in_process\tfalse\tfalse\tfalse\n" ++
+        "13\t3\t3\t4\t12\t16\t16\t20\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tdevice_download_required\tdevice_download_then_copy\tfalse\tfalse\ttrue\n" ++
+        "14\t4\t4\t5\t16\t20\t20\t24\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tlocal_only_opaque\tremote_stream\tfalse\tfalse\tfalse\n" ++
+        "15\t5\t5\t6\t20\t24\t24\t28\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\thost_readable_now\tdevice_download_then_remote_stream\ttrue\ttrue\tfalse\n";
     try std.testing.expectEqualStrings(expected, stream.getWritten());
 }

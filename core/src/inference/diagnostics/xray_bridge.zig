@@ -21,6 +21,18 @@ pub const XrayStagedFrameError =
         UnsupportedFrameLayout,
     };
 
+pub const XrayStagedFrameByteImageError =
+    XrayStagedFrameError ||
+    bridge.BoundaryByteImageError ||
+    error{
+        XrayByteImageMetadataMismatch,
+        XrayByteImageTransferDecisionMismatch,
+    };
+
+pub const XrayStagedFrameByteImageOptions = struct {
+    transfer_decision: ?bridge.StageTransferModeDecision = null,
+};
+
 pub const XrayStagedFrameObserver = struct {
     capture: *xray.staged_frame.StagedFrameCapture,
 
@@ -34,6 +46,53 @@ pub const XrayStagedFrameObserver = struct {
         try appendTensorFrameMetadata(self.capture, metadata);
     }
 };
+
+pub fn stagedFrameByteImageFactsFromBridge(
+    image: *const bridge.BoundaryByteImageRef,
+    options: XrayStagedFrameByteImageOptions,
+) XrayStagedFrameByteImageError!xray.staged_frame.StagedFrameByteImageFacts {
+    try bridge.validateBoundaryByteImage(image, .{});
+
+    if (options.transfer_decision) |decision| {
+        if (!transferDecisionProfileMatchesImage(decision, image)) {
+            return error.XrayByteImageTransferDecisionMismatch;
+        }
+        if (!transferDecisionModeConsistent(decision, image)) {
+            return error.XrayByteImageTransferDecisionMismatch;
+        }
+    }
+
+    return .{
+        .readiness = stagedFrameByteImageReadiness(image.readiness),
+        .transfer_mode = if (options.transfer_decision) |decision|
+            stagedFrameTransferMode(decision.mode)
+        else
+            .unknown,
+        .host_readable = image.readiness == .host_readable_now,
+        .remote_readable = bridge.boundaryByteImageIsRemoteReadable(image),
+        .device_download_required = image.readiness == .device_download_required,
+    };
+}
+
+pub fn appendTensorFrameByteImageMetadata(
+    capture: *xray.staged_frame.StagedFrameCapture,
+    metadata: *const bridge.TensorFrameMetadata,
+    image: *const bridge.BoundaryByteImageRef,
+    options: XrayStagedFrameByteImageOptions,
+) XrayStagedFrameByteImageError!void {
+    try metadata.validate();
+    if (image.metadata != metadata) return error.XrayByteImageMetadataMismatch;
+    const facts = try stagedFrameByteImageFactsFromBridge(image, options);
+    for (metadata.batch.entries) |entry| {
+        var record = try stagedFrameRecordFromTensorFrame(metadata, entry);
+        record.byte_image_readiness = facts.readiness;
+        record.transfer_mode = facts.transfer_mode;
+        record.host_readable = facts.host_readable;
+        record.remote_readable = facts.remote_readable;
+        record.device_download_required = facts.device_download_required;
+        try capture.append(record);
+    }
+}
 
 pub fn appendTensorFrameMetadata(
     capture: *xray.staged_frame.StagedFrameCapture,
@@ -113,6 +172,64 @@ fn stagedFramePayloadLocation(location: ?bridge.TensorFramePayloadLocationHint) 
     };
 }
 
+fn stagedFrameByteImageReadiness(
+    readiness: bridge.BoundaryByteImageReadiness,
+) xray.staged_frame.StagedFrameByteImageReadiness {
+    return switch (readiness) {
+        .host_readable_now => .host_readable_now,
+        .producer_sync_required => .producer_sync_required,
+        .device_download_required => .device_download_required,
+        .local_only_opaque => .local_only_opaque,
+    };
+}
+
+fn stagedFrameTransferMode(
+    mode: bridge.StageTransferMode,
+) xray.staged_frame.StagedFrameTransferMode {
+    return switch (mode) {
+        .borrow_in_process => .borrow_in_process,
+        .copy_in_process => .copy_in_process,
+        .device_download_then_copy => .device_download_then_copy,
+        .remote_stream => .remote_stream,
+        .device_download_then_remote_stream => .device_download_then_remote_stream,
+    };
+}
+
+fn transferDecisionProfileMatchesImage(
+    decision: bridge.StageTransferModeDecision,
+    image: *const bridge.BoundaryByteImageRef,
+) bool {
+    const profile = decision.boundary_profile;
+    const metadata = image.metadata;
+    return profile.boundary_index == metadata.boundary.boundary_index and
+        profile.source_stage_id == metadata.boundary.source_stage_id and
+        profile.target_stage_id == metadata.boundary.target_stage_id and
+        profile.step_kind == metadata.step_kind and
+        profile.dtype == metadata.tensor.dtype and
+        profile.layout == metadata.tensor.layout;
+}
+
+fn transferDecisionModeConsistent(
+    decision: bridge.StageTransferModeDecision,
+    image: *const bridge.BoundaryByteImageRef,
+) bool {
+    return switch (image.readiness) {
+        .host_readable_now => switch (decision.boundary_profile.handoff_mode) {
+            .same_host_direct => if (image.ownership == .borrowed_until_next_stage_call)
+                decision.mode == .borrow_in_process or decision.mode == .copy_in_process
+            else
+                decision.mode == .copy_in_process,
+            .local_in_process, .mock => decision.mode == .copy_in_process,
+            .remote_declared => decision.mode == .remote_stream,
+        },
+        .device_download_required => switch (decision.boundary_profile.handoff_mode) {
+            .same_host_direct, .local_in_process, .mock => decision.mode == .device_download_then_copy,
+            .remote_declared => decision.mode == .device_download_then_remote_stream,
+        },
+        .producer_sync_required, .local_only_opaque => false,
+    };
+}
+
 const test_single_batch = [_]bridge.TensorFrameBatchEntry{.{
     .batch_index = 0,
     .request_id = 3,
@@ -161,6 +278,46 @@ fn testFrame(
     });
 }
 
+fn testByteImage(
+    metadata: *const bridge.TensorFrameMetadata,
+    readiness: bridge.BoundaryByteImageReadiness,
+    host_bytes: ?[]const u8,
+) bridge.BoundaryByteImageRef {
+    return .{
+        .metadata = metadata,
+        .byte_count = metadata.payload.byte_count,
+        .host_bytes = host_bytes,
+        .location_hint = metadata.payload.location_hint,
+        .readiness = readiness,
+        .ownership = metadata.payload.ownership,
+        .lifetime = metadata.payload.lifetime,
+    };
+}
+
+fn testTransferDecision(
+    metadata: *const bridge.TensorFrameMetadata,
+    handoff_mode: bridge.BoundaryHandoffMode,
+    mode: bridge.StageTransferMode,
+) bridge.StageTransferModeDecision {
+    return .{
+        .mode = mode,
+        .boundary_profile = .{
+            .boundary_index = metadata.boundary.boundary_index,
+            .source_stage_id = metadata.boundary.source_stage_id,
+            .target_stage_id = metadata.boundary.target_stage_id,
+            .step_kind = metadata.step_kind,
+            .dtype = metadata.tensor.dtype,
+            .layout = metadata.tensor.layout,
+            .max_batch_entries = 8,
+            .max_token_count_per_frame = 16,
+            .max_activation_payload_bytes = metadata.payload.byte_count,
+            .handoff_mode = handoff_mode,
+        },
+        .source_host_id = .{ .value = 1 },
+        .target_host_id = .{ .value = 2 },
+    };
+}
+
 test "inference diagnostics stagedFrameRecordFromTensorFrame maps tensor frame metadata" {
     var fixture = try TestPlanFixture.init(std.testing.allocator);
     defer fixture.deinit();
@@ -195,6 +352,67 @@ test "inference diagnostics stagedFrameRecordFromTensorFrame maps tensor frame m
     try std.testing.expectEqual(@as(u16, 2), record.payload_location.cuda);
 }
 
+test "inference diagnostics stagedFrameByteImageFactsFromBridge maps host readable device resident and transfer mode facts" {
+    var fixture = try TestPlanFixture.init(std.testing.allocator);
+    defer fixture.deinit();
+
+    const host_metadata = try testFrame(&fixture.plan_ref, 0, 49, &test_single_batch, .cpu);
+    const host_bytes = [_]u8{0xaa} ** 32;
+    const host_image = testByteImage(&host_metadata, .host_readable_now, &host_bytes);
+    const host_decision = testTransferDecision(&host_metadata, .same_host_direct, .borrow_in_process);
+
+    const host_facts = try stagedFrameByteImageFactsFromBridge(&host_image, .{
+        .transfer_decision = host_decision,
+    });
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameByteImageReadiness.host_readable_now, host_facts.readiness);
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameTransferMode.borrow_in_process, host_facts.transfer_mode);
+    try std.testing.expect(host_facts.host_readable);
+    try std.testing.expect(host_facts.remote_readable);
+    try std.testing.expect(!host_facts.device_download_required);
+
+    const device_metadata = try testFrame(&fixture.plan_ref, 0, 50, &test_single_batch, .{ .cuda = 0 });
+    const device_image = testByteImage(&device_metadata, .device_download_required, null);
+    const device_decision = testTransferDecision(&device_metadata, .local_in_process, .device_download_then_copy);
+
+    const device_facts = try stagedFrameByteImageFactsFromBridge(&device_image, .{
+        .transfer_decision = device_decision,
+    });
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameByteImageReadiness.device_download_required, device_facts.readiness);
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameTransferMode.device_download_then_copy, device_facts.transfer_mode);
+    try std.testing.expect(!device_facts.host_readable);
+    try std.testing.expect(!device_facts.remote_readable);
+    try std.testing.expect(device_facts.device_download_required);
+
+    const remote_decision = testTransferDecision(&host_metadata, .remote_declared, .remote_stream);
+    const remote_facts = try stagedFrameByteImageFactsFromBridge(&host_image, .{
+        .transfer_decision = remote_decision,
+    });
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameTransferMode.remote_stream, remote_facts.transfer_mode);
+}
+
+test "inference diagnostics stagedFrameByteImageFactsFromBridge rejects invalid image mismatched transfer decision facts and inconsistent transfer mode" {
+    var fixture = try TestPlanFixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const metadata = try testFrame(&fixture.plan_ref, 0, 51, &test_single_batch, .cpu);
+    const host_bytes = [_]u8{0xbb} ** 32;
+
+    var invalid_image = testByteImage(&metadata, .host_readable_now, &host_bytes);
+    invalid_image.byte_count = 0;
+    try std.testing.expectError(error.InvalidPayloadByteCount, stagedFrameByteImageFactsFromBridge(&invalid_image, .{}));
+
+    const valid_image = testByteImage(&metadata, .host_readable_now, &host_bytes);
+    var mismatched_decision = testTransferDecision(&metadata, .same_host_direct, .borrow_in_process);
+    mismatched_decision.boundary_profile.dtype = .f16;
+    try std.testing.expectError(error.XrayByteImageTransferDecisionMismatch, stagedFrameByteImageFactsFromBridge(&valid_image, .{
+        .transfer_decision = mismatched_decision,
+    }));
+
+    const inconsistent_decision = testTransferDecision(&metadata, .local_in_process, .remote_stream);
+    try std.testing.expectError(error.XrayByteImageTransferDecisionMismatch, stagedFrameByteImageFactsFromBridge(&valid_image, .{
+        .transfer_decision = inconsistent_decision,
+    }));
+}
+
 test "inference diagnostics appendTensorFrameMetadata appends one record per batch entry" {
     var fixture = try TestPlanFixture.init(std.testing.allocator);
     defer fixture.deinit();
@@ -211,6 +429,73 @@ test "inference diagnostics appendTensorFrameMetadata appends one record per bat
     try std.testing.expectEqual(@as(u64, 4), capture.get(1).?.request_id);
     try std.testing.expect(capture.get(0).?.payload_location == .cpu);
     try std.testing.expect(capture.get(1).?.payload_location == .cpu);
+}
+
+test "inference diagnostics appendTensorFrameByteImageMetadata appends byte image facts without reading payload bytes" {
+    var fixture = try TestPlanFixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const metadata = try testFrame(&fixture.plan_ref, 0, 52, &test_single_batch, .cpu);
+    const host_bytes = [_]u8{0xcc} ** 32;
+    const image = testByteImage(&metadata, .host_readable_now, &host_bytes);
+    const decision = testTransferDecision(&metadata, .same_host_direct, .copy_in_process);
+    var capture = xray.staged_frame.StagedFrameCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    try appendTensorFrameByteImageMetadata(&capture, &metadata, &image, .{
+        .transfer_decision = decision,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), capture.count());
+    const record = capture.get(0).?;
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameByteImageReadiness.host_readable_now, record.byte_image_readiness);
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameTransferMode.copy_in_process, record.transfer_mode);
+    try std.testing.expect(record.host_readable);
+    try std.testing.expect(record.remote_readable);
+    try std.testing.expect(!record.device_download_required);
+    try std.testing.expectEqual(@as(u64, metadata.payload.byte_count), record.payload_byte_count);
+}
+
+test "inference diagnostics appendTensorFrameByteImageMetadata rejects mismatched metadata and image" {
+    var fixture = try TestPlanFixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const image_metadata = try testFrame(&fixture.plan_ref, 0, 53, &test_single_batch, .cpu);
+    const append_metadata = try testFrame(&fixture.plan_ref, 0, 54, &test_single_batch, .cpu);
+    const host_bytes = [_]u8{0xdd} ** 32;
+    const image = testByteImage(&image_metadata, .host_readable_now, &host_bytes);
+    var capture = xray.staged_frame.StagedFrameCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    try std.testing.expectError(error.XrayByteImageMetadataMismatch, appendTensorFrameByteImageMetadata(&capture, &append_metadata, &image, .{}));
+}
+
+test "inference diagnostics appendTensorFrameByteImageMetadata preserves batch order and base tensor frame facts" {
+    var fixture = try TestPlanFixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const metadata = try testFrame(&fixture.plan_ref, 0, 55, &test_multi_batch, .cpu);
+    const host_bytes = [_]u8{0xee} ** 64;
+    const image = testByteImage(&metadata, .host_readable_now, &host_bytes);
+    const decision = testTransferDecision(&metadata, .remote_declared, .remote_stream);
+    var capture = xray.staged_frame.StagedFrameCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    try appendTensorFrameByteImageMetadata(&capture, &metadata, &image, .{
+        .transfer_decision = decision,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), capture.count());
+    try std.testing.expectEqual(@as(u32, 0), capture.get(0).?.batch_index);
+    try std.testing.expectEqual(@as(u32, 1), capture.get(1).?.batch_index);
+    try std.testing.expectEqual(@as(u64, 3), capture.get(0).?.request_id);
+    try std.testing.expectEqual(@as(u64, 4), capture.get(1).?.request_id);
+    try std.testing.expectEqual(@as(u64, 7), capture.get(0).?.slot_id);
+    try std.testing.expectEqual(@as(u64, 8), capture.get(1).?.slot_id);
+    try std.testing.expectEqual(@as(u64, metadata.payload.byte_count), capture.get(0).?.payload_byte_count);
+    try std.testing.expect(capture.get(0).?.payload_location == .cpu);
+    try std.testing.expect(capture.get(1).?.payload_location == .cpu);
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameByteImageReadiness.host_readable_now, capture.get(0).?.byte_image_readiness);
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameTransferMode.remote_stream, capture.get(1).?.transfer_mode);
+    try std.testing.expect(capture.get(0).?.host_readable);
+    try std.testing.expect(capture.get(1).?.remote_readable);
 }
 
 test "inference diagnostics appendTensorFrameMetadata rejects empty batch" {

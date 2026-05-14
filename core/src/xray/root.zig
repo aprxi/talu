@@ -32,12 +32,15 @@ pub const TraceCaptureMode = capture.TraceCaptureMode;
 pub const TracePointSet = capture.TracePointSet;
 pub const CaptureQuery = query.CaptureQuery;
 pub const StagedFrameCapture = staged_frame.StagedFrameCapture;
+pub const StagedFrameByteImageFacts = staged_frame.StagedFrameByteImageFacts;
+pub const StagedFrameByteImageReadiness = staged_frame.StagedFrameByteImageReadiness;
 pub const StagedFrameDType = staged_frame.StagedFrameDType;
 pub const StagedFrameLayout = staged_frame.StagedFrameLayout;
 pub const StagedFramePayloadLocation = staged_frame.StagedFramePayloadLocation;
 pub const StagedFrameRecord = staged_frame.StagedFrameRecord;
 pub const StagedFrameSequenceError = staged_frame.StagedFrameSequenceError;
 pub const StagedFrameStepKind = staged_frame.StagedFrameStepKind;
+pub const StagedFrameTransferMode = staged_frame.StagedFrameTransferMode;
 pub const stagedFrameRecordEql = staged_frame.stagedFrameRecordEql;
 pub const validateExpectedSequence = staged_frame.validateExpectedSequence;
 pub const validateAdjacentBoundarySequence = staged_frame.validateAdjacentBoundarySequence;
@@ -117,4 +120,10 @@ pub fn disableCapture() void {
 /// Check if tracing is active (handler installed).
 pub fn isTraceEnabled() bool {
     return trace.isEnabled();
+}
+
+test "xray root exports StagedFrameByteImageFacts StagedFrameByteImageReadiness and StagedFrameTransferMode" {
+    _ = StagedFrameByteImageFacts;
+    _ = StagedFrameByteImageReadiness;
+    _ = StagedFrameTransferMode;
 }
