@@ -384,6 +384,141 @@ pub fn executeCpuSegmentedDecodeActivationBoundary(
     try executeDecodeBoundaryPipeline(root_backend, stages[0..], slot_indices, positions, payload_specs[0..]);
 }
 
+pub const PrefillBoundaryImageSpec = union(enum) {
+    device,
+    host_bytes: []const u8,
+};
+
+pub const PrefillBoundaryPayloadSpec = struct {
+    boundary_index: usize,
+    slot_index: usize,
+    sequence_start: usize,
+    token_count: usize,
+    activation_byte_count: usize,
+    location_hint: ?bridge.TensorFramePayloadLocationHint,
+    image: PrefillBoundaryImageSpec,
+    local_device_peer_copy_available: ?bool = null,
+};
+
+pub fn executePrefillBoundaryPipeline(
+    root_backend: anytype,
+    stages: []bridge.LocalStageChainStage,
+    payload_specs: []const PrefillBoundaryPayloadSpec,
+) !void {
+    if (payload_specs.len == 0 or payload_specs.len + 1 != stages.len) return error.InvalidStepRequest;
+    if (payload_specs.len > 2) return error.InvalidStepRequest;
+
+    var batch_entries: [2][1]bridge.TensorFrameBatchEntry = undefined;
+    var metadata: [2]bridge.TensorFrameMetadata = undefined;
+    var images: [2]bridge.BoundaryByteImageRef = undefined;
+    var payloads: [2]bridge.LocalPipelineBoundaryPayload = undefined;
+    const plan_ref = try localTopologyTensorFramePlanRef(root_backend);
+
+    for (payload_specs, 0..) |spec, index| {
+        const boundary = try localBoundaryRuntime(root_backend, spec.boundary_index);
+        metadata[index] = try buildPrefillActivationMetadata(
+            root_backend,
+            boundary.boundary_index,
+            boundary.dtype,
+            boundary.layout,
+            spec.location_hint,
+            spec.slot_index,
+            spec.sequence_start,
+            spec.token_count,
+            batch_entries[index][0..],
+        );
+        try bridge.validateTensorFrameForPlanBoundary(&metadata[index], plan_ref, boundary.boundary_index);
+        try bridge.validatePayloadBufferLength(&metadata[index], spec.activation_byte_count);
+        images[index] = switch (spec.image) {
+            .device => bridge.deviceActivationByteImage(&metadata[index]),
+            .host_bytes => |host_bytes| blk: {
+                if (spec.activation_byte_count > host_bytes.len) return error.InvalidArgument;
+                break :blk bridge.hostActivationByteImage(&metadata[index], host_bytes[0..spec.activation_byte_count]);
+            },
+        };
+        payloads[index] = .{
+            .metadata = &metadata[index],
+            .image = &images[index],
+            .runtime = .{
+                .staging = boundary.staging,
+                .allow_borrow = false,
+                .local_device_peer_copy_available = spec.local_device_peer_copy_available orelse boundary.local_device_peer_copy_available,
+            },
+        };
+    }
+
+    try bridge.executeLocalPipelineStep(
+        try localPipelineContext(root_backend),
+        stages,
+        payloads[0..payload_specs.len],
+        .prefill,
+        &.{},
+    );
+}
+
+pub fn executeHostToCudaPrefillBoundary(
+    root_backend: anytype,
+    cuda_target: anytype,
+    boundary_index: usize,
+    slot_index: usize,
+    sequence_start: usize,
+    token_count: usize,
+    host_bytes: []const u8,
+    activation_byte_count: usize,
+) !void {
+    const Source = transport.NoopActivationStage;
+    const Target = transport.CudaActivationStage(@TypeOf(cuda_target));
+    const stage_ids = try localBoundaryStageIds(root_backend, boundary_index);
+    var source = Source{};
+    var target = Target{ .backend = cuda_target, .slot_index = slot_index };
+    var stages = [_]bridge.LocalStageChainStage{
+        bridge.localStageAdapter(Source, stage_ids.source_stage_id, &source),
+        bridge.localStageAdapter(Target, stage_ids.target_stage_id, &target),
+    };
+    const payload_specs = [_]PrefillBoundaryPayloadSpec{.{
+        .boundary_index = boundary_index,
+        .slot_index = slot_index,
+        .sequence_start = sequence_start,
+        .token_count = token_count,
+        .activation_byte_count = activation_byte_count,
+        .location_hint = .{ .cpu = {} },
+        .image = .{ .host_bytes = host_bytes },
+    }};
+    try executePrefillBoundaryPipeline(root_backend, stages[0..], payload_specs[0..]);
+}
+
+pub fn executeCudaDevicePrefillBoundary(
+    root_backend: anytype,
+    source_backend: anytype,
+    target_backend: anytype,
+    boundary_index: usize,
+    slot_index: usize,
+    sequence_start: usize,
+    token_count: usize,
+    activation_byte_count: usize,
+    comptime synchronization: transport.CudaPeerCopySynchronization,
+) !void {
+    const Source = transport.CudaPeerActivationStage(@TypeOf(source_backend), @TypeOf(target_backend), synchronization);
+    const Target = transport.CudaActivationStage(@TypeOf(target_backend));
+    const stage_ids = try localBoundaryStageIds(root_backend, boundary_index);
+    var source = Source{ .backend = source_backend, .target_backend = target_backend, .slot_index = slot_index };
+    var target = Target{ .backend = target_backend, .slot_index = slot_index };
+    var stages = [_]bridge.LocalStageChainStage{
+        bridge.localStageAdapter(Source, stage_ids.source_stage_id, &source),
+        bridge.localStageAdapter(Target, stage_ids.target_stage_id, &target),
+    };
+    const payload_specs = [_]PrefillBoundaryPayloadSpec{.{
+        .boundary_index = boundary_index,
+        .slot_index = slot_index,
+        .sequence_start = sequence_start,
+        .token_count = token_count,
+        .activation_byte_count = activation_byte_count,
+        .location_hint = try cudaPayloadLocationHint(source_backend),
+        .image = .device,
+    }};
+    try executePrefillBoundaryPipeline(root_backend, stages[0..], payload_specs[0..]);
+}
+
 pub fn buildPrefillActivationMetadata(
     backend: anytype,
     boundary_index: usize,
@@ -780,6 +915,116 @@ test "executeCpuSegmentedDecodeActivationBoundary rejects mismatched host segmen
     try std.testing.expectError(
         error.InvalidArgument,
         executeCpuSegmentedDecodeActivationBoundary(&backend, &backend, &backend, 0, &slots, &positions, &.{}, 4),
+    );
+}
+
+const PrefillBoundaryTestRuntime = struct {
+    boundary_index: usize,
+    dtype: bridge.BoundaryDType,
+    layout: bridge.BoundaryLayout,
+    staging: ?[]align(64) u8 = null,
+    local_device_peer_copy_available: bool = false,
+};
+
+const PrefillBoundaryTestBackend = struct {
+    d_model: usize = 4,
+    local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+    slot_request_ids: [2]?u64 = .{ 101, 202 },
+    runtime: PrefillBoundaryTestRuntime = .{
+        .boundary_index = 0,
+        .dtype = .f32,
+        .layout = .row_major,
+    },
+
+    pub fn localBoundaryRuntime(self: *@This(), boundary_index: usize) !*const PrefillBoundaryTestRuntime {
+        if (boundary_index != self.runtime.boundary_index) return error.InvalidTopologyConfig;
+        return &self.runtime;
+    }
+};
+
+fn prefillBoundaryTestPlanRef(boundaries: []const bridge.TensorFrameBoundaryRef) bridge.TensorFramePlanRef {
+    return .{
+        .allocator = std.testing.allocator,
+        .identity = .{
+            .graph_digest = [_]u8{1} ** 32,
+            .graph_contract_version = 1,
+            .stage_plan_contract_version = 1,
+            .stage_plan_id = .{ .digest = [_]u8{2} ** 32 },
+        },
+        .boundaries = boundaries,
+    };
+}
+
+test "executePrefillBoundaryPipeline rejects invalid stage boundary shape" {
+    const MockBackend = struct {};
+    var backend = MockBackend{};
+    var stages: [2]bridge.LocalStageChainStage = undefined;
+
+    try std.testing.expectError(
+        error.InvalidStepRequest,
+        executePrefillBoundaryPipeline(&backend, stages[0..], &.{}),
+    );
+}
+
+test "executePrefillBoundaryPipeline builds host and device prefill payload specs" {
+    const boundaries = [_]bridge.TensorFrameBoundaryRef{.{
+        .boundary_index = 0,
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+    }};
+    var backend = PrefillBoundaryTestBackend{
+        .local_tensor_frame_plan_ref = prefillBoundaryTestPlanRef(&boundaries),
+    };
+    var stages: [2]bridge.LocalStageChainStage = undefined;
+    const activation_byte_count = 2 * 4 * @sizeOf(f32);
+    var short_host_storage = [_]u8{0x5a} ** (activation_byte_count - 1);
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        executePrefillBoundaryPipeline(&backend, stages[0..], &.{.{
+            .boundary_index = 0,
+            .slot_index = 0,
+            .sequence_start = 3,
+            .token_count = 2,
+            .activation_byte_count = activation_byte_count,
+            .location_hint = .{ .cpu = {} },
+            .image = .{ .host_bytes = short_host_storage[0..] },
+        }}),
+    );
+    try std.testing.expectError(
+        error.InvalidTopologyConfig,
+        executePrefillBoundaryPipeline(&backend, stages[0..], &.{.{
+            .boundary_index = 0,
+            .slot_index = 0,
+            .sequence_start = 3,
+            .token_count = 2,
+            .activation_byte_count = activation_byte_count,
+            .location_hint = .{ .cuda = 0 },
+            .image = .device,
+        }}),
+    );
+}
+
+test "executeHostToCudaPrefillBoundary rejects missing runner plan" {
+    var backend = PrefillBoundaryTestBackend{};
+    var host_storage = [_]u8{0x5a} ** (2 * 4 * @sizeOf(f32));
+
+    try std.testing.expectError(
+        error.InvalidTopologyConfig,
+        executeHostToCudaPrefillBoundary(&backend, &backend, 0, 0, 3, 2, host_storage[0..], host_storage.len),
+    );
+}
+
+test "executeCudaDevicePrefillBoundary rejects missing runner plan" {
+    var backend = PrefillBoundaryTestBackend{};
+
+    try std.testing.expectError(
+        error.InvalidTopologyConfig,
+        executeCudaDevicePrefillBoundary(&backend, &backend, &backend, 0, 0, 3, 2, 2 * 4 * @sizeOf(f32), .source_stream),
     );
 }
 

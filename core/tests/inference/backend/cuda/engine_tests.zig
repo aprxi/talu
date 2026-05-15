@@ -3455,7 +3455,7 @@ test "computeBatchedDecodeLogits rejects cpu_gpu decode without local stage spec
     try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
-test "executePrefillWithLayerLimit routes pipeline2 prefill through staged token loop" {
+test "executePrefillWithLayerLimit rejects pipeline2 prefill without local stage specs" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [4]u8 = [_]u8{0} ** 4,
@@ -3520,25 +3520,21 @@ test "executePrefillWithLayerLimit routes pipeline2 prefill through staged token
     const tokens = [_]u32{ 100, 101, 102, 103 };
     var logits_out: [6]f32 = undefined;
 
-    try engine_forward.executePrefillWithLayerLimit(
-        &mock,
-        tokens[0..],
-        0,
-        logits_out[0..],
-        mock.block_runtime.blocks.len,
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        engine_forward.executePrefillWithLayerLimit(
+            &mock,
+            tokens[0..],
+            0,
+            logits_out[0..],
+            mock.block_runtime.blocks.len,
+        ),
     );
 
-    try std.testing.expectEqual(tokens.len, mock.compute_calls);
-    for (0..tokens.len) |i| {
-        const is_last = i + 1 == tokens.len;
-        try std.testing.expectEqual(is_last, mock.recorded_download_logits[i]);
-        try std.testing.expectEqual(is_last, mock.recorded_logits_out_present[i]);
-        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), mock.recorded_trace_seq_lens[i]);
-        try std.testing.expectEqual(i, mock.recorded_trace_positions[i]);
-    }
+    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
-test "executePrefillWithLayerLimit routes cpu_gpu prefill through staged token loop" {
+test "executePrefillWithLayerLimit rejects cpu_gpu prefill without local stage specs" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [4]u8 = [_]u8{0} ** 4,
@@ -3603,22 +3599,18 @@ test "executePrefillWithLayerLimit routes cpu_gpu prefill through staged token l
     const tokens = [_]u32{ 100, 101, 102, 103 };
     var logits_out: [6]f32 = undefined;
 
-    try engine_forward.executePrefillWithLayerLimit(
-        &mock,
-        tokens[0..],
-        0,
-        logits_out[0..],
-        mock.block_runtime.blocks.len,
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        engine_forward.executePrefillWithLayerLimit(
+            &mock,
+            tokens[0..],
+            0,
+            logits_out[0..],
+            mock.block_runtime.blocks.len,
+        ),
     );
 
-    try std.testing.expectEqual(tokens.len, mock.compute_calls);
-    for (0..tokens.len) |i| {
-        const is_last = i + 1 == tokens.len;
-        try std.testing.expectEqual(is_last, mock.recorded_download_logits[i]);
-        try std.testing.expectEqual(is_last, mock.recorded_logits_out_present[i]);
-        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), mock.recorded_trace_seq_lens[i]);
-        try std.testing.expectEqual(i, mock.recorded_trace_positions[i]);
-    }
+    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
 test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and stage1" {
@@ -4609,8 +4601,7 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
         };
         for (windows) |window_tokens| {
             var logits_split: [vocab]f32 = undefined;
-            try engine_forward.executePrefillWithLayerLimit(
-                &split,
+            try split.executePrefillWithLayerLimitTestHook(
                 window_tokens,
                 0,
                 logits_split[0..],
@@ -4809,8 +4800,7 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
         for (slot_windows, 0..) |windows, slot_index| {
             for (windows) |window_tokens| {
                 var logits_split: [vocab]f32 = undefined;
-                try engine_forward.executePrefillWithLayerLimit(
-                    &split,
+                try split.executePrefillWithLayerLimitTestHook(
                     window_tokens,
                     slot_index,
                     logits_split[0..],
@@ -5324,7 +5314,7 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
     try std.testing.expect(trace_state.stage2_logits_present);
 }
 
-test "executePrefillWithLayerLimit routes cpu_gpu_gpu prefill through staged token loop" {
+test "executePrefillWithLayerLimit rejects cpu_gpu_gpu prefill without local stage specs" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [4]u8 = [_]u8{0} ** 4,
@@ -5389,22 +5379,18 @@ test "executePrefillWithLayerLimit routes cpu_gpu_gpu prefill through staged tok
     const tokens = [_]u32{ 100, 101, 102, 103 };
     var logits_out: [6]f32 = undefined;
 
-    try engine_forward.executePrefillWithLayerLimit(
-        &mock,
-        tokens[0..],
-        0,
-        logits_out[0..],
-        mock.block_runtime.blocks.len,
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        engine_forward.executePrefillWithLayerLimit(
+            &mock,
+            tokens[0..],
+            0,
+            logits_out[0..],
+            mock.block_runtime.blocks.len,
+        ),
     );
 
-    try std.testing.expectEqual(tokens.len, mock.compute_calls);
-    for (0..tokens.len) |i| {
-        const is_last = i + 1 == tokens.len;
-        try std.testing.expectEqual(is_last, mock.recorded_download_logits[i]);
-        try std.testing.expectEqual(is_last, mock.recorded_logits_out_present[i]);
-        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), mock.recorded_trace_seq_lens[i]);
-        try std.testing.expectEqual(i, mock.recorded_trace_positions[i]);
-    }
+    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
 test "cpu_gpu_gpu decode parity matches single topology across slots and lifecycle cycles" {
@@ -5981,8 +5967,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
         };
         for (windows) |window_tokens| {
             var logits_split: [vocab]f32 = undefined;
-            try engine_forward.executePrefillWithLayerLimit(
-                &split,
+            try split.executePrefillWithLayerLimitTestHook(
                 window_tokens,
                 0,
                 logits_split[0..],
@@ -6235,8 +6220,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
         for (slot_windows, 0..) |windows, slot_index| {
             for (windows) |window_tokens| {
                 var logits_split: [vocab]f32 = undefined;
-                try engine_forward.executePrefillWithLayerLimit(
-                    &split,
+                try split.executePrefillWithLayerLimitTestHook(
                     window_tokens,
                     slot_index,
                     logits_split[0..],
