@@ -62,9 +62,9 @@ const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const dumpHiddenState = common.dumpHiddenState;
 const applyHostLogitsPostProcess = common.applyHostLogitsPostProcess;
 const executeCpuStage0LayerRange = common.executeCpuStage0LayerRange;
-const executeStagedPrefillCudaCuda = staged_prefill.executeStagedPrefillCudaCuda;
-const executeStagedPrefillCpuCuda = staged_prefill.executeStagedPrefillCpuCuda;
-const executeStagedPrefillCpuCudaCuda = staged_prefill.executeStagedPrefillCpuCudaCuda;
+const executeLocalPrefillCudaCuda = staged_prefill.executeLocalPrefillCudaCuda;
+const executeLocalPrefillCpuCuda = staged_prefill.executeLocalPrefillCpuCuda;
+const executeLocalPrefillCpuCudaCuda = staged_prefill.executeLocalPrefillCpuCudaCuda;
 const ensureKvCapacity = kv_capacity.ensureKvCapacity;
 const resetShortConvStates = resets.resetShortConvStates;
 const resetGatedDeltaStates = resets.resetGatedDeltaStates;
@@ -92,7 +92,7 @@ pub fn executePrefillWithLayerLimit(
         return self.executePrefillWithLayerLimitTestHook(tokens, slot_index, logits_out, layer_limit);
     }
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook") and
-        !@hasDecl(SelfType, "pipelineCpuStage0"))
+        !@hasDecl(SelfType, "localCpuStage0"))
     {
         if (tokens.len == 0) return error.InvalidArgument;
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
@@ -122,7 +122,7 @@ pub fn executePrefillWithLayerLimit(
         return;
     }
 
-    // Pipeline2: batched prefill through stage0 → bulk transfer → stage1.
+    // Local CUDA+CUDA: batched prefill through stage0 -> bulk transfer -> stage1.
     // Uses comptime guard because anytype monomorphization requires all referenced
     // methods to exist on the type, even in runtime-unreachable branches.
     if (topologyModeIs(self, "pipeline2") and layer_limit == self.block_runtime.blocks.len) {
@@ -131,12 +131,12 @@ pub fn executePrefillWithLayerLimit(
         if (logits_out.len != self.vocab_size) return error.InvalidArgument;
         if (tokens.len > self.max_seq_len) return error.InvalidArgument;
 
-        if (comptime @hasDecl(SelfType, "pipelineStage1")) {
-            var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+        if (comptime @hasDecl(SelfType, "localCudaStage1")) {
+            var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
             if (stage1.state_descriptor_count > 0) try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
             stage1.activateKvSlot(slot_index);
             self.activateKvSlot(slot_index);
-            return executeStagedPrefillCudaCuda(self, stage1, tokens, slot_index, logits_out);
+            return executeLocalPrefillCudaCuda(self, stage1, tokens, slot_index, logits_out);
         }
     }
 
@@ -149,22 +149,22 @@ pub fn executePrefillWithLayerLimit(
         if (logits_out.len != self.vocab_size) return error.InvalidArgument;
         if (tokens.len > self.max_seq_len) return error.InvalidArgument;
 
-        if (comptime @hasDecl(SelfType, "pipelineCpuStage0")) {
-            const cpu_stage0 = self.pipelineCpuStage0() orelse return error.InvalidTopologyConfig;
+        if (comptime @hasDecl(SelfType, "localCpuStage0")) {
+            const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
             self.activateKvSlot(slot_index);
 
             // cpu_gpu_gpu: CPU → GPU0 → GPU1 (3-stage).
             if (topologyModeIs(self, "cpu_gpu_gpu")) {
-                if (comptime @hasDecl(SelfType, "pipelineStage1")) {
-                    var gpu_stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+                if (comptime @hasDecl(SelfType, "localCudaStage1")) {
+                    var gpu_stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
                     if (gpu_stage1.state_descriptor_count > 0) try gpu_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
                     gpu_stage1.activateKvSlot(slot_index);
-                    return executeStagedPrefillCpuCudaCuda(self, cpu_stage0, gpu_stage1, tokens, slot_index, logits_out);
+                    return executeLocalPrefillCpuCudaCuda(self, cpu_stage0, gpu_stage1, tokens, slot_index, logits_out);
                 }
             }
 
             // cpu_gpu: CPU → GPU (2-stage).
-            return executeStagedPrefillCpuCuda(self, cpu_stage0, tokens, slot_index, logits_out);
+            return executeLocalPrefillCpuCuda(self, cpu_stage0, tokens, slot_index, logits_out);
         }
     }
 

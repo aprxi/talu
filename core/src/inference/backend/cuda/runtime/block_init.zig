@@ -208,7 +208,7 @@ pub fn init(
 }
 
 /// Initialize a BlockRuntime for a contiguous range of decoder layers
-/// [layer_start, layer_end). Used by pipeline parallel to split layers
+/// [layer_start, layer_end). Used by local stage to split layers
 /// across devices.
 pub fn initRange(
     allocator: std.mem.Allocator,

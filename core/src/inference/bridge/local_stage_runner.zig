@@ -421,10 +421,6 @@ pub fn buildActivationTransportContract(
     };
 }
 
-pub fn executeLocalStageStepChain(request: LocalStageChainRequest) anyerror!void {
-    return executeLocalStageChain(request);
-}
-
 pub const LocalStageBoundaryStep = struct {
     boundary_index: usize,
     step_kind: tensor_frame.TensorFrameStepKind,
@@ -600,51 +596,6 @@ pub const LocalStageChainRequest = struct {
     stage_inputs: []const []const u8 = &.{},
 };
 
-pub const PreparedLocalStageBoundaryRequest = struct {
-    allocator: ?Allocator = null,
-    plan_ref: *const LocalStageRunnerPlanRef,
-    placement_plan: *const host_capability.PlacementPlan,
-    state_ownership_plan: ?*const state_ownership.StageStateOwnershipPlan = null,
-    cleanup_obligations: []const state_ownership.StateCleanupObligation = &.{},
-    step_kind: tensor_frame.TensorFrameStepKind,
-    metadata: *const tensor_frame.TensorFrameMetadata,
-    image: *const boundary_byte_image.BoundaryByteImageRef,
-    staging: ?[]align(64) u8 = null,
-    allow_borrow: bool = false,
-    local_device_peer_copy_available: bool = false,
-};
-
-pub fn executePreparedLocalStageBoundary(
-    comptime Source: type,
-    comptime Target: type,
-    source: *Source,
-    target: *Target,
-    request: PreparedLocalStageBoundaryRequest,
-) anyerror!void {
-    var stages = [_]LocalStageChainStage{
-        localStageAdapter(Source, request.metadata.boundary.source_stage_id, source),
-        localStageAdapter(Target, request.metadata.boundary.target_stage_id, target),
-    };
-    const boundaries = [_]LocalStageChainBoundaryStep{.{
-        .boundary_index = request.metadata.boundary.boundary_index,
-        .step_kind = request.step_kind,
-        .metadata = request.metadata,
-        .image = request.image,
-        .staging = request.staging,
-        .allow_borrow = request.allow_borrow,
-        .local_device_peer_copy_available = request.local_device_peer_copy_available,
-    }};
-    try executeLocalStageStepChain(.{
-        .allocator = request.allocator,
-        .plan_ref = request.plan_ref,
-        .placement_plan = request.placement_plan,
-        .state_ownership_plan = request.state_ownership_plan,
-        .cleanup_obligations = request.cleanup_obligations,
-        .stages = &stages,
-        .boundaries = &boundaries,
-    });
-}
-
 pub fn executeLocalStageChain(request: LocalStageChainRequest) anyerror!void {
     try validateLocalStageChainRequestShape(request);
 
@@ -715,9 +666,8 @@ pub fn executeLocalStageChain(request: LocalStageChainRequest) anyerror!void {
 }
 
 // Private regression harness for the pre-chain one-boundary runner contract.
-// Production bridge users must enter through executeLocalStageStepChain or
-// executePreparedLocalStageBoundary so ordered local topology execution has one
-// bridge path.
+// Production bridge users must enter through executeLocalStageChain so ordered
+// local topology execution has one bridge path.
 fn executeLocalStageBoundary(
     comptime SourceStageType: type,
     comptime TargetStageType: type,
@@ -771,10 +721,10 @@ fn executeLocalStageBoundary(
     }
 
     const staging = request.host_staging orelse {
-        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, error.PipelineTransferNotInitialized, &.{}, .validation_before_mutation);
+        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, error.LocalStageTransferNotInitialized, &.{}, .validation_before_mutation);
     };
     if (request.step.activation_byte_count > staging.len) {
-        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, error.PipelineTransferBufferTooSmall, &.{}, .validation_before_mutation);
+        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, error.LocalStageTransferBufferTooSmall, &.{}, .validation_before_mutation);
     }
     if (request.touched_stage_scratch.len < 2) return error.MissingFailureScratch;
 
@@ -2343,7 +2293,7 @@ test "executeLocalStageBoundary executes mock handoff through host staging and p
     try std.testing.expectEqual(@as(usize, 0), target_trace.deinit_calls);
 }
 
-test "localStageAdapter executePreparedLocalStageBoundary executeLocalStageStepChain executes prepared bridge boundary" {
+test "localStageAdapter executeLocalStageChain executes bridge boundary" {
     const allocator = std.testing.allocator;
     var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
     defer fixture.deinit();
@@ -2361,15 +2311,24 @@ test "localStageAdapter executePreparedLocalStageBoundary executeLocalStageStepC
     var payload = [_]u8{0x5a} ** (@sizeOf(f32) * 8);
     const frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
     const image = hostActivationByteImage(&frame, payload[0..]);
-
-    try executePreparedLocalStageBoundary(MockStage, MockStage, &source, &target, .{
-        .allocator = allocator,
-        .plan_ref = &runner,
-        .placement_plan = &fixture.placement,
+    var stages = [_]LocalStageChainStage{
+        localStageAdapter(MockStage, frame.boundary.source_stage_id, &source),
+        localStageAdapter(MockStage, frame.boundary.target_stage_id, &target),
+    };
+    const boundaries = [_]LocalStageChainBoundaryStep{.{
+        .boundary_index = frame.boundary.boundary_index,
         .step_kind = .decode,
         .metadata = &frame,
         .image = &image,
         .allow_borrow = false,
+    }};
+
+    try executeLocalStageChain(.{
+        .allocator = allocator,
+        .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
+        .stages = stages[0..],
+        .boundaries = boundaries[0..],
     });
 
     try std.testing.expectEqual(@as(usize, 1), source_trace.execute_calls);
@@ -2612,13 +2571,13 @@ test "executeLocalStageBoundary returns exact source_error for validation failur
     var touched: [2]LocalStageTouchedRef = undefined;
     var frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
 
-    try expectFailureSourceFrameId(error.PipelineTransferNotInitialized, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
+    try expectFailureSourceFrameId(error.LocalStageTransferNotInitialized, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = null,
         .touched_stage_scratch = &touched,
     }));
-    try expectFailureSource(error.PipelineTransferBufferTooSmall, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
+    try expectFailureSource(error.LocalStageTransferBufferTooSmall, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..4],

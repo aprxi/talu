@@ -4,7 +4,7 @@
 //! CPU, CUDA, and Metal backends remain execution providers; bridge code owns
 //! stage ordering, activation handoff, and future tensor-frame/distributed
 //! boundaries. The current implementation stays fully in-process and generic so
-//! existing CPU/GPU split paths keep their current performance shape.
+//! local CPU/CUDA placements keep their current performance shape.
 
 pub const pipeline = @import("pipeline.zig");
 pub const tensor_frame = @import("tensor_frame.zig");
@@ -67,9 +67,6 @@ pub const LocalStageRunnerPlanRef = local_stage_runner.LocalStageRunnerPlanRef;
 pub const LocalStageRunnerPlanRequest = local_stage_runner.LocalStageRunnerPlanRequest;
 pub const LocalStageRunnerStageRef = local_stage_runner.LocalStageRunnerStageRef;
 pub const PrefillActivationMetadataRequest = local_stage_runner.PrefillActivationMetadataRequest;
-pub const PreparedLocalStageBoundaryRequest = local_stage_runner.PreparedLocalStageBoundaryRequest;
-pub const PipelineRuntime = pipeline.PipelineRuntime;
-pub const PipelineRuntime3 = pipeline.PipelineRuntime3;
 pub const StageStateBindingReport = state_ownership.StageStateBindingReport;
 pub const StageStateBoundaryRef = state_ownership.StageStateBoundaryRef;
 pub const StageStateCleanupTarget = state_ownership.StageStateCleanupTarget;
@@ -189,8 +186,6 @@ pub const dtypeByteSize = tensor_frame.dtypeByteSize;
 pub const emitTensorFrame = tensor_frame.emitTensorFrame;
 pub const executeLocalStageChain = local_stage_runner.executeLocalStageChain;
 pub const executeLocalStageLayers = local_stage_runner.executeLocalStageLayers;
-pub const executePreparedLocalStageBoundary = local_stage_runner.executePreparedLocalStageBoundary;
-pub const executeLocalStageStepChain = local_stage_runner.executeLocalStageStepChain;
 pub const fromComputeDType = tensor_frame.fromComputeDType;
 pub const selectedBoundaryTensorContract = tensor_frame.selectedBoundaryTensorContract;
 pub const bindingForStage = host_capability.bindingForStage;
@@ -308,8 +303,7 @@ test "inference bridge root exports local_stage_runner contract" {
     _ = LocalStageRunnerPlanId;
     _ = buildLocalStageRunnerPlanRef;
     _ = validateLocalStageRunnerPlanRef;
-    _ = executePreparedLocalStageBoundary;
-    _ = executeLocalStageStepChain;
+    _ = executeLocalStageChain;
     _ = localStageRunnerPlanIdEql;
 }
 

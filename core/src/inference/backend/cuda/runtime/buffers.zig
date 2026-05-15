@@ -158,7 +158,7 @@ pub const RuntimeBuffers = struct {
         errdefer if (projection_weight_opt) |*w| w.deinit(device);
 
         if (skip_projection) {
-            // Intermediate pipeline stage — never computes logits.
+            // Intermediate local stage: never computes logits.
             // Skip uploading projection weight to avoid init-time peak memory.
             projection_weight_opt = .{ .dense_f32 = missing_device_tensor };
         } else {

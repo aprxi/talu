@@ -430,11 +430,11 @@ pub fn maybeCapturePerLayerSourceEmbeddings(self: anytype, rows: usize) !?comput
     return dst;
 }
 
-pub fn capturePerLayerSourceEmbeddingsForPipeline(self: anytype, token: u32) !?compute.cuda.Buffer {
+pub fn capturePerLayerSourceEmbeddingsForLocalStage(self: anytype, token: u32) !?compute.cuda.Buffer {
     _ = self.per_layer_branch_runtime orelse return null;
     const used = try engine_weights.tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host);
     if (!used) {
-        log.warn("inference", "capturePerLayerSourceEmbeddingsForPipeline: tryPopulateHiddenFromToken returned false", .{
+        log.warn("inference", "capturePerLayerSourceEmbeddingsForLocalStage: tryPopulateHiddenFromToken returned false", .{
             .token = token,
             .embed_dtype = @tagName(self.loaded.token_embeddings.dtype),
             .embed_ndim = self.loaded.token_embeddings.n_dims,

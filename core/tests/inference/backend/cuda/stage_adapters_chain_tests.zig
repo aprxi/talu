@@ -4,12 +4,13 @@ const std = @import("std");
 const main = @import("main");
 
 const bridge = main.inference.bridge;
+const transport = main.inference.transport;
 const models = main.models.dispatcher;
 const cuda_testing = main.inference.backend.cuda.testing;
 const engine = cuda_testing.engine;
 const stage_adapters = cuda_testing.exec.stage_adapters;
 
-test "peerCopyPipelineActivation issues event ordered device peer copy" {
+test "peerCopyCudaActivation issues event ordered device peer copy" {
     const Trace = struct {
         record_calls: usize = 0,
         wait_calls: usize = 0,
@@ -67,21 +68,21 @@ test "peerCopyPipelineActivation issues event ordered device peer copy" {
         device: Device,
         runtime_buffers: RuntimeBuffers = .{},
         compute_stream: ?usize,
-        pipeline_stage0_event: ?usize = null,
+        local_stage_peer_copy_event: ?usize = null,
     };
 
     var trace_data = Trace{};
     var source = Backend{
         .device = .{ .trace = &trace_data },
         .compute_stream = 11,
-        .pipeline_stage0_event = 99,
+        .local_stage_peer_copy_event = 99,
     };
     var target = Backend{
         .device = .{ .trace = &trace_data },
         .compute_stream = 22,
     };
 
-    try stage_adapters.peerCopyPipelineActivation(&source, &target, 64);
+    try transport.peerCopyCudaActivation(&source, &target, 64, .source_event_target_stream);
 
     try std.testing.expectEqual(@as(usize, 1), trace_data.record_calls);
     try std.testing.expectEqual(@as(usize, 1), trace_data.wait_calls);
@@ -90,6 +91,19 @@ test "peerCopyPipelineActivation issues event ordered device peer copy" {
     try std.testing.expectEqual(@as(usize, 64), trace_data.peer_bytes);
     try std.testing.expectEqual(@as(?usize, 22), trace_data.peer_stream);
     try std.testing.expectEqual(@as(usize, 0), trace_data.sync_calls);
+    try std.testing.expect(transport.peerCopyCudaActivationHandlesStageSync(&source, .source_event_target_stream));
+}
+
+test "peerCopyCudaActivationHandlesStageSync reports only event-synchronized copies" {
+    const Backend = struct {
+        local_stage_peer_copy_event: ?usize = null,
+    };
+    var without_event = Backend{};
+    var with_event = Backend{ .local_stage_peer_copy_event = 99 };
+
+    try std.testing.expect(!transport.peerCopyCudaActivationHandlesStageSync(&without_event, .source_event_target_stream));
+    try std.testing.expect(transport.peerCopyCudaActivationHandlesStageSync(&with_event, .source_event_target_stream));
+    try std.testing.expect(!transport.peerCopyCudaActivationHandlesStageSync(&with_event, .source_stream));
 }
 
 test "localCudaPeerCopyAvailable matches bridge adapter peer-copy direction" {
@@ -119,7 +133,7 @@ test "localCudaPeerCopyAvailable matches bridge adapter peer-copy direction" {
         device: Device,
         probe_result: bool = true,
 
-        pub fn probePipelinePeerCopy(backend: *@This(), _: *@This()) bool {
+        pub fn probeLocalCudaPeerCopy(backend: *@This(), _: *@This()) bool {
             backend.device.trace.probe_calls += 1;
             return backend.probe_result;
         }
@@ -549,7 +563,7 @@ fn buildPlacement(step_kind: bridge.TensorFrameStepKind) !engine.testing.LocalTo
     const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{2});
     const kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
     const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 4, 1),
+        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 1),
     };
     var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
         std.testing.allocator,
@@ -565,7 +579,7 @@ fn buildPlacement(step_kind: bridge.TensorFrameStepKind) !engine.testing.LocalTo
 fn buildThreeStagePlacement() !engine.testing.LocalTopologyContractBundle {
     const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{ 2, 3 });
     const kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const configs = engine.testing.cpuGpuGpuBoundaryConfigs(.f32, .row_major, .f32, .row_major, 4, 4, 1, 1);
+    const configs = engine.testing.localCpuCudaCudaBoundaryConfigs(.f32, .row_major, .f32, .row_major, 4, 4, 1, 1);
     return engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
         std.testing.allocator,
         4,

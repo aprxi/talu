@@ -471,7 +471,7 @@ fn utilPerMille(bytes: usize, budget: usize) usize {
 ///
 /// Uses per-GPU estimation that separates fixed costs (embedding, projection,
 /// activation buffers) from per-layer costs (weights, KV cache).
-/// Intermediate pipeline stages skip embedding/projection at init time.
+/// Intermediate local stages skip embedding/projection at init time.
 ///
 /// Pure logic — no I/O, no side effects. Fully testable with synthetic values.
 /// Returns .single when in doubt (safest default).

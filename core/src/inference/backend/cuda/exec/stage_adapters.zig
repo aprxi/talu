@@ -1,13 +1,10 @@
 //! Shared adapter helpers for CUDA staged decode and prefill routes.
 //!
-//! This module owns common stage-method validation and activation movement used
-//! by local staged-route adapters.
+//! This module owns common stage-method validation and stage metadata helpers
+//! used by local staged-route adapters.
 
 const std = @import("std");
 const bridge = @import("../../../bridge/root.zig");
-const engine_weights = @import("../weights/root.zig");
-
-const bufferSlice = engine_weights.bufferSlice;
 
 pub const max_decode_transport_rows: usize = 128;
 
@@ -85,30 +82,76 @@ pub fn backendAllocator(backend: anytype) ?std.mem.Allocator {
 
 pub fn localTopologyTensorFramePlanRef(backend: anytype) !*const bridge.TensorFramePlanRef {
     const BackendType = @TypeOf(backend.*);
-    if (comptime !@hasField(BackendType, "cpu_gpu_tensor_frame_plan_ref")) return error.InvalidTopologyConfig;
-    if (backend.cpu_gpu_tensor_frame_plan_ref) |*plan_ref| return plan_ref;
+    if (comptime !@hasField(BackendType, "local_tensor_frame_plan_ref")) return error.InvalidTopologyConfig;
+    if (backend.local_tensor_frame_plan_ref) |*plan_ref| return plan_ref;
     return error.InvalidTopologyConfig;
 }
 
 pub fn localTopologyPlacementPlan(backend: anytype) !*const bridge.PlacementPlan {
     const BackendType = @TypeOf(backend.*);
-    if (comptime !@hasField(BackendType, "cpu_gpu_placement_plan")) return error.InvalidTopologyConfig;
-    if (backend.cpu_gpu_placement_plan) |*placement_plan| return placement_plan;
+    if (comptime !@hasField(BackendType, "local_placement_plan")) return error.InvalidTopologyConfig;
+    if (backend.local_placement_plan) |*placement_plan| return placement_plan;
     return error.InvalidTopologyConfig;
 }
 
 pub fn localTopologyStateOwnershipPlan(backend: anytype) ?*const bridge.StageStateOwnershipPlan {
     const BackendType = @TypeOf(backend.*);
-    if (comptime !@hasField(BackendType, "cpu_gpu_state_ownership_plan")) return null;
-    if (backend.cpu_gpu_state_ownership_plan) |*state_plan| return state_plan;
+    if (comptime !@hasField(BackendType, "local_state_ownership_plan")) return null;
+    if (backend.local_state_ownership_plan) |*state_plan| return state_plan;
     return null;
 }
 
 pub fn localTopologyRunnerPlanRef(backend: anytype) !*const bridge.LocalStageRunnerPlanRef {
     const BackendType = @TypeOf(backend.*);
-    if (comptime !@hasField(BackendType, "cpu_gpu_local_stage_runner_plan_ref")) return error.InvalidTopologyConfig;
-    if (backend.cpu_gpu_local_stage_runner_plan_ref) |*plan_ref| return plan_ref;
+    if (comptime !@hasField(BackendType, "local_stage_runner_plan_ref")) return error.InvalidTopologyConfig;
+    if (backend.local_stage_runner_plan_ref) |*plan_ref| return plan_ref;
     return error.InvalidTopologyConfig;
+}
+
+pub const LocalBoundaryRuntimeView = struct {
+    boundary_index: usize,
+    dtype: bridge.BoundaryDType,
+    layout: bridge.BoundaryLayout,
+    staging: ?[]align(64) u8 = null,
+    local_device_peer_copy_available: bool = false,
+};
+
+pub fn localBoundaryRuntime(backend: anytype, boundary_index: usize) !LocalBoundaryRuntimeView {
+    const BackendType = @TypeOf(backend.*);
+    if (comptime @hasDecl(BackendType, "localBoundaryRuntime")) {
+        const boundary = try backend.localBoundaryRuntime(boundary_index);
+        return .{
+            .boundary_index = boundary.boundary_index,
+            .dtype = boundary.dtype,
+            .layout = boundary.layout,
+            .staging = boundary.staging,
+            .local_device_peer_copy_available = boundary.local_device_peer_copy_available,
+        };
+    }
+    if (comptime @hasField(BackendType, "local_boundary_runtimes")) {
+        if (boundary_index >= backend.local_boundary_runtimes.len) return error.InvalidTopologyConfig;
+        const boundary = backend.local_boundary_runtimes[boundary_index];
+        if (boundary.boundary_index != boundary_index) return error.InvalidTopologyConfig;
+        return .{
+            .boundary_index = boundary.boundary_index,
+            .dtype = boundary.dtype,
+            .layout = boundary.layout,
+            .staging = boundary.staging,
+            .local_device_peer_copy_available = boundary.local_device_peer_copy_available,
+        };
+    }
+    return error.InvalidTopologyConfig;
+}
+
+pub fn localLayerOffset(backend: anytype) usize {
+    const BackendType = @TypeOf(backend.*);
+    if (comptime @hasDecl(BackendType, "localSplitLayer")) {
+        return backend.localSplitLayer();
+    }
+    if (comptime @hasField(BackendType, "split_layer")) {
+        return backend.split_layer;
+    }
+    return 0;
 }
 
 pub fn cudaPayloadLocationHint(backend: anytype) !bridge.TensorFramePayloadLocationHint {
@@ -236,158 +279,6 @@ pub fn executeCudaDecodeLayerRange(
     );
 }
 
-pub fn downloadCpuActivation(backend: anytype, slot_index: usize, host_buf: []u8, byte_count: usize) !void {
-    if (byte_count > host_buf.len) return error.InvalidArgument;
-    const source = backend.slotActivationBytes(slot_index);
-    if (byte_count > source.len) return error.InvalidArgument;
-    @memcpy(host_buf[0..byte_count], source[0..byte_count]);
-}
-
-pub fn uploadCpuActivation(backend: anytype, slot_index: usize, host_buf: []const u8, byte_count: usize) !void {
-    if (byte_count > host_buf.len) return error.InvalidArgument;
-    const dst = backend.slotActivationBytesMut(slot_index);
-    if (byte_count > dst.len) return error.InvalidArgument;
-    @memcpy(dst[0..byte_count], host_buf[0..byte_count]);
-}
-
-pub fn downloadCudaActivation(backend: anytype, host_buf: []u8, byte_count: usize) !void {
-    if (byte_count > host_buf.len) return error.InvalidArgument;
-    const BackendType = @TypeOf(backend.*);
-    if (comptime @hasDecl(BackendType, "downloadPipelineActivationToHost")) {
-        return backend.downloadPipelineActivationToHost(host_buf[0..byte_count], byte_count);
-    }
-    if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
-        return backend.runtime_buffers.input_dev.download(&backend.device, host_buf[0..byte_count]);
-    }
-    return error.InvalidTopologyConfig;
-}
-
-pub fn uploadCudaActivation(backend: anytype, slot_index: usize, host_buf: []const u8, byte_count: usize) !void {
-    if (byte_count > host_buf.len) return error.InvalidArgument;
-    const BackendType = @TypeOf(backend.*);
-    if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
-        return backend.uploadPipelineActivationFromHost(slot_index, host_buf[0..byte_count], byte_count);
-    }
-    if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
-        return backend.runtime_buffers.input_dev.upload(&backend.device, host_buf[0..byte_count]);
-    }
-    return error.InvalidTopologyConfig;
-}
-
-pub fn uploadCudaActivationSegments(backend: anytype, host_segments: []const []const u8, byte_count: usize) !void {
-    const BackendType = @TypeOf(backend.*);
-    if (comptime !@hasField(BackendType, "runtime_buffers") or !@hasField(BackendType, "device")) {
-        return error.InvalidTopologyConfig;
-    }
-    var offset: usize = 0;
-    for (host_segments) |segment| {
-        offset = std.math.add(usize, offset, segment.len) catch return error.InvalidArgument;
-        if (offset > byte_count) return error.InvalidArgument;
-        const start = offset - segment.len;
-        var dst_slice = try bufferSlice(&backend.runtime_buffers.input_dev, start, segment.len);
-        try dst_slice.upload(&backend.device, segment);
-    }
-    if (offset != byte_count) return error.InvalidArgument;
-}
-
-pub fn synchronizeCudaBackend(backend: anytype) !void {
-    const BackendType = @TypeOf(backend.*);
-    if (comptime @hasDecl(BackendType, "synchronizePipelineActivation")) {
-        return backend.synchronizePipelineActivation();
-    }
-    if (comptime !@hasField(BackendType, "device")) return error.InvalidTopologyConfig;
-    if (comptime @hasField(BackendType, "compute_stream")) {
-        if (backend.compute_stream) |stream| {
-            const DeviceType = @TypeOf(backend.device);
-            if (comptime @hasDecl(DeviceType, "synchronizeStream")) {
-                try backend.device.synchronizeStream(stream);
-                return;
-            }
-        }
-    }
-    const DeviceType = @TypeOf(backend.device);
-    if (comptime @hasDecl(DeviceType, "synchronize")) {
-        try backend.device.synchronize();
-        return;
-    }
-    return error.InvalidTopologyConfig;
-}
-
-pub fn peerCopyPipelineActivation(source_backend: anytype, target_backend: anytype, byte_count: usize) !void {
-    if (byte_count == 0) return;
-    const SourceType = @TypeOf(source_backend.*);
-    const TargetType = @TypeOf(target_backend.*);
-    if (comptime !@hasField(SourceType, "device") or
-        !@hasField(SourceType, "runtime_buffers") or
-        !@hasField(SourceType, "compute_stream") or
-        !@hasField(TargetType, "device") or
-        !@hasField(TargetType, "runtime_buffers") or
-        !@hasField(TargetType, "compute_stream"))
-    {
-        return error.InvalidTopologyConfig;
-    }
-    if (!target_backend.device.canAccessPeer(&source_backend.device)) return error.InvalidTopologyConfig;
-    target_backend.device.enablePeerAccess(&source_backend.device) catch {};
-    source_backend.device.enablePeerAccess(&target_backend.device) catch {};
-
-    if (comptime @hasField(SourceType, "pipeline_stage0_event")) {
-        if (source_backend.pipeline_stage0_event) |event| {
-            try source_backend.device.recordEvent(event, source_backend.compute_stream);
-            try target_backend.device.streamWaitEvent(target_backend.compute_stream, event);
-            try target_backend.device.makeCurrent();
-            return source_backend.device.memcpyPeerAsync(
-                &target_backend.device,
-                &target_backend.runtime_buffers.input_dev,
-                &source_backend.runtime_buffers.input_dev,
-                byte_count,
-                target_backend.compute_stream,
-            );
-        }
-    }
-
-    try source_backend.device.memcpyPeerAsync(
-        &target_backend.device,
-        &target_backend.runtime_buffers.input_dev,
-        &source_backend.runtime_buffers.input_dev,
-        byte_count,
-        source_backend.compute_stream,
-    );
-    if (source_backend.compute_stream) |stream| {
-        try source_backend.device.synchronizeStream(stream);
-    } else {
-        try source_backend.device.synchronize();
-    }
-}
-
-pub fn peerCopyStage12Activation(source_backend: anytype, target_backend: anytype, byte_count: usize) !void {
-    if (byte_count == 0) return;
-    const SourceType = @TypeOf(source_backend.*);
-    const TargetType = @TypeOf(target_backend.*);
-    if (comptime !@hasField(SourceType, "device") or
-        !@hasField(SourceType, "runtime_buffers") or
-        !@hasField(SourceType, "compute_stream") or
-        !@hasField(TargetType, "device") or
-        !@hasField(TargetType, "runtime_buffers"))
-    {
-        return error.InvalidTopologyConfig;
-    }
-    if (!target_backend.device.canAccessPeer(&source_backend.device)) return error.InvalidTopologyConfig;
-    target_backend.device.enablePeerAccess(&source_backend.device) catch {};
-    source_backend.device.enablePeerAccess(&target_backend.device) catch {};
-    try source_backend.device.memcpyPeerAsync(
-        &target_backend.device,
-        &target_backend.runtime_buffers.input_dev,
-        &source_backend.runtime_buffers.input_dev,
-        byte_count,
-        source_backend.compute_stream,
-    );
-    if (source_backend.compute_stream) |stream| {
-        try source_backend.device.synchronizeStream(stream);
-    } else {
-        try source_backend.device.synchronize();
-    }
-}
-
 fn hasDecl(comptime T: type, comptime name: []const u8) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, name),
@@ -408,7 +299,7 @@ test "localTopologyStateOwnershipPlan returns optional topology ownership plan f
         allocator: std.mem.Allocator = std.testing.allocator,
     };
     const WithPlan = struct {
-        cpu_gpu_state_ownership_plan: ?bridge.StageStateOwnershipPlan = null,
+        local_state_ownership_plan: ?bridge.StageStateOwnershipPlan = null,
     };
     var without_plan = WithoutPlan{};
     var with_plan = WithPlan{};
@@ -417,10 +308,47 @@ test "localTopologyStateOwnershipPlan returns optional topology ownership plan f
     try std.testing.expect(localTopologyStateOwnershipPlan(&with_plan) == null);
 }
 
+test "localBoundaryRuntime reads generic boundary runtime by index" {
+    const Runtime = struct {
+        boundary_index: usize,
+        dtype: bridge.BoundaryDType,
+        layout: bridge.BoundaryLayout,
+        staging: ?[]align(64) u8 = null,
+        local_device_peer_copy_available: bool = false,
+    };
+    const MockBackend = struct {
+        runtimes: [2]Runtime,
+
+        pub fn localBoundaryRuntime(self: *@This(), boundary_index: usize) !*const Runtime {
+            if (boundary_index >= self.runtimes.len) return error.InvalidTopologyConfig;
+            return &self.runtimes[boundary_index];
+        }
+    };
+    var staging: [16]u8 align(64) = [_]u8{0} ** 16;
+    var backend = MockBackend{ .runtimes = .{
+        .{ .boundary_index = 0, .dtype = .f32, .layout = .row_major },
+        .{
+            .boundary_index = 1,
+            .dtype = .f16,
+            .layout = .row_major,
+            .staging = staging[0..],
+            .local_device_peer_copy_available = true,
+        },
+    } };
+
+    const boundary = try localBoundaryRuntime(&backend, 1);
+    try std.testing.expectEqual(@as(usize, 1), boundary.boundary_index);
+    try std.testing.expectEqual(bridge.BoundaryDType.f16, boundary.dtype);
+    try std.testing.expectEqual(bridge.BoundaryLayout.row_major, boundary.layout);
+    try std.testing.expect(boundary.staging != null);
+    try std.testing.expect(boundary.local_device_peer_copy_available);
+    try std.testing.expectError(error.InvalidTopologyConfig, localBoundaryRuntime(&backend, 2));
+}
+
 test "buildDecodeActivationMetadata creates multi-entry decode frame" {
     const MockBackend = struct {
         d_model: usize = 4,
-        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
         slot_request_ids: [3]?u64 = .{ 101, 202, 303 },
     };
     const boundaries = [_]bridge.TensorFrameBoundaryRef{.{
@@ -442,7 +370,7 @@ test "buildDecodeActivationMetadata creates multi-entry decode frame" {
         },
         .boundaries = &boundaries,
     };
-    var backend = MockBackend{ .cpu_gpu_tensor_frame_plan_ref = plan_ref };
+    var backend = MockBackend{ .local_tensor_frame_plan_ref = plan_ref };
     var entries: [max_decode_transport_rows]bridge.TensorFrameBatchEntry = undefined;
     const slots = [_]usize{ 0, 2 };
     const positions = [_]usize{ 7, 9 };
@@ -470,7 +398,7 @@ test "buildDecodeActivationMetadata creates multi-entry decode frame" {
 test "buildPrefillActivationMetadata hostActivationByteImage deviceActivationByteImage creates single-entry prefill frame images" {
     const MockBackend = struct {
         d_model: usize = 4,
-        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
         slot_request_ids: [2]?u64 = .{ 101, 202 },
     };
     const boundaries = [_]bridge.TensorFrameBoundaryRef{.{
@@ -492,7 +420,7 @@ test "buildPrefillActivationMetadata hostActivationByteImage deviceActivationByt
         },
         .boundaries = &boundaries,
     };
-    var backend = MockBackend{ .cpu_gpu_tensor_frame_plan_ref = plan_ref };
+    var backend = MockBackend{ .local_tensor_frame_plan_ref = plan_ref };
     var entries: [1]bridge.TensorFrameBatchEntry = undefined;
     const metadata = try buildPrefillActivationMetadata(
         &backend,

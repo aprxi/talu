@@ -6,6 +6,7 @@ const std = @import("std");
 const compute = @import("compute_pkg");
 const trace = @import("xray_pkg").trace;
 const bridge = @import("../../../bridge/root.zig");
+const transport = @import("../../../transport/root.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 const engine_types = @import("../runtime/root.zig");
@@ -25,9 +26,8 @@ const common = @import("common.zig");
 const kv_capacity = @import("kv_capacity.zig");
 const resets = @import("resets.zig");
 const stage_adapters = @import("stage_adapters.zig");
-const transfers = @import("transfers.zig");
 const resolveStagedPrefillChunkRows = @import("prefill_route.zig").resolveStagedPrefillChunkRows;
-const uploadCpuKvToMirrors = transfers.uploadCpuKvToMirrors;
+const uploadCpuKvToMirrors = transport.uploadCpuKvToCudaMirrors;
 const dumpHiddenState = common.dumpHiddenState;
 const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const applyHostLogitsPostProcess = common.applyHostLogitsPostProcess;
@@ -36,7 +36,7 @@ const resetShortConvStates = resets.resetShortConvStates;
 const resetGatedDeltaStates = resets.resetGatedDeltaStates;
 const resetAttentionCpuStates = resets.resetAttentionCpuStates;
 
-fn executePreparedBridgeBoundary(
+fn executeLocalPrefillBoundaryChain(
     root_backend: anytype,
     allocator: ?std.mem.Allocator,
     comptime step_kind: bridge.TensorFrameStepKind,
@@ -52,21 +52,30 @@ fn executePreparedBridgeBoundary(
     allow_borrow: bool,
     local_peer_copy: bool,
 ) !void {
-    try bridge.executePreparedLocalStageBoundary(Source, Target, source, target, .{
-        .allocator = allocator,
-        .plan_ref = try stage_adapters.localTopologyRunnerPlanRef(root_backend),
-        .placement_plan = placement_plan,
-        .state_ownership_plan = state_ownership_plan,
+    var stages = [_]bridge.LocalStageChainStage{
+        bridge.localStageAdapter(Source, metadata.boundary.source_stage_id, source),
+        bridge.localStageAdapter(Target, metadata.boundary.target_stage_id, target),
+    };
+    const boundaries = [_]bridge.LocalStageChainBoundaryStep{.{
+        .boundary_index = metadata.boundary.boundary_index,
         .step_kind = step_kind,
         .metadata = metadata,
         .image = image,
         .staging = staging,
         .allow_borrow = allow_borrow,
         .local_device_peer_copy_available = local_peer_copy,
+    }};
+    try bridge.executeLocalStageChain(.{
+        .allocator = allocator,
+        .plan_ref = try stage_adapters.localTopologyRunnerPlanRef(root_backend),
+        .placement_plan = placement_plan,
+        .state_ownership_plan = state_ownership_plan,
+        .stages = stages[0..],
+        .boundaries = boundaries[0..],
     });
 }
 
-pub fn executeStagedPrefillCpuCuda(
+pub fn executeLocalPrefillCpuCuda(
     self: anytype,
     cpu_stage0: anytype,
     tokens: []const u32,
@@ -75,40 +84,8 @@ pub fn executeStagedPrefillCpuCuda(
 ) !void {
     const SelfType = @TypeOf(self.*);
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
-    const PrefillSource = struct {
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(_: *@This()) anyerror!void {}
-
-        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
-            return error.InvalidTopologyConfig;
-        }
-
-        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
-            return error.InvalidTopologyConfig;
-        }
-    };
-    const PrefillTarget = struct {
-        backend: @TypeOf(self),
-
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try stage_adapters.synchronizeCudaBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try stage_adapters.uploadCudaActivation(stage.backend, 0, host_buf, byte_count);
-        }
-    };
+    const PrefillSource = transport.NoopActivationStage;
+    const PrefillTarget = transport.CudaActivationStage(@TypeOf(self));
 
     const previous_launch_phase = self.device.setLaunchPhase(.prefill);
     defer _ = self.device.setLaunchPhase(previous_launch_phase);
@@ -178,7 +155,7 @@ pub fn executeStagedPrefillCpuCuda(
         null;
     defer if (source_embeddings_host) |buf| self.allocator.free(buf);
 
-    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, self.split_layer, source_embeddings_host);
+    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, stage_adapters.localLayerOffset(self), source_embeddings_host);
 
     // Upload CPU source layer KV to GPU mirror buffers for cross-device sharing.
     try uploadCpuKvToMirrors(self, cpu_stage0, slot_index, 0, total_rows);
@@ -188,6 +165,7 @@ pub fn executeStagedPrefillCpuCuda(
     const allocator = stage_adapters.backendAllocator(self);
     var prefill_source = PrefillSource{};
     var prefill_target = PrefillTarget{ .backend = self };
+    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
 
     // ── GPU stage1: chunked forward through GPU layers ──
     var pos_base: usize = 0;
@@ -204,19 +182,19 @@ pub fn executeStagedPrefillCpuCuda(
         var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
         const activation_metadata = try stage_adapters.buildPrefillActivationMetadata(
             self,
-            0,
-            self.pipeline_boundary_dtype,
-            self.pipeline_boundary_layout,
+            boundary0.boundary_index,
+            boundary0.dtype,
+            boundary0.layout,
             .{ .cpu = {} },
             slot_index,
             pos_base,
             rows,
             batch_entries[0..],
         );
-        try bridge.validateTensorFrameForPlanBoundary(&activation_metadata, try stage_adapters.localTopologyTensorFramePlanRef(self), 0);
+        try bridge.validateTensorFrameForPlanBoundary(&activation_metadata, try stage_adapters.localTopologyTensorFramePlanRef(self), boundary0.boundary_index);
         try bridge.validatePayloadBufferLength(&activation_metadata, chunk_bytes.len);
         const image = bridge.hostActivationByteImage(&activation_metadata, chunk_bytes);
-        try executePreparedBridgeBoundary(
+        try executeLocalPrefillBoundaryChain(
             self,
             allocator,
             .prefill,
@@ -228,9 +206,9 @@ pub fn executeStagedPrefillCpuCuda(
             state_ownership_plan,
             &activation_metadata,
             &image,
-            self.pipeline_host_staging,
+            boundary0.staging,
             false,
-            false,
+            boundary0.local_device_peer_copy_available,
         );
 
         const active_rows_u32: u32 = @intCast(rows);
@@ -241,7 +219,7 @@ pub fn executeStagedPrefillCpuCuda(
         var final_hidden_rows = self.runtime_buffers.input_dev;
         var per_layer_source_embeddings_opt: ?compute.cuda.Buffer = null;
         if (source_embeddings_host) |se_host| {
-            // Pipeline mode: upload source embeddings from CPU to deepstack_add_dev.
+            // local-stage mode: upload source embeddings from CPU to deepstack_add_dev.
             const se_chunk_offset = pos_base * d_model;
             const se_chunk_f32s = rows * d_model;
             const se_bytes = std.math.mul(usize, se_chunk_f32s, @sizeOf(f32)) catch return error.InvalidArgument;
@@ -280,7 +258,7 @@ pub fn executeStagedPrefillCpuCuda(
                 attention_kernels,
                 null,
             );
-            dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_layer", self.d_model, 1);
+            dumpHiddenState(self, &self.runtime_buffers.input_dev, stage_adapters.localLayerOffset(self) + layer_idx, "post_layer", self.d_model, 1);
             if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
                 if (per_layer_source_embeddings_opt) |*per_layer_source_embeddings| {
                     const chunk_tokens = tokens[pos_base .. pos_base + rows];
@@ -292,7 +270,7 @@ pub fn executeStagedPrefillCpuCuda(
                         &self.runtime_buffers.input_dev,
                     );
                     final_hidden_rows = self.runtime_buffers.input_dev;
-                    dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_ple", self.d_model, 1);
+                    dumpHiddenState(self, &self.runtime_buffers.input_dev, stage_adapters.localLayerOffset(self) + layer_idx, "post_ple", self.d_model, 1);
                 } else if (per_layer_branch_feature.hasStandaloneLayerScalars(self)) {
                     try per_layer_branch_feature.applyStandaloneLayerScalar(self, layer_idx, &self.runtime_buffers.input_dev, rows);
                 }
@@ -333,7 +311,7 @@ pub fn executeStagedPrefillCpuCuda(
     }
 }
 
-pub fn executeStagedPrefillCudaCuda(
+pub fn executeLocalPrefillCudaCuda(
     self: anytype,
     stage1: anytype,
     tokens: []const u32,
@@ -343,56 +321,8 @@ pub fn executeStagedPrefillCudaCuda(
     const SelfType = @TypeOf(self.*);
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
     if (comptime !@hasField(@TypeOf(stage1.*), "device")) return error.InvalidArgument;
-    const PrefillSource = struct {
-        backend: @TypeOf(self),
-        target_backend: @TypeOf(stage1),
-
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try stage_adapters.synchronizeCudaBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try stage_adapters.uploadCudaActivation(stage.backend, 0, host_buf, byte_count);
-        }
-
-        pub fn peerCopyActivationToErased(stage: *@This(), target_ptr: *anyopaque, byte_count: usize) anyerror!void {
-            _ = target_ptr;
-            try stage_adapters.peerCopyPipelineActivation(stage.backend, stage.target_backend, byte_count);
-        }
-
-        pub fn peerCopyHandlesStageSync(stage: *const @This()) bool {
-            const BackendType = @TypeOf(stage.backend.*);
-            if (comptime !@hasField(BackendType, "pipeline_stage0_event")) return false;
-            return stage.backend.pipeline_stage0_event != null;
-        }
-    };
-    const PrefillTarget = struct {
-        backend: @TypeOf(stage1),
-
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try stage_adapters.synchronizeCudaBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try stage_adapters.uploadCudaActivation(stage.backend, 0, host_buf, byte_count);
-        }
-    };
+    const PrefillSource = transport.CudaPeerActivationStage(@TypeOf(self), @TypeOf(stage1), .source_event_target_stream);
+    const PrefillTarget = transport.CudaActivationStage(@TypeOf(stage1));
 
     const previous_launch_phase0 = self.device.setLaunchPhase(.prefill);
     defer _ = self.device.setLaunchPhase(previous_launch_phase0);
@@ -455,6 +385,7 @@ pub fn executeStagedPrefillCudaCuda(
     const allocator = stage_adapters.backendAllocator(self);
     var prefill_source = PrefillSource{ .backend = self, .target_backend = stage1 };
     var prefill_target = PrefillTarget{ .backend = stage1 };
+    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
 
     var pos_base: usize = 0;
     while (pos_base < total_rows) {
@@ -691,19 +622,19 @@ pub fn executeStagedPrefillCudaCuda(
         var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
         const activation_metadata = try stage_adapters.buildPrefillActivationMetadata(
             self,
-            0,
-            self.pipeline_boundary_dtype,
-            self.pipeline_boundary_layout,
+            boundary0.boundary_index,
+            boundary0.dtype,
+            boundary0.layout,
             try stage_adapters.cudaPayloadLocationHint(self),
             slot_index,
             pos_base,
             rows,
             batch_entries[0..],
         );
-        try bridge.validateTensorFrameForPlanBoundary(&activation_metadata, try stage_adapters.localTopologyTensorFramePlanRef(self), 0);
+        try bridge.validateTensorFrameForPlanBoundary(&activation_metadata, try stage_adapters.localTopologyTensorFramePlanRef(self), boundary0.boundary_index);
         try bridge.validatePayloadBufferLength(&activation_metadata, transfer_bytes);
         const image = bridge.deviceActivationByteImage(&activation_metadata);
-        try executePreparedBridgeBoundary(
+        try executeLocalPrefillBoundaryChain(
             self,
             allocator,
             .prefill,
@@ -715,9 +646,9 @@ pub fn executeStagedPrefillCudaCuda(
             state_ownership_plan,
             &activation_metadata,
             &image,
-            self.pipeline_host_staging,
+            boundary0.staging,
             false,
-            self.pipeline_boundary01_local_device_peer_copy_available,
+            boundary0.local_device_peer_copy_available,
         );
 
         // Upload source embeddings for this chunk to stage1's deepstack_add_dev.
@@ -879,7 +810,7 @@ pub fn executeStagedPrefillCudaCuda(
     }
 }
 
-pub fn executeStagedPrefillCpuCudaCuda(
+pub fn executeLocalPrefillCpuCudaCuda(
     self: anytype,
     cpu_stage0: anytype,
     gpu_stage1: anytype,
@@ -890,88 +821,10 @@ pub fn executeStagedPrefillCpuCudaCuda(
     const SelfType = @TypeOf(self.*);
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
     if (comptime !@hasField(@TypeOf(gpu_stage1.*), "device")) return error.InvalidArgument;
-    const CpuPrefillSource = struct {
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(_: *@This()) anyerror!void {}
-
-        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
-            return error.InvalidTopologyConfig;
-        }
-
-        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
-            return error.InvalidTopologyConfig;
-        }
-    };
-    const GpuPrefillSource = struct {
-        backend: @TypeOf(gpu_stage1),
-        target_backend: @TypeOf(self),
-
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try stage_adapters.synchronizeCudaBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try stage_adapters.uploadCudaActivation(stage.backend, 0, host_buf, byte_count);
-        }
-
-        pub fn peerCopyActivationToErased(stage: *@This(), target_ptr: *anyopaque, byte_count: usize) anyerror!void {
-            _ = target_ptr;
-            try stage_adapters.peerCopyStage12Activation(stage.backend, stage.target_backend, byte_count);
-        }
-
-        pub fn peerCopyHandlesStageSync(_: *const @This()) bool {
-            return false;
-        }
-    };
-    const GpuPrefillTarget = struct {
-        backend: @TypeOf(gpu_stage1),
-
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try stage_adapters.synchronizeCudaBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try stage_adapters.uploadCudaActivation(stage.backend, 0, host_buf, byte_count);
-        }
-    };
-    const FinalPrefillTarget = struct {
-        backend: @TypeOf(self),
-
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try stage_adapters.synchronizeCudaBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try stage_adapters.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try stage_adapters.uploadCudaActivation(stage.backend, 0, host_buf, byte_count);
-        }
-    };
+    const CpuPrefillSource = transport.NoopActivationStage;
+    const GpuPrefillSource = transport.CudaPeerActivationStage(@TypeOf(gpu_stage1), @TypeOf(self), .source_stream);
+    const GpuPrefillTarget = transport.CudaActivationStage(@TypeOf(gpu_stage1));
+    const FinalPrefillTarget = transport.CudaActivationStage(@TypeOf(self));
 
     const previous_launch_phase1 = gpu_stage1.device.setLaunchPhase(.prefill);
     defer _ = gpu_stage1.device.setLaunchPhase(previous_launch_phase1);
@@ -1030,7 +883,7 @@ pub fn executeStagedPrefillCpuCudaCuda(
         null;
     defer if (source_embeddings_host) |buf| self.allocator.free(buf);
 
-    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, self.split_layer, source_embeddings_host);
+    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, stage_adapters.localLayerOffset(self), source_embeddings_host);
 
     const placement_plan = try stage_adapters.localTopologyPlacementPlan(self);
     const state_ownership_plan = stage_adapters.localTopologyStateOwnershipPlan(self);
@@ -1040,6 +893,8 @@ pub fn executeStagedPrefillCpuCudaCuda(
     var gpu_prefill_source = GpuPrefillSource{ .backend = gpu_stage1, .target_backend = self };
     var gpu_prefill_target = GpuPrefillTarget{ .backend = gpu_stage1 };
     var final_prefill_target = FinalPrefillTarget{ .backend = self };
+    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
+    const boundary1 = try stage_adapters.localBoundaryRuntime(self, 1);
 
     // ── GPU1 → GPU2: chunked forward ──
     var pos_base: usize = 0;
@@ -1061,19 +916,19 @@ pub fn executeStagedPrefillCpuCudaCuda(
         var batch_entries01: [1]bridge.TensorFrameBatchEntry = undefined;
         const metadata01 = try stage_adapters.buildPrefillActivationMetadata(
             self,
-            0,
-            self.pipeline_boundary_dtype,
-            self.pipeline_boundary_layout,
+            boundary0.boundary_index,
+            boundary0.dtype,
+            boundary0.layout,
             .{ .cpu = {} },
             slot_index,
             pos_base,
             rows,
             batch_entries01[0..],
         );
-        try bridge.validateTensorFrameForPlanBoundary(&metadata01, plan_ref, 0);
+        try bridge.validateTensorFrameForPlanBoundary(&metadata01, plan_ref, boundary0.boundary_index);
         try bridge.validatePayloadBufferLength(&metadata01, chunk_bytes.len);
         const image01 = bridge.hostActivationByteImage(&metadata01, chunk_bytes);
-        try executePreparedBridgeBoundary(
+        try executeLocalPrefillBoundaryChain(
             self,
             allocator,
             .prefill,
@@ -1085,9 +940,9 @@ pub fn executeStagedPrefillCpuCudaCuda(
             state_ownership_plan,
             &metadata01,
             &image01,
-            self.pipeline_host_staging,
+            boundary0.staging,
             false,
-            false,
+            boundary0.local_device_peer_copy_available,
         );
 
         // Upload source embeddings for GPU1 per-layer branch branch.
@@ -1159,19 +1014,19 @@ pub fn executeStagedPrefillCpuCudaCuda(
         var batch_entries12: [1]bridge.TensorFrameBatchEntry = undefined;
         const metadata12 = try stage_adapters.buildPrefillActivationMetadata(
             self,
-            1,
-            self.pipeline_boundary_dtype_stage12,
-            self.pipeline_boundary_layout_stage12,
+            boundary1.boundary_index,
+            boundary1.dtype,
+            boundary1.layout,
             try stage_adapters.cudaPayloadLocationHint(gpu_stage1),
             slot_index,
             pos_base,
             rows,
             batch_entries12[0..],
         );
-        try bridge.validateTensorFrameForPlanBoundary(&metadata12, plan_ref, 1);
+        try bridge.validateTensorFrameForPlanBoundary(&metadata12, plan_ref, boundary1.boundary_index);
         try bridge.validatePayloadBufferLength(&metadata12, transfer_bytes);
         const image12 = bridge.deviceActivationByteImage(&metadata12);
-        try executePreparedBridgeBoundary(
+        try executeLocalPrefillBoundaryChain(
             self,
             allocator,
             .prefill,
@@ -1183,9 +1038,9 @@ pub fn executeStagedPrefillCpuCudaCuda(
             state_ownership_plan,
             &metadata12,
             &image12,
-            self.pipeline_host_staging_stage12,
+            boundary1.staging,
             false,
-            self.pipeline_boundary12_local_device_peer_copy_available,
+            boundary1.local_device_peer_copy_available,
         );
 
         // Upload source embeddings for GPU2 per-layer branch branch.

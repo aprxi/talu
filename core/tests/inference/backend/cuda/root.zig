@@ -23,6 +23,8 @@ test {
     _ = @import("gated_delta_conv_test.zig");
     _ = @import("gated_delta_qk_norm_test.zig");
     _ = @import("gated_delta_ssm_test.zig");
+    _ = @import("transport_cuda_activation_test.zig");
+    _ = @import("transport_cuda_kv_mirror_test.zig");
     _ = @import("stage_adapters_chain_tests.zig");
     if (comptime has_cuda) {
         _ = @import("engine_tests.zig");

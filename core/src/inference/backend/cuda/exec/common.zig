@@ -150,10 +150,10 @@ pub fn executeCpuStage0LayerRange(
     );
 }
 
-pub fn pipelineActivationByteCountFor(self: anytype) !usize {
+pub fn localActivationByteCountFor(self: anytype) !usize {
     const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "pipelineActivationByteCount")) {
-        return self.pipelineActivationByteCount();
+    if (comptime @hasDecl(SelfType, "localActivationByteCount")) {
+        return self.localActivationByteCount();
     }
     return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
 }
