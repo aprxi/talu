@@ -46,9 +46,17 @@ pub fn writeStageFrameBytes(
     const header_count = writer.write(header_bytes[0..]) catch return error.ShortStageHeaderWrite;
     if (header_count < header_bytes.len) return error.ShortStageHeaderWrite;
 
-    const payload = image.host_bytes.?;
-    const payload_count = writer.write(payload) catch return error.ShortStagePayloadWrite;
-    if (payload_count < payload.len) return error.ShortStagePayloadWrite;
+    if (image.host_bytes) |payload| {
+        const payload_count = writer.write(payload) catch return error.ShortStagePayloadWrite;
+        if (payload_count < payload.len) return error.ShortStagePayloadWrite;
+    } else if (image.host_segments) |segments| {
+        for (segments) |segment| {
+            const payload_count = writer.write(segment) catch return error.ShortStagePayloadWrite;
+            if (payload_count < segment.len) return error.ShortStagePayloadWrite;
+        }
+    } else {
+        unreachable;
+    }
 
     return header;
 }
@@ -252,6 +260,21 @@ fn testImage(
     };
 }
 
+fn testSegmentedImage(
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    host_segments: []const []const u8,
+) boundary_byte_image.BoundaryByteImageRef {
+    return .{
+        .metadata = metadata,
+        .byte_count = metadata.payload.byte_count,
+        .host_segments = host_segments,
+        .location_hint = metadata.payload.location_hint,
+        .readiness = .host_readable_now,
+        .ownership = metadata.payload.ownership,
+        .lifetime = metadata.payload.lifetime,
+    };
+}
+
 fn encodeFrame(
     metadata: *const tensor_frame.TensorFrameMetadata,
     dest: []u8,
@@ -304,6 +327,30 @@ test "inference bridge stage_byte_harness writeStageFrameBytes readStageFrameByt
     try std.testing.expectEqualSlices(u8, &payload, &received);
 }
 
+test "inference bridge stage_byte_harness writeStageFrameBytes writes segmented host readable bytes in order" {
+    var metadata = try testDecodeMetadata();
+    const first = [_]u8{ 0x10, 0x11, 0x12, 0x13 };
+    const second = [_]u8{ 0x20, 0x21, 0x22, 0x23, 0x30, 0x31, 0x32, 0x33, 0x40, 0x41, 0x42, 0x43 };
+    const expected_payload = first ++ second;
+    const segments = [_][]const u8{ &first, &second };
+    const image = testSegmentedImage(&metadata, &segments);
+    var written: [stage_frame_header.stage_frame_header_encoded_len + test_payload_len]u8 = [_]u8{0} ** (stage_frame_header.stage_frame_header_encoded_len + test_payload_len);
+    var writer = TestWriter{ .dest = written[0..] };
+
+    const written_header = try writeStageFrameBytes(&writer, &metadata, &image, .{});
+
+    try std.testing.expectEqual(@as(usize, 3), writer.call_count);
+    try std.testing.expectEqual(stage_frame_header.stage_frame_header_encoded_len, writer.call_lengths[0]);
+    try std.testing.expectEqual(first.len, writer.call_lengths[1]);
+    try std.testing.expectEqual(second.len, writer.call_lengths[2]);
+    try std.testing.expectEqual(stage_frame_header.stage_frame_header_encoded_len + expected_payload.len, writer.len);
+
+    var expected_header_bytes: [stage_frame_header.stage_frame_header_encoded_len]u8 = undefined;
+    try stage_frame_header.encodeStageFrameHeader(&expected_header_bytes, written_header);
+    try std.testing.expectEqualSlices(u8, &expected_header_bytes, written[0..stage_frame_header.stage_frame_header_encoded_len]);
+    try std.testing.expectEqualSlices(u8, &expected_payload, written[stage_frame_header.stage_frame_header_encoded_len..writer.len]);
+}
+
 test "inference bridge stage_byte_harness writeStageFrameBytes rejects mismatched metadata and image before header write" {
     var metadata = try testDecodeMetadata();
     var other_metadata = try testMetadata(66, testBoundary(2), &test_decode_entries, .{ 1, 1, 4, 0 });
@@ -350,6 +397,19 @@ test "inference bridge stage_byte_harness writeStageFrameBytes reports writer er
     var payload_short_writer = TestWriter{ .dest = dest[0..], .short_call = 1 };
     try std.testing.expectError(error.ShortStagePayloadWrite, writeStageFrameBytes(&payload_short_writer, &metadata, &image, .{}));
     try std.testing.expectEqual(@as(usize, 2), payload_short_writer.call_count);
+
+    const first = [_]u8{0xcd} ** 4;
+    const second = [_]u8{0xce} ** 12;
+    const segments = [_][]const u8{ &first, &second };
+    const segmented_image = testSegmentedImage(&metadata, &segments);
+
+    var segment_error_writer = TestWriter{ .dest = dest[0..], .fail_call = 2 };
+    try std.testing.expectError(error.ShortStagePayloadWrite, writeStageFrameBytes(&segment_error_writer, &metadata, &segmented_image, .{}));
+    try std.testing.expectEqual(@as(usize, 3), segment_error_writer.call_count);
+
+    var segment_short_writer = TestWriter{ .dest = dest[0..], .short_call = 2 };
+    try std.testing.expectError(error.ShortStagePayloadWrite, writeStageFrameBytes(&segment_short_writer, &metadata, &segmented_image, .{}));
+    try std.testing.expectEqual(@as(usize, 3), segment_short_writer.call_count);
 }
 
 test "inference bridge stage_byte_harness readStageFrameBytes rejects reader errors short header and short payload" {

@@ -93,6 +93,7 @@ test "xray staged_frame writeStagedFrameTsv public API emits byte image readines
         record(3),
         record(4),
         record(5),
+        record(6),
     };
     records[0].byte_image_readiness = xray.StagedFrameByteImageReadiness.unknown;
     records[0].transfer_mode = xray.StagedFrameTransferMode.unknown;
@@ -105,12 +106,15 @@ test "xray staged_frame writeStagedFrameTsv public API emits byte image readines
     records[3].byte_image_readiness = xray.StagedFrameByteImageReadiness.device_download_required;
     records[3].transfer_mode = xray.StagedFrameTransferMode.device_download_then_copy;
     records[3].device_download_required = true;
-    records[4].byte_image_readiness = xray.StagedFrameByteImageReadiness.local_only_opaque;
-    records[4].transfer_mode = xray.StagedFrameTransferMode.remote_stream;
-    records[5].byte_image_readiness = xray.StagedFrameByteImageReadiness.host_readable_now;
-    records[5].transfer_mode = xray.StagedFrameTransferMode.device_download_then_remote_stream;
-    records[5].host_readable = true;
-    records[5].remote_readable = true;
+    records[4].byte_image_readiness = xray.StagedFrameByteImageReadiness.device_download_required;
+    records[4].transfer_mode = xray.StagedFrameTransferMode.device_peer_copy_in_process;
+    records[4].device_download_required = true;
+    records[5].byte_image_readiness = xray.StagedFrameByteImageReadiness.local_only_opaque;
+    records[5].transfer_mode = xray.StagedFrameTransferMode.remote_stream;
+    records[6].byte_image_readiness = xray.StagedFrameByteImageReadiness.host_readable_now;
+    records[6].transfer_mode = xray.StagedFrameTransferMode.device_download_then_remote_stream;
+    records[6].host_readable = true;
+    records[6].remote_readable = true;
 
     var buffer: [4096]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
@@ -122,7 +126,8 @@ test "xray staged_frame writeStagedFrameTsv public API emits byte image readines
         "101\t1\t1\t2\t3\t6\t6\t9\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\thost_readable_now\tborrow_in_process\ttrue\ttrue\tfalse\n" ++
         "102\t2\t2\t3\t6\t9\t9\t12\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\tproducer_sync_required\tcopy_in_process\tfalse\tfalse\tfalse\n" ++
         "103\t3\t3\t4\t9\t12\t12\t15\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\tdevice_download_required\tdevice_download_then_copy\tfalse\tfalse\ttrue\n" ++
-        "104\t4\t4\t5\t12\t15\t15\t18\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\tlocal_only_opaque\tremote_stream\tfalse\tfalse\tfalse\n" ++
-        "105\t5\t5\t6\t15\t18\t18\t21\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\thost_readable_now\tdevice_download_then_remote_stream\ttrue\ttrue\tfalse\n";
+        "104\t4\t4\t5\t12\t15\t15\t18\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\tdevice_download_required\tdevice_peer_copy_in_process\tfalse\tfalse\ttrue\n" ++
+        "105\t5\t5\t6\t15\t18\t18\t21\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\tlocal_only_opaque\tremote_stream\tfalse\tfalse\tfalse\n" ++
+        "106\t6\t6\t7\t18\t21\t21\t24\tdecode\tf32\trow_major\t3\t1\t1\t16\t0\t64\t0\t11\t12\t13\t1\tnone\thost_readable_now\tdevice_download_then_remote_stream\ttrue\ttrue\tfalse\n";
     try std.testing.expectEqualStrings(expected, stream.getWritten());
 }

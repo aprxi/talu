@@ -29,6 +29,7 @@ pub const StageTransferMode = enum(u8) {
     borrow_in_process,
     copy_in_process,
     device_download_then_copy,
+    device_peer_copy_in_process,
     remote_stream,
     device_download_then_remote_stream,
 };
@@ -38,6 +39,7 @@ pub const StageTransferModeRequest = struct {
     metadata: *const tensor_frame.TensorFrameMetadata,
     image: *const boundary_byte_image.BoundaryByteImageRef,
     allow_borrow: bool = true,
+    local_device_peer_copy_available: bool = false,
 };
 
 pub const StageTransferModeDecision = struct {
@@ -72,7 +74,12 @@ pub fn chooseStageTransferMode(
     try validateEnvelopeLimits(profile, request.metadata, request.image);
 
     return .{
-        .mode = try selectMode(profile.handoff_mode, request.image, request.allow_borrow),
+        .mode = try selectMode(
+            profile.handoff_mode,
+            request.image,
+            request.allow_borrow,
+            request.local_device_peer_copy_available,
+        ),
         .boundary_profile = profile,
         .source_host_id = source_binding.host_id,
         .target_host_id = target_binding.host_id,
@@ -152,10 +159,13 @@ fn selectMode(
     handoff_mode: host_capability.BoundaryHandoffMode,
     image: *const boundary_byte_image.BoundaryByteImageRef,
     allow_borrow: bool,
+    local_device_peer_copy_available: bool,
 ) StageTransferModeError!StageTransferMode {
     return switch (image.readiness) {
         .host_readable_now => switch (handoff_mode) {
-            .same_host_direct => if (allow_borrow and image.ownership == .borrowed_until_next_stage_call)
+            .same_host_direct => if (allow_borrow and
+                image.host_segments == null and
+                image.ownership == .borrowed_until_next_stage_call)
                 .borrow_in_process
             else
                 .copy_in_process,
@@ -163,7 +173,11 @@ fn selectMode(
             .remote_declared => .remote_stream,
         },
         .device_download_required => switch (handoff_mode) {
-            .same_host_direct, .local_in_process, .mock => .device_download_then_copy,
+            .same_host_direct, .local_in_process => if (local_device_peer_copy_available)
+                .device_peer_copy_in_process
+            else
+                .device_download_then_copy,
+            .mock => .device_download_then_copy,
             .remote_declared => .device_download_then_remote_stream,
         },
         .producer_sync_required => error.StageTransferPayloadNotHostReadable,
@@ -705,6 +719,25 @@ test "inference bridge stage_transfer_mode chooseStageTransferMode selects copy_
     try expectDecision(decision, .copy_in_process, &bundle.placement, &metadata);
 }
 
+test "inference bridge stage_transfer_mode chooseStageTransferMode selects copy_in_process for segmented host readable bytes" {
+    const allocator = std.testing.allocator;
+    var bundle = try buildPlacementBundle(allocator, .same_host, .same_host_direct, .{});
+    defer bundle.deinit();
+    var metadata = try metadataForPlacement(&bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    const first = [_]u8{0xbc} ** 4;
+    const second = [_]u8{0xbd} ** 12;
+    const segments = [_][]const u8{ &first, &second };
+    var image = testImage(&metadata, .host_readable_now, null);
+    image.host_segments = &segments;
+
+    const decision = try chooseStageTransferMode(.{
+        .placement_plan = &bundle.placement,
+        .metadata = &metadata,
+        .image = &image,
+    });
+    try expectDecision(decision, .copy_in_process, &bundle.placement, &metadata);
+}
+
 test "inference bridge stage_transfer_mode chooseStageTransferMode selects copy_in_process for local and mock host readable bytes" {
     const allocator = std.testing.allocator;
     const payload = [_]u8{0xcc} ** 16;
@@ -732,20 +765,92 @@ test "inference bridge stage_transfer_mode chooseStageTransferMode selects copy_
     try expectDecision(mock_decision, .copy_in_process, &mock_bundle.placement, &mock_metadata);
 }
 
-test "inference bridge stage_transfer_mode chooseStageTransferMode selects device_download_then_copy for local device resident bytes" {
+test "inference bridge stage_transfer_mode chooseStageTransferMode selects device_download_then_copy for local device resident bytes without peer copy" {
     const allocator = std.testing.allocator;
-    var bundle = try buildPlacementBundle(allocator, .two_host_local, .local_in_process, .{});
-    defer bundle.deinit();
-    var metadata = try metadataForPlacement(&bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
-    metadata.payload.location_hint = .{ .cuda = 0 };
-    const image = testImage(&metadata, .device_download_required, null);
 
-    const decision = try chooseStageTransferMode(.{
-        .placement_plan = &bundle.placement,
-        .metadata = &metadata,
-        .image = &image,
+    var same_host_bundle = try buildPlacementBundle(allocator, .same_host, .same_host_direct, .{});
+    defer same_host_bundle.deinit();
+    var same_host_metadata = try metadataForPlacement(&same_host_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    same_host_metadata.payload.location_hint = .{ .cuda = 0 };
+    const same_host_image = testImage(&same_host_metadata, .device_download_required, null);
+    const same_host_decision = try chooseStageTransferMode(.{
+        .placement_plan = &same_host_bundle.placement,
+        .metadata = &same_host_metadata,
+        .image = &same_host_image,
     });
-    try expectDecision(decision, .device_download_then_copy, &bundle.placement, &metadata);
+    try expectDecision(same_host_decision, .device_download_then_copy, &same_host_bundle.placement, &same_host_metadata);
+
+    var local_bundle = try buildPlacementBundle(allocator, .two_host_local, .local_in_process, .{});
+    defer local_bundle.deinit();
+    var local_metadata = try metadataForPlacement(&local_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    local_metadata.payload.location_hint = .{ .cuda = 1 };
+    const local_image = testImage(&local_metadata, .device_download_required, null);
+    const local_decision = try chooseStageTransferMode(.{
+        .placement_plan = &local_bundle.placement,
+        .metadata = &local_metadata,
+        .image = &local_image,
+    });
+    try expectDecision(local_decision, .device_download_then_copy, &local_bundle.placement, &local_metadata);
+}
+
+test "inference bridge stage_transfer_mode chooseStageTransferMode selects device_peer_copy_in_process for local device resident bytes when available" {
+    const allocator = std.testing.allocator;
+
+    var same_host_bundle = try buildPlacementBundle(allocator, .same_host, .same_host_direct, .{});
+    defer same_host_bundle.deinit();
+    var same_host_metadata = try metadataForPlacement(&same_host_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    same_host_metadata.payload.location_hint = .{ .cuda = 0 };
+    const same_host_image = testImage(&same_host_metadata, .device_download_required, null);
+    const same_host_decision = try chooseStageTransferMode(.{
+        .placement_plan = &same_host_bundle.placement,
+        .metadata = &same_host_metadata,
+        .image = &same_host_image,
+        .local_device_peer_copy_available = true,
+    });
+    try expectDecision(same_host_decision, .device_peer_copy_in_process, &same_host_bundle.placement, &same_host_metadata);
+
+    var local_bundle = try buildPlacementBundle(allocator, .two_host_local, .local_in_process, .{});
+    defer local_bundle.deinit();
+    var local_metadata = try metadataForPlacement(&local_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    local_metadata.payload.location_hint = .{ .cuda = 1 };
+    const local_image = testImage(&local_metadata, .device_download_required, null);
+    const local_decision = try chooseStageTransferMode(.{
+        .placement_plan = &local_bundle.placement,
+        .metadata = &local_metadata,
+        .image = &local_image,
+        .local_device_peer_copy_available = true,
+    });
+    try expectDecision(local_decision, .device_peer_copy_in_process, &local_bundle.placement, &local_metadata);
+}
+
+test "inference bridge stage_transfer_mode chooseStageTransferMode does not select peer copy for mock or remote device resident bytes" {
+    const allocator = std.testing.allocator;
+
+    var mock_bundle = try buildPlacementBundle(allocator, .two_host_mock, .mock, .{});
+    defer mock_bundle.deinit();
+    var mock_metadata = try metadataForPlacement(&mock_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    mock_metadata.payload.location_hint = .{ .cuda = 2 };
+    const mock_image = testImage(&mock_metadata, .device_download_required, null);
+    const mock_decision = try chooseStageTransferMode(.{
+        .placement_plan = &mock_bundle.placement,
+        .metadata = &mock_metadata,
+        .image = &mock_image,
+        .local_device_peer_copy_available = true,
+    });
+    try expectDecision(mock_decision, .device_download_then_copy, &mock_bundle.placement, &mock_metadata);
+
+    var remote_bundle = try buildPlacementBundle(allocator, .two_host_remote, .remote_declared, .{});
+    defer remote_bundle.deinit();
+    var remote_metadata = try metadataForPlacement(&remote_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    remote_metadata.payload.location_hint = .{ .cuda = 3 };
+    const remote_image = testImage(&remote_metadata, .device_download_required, null);
+    const remote_decision = try chooseStageTransferMode(.{
+        .placement_plan = &remote_bundle.placement,
+        .metadata = &remote_metadata,
+        .image = &remote_image,
+        .local_device_peer_copy_available = true,
+    });
+    try expectDecision(remote_decision, .device_download_then_remote_stream, &remote_bundle.placement, &remote_metadata);
 }
 
 test "inference bridge stage_transfer_mode chooseStageTransferMode selects remote_stream for remote host readable bytes" {

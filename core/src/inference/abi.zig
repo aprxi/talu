@@ -16,6 +16,7 @@ pub const TokenEvent = root.TokenEvent;
 pub const SamplingStrategy = root.SamplingStrategy;
 pub const SamplingConfig = root.SamplingConfig;
 pub const bridge = root.bridge;
+pub const transport = root.transport;
 pub const diagnostics = root.diagnostics;
 
 pub const backend = @import("backend/root.zig");

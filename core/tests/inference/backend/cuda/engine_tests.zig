@@ -5,24 +5,48 @@
 //! engine_ops, engine_mixers, and engine_layer_program.
 
 const std = @import("std");
-const compute = @import("compute_pkg");
-const tensor = @import("compute_pkg").tensor;
-const dtype = @import("compute_pkg").dtype;
-const models = @import("models_pkg");
+const main = @import("main");
+const compute = main.compute;
+const tensor = compute.tensor;
+const dtype = compute.dtype;
+const models = main.models.dispatcher;
 const layer_ops = models.layer_ops;
 const opcode_map = models.plan.opcode_map;
 const plan_compiler = models.plan.compiler;
-const runtime_contract = @import("runtime_contract_pkg");
-const bridge = @import("../../bridge/root.zig");
+const runtime_contract = main.inference.runtime_contract;
+const bridge = main.inference.bridge;
+const transport = main.inference.transport;
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
+const cuda_testing = main.inference.backend.cuda.testing;
 
 // --- Types from engine.zig ---
-const engine = @import("engine.zig");
+const engine = cuda_testing.engine;
 const CudaBackend = engine.CudaBackend;
 
+fn localTransportRequest(
+    placement_plan: *const bridge.PlacementPlan,
+    metadata: *const bridge.TensorFrameMetadata,
+    image: *const bridge.BoundaryByteImageRef,
+    contract: *const bridge.ActivationTransportContract,
+    staging: ?[]align(64) u8,
+    allow_borrow: bool,
+    local_device_peer_copy_available: bool,
+) transport.LocalStageTransportRequest {
+    return .{
+        .placement_plan = placement_plan,
+        .metadata = metadata,
+        .image = image,
+        .decision = contract.decision,
+        .envelope = &contract.envelope,
+        .staging = staging,
+        .allow_borrow = allow_borrow,
+        .local_device_peer_copy_available = local_device_peer_copy_available,
+    };
+}
+
 // --- Types from engine_types.zig ---
-const engine_types = @import("runtime/root.zig");
+const engine_types = cuda_testing.runtime;
 const DeviceTensor = engine_types.DeviceTensor;
 const LinearWeight = engine_types.LinearWeight;
 const U16LinearWeight = engine_types.U16LinearWeight;
@@ -37,6 +61,9 @@ const KvRuntimeState = engine_types.KvRuntimeState;
 const ShortConvRuntimeState = engine_types.ShortConvRuntimeState;
 const MambaRuntimeState = engine_types.MambaRuntimeState;
 const GatedDeltaRuntimeState = engine_types.GatedDeltaRuntimeState;
+const BlockRuntimeLayerForTest = engine_types.BlockRuntimeLayer;
+const KvCacheDtypeForTest = engine_types.KvCacheDtype;
+const KvCacheStorageModeForTest = engine_types.KvCacheStorageMode;
 const gaffine_scales_dtype_bf16 = engine_types.gaffine_scales_dtype_bf16;
 const expectedAttentionQProjectionDim = engine_types.expectedAttentionQProjectionDim;
 const bufferF32RowCount = engine_types.bufferF32RowCount;
@@ -47,7 +74,7 @@ const KernelSlot = engine_types.KernelSlot;
 const resolveGatedDeltaFfnUploadPlan = engine_types.resolveGatedDeltaFfnUploadPlan;
 
 // --- Functions from engine_weights.zig ---
-const engine_weights = @import("weights/root.zig");
+const engine_weights = cuda_testing.weights;
 const resolveDenseInOutLayout = engine_weights.resolveDenseInOutLayout;
 const resolveDenseOutInLayout = engine_weights.resolveDenseOutInLayout;
 const transposeRowMajor = engine_weights.transposeRowMajor;
@@ -64,18 +91,341 @@ const findPositionIndex = engine_weights.findPositionIndex;
 const deepstackLayersCompatibleWithPrompt = engine_weights.deepstackLayersCompatibleWithPrompt;
 
 // --- Functions from engine_ops.zig ---
-const engine_ops = @import("operators/root.zig");
+const engine_ops = cuda_testing.operators;
 
 // --- Functions from engine_mixers.zig ---
-const engine_mixers = @import("operators/root.zig");
-const engine_forward = @import("exec/root.zig");
+const engine_mixers = cuda_testing.operators;
+const engine_forward = cuda_testing.exec;
 const resolveStagedPrefillChunkRows = engine_forward.resolveStagedPrefillChunkRows;
+const stage_adapters = engine_forward.stage_adapters;
 
 const MockCudaDevice = struct {
+    launch_phase: compute.cuda.device.LaunchPhase = .none,
+
     pub fn ordinal(_: *const @This()) u16 {
         return 0;
     }
+
+    pub fn setLaunchPhase(self: *@This(), phase: compute.cuda.device.LaunchPhase) compute.cuda.device.LaunchPhase {
+        const previous = self.launch_phase;
+        self.launch_phase = phase;
+        return previous;
+    }
 };
+
+fn localTopologyTestConfig(layer_count: usize) models.config.ModelConfig {
+    return .{
+        .vocab_size = 64,
+        .d_model = 8,
+        .n_layers = @intCast(layer_count),
+        .n_heads = 2,
+        .n_kv_groups = 2,
+        .d_ff = 16,
+        .max_seq_len = 32,
+        .head_dim = 4,
+        .rope_theta = 10000,
+        .norm_eps = 0.00001,
+        .gaffine_group_size = 0,
+        .tie_word_embeddings = false,
+    };
+}
+
+fn localTopologyTestArch() models.op_types.Architecture {
+    return .{
+        .name = "cuda_local_topology_test",
+        .model_types = &.{"cuda_local_topology_test"},
+    };
+}
+
+fn localTopologyTestManifest(allocator: std.mem.Allocator, layer_count: usize) !models.manifest.ModelManifest {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+    const entry_count = layer_count + 3;
+    const entries = try arena_allocator.alloc(models.manifest.TensorManifestEntry, entry_count);
+    entries[0] = .{
+        .name = "model.embed_tokens.weight",
+        .dtype = .f32,
+        .shape = &.{ 64, 8 },
+        .checkpoint_bytes = 128,
+        .role = .token_embeddings,
+        .weight_id = "token_embeddings",
+        .status = .architecture_weight,
+    };
+    for (0..layer_count) |layer_index| {
+        entries[layer_index + 1] = .{
+            .name = "model.layers.self_attn.q_proj.weight",
+            .dtype = .f32,
+            .shape = &.{ 8, 8 },
+            .checkpoint_bytes = 64,
+            .role = .decoder_layer,
+            .layer_index = layer_index,
+            .weight_id = "self_attn.q_proj.weight",
+            .status = .architecture_weight,
+        };
+    }
+    entries[layer_count + 1] = .{
+        .name = "model.norm.weight",
+        .dtype = .f32,
+        .shape = &.{8},
+        .checkpoint_bytes = 32,
+        .role = .final_norm,
+        .weight_id = "ln_final",
+        .status = .architecture_weight,
+    };
+    entries[layer_count + 2] = .{
+        .name = "lm_head.weight",
+        .dtype = .f32,
+        .shape = &.{ 64, 8 },
+        .checkpoint_bytes = 128,
+        .role = .lm_head,
+        .weight_id = "lm_head",
+        .status = .architecture_weight,
+    };
+
+    var role_bytes = [_]usize{0} ** models.manifest.role_count;
+    var total_bytes: usize = 0;
+    for (entries) |entry| {
+        total_bytes += entry.checkpoint_bytes;
+        role_bytes[@intFromEnum(entry.role)] += entry.checkpoint_bytes;
+    }
+
+    return .{
+        .arena = arena,
+        .architecture_id = "cuda_local_topology_test",
+        .layer_count = layer_count,
+        .entries = entries,
+        .total_checkpoint_bytes = total_bytes,
+        .role_bytes = role_bytes,
+    };
+}
+
+fn buildLocalTopologyTestStagePlan(
+    allocator: std.mem.Allocator,
+    layer_count: usize,
+    splits: []const usize,
+    dependencies: []const models.stage_plan.DependencyOverride,
+) !models.stage_plan.StagePlan {
+    var arch = localTopologyTestArch();
+    var config = localTopologyTestConfig(layer_count);
+    var manifest = try localTopologyTestManifest(allocator, layer_count);
+    defer manifest.deinit();
+    return models.stage_plan.buildStagePlan(allocator, .{
+        .n_layers = layer_count,
+        .split_points = splits,
+        .architecture = &arch,
+        .model_config = &config,
+        .manifest = &manifest,
+        .partition_constraints = .{
+            .decoder_cuts_allowed = true,
+            .dependency_overrides = dependencies,
+        },
+    });
+}
+
+const LocalTopologyStateFixture = struct {
+    plan: bridge.StageStateOwnershipPlan,
+    ref: bridge.StageStatePlacementRef,
+
+    fn deinit(self: *@This()) void {
+        self.ref.deinit();
+        self.plan.deinit();
+    }
+};
+
+fn buildLocalTopologyStateFixture(
+    allocator: std.mem.Allocator,
+    plan: *const models.stage_plan.StagePlan,
+) !LocalTopologyStateFixture {
+    var state_plan = try engine.testing.buildLocalTopologyStateOwnershipPlan(allocator, plan);
+    errdefer state_plan.deinit();
+    var state_ref = try bridge.buildStageStatePlacementRef(allocator, &state_plan);
+    errdefer state_ref.deinit();
+    return .{ .plan = state_plan, .ref = state_ref };
+}
+
+fn expectLocalTopologyPlacement(
+    placement: *const bridge.PlacementPlan,
+    d_model: usize,
+    stage_count: usize,
+    configs: []const engine.testing.BoundaryConfig,
+) !void {
+    try bridge.validatePlacementPlan(placement);
+    try std.testing.expectEqual(stage_count, placement.stage_summaries.len);
+    try std.testing.expectEqual(stage_count - 1, placement.boundary_summaries.len);
+    try std.testing.expectEqual(stage_count, placement.stage_host_bindings.len);
+    try std.testing.expectEqualSlices(
+        bridge.TensorFrameStepKind,
+        &engine.testing.local_topology_required_step_kinds,
+        placement.required_step_kinds,
+    );
+
+    for (placement.stage_host_bindings, 0..) |binding, stage_id| {
+        try std.testing.expectEqual(stage_id, binding.stage_id);
+        try std.testing.expectEqual(@as(u64, @intCast(stage_id + 1)), binding.host_id.value);
+    }
+
+    try std.testing.expectEqual(configs.len * engine.testing.local_topology_required_step_kinds.len, placement.boundary_frame_profiles.len);
+    for (configs, 0..) |config, boundary_index| {
+        const row_bytes = try engine.testing.boundaryRowByteCount(d_model, config.dtype);
+        const prefill = placement.boundary_frame_profiles[boundary_index * 2];
+        try std.testing.expectEqual(boundary_index, prefill.boundary_index);
+        try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, prefill.step_kind);
+        try std.testing.expectEqual(config.dtype, prefill.dtype);
+        try std.testing.expectEqual(config.layout, prefill.layout);
+        try std.testing.expectEqual(@as(u64, 1), prefill.max_batch_entries);
+        try std.testing.expectEqual(@as(u64, @intCast(config.prefill_max_token_count_per_frame)), prefill.max_token_count_per_frame);
+        try std.testing.expectEqual(
+            row_bytes * @as(u64, @intCast(config.prefill_max_token_count_per_frame)),
+            prefill.max_activation_payload_bytes,
+        );
+
+        const decode = placement.boundary_frame_profiles[boundary_index * 2 + 1];
+        try std.testing.expectEqual(boundary_index, decode.boundary_index);
+        try std.testing.expectEqual(bridge.TensorFrameStepKind.decode, decode.step_kind);
+        try std.testing.expectEqual(config.dtype, decode.dtype);
+        try std.testing.expectEqual(config.layout, decode.layout);
+        try std.testing.expectEqual(@as(u64, @intCast(config.decode_max_batch_entries)), decode.max_batch_entries);
+        try std.testing.expect(decode.max_batch_entries > 1);
+        try std.testing.expectEqual(@as(u64, 1), decode.max_token_count_per_frame);
+        try std.testing.expectEqual(
+            row_bytes * @as(u64, @intCast(config.decode_max_batch_entries)),
+            decode.max_activation_payload_bytes,
+        );
+    }
+}
+
+fn expectPlacementBuildFailureCleanup(
+    d_model: usize,
+    plan: *const models.stage_plan.StagePlan,
+    stage_backend_kinds: []const bridge.HostBackendKind,
+    configs: []const engine.testing.BoundaryConfig,
+    state_ref: ?*const bridge.StageStatePlacementRef,
+) !void {
+    var saw_success = false;
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var placement_or_error = engine.testing.buildLocalTopologyPlacementPlan(
+            failing.allocator(),
+            d_model,
+            plan,
+            stage_backend_kinds,
+            configs,
+            state_ref,
+        );
+        if (placement_or_error) |*placement| {
+            placement.deinit();
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            saw_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
+    try std.testing.expect(saw_success);
+}
+
+fn runCpuGpuPrefillTestHook(
+    self: anytype,
+    tokens: []const u32,
+    slot_index: usize,
+    logits_out: []f32,
+    layer_limit: usize,
+) !void {
+    if (tokens.len == 0) return error.InvalidArgument;
+    if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+    if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+    if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+    if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
+
+    const cpu_stage0 = self.pipelineCpuStage0() orelse return error.InvalidTopologyConfig;
+    self.activateKvSlot(slot_index);
+    const byte_count = try self.pipelineActivationByteCount();
+    for (tokens, 0..) |token, position| {
+        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, self.pipelineSplitLayer(), false, false, true, false);
+        const cpu_activation = cpu_stage0.slotActivationBytes(slot_index);
+        if (byte_count > cpu_activation.len) return error.InvalidArgument;
+        try self.uploadPipelineActivationFromHost(slot_index, cpu_activation[0..byte_count], byte_count);
+        const is_last = position + 1 == tokens.len;
+        try self.executeDecodeWithLayerLimitTestHook(
+            token,
+            position,
+            slot_index,
+            if (is_last) logits_out else null,
+            layer_limit,
+            true,
+            is_last,
+            true,
+            @intCast(position + 1),
+            position,
+            null,
+            null,
+            null,
+            true,
+        );
+    }
+}
+
+fn runCpuGpuGpuPrefillTestHook(
+    self: anytype,
+    tokens: []const u32,
+    slot_index: usize,
+    logits_out: []f32,
+    layer_limit: usize,
+) !void {
+    if (tokens.len == 0) return error.InvalidArgument;
+    if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+    if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+    if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+    if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
+
+    const cpu_stage0 = self.pipelineCpuStage0() orelse return error.InvalidTopologyConfig;
+    var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+    self.activateKvSlot(slot_index);
+    stage1.activateKvSlot(slot_index);
+    const byte_count = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+    for (tokens, 0..) |token, position| {
+        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, self.pipelineSplitLayer(), false, false, true, false);
+        const cpu_activation = cpu_stage0.slotActivationBytes(slot_index);
+        if (byte_count > cpu_activation.len) return error.InvalidArgument;
+        try stage1.uploadPipelineActivationFromHost(slot_index, cpu_activation[0..byte_count], byte_count);
+        try stage1.executeDecodeWithLayerLimitTestHook(
+            token,
+            position,
+            slot_index,
+            null,
+            stage1.block_runtime.blocks.len,
+            true,
+            false,
+            true,
+            @intCast(position + 1),
+            position,
+            null,
+            null,
+            null,
+            true,
+        );
+        try stage1.copyPipelineActivationTo(self, slot_index, byte_count);
+        const is_last = position + 1 == tokens.len;
+        try self.executeDecodeWithLayerLimitTestHook(
+            token,
+            position,
+            slot_index,
+            if (is_last) logits_out else null,
+            layer_limit,
+            true,
+            is_last,
+            true,
+            @intCast(position + 1),
+            position,
+            null,
+            null,
+            null,
+            true,
+        );
+    }
+}
 
 test "resolveDenseInOutLayout keeps [in,out] orientation" {
     const layout = try resolveDenseInOutLayout(128, 256, 128);
@@ -93,6 +443,922 @@ test "resolveStagedPrefillChunkRows tunes medium staged prefill lengths" {
 test "resolveStagedPrefillChunkRows honors explicit env override behavior" {
     try std.testing.expectEqual(@as(usize, 256), resolveStagedPrefillChunkRows(486, 256, true));
     try std.testing.expectEqual(@as(usize, 320), resolveStagedPrefillChunkRows(900, 320, true));
+}
+
+test "inference.backend.cuda 10G-D local topology profile envelopes are exact" {
+    const boundary = models.stage_plan.StageBoundary{
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .producer_layer_start = 0,
+        .producer_layer_end = 2,
+        .consumer_layer_start = 2,
+        .consumer_layer_end = 4,
+    };
+    const config = engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 4, 9);
+    const profiles = try engine.testing.boundaryProfilePair(8, 0, boundary, config);
+
+    try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, profiles[0].step_kind);
+    try std.testing.expectEqual(@as(u64, 1), profiles[0].max_batch_entries);
+    try std.testing.expectEqual(@as(u64, 9), profiles[0].max_token_count_per_frame);
+    try std.testing.expectEqual(@as(u64, 9 * 8 * @sizeOf(f32)), profiles[0].max_activation_payload_bytes);
+
+    try std.testing.expectEqual(bridge.TensorFrameStepKind.decode, profiles[1].step_kind);
+    try std.testing.expectEqual(@as(u64, 4), profiles[1].max_batch_entries);
+    try std.testing.expectEqual(@as(u64, 1), profiles[1].max_token_count_per_frame);
+    try std.testing.expectEqual(@as(u64, 4 * 8 * @sizeOf(f32)), profiles[1].max_activation_payload_bytes);
+}
+
+test "inference.backend.cuda 10G-D local topology caps use required min rules" {
+    const pipeline_config = engine.testing.pipeline2BoundaryConfig(.f16, .row_major, 8, 3, 40, 7);
+    try std.testing.expectEqual(@as(usize, 3), pipeline_config.decode_max_batch_entries);
+    try std.testing.expectEqual(@as(usize, 7), pipeline_config.prefill_max_token_count_per_frame);
+
+    const cpu_gpu_gpu_configs = engine.testing.cpuGpuGpuBoundaryConfigs(
+        .f32,
+        .row_major,
+        .f16,
+        .row_major,
+        5,
+        9,
+        16,
+        64,
+    );
+    try std.testing.expectEqual(@as(usize, 5), cpu_gpu_gpu_configs[0].decode_max_batch_entries);
+    try std.testing.expectEqual(@as(usize, 5), cpu_gpu_gpu_configs[1].decode_max_batch_entries);
+    try std.testing.expectEqual(@as(usize, 16), cpu_gpu_gpu_configs[0].prefill_max_token_count_per_frame);
+    try std.testing.expectEqual(@as(usize, 16), cpu_gpu_gpu_configs[1].prefill_max_token_count_per_frame);
+    try std.testing.expectEqual(@as(u64, 16), try engine.testing.boundaryRowByteCount(8, cpu_gpu_gpu_configs[1].dtype));
+}
+
+test "inference.backend.cuda 10G-D local topology host ids are deterministic stage ids" {
+    try std.testing.expectEqual(@as(u64, 1), (try engine.testing.deterministicHostId(0)).value);
+    try std.testing.expectEqual(@as(u64, 2), (try engine.testing.deterministicHostId(1)).value);
+    try std.testing.expectEqual(@as(u64, 3), (try engine.testing.deterministicHostId(2)).value);
+    try std.testing.expectError(error.InvalidTopologyConfig, engine.testing.deterministicHostId(std.math.maxInt(usize)));
+}
+
+test "inference.backend.cuda 10G-E buildDecodeActivationMetadata segmentedHostDecodeByteImage buildDecodeTransportContract localTransportRequest uses multi_entry_local host segments" {
+    const d_model: usize = 4;
+    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 4, 8),
+    };
+    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        d_model,
+        plan,
+        &stage_backend_kinds,
+        &configs,
+    );
+    defer bundle.deinit();
+
+    const MockBackend = struct {
+        d_model: usize = d_model,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [4]?u64 = .{ 101, 202, 303, 404 },
+    };
+    var backend = MockBackend{
+        .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+        .cpu_gpu_placement_plan = bundle.placement_plan.?,
+        .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
+    };
+
+    const slot_indices = [_]usize{ 0, 1, 3 };
+    const positions = [_]usize{ 7, 8, 9 };
+    var batch_entries: [stage_adapters.max_decode_transport_rows]bridge.TensorFrameBatchEntry = undefined;
+    const metadata = try stage_adapters.buildDecodeActivationMetadata(
+        &backend,
+        0,
+        .f32,
+        .row_major,
+        .{ .cpu = {} },
+        &slot_indices,
+        &positions,
+        batch_entries[0..],
+    );
+
+    var row0 = [_]f32{ 1, 2, 3, 4 };
+    var row1 = [_]f32{ 5, 6, 7, 8 };
+    var row2 = [_]f32{ 9, 10, 11, 12 };
+    const host_segments = [_][]const u8{
+        std.mem.sliceAsBytes(row0[0..]),
+        std.mem.sliceAsBytes(row1[0..]),
+        std.mem.sliceAsBytes(row2[0..]),
+    };
+    const image = bridge.segmentedHostActivationByteImage(&metadata, &host_segments);
+    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
+    const contract = try bridge.buildActivationTransportContract(
+        placement_plan,
+        &metadata,
+        &image,
+        false,
+        false,
+    );
+    const request = localTransportRequest(
+        placement_plan,
+        &metadata,
+        &image,
+        &contract,
+        null,
+        false,
+        false,
+    );
+
+    try std.testing.expectEqual(bridge.StageTransportActivationScope.multi_entry_local, contract.envelope.activation_scope.?);
+    try std.testing.expectEqual(@as(u64, slot_indices.len), contract.envelope.batch_entry_count);
+    try std.testing.expectEqual(metadata.payload.byte_count, contract.envelope.payload_byte_count);
+    try std.testing.expectEqual(bridge.StageTransferMode.copy_in_process, contract.decision.mode);
+    try std.testing.expect(request.envelope == &contract.envelope);
+    try std.testing.expectEqual(bridge.StageTransferMode.copy_in_process, request.decision.mode);
+
+    const TraceStep = enum { synchronize, upload_segments };
+    const Trace = struct {
+        steps: [4]TraceStep = undefined,
+        count: usize = 0,
+        synchronized_rows: usize = 0,
+        upload_segments_calls: usize = 0,
+        upload_byte_count: usize = 0,
+
+        fn push(self: *@This(), step: TraceStep) void {
+            self.steps[self.count] = step;
+            self.count += 1;
+        }
+    };
+    const Source = struct {
+        trace: *Trace,
+        slots: []const usize,
+
+        pub fn synchronize(self: *@This()) anyerror!void {
+            self.trace.synchronized_rows += self.slots.len;
+            self.trace.push(.synchronize);
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+    };
+    const Target = struct {
+        trace: *Trace,
+
+        pub fn synchronize(_: *@This()) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivationSegments(self: *@This(), segments: []const []const u8, byte_count: usize) anyerror!void {
+            self.trace.upload_segments_calls += 1;
+            self.trace.upload_byte_count = byte_count;
+            self.trace.push(.upload_segments);
+            try std.testing.expectEqual(@as(usize, 3), segments.len);
+            try std.testing.expectEqual(@as(usize, 3 * d_model * @sizeOf(f32)), byte_count);
+        }
+    };
+
+    var trace_state = Trace{};
+    var source = Source{ .trace = &trace_state, .slots = &slot_indices };
+    var target = Target{ .trace = &trace_state };
+    try transport.executeLocalStageTransport(Source, Target, &source, &target, request);
+
+    try std.testing.expectEqual(@as(usize, 2), trace_state.count);
+    try std.testing.expectEqual(TraceStep.synchronize, trace_state.steps[0]);
+    try std.testing.expectEqual(TraceStep.upload_segments, trace_state.steps[1]);
+    try std.testing.expectEqual(slot_indices.len, trace_state.synchronized_rows);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.upload_segments_calls);
+    try std.testing.expectEqual(@as(usize, 3 * d_model * @sizeOf(f32)), trace_state.upload_byte_count);
+}
+
+test "inference.backend.cuda 10G-E deviceDecodeByteImage buildDecodeTransportContract keeps peer copy event sync out of source synchronize" {
+    const d_model: usize = 4;
+    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.pipeline2BoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
+    };
+    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        d_model,
+        plan,
+        &stage_backend_kinds,
+        &configs,
+    );
+    defer bundle.deinit();
+
+    const MockBackend = struct {
+        d_model: usize = d_model,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [4]?u64 = .{ 101, 202, 303, 404 },
+    };
+    var backend = MockBackend{
+        .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+        .cpu_gpu_placement_plan = bundle.placement_plan.?,
+        .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
+    };
+
+    const slot_indices = [_]usize{ 0, 2 };
+    const positions = [_]usize{ 5, 6 };
+    var batch_entries: [stage_adapters.max_decode_transport_rows]bridge.TensorFrameBatchEntry = undefined;
+    const metadata = try stage_adapters.buildDecodeActivationMetadata(
+        &backend,
+        0,
+        .f32,
+        .row_major,
+        .{ .cuda = 0 },
+        &slot_indices,
+        &positions,
+        batch_entries[0..],
+    );
+    const image = bridge.deviceActivationByteImage(&metadata);
+    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
+    const contract = try bridge.buildActivationTransportContract(
+        placement_plan,
+        &metadata,
+        &image,
+        false,
+        true,
+    );
+    try std.testing.expectEqual(bridge.StageTransferMode.device_peer_copy_in_process, contract.decision.mode);
+    try std.testing.expectEqual(bridge.StageTransportActivationScope.multi_entry_local, contract.envelope.activation_scope.?);
+
+    const Trace = struct {
+        synchronize_calls: usize = 0,
+        peer_copy_calls: usize = 0,
+        peer_copy_bytes: usize = 0,
+    };
+    const Source = struct {
+        trace: *Trace,
+
+        pub fn synchronize(self: *@This()) anyerror!void {
+            self.trace.synchronize_calls += 1;
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn peerCopyActivationTo(self: *@This(), _: anytype, byte_count: usize) anyerror!void {
+            self.trace.peer_copy_calls += 1;
+            self.trace.peer_copy_bytes = byte_count;
+        }
+
+        pub fn peerCopyHandlesStageSync(_: *const @This()) bool {
+            return true;
+        }
+    };
+    const Target = struct {
+        pub fn synchronize(_: *@This()) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+    };
+
+    var staging: [2 * d_model * @sizeOf(f32)]u8 align(64) = [_]u8{0xaa} ** (2 * d_model * @sizeOf(f32));
+    var trace_state = Trace{};
+    var source = Source{ .trace = &trace_state };
+    var target = Target{};
+    try transport.executeLocalStageTransport(
+        Source,
+        Target,
+        &source,
+        &target,
+        localTransportRequest(
+            placement_plan,
+            &metadata,
+            &image,
+            &contract,
+            staging[0..],
+            false,
+            true,
+        ),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), trace_state.synchronize_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.peer_copy_calls);
+    try std.testing.expectEqual(@as(usize, 2 * d_model * @sizeOf(f32)), trace_state.peer_copy_bytes);
+    try std.testing.expectEqual(@as(u8, 0xaa), staging[0]);
+}
+
+test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivationByteImage buildActivationTransportContract buildPrefillTransportContract executeLocalStageTransport keeps CPU KV upload outside chunk handoffs" {
+    const d_model: usize = 4;
+    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 4, 8),
+    };
+    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        d_model,
+        plan,
+        &stage_backend_kinds,
+        &configs,
+    );
+    defer bundle.deinit();
+
+    const MockBackend = struct {
+        d_model: usize = d_model,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [2]?u64 = .{ 101, 202 },
+    };
+    var backend = MockBackend{
+        .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+        .cpu_gpu_placement_plan = bundle.placement_plan.?,
+        .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
+    };
+
+    var payload_rows: [6 * d_model]f32 = undefined;
+    for (&payload_rows, 0..) |*value, index| value.* = @floatFromInt(index);
+
+    const Chunk = struct { sequence_start: usize, rows: usize };
+    const chunks = [_]Chunk{
+        .{ .sequence_start = 0, .rows = 4 },
+        .{ .sequence_start = 4, .rows = 2 },
+    };
+
+    const Trace = struct {
+        source_synchronize_calls: usize = 0,
+        upload_calls: usize = 0,
+        upload_byte_count: usize = 0,
+    };
+    const Source = struct {
+        trace: *Trace,
+
+        pub fn synchronize(self: *@This()) anyerror!void {
+            self.trace.source_synchronize_calls += 1;
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+    };
+    const Target = struct {
+        trace: *Trace,
+
+        pub fn synchronize(_: *@This()) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(self: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            try std.testing.expect(byte_count <= host_buf.len);
+            self.trace.upload_calls += 1;
+            self.trace.upload_byte_count += byte_count;
+        }
+    };
+
+    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
+    const plan_ref = try stage_adapters.localTopologyTensorFramePlanRef(&backend);
+    var trace_state = Trace{};
+    var source = Source{ .trace = &trace_state };
+    var target = Target{ .trace = &trace_state };
+
+    const cpu_kv_upload_calls_before_chunk_loop: usize = 1;
+    var expected_payload_bytes: usize = 0;
+    for (chunks) |chunk| {
+        const row_start = chunk.sequence_start * d_model;
+        const row_count = chunk.rows * d_model;
+        const chunk_bytes = std.mem.sliceAsBytes(payload_rows[row_start..][0..row_count]);
+        expected_payload_bytes += chunk_bytes.len;
+
+        var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
+        const metadata = try stage_adapters.buildPrefillActivationMetadata(
+            &backend,
+            0,
+            .f32,
+            .row_major,
+            .{ .cpu = {} },
+            0,
+            chunk.sequence_start,
+            chunk.rows,
+            batch_entries[0..],
+        );
+        try bridge.validateTensorFrameForPlanBoundary(&metadata, plan_ref, 0);
+        try bridge.validatePayloadBufferLength(&metadata, chunk_bytes.len);
+        try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, metadata.step_kind);
+        try std.testing.expectEqual(@as(u64, @intCast(chunk.sequence_start)), metadata.batch.entries[0].sequence_start);
+        try std.testing.expectEqual(@as(u64, @intCast(chunk.rows)), metadata.batch.entries[0].token_count);
+
+        const image = bridge.hostActivationByteImage(&metadata, chunk_bytes);
+        const generic_contract = try bridge.buildActivationTransportContract(
+            placement_plan,
+            &metadata,
+            &image,
+            false,
+            false,
+        );
+        const prefill_contract = try bridge.buildActivationTransportContract(
+            placement_plan,
+            &metadata,
+            &image,
+            false,
+            false,
+        );
+        try std.testing.expectEqual(generic_contract.decision.mode, prefill_contract.decision.mode);
+        try std.testing.expectEqual(bridge.StageTransferMode.copy_in_process, prefill_contract.decision.mode);
+        try std.testing.expectEqual(bridge.StageTransportActivationScope.single_entry_header, prefill_contract.envelope.activation_scope.?);
+
+        try transport.executeLocalStageTransport(
+            Source,
+            Target,
+            &source,
+            &target,
+            localTransportRequest(
+                placement_plan,
+                &metadata,
+                &image,
+                &prefill_contract,
+                null,
+                false,
+                false,
+            ),
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), cpu_kv_upload_calls_before_chunk_loop);
+    try std.testing.expectEqual(@as(usize, chunks.len), trace_state.source_synchronize_calls);
+    try std.testing.expectEqual(@as(usize, chunks.len), trace_state.upload_calls);
+    try std.testing.expectEqual(expected_payload_bytes, trace_state.upload_byte_count);
+}
+
+test "inference.backend.cuda 10G-F deviceActivationByteImage buildPrefillTransportContract executeLocalStageTransport covers GPU peer copy and host-staged fallback" {
+    const d_model: usize = 4;
+    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.pipeline2BoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
+    };
+    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        d_model,
+        plan,
+        &stage_backend_kinds,
+        &configs,
+    );
+    defer bundle.deinit();
+
+    const MockBackend = struct {
+        d_model: usize = d_model,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [2]?u64 = .{ 101, 202 },
+    };
+    var backend = MockBackend{
+        .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+        .cpu_gpu_placement_plan = bundle.placement_plan.?,
+        .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
+    };
+
+    var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
+    const metadata = try stage_adapters.buildPrefillActivationMetadata(
+        &backend,
+        0,
+        .f32,
+        .row_major,
+        .{ .cuda = 0 },
+        1,
+        5,
+        3,
+        batch_entries[0..],
+    );
+    try bridge.validateTensorFrameForPlanBoundary(&metadata, try stage_adapters.localTopologyTensorFramePlanRef(&backend), 0);
+    try bridge.validatePayloadBufferLength(&metadata, 3 * d_model * @sizeOf(f32));
+    const image = bridge.deviceActivationByteImage(&metadata);
+    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
+
+    const Trace = struct {
+        synchronize_calls: usize = 0,
+        download_calls: usize = 0,
+        upload_calls: usize = 0,
+        peer_copy_calls: usize = 0,
+        byte_count: usize = 0,
+        upload_first_byte: u8 = 0,
+    };
+    const Source = struct {
+        trace: *Trace,
+        peer_copy_handles_sync: bool,
+
+        pub fn synchronize(self: *@This()) anyerror!void {
+            self.trace.synchronize_calls += 1;
+        }
+
+        pub fn downloadActivation(self: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            try std.testing.expect(byte_count <= host_buf.len);
+            self.trace.download_calls += 1;
+            self.trace.byte_count = byte_count;
+            @memset(host_buf[0..byte_count], 0x7b);
+        }
+
+        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn peerCopyActivationTo(self: *@This(), _: anytype, byte_count: usize) anyerror!void {
+            self.trace.peer_copy_calls += 1;
+            self.trace.byte_count = byte_count;
+        }
+
+        pub fn peerCopyHandlesStageSync(self: *const @This()) bool {
+            return self.peer_copy_handles_sync;
+        }
+    };
+    const Target = struct {
+        trace: *Trace,
+
+        pub fn synchronize(_: *@This()) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(self: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            try std.testing.expect(byte_count <= host_buf.len);
+            self.trace.upload_calls += 1;
+            self.trace.byte_count = byte_count;
+            self.trace.upload_first_byte = host_buf[0];
+        }
+    };
+
+    var trace_state = Trace{};
+    var source = Source{ .trace = &trace_state, .peer_copy_handles_sync = true };
+    var target = Target{ .trace = &trace_state };
+    var staging: [3 * d_model * @sizeOf(f32)]u8 align(64) = [_]u8{0xaa} ** (3 * d_model * @sizeOf(f32));
+    const peer_contract = try bridge.buildActivationTransportContract(
+        placement_plan,
+        &metadata,
+        &image,
+        false,
+        true,
+    );
+    try std.testing.expectEqual(bridge.StageTransferMode.device_peer_copy_in_process, peer_contract.decision.mode);
+    try transport.executeLocalStageTransport(
+        Source,
+        Target,
+        &source,
+        &target,
+        localTransportRequest(
+            placement_plan,
+            &metadata,
+            &image,
+            &peer_contract,
+            staging[0..],
+            false,
+            true,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), trace_state.synchronize_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.peer_copy_calls);
+    try std.testing.expectEqual(@as(usize, 3 * d_model * @sizeOf(f32)), trace_state.byte_count);
+    try std.testing.expectEqual(@as(u8, 0xaa), staging[0]);
+
+    trace_state = .{};
+    source = .{ .trace = &trace_state, .peer_copy_handles_sync = false };
+    target = .{ .trace = &trace_state };
+    const fallback_contract = try bridge.buildActivationTransportContract(
+        placement_plan,
+        &metadata,
+        &image,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(bridge.StageTransferMode.device_download_then_copy, fallback_contract.decision.mode);
+    try transport.executeLocalStageTransport(
+        Source,
+        Target,
+        &source,
+        &target,
+        localTransportRequest(
+            placement_plan,
+            &metadata,
+            &image,
+            &fallback_contract,
+            staging[0..],
+            false,
+            false,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), trace_state.synchronize_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.download_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.upload_calls);
+    try std.testing.expectEqual(@as(u8, 0x7b), trace_state.upload_first_byte);
+}
+
+test "buildLocalTopologyPlacementPlan covers decode and prefill profiles for local topologies" {
+    const d_model: usize = 8;
+
+    const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .reason = .stateful_decoder,
+        .affects_loader_residency = false,
+    }};
+
+    var cpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer cpu_gpu_plan.deinit();
+    var cpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_plan);
+    defer cpu_gpu_state.deinit();
+    const cpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const cpu_gpu_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 4, 9),
+    };
+    var cpu_gpu_placement = try engine.testing.buildLocalTopologyPlacementPlan(
+        std.testing.allocator,
+        d_model,
+        &cpu_gpu_plan,
+        &cpu_gpu_kinds,
+        &cpu_gpu_configs,
+        &cpu_gpu_state.ref,
+    );
+    defer cpu_gpu_placement.deinit();
+    try expectLocalTopologyPlacement(&cpu_gpu_placement, d_model, 2, &cpu_gpu_configs);
+    try std.testing.expectEqual(bridge.StatePlacementMode.validate_ref, cpu_gpu_placement.state_placement_mode);
+    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_placement.state_stage_summaries.len);
+
+    var pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer pipeline2_plan.deinit();
+    var pipeline2_state = try buildLocalTopologyStateFixture(std.testing.allocator, &pipeline2_plan);
+    defer pipeline2_state.deinit();
+    const pipeline2_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const pipeline2_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.pipeline2BoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    };
+    var pipeline2_placement = try engine.testing.buildLocalTopologyPlacementPlan(
+        std.testing.allocator,
+        d_model,
+        &pipeline2_plan,
+        &pipeline2_kinds,
+        &pipeline2_configs,
+        &pipeline2_state.ref,
+    );
+    defer pipeline2_placement.deinit();
+    try expectLocalTopologyPlacement(&pipeline2_placement, d_model, 2, &pipeline2_configs);
+
+    const three_stage_deps = [_]models.stage_plan.DependencyOverride{
+        .{
+            .source_stage_id = 0,
+            .target_stage_id = 1,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+        .{
+            .source_stage_id = 1,
+            .target_stage_id = 2,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+    };
+    var cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    defer cpu_gpu_gpu_plan.deinit();
+    var cpu_gpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_gpu_plan);
+    defer cpu_gpu_gpu_state.deinit();
+    const cpu_gpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+    const cpu_gpu_gpu_configs = engine.testing.cpuGpuGpuBoundaryConfigs(
+        .f32,
+        .row_major,
+        .f16,
+        .row_major,
+        5,
+        9,
+        16,
+        64,
+    );
+    var cpu_gpu_gpu_placement = try engine.testing.buildLocalTopologyPlacementPlan(
+        std.testing.allocator,
+        d_model,
+        &cpu_gpu_gpu_plan,
+        &cpu_gpu_gpu_kinds,
+        &cpu_gpu_gpu_configs,
+        &cpu_gpu_gpu_state.ref,
+    );
+    defer cpu_gpu_gpu_placement.deinit();
+    try expectLocalTopologyPlacement(&cpu_gpu_gpu_placement, d_model, 3, &cpu_gpu_gpu_configs);
+}
+
+test "buildLocalTopologyStateOwnershipPlan covers stateful local topology dependencies" {
+    const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .reason = .stateful_decoder,
+        .affects_loader_residency = false,
+    }};
+    var pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer pipeline2_plan.deinit();
+    var pipeline2_state = try engine.testing.buildLocalTopologyStateOwnershipPlan(std.testing.allocator, &pipeline2_plan);
+    defer pipeline2_state.deinit();
+    try bridge.validateStageStateOwnershipPlan(&pipeline2_state);
+    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.boundaries.len);
+    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.stateful_dependencies.len);
+    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.partition_facts.len);
+    try std.testing.expectEqual(@as(usize, 0), pipeline2_state.partition_facts[0].boundary_index);
+    try std.testing.expectEqual(@as(usize, 0), pipeline2_state.partition_facts[0].source_stage_id);
+    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.partition_facts[0].target_stage_id);
+
+    const three_stage_deps = [_]models.stage_plan.DependencyOverride{
+        .{
+            .source_stage_id = 0,
+            .target_stage_id = 1,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+        .{
+            .source_stage_id = 1,
+            .target_stage_id = 2,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+    };
+    var cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    defer cpu_gpu_gpu_plan.deinit();
+    var cpu_gpu_gpu_state = try engine.testing.buildLocalTopologyStateOwnershipPlan(std.testing.allocator, &cpu_gpu_gpu_plan);
+    defer cpu_gpu_gpu_state.deinit();
+    try bridge.validateStageStateOwnershipPlan(&cpu_gpu_gpu_state);
+    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_gpu_state.boundaries.len);
+    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_gpu_state.stateful_dependencies.len);
+    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_gpu_state.partition_facts.len);
+    for (cpu_gpu_gpu_state.partition_facts, 0..) |fact, boundary_index| {
+        try std.testing.expectEqual(boundary_index, fact.boundary_index);
+        try std.testing.expectEqual(boundary_index, fact.source_stage_id);
+        try std.testing.expectEqual(boundary_index + 1, fact.target_stage_id);
+    }
+}
+
+test "deinitCpuGpuTensorFrameContract uses reverse local topology contract order and is idempotent" {
+    const expected_order = [_]engine.testing.ContractField{
+        .local_stage_runner_plan_ref,
+        .placement_plan,
+        .state_placement_ref,
+        .state_ownership_plan,
+        .tensor_frame_plan_ref,
+        .stage_plan,
+    };
+    try std.testing.expectEqualSlices(engine.testing.ContractField, &expected_order, &engine.testing.contract_deinit_order);
+
+    const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .reason = .stateful_decoder,
+        .affects_loader_residency = false,
+    }};
+    const cpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const cpu_gpu_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 4, 9),
+    };
+    const cpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    var cpu_gpu_bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        8,
+        cpu_gpu_plan,
+        &cpu_gpu_kinds,
+        &cpu_gpu_configs,
+    );
+    defer cpu_gpu_bundle.deinit();
+    engine.testing.deinitLocalTopologyContractBundleThroughBackendTwice(&cpu_gpu_bundle);
+
+    const pipeline2_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const pipeline2_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.pipeline2BoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    };
+    const pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    var pipeline2_bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        8,
+        pipeline2_plan,
+        &pipeline2_kinds,
+        &pipeline2_configs,
+    );
+    defer pipeline2_bundle.deinit();
+    engine.testing.deinitLocalTopologyContractBundleThroughBackendTwice(&pipeline2_bundle);
+
+    const three_stage_deps = [_]models.stage_plan.DependencyOverride{
+        .{
+            .source_stage_id = 0,
+            .target_stage_id = 1,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+        .{
+            .source_stage_id = 1,
+            .target_stage_id = 2,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+    };
+    const cpu_gpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+    const cpu_gpu_gpu_configs = engine.testing.cpuGpuGpuBoundaryConfigs(
+        .f32,
+        .row_major,
+        .f16,
+        .row_major,
+        5,
+        9,
+        16,
+        64,
+    );
+    const cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    var cpu_gpu_gpu_bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        8,
+        cpu_gpu_gpu_plan,
+        &cpu_gpu_gpu_kinds,
+        &cpu_gpu_gpu_configs,
+    );
+    defer cpu_gpu_gpu_bundle.deinit();
+    engine.testing.deinitLocalTopologyContractBundleThroughBackendTwice(&cpu_gpu_gpu_bundle);
+}
+
+test "buildLocalTopologyPlacementPlan cleans up allocation failures for local topology contract bundles" {
+    const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
+        .source_stage_id = 0,
+        .target_stage_id = 1,
+        .reason = .stateful_decoder,
+        .affects_loader_residency = false,
+    }};
+    var cpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer cpu_gpu_plan.deinit();
+    var cpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_plan);
+    defer cpu_gpu_state.deinit();
+    const cpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const cpu_gpu_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 4, 9),
+    };
+    try expectPlacementBuildFailureCleanup(8, &cpu_gpu_plan, &cpu_gpu_kinds, &cpu_gpu_configs, &cpu_gpu_state.ref);
+
+    var pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer pipeline2_plan.deinit();
+    var pipeline2_state = try buildLocalTopologyStateFixture(std.testing.allocator, &pipeline2_plan);
+    defer pipeline2_state.deinit();
+    const pipeline2_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const pipeline2_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.pipeline2BoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    };
+    try expectPlacementBuildFailureCleanup(8, &pipeline2_plan, &pipeline2_kinds, &pipeline2_configs, &pipeline2_state.ref);
+
+    const three_stage_deps = [_]models.stage_plan.DependencyOverride{
+        .{
+            .source_stage_id = 0,
+            .target_stage_id = 1,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+        .{
+            .source_stage_id = 1,
+            .target_stage_id = 2,
+            .reason = .stateful_decoder,
+            .affects_loader_residency = false,
+        },
+    };
+    var cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    defer cpu_gpu_gpu_plan.deinit();
+    var cpu_gpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_gpu_plan);
+    defer cpu_gpu_gpu_state.deinit();
+    const cpu_gpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+    const cpu_gpu_gpu_configs = engine.testing.cpuGpuGpuBoundaryConfigs(
+        .f32,
+        .row_major,
+        .f16,
+        .row_major,
+        5,
+        9,
+        16,
+        64,
+    );
+    try expectPlacementBuildFailureCleanup(8, &cpu_gpu_gpu_plan, &cpu_gpu_gpu_kinds, &cpu_gpu_gpu_configs, &cpu_gpu_gpu_state.ref);
 }
 
 test "finalOutputBuffer returns residual when program ends with add" {
@@ -1442,7 +2708,7 @@ test "bindSlotStateBlocks rolls back self on cpu stage bind failure" {
     // Zero-initialized CPU backend stub: slot_state_bindings.len == 0
     // triggers the bounds check in CPU bindSlotStateBlocks before any other field access.
     // Uses aligned byte buffer to satisfy the struct's natural alignment requirement.
-    const cpu_backend = @import("../cpu/root.zig");
+    const cpu_backend = main.inference.backend.cpu;
     var cpu_stage0_bytes: [@sizeOf(cpu_backend.BackendType)]u8 align(@alignOf(cpu_backend.BackendType)) = @splat(0);
     const cpu_stage0: *cpu_backend.BackendType = @ptrCast(&cpu_stage0_bytes);
     backend.pipeline_backend0_cpu = cpu_stage0;
@@ -1618,6 +2884,8 @@ test "mirrorSlotStateBlocksFrom synthesizes stage-local runtime descriptors with
 
     var source: CudaBackend = undefined;
     source.max_batch_size = 1;
+    source.pipeline_backend1 = null;
+    source.pipeline_backend0_cpu = null;
     source.block_runtime = undefined;
     source.state_descriptor_count = 1;
     source.state_descriptors_storage[0] = .{
@@ -1633,6 +2901,8 @@ test "mirrorSlotStateBlocksFrom synthesizes stage-local runtime descriptors with
 
     var target: CudaBackend = undefined;
     target.max_batch_size = 1;
+    target.pipeline_backend1 = null;
+    target.pipeline_backend0_cpu = null;
     target.block_runtime = undefined;
     target.state_descriptor_count = 2;
     target.state_descriptors_storage[0] = .{
@@ -1699,6 +2969,8 @@ test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtim
 
     var source: CudaBackend = undefined;
     source.max_batch_size = 1;
+    source.pipeline_backend1 = null;
+    source.pipeline_backend0_cpu = null;
     source.block_runtime = undefined;
     source.state_descriptor_count = 1;
     source.state_descriptors_storage[0] = .{
@@ -1714,6 +2986,8 @@ test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtim
 
     var target: CudaBackend = undefined;
     target.max_batch_size = 1;
+    target.pipeline_backend1 = null;
+    target.pipeline_backend0_cpu = null;
     target.block_runtime = undefined;
     target.state_descriptor_count = 2;
     target.state_descriptors_storage[0] = .{
@@ -1753,6 +3027,8 @@ test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtim
 test "mirrorSlotStateBlocksFrom synthesizes runtime descriptors when source slot is unbound" {
     var source: CudaBackend = undefined;
     source.max_batch_size = 1;
+    source.pipeline_backend1 = null;
+    source.pipeline_backend0_cpu = null;
     source.block_runtime = undefined;
     source.state_descriptor_count = 0;
     var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
@@ -1760,6 +3036,8 @@ test "mirrorSlotStateBlocksFrom synthesizes runtime descriptors when source slot
 
     var target: CudaBackend = undefined;
     target.max_batch_size = 1;
+    target.pipeline_backend1 = null;
+    target.pipeline_backend0_cpu = null;
     target.block_runtime = undefined;
     target.state_descriptor_count = 1;
     target.state_descriptors_storage[0] = .{
@@ -2324,7 +3602,7 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
 
     const Mock = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         trace: *SharedTrace,
@@ -2335,6 +3613,15 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
         topology_mode: enum { single, pipeline2 } = .single,
         block_runtime: BlockRuntimeMock = .{},
         pipeline_backend1: ?*@This() = null,
+        pipeline_host_staging: ?[]align(64) u8 = null,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        pipeline_boundary01_local_device_peer_copy_available: bool = false,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [2]?u64 = .{ 101, 202 },
+        device: MockCudaDevice = .{},
 
         pub fn pipelineStage1(self: *@This()) ?*@This() {
             return self.pipeline_backend1;
@@ -2353,8 +3640,25 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
             self.trace.push(.activate);
         }
 
-        pub fn transferPipelineActivation(self: *@This(), stage1: *@This(), byte_count: usize) !void {
-            _ = stage1;
+        pub fn pipelineActivationByteCount(self: *const @This()) !usize {
+            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
+        }
+
+        pub fn synchronizePipelineActivation(_: *@This()) !void {}
+
+        pub fn downloadPipelineActivationToHost(self: *@This(), host_buf: []u8, byte_count: usize) !void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            @memset(host_buf[0..byte_count], if (self.is_stage1) 0x22 else 0x11);
+        }
+
+        pub fn uploadPipelineActivationFromHost(
+            self: *@This(),
+            slot_index: usize,
+            host_buf: []const u8,
+            byte_count: usize,
+        ) !void {
+            _ = slot_index;
+            if (byte_count > host_buf.len) return error.InvalidArgument;
             self.trace.transfer_calls += 1;
             self.trace.transfer_bytes = byte_count;
             self.trace.push(.transfer);
@@ -2408,6 +3712,20 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
     };
 
     var trace_state = SharedTrace{};
+    var staging: [8 * @sizeOf(f32)]u8 align(64) = undefined;
+    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.pipeline2BoundaryConfig(.f32, .row_major, 2, 2, 1, 1),
+    };
+    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        8,
+        plan,
+        &stage_backend_kinds,
+        &configs,
+    );
+    defer bundle.deinit();
     var stage1 = Mock{
         .trace = &trace_state,
         .is_stage1 = true,
@@ -2415,7 +3733,7 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
         .d_model = 8,
         .state_descriptor_count = 1,
         .topology_mode = .single,
-        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
         .pipeline_backend1 = null,
     };
     var stage0 = Mock{
@@ -2425,8 +3743,12 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
         .d_model = 8,
         .state_descriptor_count = 0,
         .topology_mode = .pipeline2,
-        .block_runtime = .{ .blocks = &[_]u8{ 0, 0, 0, 0 } },
+        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
         .pipeline_backend1 = &stage1,
+        .pipeline_host_staging = staging[0..],
+        .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+        .cpu_gpu_placement_plan = bundle.placement_plan.?,
+        .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
     };
 
     var logits: [7]f32 = undefined;
@@ -2522,6 +3844,7 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
 
     const CpuStage0Mock = struct {
         trace: *SharedTrace,
+        activation: [8]f32 = [_]f32{0.0} ** 8,
 
         pub fn executeDecodeLayerRange(
             self: *@This(),
@@ -2546,14 +3869,19 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
             self.trace.stage0_compute_logits = compute_logits;
             self.trace.stage0_download_logits = download_logits;
             self.trace.stage0_use_preloaded_input = use_preloaded_input;
+            @memset(self.activation[0..], 1.0);
             try std.testing.expect(logits_out_opt == null);
             self.trace.push(.stage0_compute);
+        }
+
+        pub fn slotActivationBytes(self: *@This(), _: usize) []const u8 {
+            return std.mem.sliceAsBytes(self.activation[0..]);
         }
     };
 
     const Mock = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         trace: *SharedTrace,
@@ -2562,6 +3890,13 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
         d_model: usize = 8,
         topology_mode: enum { single, pipeline2, cpu_gpu } = .cpu_gpu,
         block_runtime: BlockRuntimeMock = .{},
+        pipeline_host_staging: ?[]align(64) u8 = null,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [2]?u64 = .{ 101, 202 },
 
         pub fn pipelineCpuStage0(self: *@This()) ?*CpuStage0Mock {
             return self.cpu_stage0;
@@ -2571,13 +3906,19 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
             return self.split_layer;
         }
 
-        pub fn transferPipelineActivationFromCpu(
+        pub fn pipelineActivationByteCount(self: *const @This()) !usize {
+            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
+        }
+
+        pub fn activateKvSlot(_: *@This(), _: usize) void {}
+
+        pub fn uploadPipelineActivationFromHost(
             self: *@This(),
-            src: *CpuStage0Mock,
             slot_index: usize,
+            host_buf: []const u8,
             byte_count: usize,
         ) !void {
-            _ = src;
+            if (byte_count > host_buf.len) return error.InvalidArgument;
             self.trace.transfer_calls += 1;
             self.trace.transfer_slot = slot_index;
             self.trace.transfer_bytes = byte_count;
@@ -2622,13 +3963,29 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
 
     var trace_state = SharedTrace{};
     var cpu_stage0 = CpuStage0Mock{ .trace = &trace_state };
+    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{3}, &.{});
+    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, 2, 1),
+    };
+    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        8,
+        plan,
+        &stage_backend_kinds,
+        &configs,
+    );
+    defer bundle.deinit();
     var stage1 = Mock{
         .trace = &trace_state,
         .cpu_stage0 = &cpu_stage0,
         .split_layer = 3,
         .d_model = 8,
         .topology_mode = .cpu_gpu,
-        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
+        .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+        .cpu_gpu_placement_plan = bundle.placement_plan.?,
+        .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
     };
     var logits: [7]f32 = undefined;
 
@@ -2693,10 +4050,6 @@ test "executeDecodeWithLayerLimit cpu_gpu returns error when stage0 is missing" 
 
         pub fn pipelineSplitLayer(self: *const @This()) usize {
             return self.split_layer;
-        }
-
-        pub fn transferPipelineActivationFromCpu(_: *@This(), _: *u8, _: usize, _: usize) !void {
-            return;
         }
 
         pub fn executeDecodeWithLayerLimitTestHook(
@@ -2786,7 +4139,7 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
 
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         topology_mode: enum { single, cpu_gpu } = .single,
@@ -2799,8 +4152,19 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
         pipeline_host_staging: ?[]align(64) u8 = null,
         pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
         pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [slot_count]?u64 = .{ 101, 202 },
         cpu_stage0: ?*CpuStage0Mock = null,
         device: MockCudaDevice = .{},
+        copy_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
+        copy_u16_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
+        fixed_alloc_mode: bool = false,
+        kv_cache_dtype: KvCacheDtypeForTest = .f16,
+        kv_storage_mode: KvCacheStorageModeForTest = .device,
+        n_kv_heads: usize = 1,
+        kernel_arg_pack: compute.cuda.args.ArgPack = undefined,
         preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
         slot_in_use: [slot_count]bool = [_]bool{true} ** slot_count,
         slot_positions: [slot_count]usize = [_]usize{0} ** slot_count,
@@ -2817,16 +4181,14 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
             return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
         }
 
-        pub fn transferPipelineActivationFromCpu(
+        pub fn executePrefillWithLayerLimitTestHook(
             self: *@This(),
-            src: *CpuStage0Mock,
+            tokens: []const u32,
             slot_index: usize,
-            byte_count: usize,
+            logits_out: []f32,
+            layer_limit: usize,
         ) !void {
-            const src_bytes = src.slotActivationBytes(slot_index);
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
+            return runCpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
         }
 
         pub fn uploadPipelineActivationFromHost(
@@ -2892,17 +4254,33 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
     while (cycle < 8) : (cycle += 1) {
         var cpu_stage = CpuStage0Mock{};
         var staging: [d_model * @sizeOf(f32)]u8 align(64) = undefined;
+        const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{split_layer}, &.{});
+        const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+        const configs = [_]engine.testing.BoundaryConfig{
+            engine.testing.cpuGpuBoundaryConfig(.f32, .row_major, slot_count, 1),
+        };
+        var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+            std.testing.allocator,
+            d_model,
+            plan,
+            &stage_backend_kinds,
+            &configs,
+        );
+        defer bundle.deinit();
         var single = MockBackend{
             .topology_mode = .single,
             .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0, 0, 0, 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{}, .{}, .{} } },
         };
         var split = MockBackend{
             .topology_mode = .cpu_gpu,
             .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0, 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
             .pipeline_host_staging = staging[0..],
             .cpu_stage0 = &cpu_stage,
+            .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+            .cpu_gpu_placement_plan = bundle.placement_plan.?,
+            .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
         };
 
         var positions: [slot_count]usize = [_]usize{0} ** slot_count;
@@ -2995,7 +4373,7 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
 
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         topology_mode: enum { single, cpu_gpu } = .single,
@@ -3009,6 +4387,13 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
         pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
         pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
         device: MockCudaDevice = .{},
+        copy_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
+        copy_u16_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
+        fixed_alloc_mode: bool = false,
+        kv_cache_dtype: KvCacheDtypeForTest = .f16,
+        kv_storage_mode: KvCacheStorageModeForTest = .device,
+        n_kv_heads: usize = 1,
+        kernel_arg_pack: compute.cuda.args.ArgPack = undefined,
         preloaded: [d_model]f32 = [_]f32{0.0} ** d_model,
 
         pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
@@ -3027,19 +4412,17 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
             return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
         }
 
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn transferPipelineActivationFromCpu(
+        pub fn executePrefillWithLayerLimitTestHook(
             self: *@This(),
-            src: *CpuStage0Mock,
-            _: usize,
-            byte_count: usize,
+            tokens: []const u32,
+            slot_index: usize,
+            logits_out: []f32,
+            layer_limit: usize,
         ) !void {
-            const src_bytes = src.slotActivationBytes(0);
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
+            return runCpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
         }
+
+        pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
         pub fn uploadPipelineActivationFromHost(
             self: *@This(),
@@ -3107,7 +4490,7 @@ test "cpu_gpu prefill parity matches single topology across repeated windows" {
         var split = MockBackend{
             .topology_mode = .cpu_gpu,
             .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0, 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
             .cpu_stage0 = &cpu_stage,
             .pipeline_host_staging = staging[0..],
         };
@@ -3173,7 +4556,7 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
 
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         topology_mode: enum { single, cpu_gpu } = .single,
@@ -3187,6 +4570,13 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
         pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
         pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
         device: MockCudaDevice = .{},
+        copy_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
+        copy_u16_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
+        fixed_alloc_mode: bool = false,
+        kv_cache_dtype: KvCacheDtypeForTest = .f16,
+        kv_storage_mode: KvCacheStorageModeForTest = .device,
+        n_kv_heads: usize = 1,
+        kernel_arg_pack: compute.cuda.args.ArgPack = undefined,
         preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
 
         pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
@@ -3205,19 +4595,17 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
             return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
         }
 
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn transferPipelineActivationFromCpu(
+        pub fn executePrefillWithLayerLimitTestHook(
             self: *@This(),
-            src: *CpuStage0Mock,
+            tokens: []const u32,
             slot_index: usize,
-            byte_count: usize,
+            logits_out: []f32,
+            layer_limit: usize,
         ) !void {
-            const src_bytes = src.slotActivationBytes(slot_index);
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
+            return runCpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
         }
+
+        pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
         pub fn uploadPipelineActivationFromHost(
             self: *@This(),
@@ -3292,7 +4680,7 @@ test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cy
         var split = MockBackend{
             .topology_mode = .cpu_gpu,
             .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0, 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
             .cpu_stage0 = &cpu_stage,
             .pipeline_host_staging = staging[0..],
         };
@@ -3339,10 +4727,6 @@ test "executeDecodeWithLayerLimit pipeline2 returns error when stage1 is missing
         }
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn transferPipelineActivation(_: *@This(), _: *@This(), _: usize) !void {
-            return;
-        }
 
         pub fn executeDecodeWithLayerLimitTestHook(
             _: *@This(),
@@ -3544,12 +4928,13 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
 
     const Stage1Mock = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         trace: *SharedTrace,
         state_descriptor_count: usize = 0,
         block_runtime: BlockRuntimeMock = .{},
+        device: MockCudaDevice = .{},
 
         pub fn mirrorSlotStateBlocksFrom(self: *@This(), _: anytype, _: usize) !void {
             self.trace.push(.mirror);
@@ -3559,17 +4944,21 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
             self.trace.push(.stage1_activate);
         }
 
-        pub fn transferPipelineActivationFromCpu(
+        pub fn synchronizePipelineActivation(_: *@This()) !void {}
+
+        pub fn uploadPipelineActivationFromHost(
             self: *@This(),
-            _: *CpuStage0Mock,
             _: usize,
+            host_buf: []const u8,
             byte_count: usize,
         ) !void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
             self.trace.transfer01_bytes = byte_count;
             self.trace.push(.transfer_01);
         }
 
-        pub fn transferPipelineActivation(self: *@This(), _: anytype, byte_count: usize) !void {
+        pub fn downloadPipelineActivationToHost(self: *@This(), host_buf: []u8, byte_count: usize) !void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
             self.trace.transfer12_bytes = byte_count;
             self.trace.push(.transfer_12);
         }
@@ -3611,7 +5000,7 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
 
     const Stage2Mock = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         trace: *SharedTrace,
@@ -3624,6 +5013,16 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
         block_runtime: BlockRuntimeMock = .{},
         pipeline_host_staging: ?[]align(64) u8 = null,
         pipeline_host_staging_stage12: ?[]align(64) u8 = null,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        pipeline_boundary_dtype_stage12: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout_stage12: bridge.BoundaryLayout = .row_major,
+        pipeline_boundary01_local_device_peer_copy_available: bool = false,
+        pipeline_boundary12_local_device_peer_copy_available: bool = false,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [2]?u64 = .{ 101, 202 },
 
         pub fn pipelineCpuStage0(self: *@This()) ?*CpuStage0Mock {
             return self.cpu_stage0;
@@ -3641,17 +5040,31 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
             return self.split_layer_stage2;
         }
 
+        pub fn pipelineActivationByteCount(self: *const @This()) !usize {
+            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
+        }
+
+        pub fn executePrefillWithLayerLimitTestHook(
+            self: *@This(),
+            tokens: []const u32,
+            slot_index: usize,
+            logits_out: []f32,
+            layer_limit: usize,
+        ) !void {
+            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
+        }
+
         pub fn activateKvSlot(self: *@This(), _: usize) void {
             self.trace.push(.stage2_activate);
         }
 
-        pub fn transferPipelineActivationFromCpu(
+        pub fn uploadPipelineActivationFromHost(
             _: *@This(),
-            _: *CpuStage0Mock,
             _: usize,
-            _: usize,
+            host_buf: []const u8,
+            byte_count: usize,
         ) !void {
-            return;
+            if (byte_count > host_buf.len) return error.InvalidArgument;
         }
 
         pub fn executeDecodeWithLayerLimitTestHook(
@@ -3694,8 +5107,29 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
     var stage1 = Stage1Mock{
         .trace = &trace_state,
         .state_descriptor_count = 1,
-        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
     };
+    var staging12: [8 * @sizeOf(f32)]u8 align(64) = undefined;
+    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{ 2, 4 }, &.{});
+    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+    const configs = engine.testing.cpuGpuGpuBoundaryConfigs(
+        .f32,
+        .row_major,
+        .f32,
+        .row_major,
+        2,
+        2,
+        1,
+        1,
+    );
+    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        8,
+        plan,
+        &stage_backend_kinds,
+        &configs,
+    );
+    defer bundle.deinit();
     var stage2 = Stage2Mock{
         .trace = &trace_state,
         .cpu_stage0 = &cpu_stage0,
@@ -3704,7 +5138,11 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
         .split_layer_stage2 = 4,
         .d_model = 8,
         .topology_mode = .cpu_gpu_gpu,
-        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
+        .pipeline_host_staging_stage12 = staging12[0..],
+        .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+        .cpu_gpu_placement_plan = bundle.placement_plan.?,
+        .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
     };
     var logits: [7]f32 = undefined;
 
@@ -3870,35 +5308,36 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
 
     const Stage1Mock = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         block_runtime: BlockRuntimeMock = .{},
         state_descriptor_count: usize = 0,
         preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
         last_slot: usize = 0,
+        device: MockCudaDevice = .{},
 
         pub fn mirrorSlotStateBlocksFrom(_: *@This(), _: anytype, _: usize) !void {}
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
-        pub fn transferPipelineActivationFromCpu(
+        pub fn synchronizePipelineActivation(_: *@This()) !void {}
+
+        pub fn uploadPipelineActivationFromHost(
             self: *@This(),
-            src: *CpuStage0Mock,
             slot_index: usize,
+            host_buf: []const u8,
             byte_count: usize,
         ) !void {
-            const src_bytes = src.slotActivationBytes(slot_index);
             const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
+            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
+            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
         }
 
-        pub fn transferPipelineActivation(self: *@This(), dst: anytype, byte_count: usize) !void {
+        pub fn downloadPipelineActivationToHost(self: *@This(), host_buf: []u8, byte_count: usize) !void {
             const src_bytes = std.mem.sliceAsBytes(self.preloaded[self.last_slot][0..]);
-            const dst_bytes = std.mem.sliceAsBytes(dst.preloaded[self.last_slot][0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
+            if (byte_count > src_bytes.len or byte_count > host_buf.len) return error.InvalidArgument;
+            @memcpy(host_buf[0..byte_count], src_bytes[0..byte_count]);
         }
 
         pub fn executeDecodeWithLayerLimitTestHook(
@@ -3932,7 +5371,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
             } else {
                 hidden = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25 + @as(f32, @floatFromInt(layer_limit));
             }
-            // Always write back: transferPipelineActivation reads from preloaded after compute.
+            // Always write back: the next bridge handoff reads the stage output bytes.
             @memset(self.preloaded[slot_index][0..], hidden);
             if (!compute_logits) return;
             _ = download_logits;
@@ -3946,7 +5385,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
 
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         topology_mode: enum { single, cpu_gpu_gpu } = .single,
@@ -3957,7 +5396,18 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
         max_seq_len: usize = 256,
         max_batch_size: usize = slot_count,
         block_runtime: BlockRuntimeMock = .{},
+        pipeline_host_staging: ?[]align(64) u8 = null,
         pipeline_host_staging_stage12: ?[]align(64) u8 = null,
+        pipeline_boundary_dtype: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout: bridge.BoundaryLayout = .row_major,
+        pipeline_boundary_dtype_stage12: bridge.BoundaryDType = .f32,
+        pipeline_boundary_layout_stage12: bridge.BoundaryLayout = .row_major,
+        pipeline_boundary01_local_device_peer_copy_available: bool = false,
+        pipeline_boundary12_local_device_peer_copy_available: bool = false,
+        cpu_gpu_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
+        cpu_gpu_placement_plan: ?bridge.PlacementPlan = null,
+        cpu_gpu_local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+        slot_request_ids: [slot_count]?u64 = .{ 101, 202 },
         cpu_stage0: ?*CpuStage0Mock = null,
         stage1: ?*Stage1Mock = null,
         preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
@@ -3978,14 +5428,32 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
             return self.split_layer_stage2;
         }
 
-        pub fn transferPipelineActivationFromCpu(
-            _: *@This(),
-            _: *CpuStage0Mock,
-            _: usize,
-            _: usize,
-        ) !void {}
+        pub fn pipelineActivationByteCount(self: *const @This()) !usize {
+            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
+        }
+
+        pub fn executePrefillWithLayerLimitTestHook(
+            self: *@This(),
+            tokens: []const u32,
+            slot_index: usize,
+            logits_out: []f32,
+            layer_limit: usize,
+        ) !void {
+            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
+        }
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
+
+        pub fn uploadPipelineActivationFromHost(
+            self: *@This(),
+            slot_index: usize,
+            host_buf: []const u8,
+            byte_count: usize,
+        ) !void {
+            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
+            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
+            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
+        }
 
         pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
             return slot_index < slot_count;
@@ -4037,17 +5505,42 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
     while (cycle < 8) : (cycle += 1) {
         var cpu_stage = CpuStage0Mock{};
         var stage1 = Stage1Mock{
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
         };
+        var staging12: [d_model * @sizeOf(f32)]u8 align(64) = undefined;
+        const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{ split_layer, split_layer_stage2 }, &.{});
+        const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+        const configs = engine.testing.cpuGpuGpuBoundaryConfigs(
+            .f32,
+            .row_major,
+            .f32,
+            .row_major,
+            slot_count,
+            slot_count,
+            1,
+            1,
+        );
+        var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+            std.testing.allocator,
+            d_model,
+            plan,
+            &stage_backend_kinds,
+            &configs,
+        );
+        defer bundle.deinit();
         var single = MockBackend{
             .topology_mode = .single,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0, 0, 0, 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{}, .{}, .{} } },
         };
         var split = MockBackend{
             .topology_mode = .cpu_gpu_gpu,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
+            .pipeline_host_staging_stage12 = staging12[0..],
             .cpu_stage0 = &cpu_stage,
             .stage1 = &stage1,
+            .cpu_gpu_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
+            .cpu_gpu_placement_plan = bundle.placement_plan.?,
+            .cpu_gpu_local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
         };
 
         var positions: [slot_count]usize = [_]usize{0} ** slot_count;
@@ -4141,7 +5634,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
 
     const Stage1Mock = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         block_runtime: BlockRuntimeMock = .{},
@@ -4152,19 +5645,18 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
-        pub fn transferPipelineActivationFromCpu(
+        pub fn uploadPipelineActivationFromHost(
             self: *@This(),
-            src: *CpuStage0Mock,
             _: usize,
+            host_buf: []const u8,
             byte_count: usize,
         ) !void {
-            const src_bytes = src.slotActivationBytes(0);
             const dst_bytes = std.mem.sliceAsBytes(self.preloaded[0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
+            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
+            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
         }
 
-        pub fn transferPipelineActivation(self: *@This(), dst: anytype, byte_count: usize) !void {
+        pub fn copyPipelineActivationTo(self: *@This(), dst: anytype, _: usize, byte_count: usize) !void {
             const src_bytes = std.mem.sliceAsBytes(self.preloaded[0..]);
             const dst_bytes = std.mem.sliceAsBytes(dst.preloaded[0..]);
             if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
@@ -4202,7 +5694,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
                 const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
                 hidden = base + @as(f32, @floatFromInt(layer_limit));
             }
-            // Always write back: transferPipelineActivation reads from preloaded after compute.
+            // Always write back: the next bridge handoff reads the stage output bytes.
             @memset(self.preloaded[0..], hidden);
             if (!compute_logits) return;
             _ = download_logits;
@@ -4216,7 +5708,7 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
 
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         topology_mode: enum { single, cpu_gpu_gpu } = .single,
@@ -4251,12 +5743,15 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
             return self.split_layer_stage2;
         }
 
-        pub fn transferPipelineActivationFromCpu(
-            _: *@This(),
-            _: *CpuStage0Mock,
-            _: usize,
-            _: usize,
-        ) !void {}
+        pub fn executePrefillWithLayerLimitTestHook(
+            self: *@This(),
+            tokens: []const u32,
+            slot_index: usize,
+            logits_out: []f32,
+            layer_limit: usize,
+        ) !void {
+            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
+        }
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
@@ -4312,11 +5807,11 @@ test "cpu_gpu_gpu prefill parity matches single topology across repeated windows
     while (cycle < 6) : (cycle += 1) {
         var cpu_stage = CpuStage0Mock{};
         var stage1 = Stage1Mock{
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
         };
         var split = MockBackend{
             .topology_mode = .cpu_gpu_gpu,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
             .cpu_stage0 = &cpu_stage,
             .stage1 = &stage1,
         };
@@ -4383,7 +5878,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
 
     const Stage1Mock = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         block_runtime: BlockRuntimeMock = .{},
@@ -4395,19 +5890,18 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
-        pub fn transferPipelineActivationFromCpu(
+        pub fn uploadPipelineActivationFromHost(
             self: *@This(),
-            src: *CpuStage0Mock,
             slot_index: usize,
+            host_buf: []const u8,
             byte_count: usize,
         ) !void {
-            const src_bytes = src.slotActivationBytes(slot_index);
             const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
+            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
+            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
         }
 
-        pub fn transferPipelineActivation(self: *@This(), dst: anytype, byte_count: usize) !void {
+        pub fn copyPipelineActivationTo(self: *@This(), dst: anytype, _: usize, byte_count: usize) !void {
             const src_bytes = std.mem.sliceAsBytes(self.preloaded[self.last_slot][0..]);
             const dst_bytes = std.mem.sliceAsBytes(dst.preloaded[self.last_slot][0..]);
             if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
@@ -4445,7 +5939,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
             } else {
                 hidden = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25 + @as(f32, @floatFromInt(layer_limit));
             }
-            // Always write back: transferPipelineActivation reads from preloaded after compute.
+            // Always write back: the next bridge handoff reads the stage output bytes.
             @memset(self.preloaded[slot_index][0..], hidden);
             if (!compute_logits) return;
             _ = download_logits;
@@ -4459,7 +5953,7 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
 
     const MockBackend = struct {
         const BlockRuntimeMock = struct {
-            blocks: []const u8 = &.{},
+            blocks: []const BlockRuntimeLayerForTest = &.{},
         };
 
         topology_mode: enum { single, cpu_gpu_gpu } = .single,
@@ -4494,12 +5988,15 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
             return self.split_layer_stage2;
         }
 
-        pub fn transferPipelineActivationFromCpu(
-            _: *@This(),
-            _: *CpuStage0Mock,
-            _: usize,
-            _: usize,
-        ) !void {}
+        pub fn executePrefillWithLayerLimitTestHook(
+            self: *@This(),
+            tokens: []const u32,
+            slot_index: usize,
+            logits_out: []f32,
+            layer_limit: usize,
+        ) !void {
+            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
+        }
 
         pub fn activateKvSlot(_: *@This(), _: usize) void {}
 
@@ -4562,11 +6059,11 @@ test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycl
     while (cycle < 6) : (cycle += 1) {
         var cpu_stage = CpuStage0Mock{};
         var stage1 = Stage1Mock{
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
         };
         var split = MockBackend{
             .topology_mode = .cpu_gpu_gpu,
-            .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
             .cpu_stage0 = &cpu_stage,
             .stage1 = &stage1,
         };
@@ -4687,7 +6184,7 @@ test "unbindSlotStateBlocks fans out to pipeline stage and is idempotent" {
 
     // Now wire the zero-init CPU stub so unbind exercises the CPU fan-out path.
     // Uses aligned byte buffer to satisfy the struct's natural alignment requirement.
-    const cpu_backend = @import("../cpu/root.zig");
+    const cpu_backend = main.inference.backend.cpu;
     var cpu_stage0_bytes: [@sizeOf(cpu_backend.BackendType)]u8 align(@alignOf(cpu_backend.BackendType)) = @splat(0);
     const cpu_stage0: *cpu_backend.BackendType = @ptrCast(&cpu_stage0_bytes);
     source.pipeline_backend0_cpu = cpu_stage0;

@@ -190,6 +190,7 @@ fn stagedFrameTransferMode(
         .borrow_in_process => .borrow_in_process,
         .copy_in_process => .copy_in_process,
         .device_download_then_copy => .device_download_then_copy,
+        .device_peer_copy_in_process => .device_peer_copy_in_process,
         .remote_stream => .remote_stream,
         .device_download_then_remote_stream => .device_download_then_remote_stream,
     };
@@ -223,7 +224,9 @@ fn transferDecisionModeConsistent(
             .remote_declared => decision.mode == .remote_stream,
         },
         .device_download_required => switch (decision.boundary_profile.handoff_mode) {
-            .same_host_direct, .local_in_process, .mock => decision.mode == .device_download_then_copy,
+            .same_host_direct, .local_in_process => decision.mode == .device_download_then_copy or
+                decision.mode == .device_peer_copy_in_process,
+            .mock => decision.mode == .device_download_then_copy,
             .remote_declared => decision.mode == .device_download_then_remote_stream,
         },
         .producer_sync_required, .local_only_opaque => false,
@@ -383,6 +386,13 @@ test "inference diagnostics stagedFrameByteImageFactsFromBridge maps host readab
     try std.testing.expect(!device_facts.remote_readable);
     try std.testing.expect(device_facts.device_download_required);
 
+    const peer_decision = testTransferDecision(&device_metadata, .local_in_process, .device_peer_copy_in_process);
+    const peer_facts = try stagedFrameByteImageFactsFromBridge(&device_image, .{
+        .transfer_decision = peer_decision,
+    });
+    try std.testing.expectEqual(xray.staged_frame.StagedFrameTransferMode.device_peer_copy_in_process, peer_facts.transfer_mode);
+    try std.testing.expect(peer_facts.device_download_required);
+
     const remote_decision = testTransferDecision(&host_metadata, .remote_declared, .remote_stream);
     const remote_facts = try stagedFrameByteImageFactsFromBridge(&host_image, .{
         .transfer_decision = remote_decision,
@@ -410,6 +420,13 @@ test "inference diagnostics stagedFrameByteImageFactsFromBridge rejects invalid 
     const inconsistent_decision = testTransferDecision(&metadata, .local_in_process, .remote_stream);
     try std.testing.expectError(error.XrayByteImageTransferDecisionMismatch, stagedFrameByteImageFactsFromBridge(&valid_image, .{
         .transfer_decision = inconsistent_decision,
+    }));
+
+    const device_metadata = try testFrame(&fixture.plan_ref, 0, 52, &test_single_batch, .{ .cuda = 0 });
+    const device_image = testByteImage(&device_metadata, .device_download_required, null);
+    const mock_peer_decision = testTransferDecision(&device_metadata, .mock, .device_peer_copy_in_process);
+    try std.testing.expectError(error.XrayByteImageTransferDecisionMismatch, stagedFrameByteImageFactsFromBridge(&device_image, .{
+        .transfer_decision = mock_peer_decision,
     }));
 }
 

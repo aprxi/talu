@@ -41,6 +41,7 @@ pub const StagedFrameTransferMode = enum(u8) {
     borrow_in_process,
     copy_in_process,
     device_download_then_copy,
+    device_peer_copy_in_process,
     remote_stream,
     device_download_then_remote_stream,
 };
@@ -321,6 +322,7 @@ fn transferModeName(mode: StagedFrameTransferMode) []const u8 {
         .borrow_in_process => "borrow_in_process",
         .copy_in_process => "copy_in_process",
         .device_download_then_copy => "device_download_then_copy",
+        .device_peer_copy_in_process => "device_peer_copy_in_process",
         .remote_stream => "remote_stream",
         .device_download_then_remote_stream => "device_download_then_remote_stream",
     };
@@ -533,6 +535,7 @@ test "xray staged_frame writeStagedFrameTsv writes byte image readiness and tran
         testRecord(3),
         testRecord(4),
         testRecord(5),
+        testRecord(6),
     };
     records_buf[0].byte_image_readiness = .unknown;
     records_buf[0].transfer_mode = .unknown;
@@ -545,12 +548,15 @@ test "xray staged_frame writeStagedFrameTsv writes byte image readiness and tran
     records_buf[3].byte_image_readiness = .device_download_required;
     records_buf[3].transfer_mode = .device_download_then_copy;
     records_buf[3].device_download_required = true;
-    records_buf[4].byte_image_readiness = .local_only_opaque;
-    records_buf[4].transfer_mode = .remote_stream;
-    records_buf[5].byte_image_readiness = .host_readable_now;
-    records_buf[5].transfer_mode = .device_download_then_remote_stream;
-    records_buf[5].host_readable = true;
-    records_buf[5].remote_readable = true;
+    records_buf[4].byte_image_readiness = .device_download_required;
+    records_buf[4].transfer_mode = .device_peer_copy_in_process;
+    records_buf[4].device_download_required = true;
+    records_buf[5].byte_image_readiness = .local_only_opaque;
+    records_buf[5].transfer_mode = .remote_stream;
+    records_buf[6].byte_image_readiness = .host_readable_now;
+    records_buf[6].transfer_mode = .device_download_then_remote_stream;
+    records_buf[6].host_readable = true;
+    records_buf[6].remote_readable = true;
 
     var buffer: [4096]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
@@ -562,7 +568,8 @@ test "xray staged_frame writeStagedFrameTsv writes byte image readiness and tran
         "11\t1\t1\t2\t4\t8\t8\t12\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\thost_readable_now\tborrow_in_process\ttrue\ttrue\tfalse\n" ++
         "12\t2\t2\t3\t8\t12\t12\t16\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tproducer_sync_required\tcopy_in_process\tfalse\tfalse\tfalse\n" ++
         "13\t3\t3\t4\t12\t16\t16\t20\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tdevice_download_required\tdevice_download_then_copy\tfalse\tfalse\ttrue\n" ++
-        "14\t4\t4\t5\t16\t20\t20\t24\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tlocal_only_opaque\tremote_stream\tfalse\tfalse\tfalse\n" ++
-        "15\t5\t5\t6\t20\t24\t24\t28\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\thost_readable_now\tdevice_download_then_remote_stream\ttrue\ttrue\tfalse\n";
+        "14\t4\t4\t5\t16\t20\t20\t24\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tdevice_download_required\tdevice_peer_copy_in_process\tfalse\tfalse\ttrue\n" ++
+        "15\t5\t5\t6\t20\t24\t24\t28\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\tlocal_only_opaque\tremote_stream\tfalse\tfalse\tfalse\n" ++
+        "16\t6\t6\t7\t24\t28\t28\t32\tdecode\tf32\trow_major\t3\t1\t1\t8\t0\t32\t0\t100\t7\t12\t1\tnone\thost_readable_now\tdevice_download_then_remote_stream\ttrue\ttrue\tfalse\n";
     try std.testing.expectEqualStrings(expected, stream.getWritten());
 }

@@ -1439,6 +1439,7 @@ pub fn build(b: *std.Build) void {
     ut.addLazy("inference-metal", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.metal",
     });
+    const inference_cuda_test_step = b.step("test-inference-cuda", "Run inference-cuda unit tests");
     ut.addLazy("inference-cuda", b.path("core/src/lib_dev.zig"), &.{
         "inference.backend.cuda",
         "topology",
@@ -1619,6 +1620,81 @@ pub fn build(b: *std.Build) void {
         integration_metal_step.dependOn(&FailStep.create(
             b,
             "test-integration-inference-metal requires macOS with Metal enabled (-Dmetal=true)\n",
+        ).step);
+    }
+
+    // CUDA-focused inference integration tests (opt-in lane for relocated backend tests).
+    const integration_cuda_step = b.step(
+        "test-integration-inference-cuda",
+        "Run inference backend CUDA integration tests",
+    );
+    const supports_cuda_target = target.result.os.tag == .linux or target.result.os.tag == .windows;
+    if (supports_cuda_target and enable_cuda) {
+        const integration_cuda_build_options = b.addOptions();
+        integration_cuda_build_options.addOption(bool, "enable_metal", false);
+        integration_cuda_build_options.addOption(bool, "enable_cuda", true);
+        integration_cuda_build_options.addOption(bool, "cuda_startup_selftests", false);
+        integration_cuda_build_options.addOption(bool, "debug_matmul", debug_matmul);
+        integration_cuda_build_options.addOption(bool, "dump_tensors", dump_tensors);
+        integration_cuda_build_options.addOption(bool, "xray_bridge", xray_bridge);
+        integration_cuda_build_options.addOption([]const u8, "version", version);
+        const integration_cuda_build_options_mod = integration_cuda_build_options.createModule();
+        const integration_cuda_core_pkgs = prepareCorePackages(
+            b,
+            target,
+            optimize,
+            cuda_assets_mod,
+            integration_cuda_build_options_mod,
+            cacert_mod,
+            pcre2,
+        );
+        const integration_cuda_inference_pkg_mod = createInferencePackageModule(
+            b,
+            target,
+            optimize,
+            cuda_assets_mod,
+            &integration_cuda_core_pkgs,
+            integration_cuda_build_options_mod,
+            cacert_mod,
+            pcre2,
+        );
+
+        const integration_cuda_main_mod = b.createModule(.{
+            .root_source_file = b.path("core/src/lib_dev.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        integration_cuda_main_mod.addImport("cuda_assets", cuda_assets_mod);
+        integration_cuda_main_mod.addImport("inference_pkg", integration_cuda_inference_pkg_mod);
+        addCorePackageImports(integration_cuda_main_mod, &integration_cuda_core_pkgs);
+        integration_cuda_main_mod.addImport("build_options", integration_cuda_build_options_mod);
+        addCDependencies(b, integration_cuda_main_mod, cacert_mod, pcre2);
+
+        const integration_cuda_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/tests/inference/backend/cuda/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "main", .module = integration_cuda_main_mod },
+            },
+        });
+        integration_cuda_test_mod.addImport("build_options", integration_cuda_build_options_mod);
+
+        const integration_cuda_tests = b.addTest(.{
+            .name = "test-integration-inference-cuda",
+            .root_module = integration_cuda_test_mod,
+        });
+        if (cuda_kernel_assets_step) |step| integration_cuda_tests.step.dependOn(step);
+        linkCDependencies(b, integration_cuda_tests, pcre2, false);
+
+        const run_integration_cuda_tests = b.addRunArtifact(integration_cuda_tests);
+        integration_cuda_step.dependOn(&run_integration_cuda_tests.step);
+        inference_cuda_test_step.dependOn(&run_integration_cuda_tests.step);
+    } else {
+        integration_cuda_step.dependOn(&FailStep.create(
+            b,
+            "test-integration-inference-cuda requires Linux/Windows with CUDA enabled (-Dcuda=true)\n",
         ).step);
     }
 

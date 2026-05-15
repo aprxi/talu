@@ -34,6 +34,7 @@ pub const BoundaryByteImageRef = struct {
     metadata: *const tensor_frame.TensorFrameMetadata,
     byte_count: u64,
     host_bytes: ?[]const u8 = null,
+    host_segments: ?[]const []const u8 = null,
     location_hint: ?tensor_frame.TensorFramePayloadLocationHint = null,
     readiness: BoundaryByteImageReadiness,
     ownership: tensor_frame.TensorFrameOwnership,
@@ -71,10 +72,7 @@ pub fn validateBoundaryByteImage(
         return error.InvalidPayloadLifetime;
     }
 
-    if (image.host_bytes) |host_bytes| {
-        const expected_len = std.math.cast(usize, image.byte_count) orelse return error.HostReadableLengthMismatch;
-        if (host_bytes.len != expected_len) return error.HostReadableLengthMismatch;
-    }
+    try validateHostReadableBytes(image);
 
     try validateReadinessLocationMatrix(image);
 
@@ -86,7 +84,7 @@ pub fn validateBoundaryByteImage(
         return error.RemoteByteImageUnavailable;
     }
 
-    if (options.require_host_readable and image.readiness == .host_readable_now and image.host_bytes == null) {
+    if (options.require_host_readable and image.readiness == .host_readable_now and !hasHostReadableBytes(image)) {
         return error.MissingHostReadableBytes;
     }
 }
@@ -104,22 +102,48 @@ pub fn boundaryByteImageIsRemoteReadable(
 fn validateReadinessLocationMatrix(image: *const BoundaryByteImageRef) BoundaryByteImageError!void {
     switch (image.readiness) {
         .host_readable_now => {
-            if (image.host_bytes == null) return error.MissingHostReadableBytes;
+            if (!hasHostReadableBytes(image)) return error.MissingHostReadableBytes;
             if (!locationHintIsNullOrCpu(image.location_hint)) return error.InvalidPayloadReadiness;
         },
         .producer_sync_required => {
-            if (image.host_bytes != null) return error.InvalidPayloadReadiness;
+            if (hasHostReadableBytes(image)) return error.InvalidPayloadReadiness;
             if (!locationHintIsNullOrCpu(image.location_hint)) return error.InvalidPayloadReadiness;
         },
         .device_download_required => {
-            if (image.host_bytes != null) return error.InvalidPayloadReadiness;
+            if (hasHostReadableBytes(image)) return error.InvalidPayloadReadiness;
             if (!locationHintIsCudaOrMetal(image.location_hint)) return error.InvalidPayloadReadiness;
         },
         .local_only_opaque => {
-            if (image.host_bytes != null) return error.InvalidPayloadReadiness;
+            if (hasHostReadableBytes(image)) return error.InvalidPayloadReadiness;
             if (!locationHintIsOpaqueLocal(image.location_hint)) return error.InvalidPayloadReadiness;
         },
     }
+}
+
+fn validateHostReadableBytes(image: *const BoundaryByteImageRef) BoundaryByteImageError!void {
+    if (image.host_bytes != null and image.host_segments != null) {
+        return error.InvalidPayloadReadiness;
+    }
+
+    if (image.host_bytes) |host_bytes| {
+        const expected_len = std.math.cast(usize, image.byte_count) orelse return error.HostReadableLengthMismatch;
+        if (host_bytes.len != expected_len) return error.HostReadableLengthMismatch;
+    }
+
+    if (image.host_segments) |host_segments| {
+        const expected_len = std.math.cast(usize, image.byte_count) orelse return error.HostReadableLengthMismatch;
+        if (host_segments.len == 0) return error.HostReadableLengthMismatch;
+        var total_len: usize = 0;
+        for (host_segments) |segment| {
+            if (segment.len == 0) return error.HostReadableLengthMismatch;
+            total_len = std.math.add(usize, total_len, segment.len) catch return error.HostReadableLengthMismatch;
+        }
+        if (total_len != expected_len) return error.HostReadableLengthMismatch;
+    }
+}
+
+fn hasHostReadableBytes(image: *const BoundaryByteImageRef) bool {
+    return image.host_bytes != null or image.host_segments != null;
 }
 
 fn locationHintEql(
@@ -236,12 +260,39 @@ fn testImage(
     };
 }
 
+fn testSegmentedImage(
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    readiness: BoundaryByteImageReadiness,
+    host_segments: ?[]const []const u8,
+) BoundaryByteImageRef {
+    return .{
+        .metadata = metadata,
+        .byte_count = metadata.payload.byte_count,
+        .host_segments = host_segments,
+        .location_hint = metadata.payload.location_hint,
+        .readiness = readiness,
+        .ownership = metadata.payload.ownership,
+        .lifetime = metadata.payload.lifetime,
+    };
+}
+
 test "inference bridge boundary_byte_image validateBoundaryByteImage accepts host readable exact byte image" {
     const metadata = try testMetadata(.cpu);
     const payload = [_]u8{0xaa} ** 64;
     const image = testImage(&metadata, .host_readable_now, &payload);
 
     try validateBoundaryByteImage(&image, .{});
+}
+
+test "inference bridge boundary_byte_image validateBoundaryByteImage accepts valid host_segments for host readable exact byte image" {
+    const metadata = try testMetadata(.cpu);
+    const first = [_]u8{0xaa} ** 16;
+    const second = [_]u8{0xbb} ** 48;
+    const segments = [_][]const u8{ &first, &second };
+    const image = testSegmentedImage(&metadata, .host_readable_now, &segments);
+
+    try validateBoundaryByteImage(&image, .{});
+    try validateBoundaryByteImage(&image, .{ .require_host_readable = true });
 }
 
 test "inference bridge boundary_byte_image validateBoundaryByteImage accepts producer sync cpu image without host bytes" {
@@ -272,6 +323,30 @@ test "inference bridge boundary_byte_image validateBoundaryByteImage rejects hos
     const payload = [_]u8{0xaa} ** 63;
     const image = testImage(&metadata, .host_readable_now, &payload);
 
+    try std.testing.expectError(error.HostReadableLengthMismatch, validateBoundaryByteImage(&image, .{}));
+}
+
+test "inference bridge boundary_byte_image validateBoundaryByteImage rejects invalid host_segments" {
+    const metadata = try testMetadata(.cpu);
+    const first = [_]u8{0xaa} ** 16;
+    const second = [_]u8{0xbb} ** 48;
+    const segments = [_][]const u8{ &first, &second };
+    const contiguous = [_]u8{0xcc} ** 64;
+    var image = testSegmentedImage(&metadata, .host_readable_now, &segments);
+    image.host_bytes = &contiguous;
+    try std.testing.expectError(error.InvalidPayloadReadiness, validateBoundaryByteImage(&image, .{}));
+
+    const empty_segments = [_][]const u8{};
+    image = testSegmentedImage(&metadata, .host_readable_now, &empty_segments);
+    try std.testing.expectError(error.HostReadableLengthMismatch, validateBoundaryByteImage(&image, .{}));
+
+    const zero = [_]u8{};
+    const zero_segments = [_][]const u8{ &first, &zero, &second };
+    image = testSegmentedImage(&metadata, .host_readable_now, &zero_segments);
+    try std.testing.expectError(error.HostReadableLengthMismatch, validateBoundaryByteImage(&image, .{}));
+
+    const short_segments = [_][]const u8{&first};
+    image = testSegmentedImage(&metadata, .host_readable_now, &short_segments);
     try std.testing.expectError(error.HostReadableLengthMismatch, validateBoundaryByteImage(&image, .{}));
 }
 
@@ -313,6 +388,13 @@ test "inference bridge boundary_byte_image validateBoundaryByteImage rejects inv
 
     image = testImage(&cpu_metadata, .producer_sync_required, &payload);
     try std.testing.expectError(error.InvalidPayloadReadiness, validateBoundaryByteImage(&image, .{}));
+
+    const segments = [_][]const u8{ payload[0..16], payload[16..64] };
+    var segmented_image = testSegmentedImage(&cpu_metadata, .producer_sync_required, &segments);
+    try std.testing.expectError(error.InvalidPayloadReadiness, validateBoundaryByteImage(&segmented_image, .{}));
+
+    segmented_image = testSegmentedImage(&cuda_metadata, .device_download_required, &segments);
+    try std.testing.expectError(error.InvalidPayloadReadiness, validateBoundaryByteImage(&segmented_image, .{}));
 
     image = testImage(&cpu_metadata, .local_only_opaque, null);
     try std.testing.expectError(error.InvalidPayloadReadiness, validateBoundaryByteImage(&image, .{}));
@@ -374,6 +456,12 @@ test "inference bridge boundary_byte_image boundaryByteImageIsRemoteReadable ret
     const remote_readable = testImage(&cpu_metadata, .host_readable_now, &payload);
     try std.testing.expect(boundaryByteImageIsRemoteReadable(&remote_readable));
 
+    const first = [_]u8{0xbb} ** 16;
+    const second = [_]u8{0xcc} ** 48;
+    const segments = [_][]const u8{ &first, &second };
+    const segmented_remote_readable = testSegmentedImage(&cpu_metadata, .host_readable_now, &segments);
+    try std.testing.expect(boundaryByteImageIsRemoteReadable(&segmented_remote_readable));
+
     const producer_sync = testImage(&cpu_metadata, .producer_sync_required, null);
     try std.testing.expect(!boundaryByteImageIsRemoteReadable(&producer_sync));
 
@@ -388,4 +476,8 @@ test "inference bridge boundary_byte_image boundaryByteImageIsRemoteReadable ret
     const short_payload = [_]u8{0xaa} ** 63;
     const invalid_host_readable = testImage(&cpu_metadata, .host_readable_now, &short_payload);
     try std.testing.expect(!boundaryByteImageIsRemoteReadable(&invalid_host_readable));
+
+    const short_segments = [_][]const u8{&first};
+    const invalid_segmented = testSegmentedImage(&cpu_metadata, .host_readable_now, &short_segments);
+    try std.testing.expect(!boundaryByteImageIsRemoteReadable(&invalid_segmented));
 }

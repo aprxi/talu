@@ -287,6 +287,7 @@ pub fn build(
     defer backing_allocator.free(tensor_names);
     for (tensor_names) |tensor_name| {
         if (name_index.contains(tensor_name)) continue;
+        if (isKnownRuntimeUnusedTensor(tensor_name)) continue;
         const role: TensorRole = if (looksLikeVisionTensor(tensor_name)) .vision_side else .unclassified_global;
         try addManifestEntry(
             backing_allocator,
@@ -376,6 +377,7 @@ fn addCompanionEntries(
         ".qzeros",
         ".weight_scale",
         ".weight_scale_2",
+        ".input_scale",
         ".weight_global_scale",
         ".weight_block_scale",
         ".weight_scale_inv",
@@ -442,6 +444,15 @@ fn looksLikeVisionTensor(name: []const u8) bool {
         std.mem.indexOf(u8, name, "merger") != null;
 }
 
+fn isKnownRuntimeUnusedTensor(name: []const u8) bool {
+    // Qwen NVFP4 checkpoints may include multi-token-prediction side heads. The
+    // runtime does not execute those heads, so they must not force staged
+    // ownership as unknown globals.
+    return std.mem.startsWith(u8, name, "mtp.") or
+        std.mem.startsWith(u8, name, "model.mtp.") or
+        std.mem.startsWith(u8, name, "model.language_model.mtp.");
+}
+
 fn shouldIncludeEntry(entry: TensorManifestEntry, request: StageResidencyRequest) bool {
     return switch (entry.role) {
         .decoder_layer => if (entry.layer_index) |layer|
@@ -491,10 +502,12 @@ test "manifest classifies tensor roles and stage residency bytes" {
     const layer1_gate_data = [_]u8{3} ** 8;
     const layer1_scale_data = [_]u8{4} ** 4;
     const layer1_scale2 = [_]u8{5} ** 4;
-    const norm_data = [_]u8{6} ** 16;
-    const lm_head_data = [_]u8{7} ** 128;
-    const vision_data = [_]u8{8} ** 12;
-    const untracked_data = [_]u8{9} ** 10;
+    const layer1_input_scale = [_]u8{6} ** 4;
+    const norm_data = [_]u8{7} ** 16;
+    const lm_head_data = [_]u8{8} ** 128;
+    const vision_data = [_]u8{9} ** 12;
+    const untracked_data = [_]u8{10} ** 10;
+    const mtp_data = [_]u8{11} ** 20;
 
     const entries = [_]st_loader.TensorEntry{
         .{ .name = "model.embed_tokens.weight", .dtype = .f16, .shape = &.{ 16, 4 }, .data = embed_data[0..] },
@@ -503,10 +516,12 @@ test "manifest classifies tensor roles and stage residency bytes" {
         .{ .name = "model.layers.1.mlp.gate_proj.weight", .dtype = .u8, .shape = &.{ 4, 2 }, .data = layer1_gate_data[0..] },
         .{ .name = "model.layers.1.mlp.gate_proj.weight_scale", .dtype = .f8_e4m3, .shape = &.{ 4, 1 }, .data = layer1_scale_data[0..] },
         .{ .name = "model.layers.1.mlp.gate_proj.weight_scale_2", .dtype = .f32, .shape = &.{1}, .data = layer1_scale2[0..] },
+        .{ .name = "model.layers.1.mlp.gate_proj.input_scale", .dtype = .f32, .shape = &.{1}, .data = layer1_input_scale[0..] },
         .{ .name = "model.norm.weight", .dtype = .f32, .shape = &.{4}, .data = norm_data[0..] },
         .{ .name = "lm_head.weight", .dtype = .f16, .shape = &.{ 4, 16 }, .data = lm_head_data[0..] },
         .{ .name = "vision.patch_embed.weight", .dtype = .f16, .shape = &.{ 3, 2 }, .data = vision_data[0..] },
         .{ .name = "untracked.weight", .dtype = .f16, .shape = &.{5}, .data = untracked_data[0..] },
+        .{ .name = "mtp.fc.weight", .dtype = .f16, .shape = &.{ 5, 2 }, .data = mtp_data[0..] },
     };
     try st_loader.write(allocator, model_path, &entries);
 
@@ -586,7 +601,7 @@ test "manifest classifies tensor roles and stage residency bytes" {
     try std.testing.expectEqual(@as(usize, 2), model_manifest.layer_count);
     try std.testing.expectEqual(@as(usize, 128), model_manifest.bytesForRole(.token_embeddings));
     try std.testing.expectEqual(@as(usize, 104), model_manifest.bytesForRole(.decoder_layer));
-    try std.testing.expectEqual(@as(usize, 8), model_manifest.bytesForRole(.quant_companion));
+    try std.testing.expectEqual(@as(usize, 12), model_manifest.bytesForRole(.quant_companion));
     try std.testing.expectEqual(@as(usize, 12), model_manifest.bytesForRole(.vision_side));
     try std.testing.expectEqual(@as(usize, 10), model_manifest.bytesForRole(.unclassified_global));
 
@@ -597,7 +612,7 @@ test "manifest classifies tensor roles and stage residency bytes" {
         .include_lm_head = true,
     });
     try std.testing.expectEqual(@as(usize, 64 + 8), layer1_report.bytesForRole(.decoder_layer));
-    try std.testing.expectEqual(@as(usize, 8), layer1_report.bytesForRole(.quant_companion));
+    try std.testing.expectEqual(@as(usize, 12), layer1_report.bytesForRole(.quant_companion));
     try std.testing.expectEqual(@as(usize, 16), layer1_report.bytesForRole(.final_norm));
     try std.testing.expectEqual(@as(usize, 128), layer1_report.bytesForRole(.lm_head));
     try std.testing.expect(layer1_report.budgetExceeded(100) != null);

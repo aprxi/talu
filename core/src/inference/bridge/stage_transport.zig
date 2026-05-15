@@ -32,6 +32,9 @@ pub const StageTransportError =
         StageTransportPayloadForbidden,
         StageTransportPayloadRequired,
         StageTransportPayloadByteCountMismatch,
+        MissingStageTransportActivationScope,
+        UnexpectedStageTransportActivationScope,
+        InvalidStageTransportBatchEntryCount,
     };
 
 pub const StageTransportEnvelopeKind = enum(u8) {
@@ -40,12 +43,19 @@ pub const StageTransportEnvelopeKind = enum(u8) {
     request_cancelled,
 };
 
+pub const StageTransportActivationScope = enum(u8) {
+    single_entry_header,
+    multi_entry_local,
+};
+
 pub const StageTransportEnvelope = struct {
     version: StageTransportContractVersion = stage_transport_contract_version,
     kind: StageTransportEnvelopeKind,
+    activation_scope: ?StageTransportActivationScope = null,
     header: ?stage_frame_header.StageFrameHeader = null,
     transfer_mode: ?stage_transfer_mode.StageTransferMode = null,
     payload_byte_count: u64 = 0,
+    batch_entry_count: u64 = 0,
     failure: ?staged_error.StagedFailure = null,
 };
 
@@ -68,16 +78,20 @@ pub fn buildStageTransportActivationEnvelope(
         return error.StageTransportDecisionMismatch;
     }
 
-    const header = try stage_frame_header.stageFrameHeaderFromMetadata(request.metadata, .{
-        .source_host_id = request.decision.source_host_id,
-        .target_host_id = request.decision.target_host_id,
-    });
-    const envelope = StageTransportEnvelope{
+    const batch_entry_count = std.math.cast(u64, request.metadata.batch.entries.len) orelse return error.InvalidStageTransportBatchEntryCount;
+    var envelope = StageTransportEnvelope{
         .kind = .activation_payload,
-        .header = header,
+        .activation_scope = if (batch_entry_count == 1) .single_entry_header else .multi_entry_local,
         .transfer_mode = request.decision.mode,
         .payload_byte_count = request.image.byte_count,
+        .batch_entry_count = batch_entry_count,
     };
+    if (batch_entry_count == 1) {
+        envelope.header = try stage_frame_header.stageFrameHeaderFromMetadata(request.metadata, .{
+            .source_host_id = request.decision.source_host_id,
+            .target_host_id = request.decision.target_host_id,
+        });
+    }
     try validateStageTransportEnvelope(&envelope);
     return envelope;
 }
@@ -119,19 +133,31 @@ pub fn validateStageTransportEnvelope(
 
     switch (envelope.kind) {
         .activation_payload => {
-            const header = envelope.header orelse return error.MissingStageTransportFrameHeader;
+            const activation_scope = envelope.activation_scope orelse return error.MissingStageTransportActivationScope;
             if (envelope.transfer_mode == null) return error.StageTransportPayloadRequired;
             if (envelope.payload_byte_count == 0) return error.StageTransportPayloadRequired;
             if (envelope.failure != null) return error.UnexpectedStageTransportFailure;
-            if (header.payload_byte_count != envelope.payload_byte_count) {
-                return error.StageTransportPayloadByteCountMismatch;
+            switch (activation_scope) {
+                .single_entry_header => {
+                    const header = envelope.header orelse return error.MissingStageTransportFrameHeader;
+                    if (envelope.batch_entry_count != 1) return error.InvalidStageTransportBatchEntryCount;
+                    if (header.payload_byte_count != envelope.payload_byte_count) {
+                        return error.StageTransportPayloadByteCountMismatch;
+                    }
+                    var header_bytes: [stage_frame_header.stage_frame_header_encoded_len]u8 = undefined;
+                    try stage_frame_header.encodeStageFrameHeader(&header_bytes, header);
+                },
+                .multi_entry_local => {
+                    if (envelope.header != null) return error.UnexpectedStageTransportFrameHeader;
+                    if (envelope.batch_entry_count <= 1) return error.InvalidStageTransportBatchEntryCount;
+                },
             }
-            var header_bytes: [stage_frame_header.stage_frame_header_encoded_len]u8 = undefined;
-            try stage_frame_header.encodeStageFrameHeader(&header_bytes, header);
         },
         .propagated_failure => {
+            if (envelope.activation_scope != null) return error.UnexpectedStageTransportActivationScope;
             if (envelope.header != null) return error.UnexpectedStageTransportFrameHeader;
             if (envelope.transfer_mode != null) return error.StageTransportPayloadForbidden;
+            if (envelope.batch_entry_count != 0) return error.InvalidStageTransportBatchEntryCount;
             if (envelope.payload_byte_count != 0) return error.StageTransportPayloadForbidden;
             const failure = envelope.failure orelse return error.MissingStageTransportFailure;
             if (failure.kind == .request_cancelled or failure.kind == .cleanup_failed) {
@@ -140,8 +166,10 @@ pub fn validateStageTransportEnvelope(
             try staged_error.validateStagedFailure(&failure, .{});
         },
         .request_cancelled => {
+            if (envelope.activation_scope != null) return error.UnexpectedStageTransportActivationScope;
             if (envelope.header != null) return error.UnexpectedStageTransportFrameHeader;
             if (envelope.transfer_mode != null) return error.StageTransportPayloadForbidden;
+            if (envelope.batch_entry_count != 0) return error.InvalidStageTransportBatchEntryCount;
             if (envelope.payload_byte_count != 0) return error.StageTransportPayloadForbidden;
             const failure = envelope.failure orelse return error.MissingStageTransportFailure;
             if (failure.kind != .request_cancelled) return error.InvalidStageTransportFailureKind;
@@ -158,6 +186,7 @@ pub fn writeStageTransportEnvelopeLocal(
 ) StageTransportError!void {
     try validateStageTransportEnvelope(envelope);
     if (envelope.kind != .activation_payload) return error.StageTransportPayloadForbidden;
+    if (envelope.activation_scope.? == .multi_entry_local) return error.UnsupportedStageFrameHeaderBatch;
     if (envelope.transfer_mode.? != .copy_in_process) return error.StageTransportPayloadForbidden;
     const header = envelope.header.?;
     try stage_frame_header.validateStageFrameHeaderForMetadata(header, metadata);
@@ -179,9 +208,11 @@ pub fn readStageTransportEnvelopeLocal(
     const result = try stage_byte_harness.readStageFrameBytes(reader, expected_metadata, payload_dest);
     const envelope = StageTransportEnvelope{
         .kind = .activation_payload,
+        .activation_scope = .single_entry_header,
         .header = result.header,
         .transfer_mode = .copy_in_process,
         .payload_byte_count = result.header.payload_byte_count,
+        .batch_entry_count = 1,
     };
     try validateStageTransportEnvelope(&envelope);
     return envelope;
@@ -206,7 +237,7 @@ fn activationDecisionModeConsistent(
 ) bool {
     return switch (image.readiness) {
         .host_readable_now => switch (decision.boundary_profile.handoff_mode) {
-            .same_host_direct => if (image.ownership == .borrowed_until_next_stage_call)
+            .same_host_direct => if (image.host_segments == null and image.ownership == .borrowed_until_next_stage_call)
                 decision.mode == .borrow_in_process or decision.mode == .copy_in_process
             else
                 decision.mode == .copy_in_process,
@@ -214,7 +245,9 @@ fn activationDecisionModeConsistent(
             .remote_declared => decision.mode == .remote_stream,
         },
         .device_download_required => switch (decision.boundary_profile.handoff_mode) {
-            .same_host_direct, .local_in_process, .mock => decision.mode == .device_download_then_copy,
+            .same_host_direct, .local_in_process => decision.mode == .device_download_then_copy or
+                decision.mode == .device_peer_copy_in_process,
+            .mock => decision.mode == .device_download_then_copy,
             .remote_declared => decision.mode == .device_download_then_remote_stream,
         },
         .producer_sync_required, .local_only_opaque => false,
@@ -413,6 +446,21 @@ fn testImage(
     };
 }
 
+fn testSegmentedImage(
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    host_segments: []const []const u8,
+) boundary_byte_image.BoundaryByteImageRef {
+    return .{
+        .metadata = metadata,
+        .byte_count = metadata.payload.byte_count,
+        .host_segments = host_segments,
+        .location_hint = metadata.payload.location_hint,
+        .readiness = .host_readable_now,
+        .ownership = metadata.payload.ownership,
+        .lifetime = metadata.payload.lifetime,
+    };
+}
+
 fn testDecision(
     metadata: *const tensor_frame.TensorFrameMetadata,
     handoff_mode: anytype,
@@ -497,19 +545,26 @@ test "inference bridge stage_transport buildStageTransportActivationEnvelope val
     try validateStageTransportEnvelope(&envelope);
 
     try std.testing.expectEqual(StageTransportEnvelopeKind.activation_payload, envelope.kind);
+    try std.testing.expectEqual(StageTransportActivationScope.single_entry_header, envelope.activation_scope.?);
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.copy_in_process, envelope.transfer_mode.?);
     try std.testing.expectEqual(metadata.payload.byte_count, envelope.payload_byte_count);
+    try std.testing.expectEqual(@as(u64, 1), envelope.batch_entry_count);
     try std.testing.expectEqual(@as(u64, 31), envelope.header.?.source_host_id.?.value);
     try std.testing.expectEqual(@as(u64, 32), envelope.header.?.target_host_id.?.value);
 
     var multi_metadata = try testMultiBatchMetadata();
     const multi_payload = [_]u8{0xaa} ** test_large_payload_len;
     const multi_image = testImage(&multi_metadata, .host_readable_now, &multi_payload);
-    try std.testing.expectError(error.UnsupportedStageFrameHeaderBatch, buildStageTransportActivationEnvelope(.{
+    const multi_envelope = try buildStageTransportActivationEnvelope(.{
         .metadata = &multi_metadata,
         .image = &multi_image,
         .decision = testDecision(&multi_metadata, .local_in_process, .copy_in_process),
-    }));
+    });
+    try validateStageTransportEnvelope(&multi_envelope);
+    try std.testing.expectEqual(StageTransportActivationScope.multi_entry_local, multi_envelope.activation_scope.?);
+    try std.testing.expect(multi_envelope.header == null);
+    try std.testing.expectEqual(@as(u64, 2), multi_envelope.batch_entry_count);
+    try std.testing.expectEqual(multi_metadata.payload.byte_count, multi_envelope.payload_byte_count);
 
     var zero_metadata = metadata;
     zero_metadata.batch = .{ .entries = &.{} };
@@ -518,6 +573,49 @@ test "inference bridge stage_transport buildStageTransportActivationEnvelope val
         .metadata = &zero_metadata,
         .image = &zero_image,
         .decision = testDecision(&zero_metadata, .local_in_process, .copy_in_process),
+    }));
+}
+
+test "inference bridge stage_transport buildStageTransportActivationEnvelope accepts peer copy only for local device resident activations" {
+    var same_host_metadata = try testMetadata(60, testBoundary(2, 10, 11), &test_decode_entries, .{ 1, 1, 4, 0 }, .{ .cuda = 0 }, .borrowed_until_next_stage_call);
+    const same_host_image = testImage(&same_host_metadata, .device_download_required, null);
+    const same_host_envelope = try buildStageTransportActivationEnvelope(.{
+        .metadata = &same_host_metadata,
+        .image = &same_host_image,
+        .decision = testDecision(&same_host_metadata, .same_host_direct, .device_peer_copy_in_process),
+    });
+    try validateStageTransportEnvelope(&same_host_envelope);
+    try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.device_peer_copy_in_process, same_host_envelope.transfer_mode.?);
+    try std.testing.expectEqual(same_host_metadata.payload.byte_count, same_host_envelope.payload_byte_count);
+
+    var local_metadata = try testMetadata(61, testBoundary(2, 10, 11), &test_decode_entries, .{ 1, 1, 4, 0 }, .{ .cuda = 1 }, .borrowed_until_next_stage_call);
+    const local_image = testImage(&local_metadata, .device_download_required, null);
+    const local_envelope = try buildStageTransportActivationEnvelope(.{
+        .metadata = &local_metadata,
+        .image = &local_image,
+        .decision = testDecision(&local_metadata, .local_in_process, .device_peer_copy_in_process),
+    });
+    try validateStageTransportEnvelope(&local_envelope);
+    try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.device_peer_copy_in_process, local_envelope.transfer_mode.?);
+
+    var host_metadata = try testDecodeMetadata();
+    const payload = [_]u8{0xba} ** test_payload_len;
+    const host_image = testImage(&host_metadata, .host_readable_now, &payload);
+    try std.testing.expectError(error.StageTransportDecisionMismatch, buildStageTransportActivationEnvelope(.{
+        .metadata = &host_metadata,
+        .image = &host_image,
+        .decision = testDecision(&host_metadata, .same_host_direct, .device_peer_copy_in_process),
+    }));
+
+    try std.testing.expectError(error.StageTransportDecisionMismatch, buildStageTransportActivationEnvelope(.{
+        .metadata = &same_host_metadata,
+        .image = &same_host_image,
+        .decision = testDecision(&same_host_metadata, .mock, .device_peer_copy_in_process),
+    }));
+    try std.testing.expectError(error.StageTransportDecisionMismatch, buildStageTransportActivationEnvelope(.{
+        .metadata = &same_host_metadata,
+        .image = &same_host_image,
+        .decision = testDecision(&same_host_metadata, .remote_declared, .device_peer_copy_in_process),
     }));
 }
 
@@ -556,6 +654,16 @@ test "inference bridge stage_transport buildStageTransportActivationEnvelope rej
         .image = &owned_image,
         .decision = testDecision(&owned_metadata, .same_host_direct, .borrow_in_process),
     }));
+
+    const first = [_]u8{0xbe} ** 4;
+    const second = [_]u8{0xbf} ** 12;
+    const segments = [_][]const u8{ &first, &second };
+    const segmented_image = testSegmentedImage(&metadata, &segments);
+    try std.testing.expectError(error.StageTransportDecisionMismatch, buildStageTransportActivationEnvelope(.{
+        .metadata = &metadata,
+        .image = &segmented_image,
+        .decision = testDecision(&metadata, .same_host_direct, .borrow_in_process),
+    }));
 }
 
 test "inference bridge stage_transport validateStageTransportEnvelope rejects contract header failure transfer mode and byte count mismatches" {
@@ -569,6 +677,10 @@ test "inference bridge stage_transport validateStageTransportEnvelope rejects co
     var invalid = envelope;
     invalid.version = 0;
     try std.testing.expectError(error.InvalidStageTransportContractVersion, validateStageTransportEnvelope(&invalid));
+
+    invalid = envelope;
+    invalid.activation_scope = null;
+    try std.testing.expectError(error.MissingStageTransportActivationScope, validateStageTransportEnvelope(&invalid));
 
     invalid = envelope;
     invalid.header = null;
@@ -591,14 +703,37 @@ test "inference bridge stage_transport validateStageTransportEnvelope rejects co
     try std.testing.expectError(error.StageTransportPayloadByteCountMismatch, validateStageTransportEnvelope(&invalid));
 
     invalid = envelope;
+    invalid.batch_entry_count = 2;
+    try std.testing.expectError(error.InvalidStageTransportBatchEntryCount, validateStageTransportEnvelope(&invalid));
+
+    invalid = envelope;
     var invalid_header = invalid.header.?;
     invalid_header.flags = 99;
     invalid.header = invalid_header;
     try std.testing.expectError(error.InvalidStageFrameHeaderFlags, validateStageTransportEnvelope(&invalid));
 
+    var multi_metadata = try testMultiBatchMetadata();
+    const multi_payload = [_]u8{0xcb} ** test_large_payload_len;
+    const multi_image = testImage(&multi_metadata, .host_readable_now, &multi_payload);
+    var multi = try buildCopyEnvelope(&multi_metadata, &multi_image);
+    multi.header = envelope.header;
+    try std.testing.expectError(error.UnexpectedStageTransportFrameHeader, validateStageTransportEnvelope(&multi));
+
+    multi = try buildCopyEnvelope(&multi_metadata, &multi_image);
+    multi.batch_entry_count = 1;
+    try std.testing.expectError(error.InvalidStageTransportBatchEntryCount, validateStageTransportEnvelope(&multi));
+
     var propagated = try buildStageTransportFailureEnvelope(failure);
     propagated.header = envelope.header;
     try std.testing.expectError(error.UnexpectedStageTransportFrameHeader, validateStageTransportEnvelope(&propagated));
+
+    propagated = try buildStageTransportFailureEnvelope(failure);
+    propagated.activation_scope = .multi_entry_local;
+    try std.testing.expectError(error.UnexpectedStageTransportActivationScope, validateStageTransportEnvelope(&propagated));
+
+    propagated = try buildStageTransportFailureEnvelope(failure);
+    propagated.batch_entry_count = 1;
+    try std.testing.expectError(error.InvalidStageTransportBatchEntryCount, validateStageTransportEnvelope(&propagated));
 
     propagated = try buildStageTransportFailureEnvelope(failure);
     propagated.transfer_mode = .copy_in_process;
@@ -616,6 +751,14 @@ test "inference bridge stage_transport validateStageTransportEnvelope rejects co
     try std.testing.expectError(error.InvalidStageTransportFailureKind, validateStageTransportEnvelope(&propagated));
 
     var cancelled = try buildStageTransportCancellationEnvelope(cancellation);
+    cancelled.activation_scope = .multi_entry_local;
+    try std.testing.expectError(error.UnexpectedStageTransportActivationScope, validateStageTransportEnvelope(&cancelled));
+
+    cancelled = try buildStageTransportCancellationEnvelope(cancellation);
+    cancelled.batch_entry_count = 1;
+    try std.testing.expectError(error.InvalidStageTransportBatchEntryCount, validateStageTransportEnvelope(&cancelled));
+
+    cancelled = try buildStageTransportCancellationEnvelope(cancellation);
     cancelled.failure = failure;
     try std.testing.expectError(error.InvalidStageTransportFailureKind, validateStageTransportEnvelope(&cancelled));
 }
@@ -642,15 +785,18 @@ test "inference bridge stage_transport writeStageTransportEnvelopeLocal readStag
 
     try std.testing.expectEqual(@as(usize, 2), reader.call_count);
     try std.testing.expectEqual(StageTransportEnvelopeKind.activation_payload, read_envelope.kind);
+    try std.testing.expectEqual(StageTransportActivationScope.single_entry_header, read_envelope.activation_scope.?);
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.copy_in_process, read_envelope.transfer_mode.?);
+    try std.testing.expectEqual(@as(u64, 1), read_envelope.batch_entry_count);
     try stage_frame_header.validateStageFrameHeaderForMetadata(read_envelope.header.?, &metadata);
     try std.testing.expectEqualSlices(u8, &payload, &received);
 
     var multi_metadata = try testMultiBatchMetadata();
     const multi_payload = [_]u8{0xee} ** test_large_payload_len;
     const multi_image = testImage(&multi_metadata, .host_readable_now, &multi_payload);
+    const multi_envelope = try buildCopyEnvelope(&multi_metadata, &multi_image);
     var multi_writer = TestWriter{ .dest = written[0..] };
-    try std.testing.expectError(error.UnsupportedStageFrameHeaderBatch, writeStageTransportEnvelopeLocal(&multi_writer, &envelope, &multi_metadata, &multi_image));
+    try std.testing.expectError(error.UnsupportedStageFrameHeaderBatch, writeStageTransportEnvelopeLocal(&multi_writer, &multi_envelope, &multi_metadata, &multi_image));
     try std.testing.expectEqual(@as(usize, 0), multi_writer.call_count);
 
     var multi_reader = TestReader{ .source = written[0..writer.len] };

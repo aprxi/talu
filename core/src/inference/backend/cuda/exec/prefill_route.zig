@@ -9,7 +9,6 @@ const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
-const orchestrator = @import("../../../bridge/orchestrator.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 // --- Shared types from engine_types.zig ---
@@ -58,22 +57,14 @@ fn rejectUnsupportedStagedPrefillRoute(topology_tag: ?[]const u8) !void {
 const common = @import("common.zig");
 const kv_capacity = @import("kv_capacity.zig");
 const resets = @import("resets.zig");
-const cpu_gpu = @import("cpu_gpu.zig");
-const cpu_gpu_gpu = @import("cpu_gpu_gpu.zig");
-const pipeline2 = @import("pipeline2.zig");
+const staged_prefill = @import("staged_prefill.zig");
 const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const dumpHiddenState = common.dumpHiddenState;
 const applyHostLogitsPostProcess = common.applyHostLogitsPostProcess;
 const executeCpuStage0LayerRange = common.executeCpuStage0LayerRange;
-const uploadCpuKvToMirrors = @import("transfers.zig").uploadCpuKvToMirrors;
-const transferPipelineActivationMultiRow = @import("transfers.zig").transferPipelineActivationMultiRow;
-const transferPipelineActivationStage12MultiRow = @import("transfers.zig").transferPipelineActivationStage12MultiRow;
-const runPipeline2WithPipelineRuntime = pipeline2.runPipeline2WithPipelineRuntime;
-const runCpuGpuWithPipelineRuntime = cpu_gpu.runCpuGpuWithPipelineRuntime;
-const runCpuGpuGpuWithPipelineRuntime = cpu_gpu_gpu.runCpuGpuGpuWithPipelineRuntime;
-const computeBatchedPrefillPipeline2 = pipeline2.computeBatchedPrefillPipeline2;
-const computeBatchedPrefillCpuGpu = cpu_gpu.computeBatchedPrefillCpuGpu;
-const computeBatchedPrefillCpuGpuGpu = cpu_gpu_gpu.computeBatchedPrefillCpuGpuGpu;
+const executeStagedPrefillCudaCuda = staged_prefill.executeStagedPrefillCudaCuda;
+const executeStagedPrefillCpuCuda = staged_prefill.executeStagedPrefillCpuCuda;
+const executeStagedPrefillCpuCudaCuda = staged_prefill.executeStagedPrefillCpuCudaCuda;
 const ensureKvCapacity = kv_capacity.ensureKvCapacity;
 const resetShortConvStates = resets.resetShortConvStates;
 const resetGatedDeltaStates = resets.resetGatedDeltaStates;
@@ -97,6 +88,40 @@ pub fn executePrefillWithLayerLimit(
 ) !void {
     const SelfType = @TypeOf(self.*);
 
+    if (comptime @hasDecl(SelfType, "executePrefillWithLayerLimitTestHook")) {
+        return self.executePrefillWithLayerLimitTestHook(tokens, slot_index, logits_out, layer_limit);
+    }
+    if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook") and
+        !@hasDecl(SelfType, "pipelineCpuStage0"))
+    {
+        if (tokens.len == 0) return error.InvalidArgument;
+        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+        if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+        if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
+
+        for (tokens, 0..) |token, position| {
+            const is_last = position + 1 == tokens.len;
+            try self.executeDecodeWithLayerLimitTestHook(
+                token,
+                position,
+                slot_index,
+                if (is_last) logits_out else null,
+                layer_limit,
+                true,
+                is_last,
+                true,
+                @intCast(position + 1),
+                position,
+                null,
+                null,
+                null,
+                false,
+            );
+        }
+        return;
+    }
+
     // Pipeline2: batched prefill through stage0 → bulk transfer → stage1.
     // Uses comptime guard because anytype monomorphization requires all referenced
     // methods to exist on the type, even in runtime-unreachable branches.
@@ -111,7 +136,7 @@ pub fn executePrefillWithLayerLimit(
             if (stage1.state_descriptor_count > 0) try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
             stage1.activateKvSlot(slot_index);
             self.activateKvSlot(slot_index);
-            return computeBatchedPrefillPipeline2(self, stage1, tokens, slot_index, logits_out);
+            return executeStagedPrefillCudaCuda(self, stage1, tokens, slot_index, logits_out);
         }
     }
 
@@ -134,12 +159,12 @@ pub fn executePrefillWithLayerLimit(
                     var gpu_stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
                     if (gpu_stage1.state_descriptor_count > 0) try gpu_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
                     gpu_stage1.activateKvSlot(slot_index);
-                    return computeBatchedPrefillCpuGpuGpu(self, cpu_stage0, gpu_stage1, tokens, slot_index, logits_out);
+                    return executeStagedPrefillCpuCudaCuda(self, cpu_stage0, gpu_stage1, tokens, slot_index, logits_out);
                 }
             }
 
             // cpu_gpu: CPU → GPU (2-stage).
-            return computeBatchedPrefillCpuGpu(self, cpu_stage0, tokens, slot_index, logits_out);
+            return executeStagedPrefillCpuCuda(self, cpu_stage0, tokens, slot_index, logits_out);
         }
     }
 

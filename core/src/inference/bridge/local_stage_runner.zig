@@ -9,6 +9,10 @@ const std = @import("std");
 const models = @import("models_pkg");
 
 const host_capability = @import("host_capability.zig");
+const boundary_byte_image = @import("boundary_byte_image.zig");
+const local_stage_transport = @import("../transport/local_stage.zig");
+const stage_transfer_mode = @import("stage_transfer_mode.zig");
+const stage_transport = @import("stage_transport.zig");
 const staged_error = @import("staged_error.zig");
 const state_ownership = @import("state_ownership.zig");
 const tensor_frame = @import("tensor_frame.zig");
@@ -16,6 +20,38 @@ const tensor_frame = @import("tensor_frame.zig");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const stage_plan = models.stage_plan;
+
+pub const ActivationTransportContract = struct {
+    decision: stage_transfer_mode.StageTransferModeDecision,
+    envelope: stage_transport.StageTransportEnvelope,
+};
+
+pub const DecodeActivationMetadataRequest = struct {
+    plan_ref: *const tensor_frame.TensorFramePlanRef,
+    hidden_size: usize,
+    boundary_index: usize,
+    dtype: tensor_frame.TensorFrameDType,
+    layout: tensor_frame.TensorFrameLayout,
+    location_hint: ?tensor_frame.TensorFramePayloadLocationHint,
+    slot_request_ids: []const ?u64,
+    slot_indices: []const usize,
+    positions: []const usize,
+    batch_entries: []tensor_frame.TensorFrameBatchEntry,
+};
+
+pub const PrefillActivationMetadataRequest = struct {
+    plan_ref: *const tensor_frame.TensorFramePlanRef,
+    hidden_size: usize,
+    boundary_index: usize,
+    dtype: tensor_frame.TensorFrameDType,
+    layout: tensor_frame.TensorFrameLayout,
+    location_hint: ?tensor_frame.TensorFramePayloadLocationHint,
+    slot_request_ids: []const ?u64,
+    slot_index: usize,
+    sequence_start: usize,
+    token_count: usize,
+    batch_entries: []tensor_frame.TensorFrameBatchEntry,
+};
 
 pub const local_stage_runner_contract_version: u32 = 1;
 
@@ -203,6 +239,192 @@ pub fn localStageRunnerPlanIdEql(
     return std.mem.eql(u8, &lhs.digest, &rhs.digest);
 }
 
+pub fn buildDecodeActivationMetadata(
+    request: DecodeActivationMetadataRequest,
+) anyerror!tensor_frame.TensorFrameMetadata {
+    if (request.slot_indices.len == 0 or request.slot_indices.len != request.positions.len) return error.InvalidArgument;
+    if (request.batch_entries.len < request.slot_indices.len) return error.InvalidArgument;
+
+    const contract = try tensor_frame.selectedBoundaryTensorContract(
+        request.plan_ref,
+        request.boundary_index,
+        request.dtype,
+        request.layout,
+        .negotiated,
+    );
+    const hidden_size = try usizeToU64(request.hidden_size, error.InvalidHiddenSize);
+    const batch_count = try usizeToU64(request.slot_indices.len, error.InvalidBatch);
+    const tensor_desc = try tensor_frame.TensorFrameTensorDesc.contiguousActivation(
+        request.dtype,
+        .{ batch_count, 1, hidden_size, 0 },
+    );
+
+    for (request.slot_indices, request.positions, 0..) |slot_index, position, row_index| {
+        const slot_id_value = try slotId(slot_index);
+        request.batch_entries[row_index] = .{
+            .batch_index = std.math.cast(u32, row_index) orelse return error.InvalidBatch,
+            .request_id = try requestIdForSlot(request.slot_request_ids, slot_index),
+            .slot_id = slot_id_value,
+            .sequence_start = try usizeToU64(position, error.InvalidSequenceRange),
+            .token_count = 1,
+        };
+    }
+
+    const first_entry = request.batch_entries[0];
+    const args = tensor_frame.ActivationFrameArgs{
+        .frame_id = try activationFrameId(
+            request.boundary_index,
+            first_entry.slot_id,
+            first_entry.sequence_start,
+            first_entry.token_count,
+            request.slot_indices.len,
+        ),
+        .plan_ref = request.plan_ref,
+        .boundary_index = request.boundary_index,
+        .selected_contract = &contract,
+        .shape_context = .{
+            .expected_hidden_size = hidden_size,
+            .expected_step_kind = .decode,
+        },
+        .tensor = tensor_desc,
+        .batch = .{ .entries = request.batch_entries[0..request.slot_indices.len] },
+        .payload = .{
+            .byte_count = tensor_desc.payload_byte_count,
+            .location_hint = request.location_hint,
+            .ownership = .borrowed_until_next_stage_call,
+            .lifetime = .step_scoped,
+        },
+    };
+    return tensor_frame.activationDecodeFrame(args);
+}
+
+pub fn buildPrefillActivationMetadata(
+    request: PrefillActivationMetadataRequest,
+) anyerror!tensor_frame.TensorFrameMetadata {
+    if (request.token_count == 0 or request.batch_entries.len == 0) return error.InvalidArgument;
+
+    const contract = try tensor_frame.selectedBoundaryTensorContract(
+        request.plan_ref,
+        request.boundary_index,
+        request.dtype,
+        request.layout,
+        .negotiated,
+    );
+    const hidden_size = try usizeToU64(request.hidden_size, error.InvalidHiddenSize);
+    const token_count_u64 = try usizeToU64(request.token_count, error.InvalidSequenceRange);
+    const tensor_desc = try tensor_frame.TensorFrameTensorDesc.contiguousActivation(
+        request.dtype,
+        .{ 1, token_count_u64, hidden_size, 0 },
+    );
+    const slot_id_value = try slotId(request.slot_index);
+    const sequence_start_u64 = try usizeToU64(request.sequence_start, error.InvalidSequenceRange);
+    request.batch_entries[0] = .{
+        .batch_index = 0,
+        .request_id = try requestIdForSlot(request.slot_request_ids, request.slot_index),
+        .slot_id = slot_id_value,
+        .sequence_start = sequence_start_u64,
+        .token_count = token_count_u64,
+    };
+
+    const args = tensor_frame.ActivationFrameArgs{
+        .frame_id = try activationFrameId(
+            request.boundary_index,
+            slot_id_value,
+            sequence_start_u64,
+            token_count_u64,
+            1,
+        ),
+        .plan_ref = request.plan_ref,
+        .boundary_index = request.boundary_index,
+        .selected_contract = &contract,
+        .shape_context = .{
+            .expected_hidden_size = hidden_size,
+            .expected_step_kind = .prefill,
+        },
+        .tensor = tensor_desc,
+        .batch = .{ .entries = request.batch_entries[0..1] },
+        .payload = .{
+            .byte_count = tensor_desc.payload_byte_count,
+            .location_hint = request.location_hint,
+            .ownership = .borrowed_until_next_stage_call,
+            .lifetime = .step_scoped,
+        },
+    };
+    return tensor_frame.activationPrefillFrame(args);
+}
+
+pub fn hostActivationByteImage(
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    host_bytes: []const u8,
+) boundary_byte_image.BoundaryByteImageRef {
+    return .{
+        .metadata = metadata,
+        .byte_count = metadata.payload.byte_count,
+        .host_bytes = host_bytes,
+        .location_hint = metadata.payload.location_hint,
+        .readiness = .host_readable_now,
+        .ownership = metadata.payload.ownership,
+        .lifetime = metadata.payload.lifetime,
+    };
+}
+
+pub fn segmentedHostActivationByteImage(
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    host_segments: []const []const u8,
+) boundary_byte_image.BoundaryByteImageRef {
+    return .{
+        .metadata = metadata,
+        .byte_count = metadata.payload.byte_count,
+        .host_segments = host_segments,
+        .location_hint = metadata.payload.location_hint,
+        .readiness = .host_readable_now,
+        .ownership = metadata.payload.ownership,
+        .lifetime = metadata.payload.lifetime,
+    };
+}
+
+pub fn deviceActivationByteImage(
+    metadata: *const tensor_frame.TensorFrameMetadata,
+) boundary_byte_image.BoundaryByteImageRef {
+    return .{
+        .metadata = metadata,
+        .byte_count = metadata.payload.byte_count,
+        .location_hint = metadata.payload.location_hint,
+        .readiness = .device_download_required,
+        .ownership = metadata.payload.ownership,
+        .lifetime = metadata.payload.lifetime,
+    };
+}
+
+pub fn buildActivationTransportContract(
+    placement_plan: *const host_capability.PlacementPlan,
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    image: *const boundary_byte_image.BoundaryByteImageRef,
+    allow_borrow: bool,
+    local_device_peer_copy_available: bool,
+) anyerror!ActivationTransportContract {
+    const decision = try stage_transfer_mode.chooseStageTransferMode(.{
+        .placement_plan = placement_plan,
+        .metadata = metadata,
+        .image = image,
+        .allow_borrow = allow_borrow,
+        .local_device_peer_copy_available = local_device_peer_copy_available,
+    });
+    const envelope = try stage_transport.buildStageTransportActivationEnvelope(.{
+        .metadata = metadata,
+        .image = image,
+        .decision = decision,
+    });
+    return .{
+        .decision = decision,
+        .envelope = envelope,
+    };
+}
+
+pub fn executeLocalStageStepChain(request: LocalStageChainRequest) anyerror!void {
+    return executeLocalStageChain(request);
+}
+
 pub const LocalStageBoundaryStep = struct {
     boundary_index: usize,
     step_kind: tensor_frame.TensorFrameStepKind,
@@ -250,7 +472,253 @@ pub const LocalStageBoundaryRunRequest = struct {
     touched_stage_scratch: []LocalStageTouchedRef,
 };
 
-pub fn executeLocalStageBoundary(
+pub const LocalStageChainStageVTable = struct {
+    execute_layers: *const fn (*anyopaque, []const u8, usize, usize) anyerror!void,
+    synchronize: *const fn (*anyopaque) anyerror!void,
+    download_activation: *const fn (*anyopaque, []u8, usize) anyerror!void,
+    upload_activation: *const fn (*anyopaque, []const u8, usize) anyerror!void,
+    upload_activation_segments: ?*const fn (*anyopaque, []const []const u8, usize) anyerror!void = null,
+    peer_copy_activation_to: ?*const fn (*anyopaque, *anyopaque, usize) anyerror!void = null,
+    peer_copy_handles_stage_sync: ?*const fn (*anyopaque) bool = null,
+};
+
+pub const LocalStageChainStage = struct {
+    stage_id: usize,
+    ptr: *anyopaque,
+    vtable: *const LocalStageChainStageVTable,
+
+    pub fn executeLayers(self: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+        return self.vtable.execute_layers(self.ptr, input, layer_start, layer_end);
+    }
+
+    pub fn synchronize(self: *@This()) anyerror!void {
+        return self.vtable.synchronize(self.ptr);
+    }
+
+    pub fn downloadActivation(self: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+        return self.vtable.download_activation(self.ptr, host_buf, byte_count);
+    }
+
+    pub fn uploadActivation(self: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+        return self.vtable.upload_activation(self.ptr, host_buf, byte_count);
+    }
+
+    pub fn uploadActivationSegments(self: *@This(), host_segments: []const []const u8, byte_count: usize) anyerror!void {
+        const upload_segments = self.vtable.upload_activation_segments orelse return error.LocalStageTransportSegmentedUploadUnsupported;
+        return upload_segments(self.ptr, host_segments, byte_count);
+    }
+
+    pub fn peerCopyActivationTo(self: *@This(), target: anytype, byte_count: usize) anyerror!void {
+        const peer_copy = self.vtable.peer_copy_activation_to orelse return error.LocalStageTransportPeerCopyUnsupported;
+        return peer_copy(self.ptr, target.ptr, byte_count);
+    }
+
+    pub fn peerCopyHandlesStageSync(self: *const @This()) bool {
+        const handles_sync = self.vtable.peer_copy_handles_stage_sync orelse return false;
+        return handles_sync(self.ptr);
+    }
+};
+
+pub fn localStageAdapter(comptime Stage: type, stage_id: usize, stage: *Stage) LocalStageChainStage {
+    const Adapter = struct {
+        fn stagePtr(ptr: *anyopaque) *Stage {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn executeLayers(ptr: *anyopaque, input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            return stagePtr(ptr).executeLayers(input, layer_start, layer_end);
+        }
+
+        fn synchronize(ptr: *anyopaque) anyerror!void {
+            return stagePtr(ptr).synchronize();
+        }
+
+        fn downloadActivation(ptr: *anyopaque, host_buf: []u8, byte_count: usize) anyerror!void {
+            return stagePtr(ptr).downloadActivation(host_buf, byte_count);
+        }
+
+        fn uploadActivation(ptr: *anyopaque, host_buf: []const u8, byte_count: usize) anyerror!void {
+            return stagePtr(ptr).uploadActivation(host_buf, byte_count);
+        }
+
+        fn uploadActivationSegments(ptr: *anyopaque, host_segments: []const []const u8, byte_count: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "uploadActivationSegments")) {
+                return stagePtr(ptr).uploadActivationSegments(host_segments, byte_count);
+            }
+            return error.LocalStageTransportSegmentedUploadUnsupported;
+        }
+
+        fn peerCopyActivationTo(ptr: *anyopaque, target_ptr: *anyopaque, byte_count: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "peerCopyActivationToErased")) {
+                return stagePtr(ptr).peerCopyActivationToErased(target_ptr, byte_count);
+            }
+            return error.LocalStageTransportPeerCopyUnsupported;
+        }
+
+        fn peerCopyHandlesStageSync(ptr: *anyopaque) bool {
+            if (comptime @hasDecl(Stage, "peerCopyHandlesStageSync")) {
+                return stagePtr(ptr).peerCopyHandlesStageSync();
+            }
+            return false;
+        }
+
+        const vtable = LocalStageChainStageVTable{
+            .execute_layers = executeLayers,
+            .synchronize = synchronize,
+            .download_activation = downloadActivation,
+            .upload_activation = uploadActivation,
+            .upload_activation_segments = if (@hasDecl(Stage, "uploadActivationSegments")) uploadActivationSegments else null,
+            .peer_copy_activation_to = if (@hasDecl(Stage, "peerCopyActivationToErased")) peerCopyActivationTo else null,
+            .peer_copy_handles_stage_sync = if (@hasDecl(Stage, "peerCopyHandlesStageSync")) peerCopyHandlesStageSync else null,
+        };
+    };
+    return .{
+        .stage_id = stage_id,
+        .ptr = stage,
+        .vtable = &Adapter.vtable,
+    };
+}
+
+pub const LocalStageChainBoundaryStep = struct {
+    boundary_index: usize,
+    step_kind: tensor_frame.TensorFrameStepKind,
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    image: *const boundary_byte_image.BoundaryByteImageRef,
+    staging: ?[]align(64) u8 = null,
+    allow_borrow: bool = false,
+    local_device_peer_copy_available: bool = false,
+};
+
+pub const LocalStageChainRequest = struct {
+    allocator: ?Allocator = null,
+    plan_ref: *const LocalStageRunnerPlanRef,
+    placement_plan: *const host_capability.PlacementPlan,
+    state_ownership_plan: ?*const state_ownership.StageStateOwnershipPlan = null,
+    cleanup_obligations: []const state_ownership.StateCleanupObligation = &.{},
+    stages: []LocalStageChainStage,
+    boundaries: []const LocalStageChainBoundaryStep,
+    stage_inputs: []const []const u8 = &.{},
+};
+
+pub const PreparedLocalStageBoundaryRequest = struct {
+    allocator: ?Allocator = null,
+    plan_ref: *const LocalStageRunnerPlanRef,
+    placement_plan: *const host_capability.PlacementPlan,
+    state_ownership_plan: ?*const state_ownership.StageStateOwnershipPlan = null,
+    cleanup_obligations: []const state_ownership.StateCleanupObligation = &.{},
+    step_kind: tensor_frame.TensorFrameStepKind,
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    image: *const boundary_byte_image.BoundaryByteImageRef,
+    staging: ?[]align(64) u8 = null,
+    allow_borrow: bool = false,
+    local_device_peer_copy_available: bool = false,
+};
+
+pub fn executePreparedLocalStageBoundary(
+    comptime Source: type,
+    comptime Target: type,
+    source: *Source,
+    target: *Target,
+    request: PreparedLocalStageBoundaryRequest,
+) anyerror!void {
+    var stages = [_]LocalStageChainStage{
+        localStageAdapter(Source, request.metadata.boundary.source_stage_id, source),
+        localStageAdapter(Target, request.metadata.boundary.target_stage_id, target),
+    };
+    const boundaries = [_]LocalStageChainBoundaryStep{.{
+        .boundary_index = request.metadata.boundary.boundary_index,
+        .step_kind = request.step_kind,
+        .metadata = request.metadata,
+        .image = request.image,
+        .staging = request.staging,
+        .allow_borrow = request.allow_borrow,
+        .local_device_peer_copy_available = request.local_device_peer_copy_available,
+    }};
+    try executeLocalStageStepChain(.{
+        .allocator = request.allocator,
+        .plan_ref = request.plan_ref,
+        .placement_plan = request.placement_plan,
+        .state_ownership_plan = request.state_ownership_plan,
+        .cleanup_obligations = request.cleanup_obligations,
+        .stages = &stages,
+        .boundaries = &boundaries,
+    });
+}
+
+pub fn executeLocalStageChain(request: LocalStageChainRequest) anyerror!void {
+    try validateLocalStageChainRequestShape(request);
+
+    for (request.boundaries, 0..) |step, boundary_position| {
+        const boundary = try request.plan_ref.boundary(step.boundary_index);
+        if (boundary_position == 0) {
+            try request.stages[0].executeLayers(
+                stageInput(request, 0),
+                boundary.producer_layer_start,
+                boundary.producer_layer_end,
+            );
+        }
+
+        try validateLocalStageChainBoundary(request, boundary, step, boundary_position);
+
+        const decision = try stage_transfer_mode.chooseStageTransferMode(.{
+            .placement_plan = request.placement_plan,
+            .metadata = step.metadata,
+            .image = step.image,
+            .allow_borrow = step.allow_borrow,
+            .local_device_peer_copy_available = step.local_device_peer_copy_available,
+        });
+        const envelope = try stage_transport.buildStageTransportActivationEnvelope(.{
+            .metadata = step.metadata,
+            .image = step.image,
+            .decision = decision,
+        });
+        const transport_request = local_stage_transport.LocalStageTransportRequest{
+            .placement_plan = request.placement_plan,
+            .metadata = step.metadata,
+            .image = step.image,
+            .decision = decision,
+            .envelope = &envelope,
+            .staging = step.staging,
+            .allow_borrow = step.allow_borrow,
+            .local_device_peer_copy_available = step.local_device_peer_copy_available,
+            .state_ownership_plan = request.state_ownership_plan,
+            .cleanup_obligations = request.cleanup_obligations,
+        };
+
+        if (request.allocator) |allocator| {
+            var failure_capture = local_stage_transport.LocalStageTransportFailureCapture.init(allocator);
+            defer failure_capture.deinit();
+            try local_stage_transport.executeLocalStageTransportWithFailureCapture(
+                LocalStageChainStage,
+                LocalStageChainStage,
+                &request.stages[boundary_position],
+                &request.stages[boundary_position + 1],
+                transport_request,
+                &failure_capture,
+            );
+        } else {
+            try local_stage_transport.executeLocalStageTransport(
+                LocalStageChainStage,
+                LocalStageChainStage,
+                &request.stages[boundary_position],
+                &request.stages[boundary_position + 1],
+                transport_request,
+            );
+        }
+
+        try request.stages[boundary_position + 1].executeLayers(
+            stageInput(request, boundary_position + 1),
+            boundary.consumer_layer_start,
+            boundary.consumer_layer_end,
+        );
+    }
+}
+
+// Private regression harness for the pre-chain one-boundary runner contract.
+// Production bridge users must enter through executeLocalStageStepChain or
+// executePreparedLocalStageBoundary so ordered local topology execution has one
+// bridge path.
+fn executeLocalStageBoundary(
     comptime SourceStageType: type,
     comptime TargetStageType: type,
     source_stage: SourceStageType,
@@ -347,6 +815,375 @@ pub fn executeLocalStageBoundary(
         .request_id = batch_entry.request_id,
         .slot_id = batch_entry.slot_id,
     } };
+}
+
+pub const LocalStageExecutionFailureEntry = struct {
+    primary_failure: staged_error.StagedFailure,
+    touched_stages: []const staged_error.TouchedStageCleanupRef,
+    cleanup_plan: ?staged_error.StagedCleanupPlan = null,
+    cleanup_report: ?staged_error.StagedCleanupReport = null,
+    error_report: staged_error.StagedErrorReport,
+};
+
+pub const LocalStageExecutionFailureReport = struct {
+    allocator: Allocator,
+    source_error: anyerror,
+    entries: []LocalStageExecutionFailureEntry,
+
+    pub fn deinit(self: *@This()) void {
+        for (self.entries) |*entry| {
+            entry.error_report.deinit();
+            if (entry.cleanup_report) |*report| report.deinit();
+            if (entry.cleanup_plan) |*plan| plan.deinit();
+            self.allocator.free(entry.touched_stages);
+        }
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+pub const LocalStageExecutionFailureRequest = struct {
+    placement_plan: *const host_capability.PlacementPlan,
+    state_ownership_plan: ?*const state_ownership.StageStateOwnershipPlan = null,
+    cleanup_obligations: []const state_ownership.StateCleanupObligation = &.{},
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    active_stage_id: usize,
+    source_error: anyerror,
+};
+
+pub fn captureLocalStageExecutionFailure(
+    allocator: Allocator,
+    request: LocalStageExecutionFailureRequest,
+) !LocalStageExecutionFailureReport {
+    const entries = try allocator.alloc(LocalStageExecutionFailureEntry, request.metadata.batch.entries.len);
+    errdefer allocator.free(entries);
+
+    for (request.metadata.batch.entries, 0..) |batch_entry, index| {
+        entries[index] = try buildLocalStageExecutionFailureEntry(allocator, request, batch_entry);
+        errdefer deinitLocalStageExecutionFailureEntry(allocator, &entries[index]);
+    }
+
+    return .{
+        .allocator = allocator,
+        .source_error = request.source_error,
+        .entries = entries,
+    };
+}
+
+pub fn preserveLocalStageExecutionError(
+    allocator: ?Allocator,
+    request: LocalStageExecutionFailureRequest,
+) anyerror {
+    if (allocator) |alloc| {
+        var report = captureLocalStageExecutionFailure(alloc, request) catch return request.source_error;
+        report.deinit();
+    }
+    return request.source_error;
+}
+
+pub fn executeLocalStageLayers(
+    allocator: ?Allocator,
+    state_ownership_plan: ?*const state_ownership.StageStateOwnershipPlan,
+    placement_plan: *const host_capability.PlacementPlan,
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    active_stage_id: usize,
+    comptime Stage: type,
+    stage: *Stage,
+    input: []const u8,
+    layer_start: usize,
+    layer_end: usize,
+) !void {
+    stage.executeLayers(input, layer_start, layer_end) catch |err| {
+        return preserveLocalStageExecutionError(allocator, .{
+            .placement_plan = placement_plan,
+            .state_ownership_plan = state_ownership_plan,
+            .metadata = metadata,
+            .active_stage_id = active_stage_id,
+            .source_error = err,
+        });
+    };
+}
+
+fn buildLocalStageExecutionFailureEntry(
+    allocator: Allocator,
+    request: LocalStageExecutionFailureRequest,
+    batch_entry: tensor_frame.TensorFrameBatchEntry,
+) !LocalStageExecutionFailureEntry {
+    const active_host = try host_capability.bindingForStage(request.placement_plan, request.active_stage_id);
+    const boundary = request.metadata.boundary;
+    const source_host = try host_capability.bindingForStage(request.placement_plan, boundary.source_stage_id);
+    const target_host = try host_capability.bindingForStage(request.placement_plan, boundary.target_stage_id);
+    const is_out_of_memory = request.source_error == error.OutOfMemory;
+    const is_cancelled = request.source_error == error.RequestCancelled;
+    const primary_failure = try staged_error.buildStagedFailure(.{
+        .kind = if (is_out_of_memory) .resource_exhausted else if (is_cancelled) .request_cancelled else .stage_execution_failed,
+        .phase = .stage_execution_after_state_mutation,
+        .scope = if (is_cancelled) .request else .stage,
+        .context = .{
+            .graph_digest = request.placement_plan.graph_digest,
+            .graph_contract_version = request.placement_plan.graph_contract_version,
+            .stage_plan_contract_version = request.placement_plan.stage_plan_contract_version,
+            .stage_plan_id = request.placement_plan.stage_plan_id,
+            .placement_plan_id = request.placement_plan.plan_id,
+            .state_ownership_plan_id = if (request.state_ownership_plan) |plan| plan.plan_id else request.placement_plan.state_ownership_plan_id,
+            .tensor_frame_id = request.metadata.frame_id,
+            .boundary_index = boundary.boundary_index,
+            .source_stage_id = boundary.source_stage_id,
+            .target_stage_id = boundary.target_stage_id,
+            .source_host_id = source_host.host_id,
+            .target_host_id = target_host.host_id,
+            .stage_id = request.active_stage_id,
+            .host_id = active_host.host_id,
+            .request_id = batch_entry.request_id,
+            .slot_id = batch_entry.slot_id,
+            .state_epoch = batch_entry.state_epoch,
+        },
+        .source = .{ .domain = .runner, .source_error_name = @errorName(request.source_error) },
+    }, .{
+        .placement_plan = request.placement_plan,
+        .state_ownership_plan = request.state_ownership_plan,
+    });
+
+    const touched = try allocator.alloc(staged_error.TouchedStageCleanupRef, 1);
+    errdefer allocator.free(touched);
+    touched[0] = .{
+        .stage_id = request.active_stage_id,
+        .request_id = batch_entry.request_id,
+        .slot_id = batch_entry.slot_id,
+        .state_epoch = batch_entry.state_epoch,
+    };
+
+    var cleanup_plan_opt: ?staged_error.StagedCleanupPlan = null;
+    var cleanup_report_opt: ?staged_error.StagedCleanupReport = null;
+    errdefer if (cleanup_report_opt) |*report| report.deinit();
+    errdefer if (cleanup_plan_opt) |*plan| plan.deinit();
+
+    var cleanup_obligation_buffer = try buildLocalStageExecutionCleanupObligationsForEntry(
+        allocator,
+        request,
+        batch_entry,
+        touched,
+    );
+    defer cleanup_obligation_buffer.deinit();
+    const cleanup_obligations = cleanup_obligation_buffer.obligations;
+
+    if (staged_error.stagedCleanupRequired(primary_failure, touched, cleanup_obligations)) {
+        cleanup_plan_opt = try staged_error.buildStagedCleanupPlan(allocator, .{
+            .primary_failure = primary_failure,
+            .request_id = batch_entry.request_id,
+            .placement_plan = request.placement_plan,
+            .state_ownership_plan = request.state_ownership_plan,
+            .touched_stages = touched,
+            .cleanup_obligations = cleanup_obligations,
+        });
+        if (cleanup_plan_opt.?.steps.len == 0) {
+            cleanup_report_opt = try staged_error.buildStagedCleanupReport(allocator, &.{}, .{
+                .cleanup_plan = &cleanup_plan_opt.?,
+                .primary_failure = &primary_failure,
+            });
+        }
+    }
+
+    const cleanup_plan_id = if (cleanup_plan_opt) |plan| plan.plan_id else null;
+    var error_report = try staged_error.buildStagedErrorReport(allocator, primary_failure, cleanup_plan_id, &.{}, .{
+        .placement_plan = request.placement_plan,
+        .state_ownership_plan = request.state_ownership_plan,
+        .cleanup_plan = if (cleanup_plan_opt) |*plan| plan else null,
+    });
+    errdefer error_report.deinit();
+
+    return .{
+        .primary_failure = primary_failure,
+        .touched_stages = touched,
+        .cleanup_plan = cleanup_plan_opt,
+        .cleanup_report = cleanup_report_opt,
+        .error_report = error_report,
+    };
+}
+
+fn deinitLocalStageExecutionFailureEntry(
+    allocator: Allocator,
+    entry: *LocalStageExecutionFailureEntry,
+) void {
+    entry.error_report.deinit();
+    if (entry.cleanup_report) |*report| report.deinit();
+    if (entry.cleanup_plan) |*plan| plan.deinit();
+    allocator.free(entry.touched_stages);
+}
+
+const LocalStageExecutionCleanupObligationBuffer = struct {
+    allocator: Allocator,
+    obligations: []const state_ownership.StateCleanupObligation = &.{},
+
+    fn deinit(self: *@This()) void {
+        if (self.obligations.len != 0) self.allocator.free(self.obligations);
+        self.* = undefined;
+    }
+};
+
+fn buildLocalStageExecutionCleanupObligationsForEntry(
+    allocator: Allocator,
+    request: LocalStageExecutionFailureRequest,
+    batch_entry: tensor_frame.TensorFrameBatchEntry,
+    touched_stages: []const staged_error.TouchedStageCleanupRef,
+) !LocalStageExecutionCleanupObligationBuffer {
+    const obligations = if (request.cleanup_obligations.len != 0)
+        try copyLocalStageExecutionCleanupObligationsForEntry(
+            allocator,
+            request.cleanup_obligations,
+            request.active_stage_id,
+            batch_entry,
+        )
+    else if (request.state_ownership_plan) |plan|
+        try deriveLocalStageExecutionCleanupObligationsForTouched(allocator, plan, touched_stages)
+    else
+        &.{};
+    return .{
+        .allocator = allocator,
+        .obligations = obligations,
+    };
+}
+
+fn copyLocalStageExecutionCleanupObligationsForEntry(
+    allocator: Allocator,
+    obligations: []const state_ownership.StateCleanupObligation,
+    active_stage_id: usize,
+    batch_entry: tensor_frame.TensorFrameBatchEntry,
+) ![]state_ownership.StateCleanupObligation {
+    var count: usize = 0;
+    for (obligations) |obligation| {
+        if (obligation.stage_id == active_stage_id and
+            obligation.request_id == batch_entry.request_id and
+            obligation.slot_id == batch_entry.slot_id)
+        {
+            count += 1;
+        }
+    }
+    if (count == 0) return &.{};
+
+    const filtered = try allocator.alloc(state_ownership.StateCleanupObligation, count);
+    var index: usize = 0;
+    for (obligations) |obligation| {
+        if (obligation.stage_id == active_stage_id and
+            obligation.request_id == batch_entry.request_id and
+            obligation.slot_id == batch_entry.slot_id)
+        {
+            filtered[index] = obligation;
+            index += 1;
+        }
+    }
+    return filtered;
+}
+
+fn deriveLocalStageExecutionCleanupObligationsForTouched(
+    allocator: Allocator,
+    plan: *const state_ownership.StageStateOwnershipPlan,
+    touched_stages: []const staged_error.TouchedStageCleanupRef,
+) ![]state_ownership.StateCleanupObligation {
+    if (touched_stages.len == 0) return &.{};
+
+    const targets = try allocator.alloc(state_ownership.StageStateCleanupTarget, touched_stages.len);
+    defer allocator.free(targets);
+    var obligation_capacity: usize = 0;
+    for (touched_stages, 0..) |touched, index| {
+        const descriptors = try state_ownership.descriptorSetForStage(plan, touched.stage_id);
+        obligation_capacity += descriptors.descriptors.len;
+        targets[index] = .{
+            .stage_id = touched.stage_id,
+            .request_id = touched.request_id,
+            .slot_id = touched.slot_id,
+        };
+    }
+    if (obligation_capacity == 0) return &.{};
+
+    const scratch = try allocator.alloc(state_ownership.StateCleanupObligation, obligation_capacity);
+    defer allocator.free(scratch);
+    const obligations = try state_ownership.buildStateCleanupObligations(plan, targets, scratch);
+    if (obligations.len == 0) return &.{};
+    return allocator.dupe(state_ownership.StateCleanupObligation, obligations);
+}
+
+fn validateLocalStageChainRequestShape(request: LocalStageChainRequest) anyerror!void {
+    try validateLocalStageRunnerPlanRef(request.plan_ref);
+    try host_capability.validatePlacementPlan(request.placement_plan);
+    if (request.stages.len < 2) return error.InvalidStageRange;
+    if (request.boundaries.len + 1 != request.stages.len) return error.InvalidStepRequest;
+    if (request.stage_inputs.len != 0 and request.stage_inputs.len != request.stages.len) {
+        return error.InvalidStepRequest;
+    }
+    for (request.stages, 0..) |stage, stage_index| {
+        const expected = stageRef(request.plan_ref.stages, stage.stage_id) orelse return error.MissingStageRef;
+        if (stage_index > 0 and request.stages[stage_index - 1].stage_id >= stage.stage_id) {
+            return error.DuplicateStageRef;
+        }
+        _ = expected;
+    }
+}
+
+fn validateLocalStageChainBoundary(
+    request: LocalStageChainRequest,
+    boundary: *const LocalStageRunnerBoundaryRef,
+    step: LocalStageChainBoundaryStep,
+    boundary_position: usize,
+) anyerror!void {
+    if (boundary_position > 0 and step.boundary_index != request.boundaries[boundary_position - 1].boundary_index + 1) {
+        return error.BoundaryIndexOutOfRange;
+    }
+    if (request.stages[boundary_position].stage_id != boundary.source_stage_id or
+        request.stages[boundary_position + 1].stage_id != boundary.target_stage_id)
+    {
+        return error.StageRunnerPlanIdentityMismatch;
+    }
+    if (boundary_position > 0) {
+        const previous = try request.plan_ref.boundary(boundary_position - 1);
+        if (previous.target_stage_id != boundary.source_stage_id or
+            previous.consumer_layer_start != boundary.producer_layer_start or
+            previous.consumer_layer_end != boundary.producer_layer_end)
+        {
+            return error.BoundaryFrameProfileMismatch;
+        }
+    }
+    const profile = profileForStep(boundary, step.step_kind) orelse return error.MissingBoundaryFrameProfile;
+    try validateTensorFrameAgainstRunnerPlan(request.plan_ref, step.metadata, step.boundary_index);
+    try tensor_frame.validatePayloadBufferLength(step.metadata, step.image.byte_count);
+    try validateTensorFrameAgainstBoundaryProfile(step.metadata, profile);
+    try boundary_byte_image.validateBoundaryByteImage(step.image, .{});
+    if (step.image.metadata != step.metadata) return error.BoundaryTensorContractMismatch;
+}
+
+fn stageInput(request: LocalStageChainRequest, stage_index: usize) []const u8 {
+    if (request.stage_inputs.len == 0) return &.{};
+    return request.stage_inputs[stage_index];
+}
+
+fn usizeToU64(value: usize, comptime err: anyerror) !u64 {
+    return std.math.cast(u64, value) orelse return err;
+}
+
+fn activationFrameId(
+    boundary_index: usize,
+    first_slot_id: u64,
+    first_sequence_start: u64,
+    first_token_count: u64,
+    batch_entry_count: usize,
+) !tensor_frame.TensorFrameInstanceId {
+    var raw: u64 = 0xcbf2_9ce4_8422_2325;
+    inline for (.{ boundary_index, batch_entry_count }) |value| {
+        raw = (raw ^ (try usizeToU64(value, error.InvalidFrameId))) *% 0x0000_0100_0000_01b3;
+    }
+    raw = (raw ^ first_slot_id) *% 0x0000_0100_0000_01b3;
+    raw = (raw ^ first_sequence_start) *% 0x0000_0100_0000_01b3;
+    raw = (raw ^ first_token_count) *% 0x0000_0100_0000_01b3;
+    return tensor_frame.TensorFrameInstanceId.init(if (raw == 0) 1 else raw);
+}
+
+fn requestIdForSlot(slot_request_ids: []const ?u64, slot_index: usize) !u64 {
+    if (slot_index >= slot_request_ids.len) return error.InvalidSlotId;
+    return slot_request_ids[slot_index] orelse error.InvalidRequestId;
+}
+
+fn slotId(slot_index: usize) !u64 {
+    return std.math.add(u64, try usizeToU64(slot_index, error.InvalidSlotId), 1) catch return error.InvalidSlotId;
 }
 
 fn validatePlanInputs(request: LocalStageRunnerPlanRequest) LocalStageRunnerError!void {
@@ -1336,6 +2173,66 @@ test "validateLocalStageRunnerPlanRef rejects tampered adjacent host facts" {
     try std.testing.expectError(error.StageRunnerPlanIdentityMismatch, validateLocalStageRunnerPlanRef(&runner));
 }
 
+test "buildDecodeActivationMetadata buildPrefillActivationMetadata hostActivationByteImage segmentedHostActivationByteImage deviceActivationByteImage buildActivationTransportContract builds bridge handoff facts" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
+    defer fixture.deinit();
+    const slot_request_ids = [_]?u64{ 101, 202, 303 };
+
+    const slots = [_]usize{ 0, 2 };
+    const positions = [_]usize{ 7, 9 };
+    var decode_entries: [2]tensor_frame.TensorFrameBatchEntry = undefined;
+    const decode_metadata = try buildDecodeActivationMetadata(.{
+        .plan_ref = &fixture.plan_ref,
+        .hidden_size = 8,
+        .boundary_index = 0,
+        .dtype = .f32,
+        .layout = .row_major,
+        .location_hint = .{ .cpu = {} },
+        .slot_request_ids = &slot_request_ids,
+        .slot_indices = &slots,
+        .positions = &positions,
+        .batch_entries = decode_entries[0..],
+    });
+    try std.testing.expectEqual(tensor_frame.TensorFrameStepKind.decode, decode_metadata.step_kind);
+    try std.testing.expectEqual(@as(usize, 2), decode_metadata.batch.entries.len);
+    try std.testing.expectEqual(@as(u64, 101), decode_metadata.batch.entries[0].request_id);
+    try std.testing.expectEqual(@as(u64, 303), decode_metadata.batch.entries[1].request_id);
+
+    var row0 = [_]u8{1} ** (@sizeOf(f32) * 8);
+    var row1 = [_]u8{2} ** (@sizeOf(f32) * 8);
+    const segments = [_][]const u8{ row0[0..], row1[0..] };
+    const segmented = segmentedHostActivationByteImage(&decode_metadata, &segments);
+    try boundary_byte_image.validateBoundaryByteImage(&segmented, .{});
+
+    var prefill_entries: [1]tensor_frame.TensorFrameBatchEntry = undefined;
+    const prefill_metadata = try buildPrefillActivationMetadata(.{
+        .plan_ref = &fixture.plan_ref,
+        .hidden_size = 8,
+        .boundary_index = 0,
+        .dtype = .f32,
+        .layout = .row_major,
+        .location_hint = .{ .cpu = {} },
+        .slot_request_ids = &slot_request_ids,
+        .slot_index = 1,
+        .sequence_start = 4,
+        .token_count = 3,
+        .batch_entries = prefill_entries[0..],
+    });
+    try std.testing.expectEqual(tensor_frame.TensorFrameStepKind.prefill, prefill_metadata.step_kind);
+    try std.testing.expectEqual(@as(u64, 202), prefill_metadata.batch.entries[0].request_id);
+
+    var contiguous = [_]u8{0x5a} ** (@sizeOf(f32) * 8 * 3);
+    const host_image = hostActivationByteImage(&prefill_metadata, contiguous[0..]);
+    const device_image = deviceActivationByteImage(&prefill_metadata);
+    try std.testing.expectEqual(boundary_byte_image.BoundaryByteImageReadiness.host_readable_now, host_image.readiness);
+    try std.testing.expectEqual(boundary_byte_image.BoundaryByteImageReadiness.device_download_required, device_image.readiness);
+
+    const contract = try buildActivationTransportContract(&fixture.placement, &prefill_metadata, &host_image, false, false);
+    try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.copy_in_process, contract.decision.mode);
+    try std.testing.expectEqual(stage_transport.StageTransportActivationScope.single_entry_header, contract.envelope.activation_scope.?);
+}
+
 test "executeLocalStageBoundary rejects boundary execution for one stage runner" {
     const allocator = std.testing.allocator;
     var single_fixture = try TestFixture.init(allocator, &.{}, .local_in_process, false);
@@ -1444,6 +2341,112 @@ test "executeLocalStageBoundary executes mock handoff through host staging and p
     try std.testing.expectEqual(@as(usize, 1), target_trace.execute_calls);
     try std.testing.expectEqual(@as(usize, 0), source_trace.deinit_calls);
     try std.testing.expectEqual(@as(usize, 0), target_trace.deinit_calls);
+}
+
+test "localStageAdapter executePreparedLocalStageBoundary executeLocalStageStepChain executes prepared bridge boundary" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
+    defer fixture.deinit();
+    var runner = try buildLocalStageRunnerPlanRef(allocator, .{
+        .stage_plan = &fixture.plan,
+        .tensor_frame_plan_ref = &fixture.plan_ref,
+        .placement_plan = &fixture.placement,
+    });
+    defer runner.deinit();
+
+    var source_trace = MockTrace{};
+    var target_trace = MockTrace{};
+    var source = MockStage{ .trace = &source_trace };
+    var target = MockStage{ .trace = &target_trace };
+    var payload = [_]u8{0x5a} ** (@sizeOf(f32) * 8);
+    const frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
+    const image = hostActivationByteImage(&frame, payload[0..]);
+
+    try executePreparedLocalStageBoundary(MockStage, MockStage, &source, &target, .{
+        .allocator = allocator,
+        .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
+        .step_kind = .decode,
+        .metadata = &frame,
+        .image = &image,
+        .allow_borrow = false,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), source_trace.execute_calls);
+    try std.testing.expectEqual(@as(usize, 1), source_trace.synchronize_calls);
+    try std.testing.expectEqual(@as(usize, 0), source_trace.download_calls);
+    try std.testing.expectEqual(@as(usize, 1), target_trace.upload_calls);
+    try std.testing.expectEqual(@as(usize, 1), target_trace.execute_calls);
+}
+
+test "captureLocalStageExecutionFailure records staged cleanup metadata and preserves source error" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
+    defer fixture.deinit();
+    var frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
+
+    var report = try captureLocalStageExecutionFailure(allocator, .{
+        .placement_plan = &fixture.placement,
+        .metadata = &frame,
+        .active_stage_id = 1,
+        .source_error = error.StageExecutionFailed,
+    });
+    defer report.deinit();
+
+    try std.testing.expectEqual(error.StageExecutionFailed, report.source_error);
+    try std.testing.expectEqual(@as(usize, 1), report.entries.len);
+    const entry = report.entries[0];
+    try std.testing.expectEqual(staged_error.StagedFailureKind.stage_execution_failed, entry.primary_failure.kind);
+    try std.testing.expectEqual(staged_error.StagedFailurePhase.stage_execution_after_state_mutation, entry.primary_failure.phase);
+    try std.testing.expectEqual(staged_error.StagedFailureScope.stage, entry.primary_failure.scope);
+    try std.testing.expectEqual(@as(usize, 1), entry.primary_failure.context.stage_id.?);
+    try std.testing.expectEqual(@as(usize, 1), entry.touched_stages.len);
+    try std.testing.expectEqual(@as(usize, 1), entry.touched_stages[0].stage_id);
+    try std.testing.expectEqual(staged_error.StagedFailureKind.stage_execution_failed, entry.error_report.primary_failure.kind);
+}
+
+test "preserveLocalStageExecutionError returns original stage error" {
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
+    defer fixture.deinit();
+    var frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
+
+    const err = preserveLocalStageExecutionError(null, .{
+        .placement_plan = &fixture.placement,
+        .metadata = &frame,
+        .active_stage_id = 0,
+        .source_error = error.RequestCancelled,
+    });
+    try std.testing.expectEqual(error.RequestCancelled, err);
+}
+
+test "executeLocalStageLayers reports failure metadata without replacing adapter error" {
+    const FailingStage = struct {
+        pub fn executeLayers(_: *@This(), _: []const u8, _: usize, _: usize) anyerror!void {
+            return error.RequestCancelled;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
+    defer fixture.deinit();
+    var frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
+    var stage = FailingStage{};
+
+    try std.testing.expectError(
+        error.RequestCancelled,
+        executeLocalStageLayers(
+            allocator,
+            null,
+            &fixture.placement,
+            &frame,
+            0,
+            FailingStage,
+            &stage,
+            &.{},
+            0,
+            2,
+        ),
+    );
 }
 
 test "executeLocalStageBoundary accepts three stage plans and executes nonzero producer boundary" {
