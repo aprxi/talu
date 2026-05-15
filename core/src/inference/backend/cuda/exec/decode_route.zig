@@ -10,7 +10,6 @@ const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
 const bridge = @import("../../../bridge/root.zig");
-const transport = @import("../../../transport/root.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 // --- Shared types from engine_types.zig ---
@@ -38,11 +37,6 @@ fn topologyModeTag(self: anytype) ?[]const u8 {
     return @tagName(self.topology_mode);
 }
 
-fn topologyModeIs(self: anytype, comptime expected: []const u8) bool {
-    const tag = topologyModeTag(self) orelse return false;
-    return std.mem.eql(u8, tag, expected);
-}
-
 fn rejectUnsupportedStagedBatchedDecodeRoute(topology_tag: ?[]const u8) !void {
     const tag = topology_tag orelse return;
     if (std.mem.eql(u8, tag, "pipeline2") or
@@ -67,7 +61,6 @@ const applyHostLogitsPostProcess = common.applyHostLogitsPostProcess;
 const executeCpuStage0LayerRange = common.executeCpuStage0LayerRange;
 const localActivationByteCountFor = common.localActivationByteCountFor;
 const logDecodeInventoryOnce = common.logDecodeInventoryOnce;
-const uploadCpuKvToMirrors = transport.uploadCpuKvToCudaMirrors;
 const ensureKvCapacity = kv_capacity.ensureKvCapacity;
 const resetShortConvStates = resets.resetShortConvStates;
 const resetGatedDeltaStates = resets.resetGatedDeltaStates;
@@ -78,49 +71,6 @@ const DecodeBoundaryStageSide = enum {
     source,
     target,
 };
-
-fn executeLocalDecodeStageChain(
-    root_backend: anytype,
-    stages: []bridge.LocalStageChainStage,
-    boundaries: []const bridge.LocalStageChainBoundaryStep,
-) !void {
-    try bridge.executeLocalStageChain(.{
-        .allocator = stage_adapters.backendAllocator(root_backend),
-        .plan_ref = try stage_adapters.localTopologyRunnerPlanRef(root_backend),
-        .placement_plan = try stage_adapters.localTopologyPlacementPlan(root_backend),
-        .state_ownership_plan = stage_adapters.localTopologyStateOwnershipPlan(root_backend),
-        .stages = stages,
-        .boundaries = boundaries,
-    });
-}
-
-fn executeLocalDecodeBoundaryChain(
-    root_backend: anytype,
-    comptime Source: type,
-    comptime Target: type,
-    source: *Source,
-    target: *Target,
-    metadata: *const bridge.TensorFrameMetadata,
-    image: *const bridge.BoundaryByteImageRef,
-    staging: ?[]align(64) u8,
-    allow_borrow: bool,
-    local_peer_copy: bool,
-) !void {
-    var stages = [_]bridge.LocalStageChainStage{
-        bridge.localStageAdapter(Source, metadata.boundary.source_stage_id, source),
-        bridge.localStageAdapter(Target, metadata.boundary.target_stage_id, target),
-    };
-    const boundaries = [_]bridge.LocalStageChainBoundaryStep{.{
-        .boundary_index = metadata.boundary.boundary_index,
-        .step_kind = .decode,
-        .metadata = metadata,
-        .image = image,
-        .staging = staging,
-        .allow_borrow = allow_borrow,
-        .local_device_peer_copy_available = local_peer_copy,
-    }};
-    try executeLocalDecodeStageChain(root_backend, stages[0..], boundaries[0..]);
-}
 
 pub fn executeDecodeWithLayerLimit(
     self: anytype,
@@ -140,174 +90,16 @@ pub fn executeDecodeWithLayerLimit(
     use_preloaded_input: bool,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    if (comptime @hasDecl(SelfType, "localCudaStage1")) {
-        if (topologyModeIs(self, "pipeline2") and
-            layer_limit == self.block_runtime.blocks.len and
-            compute_logits and
-            !use_preloaded_input)
-        {
-            if (comptime @hasDecl(SelfType, "localActivationByteCount")) {
-                if (hidden_override == null and deepstack_layer_features_opt == null and deepstack_feature_index_opt == null) {
-                    var runtime_stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-                    if (runtime_stage1.state_descriptor_count > 0) {
-                        try runtime_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
-                    }
-                    runtime_stage1.activateKvSlot(slot_index);
-                    const runtime_activation_bytes = try localActivationByteCountFor(self);
-                    try runSingleTokenLocalCudaCudaDecode(
-                        self,
-                        runtime_stage1,
-                        token,
-                        position,
-                        slot_index,
-                        logits_out_opt,
-                        compute_logits,
-                        download_logits,
-                        ensure_kv_capacity,
-                        trace_seq_len_u32,
-                        trace_pos_offset,
-                        runtime_activation_bytes,
-                    );
-                    // In device-only decode mode, keep logits resident on stage1.
-                    // local-stage-aware token-selection/top-k extraction consumes
-                    // stage1 logits directly to avoid full-vocab stage1→host→stage0
-                    // copies on every token.
-                    return;
-                }
-            }
-            var stage1_deepstack_layer_features_opt: ?[]const []const f32 = null;
-            if (deepstack_layer_features_opt) |deepstack_layer_features| {
-                const split_layer = stage_adapters.localLayerOffset(self);
-                if (split_layer < deepstack_layer_features.len) {
-                    stage1_deepstack_layer_features_opt = deepstack_layer_features[split_layer..];
-                }
-            }
-            var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-            if (stage1.state_descriptor_count > 0) {
-                try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
-            }
-            stage1.activateKvSlot(slot_index);
-            try executeDecodeWithLayerLimit(
-                self,
-                token,
-                position,
-                slot_index,
-                null,
-                layer_limit,
-                false,
-                false,
-                ensure_kv_capacity,
-                trace_seq_len_u32,
-                trace_pos_offset,
-                hidden_override,
-                deepstack_layer_features_opt,
-                deepstack_feature_index_opt,
-                false,
-            );
-            const activation_bytes = try localActivationByteCountFor(self);
-            if (comptime @hasField(SelfType, "local_placement_plan")) {
-                const slot_indices_single = [_]usize{slot_index};
-                const positions_single = [_]usize{position};
-                try transportCudaDecodeActivationBoundary(
+    const local_pipeline_kind = if (layer_limit == self.block_runtime.blocks.len and compute_logits and !use_preloaded_input)
+        try stage_adapters.localPipelinePlacementKind(self)
+    else
+        null;
+    if (local_pipeline_kind) |placement_kind| {
+        switch (placement_kind) {
+            .cuda_cuda, .cpu_cuda, .cpu_cuda_cuda => {
+                try executeSingleTokenLocalDecodePipeline(
                     self,
-                    self,
-                    stage1,
-                    0,
-                    &slot_indices_single,
-                    &positions_single,
-                    activation_bytes,
-                    .source_event_target_stream,
-                );
-            } else {
-                return error.InvalidTopologyConfig;
-            }
-            try executeDecodeWithLayerLimit(
-                stage1,
-                token,
-                position,
-                slot_index,
-                logits_out_opt,
-                stage1.block_runtime.blocks.len,
-                compute_logits,
-                download_logits,
-                ensure_kv_capacity,
-                trace_seq_len_u32,
-                trace_pos_offset,
-                null,
-                stage1_deepstack_layer_features_opt,
-                deepstack_feature_index_opt,
-                true,
-            );
-            // In device-only decode mode, keep logits resident on stage1.
-            // local-stage-aware token-selection/top-k extraction consumes stage1
-            // logits directly.
-            return;
-        }
-    }
-    if (comptime @hasDecl(SelfType, "localCpuStage0") and
-        @hasDecl(SelfType, "localSplitLayer"))
-    {
-        if (comptime @hasDecl(SelfType, "localCudaStage1") and
-            @hasDecl(SelfType, "localSplitLayerStage2"))
-        {
-            if (topologyModeIs(self, "cpu_gpu_gpu") and
-                layer_limit == self.block_runtime.blocks.len and
-                compute_logits and
-                !use_preloaded_input)
-            {
-                if (hidden_override != null or deepstack_layer_features_opt != null or deepstack_feature_index_opt != null) {
-                    return error.InvalidTopologyConfig;
-                }
-                const stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-                var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-                const split_layer = self.localSplitLayer();
-                const split_layer_stage2 = self.localSplitLayerStage2();
-                if (split_layer == 0 or split_layer_stage2 <= split_layer) return error.InvalidTopologyConfig;
-                if (stage1.state_descriptor_count > 0) {
-                    try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
-                }
-                stage1.activateKvSlot(slot_index);
-                self.activateKvSlot(slot_index);
-                if (comptime @hasDecl(SelfType, "localActivationByteCount")) {
-                    const runtime_activation01_bytes = try localActivationByteCountFor(self);
-                    try runSingleTokenLocalCpuCudaCudaDecode(
-                        self,
-                        stage0,
-                        stage1,
-                        token,
-                        position,
-                        slot_index,
-                        logits_out_opt,
-                        compute_logits,
-                        download_logits,
-                        ensure_kv_capacity,
-                        trace_seq_len_u32,
-                        trace_pos_offset,
-                        runtime_activation01_bytes,
-                        runtime_activation01_bytes,
-                    );
-                    return;
-                }
-                return error.InvalidTopologyConfig;
-            }
-        }
-        if (topologyModeIs(self, "cpu_gpu") and
-            layer_limit == self.block_runtime.blocks.len and
-            compute_logits and
-            !use_preloaded_input)
-        {
-            if (hidden_override != null or deepstack_layer_features_opt != null or deepstack_feature_index_opt != null) {
-                return error.InvalidTopologyConfig;
-            }
-            const stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-            const split_layer = self.localSplitLayer();
-            if (split_layer == 0) return error.InvalidTopologyConfig;
-            if (comptime @hasDecl(SelfType, "localActivationByteCount")) {
-                self.activateKvSlot(slot_index);
-                const runtime_activation_bytes = try localActivationByteCountFor(self);
-                try runSingleTokenLocalCpuCudaDecode(
-                    self,
-                    stage0,
+                    placement_kind,
                     token,
                     position,
                     slot_index,
@@ -317,11 +109,13 @@ pub fn executeDecodeWithLayerLimit(
                     ensure_kv_capacity,
                     trace_seq_len_u32,
                     trace_pos_offset,
-                    runtime_activation_bytes,
+                    hidden_override,
+                    deepstack_layer_features_opt,
+                    deepstack_feature_index_opt,
                 );
                 return;
-            }
-            return error.InvalidTopologyConfig;
+            },
+            .generic_local_chain => return error.InvalidTopologyConfig,
         }
     }
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook")) {
@@ -1047,9 +841,7 @@ fn copySingleBatchedDecodeLogitsToOutput(self: anytype, logits_out_opt: ?[]f32, 
     }
 }
 
-fn runSingleTokenLocalCudaCudaDecode(
-    self: anytype,
-    stage1_backend: anytype,
+fn decodeContext(
     token: u32,
     position: usize,
     slot_index: usize,
@@ -1059,427 +851,190 @@ fn runSingleTokenLocalCudaCudaDecode(
     ensure_kv_capacity: bool,
     trace_seq_len_u32: u32,
     trace_pos_offset: usize,
-    activation_byte_count: usize,
+) stage_adapters.DecodeContext {
+    return .{
+        .token = token,
+        .position = position,
+        .slot_index = slot_index,
+        .logits_out_opt = logits_out_opt,
+        .compute_logits = compute_logits,
+        .download_logits = download_logits,
+        .ensure_kv_capacity = ensure_kv_capacity,
+        .trace_seq_len_u32 = trace_seq_len_u32,
+        .trace_pos_offset = trace_pos_offset,
+    };
+}
+
+fn stage1DeepstackFeatures(self: anytype, deepstack_layer_features_opt: ?[]const []const f32) ?[]const []const f32 {
+    const deepstack_layer_features = deepstack_layer_features_opt orelse return null;
+    const split_layer = stage_adapters.localLayerOffset(self);
+    if (split_layer >= deepstack_layer_features.len) return null;
+    return deepstack_layer_features[split_layer..];
+}
+
+fn executeSingleTokenLocalDecodePipeline(
+    self: anytype,
+    placement_kind: bridge.LocalPipelinePlacementKind,
+    token: u32,
+    position: usize,
+    slot_index: usize,
+    logits_out_opt: ?[]f32,
+    compute_logits: bool,
+    download_logits: bool,
+    ensure_kv_capacity: bool,
+    trace_seq_len_u32: u32,
+    trace_pos_offset: usize,
+    hidden_override: ?[]const f32,
+    deepstack_layer_features_opt: ?[]const []const f32,
+    deepstack_feature_index_opt: ?usize,
 ) !void {
-    const Stage0 = struct {
-        backend: @TypeOf(self),
-        target_backend: @TypeOf(stage1_backend),
-        ctx: *const stage_adapters.DecodeContext,
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasDecl(SelfType, "localActivationByteCount")) return error.InvalidTopologyConfig;
 
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-            try stage_adapters.executeCudaDecodeLayerRange(
+    var ctx = decodeContext(
+        token,
+        position,
+        slot_index,
+        logits_out_opt,
+        compute_logits,
+        download_logits,
+        ensure_kv_capacity,
+        trace_seq_len_u32,
+        trace_pos_offset,
+    );
+    const slot_indices = [_]usize{slot_index};
+    const positions = [_]usize{position};
+    const activation_bytes = try localActivationByteCountFor(self);
+
+    switch (placement_kind) {
+        .cuda_cuda => {
+            if (comptime !@hasDecl(SelfType, "localCudaStage1")) return error.InvalidTopologyConfig;
+            var stage1_backend = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
+            try mirrorDecodeStageDescriptorsFromRoot(stage1_backend, self, &slot_indices);
+            stage1_backend.activateKvSlot(slot_index);
+
+            const Stage0 = stage_adapters.CudaDecodeSourceStage(
+                @TypeOf(self),
+                @TypeOf(stage1_backend),
                 executeDecodeWithLayerLimit,
-                stage.backend,
-                stage.ctx,
-                layer_start,
-                layer_end,
-                null,
-                false,
-                false,
-                false,
-            );
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try transport.synchronizeCudaActivationBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try transport.uploadCudaActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-
-        pub fn peerCopyActivationToErased(stage: *@This(), target_ptr: *anyopaque, byte_count: usize) anyerror!void {
-            _ = target_ptr;
-            try transport.peerCopyCudaActivation(
-                stage.backend,
-                stage.target_backend,
-                byte_count,
                 .source_event_target_stream,
             );
-        }
+            const Stage1 = stage_adapters.CudaDecodeTargetStage(@TypeOf(stage1_backend), executeDecodeWithLayerLimit);
+            const boundary0_ids = try stage_adapters.localBoundaryStageIds(self, 0);
+            var stage0 = Stage0{
+                .backend = self,
+                .target_backend = stage1_backend,
+                .ctx = &ctx,
+                .hidden_override = hidden_override,
+                .deepstack_layer_features_opt = deepstack_layer_features_opt,
+                .deepstack_feature_index_opt = deepstack_feature_index_opt,
+            };
+            var stage1 = Stage1{
+                .backend = stage1_backend,
+                .ctx = &ctx,
+                .deepstack_layer_features_opt = stage1DeepstackFeatures(self, deepstack_layer_features_opt),
+                .deepstack_feature_index_opt = deepstack_feature_index_opt,
+            };
+            var stages = [_]bridge.LocalStageChainStage{
+                bridge.localStageAdapter(Stage0, boundary0_ids.source_stage_id, &stage0),
+                bridge.localStageAdapter(Stage1, boundary0_ids.target_stage_id, &stage1),
+            };
+            const payload_specs = [_]stage_adapters.DecodeBoundaryPayloadSpec{.{
+                .boundary_index = 0,
+                .activation_byte_count = activation_bytes,
+                .location_hint = try stage_adapters.cudaPayloadLocationHint(self),
+                .image = .device,
+            }};
+            try stage_adapters.executeDecodeBoundaryPipeline(self, stages[0..], &slot_indices, &positions, payload_specs[0..]);
+        },
+        .cpu_cuda => {
+            if (hidden_override != null or deepstack_layer_features_opt != null or deepstack_feature_index_opt != null) {
+                return error.InvalidTopologyConfig;
+            }
+            if (comptime !@hasDecl(SelfType, "localCpuStage0") or !@hasDecl(SelfType, "localSplitLayer")) {
+                return error.InvalidTopologyConfig;
+            }
+            const stage0_backend = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
+            if (self.localSplitLayer() == 0) return error.InvalidTopologyConfig;
+            self.activateKvSlot(slot_index);
 
-        pub fn peerCopyHandlesStageSync(stage: *const @This()) bool {
-            return transport.peerCopyCudaActivationHandlesStageSync(stage.backend, .source_event_target_stream);
-        }
-    };
-    const Stage1 = struct {
-        backend: @TypeOf(stage1_backend),
-        ctx: *const stage_adapters.DecodeContext,
+            const Stage0 = stage_adapters.CpuDecodeSourceStage(@TypeOf(stage0_backend), @TypeOf(self));
+            const Stage1 = stage_adapters.CudaDecodeTargetStage(@TypeOf(self), executeDecodeWithLayerLimit);
+            const boundary0_ids = try stage_adapters.localBoundaryStageIds(self, 0);
+            var stage0 = Stage0{ .backend = stage0_backend, .gpu_backend = self, .ctx = &ctx };
+            var stage1 = Stage1{ .backend = self, .ctx = &ctx };
+            var stages = [_]bridge.LocalStageChainStage{
+                bridge.localStageAdapter(Stage0, boundary0_ids.source_stage_id, &stage0),
+                bridge.localStageAdapter(Stage1, boundary0_ids.target_stage_id, &stage1),
+            };
+            const cpu_activation = stage0_backend.slotActivationBytes(slot_index);
+            const payload_specs = [_]stage_adapters.DecodeBoundaryPayloadSpec{.{
+                .boundary_index = 0,
+                .activation_byte_count = activation_bytes,
+                .location_hint = .{ .cpu = {} },
+                .image = .{ .host_bytes = cpu_activation },
+                .local_device_peer_copy_available = false,
+            }};
+            try stage_adapters.executeDecodeBoundaryPipeline(self, stages[0..], &slot_indices, &positions, payload_specs[0..]);
+        },
+        .cpu_cuda_cuda => {
+            if (hidden_override != null or deepstack_layer_features_opt != null or deepstack_feature_index_opt != null) {
+                return error.InvalidTopologyConfig;
+            }
+            if (comptime !@hasDecl(SelfType, "localCpuStage0") or
+                !@hasDecl(SelfType, "localCudaStage1") or
+                !@hasDecl(SelfType, "localSplitLayer") or
+                !@hasDecl(SelfType, "localSplitLayerStage2"))
+            {
+                return error.InvalidTopologyConfig;
+            }
+            const stage0_backend = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
+            var stage1_backend = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
+            const split_layer = self.localSplitLayer();
+            const split_layer_stage2 = self.localSplitLayerStage2();
+            if (split_layer == 0 or split_layer_stage2 <= split_layer) return error.InvalidTopologyConfig;
+            try mirrorDecodeStageDescriptorsFromRoot(stage1_backend, self, &slot_indices);
+            stage1_backend.activateKvSlot(slot_index);
+            self.activateKvSlot(slot_index);
 
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-            try stage_adapters.executeCudaDecodeLayerRange(
+            const Stage0 = stage_adapters.CpuDecodeSourceStage(@TypeOf(stage0_backend), @TypeOf(stage1_backend));
+            const Stage1 = stage_adapters.CudaDecodeSourceStage(
+                @TypeOf(stage1_backend),
+                @TypeOf(self),
                 executeDecodeWithLayerLimit,
-                stage.backend,
-                stage.ctx,
-                layer_start,
-                layer_end,
-                stage.ctx.logits_out_opt,
-                stage.ctx.compute_logits,
-                stage.ctx.download_logits,
-                true,
-            );
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try transport.synchronizeCudaActivationBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try transport.uploadCudaActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-    };
-    var ctx = stage_adapters.DecodeContext{
-        .token = token,
-        .position = position,
-        .slot_index = slot_index,
-        .logits_out_opt = logits_out_opt,
-        .compute_logits = compute_logits,
-        .download_logits = download_logits,
-        .ensure_kv_capacity = ensure_kv_capacity,
-        .trace_seq_len_u32 = trace_seq_len_u32,
-        .trace_pos_offset = trace_pos_offset,
-    };
-    const slot_indices = [_]usize{slot_index};
-    const positions = [_]usize{position};
-    var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
-    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
-    const metadata = try stage_adapters.buildDecodeActivationMetadata(
-        self,
-        boundary0.boundary_index,
-        boundary0.dtype,
-        boundary0.layout,
-        try stage_adapters.cudaPayloadLocationHint(self),
-        &slot_indices,
-        &positions,
-        batch_entries[0..],
-    );
-    try bridge.validatePayloadBufferLength(&metadata, activation_byte_count);
-    const image = bridge.deviceActivationByteImage(&metadata);
-    var stage0 = Stage0{ .backend = self, .target_backend = stage1_backend, .ctx = &ctx };
-    var stage1 = Stage1{ .backend = stage1_backend, .ctx = &ctx };
-    try executeLocalDecodeBoundaryChain(
-        self,
-        Stage0,
-        Stage1,
-        &stage0,
-        &stage1,
-        &metadata,
-        &image,
-        boundary0.staging,
-        false,
-        boundary0.local_device_peer_copy_available,
-    );
-}
-
-fn runSingleTokenLocalCpuCudaDecode(
-    self: anytype,
-    cpu_stage0_backend: anytype,
-    token: u32,
-    position: usize,
-    slot_index: usize,
-    logits_out_opt: ?[]f32,
-    compute_logits: bool,
-    download_logits: bool,
-    ensure_kv_capacity: bool,
-    trace_seq_len_u32: u32,
-    trace_pos_offset: usize,
-    activation_byte_count: usize,
-) !void {
-    const Stage0 = struct {
-        backend: @TypeOf(cpu_stage0_backend),
-        gpu_backend: @TypeOf(self),
-        ctx: *const stage_adapters.DecodeContext,
-
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-            try stage_adapters.executeCpuDecodeLayerRange(stage.backend, stage.ctx, layer_start, layer_end, false);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try uploadCpuKvToMirrors(stage.gpu_backend, stage.backend, stage.ctx.slot_index, stage.ctx.position, 1);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadHostSlotActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
-            return error.InvalidTopologyConfig;
-        }
-    };
-    const Stage1 = struct {
-        backend: @TypeOf(self),
-        ctx: *const stage_adapters.DecodeContext,
-
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-            try stage_adapters.executeCudaDecodeLayerRange(
-                executeDecodeWithLayerLimit,
-                stage.backend,
-                stage.ctx,
-                layer_start,
-                layer_end,
-                stage.ctx.logits_out_opt,
-                stage.ctx.compute_logits,
-                stage.ctx.download_logits,
-                true,
-            );
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try transport.synchronizeCudaActivationBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try transport.uploadCudaActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-    };
-    var ctx = stage_adapters.DecodeContext{
-        .token = token,
-        .position = position,
-        .slot_index = slot_index,
-        .logits_out_opt = logits_out_opt,
-        .compute_logits = compute_logits,
-        .download_logits = download_logits,
-        .ensure_kv_capacity = ensure_kv_capacity,
-        .trace_seq_len_u32 = trace_seq_len_u32,
-        .trace_pos_offset = trace_pos_offset,
-    };
-    const slot_indices = [_]usize{slot_index};
-    const positions = [_]usize{position};
-    var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
-    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
-    const metadata = try stage_adapters.buildDecodeActivationMetadata(
-        self,
-        boundary0.boundary_index,
-        boundary0.dtype,
-        boundary0.layout,
-        .{ .cpu = {} },
-        &slot_indices,
-        &positions,
-        batch_entries[0..],
-    );
-    try bridge.validatePayloadBufferLength(&metadata, activation_byte_count);
-    const cpu_activation = cpu_stage0_backend.slotActivationBytes(slot_index);
-    if (activation_byte_count > cpu_activation.len) return error.InvalidArgument;
-    const image = bridge.hostActivationByteImage(&metadata, cpu_activation[0..activation_byte_count]);
-    var stage0 = Stage0{ .backend = cpu_stage0_backend, .gpu_backend = self, .ctx = &ctx };
-    var stage1 = Stage1{ .backend = self, .ctx = &ctx };
-    try executeLocalDecodeBoundaryChain(
-        self,
-        Stage0,
-        Stage1,
-        &stage0,
-        &stage1,
-        &metadata,
-        &image,
-        boundary0.staging,
-        false,
-        boundary0.local_device_peer_copy_available,
-    );
-}
-
-fn runSingleTokenLocalCpuCudaCudaDecode(
-    self: anytype,
-    cpu_stage0_backend: anytype,
-    gpu_stage1_backend: anytype,
-    token: u32,
-    position: usize,
-    slot_index: usize,
-    logits_out_opt: ?[]f32,
-    compute_logits: bool,
-    download_logits: bool,
-    ensure_kv_capacity: bool,
-    trace_seq_len_u32: u32,
-    trace_pos_offset: usize,
-    activation01_byte_count: usize,
-    activation12_byte_count: usize,
-) !void {
-    const Stage0 = struct {
-        backend: @TypeOf(cpu_stage0_backend),
-        gpu_backend: @TypeOf(gpu_stage1_backend),
-        ctx: *const stage_adapters.DecodeContext,
-
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-            try stage_adapters.executeCpuDecodeLayerRange(stage.backend, stage.ctx, layer_start, layer_end, false);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try uploadCpuKvToMirrors(stage.gpu_backend, stage.backend, stage.ctx.slot_index, stage.ctx.position, 1);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadHostSlotActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
-            return error.InvalidTopologyConfig;
-        }
-    };
-    const Stage1 = struct {
-        backend: @TypeOf(gpu_stage1_backend),
-        target_backend: @TypeOf(self),
-        ctx: *const stage_adapters.DecodeContext,
-
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-            try stage_adapters.executeCudaDecodeLayerRange(
-                executeDecodeWithLayerLimit,
-                stage.backend,
-                stage.ctx,
-                layer_start,
-                layer_end,
-                null,
-                false,
-                false,
-                true,
-            );
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try transport.synchronizeCudaActivationBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try transport.uploadCudaActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-
-        pub fn peerCopyActivationToErased(stage: *@This(), target_ptr: *anyopaque, byte_count: usize) anyerror!void {
-            _ = target_ptr;
-            try transport.peerCopyCudaActivation(
-                stage.backend,
-                stage.target_backend,
-                byte_count,
                 .source_stream,
             );
-        }
-
-        pub fn peerCopyHandlesStageSync(_: *const @This()) bool {
-            return false;
-        }
-    };
-    const Stage2 = struct {
-        backend: @TypeOf(self),
-        ctx: *const stage_adapters.DecodeContext,
-
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-            try stage_adapters.executeCudaDecodeLayerRange(
-                executeDecodeWithLayerLimit,
-                stage.backend,
-                stage.ctx,
-                layer_start,
-                layer_end,
-                stage.ctx.logits_out_opt,
-                stage.ctx.compute_logits,
-                stage.ctx.download_logits,
-                true,
-            );
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try transport.synchronizeCudaActivationBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try transport.uploadCudaActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-    };
-    var ctx = stage_adapters.DecodeContext{
-        .token = token,
-        .position = position,
-        .slot_index = slot_index,
-        .logits_out_opt = logits_out_opt,
-        .compute_logits = compute_logits,
-        .download_logits = download_logits,
-        .ensure_kv_capacity = ensure_kv_capacity,
-        .trace_seq_len_u32 = trace_seq_len_u32,
-        .trace_pos_offset = trace_pos_offset,
-    };
-    const slot_indices = [_]usize{slot_index};
-    const positions = [_]usize{position};
-    var batch_entries01: [1]bridge.TensorFrameBatchEntry = undefined;
-    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
-    const metadata01 = try stage_adapters.buildDecodeActivationMetadata(
-        self,
-        boundary0.boundary_index,
-        boundary0.dtype,
-        boundary0.layout,
-        .{ .cpu = {} },
-        &slot_indices,
-        &positions,
-        batch_entries01[0..],
-    );
-    var batch_entries12: [1]bridge.TensorFrameBatchEntry = undefined;
-    const boundary1 = try stage_adapters.localBoundaryRuntime(self, 1);
-    const metadata12 = try stage_adapters.buildDecodeActivationMetadata(
-        self,
-        boundary1.boundary_index,
-        boundary1.dtype,
-        boundary1.layout,
-        try stage_adapters.cudaPayloadLocationHint(gpu_stage1_backend),
-        &slot_indices,
-        &positions,
-        batch_entries12[0..],
-    );
-    try bridge.validatePayloadBufferLength(&metadata01, activation01_byte_count);
-    try bridge.validatePayloadBufferLength(&metadata12, activation12_byte_count);
-    const cpu_activation = cpu_stage0_backend.slotActivationBytes(slot_index);
-    if (activation01_byte_count > cpu_activation.len) return error.InvalidArgument;
-    const image01 = bridge.hostActivationByteImage(&metadata01, cpu_activation[0..activation01_byte_count]);
-    const image12 = bridge.deviceActivationByteImage(&metadata12);
-    var stage0 = Stage0{ .backend = cpu_stage0_backend, .gpu_backend = gpu_stage1_backend, .ctx = &ctx };
-    var stage1 = Stage1{ .backend = gpu_stage1_backend, .target_backend = self, .ctx = &ctx };
-    var stage2 = Stage2{ .backend = self, .ctx = &ctx };
-    var stages = [_]bridge.LocalStageChainStage{
-        bridge.localStageAdapter(Stage0, metadata01.boundary.source_stage_id, &stage0),
-        bridge.localStageAdapter(Stage1, metadata01.boundary.target_stage_id, &stage1),
-        bridge.localStageAdapter(Stage2, metadata12.boundary.target_stage_id, &stage2),
-    };
-    const boundaries = [_]bridge.LocalStageChainBoundaryStep{
-        .{
-            .boundary_index = 0,
-            .step_kind = .decode,
-            .metadata = &metadata01,
-            .image = &image01,
-            .staging = boundary0.staging,
-            .allow_borrow = false,
-            .local_device_peer_copy_available = boundary0.local_device_peer_copy_available,
+            const Stage2 = stage_adapters.CudaDecodeTargetStage(@TypeOf(self), executeDecodeWithLayerLimit);
+            const boundary0_ids = try stage_adapters.localBoundaryStageIds(self, 0);
+            const boundary1_ids = try stage_adapters.localBoundaryStageIds(self, 1);
+            var stage0 = Stage0{ .backend = stage0_backend, .gpu_backend = stage1_backend, .ctx = &ctx };
+            var stage1 = Stage1{ .backend = stage1_backend, .target_backend = self, .ctx = &ctx, .use_preloaded_input = true };
+            var stage2 = Stage2{ .backend = self, .ctx = &ctx };
+            var stages = [_]bridge.LocalStageChainStage{
+                bridge.localStageAdapter(Stage0, boundary0_ids.source_stage_id, &stage0),
+                bridge.localStageAdapter(Stage1, boundary0_ids.target_stage_id, &stage1),
+                bridge.localStageAdapter(Stage2, boundary1_ids.target_stage_id, &stage2),
+            };
+            const cpu_activation = stage0_backend.slotActivationBytes(slot_index);
+            const payload_specs = [_]stage_adapters.DecodeBoundaryPayloadSpec{
+                .{
+                    .boundary_index = 0,
+                    .activation_byte_count = activation_bytes,
+                    .location_hint = .{ .cpu = {} },
+                    .image = .{ .host_bytes = cpu_activation },
+                    .local_device_peer_copy_available = false,
+                },
+                .{
+                    .boundary_index = 1,
+                    .activation_byte_count = activation_bytes,
+                    .location_hint = try stage_adapters.cudaPayloadLocationHint(stage1_backend),
+                    .image = .device,
+                },
+            };
+            try stage_adapters.executeDecodeBoundaryPipeline(self, stages[0..], &slot_indices, &positions, payload_specs[0..]);
         },
-        .{
-            .boundary_index = boundary1.boundary_index,
-            .step_kind = .decode,
-            .metadata = &metadata12,
-            .image = &image12,
-            .staging = boundary1.staging,
-            .allow_borrow = false,
-            .local_device_peer_copy_available = boundary1.local_device_peer_copy_available,
-        },
-    };
-    try executeLocalDecodeStageChain(self, stages[0..], boundaries[0..]);
+        .generic_local_chain => return error.InvalidTopologyConfig,
+    }
 }
 
 const BatchedDecodeExecutionPlan = struct {
@@ -1489,137 +1044,6 @@ const BatchedDecodeExecutionPlan = struct {
     emit_decode_summary: bool = true,
     summary_label_override: ?[]const u8 = null,
 };
-
-fn transportCudaDecodeActivationBoundary(
-    root_backend: anytype,
-    source_backend: anytype,
-    target_backend: anytype,
-    boundary_index: usize,
-    slot_indices: []const usize,
-    positions: []const usize,
-    activation_byte_count: usize,
-    comptime synchronization: transport.CudaPeerCopySynchronization,
-) !void {
-    const Source = transport.CudaPeerActivationStage(@TypeOf(source_backend), @TypeOf(target_backend), synchronization);
-    const Target = transport.CudaActivationStage(@TypeOf(target_backend));
-
-    var batch_entry_scratch = try stage_adapters.DecodeBatchEntryScratch.init(
-        stage_adapters.backendAllocator(root_backend),
-        slot_indices.len,
-    );
-    defer batch_entry_scratch.deinit();
-    const boundary = try stage_adapters.localBoundaryRuntime(root_backend, boundary_index);
-    const metadata = try stage_adapters.buildDecodeActivationMetadata(
-        root_backend,
-        boundary.boundary_index,
-        boundary.dtype,
-        boundary.layout,
-        try stage_adapters.cudaPayloadLocationHint(source_backend),
-        slot_indices,
-        positions,
-        batch_entry_scratch.slice(slot_indices.len),
-    );
-    try bridge.validatePayloadBufferLength(&metadata, activation_byte_count);
-    const image = bridge.deviceActivationByteImage(&metadata);
-    var source = Source{ .backend = source_backend, .target_backend = target_backend };
-    var target = Target{ .backend = target_backend };
-    try executeLocalDecodeBoundaryChain(
-        root_backend,
-        Source,
-        Target,
-        &source,
-        &target,
-        &metadata,
-        &image,
-        boundary.staging,
-        false,
-        boundary.local_device_peer_copy_available,
-    );
-}
-
-fn transportCpuDecodeSegmentsToGpu(
-    root_backend: anytype,
-    cpu_stage0: anytype,
-    gpu_target: anytype,
-    boundary_index: usize,
-    boundary_dtype: bridge.BoundaryDType,
-    boundary_layout: bridge.BoundaryLayout,
-    slot_indices: []const usize,
-    positions: []const usize,
-    host_segments: []const []const u8,
-    activation_byte_count: usize,
-    staging: ?[]align(64) u8,
-) !void {
-    const Source = struct {
-        backend: @TypeOf(cpu_stage0),
-        gpu_backend: @TypeOf(gpu_target),
-        slot_indices: []const usize,
-        positions: []const usize,
-
-        pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            for (stage.slot_indices, stage.positions) |slot_index, position| {
-                try uploadCpuKvToMirrors(stage.gpu_backend, stage.backend, slot_index, position, 1);
-            }
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            _ = stage;
-            _ = host_buf;
-            _ = byte_count;
-            return error.InvalidTopologyConfig;
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            _ = stage;
-            _ = host_buf;
-            _ = byte_count;
-            return error.InvalidTopologyConfig;
-        }
-    };
-    const Target = transport.CudaActivationStage(@TypeOf(gpu_target));
-
-    if (slot_indices.len != host_segments.len) return error.InvalidArgument;
-    var batch_entry_scratch = try stage_adapters.DecodeBatchEntryScratch.init(
-        stage_adapters.backendAllocator(root_backend),
-        slot_indices.len,
-    );
-    defer batch_entry_scratch.deinit();
-    const metadata = try stage_adapters.buildDecodeActivationMetadata(
-        root_backend,
-        boundary_index,
-        boundary_dtype,
-        boundary_layout,
-        .{ .cpu = {} },
-        slot_indices,
-        positions,
-        batch_entry_scratch.slice(slot_indices.len),
-    );
-    try bridge.validatePayloadBufferLength(&metadata, activation_byte_count);
-    const image = bridge.segmentedHostActivationByteImage(&metadata, host_segments);
-    var source = Source{
-        .backend = cpu_stage0,
-        .gpu_backend = gpu_target,
-        .slot_indices = slot_indices,
-        .positions = positions,
-    };
-    var target = Target{ .backend = gpu_target };
-    try executeLocalDecodeBoundaryChain(
-        root_backend,
-        Source,
-        Target,
-        &source,
-        &target,
-        &metadata,
-        &image,
-        staging,
-        false,
-        false,
-    );
-}
 
 fn preserveBatchedDecodeStageFailure(
     root_backend: anytype,
@@ -1658,330 +1082,125 @@ fn preserveBatchedDecodeStageFailure(
     });
 }
 
-fn computeBatchedDecodeLocalCudaCudaWithMode(
-    self: anytype,
-    tokens: []const u32,
-    slot_indices: []const usize,
-    positions: []const usize,
+fn elapsedNsSince(start_ns: i128) u64 {
+    const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
+    return if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+}
+
+fn batchedDecodeModeLabel(
+    placement_kind: bridge.LocalPipelinePlacementKind,
     output_mode: BatchedDecodeOutputMode,
-) !void {
-    const SelfType = @TypeOf(self.*);
-    if (comptime !@hasDecl(SelfType, "localCudaStage1")) {
-        return error.InvalidTopologyConfig;
-    }
-    var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-    const decode_summary_enabled = @import("env_pkg").getenv("TALU_CUDA_DECODE_SUMMARY") != null;
-    var decode_start_ns: i128 = 0;
-    if (decode_summary_enabled and comptime @hasDecl(SelfType, "beginNvfp4RouteWindow") and
-        @hasDecl(SelfType, "beginPhaseBudgetWindow"))
-    {
-        self.beginNvfp4RouteWindow();
-        self.beginPhaseBudgetWindow();
-        decode_start_ns = std.time.nanoTimestamp();
-    }
-    const ms_divisor = 1_000_000.0;
-    var stage0_compute_ns: u64 = 0;
-    var stage0_to_stage1_transfer_ns: u64 = 0;
-    var stage1_compute_ns: u64 = 0;
-    var host_logits_copy_ns: u64 = 0;
-    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
-
-    // Stage1 state descriptors mirror stage0 bindings per slot.
-    if (stage1.state_descriptor_count > 0 and comptime @hasDecl(@TypeOf(stage1.*), "mirrorSlotStateBlocksFrom")) {
-        for (slot_indices) |slot_idx| {
-            try stage1.mirrorSlotStateBlocksFrom(self, slot_idx);
-        }
-    }
-    // Stage0: run decode layers only (no final norm/LM head).
-    const stage0_start_ns = std.time.nanoTimestamp();
-    computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, .device_only, .{
-        .allow_staged_internal_execution = true,
-        .use_preloaded_input = false,
-        .compute_logits = false,
-        .emit_decode_summary = false,
-    }) catch |err| {
-        return preserveBatchedDecodeStageFailure(
-            self,
-            boundary0.boundary_index,
-            boundary0.dtype,
-            boundary0.layout,
-            stage_adapters.cudaPayloadLocationHint(self) catch null,
-            slot_indices,
-            positions,
-            .source,
-            err,
-        );
-    };
-    if (decode_summary_enabled) {
-        // Stage0 decode work is stream-async; force completion so timing reflects
-        // actual stage0 compute instead of deferred wait in later stages.
-        try self.device.synchronize();
-    }
-    {
-        const elapsed_i128 = std.time.nanoTimestamp() - stage0_start_ns;
-        stage0_compute_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
-    }
-
-    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
-    const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
-    const transfer_start_ns = std.time.nanoTimestamp();
-    try transportCudaDecodeActivationBoundary(
-        self,
-        self,
-        stage1,
-        0,
-        slot_indices,
-        positions,
-        transfer_bytes,
-        .source_event_target_stream,
-    );
-    if (decode_summary_enabled) {
-        // Isolate P2P transfer completion from downstream stage1 compute.
-        try self.device.synchronize();
-        try stage1.device.synchronize();
-    }
-    {
-        const elapsed_i128 = std.time.nanoTimestamp() - transfer_start_ns;
-        stage0_to_stage1_transfer_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
-    }
-
-    // Stage1: consume transferred activations and complete decode.
-    const stage1_start_ns = std.time.nanoTimestamp();
-    computeBatchedDecodeLogitsWithPlan(stage1, tokens, slot_indices, positions, output_mode, .{
-        .allow_staged_internal_execution = true,
-        .use_preloaded_input = true,
-        .compute_logits = true,
-        .emit_decode_summary = false,
-        .summary_label_override = switch (output_mode) {
+) []const u8 {
+    return switch (placement_kind) {
+        .cuda_cuda => switch (output_mode) {
             .host_logits => "decode_pipeline2",
             .device_only => "decode_device_only_pipeline2",
         },
-    }) catch |err| {
-        return preserveBatchedDecodeStageFailure(
-            self,
-            boundary0.boundary_index,
-            boundary0.dtype,
-            boundary0.layout,
-            stage_adapters.cudaPayloadLocationHint(self) catch null,
-            slot_indices,
-            positions,
-            .target,
-            err,
-        );
-    };
-    if (decode_summary_enabled) {
-        // Stage1 includes the final logits projection and download; synchronize to
-        // prevent any deferred device work from leaking into host copy timing.
-        try stage1.device.synchronize();
-    }
-    {
-        const elapsed_i128 = std.time.nanoTimestamp() - stage1_start_ns;
-        stage1_compute_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
-    }
-
-    // decodeBatch() reads host logits from the root backend. Mirror stage1 rows.
-    if (output_mode == .host_logits) {
-        const host_copy_start_ns = std.time.nanoTimestamp();
-        const src_vocab = stage1.runtime_buffers.projected_vocab;
-        const dst_vocab = self.runtime_buffers.projected_vocab;
-        if (src_vocab == 0 or dst_vocab == 0) return;
-        const rows = tokens.len;
-        for (0..rows) |row| {
-            const src_row_start = std.math.mul(usize, row, src_vocab) catch continue;
-            const src_row_end = std.math.add(usize, src_row_start, src_vocab) catch continue;
-            const dst_row_start = std.math.mul(usize, row, dst_vocab) catch continue;
-            const dst_row_end = std.math.add(usize, dst_row_start, dst_vocab) catch continue;
-            if (src_row_end > stage1.runtime_buffers.projected_logits_batch_host.len or
-                dst_row_end > self.runtime_buffers.projected_logits_batch_host.len)
-            {
-                continue;
-            }
-            const src_row = stage1.runtime_buffers.projected_logits_batch_host[src_row_start..src_row_end];
-            const dst_row = self.runtime_buffers.projected_logits_batch_host[dst_row_start..dst_row_end];
-            @memset(dst_row, -1.0e9);
-            @memcpy(dst_row[0..@min(src_row.len, dst_row.len)], src_row[0..@min(src_row.len, dst_row.len)]);
-        }
-        const elapsed_i128 = std.time.nanoTimestamp() - host_copy_start_ns;
-        host_logits_copy_ns = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
-    }
-    if (decode_summary_enabled and comptime @hasDecl(SelfType, "logNvfp4RouteSummaryImpl") and
-        @hasDecl(SelfType, "logPhaseBudgetSummaryImpl"))
-    {
-        const decode_elapsed_i128 = std.time.nanoTimestamp() - decode_start_ns;
-        const decode_elapsed_ns: u64 = if (decode_elapsed_i128 > 0) @intCast(decode_elapsed_i128) else 0;
-        const mode_label = switch (output_mode) {
-            .host_logits => "decode_pipeline2",
-            .device_only => "decode_device_only_pipeline2",
-        };
-        logDecodeInventoryOnce(self, mode_label, tokens.len, tokens.len);
-        self.logNvfp4RouteSummaryImpl(mode_label, tokens.len);
-        self.logPhaseBudgetSummaryImpl(mode_label, tokens.len, decode_elapsed_ns);
-        const accounted_ns_u128: u128 = @as(u128, stage0_compute_ns) +
-            @as(u128, stage0_to_stage1_transfer_ns) +
-            @as(u128, stage1_compute_ns) +
-            @as(u128, host_logits_copy_ns);
-        const accounted_ns = saturatingU64FromU128(accounted_ns_u128);
-        const residual_ns: u64 = if (decode_elapsed_ns >= accounted_ns) decode_elapsed_ns - accounted_ns else 0;
-        log.warn("inference", "CUDA decode overhead summary", .{
-            .mode = mode_label,
-            .tokens = tokens.len,
-            .elapsed_ms = @as(f64, @floatFromInt(decode_elapsed_ns)) / ms_divisor,
-            .stage0_compute_ms = @as(f64, @floatFromInt(stage0_compute_ns)) / ms_divisor,
-            .stage0_to_stage1_transfer_ms = @as(f64, @floatFromInt(stage0_to_stage1_transfer_ns)) / ms_divisor,
-            .stage1_compute_ms = @as(f64, @floatFromInt(stage1_compute_ns)) / ms_divisor,
-            .host_logits_copy_ms = @as(f64, @floatFromInt(host_logits_copy_ns)) / ms_divisor,
-            .residual_ms = @as(f64, @floatFromInt(residual_ns)) / ms_divisor,
-        });
-    }
-}
-
-fn computeBatchedDecodeLocalCpuCudaWithMode(
-    self: anytype,
-    tokens: []const u32,
-    slot_indices: []const usize,
-    positions: []const usize,
-    output_mode: BatchedDecodeOutputMode,
-) !void {
-    const SelfType = @TypeOf(self.*);
-    if (comptime !@hasDecl(SelfType, "localCpuStage0")) {
-        return error.InvalidTopologyConfig;
-    }
-    const stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-    const split_layer = self.localSplitLayer();
-    if (split_layer == 0) return error.InvalidTopologyConfig;
-
-    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
-    try self.runtime_buffers.ensureRowCapacity(&self.device, tokens.len, self.fixed_alloc_mode);
-    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
-
-    var host_segment_scratch = try stage_adapters.HostSegmentScratch.init(
-        stage_adapters.backendAllocator(self),
-        tokens.len,
-    );
-    defer host_segment_scratch.deinit();
-    const host_segments = host_segment_scratch.slice(tokens.len);
-
-    // Prepare CPU stage0 activations per request row. The local transport
-    // executor uploads the segmented row slices after synchronizing CPU-owned
-    // boundary duties such as KV mirror upload.
-    for (0..tokens.len) |row_i| {
-        const token = tokens[row_i];
-        const slot_index = slot_indices[row_i];
-        const position = positions[row_i];
-        self.activateKvSlot(slot_index);
-        executeCpuStage0LayerRange(
-            stage0,
-            token,
-            position,
-            slot_index,
-            split_layer,
-            true,
-        ) catch |err| {
-            const row_slot_indices = [_]usize{slot_index};
-            const row_positions = [_]usize{position};
-            return preserveBatchedDecodeStageFailure(
-                self,
-                boundary0.boundary_index,
-                boundary0.dtype,
-                boundary0.layout,
-                .{ .cpu = {} },
-                &row_slot_indices,
-                &row_positions,
-                .source,
-                err,
-            );
-        };
-        const src_row = stage0.slotActivationBytes(slot_index);
-        if (src_row.len < row_bytes) return error.InvalidTopologyConfig;
-        host_segments[row_i] = src_row[0..row_bytes];
-    }
-
-    const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
-    try transportCpuDecodeSegmentsToGpu(
-        self,
-        stage0,
-        self,
-        boundary0.boundary_index,
-        boundary0.dtype,
-        boundary0.layout,
-        slot_indices,
-        positions,
-        host_segments,
-        transfer_bytes,
-        boundary0.staging,
-    );
-
-    computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{
-        .allow_staged_internal_execution = true,
-        .use_preloaded_input = true,
-        .compute_logits = true,
-        .emit_decode_summary = true,
-        .summary_label_override = switch (output_mode) {
+        .cpu_cuda => switch (output_mode) {
             .host_logits => "decode_cpu_gpu",
             .device_only => "decode_device_only_cpu_gpu",
         },
-    }) catch |err| {
-        return preserveBatchedDecodeStageFailure(
-            self,
-            boundary0.boundary_index,
-            boundary0.dtype,
-            boundary0.layout,
-            .{ .cpu = {} },
-            slot_indices,
-            positions,
-            .target,
-            err,
-        );
+        .cpu_cuda_cuda => switch (output_mode) {
+            .host_logits => "decode_cpu_gpu_gpu",
+            .device_only => "decode_device_only_cpu_gpu_gpu",
+        },
+        .generic_local_chain => "decode_local_chain",
     };
 }
 
-fn computeBatchedDecodeLocalCpuCudaCudaWithMode(
-    self: anytype,
+fn preserveDecodeBoundaryFailure(
+    root_backend: anytype,
+    boundary: stage_adapters.LocalBoundaryRuntimeView,
+    location_hint: ?bridge.TensorFramePayloadLocationHint,
+    slot_indices: []const usize,
+    positions: []const usize,
+    active_side: DecodeBoundaryStageSide,
+    source_error: anyerror,
+) anyerror {
+    return preserveBatchedDecodeStageFailure(
+        root_backend,
+        boundary.boundary_index,
+        boundary.dtype,
+        boundary.layout,
+        location_hint,
+        slot_indices,
+        positions,
+        active_side,
+        source_error,
+    );
+}
+
+fn mirrorDecodeStageDescriptorsFromRoot(stage_backend: anytype, root_backend: anytype, slot_indices: []const usize) !void {
+    const StageType = @TypeOf(stage_backend.*);
+    if (comptime @hasField(StageType, "state_descriptor_count") and @hasDecl(StageType, "mirrorSlotStateBlocksFrom")) {
+        if (stage_backend.state_descriptor_count > 0) {
+            for (slot_indices) |slot_idx| {
+                try stage_backend.mirrorSlotStateBlocksFrom(root_backend, slot_idx);
+            }
+        }
+    }
+}
+
+fn computeBatchedDecodeStageOrPreserve(
+    root_backend: anytype,
+    stage_backend: anytype,
+    boundary: stage_adapters.LocalBoundaryRuntimeView,
+    location_hint: ?bridge.TensorFramePayloadLocationHint,
+    slot_indices: []const usize,
+    positions: []const usize,
+    active_side: DecodeBoundaryStageSide,
+    tokens: []const u32,
+    output_mode: BatchedDecodeOutputMode,
+    plan: BatchedDecodeExecutionPlan,
+) !void {
+    computeBatchedDecodeLogitsWithPlan(stage_backend, tokens, slot_indices, positions, output_mode, plan) catch |err| {
+        return preserveDecodeBoundaryFailure(root_backend, boundary, location_hint, slot_indices, positions, active_side, err);
+    };
+}
+
+fn copyBatchedDecodeHostLogitsFromStage(root_backend: anytype, source_backend: anytype, rows: usize) !void {
+    const src_vocab = source_backend.runtime_buffers.projected_vocab;
+    const dst_vocab = root_backend.runtime_buffers.projected_vocab;
+    if (src_vocab == 0 or dst_vocab == 0) return;
+    for (0..rows) |row| {
+        const src_row_start = std.math.mul(usize, row, src_vocab) catch continue;
+        const src_row_end = std.math.add(usize, src_row_start, src_vocab) catch continue;
+        const dst_row_start = std.math.mul(usize, row, dst_vocab) catch continue;
+        const dst_row_end = std.math.add(usize, dst_row_start, dst_vocab) catch continue;
+        if (src_row_end > source_backend.runtime_buffers.projected_logits_batch_host.len or
+            dst_row_end > root_backend.runtime_buffers.projected_logits_batch_host.len)
+        {
+            continue;
+        }
+        const src_row = source_backend.runtime_buffers.projected_logits_batch_host[src_row_start..src_row_end];
+        const dst_row = root_backend.runtime_buffers.projected_logits_batch_host[dst_row_start..dst_row_end];
+        const copy_len = @min(src_row.len, dst_row.len);
+        @memset(dst_row, -1.0e9);
+        @memcpy(dst_row[0..copy_len], src_row[0..copy_len]);
+    }
+}
+
+fn prepareCpuBatchedDecodeSegments(
+    root_backend: anytype,
+    cpu_stage0: anytype,
+    comptime activate_intermediate: bool,
+    intermediate_backend: anytype,
+    boundary0: stage_adapters.LocalBoundaryRuntimeView,
     tokens: []const u32,
     slot_indices: []const usize,
     positions: []const usize,
-    output_mode: BatchedDecodeOutputMode,
+    split_layer: usize,
+    row_bytes: usize,
+    host_segments: [][]const u8,
 ) !void {
-    const SelfType = @TypeOf(self.*);
-    if (comptime !@hasDecl(SelfType, "localCpuStage0") or !@hasDecl(SelfType, "localCudaStage1")) {
-        return error.InvalidTopologyConfig;
-    }
-    const stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-    var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-    const split_layer = self.localSplitLayer();
-    const split_layer_stage2 = self.localSplitLayerStage2();
-    if (split_layer == 0 or split_layer_stage2 <= split_layer) return error.InvalidTopologyConfig;
-
-    // Stage1 descriptor bindings mirror stage2 bindings per slot.
-    if (stage1.state_descriptor_count > 0 and comptime @hasDecl(@TypeOf(stage1.*), "mirrorSlotStateBlocksFrom")) {
-        for (slot_indices) |slot_idx| {
-            try stage1.mirrorSlotStateBlocksFrom(self, slot_idx);
-        }
-    }
-
-    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
-    try stage1.runtime_buffers.ensureRowCapacity(&stage1.device, tokens.len, stage1.fixed_alloc_mode);
-    const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
-    const boundary1 = try stage_adapters.localBoundaryRuntime(self, 1);
-
-    var host_segment_scratch = try stage_adapters.HostSegmentScratch.init(
-        stage_adapters.backendAllocator(self),
-        tokens.len,
-    );
-    defer host_segment_scratch.deinit();
-    const host_segments = host_segment_scratch.slice(tokens.len);
-
-    // Prepare CPU stage0 activations per request row. The CPU-to-GPU local
-    // transport handoff uploads segmented row slices after the CPU source
-    // adapter synchronizes KV mirrors for the touched decode rows.
     for (0..tokens.len) |row_i| {
         const token = tokens[row_i];
         const slot_index = slot_indices[row_i];
         const position = positions[row_i];
-        stage1.activateKvSlot(slot_index);
-        self.activateKvSlot(slot_index);
+        if (activate_intermediate) intermediate_backend.activateKvSlot(slot_index);
+        root_backend.activateKvSlot(slot_index);
         executeCpuStage0LayerRange(
-            stage0,
+            cpu_stage0,
             token,
             position,
             slot_index,
@@ -1990,11 +1209,9 @@ fn computeBatchedDecodeLocalCpuCudaCudaWithMode(
         ) catch |err| {
             const row_slot_indices = [_]usize{slot_index};
             const row_positions = [_]usize{position};
-            return preserveBatchedDecodeStageFailure(
-                self,
-                boundary0.boundary_index,
-                boundary0.dtype,
-                boundary0.layout,
+            return preserveDecodeBoundaryFailure(
+                root_backend,
+                boundary0,
                 .{ .cpu = {} },
                 &row_slot_indices,
                 &row_positions,
@@ -2002,82 +1219,180 @@ fn computeBatchedDecodeLocalCpuCudaCudaWithMode(
                 err,
             );
         };
-        const src_row = stage0.slotActivationBytes(slot_index);
+        const src_row = cpu_stage0.slotActivationBytes(slot_index);
         if (src_row.len < row_bytes) return error.InvalidTopologyConfig;
         host_segments[row_i] = src_row[0..row_bytes];
     }
+}
 
-    const transfer01_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
-    try transportCpuDecodeSegmentsToGpu(
-        self,
-        stage0,
-        stage1,
-        boundary0.boundary_index,
-        boundary0.dtype,
-        boundary0.layout,
-        slot_indices,
-        positions,
-        host_segments,
-        transfer01_bytes,
-        boundary0.staging,
-    );
+fn computeBatchedDecodeLocalWithMode(
+    self: anytype,
+    placement_kind: bridge.LocalPipelinePlacementKind,
+    tokens: []const u32,
+    slot_indices: []const usize,
+    positions: []const usize,
+    output_mode: BatchedDecodeOutputMode,
+) !void {
+    const SelfType = @TypeOf(self.*);
+    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
 
-    // Stage1: decode layers only from preloaded rows.
-    computeBatchedDecodeLogitsWithPlan(stage1, tokens, slot_indices, positions, .device_only, .{
-        .allow_staged_internal_execution = true,
-        .use_preloaded_input = true,
-        .compute_logits = false,
-        .emit_decode_summary = false,
-    }) catch |err| {
-        return preserveBatchedDecodeStageFailure(
-            self,
-            boundary1.boundary_index,
-            boundary1.dtype,
-            boundary1.layout,
-            stage_adapters.cudaPayloadLocationHint(stage1) catch null,
-            slot_indices,
-            positions,
-            .source,
-            err,
-        );
-    };
+    switch (placement_kind) {
+        .cuda_cuda => {
+            if (comptime !@hasDecl(SelfType, "localCudaStage1")) return error.InvalidTopologyConfig;
+            var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
+            const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
+            const decode_summary_enabled = @import("env_pkg").getenv("TALU_CUDA_DECODE_SUMMARY") != null;
+            var decode_start_ns: i128 = 0;
+            if (decode_summary_enabled and comptime @hasDecl(SelfType, "beginNvfp4RouteWindow") and
+                @hasDecl(SelfType, "beginPhaseBudgetWindow"))
+            {
+                self.beginNvfp4RouteWindow();
+                self.beginPhaseBudgetWindow();
+                decode_start_ns = std.time.nanoTimestamp();
+            }
+            var stage0_compute_ns: u64 = 0;
+            var stage0_to_stage1_transfer_ns: u64 = 0;
+            var stage1_compute_ns: u64 = 0;
+            var host_logits_copy_ns: u64 = 0;
 
-    // Transfer stage1 output activations to stage2 (self).
-    const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
-    try transportCudaDecodeActivationBoundary(
-        self,
-        stage1,
-        self,
-        1,
-        slot_indices,
-        positions,
-        transfer_bytes,
-        .source_stream,
-    );
+            try mirrorDecodeStageDescriptorsFromRoot(stage1, self, slot_indices);
+            const stage0_start_ns = std.time.nanoTimestamp();
+            try computeBatchedDecodeStageOrPreserve(self, self, boundary0, stage_adapters.cudaPayloadLocationHint(self) catch null, slot_indices, positions, .source, tokens, .device_only, .{
+                .allow_staged_internal_execution = true,
+                .use_preloaded_input = false,
+                .compute_logits = false,
+                .emit_decode_summary = false,
+            });
+            if (decode_summary_enabled) try self.device.synchronize();
+            stage0_compute_ns = elapsedNsSince(stage0_start_ns);
 
-    // Stage2: final decode from preloaded rows.
-    computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{
-        .allow_staged_internal_execution = true,
-        .use_preloaded_input = true,
-        .compute_logits = true,
-        .emit_decode_summary = true,
-        .summary_label_override = switch (output_mode) {
-            .host_logits => "decode_cpu_gpu_gpu",
-            .device_only => "decode_device_only_cpu_gpu_gpu",
+            const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
+            const transfer_start_ns = std.time.nanoTimestamp();
+            try stage_adapters.executeCudaDecodeActivationBoundary(
+                self,
+                self,
+                stage1,
+                0,
+                slot_indices,
+                positions,
+                transfer_bytes,
+                .source_event_target_stream,
+            );
+            if (decode_summary_enabled) {
+                try self.device.synchronize();
+                try stage1.device.synchronize();
+            }
+            stage0_to_stage1_transfer_ns = elapsedNsSince(transfer_start_ns);
+
+            const stage1_start_ns = std.time.nanoTimestamp();
+            try computeBatchedDecodeStageOrPreserve(self, stage1, boundary0, stage_adapters.cudaPayloadLocationHint(self) catch null, slot_indices, positions, .target, tokens, output_mode, .{
+                .allow_staged_internal_execution = true,
+                .use_preloaded_input = true,
+                .compute_logits = true,
+                .emit_decode_summary = false,
+                .summary_label_override = batchedDecodeModeLabel(.cuda_cuda, output_mode),
+            });
+            if (decode_summary_enabled) try stage1.device.synchronize();
+            stage1_compute_ns = elapsedNsSince(stage1_start_ns);
+
+            if (output_mode == .host_logits) {
+                const host_copy_start_ns = std.time.nanoTimestamp();
+                try copyBatchedDecodeHostLogitsFromStage(self, stage1, tokens.len);
+                host_logits_copy_ns = elapsedNsSince(host_copy_start_ns);
+            }
+            if (decode_summary_enabled and comptime @hasDecl(SelfType, "logNvfp4RouteSummaryImpl") and
+                @hasDecl(SelfType, "logPhaseBudgetSummaryImpl"))
+            {
+                const decode_elapsed_ns = elapsedNsSince(decode_start_ns);
+                const mode_label = batchedDecodeModeLabel(.cuda_cuda, output_mode);
+                logDecodeInventoryOnce(self, mode_label, tokens.len, tokens.len);
+                self.logNvfp4RouteSummaryImpl(mode_label, tokens.len);
+                self.logPhaseBudgetSummaryImpl(mode_label, tokens.len, decode_elapsed_ns);
+                const accounted_ns = saturatingU64FromU128(@as(u128, stage0_compute_ns) +
+                    @as(u128, stage0_to_stage1_transfer_ns) +
+                    @as(u128, stage1_compute_ns) +
+                    @as(u128, host_logits_copy_ns));
+                const residual_ns: u64 = if (decode_elapsed_ns >= accounted_ns) decode_elapsed_ns - accounted_ns else 0;
+                const ms_divisor = 1_000_000.0;
+                log.warn("inference", "CUDA decode overhead summary", .{
+                    .mode = mode_label,
+                    .tokens = tokens.len,
+                    .elapsed_ms = @as(f64, @floatFromInt(decode_elapsed_ns)) / ms_divisor,
+                    .stage0_compute_ms = @as(f64, @floatFromInt(stage0_compute_ns)) / ms_divisor,
+                    .stage0_to_stage1_transfer_ms = @as(f64, @floatFromInt(stage0_to_stage1_transfer_ns)) / ms_divisor,
+                    .stage1_compute_ms = @as(f64, @floatFromInt(stage1_compute_ns)) / ms_divisor,
+                    .host_logits_copy_ms = @as(f64, @floatFromInt(host_logits_copy_ns)) / ms_divisor,
+                    .residual_ms = @as(f64, @floatFromInt(residual_ns)) / ms_divisor,
+                });
+            }
         },
-    }) catch |err| {
-        return preserveBatchedDecodeStageFailure(
-            self,
-            boundary1.boundary_index,
-            boundary1.dtype,
-            boundary1.layout,
-            stage_adapters.cudaPayloadLocationHint(stage1) catch null,
-            slot_indices,
-            positions,
-            .target,
-            err,
-        );
-    };
+        .cpu_cuda => {
+            if (comptime !@hasDecl(SelfType, "localCpuStage0") or !@hasDecl(SelfType, "localSplitLayer")) {
+                return error.InvalidTopologyConfig;
+            }
+            const stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
+            const split_layer = self.localSplitLayer();
+            if (split_layer == 0) return error.InvalidTopologyConfig;
+            try self.runtime_buffers.ensureRowCapacity(&self.device, tokens.len, self.fixed_alloc_mode);
+            const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
+            var host_segment_scratch = try stage_adapters.HostSegmentScratch.init(stage_adapters.backendAllocator(self), tokens.len);
+            defer host_segment_scratch.deinit();
+            const host_segments = host_segment_scratch.slice(tokens.len);
+            try prepareCpuBatchedDecodeSegments(self, stage0, false, self, boundary0, tokens, slot_indices, positions, split_layer, row_bytes, host_segments);
+
+            const transfer_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
+            try stage_adapters.executeCpuSegmentedDecodeActivationBoundary(self, stage0, self, 0, slot_indices, positions, host_segments, transfer_bytes);
+            try computeBatchedDecodeStageOrPreserve(self, self, boundary0, .{ .cpu = {} }, slot_indices, positions, .target, tokens, output_mode, .{
+                .allow_staged_internal_execution = true,
+                .use_preloaded_input = true,
+                .compute_logits = true,
+                .emit_decode_summary = true,
+                .summary_label_override = batchedDecodeModeLabel(.cpu_cuda, output_mode),
+            });
+        },
+        .cpu_cuda_cuda => {
+            if (comptime !@hasDecl(SelfType, "localCpuStage0") or
+                !@hasDecl(SelfType, "localCudaStage1") or
+                !@hasDecl(SelfType, "localSplitLayer") or
+                !@hasDecl(SelfType, "localSplitLayerStage2"))
+            {
+                return error.InvalidTopologyConfig;
+            }
+            const stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
+            var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
+            const split_layer = self.localSplitLayer();
+            const split_layer_stage2 = self.localSplitLayerStage2();
+            if (split_layer == 0 or split_layer_stage2 <= split_layer) return error.InvalidTopologyConfig;
+            try mirrorDecodeStageDescriptorsFromRoot(stage1, self, slot_indices);
+            try stage1.runtime_buffers.ensureRowCapacity(&stage1.device, tokens.len, stage1.fixed_alloc_mode);
+            const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
+            const boundary1 = try stage_adapters.localBoundaryRuntime(self, 1);
+            var host_segment_scratch = try stage_adapters.HostSegmentScratch.init(stage_adapters.backendAllocator(self), tokens.len);
+            defer host_segment_scratch.deinit();
+            const host_segments = host_segment_scratch.slice(tokens.len);
+            try prepareCpuBatchedDecodeSegments(self, stage0, true, stage1, boundary0, tokens, slot_indices, positions, split_layer, row_bytes, host_segments);
+
+            const transfer01_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
+            try stage_adapters.executeCpuSegmentedDecodeActivationBoundary(self, stage0, stage1, 0, slot_indices, positions, host_segments, transfer01_bytes);
+            try computeBatchedDecodeStageOrPreserve(self, stage1, boundary1, stage_adapters.cudaPayloadLocationHint(stage1) catch null, slot_indices, positions, .source, tokens, .device_only, .{
+                .allow_staged_internal_execution = true,
+                .use_preloaded_input = true,
+                .compute_logits = false,
+                .emit_decode_summary = false,
+            });
+
+            const transfer12_bytes = std.math.mul(usize, tokens.len, row_bytes) catch return error.InvalidArgument;
+            try stage_adapters.executeCudaDecodeActivationBoundary(self, stage1, self, 1, slot_indices, positions, transfer12_bytes, .source_stream);
+            try computeBatchedDecodeStageOrPreserve(self, self, boundary1, stage_adapters.cudaPayloadLocationHint(stage1) catch null, slot_indices, positions, .target, tokens, output_mode, .{
+                .allow_staged_internal_execution = true,
+                .use_preloaded_input = true,
+                .compute_logits = true,
+                .emit_decode_summary = true,
+                .summary_label_override = batchedDecodeModeLabel(.cpu_cuda_cuda, output_mode),
+            });
+        },
+        .generic_local_chain => return error.InvalidTopologyConfig,
+    }
 }
 
 fn computeBatchedDecodeLogitsWithMode(
@@ -2088,6 +1403,13 @@ fn computeBatchedDecodeLogitsWithMode(
     output_mode: BatchedDecodeOutputMode,
 ) !void {
     const SelfType = @TypeOf(self.*);
+    if (try stage_adapters.localPipelinePlacementKind(self)) |placement_kind| {
+        if (comptime @hasField(SelfType, "device")) {
+            return computeBatchedDecodeLocalWithMode(self, placement_kind, tokens, slot_indices, positions, output_mode);
+        }
+        return error.InvalidTopologyConfig;
+    }
+    try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook")) {
         if (tokens.len != slot_indices.len or tokens.len != positions.len) return error.InvalidArgument;
         if (tokens.len == 0) return;
@@ -2128,26 +1450,6 @@ fn computeBatchedDecodeLogitsWithMode(
         }
         return;
     }
-    if (topologyModeIs(self, "pipeline2") and
-        comptime @hasField(SelfType, "device") and
-            @hasDecl(SelfType, "localCudaStage1"))
-    {
-        return computeBatchedDecodeLocalCudaCudaWithMode(self, tokens, slot_indices, positions, output_mode);
-    }
-    if (topologyModeIs(self, "cpu_gpu") and
-        comptime @hasField(SelfType, "device") and
-            @hasDecl(SelfType, "localCpuStage0"))
-    {
-        return computeBatchedDecodeLocalCpuCudaWithMode(self, tokens, slot_indices, positions, output_mode);
-    }
-    if (topologyModeIs(self, "cpu_gpu_gpu") and
-        comptime @hasField(SelfType, "device") and
-            @hasDecl(SelfType, "localCpuStage0") and
-            @hasDecl(SelfType, "localCudaStage1"))
-    {
-        return computeBatchedDecodeLocalCpuCudaCudaWithMode(self, tokens, slot_indices, positions, output_mode);
-    }
-    try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
     return computeBatchedDecodeLogitsWithPlan(self, tokens, slot_indices, positions, output_mode, .{});
 }
 

@@ -360,7 +360,7 @@ test "executeLocalStageChain uses peer copy when selected by bridge" {
     try std.testing.expectEqual(@as(usize, 0), trace_data.upload_calls);
 }
 
-test "executeLocalStageChain executes source handoff target in order" {
+test "executeLocalPipelineStep executes source handoff target in order" {
     const TraceStep = enum { stage0_execute, stage0_sync, stage1_upload, stage1_execute, stage1_sync, stage2_upload, stage2_execute };
     const Trace = struct {
         steps: [8]TraceStep = undefined,
@@ -386,21 +386,17 @@ test "executeLocalStageChain executes source handoff target in order" {
         bridge.localStageAdapter(Stage, metadata.boundary.source_stage_id, &stage0),
         bridge.localStageAdapter(Stage, metadata.boundary.target_stage_id, &stage1),
     };
-    const boundaries = [_]bridge.LocalStageChainBoundaryStep{.{
-        .boundary_index = 0,
-        .step_kind = .decode,
+    const boundary_payloads = [_]bridge.LocalPipelineBoundaryPayload{.{
         .metadata = &metadata,
         .image = &image,
-        .allow_borrow = false,
+        .runtime = .{ .allow_borrow = false },
     }};
 
-    try bridge.executeLocalStageChain(.{
+    try bridge.executeLocalPipelineStep(.{
         .allocator = std.testing.allocator,
         .plan_ref = &bundle.local_stage_runner_plan_ref.?,
         .placement_plan = placement,
-        .stages = &stages,
-        .boundaries = &boundaries,
-    });
+    }, &stages, &boundary_payloads, .decode, &.{});
 
     try std.testing.expectEqual(@as(usize, 4), trace_data.len);
     try std.testing.expectEqual(TraceStep.stage0_execute, trace_data.steps[0]);
@@ -409,7 +405,7 @@ test "executeLocalStageChain executes source handoff target in order" {
     try std.testing.expectEqual(TraceStep.stage1_execute, trace_data.steps[3]);
 }
 
-test "executeLocalStageChain executes both adjacent boundaries in order" {
+test "executeLocalPipelineStep executes both adjacent boundaries in order" {
     const TraceStep = enum { stage0_execute, stage0_sync, stage1_upload, stage1_execute, stage1_sync, stage2_upload, stage2_execute };
     const Trace = struct {
         steps: [10]TraceStep = undefined,
@@ -440,18 +436,16 @@ test "executeLocalStageChain executes both adjacent boundaries in order" {
         bridge.localStageAdapter(Stage, metadata01.boundary.target_stage_id, &stage1),
         bridge.localStageAdapter(Stage, metadata12.boundary.target_stage_id, &stage2),
     };
-    const boundaries = [_]bridge.LocalStageChainBoundaryStep{
-        .{ .boundary_index = 0, .step_kind = .decode, .metadata = &metadata01, .image = &image01, .allow_borrow = false },
-        .{ .boundary_index = 1, .step_kind = .decode, .metadata = &metadata12, .image = &image12, .allow_borrow = false },
+    const boundary_payloads = [_]bridge.LocalPipelineBoundaryPayload{
+        .{ .metadata = &metadata01, .image = &image01, .runtime = .{ .allow_borrow = false } },
+        .{ .metadata = &metadata12, .image = &image12, .runtime = .{ .allow_borrow = false } },
     };
 
-    try bridge.executeLocalStageChain(.{
+    try bridge.executeLocalPipelineStep(.{
         .allocator = std.testing.allocator,
         .plan_ref = &bundle.local_stage_runner_plan_ref.?,
         .placement_plan = placement,
-        .stages = &stages,
-        .boundaries = &boundaries,
-    });
+    }, &stages, &boundary_payloads, .decode, &.{});
 
     try std.testing.expectEqual(@as(usize, 7), trace_data.len);
     try std.testing.expectEqual(TraceStep.stage0_execute, trace_data.steps[0]);
@@ -463,7 +457,7 @@ test "executeLocalStageChain executes both adjacent boundaries in order" {
     try std.testing.expectEqual(TraceStep.stage2_execute, trace_data.steps[6]);
 }
 
-test "executeLocalStageChain stops before stage two when boundary zero fails" {
+test "executeLocalPipelineStep stops before stage two when boundary zero fails" {
     const TraceStep = enum { stage0_execute, stage0_sync, stage1_upload, stage1_execute, stage1_sync, stage2_upload, stage2_execute };
     const Trace = struct {
         steps: [8]TraceStep = undefined,
@@ -494,20 +488,18 @@ test "executeLocalStageChain stops before stage two when boundary zero fails" {
         bridge.localStageAdapter(Stage, metadata01.boundary.target_stage_id, &stage1),
         bridge.localStageAdapter(Stage, metadata12.boundary.target_stage_id, &stage2),
     };
-    const boundaries = [_]bridge.LocalStageChainBoundaryStep{
-        .{ .boundary_index = 0, .step_kind = .decode, .metadata = &metadata01, .image = &image01, .allow_borrow = false },
-        .{ .boundary_index = 1, .step_kind = .decode, .metadata = &metadata12, .image = &image12, .allow_borrow = false },
+    const boundary_payloads = [_]bridge.LocalPipelineBoundaryPayload{
+        .{ .metadata = &metadata01, .image = &image01, .runtime = .{ .allow_borrow = false } },
+        .{ .metadata = &metadata12, .image = &image12, .runtime = .{ .allow_borrow = false } },
     };
 
     try std.testing.expectError(
         error.AccessDenied,
-        bridge.executeLocalStageChain(.{
+        bridge.executeLocalPipelineStep(.{
             .allocator = std.testing.allocator,
             .plan_ref = &bundle.local_stage_runner_plan_ref.?,
             .placement_plan = placement,
-            .stages = &stages,
-            .boundaries = &boundaries,
-        }),
+        }, &stages, &boundary_payloads, .decode, &.{}),
     );
 
     try std.testing.expectEqual(@as(usize, 3), trace_data.len);

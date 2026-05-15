@@ -12,6 +12,7 @@ pub const state_ownership = @import("state_ownership.zig");
 pub const host_capability = @import("host_capability.zig");
 pub const staged_error = @import("staged_error.zig");
 pub const local_stage_runner = @import("local_stage_runner.zig");
+pub const local_pipeline = @import("local_pipeline.zig");
 pub const boundary_byte_image = @import("boundary_byte_image.zig");
 pub const stage_frame_header = @import("stage_frame_header.zig");
 pub const stage_byte_harness = @import("stage_byte_harness.zig");
@@ -56,6 +57,11 @@ pub const LocalStageChainBoundaryStep = local_stage_runner.LocalStageChainBounda
 pub const LocalStageChainRequest = local_stage_runner.LocalStageChainRequest;
 pub const LocalStageChainStage = local_stage_runner.LocalStageChainStage;
 pub const LocalStageChainStageVTable = local_stage_runner.LocalStageChainStageVTable;
+pub const LocalPipelineBoundaryPayload = local_pipeline.LocalPipelineBoundaryPayload;
+pub const LocalPipelineBoundaryRuntime = local_pipeline.LocalPipelineBoundaryRuntime;
+pub const LocalPipelineContext = local_pipeline.LocalPipelineContext;
+pub const LocalPipelinePlacementKind = local_pipeline.LocalPipelinePlacementKind;
+pub const LocalPipelineStageBinding = local_pipeline.LocalPipelineStageBinding;
 pub const LocalStageExecutionFailureEntry = local_stage_runner.LocalStageExecutionFailureEntry;
 pub const LocalStageExecutionFailureReport = local_stage_runner.LocalStageExecutionFailureReport;
 pub const LocalStageExecutionFailureRequest = local_stage_runner.LocalStageExecutionFailureRequest;
@@ -185,6 +191,12 @@ pub const descriptorSetForStage = state_ownership.descriptorSetForStage;
 pub const dtypeByteSize = tensor_frame.dtypeByteSize;
 pub const emitTensorFrame = tensor_frame.emitTensorFrame;
 pub const executeLocalStageChain = local_stage_runner.executeLocalStageChain;
+pub const executeLocalPipelineBoundary = local_pipeline.executeLocalPipelineBoundary;
+pub const executeLocalPipelineChain = local_pipeline.executeLocalPipelineChain;
+pub const executeLocalPipelineStep = local_pipeline.executeLocalPipelineStep;
+pub const classifyLocalPipelinePlacementKind = local_pipeline.classifyLocalPipelinePlacementKind;
+pub const resolveLocalPipelinePlacementKind = local_pipeline.resolveLocalPipelinePlacementKind;
+pub const validateLocalPipelineStageBindings = local_pipeline.validateLocalPipelineStageBindings;
 pub const executeLocalStageLayers = local_stage_runner.executeLocalStageLayers;
 pub const fromComputeDType = tensor_frame.fromComputeDType;
 pub const selectedBoundaryTensorContract = tensor_frame.selectedBoundaryTensorContract;
@@ -300,10 +312,21 @@ test "inference bridge root exports staged_error contract" {
 
 test "inference bridge root exports local_stage_runner contract" {
     _ = local_stage_runner.LocalStageRunnerPlanRef;
+    _ = LocalPipelineBoundaryPayload;
+    _ = LocalPipelineBoundaryRuntime;
+    _ = LocalPipelineContext;
+    _ = LocalPipelinePlacementKind;
+    _ = LocalPipelineStageBinding;
     _ = LocalStageRunnerPlanId;
     _ = buildLocalStageRunnerPlanRef;
     _ = validateLocalStageRunnerPlanRef;
     _ = executeLocalStageChain;
+    _ = executeLocalPipelineBoundary;
+    _ = executeLocalPipelineChain;
+    _ = executeLocalPipelineStep;
+    _ = classifyLocalPipelinePlacementKind;
+    _ = resolveLocalPipelinePlacementKind;
+    _ = validateLocalPipelineStageBindings;
     _ = localStageRunnerPlanIdEql;
 }
 

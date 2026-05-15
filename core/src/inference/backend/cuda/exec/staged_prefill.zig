@@ -36,45 +36,6 @@ const resetShortConvStates = resets.resetShortConvStates;
 const resetGatedDeltaStates = resets.resetGatedDeltaStates;
 const resetAttentionCpuStates = resets.resetAttentionCpuStates;
 
-fn executeLocalPrefillBoundaryChain(
-    root_backend: anytype,
-    allocator: ?std.mem.Allocator,
-    comptime step_kind: bridge.TensorFrameStepKind,
-    comptime Source: type,
-    comptime Target: type,
-    source: *Source,
-    target: *Target,
-    placement_plan: *const bridge.PlacementPlan,
-    state_ownership_plan: ?*const bridge.StageStateOwnershipPlan,
-    metadata: *const bridge.TensorFrameMetadata,
-    image: *const bridge.BoundaryByteImageRef,
-    staging: ?[]align(64) u8,
-    allow_borrow: bool,
-    local_peer_copy: bool,
-) !void {
-    var stages = [_]bridge.LocalStageChainStage{
-        bridge.localStageAdapter(Source, metadata.boundary.source_stage_id, source),
-        bridge.localStageAdapter(Target, metadata.boundary.target_stage_id, target),
-    };
-    const boundaries = [_]bridge.LocalStageChainBoundaryStep{.{
-        .boundary_index = metadata.boundary.boundary_index,
-        .step_kind = step_kind,
-        .metadata = metadata,
-        .image = image,
-        .staging = staging,
-        .allow_borrow = allow_borrow,
-        .local_device_peer_copy_available = local_peer_copy,
-    }};
-    try bridge.executeLocalStageChain(.{
-        .allocator = allocator,
-        .plan_ref = try stage_adapters.localTopologyRunnerPlanRef(root_backend),
-        .placement_plan = placement_plan,
-        .state_ownership_plan = state_ownership_plan,
-        .stages = stages[0..],
-        .boundaries = boundaries[0..],
-    });
-}
-
 pub fn executeLocalPrefillCpuCuda(
     self: anytype,
     cpu_stage0: anytype,
@@ -163,6 +124,12 @@ pub fn executeLocalPrefillCpuCuda(
     const placement_plan = try stage_adapters.localTopologyPlacementPlan(self);
     const state_ownership_plan = stage_adapters.localTopologyStateOwnershipPlan(self);
     const allocator = stage_adapters.backendAllocator(self);
+    const pipeline_context = bridge.LocalPipelineContext{
+        .allocator = allocator,
+        .plan_ref = try stage_adapters.localTopologyRunnerPlanRef(self),
+        .placement_plan = placement_plan,
+        .state_ownership_plan = state_ownership_plan,
+    };
     var prefill_source = PrefillSource{};
     var prefill_target = PrefillTarget{ .backend = self };
     const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
@@ -194,21 +161,20 @@ pub fn executeLocalPrefillCpuCuda(
         try bridge.validateTensorFrameForPlanBoundary(&activation_metadata, try stage_adapters.localTopologyTensorFramePlanRef(self), boundary0.boundary_index);
         try bridge.validatePayloadBufferLength(&activation_metadata, chunk_bytes.len);
         const image = bridge.hostActivationByteImage(&activation_metadata, chunk_bytes);
-        try executeLocalPrefillBoundaryChain(
-            self,
-            allocator,
-            .prefill,
+        try bridge.executeLocalPipelineBoundary(
             PrefillSource,
             PrefillTarget,
+            pipeline_context,
+            .prefill,
             &prefill_source,
             &prefill_target,
-            placement_plan,
-            state_ownership_plan,
             &activation_metadata,
             &image,
-            boundary0.staging,
-            false,
-            boundary0.local_device_peer_copy_available,
+            .{
+                .staging = boundary0.staging,
+                .allow_borrow = false,
+                .local_device_peer_copy_available = boundary0.local_device_peer_copy_available,
+            },
         );
 
         const active_rows_u32: u32 = @intCast(rows);
@@ -383,6 +349,12 @@ pub fn executeLocalPrefillCudaCuda(
     const placement_plan = try stage_adapters.localTopologyPlacementPlan(self);
     const state_ownership_plan = stage_adapters.localTopologyStateOwnershipPlan(self);
     const allocator = stage_adapters.backendAllocator(self);
+    const pipeline_context = bridge.LocalPipelineContext{
+        .allocator = allocator,
+        .plan_ref = try stage_adapters.localTopologyRunnerPlanRef(self),
+        .placement_plan = placement_plan,
+        .state_ownership_plan = state_ownership_plan,
+    };
     var prefill_source = PrefillSource{ .backend = self, .target_backend = stage1 };
     var prefill_target = PrefillTarget{ .backend = stage1 };
     const boundary0 = try stage_adapters.localBoundaryRuntime(self, 0);
@@ -634,21 +606,20 @@ pub fn executeLocalPrefillCudaCuda(
         try bridge.validateTensorFrameForPlanBoundary(&activation_metadata, try stage_adapters.localTopologyTensorFramePlanRef(self), boundary0.boundary_index);
         try bridge.validatePayloadBufferLength(&activation_metadata, transfer_bytes);
         const image = bridge.deviceActivationByteImage(&activation_metadata);
-        try executeLocalPrefillBoundaryChain(
-            self,
-            allocator,
-            .prefill,
+        try bridge.executeLocalPipelineBoundary(
             PrefillSource,
             PrefillTarget,
+            pipeline_context,
+            .prefill,
             &prefill_source,
             &prefill_target,
-            placement_plan,
-            state_ownership_plan,
             &activation_metadata,
             &image,
-            boundary0.staging,
-            false,
-            boundary0.local_device_peer_copy_available,
+            .{
+                .staging = boundary0.staging,
+                .allow_borrow = false,
+                .local_device_peer_copy_available = boundary0.local_device_peer_copy_available,
+            },
         );
 
         // Upload source embeddings for this chunk to stage1's deepstack_add_dev.
@@ -888,6 +859,12 @@ pub fn executeLocalPrefillCpuCudaCuda(
     const placement_plan = try stage_adapters.localTopologyPlacementPlan(self);
     const state_ownership_plan = stage_adapters.localTopologyStateOwnershipPlan(self);
     const allocator = stage_adapters.backendAllocator(self);
+    const pipeline_context = bridge.LocalPipelineContext{
+        .allocator = allocator,
+        .plan_ref = try stage_adapters.localTopologyRunnerPlanRef(self),
+        .placement_plan = placement_plan,
+        .state_ownership_plan = state_ownership_plan,
+    };
     const plan_ref = try stage_adapters.localTopologyTensorFramePlanRef(self);
     var cpu_prefill_source = CpuPrefillSource{};
     var gpu_prefill_source = GpuPrefillSource{ .backend = gpu_stage1, .target_backend = self };
@@ -928,21 +905,20 @@ pub fn executeLocalPrefillCpuCudaCuda(
         try bridge.validateTensorFrameForPlanBoundary(&metadata01, plan_ref, boundary0.boundary_index);
         try bridge.validatePayloadBufferLength(&metadata01, chunk_bytes.len);
         const image01 = bridge.hostActivationByteImage(&metadata01, chunk_bytes);
-        try executeLocalPrefillBoundaryChain(
-            self,
-            allocator,
-            .prefill,
+        try bridge.executeLocalPipelineBoundary(
             CpuPrefillSource,
             GpuPrefillTarget,
+            pipeline_context,
+            .prefill,
             &cpu_prefill_source,
             &gpu_prefill_target,
-            placement_plan,
-            state_ownership_plan,
             &metadata01,
             &image01,
-            boundary0.staging,
-            false,
-            boundary0.local_device_peer_copy_available,
+            .{
+                .staging = boundary0.staging,
+                .allow_borrow = false,
+                .local_device_peer_copy_available = boundary0.local_device_peer_copy_available,
+            },
         );
 
         // Upload source embeddings for GPU1 per-layer branch branch.
@@ -1026,21 +1002,20 @@ pub fn executeLocalPrefillCpuCudaCuda(
         try bridge.validateTensorFrameForPlanBoundary(&metadata12, plan_ref, boundary1.boundary_index);
         try bridge.validatePayloadBufferLength(&metadata12, transfer_bytes);
         const image12 = bridge.deviceActivationByteImage(&metadata12);
-        try executeLocalPrefillBoundaryChain(
-            self,
-            allocator,
-            .prefill,
+        try bridge.executeLocalPipelineBoundary(
             GpuPrefillSource,
             FinalPrefillTarget,
+            pipeline_context,
+            .prefill,
             &gpu_prefill_source,
             &final_prefill_target,
-            placement_plan,
-            state_ownership_plan,
             &metadata12,
             &image12,
-            boundary1.staging,
-            false,
-            boundary1.local_device_peer_copy_available,
+            .{
+                .staging = boundary1.staging,
+                .allow_borrow = false,
+                .local_device_peer_copy_available = boundary1.local_device_peer_copy_available,
+            },
         );
 
         // Upload source embeddings for GPU2 per-layer branch branch.

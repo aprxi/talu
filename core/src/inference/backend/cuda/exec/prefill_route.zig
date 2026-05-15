@@ -57,6 +57,7 @@ fn rejectUnsupportedStagedPrefillRoute(topology_tag: ?[]const u8) !void {
 const common = @import("common.zig");
 const kv_capacity = @import("kv_capacity.zig");
 const resets = @import("resets.zig");
+const stage_adapters = @import("stage_adapters.zig");
 const staged_prefill = @import("staged_prefill.zig");
 const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const dumpHiddenState = common.dumpHiddenState;
@@ -122,49 +123,45 @@ pub fn executePrefillWithLayerLimit(
         return;
     }
 
-    // Local CUDA+CUDA: batched prefill through stage0 -> bulk transfer -> stage1.
-    // Uses comptime guard because anytype monomorphization requires all referenced
-    // methods to exist on the type, even in runtime-unreachable branches.
-    if (topologyModeIs(self, "pipeline2") and layer_limit == self.block_runtime.blocks.len) {
-        if (tokens.len == 0) return error.InvalidArgument;
-        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
-        if (logits_out.len != self.vocab_size) return error.InvalidArgument;
-        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+    // Local multi-stage prefill is selected from the bridge-validated local
+    // pipeline shape. The CUDA backend only binds concrete local adapters.
+    if (layer_limit == self.block_runtime.blocks.len) {
+        if (try stage_adapters.localPipelinePlacementKind(self)) |placement_kind| {
+            if (tokens.len == 0) return error.InvalidArgument;
+            if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+            if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+            if (tokens.len > self.max_seq_len) return error.InvalidArgument;
 
-        if (comptime @hasDecl(SelfType, "localCudaStage1")) {
-            var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-            if (stage1.state_descriptor_count > 0) try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
-            stage1.activateKvSlot(slot_index);
-            self.activateKvSlot(slot_index);
-            return executeLocalPrefillCudaCuda(self, stage1, tokens, slot_index, logits_out);
-        }
-    }
-
-    // cpu_gpu / cpu_gpu_gpu: batched CPU stage0 → chunked GPU stage(s).
-    if ((topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) and
-        layer_limit == self.block_runtime.blocks.len)
-    {
-        if (tokens.len == 0) return error.InvalidArgument;
-        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
-        if (logits_out.len != self.vocab_size) return error.InvalidArgument;
-        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-
-        if (comptime @hasDecl(SelfType, "localCpuStage0")) {
-            const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-            self.activateKvSlot(slot_index);
-
-            // cpu_gpu_gpu: CPU → GPU0 → GPU1 (3-stage).
-            if (topologyModeIs(self, "cpu_gpu_gpu")) {
-                if (comptime @hasDecl(SelfType, "localCudaStage1")) {
-                    var gpu_stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-                    if (gpu_stage1.state_descriptor_count > 0) try gpu_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
-                    gpu_stage1.activateKvSlot(slot_index);
-                    return executeLocalPrefillCpuCudaCuda(self, cpu_stage0, gpu_stage1, tokens, slot_index, logits_out);
-                }
+            switch (placement_kind) {
+                .cuda_cuda => {
+                    if (comptime @hasDecl(SelfType, "localCudaStage1")) {
+                        var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
+                        if (stage1.state_descriptor_count > 0) try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+                        stage1.activateKvSlot(slot_index);
+                        self.activateKvSlot(slot_index);
+                        return executeLocalPrefillCudaCuda(self, stage1, tokens, slot_index, logits_out);
+                    }
+                },
+                .cpu_cuda => {
+                    if (comptime @hasDecl(SelfType, "localCpuStage0")) {
+                        const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
+                        self.activateKvSlot(slot_index);
+                        return executeLocalPrefillCpuCuda(self, cpu_stage0, tokens, slot_index, logits_out);
+                    }
+                },
+                .cpu_cuda_cuda => {
+                    if (comptime @hasDecl(SelfType, "localCpuStage0") and @hasDecl(SelfType, "localCudaStage1")) {
+                        const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
+                        var gpu_stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
+                        self.activateKvSlot(slot_index);
+                        if (gpu_stage1.state_descriptor_count > 0) try gpu_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+                        gpu_stage1.activateKvSlot(slot_index);
+                        return executeLocalPrefillCpuCudaCuda(self, cpu_stage0, gpu_stage1, tokens, slot_index, logits_out);
+                    }
+                },
+                .generic_local_chain => {},
             }
-
-            // cpu_gpu: CPU → GPU (2-stage).
-            return executeLocalPrefillCpuCuda(self, cpu_stage0, tokens, slot_index, logits_out);
+            return error.InvalidTopologyConfig;
         }
     }
 

@@ -3210,7 +3210,7 @@ test "attentionSeparateDecodeUsesCache uses decode mode only for single-row exec
     try std.testing.expect(!engine_mixers.attentionSeparateDecodeUsesCache(15));
 }
 
-test "computeBatchedDecodeLogits routes pipeline2 decode per request through single-token path" {
+test "computeBatchedDecodeLogits rejects pipeline2 decode without local stage specs" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [3]u8 = [_]u8{0} ** 3,
@@ -3287,23 +3287,15 @@ test "computeBatchedDecodeLogits routes pipeline2 decode per request through sin
     const slot_indices = [_]usize{ 2, 0, 3 };
     const positions = [_]usize{ 7, 8, 9 };
 
-    try engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]);
-
-    try std.testing.expectEqual(tokens.len, mock.activate_calls);
-    try std.testing.expectEqual(tokens.len, mock.compute_calls);
-    for (0..tokens.len) |i| {
-        try std.testing.expectEqual(slot_indices[i], mock.activated_slots[i]);
-        try std.testing.expectEqual(tokens[i], mock.recorded_tokens[i]);
-        try std.testing.expectEqual(positions[i], mock.recorded_positions[i]);
-        try std.testing.expectEqual(slot_indices[i], mock.recorded_slots[i]);
-        try std.testing.expectEqual(mock.block_runtime.blocks.len, mock.recorded_layer_limits[i]);
-        try std.testing.expect(mock.recorded_compute_logits[i]);
-        try std.testing.expect(mock.recorded_download_logits[i]);
-        try std.testing.expect(!mock.recorded_use_preloaded_input[i]);
-    }
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
+    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
-test "computeBatchedDecodeLogitsDeviceOnly routes pipeline2 decode per request without host logits" {
+test "computeBatchedDecodeLogitsDeviceOnly rejects pipeline2 decode without local stage specs" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [3]u8 = [_]u8{0} ** 3,
@@ -3370,24 +3362,15 @@ test "computeBatchedDecodeLogitsDeviceOnly routes pipeline2 decode per request w
     const slot_indices = [_]usize{ 1, 3, 0 };
     const positions = [_]usize{ 9, 10, 11 };
 
-    try engine_forward.computeBatchedDecodeLogitsDeviceOnly(&mock, tokens[0..], slot_indices[0..], positions[0..]);
-
-    try std.testing.expectEqual(tokens.len, mock.activate_calls);
-    try std.testing.expectEqual(tokens.len, mock.compute_calls);
-    for (0..tokens.len) |i| {
-        try std.testing.expectEqual(slot_indices[i], mock.activated_slots[i]);
-        try std.testing.expectEqual(tokens[i], mock.recorded_tokens[i]);
-        try std.testing.expectEqual(positions[i], mock.recorded_positions[i]);
-        try std.testing.expectEqual(slot_indices[i], mock.recorded_slots[i]);
-        try std.testing.expectEqual(mock.block_runtime.blocks.len, mock.recorded_layer_limits[i]);
-        try std.testing.expect(mock.recorded_compute_logits[i]);
-        try std.testing.expect(!mock.recorded_download_logits[i]);
-        try std.testing.expect(!mock.recorded_has_logits_out[i]);
-        try std.testing.expect(!mock.recorded_use_preloaded_input[i]);
-    }
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        engine_forward.computeBatchedDecodeLogitsDeviceOnly(&mock, tokens[0..], slot_indices[0..], positions[0..]),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
+    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
-test "computeBatchedDecodeLogits routes cpu_gpu decode per request through single-token path" {
+test "computeBatchedDecodeLogits rejects cpu_gpu decode without local stage specs" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [3]u8 = [_]u8{0} ** 3,
@@ -3464,20 +3447,12 @@ test "computeBatchedDecodeLogits routes cpu_gpu decode per request through singl
     const slot_indices = [_]usize{ 2, 0, 3 };
     const positions = [_]usize{ 7, 8, 9 };
 
-    try engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]);
-
-    try std.testing.expectEqual(tokens.len, mock.activate_calls);
-    try std.testing.expectEqual(tokens.len, mock.compute_calls);
-    for (0..tokens.len) |i| {
-        try std.testing.expectEqual(slot_indices[i], mock.activated_slots[i]);
-        try std.testing.expectEqual(tokens[i], mock.recorded_tokens[i]);
-        try std.testing.expectEqual(positions[i], mock.recorded_positions[i]);
-        try std.testing.expectEqual(slot_indices[i], mock.recorded_slots[i]);
-        try std.testing.expectEqual(mock.block_runtime.blocks.len, mock.recorded_layer_limits[i]);
-        try std.testing.expect(mock.recorded_compute_logits[i]);
-        try std.testing.expect(mock.recorded_download_logits[i]);
-        try std.testing.expect(!mock.recorded_use_preloaded_input[i]);
-    }
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
+    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
 test "executePrefillWithLayerLimit routes pipeline2 prefill through staged token loop" {
@@ -3701,6 +3676,7 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
         local_boundary0_dtype: bridge.BoundaryDType = .f32,
         local_boundary0_layout: bridge.BoundaryLayout = .row_major,
         local_boundary0_peer_copy_available: bool = false,
+        local_stage_specs: []const engine.testing.StageSpec = &.{},
         local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
         local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
         local_placement_plan: ?bridge.PlacementPlan = null,
@@ -3804,6 +3780,10 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
         .layout = .row_major,
         .staging = staging[0..],
     }};
+    const stage_specs = [_]engine.testing.StageSpec{
+        .{ .stage_id = 0, .backend_kind = .cuda, .layer_start = 0, .layer_end = 2, .owns_embedding = true, .owns_projection = false },
+        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 2, .layer_end = 4, .owns_embedding = false, .owns_projection = true },
+    };
     const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
     const configs = [_]engine.testing.BoundaryConfig{
@@ -3837,6 +3817,7 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
         .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
         .local_cuda_stage1_backend = &stage1,
         .local_boundary0_staging = staging[0..],
+        .local_stage_specs = stage_specs[0..],
         .local_boundary_runtimes = boundary_runtimes[0..],
         .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
         .local_placement_plan = bundle.placement_plan.?,
@@ -3884,7 +3865,7 @@ test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and sta
 
     try std.testing.expectEqual(@as(usize, 1), trace_state.stage0_compute_calls);
     try std.testing.expectEqual(@as(usize, 1), trace_state.stage1_compute_calls);
-    try std.testing.expectEqual(stage0.block_runtime.blocks.len, trace_state.stage0_layer_limit);
+    try std.testing.expectEqual(stage0.split_layer, trace_state.stage0_layer_limit);
     try std.testing.expectEqual(stage1.block_runtime.blocks.len, trace_state.stage1_layer_limit);
 
     try std.testing.expect(!trace_state.stage0_compute_logits);
@@ -3985,6 +3966,7 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
         local_boundary0_staging: ?[]align(64) u8 = null,
         local_boundary0_dtype: bridge.BoundaryDType = .f32,
         local_boundary0_layout: bridge.BoundaryLayout = .row_major,
+        local_stage_specs: []const engine.testing.StageSpec = &.{},
         local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
         local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
         local_placement_plan: ?bridge.PlacementPlan = null,
@@ -4061,6 +4043,10 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
         .dtype = .f32,
         .layout = .row_major,
     }};
+    const stage_specs = [_]engine.testing.StageSpec{
+        .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = 3, .owns_embedding = true, .owns_projection = false },
+        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 3, .layer_end = 5, .owns_embedding = false, .owns_projection = true },
+    };
     const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{3}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
     const configs = [_]engine.testing.BoundaryConfig{
@@ -4081,6 +4067,7 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage
         .d_model = 8,
         .topology_mode = .cpu_gpu,
         .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
+        .local_stage_specs = stage_specs[0..],
         .local_boundary_runtimes = boundary_runtimes[0..],
         .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
         .local_placement_plan = bundle.placement_plan.?,
@@ -4142,6 +4129,7 @@ test "executeDecodeWithLayerLimit cpu_gpu returns error when stage0 is missing" 
         split_layer: usize = 1,
         d_model: usize = 8,
         block_runtime: BlockRuntimeMock = .{},
+        local_stage_specs: []const engine.testing.StageSpec = &.{},
 
         pub fn localCpuStage0(_: *@This()) ?*u8 {
             return null;
@@ -4172,7 +4160,11 @@ test "executeDecodeWithLayerLimit cpu_gpu returns error when stage0 is missing" 
         }
     };
 
-    var mock = Mock{};
+    const stage_specs = [_]engine.testing.StageSpec{
+        .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = 1, .owns_embedding = true, .owns_projection = false },
+        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 1, .layer_end = 2, .owns_embedding = false, .owns_projection = true },
+    };
+    var mock = Mock{ .local_stage_specs = stage_specs[0..] };
     var logits: [5]f32 = undefined;
     try std.testing.expectError(
         error.InvalidTopologyConfig,
@@ -4251,6 +4243,7 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
         local_boundary0_staging: ?[]align(64) u8 = null,
         local_boundary0_dtype: bridge.BoundaryDType = .f32,
         local_boundary0_layout: bridge.BoundaryLayout = .row_major,
+        local_stage_specs: []const engine.testing.StageSpec = &.{},
         local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
         local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
         local_placement_plan: ?bridge.PlacementPlan = null,
@@ -4360,6 +4353,10 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
             .layout = .row_major,
             .staging = staging[0..],
         }};
+        const stage_specs = [_]engine.testing.StageSpec{
+            .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = split_layer, .owns_embedding = true, .owns_projection = false },
+            .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = split_layer, .layer_end = 6, .owns_embedding = false, .owns_projection = true },
+        };
         const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{split_layer}, &.{});
         const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
         const configs = [_]engine.testing.BoundaryConfig{
@@ -4384,6 +4381,7 @@ test "cpu_gpu decode parity matches single topology across slots and lifecycle c
             .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
             .local_boundary0_staging = staging[0..],
             .cpu_stage0 = &cpu_stage,
+            .local_stage_specs = stage_specs[0..],
             .local_boundary_runtimes = boundary_runtimes[0..],
             .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
             .local_placement_plan = bundle.placement_plan.?,
@@ -4840,6 +4838,7 @@ test "executeDecodeWithLayerLimit pipeline2 returns error when stage1 is missing
         d_model: usize = 8,
         state_descriptor_count: usize = 0,
         block_runtime: BlockRuntimeMock = .{},
+        local_stage_specs: []const engine.testing.StageSpec = &.{},
 
         pub fn localCudaStage1(_: *@This()) ?*@This() {
             return null;
@@ -4872,7 +4871,11 @@ test "executeDecodeWithLayerLimit pipeline2 returns error when stage1 is missing
         }
     };
 
-    var mock = Mock{};
+    const stage_specs = [_]engine.testing.StageSpec{
+        .{ .stage_id = 0, .backend_kind = .cuda, .layer_start = 0, .layer_end = 2, .owns_embedding = true, .owns_projection = false },
+        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 2, .layer_end = 4, .owns_embedding = false, .owns_projection = true },
+    };
+    var mock = Mock{ .local_stage_specs = stage_specs[0..] };
     var logits: [5]f32 = undefined;
     try std.testing.expectError(
         error.InvalidTopologyConfig,
@@ -4896,7 +4899,7 @@ test "executeDecodeWithLayerLimit pipeline2 returns error when stage1 is missing
     );
 }
 
-test "computeBatchedDecodeLogits routes cpu_gpu_gpu decode per request through single-token path" {
+test "computeBatchedDecodeLogits rejects cpu_gpu_gpu decode without local stage specs" {
     const Mock = struct {
         const BlockRuntimeMock = struct {
             blocks: [3]u8 = [_]u8{0} ** 3,
@@ -4971,18 +4974,12 @@ test "computeBatchedDecodeLogits routes cpu_gpu_gpu decode per request through s
     const slot_indices = [_]usize{ 2, 0, 3 };
     const positions = [_]usize{ 7, 8, 9 };
 
-    try engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]);
-
-    try std.testing.expectEqual(tokens.len, mock.activate_calls);
-    try std.testing.expectEqual(tokens.len, mock.compute_calls);
-    for (0..tokens.len) |i| {
-        try std.testing.expectEqual(slot_indices[i], mock.recorded_slots[i]);
-        try std.testing.expectEqual(tokens[i], mock.recorded_tokens[i]);
-        try std.testing.expectEqual(positions[i], mock.recorded_positions[i]);
-        try std.testing.expectEqual(mock.block_runtime.blocks.len, mock.recorded_layer_limits[i]);
-        try std.testing.expect(mock.recorded_compute_logits[i]);
-        try std.testing.expect(mock.recorded_download_logits[i]);
-    }
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
+    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
 }
 
 test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
@@ -5142,6 +5139,7 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
         local_boundary1_layout: bridge.BoundaryLayout = .row_major,
         local_boundary0_peer_copy_available: bool = false,
         local_boundary1_peer_copy_available: bool = false,
+        local_stage_specs: []const engine.testing.StageSpec = &.{},
         local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
         local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
         local_placement_plan: ?bridge.PlacementPlan = null,
@@ -5247,6 +5245,11 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
             .staging = staging12[0..],
         },
     };
+    const stage_specs = [_]engine.testing.StageSpec{
+        .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = 2, .owns_embedding = true, .owns_projection = false },
+        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 2, .layer_end = 4, .owns_embedding = false, .owns_projection = false },
+        .{ .stage_id = 2, .backend_kind = .cuda, .layer_start = 4, .layer_end = 6, .owns_embedding = false, .owns_projection = true },
+    };
     const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{ 2, 4 }, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
     const configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
@@ -5277,6 +5280,7 @@ test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
         .topology_mode = .cpu_gpu_gpu,
         .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
         .local_boundary1_staging = staging12[0..],
+        .local_stage_specs = stage_specs[0..],
         .local_boundary_runtimes = boundary_runtimes[0..],
         .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
         .local_placement_plan = bundle.placement_plan.?,
@@ -5542,6 +5546,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
         local_boundary1_layout: bridge.BoundaryLayout = .row_major,
         local_boundary0_peer_copy_available: bool = false,
         local_boundary1_peer_copy_available: bool = false,
+        local_stage_specs: []const engine.testing.StageSpec = &.{},
         local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
         local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
         local_placement_plan: ?bridge.PlacementPlan = null,
@@ -5660,6 +5665,11 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
                 .staging = staging12[0..],
             },
         };
+        const stage_specs = [_]engine.testing.StageSpec{
+            .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = split_layer, .owns_embedding = true, .owns_projection = false },
+            .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = split_layer, .layer_end = split_layer_stage2, .owns_embedding = false, .owns_projection = false },
+            .{ .stage_id = 2, .backend_kind = .cuda, .layer_start = split_layer_stage2, .layer_end = 6, .owns_embedding = false, .owns_projection = true },
+        };
         const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{ split_layer, split_layer_stage2 }, &.{});
         const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
         const configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
@@ -5690,6 +5700,7 @@ test "cpu_gpu_gpu decode parity matches single topology across slots and lifecyc
             .local_boundary1_staging = staging12[0..],
             .cpu_stage0 = &cpu_stage,
             .stage1 = &stage1,
+            .local_stage_specs = stage_specs[0..],
             .local_boundary_runtimes = boundary_runtimes[0..],
             .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
             .local_placement_plan = bundle.placement_plan.?,
