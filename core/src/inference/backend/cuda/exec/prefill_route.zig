@@ -67,14 +67,12 @@ pub fn executePrefillWithLayerLimit(
 ) !void {
     const SelfType = @TypeOf(self.*);
 
-    // Local multi-stage prefill is selected from the bridge-validated local
-    // pipeline shape. The compatibility topology label is only a rejection
-    // guard for staged mocks/configurations that do not carry bridge facts.
+    // Compatibility topology labels only reject staged mocks without bridge facts.
     if (comptime @hasField(SelfType, "block_runtime")) {
         if (layer_limit == self.block_runtime.blocks.len) {
-            if (try stage_adapters.localPipelinePlacementKind(self)) |placement_kind| {
+            if (try stage_adapters.localPipelineFactsAvailable(self)) {
                 try validatePrefillRequest(self, tokens, slot_index, logits_out);
-                return staged_prefill.executeLocalPrefillPipeline(self, placement_kind, tokens, slot_index, logits_out);
+                return staged_prefill.executeLocalPrefillPipeline(self, tokens, slot_index, logits_out);
             }
             try rejectUnsupportedStagedPrefillRoute(topologyModeTag(self));
         }

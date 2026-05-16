@@ -40,42 +40,61 @@ pub const LocalPipelineStageBinding = struct {
     backend_kind: host_capability.HostBackendKind,
 };
 
-pub const LocalPipelinePlacementKind = enum {
-    cuda_cuda,
-    cpu_cuda,
-    cpu_cuda_cuda,
-    generic_local_chain,
+pub const LocalPipelineBoundaryFrameSpec = struct {
+    boundary_index: usize,
+    dtype: tensor_frame.TensorFrameDType,
+    layout: tensor_frame.TensorFrameLayout,
+    staging: ?[]align(64) u8 = null,
+    local_device_peer_copy_available: bool = false,
 };
 
-pub fn resolveLocalPipelinePlacementKind(
-    context: LocalPipelineContext,
-    stage_bindings: []const LocalPipelineStageBinding,
-) anyerror!LocalPipelinePlacementKind {
-    try validateLocalPipelineStageBindings(context, stage_bindings);
-    return classifyLocalPipelinePlacementKind(stage_bindings);
-}
+pub const LocalDecodeBoundaryImageSpec = union(enum) {
+    device,
+    host_bytes: []const u8,
+    host_segments: []const []const u8,
+};
 
-pub fn classifyLocalPipelinePlacementKind(
-    stage_bindings: []const LocalPipelineStageBinding,
-) anyerror!LocalPipelinePlacementKind {
-    if (stage_bindings.len < 2) return error.InvalidStageRange;
-    if (stage_bindings.len == 2) {
-        if (stage_bindings[0].backend_kind == .cuda and stage_bindings[1].backend_kind == .cuda) {
-            return .cuda_cuda;
-        }
-        if (stage_bindings[0].backend_kind == .cpu and stage_bindings[1].backend_kind == .cuda) {
-            return .cpu_cuda;
-        }
-    }
-    if (stage_bindings.len == 3 and
-        stage_bindings[0].backend_kind == .cpu and
-        stage_bindings[1].backend_kind == .cuda and
-        stage_bindings[2].backend_kind == .cuda)
-    {
-        return .cpu_cuda_cuda;
-    }
-    return .generic_local_chain;
-}
+pub const LocalDecodeBoundaryPayloadSpec = struct {
+    frame: LocalPipelineBoundaryFrameSpec,
+    activation_byte_count: usize,
+    location_hint: ?tensor_frame.TensorFramePayloadLocationHint,
+    image: LocalDecodeBoundaryImageSpec,
+    local_device_peer_copy_available: ?bool = null,
+};
+
+pub const LocalDecodePipelineStepRequest = struct {
+    tensor_frame_plan_ref: *const tensor_frame.TensorFramePlanRef,
+    hidden_size: usize,
+    slot_request_ids: []const ?u64,
+    slot_indices: []const usize,
+    positions: []const usize,
+    boundary_payloads: []const LocalDecodeBoundaryPayloadSpec,
+    stage_inputs: []const []const u8 = &.{},
+};
+
+pub const LocalPrefillBoundaryImageSpec = union(enum) {
+    device,
+    host_bytes: []const u8,
+};
+
+pub const LocalPrefillBoundaryPayloadSpec = struct {
+    frame: LocalPipelineBoundaryFrameSpec,
+    slot_index: usize,
+    sequence_start: usize,
+    token_count: usize,
+    activation_byte_count: usize,
+    location_hint: ?tensor_frame.TensorFramePayloadLocationHint,
+    image: LocalPrefillBoundaryImageSpec,
+    local_device_peer_copy_available: ?bool = null,
+};
+
+pub const LocalPrefillPipelineStepRequest = struct {
+    tensor_frame_plan_ref: *const tensor_frame.TensorFramePlanRef,
+    hidden_size: usize,
+    slot_request_ids: []const ?u64,
+    boundary_payloads: []const LocalPrefillBoundaryPayloadSpec,
+    stage_inputs: []const []const u8 = &.{},
+};
 
 pub fn validateLocalPipelineStageBindings(
     context: LocalPipelineContext,
@@ -103,41 +122,6 @@ pub fn validateLocalPipelineStageBindings(
     }
 }
 
-test "classifyLocalPipelinePlacementKind classifies current local chain placements" {
-    try std.testing.expectEqual(
-        LocalPipelinePlacementKind.cuda_cuda,
-        try classifyLocalPipelinePlacementKind(&.{
-            .{ .stage_id = 0, .backend_kind = .cuda },
-            .{ .stage_id = 1, .backend_kind = .cuda },
-        }),
-    );
-    try std.testing.expectEqual(
-        LocalPipelinePlacementKind.cpu_cuda,
-        try classifyLocalPipelinePlacementKind(&.{
-            .{ .stage_id = 0, .backend_kind = .cpu },
-            .{ .stage_id = 1, .backend_kind = .cuda },
-        }),
-    );
-    try std.testing.expectEqual(
-        LocalPipelinePlacementKind.cpu_cuda_cuda,
-        try classifyLocalPipelinePlacementKind(&.{
-            .{ .stage_id = 0, .backend_kind = .cpu },
-            .{ .stage_id = 1, .backend_kind = .cuda },
-            .{ .stage_id = 2, .backend_kind = .cuda },
-        }),
-    );
-    try std.testing.expectEqual(
-        LocalPipelinePlacementKind.generic_local_chain,
-        try classifyLocalPipelinePlacementKind(&.{
-            .{ .stage_id = 0, .backend_kind = .cuda },
-            .{ .stage_id = 1, .backend_kind = .cpu },
-        }),
-    );
-    try std.testing.expectError(error.InvalidStageRange, classifyLocalPipelinePlacementKind(&.{
-        .{ .stage_id = 0, .backend_kind = .cuda },
-    }));
-}
-
 test "validateLocalPipelineStageBindings rejects invalid bridge runner contract" {
     var plan_ref: local_stage_runner.LocalStageRunnerPlanRef = undefined;
     plan_ref.version = local_stage_runner.local_stage_runner_contract_version + 1;
@@ -146,23 +130,6 @@ test "validateLocalPipelineStageBindings rejects invalid bridge runner contract"
     try std.testing.expectError(
         error.InvalidLocalStageRunnerContractVersion,
         validateLocalPipelineStageBindings(.{
-            .plan_ref = &plan_ref,
-            .placement_plan = &placement_plan,
-        }, &.{
-            .{ .stage_id = 0, .backend_kind = .cpu },
-            .{ .stage_id = 1, .backend_kind = .cuda },
-        }),
-    );
-}
-
-test "resolveLocalPipelinePlacementKind rejects invalid bridge runner contract" {
-    var plan_ref: local_stage_runner.LocalStageRunnerPlanRef = undefined;
-    plan_ref.version = local_stage_runner.local_stage_runner_contract_version + 1;
-    var placement_plan: host_capability.PlacementPlan = undefined;
-
-    try std.testing.expectError(
-        error.InvalidLocalStageRunnerContractVersion,
-        resolveLocalPipelinePlacementKind(.{
             .plan_ref = &plan_ref,
             .placement_plan = &placement_plan,
         }, &.{
@@ -227,27 +194,206 @@ pub fn executeLocalPipelineStep(
     try executeLocalPipelineChain(context, stages, steps, stage_inputs);
 }
 
-pub fn executeLocalPipelineBoundary(
-    comptime Source: type,
-    comptime Target: type,
+pub fn executeLocalDecodePipelineStep(
     context: LocalPipelineContext,
-    comptime step_kind: tensor_frame.TensorFrameStepKind,
-    source: *Source,
-    target: *Target,
-    metadata: *const tensor_frame.TensorFrameMetadata,
-    image: *const boundary_byte_image.BoundaryByteImageRef,
-    runtime: LocalPipelineBoundaryRuntime,
+    stages: []local_stage_runner.LocalStageChainStage,
+    request: LocalDecodePipelineStepRequest,
 ) anyerror!void {
-    var stages = [_]local_stage_runner.LocalStageChainStage{
-        local_stage_runner.localStageAdapter(Source, metadata.boundary.source_stage_id, source),
-        local_stage_runner.localStageAdapter(Target, metadata.boundary.target_stage_id, target),
+    if (request.slot_indices.len != request.positions.len) return error.InvalidArgument;
+    if (request.boundary_payloads.len == 0 or request.boundary_payloads.len + 1 != stages.len) {
+        return error.InvalidStepRequest;
+    }
+    if (request.slot_indices.len == 0) return error.InvalidArgument;
+
+    const boundary_count = request.boundary_payloads.len;
+    var inline_metadata: [8]tensor_frame.TensorFrameMetadata = undefined;
+    var inline_images: [8]boundary_byte_image.BoundaryByteImageRef = undefined;
+    var inline_payloads: [8]LocalPipelineBoundaryPayload = undefined;
+    var heap_metadata: []tensor_frame.TensorFrameMetadata = &.{};
+    var heap_images: []boundary_byte_image.BoundaryByteImageRef = &.{};
+    var heap_payloads: []LocalPipelineBoundaryPayload = &.{};
+    defer {
+        if (heap_payloads.len != 0) context.allocator.?.free(heap_payloads);
+        if (heap_images.len != 0) context.allocator.?.free(heap_images);
+        if (heap_metadata.len != 0) context.allocator.?.free(heap_metadata);
+    }
+
+    const metadata = if (boundary_count <= inline_metadata.len)
+        inline_metadata[0..boundary_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_metadata = try allocator.alloc(tensor_frame.TensorFrameMetadata, boundary_count);
+        break :blk heap_metadata;
     };
-    const boundary_payloads = [_]LocalPipelineBoundaryPayload{.{
-        .metadata = metadata,
-        .image = image,
-        .runtime = runtime,
-    }};
-    try executeLocalPipelineStep(context, stages[0..], boundary_payloads[0..], step_kind, &.{});
+    const images = if (boundary_count <= inline_images.len)
+        inline_images[0..boundary_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_images = try allocator.alloc(boundary_byte_image.BoundaryByteImageRef, boundary_count);
+        break :blk heap_images;
+    };
+    const payloads = if (boundary_count <= inline_payloads.len)
+        inline_payloads[0..boundary_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_payloads = try allocator.alloc(LocalPipelineBoundaryPayload, boundary_count);
+        break :blk heap_payloads;
+    };
+
+    const entry_count = std.math.mul(usize, boundary_count, request.slot_indices.len) catch return error.InvalidArgument;
+    var inline_entries: [256]tensor_frame.TensorFrameBatchEntry = undefined;
+    var heap_entries: []tensor_frame.TensorFrameBatchEntry = &.{};
+    defer if (heap_entries.len != 0) context.allocator.?.free(heap_entries);
+    const entries = if (entry_count <= inline_entries.len)
+        inline_entries[0..entry_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_entries = try allocator.alloc(tensor_frame.TensorFrameBatchEntry, entry_count);
+        break :blk heap_entries;
+    };
+
+    for (request.boundary_payloads, 0..) |spec, index| {
+        const batch_start = index * request.slot_indices.len;
+        const batch_entries = entries[batch_start..][0..request.slot_indices.len];
+        metadata[index] = try local_stage_runner.buildDecodeActivationMetadata(.{
+            .plan_ref = request.tensor_frame_plan_ref,
+            .hidden_size = request.hidden_size,
+            .boundary_index = spec.frame.boundary_index,
+            .dtype = spec.frame.dtype,
+            .layout = spec.frame.layout,
+            .location_hint = spec.location_hint,
+            .slot_request_ids = request.slot_request_ids,
+            .slot_indices = request.slot_indices,
+            .positions = request.positions,
+            .batch_entries = batch_entries,
+        });
+        try tensor_frame.validatePayloadBufferLength(&metadata[index], spec.activation_byte_count);
+        images[index] = switch (spec.image) {
+            .device => local_stage_runner.deviceActivationByteImage(&metadata[index]),
+            .host_bytes => |host_bytes| blk: {
+                if (spec.activation_byte_count > host_bytes.len) return error.InvalidArgument;
+                break :blk local_stage_runner.hostActivationByteImage(
+                    &metadata[index],
+                    host_bytes[0..spec.activation_byte_count],
+                );
+            },
+            .host_segments => |host_segments| blk: {
+                if (host_segments.len != request.slot_indices.len) return error.InvalidArgument;
+                break :blk local_stage_runner.segmentedHostActivationByteImage(&metadata[index], host_segments);
+            },
+        };
+        payloads[index] = .{
+            .metadata = &metadata[index],
+            .image = &images[index],
+            .runtime = .{
+                .staging = spec.frame.staging,
+                .allow_borrow = false,
+                .local_device_peer_copy_available = spec.local_device_peer_copy_available orelse
+                    spec.frame.local_device_peer_copy_available,
+            },
+        };
+    }
+
+    try executeLocalPipelineStep(context, stages, payloads, .decode, request.stage_inputs);
+}
+
+pub fn executeLocalPrefillPipelineStep(
+    context: LocalPipelineContext,
+    stages: []local_stage_runner.LocalStageChainStage,
+    request: LocalPrefillPipelineStepRequest,
+) anyerror!void {
+    if (request.boundary_payloads.len == 0 or request.boundary_payloads.len + 1 != stages.len) {
+        return error.InvalidStepRequest;
+    }
+
+    const boundary_count = request.boundary_payloads.len;
+    var inline_metadata: [8]tensor_frame.TensorFrameMetadata = undefined;
+    var inline_images: [8]boundary_byte_image.BoundaryByteImageRef = undefined;
+    var inline_payloads: [8]LocalPipelineBoundaryPayload = undefined;
+    var inline_entries: [8]tensor_frame.TensorFrameBatchEntry = undefined;
+    var heap_metadata: []tensor_frame.TensorFrameMetadata = &.{};
+    var heap_images: []boundary_byte_image.BoundaryByteImageRef = &.{};
+    var heap_payloads: []LocalPipelineBoundaryPayload = &.{};
+    var heap_entries: []tensor_frame.TensorFrameBatchEntry = &.{};
+    defer {
+        if (heap_entries.len != 0) context.allocator.?.free(heap_entries);
+        if (heap_payloads.len != 0) context.allocator.?.free(heap_payloads);
+        if (heap_images.len != 0) context.allocator.?.free(heap_images);
+        if (heap_metadata.len != 0) context.allocator.?.free(heap_metadata);
+    }
+
+    const metadata = if (boundary_count <= inline_metadata.len)
+        inline_metadata[0..boundary_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_metadata = try allocator.alloc(tensor_frame.TensorFrameMetadata, boundary_count);
+        break :blk heap_metadata;
+    };
+    const images = if (boundary_count <= inline_images.len)
+        inline_images[0..boundary_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_images = try allocator.alloc(boundary_byte_image.BoundaryByteImageRef, boundary_count);
+        break :blk heap_images;
+    };
+    const payloads = if (boundary_count <= inline_payloads.len)
+        inline_payloads[0..boundary_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_payloads = try allocator.alloc(LocalPipelineBoundaryPayload, boundary_count);
+        break :blk heap_payloads;
+    };
+    const entries = if (boundary_count <= inline_entries.len)
+        inline_entries[0..boundary_count]
+    else blk: {
+        const allocator = context.allocator orelse return error.InvalidStepRequest;
+        heap_entries = try allocator.alloc(tensor_frame.TensorFrameBatchEntry, boundary_count);
+        break :blk heap_entries;
+    };
+
+    for (request.boundary_payloads, 0..) |spec, index| {
+        metadata[index] = try local_stage_runner.buildPrefillActivationMetadata(.{
+            .plan_ref = request.tensor_frame_plan_ref,
+            .hidden_size = request.hidden_size,
+            .boundary_index = spec.frame.boundary_index,
+            .dtype = spec.frame.dtype,
+            .layout = spec.frame.layout,
+            .location_hint = spec.location_hint,
+            .slot_request_ids = request.slot_request_ids,
+            .slot_index = spec.slot_index,
+            .sequence_start = spec.sequence_start,
+            .token_count = spec.token_count,
+            .batch_entries = entries[index .. index + 1],
+        });
+        try tensor_frame.validateTensorFrameForPlanBoundary(
+            &metadata[index],
+            request.tensor_frame_plan_ref,
+            spec.frame.boundary_index,
+        );
+        try tensor_frame.validatePayloadBufferLength(&metadata[index], spec.activation_byte_count);
+        images[index] = switch (spec.image) {
+            .device => local_stage_runner.deviceActivationByteImage(&metadata[index]),
+            .host_bytes => |host_bytes| blk: {
+                if (spec.activation_byte_count > host_bytes.len) return error.InvalidArgument;
+                break :blk local_stage_runner.hostActivationByteImage(
+                    &metadata[index],
+                    host_bytes[0..spec.activation_byte_count],
+                );
+            },
+        };
+        payloads[index] = .{
+            .metadata = &metadata[index],
+            .image = &images[index],
+            .runtime = .{
+                .staging = spec.frame.staging,
+                .allow_borrow = false,
+                .local_device_peer_copy_available = spec.local_device_peer_copy_available orelse
+                    spec.frame.local_device_peer_copy_available,
+            },
+        };
+    }
+
+    try executeLocalPipelineStep(context, stages, payloads, .prefill, request.stage_inputs);
 }
 
 test "executeLocalPipelineChain rejects invalid bridge runner contract" {
@@ -307,49 +453,5 @@ test "executeLocalPipelineStep rejects invalid stage boundary contract shape" {
             .plan_ref = &plan_ref,
             .placement_plan = &placement_plan,
         }, chain_stages[0..], &.{}, .decode, &.{}),
-    );
-}
-
-test "executeLocalPipelineBoundary rejects invalid bridge runner contract" {
-    const Stage = struct {
-        pub fn executeLayers(_: *@This(), _: []const u8, _: usize, _: usize) anyerror!void {}
-        pub fn synchronize(_: *@This()) anyerror!void {}
-        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {}
-        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {}
-    };
-
-    var plan_ref: local_stage_runner.LocalStageRunnerPlanRef = undefined;
-    plan_ref.version = local_stage_runner.local_stage_runner_contract_version + 1;
-    var placement_plan: host_capability.PlacementPlan = undefined;
-    var metadata: tensor_frame.TensorFrameMetadata = undefined;
-    metadata.boundary = .{
-        .boundary_index = 0,
-        .source_stage_id = 0,
-        .target_stage_id = 1,
-        .producer_layer_start = 0,
-        .producer_layer_end = 1,
-        .consumer_layer_start = 1,
-        .consumer_layer_end = 2,
-    };
-    var image: boundary_byte_image.BoundaryByteImageRef = undefined;
-    var source = Stage{};
-    var target = Stage{};
-
-    try std.testing.expectError(
-        error.InvalidLocalStageRunnerContractVersion,
-        executeLocalPipelineBoundary(
-            Stage,
-            Stage,
-            .{
-                .plan_ref = &plan_ref,
-                .placement_plan = &placement_plan,
-            },
-            .decode,
-            &source,
-            &target,
-            &metadata,
-            &image,
-            .{},
-        ),
     );
 }

@@ -23,14 +23,7 @@ const prepareCudaPrefillBackend = common.prepareCudaPrefillBackend;
 const populateCudaPrefillInputRows = common.populateCudaPrefillInputRows;
 const executeGpuPrefillLayers = common.executeGpuPrefillLayers;
 const projectFinalLogitsFromCudaStage = common.projectFinalLogitsFromCudaStage;
-
-fn resolveTwoCudaChunkCap(total_rows: usize, backend_a: anytype, backend_b: anytype) usize {
-    return resolveStagedPrefillChunkRows(
-        total_rows,
-        @min(backend_a.prefill_chunk_rows_cap, backend_b.prefill_chunk_rows_cap),
-        @import("env_pkg").getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null,
-    );
-}
+const AttentionKernelSet = @import("../runtime/root.zig").AttentionKernelSet;
 
 fn hasActivePerLayerBranch(backend: anytype) bool {
     const BackendType = @TypeOf(backend.*);
@@ -77,198 +70,167 @@ fn canExecuteConcreteCudaPrefill(comptime BackendType: type) bool {
         @hasDecl(BackendType, "tryExecuteLayerProgram");
 }
 
-pub fn executeLocalPrefillPipeline(
-    self: anytype,
-    placement_kind: bridge.LocalPipelinePlacementKind,
-    tokens: []const u32,
-    slot_index: usize,
-    logits_out: []f32,
-) !void {
-    const SelfType = @TypeOf(self.*);
-    switch (placement_kind) {
-        .cuda_cuda => {
-            if (comptime @hasDecl(SelfType, "localCudaStage1")) {
-                var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-                const Stage1Type = @TypeOf(stage1.*);
-                if (comptime @hasField(Stage1Type, "state_descriptor_count") and @hasDecl(Stage1Type, "mirrorSlotStateBlocksFrom")) {
-                    if (stage1.state_descriptor_count > 0) try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
-                }
-                if (comptime @hasDecl(Stage1Type, "activateKvSlot")) {
-                    stage1.activateKvSlot(slot_index);
-                } else return error.InvalidTopologyConfig;
-                if (comptime @hasDecl(SelfType, "activateKvSlot")) {
-                    self.activateKvSlot(slot_index);
-                } else return error.InvalidTopologyConfig;
-                if (comptime canExecuteConcreteCudaPrefill(SelfType) and canExecuteConcreteCudaPrefill(Stage1Type)) {
-                    return executeLocalPrefillCudaCuda(self, stage1, tokens, slot_index, logits_out);
-                }
-                return error.InvalidTopologyConfig;
-            }
-        },
-        .cpu_cuda => {
-            if (comptime @hasDecl(SelfType, "localCpuStage0")) {
-                const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-                if (comptime @hasDecl(SelfType, "activateKvSlot")) {
-                    self.activateKvSlot(slot_index);
-                } else return error.InvalidTopologyConfig;
-                if (comptime canExecuteConcreteCudaPrefill(SelfType)) {
-                    return executeLocalPrefillCpuCuda(self, cpu_stage0, tokens, slot_index, logits_out);
-                }
-                return error.InvalidTopologyConfig;
-            }
-        },
-        .cpu_cuda_cuda => {
-            if (comptime @hasDecl(SelfType, "localCpuStage0") and @hasDecl(SelfType, "localCudaStage1")) {
-                const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-                var gpu_stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
-                const Stage1Type = @TypeOf(gpu_stage1.*);
-                if (comptime @hasDecl(SelfType, "activateKvSlot")) {
-                    self.activateKvSlot(slot_index);
-                } else return error.InvalidTopologyConfig;
-                if (comptime @hasField(Stage1Type, "state_descriptor_count") and @hasDecl(Stage1Type, "mirrorSlotStateBlocksFrom")) {
-                    if (gpu_stage1.state_descriptor_count > 0) try gpu_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
-                }
-                if (comptime @hasDecl(Stage1Type, "activateKvSlot")) {
-                    gpu_stage1.activateKvSlot(slot_index);
-                } else return error.InvalidTopologyConfig;
-                if (comptime canExecuteConcreteCudaPrefill(SelfType) and canExecuteConcreteCudaPrefill(Stage1Type)) {
-                    return executeLocalPrefillCpuCudaCuda(self, cpu_stage0, gpu_stage1, tokens, slot_index, logits_out);
-                }
-                return error.InvalidTopologyConfig;
-            }
-        },
-        .generic_local_chain => {},
-    }
-    return error.InvalidTopologyConfig;
+fn activatePrefillKvSlot(backend: anytype, slot_index: usize) !void {
+    const BackendType = @TypeOf(backend.*);
+    if (comptime !@hasDecl(BackendType, "activateKvSlot")) return error.InvalidTopologyConfig;
+    backend.activateKvSlot(slot_index);
 }
 
-fn executeLocalPrefillCpuCuda(
+fn mirrorPrefillStageDescriptorsFromRoot(stage_backend: anytype, root_backend: anytype, slot_index: usize) !void {
+    const StageType = @TypeOf(stage_backend.*);
+    if (comptime @hasField(StageType, "state_descriptor_count") and @hasDecl(StageType, "mirrorSlotStateBlocksFrom")) {
+        if (stage_backend.state_descriptor_count > 0) try stage_backend.mirrorSlotStateBlocksFrom(root_backend, slot_index);
+    }
+}
+
+fn PrefillPipelineWork(comptime Backend: type) type {
+    return struct {
+        slot_index: usize,
+        chunk_tokens: []const u32,
+        math: common.PrefillMath,
+        chunk: common.PrefillChunkContext,
+        attention_kernels: AttentionKernelSet,
+        per_layer_source_embeddings_opt: ?compute.cuda.Buffer = null,
+        branch_enabled: bool = false,
+        dump_layer_offset: ?usize = null,
+        layer_limit: usize,
+        final_hidden_out: *?compute.cuda.Buffer,
+
+        pub fn execute(work: *@This(), backend: Backend, input: []const u8, _: usize, _: usize) anyerror!void {
+            try stage_adapters.validateEmptyInput(input);
+            work.final_hidden_out.* = try executeGpuPrefillLayers(
+                backend,
+                work.slot_index,
+                work.chunk_tokens,
+                work.math,
+                work.chunk,
+                work.attention_kernels,
+                work.per_layer_source_embeddings_opt,
+                work.branch_enabled,
+                work.dump_layer_offset,
+                work.layer_limit,
+            );
+        }
+    };
+}
+
+fn prefillPipelineWork(
+    comptime Backend: type,
+    slot_index: usize,
+    chunk_tokens: []const u32,
+    math: common.PrefillMath,
+    chunk: common.PrefillChunkContext,
+    attention_kernels: AttentionKernelSet,
+    per_layer_source_embeddings_opt: ?compute.cuda.Buffer,
+    branch_enabled: bool,
+    dump_layer_offset: ?usize,
+    layer_limit: usize,
+    final_hidden_out: *?compute.cuda.Buffer,
+) PrefillPipelineWork(Backend) {
+    return .{
+        .slot_index = slot_index,
+        .chunk_tokens = chunk_tokens,
+        .math = math,
+        .chunk = chunk,
+        .attention_kernels = attention_kernels,
+        .per_layer_source_embeddings_opt = per_layer_source_embeddings_opt,
+        .branch_enabled = branch_enabled,
+        .dump_layer_offset = dump_layer_offset,
+        .layer_limit = layer_limit,
+        .final_hidden_out = final_hidden_out,
+    };
+}
+
+pub fn executeLocalPrefillPipeline(
     self: anytype,
-    cpu_stage0: anytype,
     tokens: []const u32,
     slot_index: usize,
     logits_out: []f32,
 ) !void {
     const SelfType = @TypeOf(self.*);
+    if (comptime !@hasField(SelfType, "local_stage_specs")) return error.InvalidTopologyConfig;
+    const specs = self.local_stage_specs;
+    if (specs.len < 2 or specs.len > 3) return error.InvalidTopologyConfig;
+    if (comptime !canExecuteConcreteCudaPrefill(SelfType)) return error.InvalidTopologyConfig;
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
+
+    const total_rows = tokens.len;
+    const math = try prefillMath(self);
+    const root_stage_id = try rootCudaStageId(self);
+    const aux_stage_id = try auxCudaStageId(self, root_stage_id);
+    const has_cpu_stage = comptime @hasDecl(SelfType, "localCpuStage0");
+    const has_aux_cuda_stage = comptime @hasDecl(SelfType, "localCudaStage1");
+    const CpuPtr = if (has_cpu_stage) localCpuStagePointerType(SelfType) else @TypeOf(self);
+    const AuxCudaPtr = if (has_aux_cuda_stage) localCudaStagePointerType(SelfType) else @TypeOf(self);
+    const cpu_stage0: ?CpuPtr = if (has_cpu_stage) self.localCpuStage0() else null;
+    const aux_cuda_backend: ?AuxCudaPtr = if (has_aux_cuda_stage) self.localCudaStage1() else null;
+    if (aux_stage_id != null and aux_cuda_backend == null) return error.InvalidTopologyConfig;
+    if (cpu_stage0 == null) {
+        for (specs) |spec| if (spec.backend_kind == .cpu) return error.InvalidTopologyConfig;
+    }
+    if (aux_cuda_backend) |aux| {
+        const AuxType = @TypeOf(aux.*);
+        if (comptime !canExecuteConcreteCudaPrefill(AuxType)) return error.InvalidTopologyConfig;
+        if (comptime !@hasField(AuxType, "device")) return error.InvalidArgument;
+    }
 
     const previous_launch_phase = self.device.setLaunchPhase(.prefill);
     defer _ = self.device.setLaunchPhase(previous_launch_phase);
+    const previous_aux_launch_phase = if (aux_cuda_backend) |aux| aux.device.setLaunchPhase(.prefill) else null;
+    defer if (aux_cuda_backend) |aux| {
+        if (previous_aux_launch_phase) |phase| _ = aux.device.setLaunchPhase(phase);
+    };
 
-    const total_rows = tokens.len;
-    const math = try prefillMath(self);
-
+    if (aux_cuda_backend) |aux| try mirrorPrefillStageDescriptorsFromRoot(aux, self, slot_index);
     try prepareCudaPrefillBackend(self, total_rows);
-    const attention_kernels = buildAttentionKernelSet(self) catch return error.CudaKernelUnavailable;
-
-    // ── CPU stage0: batched embed + forward through [0, split_layer) ──
-    const prefill_buffer = try self.allocator.alloc(f32, total_rows * math.d_model);
-    defer self.allocator.free(prefill_buffer);
-
-    // For per-layer branch-input: capture source embeddings (raw scaled
-    // embed_tokens output) before CPU layers modify the hidden states.
-    const source_embeddings_host = try allocateSourceEmbeddings(
-        self.allocator,
-        hasActivePerLayerBranch(self),
-        total_rows,
-        math.d_model,
-    );
-    defer if (source_embeddings_host) |buf| self.allocator.free(buf);
-
-    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, stage_adapters.localLayerOffset(self), source_embeddings_host);
-
-    // Upload CPU source layer KV to GPU mirror buffers for cross-device sharing.
-    try uploadCpuKvToMirrors(self, cpu_stage0, slot_index, 0, total_rows);
-
-    // ── GPU stage1: chunked forward through GPU layers ──
-    var pos_base: usize = 0;
-    while (pos_base < total_rows) {
-        const rows = @min(total_rows - pos_base, self.prefill_chunk_rows_cap);
-        const chunk = try prefillChunkContext(pos_base, rows);
-        const chunk_tokens = tokens[pos_base .. pos_base + rows];
-
-        try ensureCudaChunkBuffers(self, rows);
-
-        // Upload chunk from CPU host buffer to GPU input_dev.
-        const chunk_offset = pos_base * math.d_model;
-        const chunk_f32s = rows * math.d_model;
-        const chunk_bytes = std.mem.sliceAsBytes(prefill_buffer[chunk_offset..][0..chunk_f32s]);
-        try stage_adapters.executeHostToCudaPrefillBoundary(
-            self,
-            self,
-            0,
-            slot_index,
-            pos_base,
-            rows,
-            chunk_bytes,
-            chunk_bytes.len,
-        );
-
-        var per_layer_source_embeddings_opt: ?compute.cuda.Buffer = null;
-        if (source_embeddings_host) |se_host| {
-            per_layer_source_embeddings_opt = try uploadChunkSourceEmbeddings(self, se_host, pos_base, rows, math.d_model);
-        } else if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
-            per_layer_source_embeddings_opt = try per_layer_branch_feature.maybeCapturePerLayerSourceEmbeddings(self, rows);
+    if (aux_cuda_backend) |aux| try prepareCudaPrefillBackend(aux, total_rows);
+    for (specs) |spec| {
+        if (spec.backend_kind != .cuda) continue;
+        if (spec.stage_id == root_stage_id) {
+            try activatePrefillKvSlot(self, slot_index);
+        } else if (aux_stage_id != null and spec.stage_id == aux_stage_id.?) {
+            try activatePrefillKvSlot(aux_cuda_backend orelse return error.InvalidTopologyConfig, slot_index);
         }
-        const final_hidden_rows = try executeGpuPrefillLayers(
-            self,
-            slot_index,
-            chunk_tokens,
-            math,
-            chunk,
-            attention_kernels,
-            per_layer_source_embeddings_opt,
-            per_layer_branch_feature.hasPerLayerBranchRuntime(self),
-            stage_adapters.localLayerOffset(self),
-            self.block_runtime.blocks.len,
-        );
-
-        // Extract logits from the last row of the final chunk.
-        if (pos_base + rows >= total_rows) {
-            try projectFinalLogitsFromCudaStage(self, final_hidden_rows, rows, math.row_bytes, chunk.last_position, logits_out, null);
-        }
-
-        pos_base += rows;
     }
-}
 
-fn executeLocalPrefillCudaCuda(
-    self: anytype,
-    stage1: anytype,
-    tokens: []const u32,
-    slot_index: usize,
-    logits_out: []f32,
-) !void {
-    const SelfType = @TypeOf(self.*);
-    if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
-    if (comptime !@hasField(@TypeOf(stage1.*), "device")) return error.InvalidArgument;
+    const root_attention_kernels = buildAttentionKernelSet(self) catch return error.CudaKernelUnavailable;
+    const aux_attention_kernels: ?AttentionKernelSet = if (aux_cuda_backend) |aux|
+        buildAttentionKernelSet(aux) catch return error.CudaKernelUnavailable
+    else
+        null;
+    var chunk_cap_limit = self.prefill_chunk_rows_cap;
+    if (aux_cuda_backend) |aux| chunk_cap_limit = @min(chunk_cap_limit, aux.prefill_chunk_rows_cap);
+    const chunk_cap = resolveStagedPrefillChunkRows(
+        total_rows,
+        chunk_cap_limit,
+        @import("env_pkg").getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null,
+    );
 
-    const previous_launch_phase0 = self.device.setLaunchPhase(.prefill);
-    defer _ = self.device.setLaunchPhase(previous_launch_phase0);
-    const previous_launch_phase1 = stage1.device.setLaunchPhase(.prefill);
-    defer _ = stage1.device.setLaunchPhase(previous_launch_phase1);
-
-    const total_rows = tokens.len;
-    const math = try prefillMath(self);
-
-    try prepareCudaPrefillBackend(self, total_rows);
-    try prepareCudaPrefillBackend(stage1, total_rows);
-    const attn_kernels_0 = buildAttentionKernelSet(self) catch return error.CudaKernelUnavailable;
-    const attn_kernels_1 = buildAttentionKernelSet(stage1) catch return error.CudaKernelUnavailable;
-    const chunk_cap = resolveTwoCudaChunkCap(total_rows, self, stage1);
-
-    // ── per-layer branch input: compute source embeddings on host ──
-    const has_per_layer_branch_0 = per_layer_branch_feature.hasPerLayerBranchRuntime(self);
-    const has_per_layer_branch_1 = per_layer_branch_feature.hasPerLayerBranchRuntime(stage1);
+    const aux_branch_active = if (aux_cuda_backend) |aux| hasActivePerLayerBranch(aux) else false;
     const source_embeddings_host = try allocateSourceEmbeddings(
         self.allocator,
-        hasActivePerLayerBranch(self) or hasActivePerLayerBranch(stage1),
+        hasActivePerLayerBranch(self) or aux_branch_active,
         total_rows,
         math.d_model,
     );
     defer if (source_embeddings_host) |buf| self.allocator.free(buf);
 
-    if (source_embeddings_host) |se_host| {
+    var prefill_buffer: ?[]f32 = null;
+    defer if (prefill_buffer) |buffer| self.allocator.free(buffer);
+
+    if (specs[0].backend_kind == .cpu) {
+        const cpu = cpu_stage0 orelse return error.InvalidTopologyConfig;
+        prefill_buffer = try self.allocator.alloc(f32, total_rows * math.d_model);
+        try cpu.prefillSlotLayerRange(slot_index, tokens, prefill_buffer.?, specs[0].layer_end, source_embeddings_host);
+        const first_cuda_stage_id = specs[1].stage_id;
+        if (first_cuda_stage_id == root_stage_id) {
+            try uploadCpuKvToMirrors(self, cpu, slot_index, 0, total_rows);
+        } else if (aux_stage_id != null and first_cuda_stage_id == aux_stage_id.?) {
+            try uploadCpuKvToMirrors(aux_cuda_backend orelse return error.InvalidTopologyConfig, cpu, slot_index, 0, total_rows);
+        } else {
+            return error.InvalidTopologyConfig;
+        }
+    } else if (source_embeddings_host) |se_host| {
         try populatePrefillHiddenFromTokens(self.loaded, tokens, math.d_model, se_host, null);
     }
 
@@ -277,213 +239,238 @@ fn executeLocalPrefillCudaCuda(
         const rows = @min(total_rows - pos_base, chunk_cap);
         const chunk = try prefillChunkContext(pos_base, rows);
         const chunk_tokens = tokens[pos_base .. pos_base + rows];
+        const chunk_host_bytes = if (prefill_buffer) |buffer| blk: {
+            const chunk_offset = pos_base * math.d_model;
+            const chunk_f32s = rows * math.d_model;
+            break :blk std.mem.sliceAsBytes(buffer[chunk_offset..][0..chunk_f32s]);
+        } else &[_]u8{};
 
-        // ── Stage 0: embedding + layers on GPU0 ──
-        try ensureCudaChunkBuffers(self, rows);
-        try populateCudaPrefillInputRows(self, chunk_tokens, rows, math.row_bytes);
-
-        // Upload source embeddings for this chunk to stage0's deepstack_add_dev.
-        var per_layer_source_embeddings_0: ?compute.cuda.Buffer = null;
-        if (hasActivePerLayerBranch(self)) {
-            if (source_embeddings_host) |se_host| {
-                per_layer_source_embeddings_0 = try uploadChunkSourceEmbeddings(self, se_host, pos_base, rows, math.d_model);
+        var root_source_embeddings: ?compute.cuda.Buffer = null;
+        var aux_source_embeddings: ?compute.cuda.Buffer = null;
+        for (specs) |spec| {
+            if (spec.backend_kind != .cuda) continue;
+            if (spec.stage_id == root_stage_id) {
+                try ensureCudaChunkBuffers(self, rows);
+                if (spec.owns_embedding) try populateCudaPrefillInputRows(self, chunk_tokens, rows, math.row_bytes);
+                if (hasActivePerLayerBranch(self)) {
+                    if (source_embeddings_host) |se_host| {
+                        root_source_embeddings = try uploadChunkSourceEmbeddings(self, se_host, pos_base, rows, math.d_model);
+                    } else if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
+                        root_source_embeddings = try per_layer_branch_feature.maybeCapturePerLayerSourceEmbeddings(self, rows);
+                    }
+                }
+            } else if (aux_stage_id != null and spec.stage_id == aux_stage_id.?) {
+                const aux = aux_cuda_backend orelse return error.InvalidTopologyConfig;
+                try ensureCudaChunkBuffers(aux, rows);
+                if (hasActivePerLayerBranch(aux)) {
+                    if (source_embeddings_host) |se_host| {
+                        aux_source_embeddings = try uploadChunkSourceEmbeddings(aux, se_host, pos_base, rows, math.d_model);
+                    }
+                }
+            } else {
+                return error.InvalidTopologyConfig;
             }
         }
 
-        _ = try executeGpuPrefillLayers(
-            self,
-            slot_index,
-            chunk_tokens,
-            math,
-            chunk,
-            attn_kernels_0,
-            per_layer_source_embeddings_0,
-            has_per_layer_branch_0,
-            null,
-            self.block_runtime.blocks.len,
-        );
+        const RootWork = PrefillPipelineWork(@TypeOf(self));
+        const AuxWork = PrefillPipelineWork(AuxCudaPtr);
+        const RootToRoot = stage_adapters.CudaLocalPipelineStage(@TypeOf(self), @TypeOf(self), RootWork);
+        const RootToAux = stage_adapters.CudaLocalPipelineStage(@TypeOf(self), AuxCudaPtr, RootWork);
+        const AuxToRoot = stage_adapters.CudaLocalPipelineStage(AuxCudaPtr, @TypeOf(self), AuxWork);
+        const AuxToAux = stage_adapters.CudaLocalPipelineStage(AuxCudaPtr, AuxCudaPtr, AuxWork);
+        const Noop = transport.NoopActivationStage;
 
-        // ── Stage 1 buffer setup (must precede transfer into input_dev) ──
-        try ensureCudaChunkBuffers(stage1, rows);
+        var root_final_hidden: ?compute.cuda.Buffer = null;
+        var aux_final_hidden: ?compute.cuda.Buffer = null;
+        var root_to_root: RootToRoot = undefined;
+        var root_to_aux: RootToAux = undefined;
+        var aux_to_root: AuxToRoot = undefined;
+        var aux_to_aux: AuxToAux = undefined;
+        var noop = Noop{};
+        var stages: [3]bridge.LocalStageChainStage = undefined;
+        var stage_count: usize = 0;
 
-        // ── Bulk transfer stage0 → stage1 ──
-        const transfer_bytes = std.math.mul(usize, rows, math.row_bytes) catch return error.InvalidArgument;
-        try stage_adapters.executeCudaDevicePrefillBoundary(
-            self,
-            self,
-            stage1,
-            0,
-            slot_index,
-            pos_base,
-            rows,
-            transfer_bytes,
-            .source_event_target_stream,
-        );
-
-        // Upload source embeddings for this chunk to stage1's deepstack_add_dev.
-        var per_layer_source_embeddings_1: ?compute.cuda.Buffer = null;
-        if (hasActivePerLayerBranch(stage1)) {
-            if (source_embeddings_host) |se_host| {
-                per_layer_source_embeddings_1 = try uploadChunkSourceEmbeddings(stage1, se_host, pos_base, rows, math.d_model);
+        for (specs, 0..) |spec, index| {
+            const is_final = index + 1 == specs.len;
+            const next_stage_id: ?usize = if (is_final) null else specs[index + 1].stage_id;
+            switch (spec.backend_kind) {
+                .cpu => {
+                    stages[stage_count] = bridge.localStageAdapter(Noop, spec.stage_id, &noop);
+                },
+                .cuda => {
+                    const boundary = if (!is_final) try stage_adapters.localBoundaryRuntime(self, index) else null;
+                    if (spec.stage_id == root_stage_id) {
+                        const work = prefillPipelineWork(
+                            @TypeOf(self),
+                            slot_index,
+                            chunk_tokens,
+                            math,
+                            chunk,
+                            root_attention_kernels,
+                            root_source_embeddings,
+                            per_layer_branch_feature.hasPerLayerBranchRuntime(self),
+                            if (spec.owns_embedding) null else spec.layer_start,
+                            self.block_runtime.blocks.len,
+                            &root_final_hidden,
+                        );
+                        if (next_stage_id != null and aux_stage_id != null and next_stage_id.? == aux_stage_id.?) {
+                            root_to_aux = .{
+                                .backend = self,
+                                .target_backend = aux_cuda_backend orelse return error.InvalidTopologyConfig,
+                                .work = work,
+                                .activation_slot_index = slot_index,
+                                .peer_copy_synchronization = boundary.?.peer_copy_synchronization,
+                            };
+                            stages[stage_count] = bridge.localStageAdapter(RootToAux, spec.stage_id, &root_to_aux);
+                        } else {
+                            root_to_root = .{
+                                .backend = self,
+                                .target_backend = self,
+                                .work = work,
+                                .activation_slot_index = slot_index,
+                            };
+                            stages[stage_count] = bridge.localStageAdapter(RootToRoot, spec.stage_id, &root_to_root);
+                        }
+                    } else if (aux_stage_id != null and spec.stage_id == aux_stage_id.?) {
+                        const aux = aux_cuda_backend orelse return error.InvalidTopologyConfig;
+                        const work = prefillPipelineWork(
+                            AuxCudaPtr,
+                            slot_index,
+                            chunk_tokens,
+                            math,
+                            chunk,
+                            aux_attention_kernels orelse return error.InvalidTopologyConfig,
+                            aux_source_embeddings,
+                            per_layer_branch_feature.hasPerLayerBranchRuntime(aux),
+                            if (spec.owns_embedding) null else spec.layer_start,
+                            aux.block_runtime.blocks.len,
+                            &aux_final_hidden,
+                        );
+                        if (next_stage_id != null and next_stage_id.? == root_stage_id) {
+                            aux_to_root = .{
+                                .backend = aux,
+                                .target_backend = self,
+                                .work = work,
+                                .activation_slot_index = slot_index,
+                                .peer_copy_synchronization = boundary.?.peer_copy_synchronization,
+                            };
+                            stages[stage_count] = bridge.localStageAdapter(AuxToRoot, spec.stage_id, &aux_to_root);
+                        } else {
+                            aux_to_aux = .{
+                                .backend = aux,
+                                .target_backend = aux,
+                                .work = work,
+                                .activation_slot_index = slot_index,
+                            };
+                            stages[stage_count] = bridge.localStageAdapter(AuxToAux, spec.stage_id, &aux_to_aux);
+                        }
+                    } else {
+                        return error.InvalidTopologyConfig;
+                    }
+                },
+                else => return error.InvalidTopologyConfig,
             }
+            stage_count += 1;
         }
 
-        const stage1_final_hidden = try executeGpuPrefillLayers(
-            stage1,
-            slot_index,
-            chunk_tokens,
-            math,
-            chunk,
-            attn_kernels_1,
-            per_layer_source_embeddings_1,
-            has_per_layer_branch_1,
-            null,
-            stage1.block_runtime.blocks.len,
-        );
+        var payload_specs: [2]bridge.LocalPrefillBoundaryPayloadSpec = undefined;
+        for (payload_specs[0 .. specs.len - 1], 0..) |*payload, boundary_index| {
+            const source_spec = specs[boundary_index];
+            const row_bytes = try stage_adapters.localBoundaryActivationByteCount(self, boundary_index);
+            const transfer_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
+            payload.* = switch (source_spec.backend_kind) {
+                .cpu => .{
+                    .frame = try stage_adapters.localBoundaryFrameSpec(self, boundary_index),
+                    .slot_index = slot_index,
+                    .sequence_start = pos_base,
+                    .token_count = rows,
+                    .activation_byte_count = chunk_host_bytes.len,
+                    .location_hint = .{ .cpu = {} },
+                    .image = .{ .host_bytes = chunk_host_bytes },
+                    .local_device_peer_copy_available = false,
+                },
+                .cuda => .{
+                    .frame = try stage_adapters.localBoundaryFrameSpec(self, boundary_index),
+                    .slot_index = slot_index,
+                    .sequence_start = pos_base,
+                    .token_count = rows,
+                    .activation_byte_count = transfer_bytes,
+                    .location_hint = try cudaLocationHintForStageId(self, aux_cuda_backend, root_stage_id, source_spec.stage_id),
+                    .image = .device,
+                },
+                else => return error.InvalidTopologyConfig,
+            };
+        }
 
-        // ── Logits from last chunk (on stage1) ──
+        try bridge.executeLocalPrefillPipelineStep(try stage_adapters.localPipelineContext(self), stages[0..stage_count], .{
+            .tensor_frame_plan_ref = try stage_adapters.localTopologyTensorFramePlanRef(self),
+            .hidden_size = self.d_model,
+            .slot_request_ids = self.slot_request_ids[0..],
+            .boundary_payloads = payload_specs[0 .. specs.len - 1],
+        });
+
         if (pos_base + rows >= total_rows) {
-            try projectFinalLogitsFromCudaStage(stage1, stage1_final_hidden, rows, math.row_bytes, chunk.last_position, logits_out, "cuda_pipeline2_final_norm_host");
+            const final_stage_id = specs[specs.len - 1].stage_id;
+            if (final_stage_id == root_stage_id) {
+                try projectFinalLogitsFromCudaStage(self, root_final_hidden orelse return error.InvalidTopologyConfig, rows, math.row_bytes, chunk.last_position, logits_out, null);
+            } else if (aux_stage_id != null and final_stage_id == aux_stage_id.?) {
+                try projectFinalLogitsFromCudaStage(aux_cuda_backend orelse return error.InvalidTopologyConfig, aux_final_hidden orelse return error.InvalidTopologyConfig, rows, math.row_bytes, chunk.last_position, logits_out, "cuda_pipeline2_final_norm_host");
+            } else {
+                return error.InvalidTopologyConfig;
+            }
         }
 
         pos_base += rows;
     }
 }
 
-fn executeLocalPrefillCpuCudaCuda(
-    self: anytype,
-    cpu_stage0: anytype,
-    gpu_stage1: anytype,
-    tokens: []const u32,
-    slot_index: usize,
-    logits_out: []f32,
-) !void {
+fn optionalPointerPayload(comptime MaybePointer: type) type {
+    return switch (@typeInfo(MaybePointer)) {
+        .optional => |optional| optional.child,
+        else => MaybePointer,
+    };
+}
+
+fn localCpuStagePointerType(comptime Backend: type) type {
+    const return_type = @typeInfo(@TypeOf(Backend.localCpuStage0)).@"fn".return_type.?;
+    return optionalPointerPayload(return_type);
+}
+
+fn localCudaStagePointerType(comptime Backend: type) type {
+    const return_type = @typeInfo(@TypeOf(Backend.localCudaStage1)).@"fn".return_type.?;
+    return optionalPointerPayload(return_type);
+}
+
+fn rootCudaStageId(self: anytype) !usize {
     const SelfType = @TypeOf(self.*);
-    if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
-    if (comptime !@hasField(@TypeOf(gpu_stage1.*), "device")) return error.InvalidArgument;
-
-    const previous_launch_phase1 = gpu_stage1.device.setLaunchPhase(.prefill);
-    defer _ = gpu_stage1.device.setLaunchPhase(previous_launch_phase1);
-    const previous_launch_phase2 = self.device.setLaunchPhase(.prefill);
-    defer _ = self.device.setLaunchPhase(previous_launch_phase2);
-
-    const total_rows = tokens.len;
-    const math = try prefillMath(self);
-
-    // ── GPU1 + GPU2 setup ──
-    try prepareCudaPrefillBackend(gpu_stage1, total_rows);
-    try prepareCudaPrefillBackend(self, total_rows);
-    const attn_kernels_1 = buildAttentionKernelSet(gpu_stage1) catch return error.CudaKernelUnavailable;
-    const attn_kernels_2 = buildAttentionKernelSet(self) catch return error.CudaKernelUnavailable;
-    const chunk_cap = resolveTwoCudaChunkCap(total_rows, self, gpu_stage1);
-
-    // ── CPU stage0: batched embed + forward through [0, split_layer) ──
-    const prefill_buffer = try self.allocator.alloc(f32, total_rows * math.d_model);
-    defer self.allocator.free(prefill_buffer);
-
-    // For per-layer branch-input: capture source embeddings from CPU.
-    const per_layer_branch_active_1 = per_layer_branch_feature.hasPerLayerBranchRuntime(gpu_stage1);
-    const per_layer_branch_active_2 = per_layer_branch_feature.hasPerLayerBranchRuntime(self);
-    const source_embeddings_host = try allocateSourceEmbeddings(
-        self.allocator,
-        hasActivePerLayerBranch(gpu_stage1) or hasActivePerLayerBranch(self),
-        total_rows,
-        math.d_model,
-    );
-    defer if (source_embeddings_host) |buf| self.allocator.free(buf);
-
-    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, stage_adapters.localLayerOffset(self), source_embeddings_host);
-
-    // ── GPU1 → GPU2: chunked forward ──
-    var pos_base: usize = 0;
-    while (pos_base < total_rows) {
-        const rows = @min(total_rows - pos_base, chunk_cap);
-        const chunk = try prefillChunkContext(pos_base, rows);
-        const chunk_tokens = tokens[pos_base .. pos_base + rows];
-
-        // GPU1: upload CPU output + layer loop.
-        try ensureCudaChunkBuffers(gpu_stage1, rows);
-
-        const chunk_offset = pos_base * math.d_model;
-        const chunk_f32s = rows * math.d_model;
-        const chunk_bytes = std.mem.sliceAsBytes(prefill_buffer[chunk_offset..][0..chunk_f32s]);
-        try stage_adapters.executeHostToCudaPrefillBoundary(
-            self,
-            gpu_stage1,
-            0,
-            slot_index,
-            pos_base,
-            rows,
-            chunk_bytes,
-            chunk_bytes.len,
-        );
-
-        // Upload source embeddings for GPU1 per-layer branch branch.
-        var per_layer_source_embeddings_1: ?compute.cuda.Buffer = null;
-        if (hasActivePerLayerBranch(gpu_stage1)) {
-            if (source_embeddings_host) |se_host| {
-                per_layer_source_embeddings_1 = try uploadChunkSourceEmbeddings(gpu_stage1, se_host, pos_base, rows, math.d_model);
-            }
-        }
-
-        _ = try executeGpuPrefillLayers(
-            gpu_stage1,
-            slot_index,
-            chunk_tokens,
-            math,
-            chunk,
-            attn_kernels_1,
-            per_layer_source_embeddings_1,
-            per_layer_branch_active_1,
-            null,
-            gpu_stage1.block_runtime.blocks.len,
-        );
-
-        // GPU2: transfer from GPU1 + layer loop.
-        try ensureCudaChunkBuffers(self, rows);
-
-        // Bulk stage1→stage2 transfer for the full chunk.
-        const transfer_bytes = std.math.mul(usize, rows, math.row_bytes) catch return error.InvalidArgument;
-        try stage_adapters.executeCudaDevicePrefillBoundary(
-            self,
-            gpu_stage1,
-            self,
-            1,
-            slot_index,
-            pos_base,
-            rows,
-            transfer_bytes,
-            .source_stream,
-        );
-
-        // Upload source embeddings for GPU2 per-layer branch branch.
-        var per_layer_source_embeddings_2: ?compute.cuda.Buffer = null;
-        if (hasActivePerLayerBranch(self)) {
-            if (source_embeddings_host) |se_host| {
-                per_layer_source_embeddings_2 = try uploadChunkSourceEmbeddings(self, se_host, pos_base, rows, math.d_model);
-            }
-        }
-
-        const final_hidden_rows = try executeGpuPrefillLayers(
-            self,
-            slot_index,
-            chunk_tokens,
-            math,
-            chunk,
-            attn_kernels_2,
-            per_layer_source_embeddings_2,
-            per_layer_branch_active_2,
-            null,
-            self.block_runtime.blocks.len,
-        );
-
-        // Logits from last chunk (on GPU2).
-        if (pos_base + rows >= total_rows) {
-            try projectFinalLogitsFromCudaStage(self, final_hidden_rows, rows, math.row_bytes, chunk.last_position, logits_out, null);
-        }
-
-        pos_base += rows;
+    if (comptime !@hasField(SelfType, "local_stage_specs")) return error.InvalidTopologyConfig;
+    const specs = self.local_stage_specs;
+    if (specs.len < 2) return error.InvalidTopologyConfig;
+    if (specs[0].backend_kind == .cuda) return specs[0].stage_id;
+    for (specs) |spec| {
+        if (spec.backend_kind == .cuda and spec.owns_projection) return spec.stage_id;
     }
+    return error.InvalidTopologyConfig;
+}
+
+fn auxCudaStageId(self: anytype, root_stage_id: usize) !?usize {
+    var found: ?usize = null;
+    for (self.local_stage_specs) |spec| {
+        if (spec.backend_kind != .cuda or spec.stage_id == root_stage_id) continue;
+        if (found != null) return error.InvalidTopologyConfig;
+        found = spec.stage_id;
+    }
+    return found;
+}
+
+fn cudaLocationHintForStageId(
+    self: anytype,
+    aux_cuda_backend: anytype,
+    root_stage_id: usize,
+    stage_id: usize,
+) !bridge.TensorFramePayloadLocationHint {
+    if (stage_id == root_stage_id) return try stage_adapters.cudaPayloadLocationHint(self);
+    return try stage_adapters.cudaPayloadLocationHint(aux_cuda_backend orelse return error.InvalidTopologyConfig);
 }
 
 test "executeLocalPrefillPipeline rejects missing placement adapters" {
@@ -494,6 +481,6 @@ test "executeLocalPrefillPipeline rejects missing placement adapters" {
 
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        executeLocalPrefillPipeline(&backend, .cuda_cuda, tokens[0..], 0, logits[0..]),
+        executeLocalPrefillPipeline(&backend, tokens[0..], 0, logits[0..]),
     );
 }

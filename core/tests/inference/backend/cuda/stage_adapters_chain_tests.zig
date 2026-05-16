@@ -457,6 +457,320 @@ test "executeLocalPipelineStep executes both adjacent boundaries in order" {
     try std.testing.expectEqual(TraceStep.stage2_execute, trace_data.steps[6]);
 }
 
+test "executeLocalPipelineStep executes three adjacent boundaries in order" {
+    const TraceStep = enum {
+        stage0_execute,
+        stage0_sync,
+        stage1_upload,
+        stage1_execute,
+        stage1_sync,
+        stage2_upload,
+        stage2_execute,
+        stage2_sync,
+        stage3_upload,
+        stage3_execute,
+    };
+    const Trace = struct {
+        steps: [12]TraceStep = undefined,
+        len: usize = 0,
+
+        fn push(trace_data: *@This(), step: TraceStep) void {
+            trace_data.steps[trace_data.len] = step;
+            trace_data.len += 1;
+        }
+    };
+    const Stage = struct {
+        trace: *Trace,
+        id: usize,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            try stage_adapters.validateEmptyInput(input);
+            try std.testing.expect(layer_end > layer_start);
+            stage.trace.push(switch (stage.id) {
+                0 => TraceStep.stage0_execute,
+                1 => TraceStep.stage1_execute,
+                2 => TraceStep.stage2_execute,
+                else => TraceStep.stage3_execute,
+            });
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            switch (stage.id) {
+                0 => stage.trace.push(TraceStep.stage0_sync),
+                1 => stage.trace.push(TraceStep.stage1_sync),
+                2 => stage.trace.push(TraceStep.stage2_sync),
+                else => {},
+            }
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            switch (stage.id) {
+                1 => stage.trace.push(TraceStep.stage1_upload),
+                2 => stage.trace.push(TraceStep.stage2_upload),
+                3 => stage.trace.push(TraceStep.stage3_upload),
+                else => {},
+            }
+        }
+    };
+
+    var bundle = try buildFourStagePlacement();
+    defer bundle.deinit();
+    const placement = &bundle.placement_plan.?;
+    var metadata01 = try metadataForBoundary(placement, 0, .decode);
+    var metadata12 = try metadataForBoundary(placement, 1, .decode);
+    var metadata23 = try metadataForBoundary(placement, 2, .decode);
+    var payload01 = [_]u8{0xc1} ** 16;
+    var payload12 = [_]u8{0xc2} ** 16;
+    var payload23 = [_]u8{0xc3} ** 16;
+    const image01 = bridge.hostActivationByteImage(&metadata01, payload01[0..]);
+    const image12 = bridge.hostActivationByteImage(&metadata12, payload12[0..]);
+    const image23 = bridge.hostActivationByteImage(&metadata23, payload23[0..]);
+    var trace_data = Trace{};
+    var stage0 = Stage{ .trace = &trace_data, .id = 0 };
+    var stage1 = Stage{ .trace = &trace_data, .id = 1 };
+    var stage2 = Stage{ .trace = &trace_data, .id = 2 };
+    var stage3 = Stage{ .trace = &trace_data, .id = 3 };
+    var stages = [_]bridge.LocalStageChainStage{
+        bridge.localStageAdapter(Stage, metadata01.boundary.source_stage_id, &stage0),
+        bridge.localStageAdapter(Stage, metadata01.boundary.target_stage_id, &stage1),
+        bridge.localStageAdapter(Stage, metadata12.boundary.target_stage_id, &stage2),
+        bridge.localStageAdapter(Stage, metadata23.boundary.target_stage_id, &stage3),
+    };
+    const boundary_payloads = [_]bridge.LocalPipelineBoundaryPayload{
+        .{ .metadata = &metadata01, .image = &image01, .runtime = .{ .allow_borrow = false } },
+        .{ .metadata = &metadata12, .image = &image12, .runtime = .{ .allow_borrow = false } },
+        .{ .metadata = &metadata23, .image = &image23, .runtime = .{ .allow_borrow = false } },
+    };
+
+    try bridge.executeLocalPipelineStep(.{
+        .allocator = std.testing.allocator,
+        .plan_ref = &bundle.local_stage_runner_plan_ref.?,
+        .placement_plan = placement,
+    }, &stages, &boundary_payloads, .decode, &.{});
+
+    try std.testing.expectEqual(@as(usize, 10), trace_data.len);
+    try std.testing.expectEqual(TraceStep.stage0_execute, trace_data.steps[0]);
+    try std.testing.expectEqual(TraceStep.stage0_sync, trace_data.steps[1]);
+    try std.testing.expectEqual(TraceStep.stage1_upload, trace_data.steps[2]);
+    try std.testing.expectEqual(TraceStep.stage1_execute, trace_data.steps[3]);
+    try std.testing.expectEqual(TraceStep.stage1_sync, trace_data.steps[4]);
+    try std.testing.expectEqual(TraceStep.stage2_upload, trace_data.steps[5]);
+    try std.testing.expectEqual(TraceStep.stage2_execute, trace_data.steps[6]);
+    try std.testing.expectEqual(TraceStep.stage2_sync, trace_data.steps[7]);
+    try std.testing.expectEqual(TraceStep.stage3_upload, trace_data.steps[8]);
+    try std.testing.expectEqual(TraceStep.stage3_execute, trace_data.steps[9]);
+}
+
+test "executeLocalDecodePipelineStep accepts generic four stage local chain" {
+    const TraceStep = enum {
+        stage0_execute,
+        stage0_sync,
+        stage1_upload,
+        stage1_execute,
+        stage1_sync,
+        stage2_upload,
+        stage2_execute,
+        stage2_sync,
+        stage3_upload,
+        stage3_execute,
+    };
+    const Trace = struct {
+        steps: [12]TraceStep = undefined,
+        len: usize = 0,
+
+        fn push(trace_data: *@This(), step: TraceStep) void {
+            trace_data.steps[trace_data.len] = step;
+            trace_data.len += 1;
+        }
+    };
+    const Stage = struct {
+        trace: *Trace,
+        id: usize,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            try stage_adapters.validateEmptyInput(input);
+            try std.testing.expect(layer_end > layer_start);
+            stage.trace.push(switch (stage.id) {
+                0 => TraceStep.stage0_execute,
+                1 => TraceStep.stage1_execute,
+                2 => TraceStep.stage2_execute,
+                else => TraceStep.stage3_execute,
+            });
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            switch (stage.id) {
+                0 => stage.trace.push(TraceStep.stage0_sync),
+                1 => stage.trace.push(TraceStep.stage1_sync),
+                2 => stage.trace.push(TraceStep.stage2_sync),
+                else => {},
+            }
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            switch (stage.id) {
+                1 => stage.trace.push(TraceStep.stage1_upload),
+                2 => stage.trace.push(TraceStep.stage2_upload),
+                3 => stage.trace.push(TraceStep.stage3_upload),
+                else => {},
+            }
+        }
+    };
+
+    var bundle = try buildFourStagePlacement();
+    defer bundle.deinit();
+    var payload01 = [_]u8{0xc4} ** 16;
+    var payload12 = [_]u8{0xc5} ** 16;
+    var payload23 = [_]u8{0xc6} ** 16;
+    var slot_request_ids = [_]?u64{null} ** 8;
+    slot_request_ids[2] = 202;
+    const slot_indices = [_]usize{2};
+    const positions = [_]usize{5};
+    var trace_data = Trace{};
+    var stage0 = Stage{ .trace = &trace_data, .id = 0 };
+    var stage1 = Stage{ .trace = &trace_data, .id = 1 };
+    var stage2 = Stage{ .trace = &trace_data, .id = 2 };
+    var stage3 = Stage{ .trace = &trace_data, .id = 3 };
+    const runner = &bundle.local_stage_runner_plan_ref.?;
+    var stages = [_]bridge.LocalStageChainStage{
+        bridge.localStageAdapter(Stage, runner.stages[0].stage_id, &stage0),
+        bridge.localStageAdapter(Stage, runner.stages[1].stage_id, &stage1),
+        bridge.localStageAdapter(Stage, runner.stages[2].stage_id, &stage2),
+        bridge.localStageAdapter(Stage, runner.stages[3].stage_id, &stage3),
+    };
+    const boundary_payloads = [_]bridge.LocalDecodeBoundaryPayloadSpec{
+        .{
+            .frame = .{ .boundary_index = 0, .dtype = .f32, .layout = .row_major },
+            .activation_byte_count = payload01.len,
+            .location_hint = .cpu,
+            .image = .{ .host_bytes = payload01[0..] },
+        },
+        .{
+            .frame = .{ .boundary_index = 1, .dtype = .f32, .layout = .row_major },
+            .activation_byte_count = payload12.len,
+            .location_hint = .cpu,
+            .image = .{ .host_bytes = payload12[0..] },
+        },
+        .{
+            .frame = .{ .boundary_index = 2, .dtype = .f32, .layout = .row_major },
+            .activation_byte_count = payload23.len,
+            .location_hint = .cpu,
+            .image = .{ .host_bytes = payload23[0..] },
+        },
+    };
+
+    try bridge.executeLocalDecodePipelineStep(.{
+        .allocator = std.testing.allocator,
+        .plan_ref = runner,
+        .placement_plan = &bundle.placement_plan.?,
+    }, &stages, .{
+        .tensor_frame_plan_ref = &bundle.tensor_frame_plan_ref.?,
+        .hidden_size = 4,
+        .slot_request_ids = &slot_request_ids,
+        .slot_indices = &slot_indices,
+        .positions = &positions,
+        .boundary_payloads = &boundary_payloads,
+    });
+
+    try std.testing.expectEqual(@as(usize, 10), trace_data.len);
+    try std.testing.expectEqual(TraceStep.stage0_execute, trace_data.steps[0]);
+    try std.testing.expectEqual(TraceStep.stage0_sync, trace_data.steps[1]);
+    try std.testing.expectEqual(TraceStep.stage1_upload, trace_data.steps[2]);
+    try std.testing.expectEqual(TraceStep.stage1_execute, trace_data.steps[3]);
+    try std.testing.expectEqual(TraceStep.stage1_sync, trace_data.steps[4]);
+    try std.testing.expectEqual(TraceStep.stage2_upload, trace_data.steps[5]);
+    try std.testing.expectEqual(TraceStep.stage2_execute, trace_data.steps[6]);
+    try std.testing.expectEqual(TraceStep.stage2_sync, trace_data.steps[7]);
+    try std.testing.expectEqual(TraceStep.stage3_upload, trace_data.steps[8]);
+    try std.testing.expectEqual(TraceStep.stage3_execute, trace_data.steps[9]);
+}
+
+test "executeLocalPrefillPipelineStep builds prefill activation handoff" {
+    const TraceStep = enum { stage0_execute, stage0_sync, stage1_upload, stage1_execute };
+    const Trace = struct {
+        steps: [4]TraceStep = undefined,
+        len: usize = 0,
+
+        fn push(trace_data: *@This(), step: TraceStep) void {
+            trace_data.steps[trace_data.len] = step;
+            trace_data.len += 1;
+        }
+    };
+    const Stage = struct {
+        trace: *Trace,
+        id: usize,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            try stage_adapters.validateEmptyInput(input);
+            try std.testing.expect(layer_end > layer_start);
+            stage.trace.push(if (stage.id == 0) TraceStep.stage0_execute else TraceStep.stage1_execute);
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            if (stage.id == 0) stage.trace.push(TraceStep.stage0_sync);
+        }
+
+        pub fn downloadActivation(_: *@This(), _: []u8, _: usize) anyerror!void {
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            if (stage.id == 1) stage.trace.push(TraceStep.stage1_upload);
+        }
+    };
+
+    var bundle = try buildPlacement(.prefill);
+    defer bundle.deinit();
+    var payload = [_]u8{0xc7} ** 16;
+    var slot_request_ids = [_]?u64{null} ** 4;
+    slot_request_ids[1] = 101;
+    var trace_data = Trace{};
+    var stage0 = Stage{ .trace = &trace_data, .id = 0 };
+    var stage1 = Stage{ .trace = &trace_data, .id = 1 };
+    const runner = &bundle.local_stage_runner_plan_ref.?;
+    var stages = [_]bridge.LocalStageChainStage{
+        bridge.localStageAdapter(Stage, runner.stages[0].stage_id, &stage0),
+        bridge.localStageAdapter(Stage, runner.stages[1].stage_id, &stage1),
+    };
+    const boundary_payloads = [_]bridge.LocalPrefillBoundaryPayloadSpec{.{
+        .frame = .{ .boundary_index = 0, .dtype = .f32, .layout = .row_major },
+        .slot_index = 1,
+        .sequence_start = 3,
+        .token_count = 1,
+        .activation_byte_count = payload.len,
+        .location_hint = .cpu,
+        .image = .{ .host_bytes = payload[0..] },
+    }};
+
+    try bridge.executeLocalPrefillPipelineStep(.{
+        .allocator = std.testing.allocator,
+        .plan_ref = runner,
+        .placement_plan = &bundle.placement_plan.?,
+    }, &stages, .{
+        .tensor_frame_plan_ref = &bundle.tensor_frame_plan_ref.?,
+        .hidden_size = 4,
+        .slot_request_ids = &slot_request_ids,
+        .boundary_payloads = &boundary_payloads,
+    });
+
+    try std.testing.expectEqual(@as(usize, 4), trace_data.len);
+    try std.testing.expectEqual(TraceStep.stage0_execute, trace_data.steps[0]);
+    try std.testing.expectEqual(TraceStep.stage0_sync, trace_data.steps[1]);
+    try std.testing.expectEqual(TraceStep.stage1_upload, trace_data.steps[2]);
+    try std.testing.expectEqual(TraceStep.stage1_execute, trace_data.steps[3]);
+}
+
 test "executeLocalPipelineStep stops before stage two when boundary zero fails" {
     const TraceStep = enum { stage0_execute, stage0_sync, stage1_upload, stage1_execute, stage1_sync, stage2_upload, stage2_execute };
     const Trace = struct {
@@ -572,6 +886,23 @@ fn buildThreeStagePlacement() !engine.testing.LocalTopologyContractBundle {
     const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{ 2, 3 });
     const kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
     const configs = engine.testing.localCpuCudaCudaBoundaryConfigs(.f32, .row_major, .f32, .row_major, 4, 4, 1, 1);
+    return engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+        std.testing.allocator,
+        4,
+        plan,
+        &kinds,
+        &configs,
+    );
+}
+
+fn buildFourStagePlacement() !engine.testing.LocalTopologyContractBundle {
+    const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{ 1, 2, 3 });
+    const kinds = [_]bridge.HostBackendKind{ .cuda, .cpu, .cuda, .cpu };
+    const configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 1),
+        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 1),
+        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 1),
+    };
     return engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
         std.testing.allocator,
         4,

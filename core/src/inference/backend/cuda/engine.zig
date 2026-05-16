@@ -24,6 +24,7 @@ const load_transforms = @import("models_pkg").load.transforms;
 const vision_types = @import("../../vision_types.zig");
 const common_mrope = @import("../../vision_mrope.zig");
 const bridge = @import("../../bridge/root.zig");
+const transport = @import("../../transport/root.zig");
 const smoke_checks = @import("selftest.zig");
 const attention_policy = @import("attention_policy.zig");
 const attention_mod = @import("attention_path.zig");
@@ -64,6 +65,7 @@ const LocalBoundaryRuntime = struct {
     layout: bridge.BoundaryLayout,
     staging: ?[]align(4096) u8 = null,
     local_device_peer_copy_available: bool = false,
+    peer_copy_synchronization: transport.CudaPeerCopySynchronization = .source_stream,
 };
 
 const LocalTopologyBridgeBoundaryConfig = struct {
@@ -1767,6 +1769,7 @@ pub const CudaBackend = struct {
                     .layout = boundary_layout,
                     .staging = backend.local_boundary_staging[0],
                     .local_device_peer_copy_available = boundary_peer_copy_available,
+                    .peer_copy_synchronization = .source_event_target_stream,
                 }};
                 try backend.initLocalStageRuntime(total_layers, &stage_specs, &boundary_runtimes);
                 errdefer backend.deinitLocalStageRuntime();
@@ -2077,6 +2080,7 @@ pub const CudaBackend = struct {
                         .layout = boundary12_layout,
                         .staging = backend.local_boundary_staging[1],
                         .local_device_peer_copy_available = boundary12_peer_copy_available,
+                        .peer_copy_synchronization = .source_stream,
                     },
                 };
                 try backend.initLocalStageRuntime(total_layers, &stage_specs, &boundary_runtimes);
