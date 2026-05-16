@@ -294,6 +294,7 @@ pub const PlacementBoundarySummary = struct {
 
 pub const PlacementHostSummary = struct {
     host_id: HostId,
+    backend_kind: HostBackendKind = .@"opaque",
     capability_id: HostCapabilityId,
     residency_snapshot_id: HostResidencySnapshotId,
 };
@@ -963,6 +964,7 @@ fn copyBoundHostSummaries(
         const snapshot = residencyForHost(snapshots, binding.host_id) orelse return error.MissingHostResidency;
         summaries[out_index] = .{
             .host_id = binding.host_id,
+            .backend_kind = capability.backend_kind,
             .capability_id = capability.capability_id,
             .residency_snapshot_id = snapshot.snapshot_id,
         };
@@ -1447,6 +1449,7 @@ fn writeStageHostBinding(encoder: *HashEncoder, binding: StageHostBinding) void 
 
 fn writePlacementHostSummary(encoder: *HashEncoder, summary: PlacementHostSummary) void {
     encoder.writeU64(summary.host_id.value);
+    encoder.writeU8(@intFromEnum(summary.backend_kind));
     encoder.writeBytes(&summary.capability_id.digest);
     encoder.writeBytes(&summary.residency_snapshot_id.digest);
 }

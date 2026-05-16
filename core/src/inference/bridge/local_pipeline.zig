@@ -145,15 +145,32 @@ pub fn executeLocalPipelineChain(
     boundaries: []const local_stage_runner.LocalStageChainBoundaryStep,
     stage_inputs: []const []const u8,
 ) anyerror!void {
-    try local_stage_runner.executeLocalStageChain(.{
+    try executeLocalPipelineEndpointRegistryChain(
+        context,
+        .{ .endpoints = stages },
+        boundaries,
+        stage_inputs,
+        false,
+    );
+}
+
+pub fn executeLocalPipelineEndpointRegistryChain(
+    context: LocalPipelineContext,
+    registry: local_stage_runner.LocalStageEndpointRegistry,
+    boundaries: []const local_stage_runner.LocalStageChainBoundaryStep,
+    stage_inputs: []const []const u8,
+    project_final_logits: bool,
+) anyerror!void {
+    try local_stage_runner.executeLocalStageEndpointRegistryChain(.{
         .allocator = context.allocator,
         .plan_ref = context.plan_ref,
         .placement_plan = context.placement_plan,
         .state_ownership_plan = context.state_ownership_plan,
         .cleanup_obligations = context.cleanup_obligations,
-        .stages = stages,
+        .registry = registry,
         .boundaries = boundaries,
         .stage_inputs = stage_inputs,
+        .project_final_logits = project_final_logits,
     });
 }
 
@@ -164,8 +181,26 @@ pub fn executeLocalPipelineStep(
     comptime step_kind: tensor_frame.TensorFrameStepKind,
     stage_inputs: []const []const u8,
 ) anyerror!void {
-    if (stages.len < 2) return error.InvalidStageRange;
-    if (boundary_payloads.len + 1 != stages.len) return error.InvalidStepRequest;
+    try executeLocalPipelineStepWithEndpointRegistry(
+        context,
+        .{ .endpoints = stages },
+        boundary_payloads,
+        step_kind,
+        stage_inputs,
+        false,
+    );
+}
+
+pub fn executeLocalPipelineStepWithEndpointRegistry(
+    context: LocalPipelineContext,
+    registry: local_stage_runner.LocalStageEndpointRegistry,
+    boundary_payloads: []const LocalPipelineBoundaryPayload,
+    comptime step_kind: tensor_frame.TensorFrameStepKind,
+    stage_inputs: []const []const u8,
+    project_final_logits: bool,
+) anyerror!void {
+    if (registry.endpoints.len < 2) return error.InvalidStageRange;
+    if (boundary_payloads.len + 1 != registry.endpoints.len) return error.InvalidStepRequest;
 
     var inline_steps: [8]local_stage_runner.LocalStageChainBoundaryStep = undefined;
     var heap_steps: []local_stage_runner.LocalStageChainBoundaryStep = &.{};
@@ -191,7 +226,7 @@ pub fn executeLocalPipelineStep(
         };
     }
 
-    try executeLocalPipelineChain(context, stages, steps, stage_inputs);
+    try executeLocalPipelineEndpointRegistryChain(context, registry, steps, stage_inputs, project_final_logits);
 }
 
 pub fn executeLocalDecodePipelineStep(
@@ -199,8 +234,17 @@ pub fn executeLocalDecodePipelineStep(
     stages: []local_stage_runner.LocalStageChainStage,
     request: LocalDecodePipelineStepRequest,
 ) anyerror!void {
+    try executeLocalDecodePipelineStepWithEndpointRegistry(context, .{ .endpoints = stages }, request, false);
+}
+
+pub fn executeLocalDecodePipelineStepWithEndpointRegistry(
+    context: LocalPipelineContext,
+    registry: local_stage_runner.LocalStageEndpointRegistry,
+    request: LocalDecodePipelineStepRequest,
+    project_final_logits: bool,
+) anyerror!void {
     if (request.slot_indices.len != request.positions.len) return error.InvalidArgument;
-    if (request.boundary_payloads.len == 0 or request.boundary_payloads.len + 1 != stages.len) {
+    if (request.boundary_payloads.len == 0 or request.boundary_payloads.len + 1 != registry.endpoints.len) {
         return error.InvalidStepRequest;
     }
     if (request.slot_indices.len == 0) return error.InvalidArgument;
@@ -294,7 +338,14 @@ pub fn executeLocalDecodePipelineStep(
         };
     }
 
-    try executeLocalPipelineStep(context, stages, payloads, .decode, request.stage_inputs);
+    try executeLocalPipelineStepWithEndpointRegistry(
+        context,
+        registry,
+        payloads,
+        .decode,
+        request.stage_inputs,
+        project_final_logits,
+    );
 }
 
 pub fn executeLocalPrefillPipelineStep(
@@ -302,7 +353,16 @@ pub fn executeLocalPrefillPipelineStep(
     stages: []local_stage_runner.LocalStageChainStage,
     request: LocalPrefillPipelineStepRequest,
 ) anyerror!void {
-    if (request.boundary_payloads.len == 0 or request.boundary_payloads.len + 1 != stages.len) {
+    try executeLocalPrefillPipelineStepWithEndpointRegistry(context, .{ .endpoints = stages }, request, false);
+}
+
+pub fn executeLocalPrefillPipelineStepWithEndpointRegistry(
+    context: LocalPipelineContext,
+    registry: local_stage_runner.LocalStageEndpointRegistry,
+    request: LocalPrefillPipelineStepRequest,
+    project_final_logits: bool,
+) anyerror!void {
+    if (request.boundary_payloads.len == 0 or request.boundary_payloads.len + 1 != registry.endpoints.len) {
         return error.InvalidStepRequest;
     }
 
@@ -393,7 +453,14 @@ pub fn executeLocalPrefillPipelineStep(
         };
     }
 
-    try executeLocalPipelineStep(context, stages, payloads, .prefill, request.stage_inputs);
+    try executeLocalPipelineStepWithEndpointRegistry(
+        context,
+        registry,
+        payloads,
+        .prefill,
+        request.stage_inputs,
+        project_final_logits,
+    );
 }
 
 test "executeLocalPipelineChain rejects invalid bridge runner contract" {

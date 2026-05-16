@@ -16,9 +16,9 @@ Examples:
     python bench/run.py responses/evals/gpqa --samples 50
 
 Multi-GPU:
-    python bench/run.py responses/perf/pp512 --config cuda --env TALU_CUDA_TOPOLOGY=pipeline2 --env TALU_CUDA_STAGE_DEVICES=0,1
-    python bench/run.py responses/perf/pp512 --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu --env TALU_CUDA_STAGE_DEVICES=0
-    python bench/run.py responses/perf/pp512 --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu_gpu --env TALU_CUDA_STAGE_DEVICES=0,1
+    python bench/run.py responses/perf/pp512 --config cuda --env TALU_LOCAL_STAGES=cuda@0:0..16,cuda@1:16..end
+    python bench/run.py responses/perf/pp512 --config cuda --env TALU_LOCAL_STAGES=cpu:0..1,cuda@0:1..end
+    python bench/run.py responses/perf/pp512 --config cuda --env TALU_LOCAL_STAGES=cpu:0..1,cuda@0:1..16,cuda@1:16..end
 """
 
 from __future__ import annotations
@@ -226,10 +226,10 @@ def cmd_list() -> None:
     print(f"  python {argv0} {first} --set preset=coding")
     print(f"  python {argv0} {first} --set preset=coding --set temperature=0.3")
     print()
-    print("Multi-GPU topologies (via --env):")
-    print(f"  python {argv0} {first} --config cuda --env TALU_CUDA_TOPOLOGY=pipeline2 --env TALU_CUDA_STAGE_DEVICES=0,1")
-    print(f"  python {argv0} {first} --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu --env TALU_CUDA_STAGE_DEVICES=0")
-    print(f"  python {argv0} {first} --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu_gpu --env TALU_CUDA_STAGE_DEVICES=0,1")
+    print("Local stage examples (via --env):")
+    print(f"  python {argv0} {first} --config cuda --env TALU_LOCAL_STAGES=cuda@0:0..16,cuda@1:16..end")
+    print(f"  python {argv0} {first} --config cuda --env TALU_LOCAL_STAGES=cpu:0..1,cuda@0:1..end")
+    print(f"  python {argv0} {first} --config cuda --env TALU_LOCAL_STAGES=cpu:0..1,cuda@0:1..16,cuda@1:16..end")
     print()
 
 

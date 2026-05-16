@@ -71,6 +71,7 @@ const MockSlotBackend = struct {
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         [_]u8{0} ** 8,
     },
+    prefill: [16]u8 = [_]u8{0} ** 16,
 
     pub fn slotActivationBytes(self: *@This(), slot_index: usize) []const u8 {
         return self.slots[slot_index][0..];
@@ -78,6 +79,10 @@ const MockSlotBackend = struct {
 
     pub fn slotActivationBytesMut(self: *@This(), slot_index: usize) []u8 {
         return self.slots[slot_index][0..];
+    }
+
+    pub fn localPrefillActivationBytesMut(self: *@This(), byte_count: usize) []u8 {
+        return self.prefill[0..byte_count];
     }
 };
 
@@ -169,6 +174,14 @@ test "host slot activation transport copies bounded bytes" {
     try cuda_activation.uploadHostSlotActivation(&backend, 1, update[0..], update.len);
     try std.testing.expectEqualSlices(u8, update[0..], backend.slots[1][0..4]);
     try std.testing.expectError(error.InvalidArgument, cuda_activation.downloadHostSlotActivation(&backend, 0, host[0..], 5));
+}
+
+test "host prefill activation transport copies into staged CPU buffer" {
+    var backend = MockSlotBackend{};
+    const update = [_]u8{ 3, 1, 4, 1, 5, 9 };
+
+    try cuda_activation.uploadHostPrefillActivation(&backend, update[0..], update.len);
+    try std.testing.expectEqualSlices(u8, update[0..], backend.prefill[0..update.len]);
 }
 
 test "cuda activation transport uploads downloads and synchronizes backend" {

@@ -1,6 +1,6 @@
-//! CUDA topology selection and validation policy.
+//! Local stage plan selection and validation policy.
 //!
-//! This module owns CUDA stage topology parsing, validation, memory estimation,
+//! This module owns local stage parsing, validation, memory estimation,
 //! and model-shape policy used before CUDA backend initialization.
 
 const std = @import("std");
@@ -14,167 +14,95 @@ const tensor = @import("compute_pkg").tensor;
 const LoadedModel = models.LoadedModel;
 const has_cuda = build_options.enable_cuda and (builtin.os.tag == .linux or builtin.os.tag == .windows);
 
-/// Execution topology for CUDA-capable backends.
-///
-/// - `single`: All layers on one GPU (default).
-/// - `pipeline2`: Two CUDA GPUs, layers split at `split_layer`.
-/// - `cpu_gpu`: CPU executes layers [0, split_layer), GPU executes [split_layer, N).
-/// - `cpu_gpu_gpu`: CPU [0, split_layer), GPU0 [split_layer, split_layer_stage2), GPU1 [split_layer_stage2, N).
-pub const CudaTopologyMode = enum {
-    single,
-    pipeline2,
-    cpu_gpu,
-    cpu_gpu_gpu,
+pub const LocalStageBackendKind = enum {
+    cpu,
+    cuda,
+    metal,
 };
 
-/// Configuration for multi-stage execution topologies.
-///
-/// `mode` selects the topology. `split_layer` sets the first stage boundary
-/// (layer index where stage 0 ends and stage 1 begins). For 3-stage modes,
-/// `split_layer_stage2` sets the second boundary. `stage_device_ordinals`
-/// identifies which CUDA devices to use for GPU stages.
-///
-/// When `split_layer` is null, the runtime uses a default heuristic (n/2 for
-/// 2-stage, n/3 for 3-stage). Explicit values are validated against the model's
-/// layer count at init.
-pub const CudaTopologyConfig = struct {
-    mode: CudaTopologyMode = .single,
-    stage_device_ordinals: [2]usize = .{ 0, 1 },
-    split_layer: ?usize = null,
-    split_layer_stage2: ?usize = null,
+pub const LocalStageSpec = struct {
+    backend_kind: LocalStageBackendKind,
+    device_ordinal: ?usize = null,
+    layer_start: usize,
+    layer_end: usize,
 };
 
-pub const CudaTopology = struct {
-    mode: CudaTopologyMode = .single,
-    stage_device_ordinals: [2]usize = .{ 0, 1 },
-    split_layer: ?usize = null,
-    split_layer_stage2: ?usize = null,
+pub const max_local_stage_count: usize = 16;
 
-    pub fn primaryDeviceOrdinal(self: *const CudaTopology) usize {
-        return switch (self.mode) {
-            .cpu_gpu_gpu => self.stage_device_ordinals[1],
-            else => self.stage_device_ordinals[0],
-        };
+pub const LocalStageSpecList = struct {
+    allocator: std.mem.Allocator,
+    stages: []LocalStageSpec,
+
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.stages);
+        self.* = undefined;
     }
 };
 
-pub const CudaTopologyCapabilities = struct {
-    supports_pipeline2: bool = true,
-    supports_cpu_gpu: bool = true,
-    supports_cpu_gpu_gpu: bool = true,
-    min_pipeline2_layers: usize = 2,
-    min_cpu_gpu_layers: usize = 2,
-    min_cpu_gpu_gpu_layers: usize = 3,
-    requires_distinct_stage_devices: bool = true,
+pub const LocalStagePlan = struct {
+    stage_count: usize = 0,
+    stages: [max_local_stage_count]LocalStageSpec = undefined,
+
+    pub fn stagesSlice(self: *const @This()) []const LocalStageSpec {
+        return self.stages[0..self.stage_count];
+    }
+
+    pub fn primaryDeviceOrdinal(self: *const @This()) usize {
+        for (self.stagesSlice()) |stage| {
+            if (stage.backend_kind == .cuda) return stage.device_ordinal orelse 0;
+        }
+        return 0;
+    }
+
+    pub fn cudaStageCount(self: *const @This()) usize {
+        var count: usize = 0;
+        for (self.stagesSlice()) |stage| {
+            if (stage.backend_kind == .cuda) count += 1;
+        }
+        return count;
+    }
+
+    pub fn isSingleCudaStage(self: *const @This()) bool {
+        return self.stage_count == 1 and self.stages[0].backend_kind == .cuda;
+    }
 };
 
-pub const cuda_topology_capabilities = CudaTopologyCapabilities{};
-
-pub const CudaTopologyValidationError = error{
-    Pipeline2Unsupported,
-    Pipeline2InsufficientLayers,
-    Pipeline2InvalidSplitLayer,
-    Pipeline2RequiresDistinctDevices,
-    Pipeline2DeviceOrdinalOutOfRange,
-    CpuGpuUnsupported,
-    CpuGpuInsufficientLayers,
-    CpuGpuInvalidSplitLayer,
-    CpuGpuDeviceOrdinalOutOfRange,
-    CpuGpuGpuUnsupported,
-    CpuGpuGpuInsufficientLayers,
-    CpuGpuGpuInvalidSplitLayer,
-    CpuGpuGpuInvalidSplitLayerStage2,
-    CpuGpuGpuSplitOrderInvalid,
-    CpuGpuGpuRequiresDistinctDevices,
-    CpuGpuGpuDeviceOrdinalOutOfRange,
+pub const LocalStageValidationError = error{
+    InvalidTopologyConfig,
+    LocalStageTooManyStages,
+    LocalStageInsufficientLayers,
+    LocalStageUnsupportedBackend,
+    LocalStageDeviceOrdinalOutOfRange,
 };
 
-pub fn validateCudaTopologyConfig(
-    topology: CudaTopology,
+pub fn validateLocalStagePlan(
+    plan: LocalStagePlan,
     total_layers: usize,
     device_count: usize,
-) CudaTopologyValidationError!void {
-    switch (topology.mode) {
-        .single => return,
-        .pipeline2 => {
-            if (!cuda_topology_capabilities.supports_pipeline2) return error.Pipeline2Unsupported;
-            if (total_layers < cuda_topology_capabilities.min_pipeline2_layers) return error.Pipeline2InsufficientLayers;
-            if (topology.split_layer) |split| {
-                if (split == 0 or split >= total_layers) return error.Pipeline2InvalidSplitLayer;
-            }
-            if (cuda_topology_capabilities.requires_distinct_stage_devices and
-                topology.stage_device_ordinals[0] == topology.stage_device_ordinals[1])
-            {
-                return error.Pipeline2RequiresDistinctDevices;
-            }
-            if (topology.stage_device_ordinals[0] >= device_count or
-                topology.stage_device_ordinals[1] >= device_count)
-            {
-                return error.Pipeline2DeviceOrdinalOutOfRange;
-            }
-        },
-        .cpu_gpu => {
-            if (!cuda_topology_capabilities.supports_cpu_gpu) return error.CpuGpuUnsupported;
-            if (total_layers < cuda_topology_capabilities.min_cpu_gpu_layers) return error.CpuGpuInsufficientLayers;
-            if (topology.split_layer) |split| {
-                if (split == 0 or split >= total_layers) return error.CpuGpuInvalidSplitLayer;
-            }
-            if (topology.stage_device_ordinals[0] >= device_count) return error.CpuGpuDeviceOrdinalOutOfRange;
-        },
-        .cpu_gpu_gpu => {
-            if (!cuda_topology_capabilities.supports_cpu_gpu_gpu) return error.CpuGpuGpuUnsupported;
-            if (total_layers < cuda_topology_capabilities.min_cpu_gpu_gpu_layers) return error.CpuGpuGpuInsufficientLayers;
-            const split_default = @max(@as(usize, 1), total_layers / 3);
-            const split = topology.split_layer orelse split_default;
-            if (split == 0 or split >= total_layers) return error.CpuGpuGpuInvalidSplitLayer;
-            const split2_default = split + @max(@as(usize, 1), (total_layers - split) / 2);
-            const split2 = topology.split_layer_stage2 orelse split2_default;
-            if (split2 == 0 or split2 >= total_layers) return error.CpuGpuGpuInvalidSplitLayerStage2;
-            if (split2 <= split) return error.CpuGpuGpuSplitOrderInvalid;
-            if (cuda_topology_capabilities.requires_distinct_stage_devices and
-                topology.stage_device_ordinals[0] == topology.stage_device_ordinals[1])
-            {
-                return error.CpuGpuGpuRequiresDistinctDevices;
-            }
-            if (topology.stage_device_ordinals[0] >= device_count or
-                topology.stage_device_ordinals[1] >= device_count)
-            {
-                return error.CpuGpuGpuDeviceOrdinalOutOfRange;
-            }
-        },
+) LocalStageValidationError!void {
+    if (total_layers == 0 or plan.stage_count == 0) return error.InvalidTopologyConfig;
+    if (plan.stage_count > max_local_stage_count) return error.LocalStageTooManyStages;
+    if (plan.stage_count > 1 and total_layers < plan.stage_count) return error.LocalStageInsufficientLayers;
+    var expected_start: usize = 0;
+    for (plan.stagesSlice()) |stage| {
+        if (stage.layer_start != expected_start) return error.InvalidTopologyConfig;
+        if (stage.layer_end <= stage.layer_start or stage.layer_end > total_layers) return error.InvalidTopologyConfig;
+        switch (stage.backend_kind) {
+            .cpu => {
+                if (stage.device_ordinal != null) return error.InvalidTopologyConfig;
+            },
+            .cuda => {
+                const ordinal = stage.device_ordinal orelse return error.InvalidTopologyConfig;
+                if (ordinal >= device_count) return error.LocalStageDeviceOrdinalOutOfRange;
+            },
+            .metal => {
+                const ordinal = stage.device_ordinal orelse return error.InvalidTopologyConfig;
+                if (ordinal != 0) return error.LocalStageDeviceOrdinalOutOfRange;
+            },
+        }
+        expected_start = stage.layer_end;
     }
-}
-
-fn parseCudaTopologyMode(raw: []const u8) !CudaTopologyMode {
-    const token = std.mem.trim(u8, raw, " \t\r\n");
-    if (token.len == 0) return error.InvalidTopologyConfig;
-    if (std.ascii.eqlIgnoreCase(token, "single")) return .single;
-    if (std.ascii.eqlIgnoreCase(token, "pipeline2")) return .pipeline2;
-    if (std.ascii.eqlIgnoreCase(token, "pipeline_2")) return .pipeline2;
-    if (std.ascii.eqlIgnoreCase(token, "pipeline_2way")) return .pipeline2;
-    if (std.ascii.eqlIgnoreCase(token, "gpu_gpu")) return .pipeline2;
-    if (std.ascii.eqlIgnoreCase(token, "gpu-gpu")) return .pipeline2;
-    if (std.ascii.eqlIgnoreCase(token, "gpu+gpu")) return .pipeline2;
-    if (std.ascii.eqlIgnoreCase(token, "pipeline_gpu_gpu")) return .pipeline2;
-    if (std.ascii.eqlIgnoreCase(token, "cpu_gpu")) return .cpu_gpu;
-    if (std.ascii.eqlIgnoreCase(token, "cpu+gpu")) return .cpu_gpu;
-    if (std.ascii.eqlIgnoreCase(token, "pipeline_cpu_gpu")) return .cpu_gpu;
-    if (std.ascii.eqlIgnoreCase(token, "cpu_gpu_gpu")) return .cpu_gpu_gpu;
-    if (std.ascii.eqlIgnoreCase(token, "cpu+gpu+gpu")) return .cpu_gpu_gpu;
-    if (std.ascii.eqlIgnoreCase(token, "pipeline_cpu_gpu_gpu")) return .cpu_gpu_gpu;
-    return error.InvalidTopologyConfig;
-}
-
-fn parseTwoDeviceOrdinals(raw: []const u8) ![2]usize {
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return error.InvalidTopologyConfig;
-    var iter = std.mem.splitScalar(u8, trimmed, ',');
-    const left_raw = iter.next() orelse return error.InvalidTopologyConfig;
-    const right_raw = iter.next() orelse return error.InvalidTopologyConfig;
-    if (iter.next() != null) return error.InvalidTopologyConfig;
-    const left = std.fmt.parseUnsigned(usize, std.mem.trim(u8, left_raw, " \t\r\n"), 10) catch return error.InvalidTopologyConfig;
-    const right = std.fmt.parseUnsigned(usize, std.mem.trim(u8, right_raw, " \t\r\n"), 10) catch return error.InvalidTopologyConfig;
-    return .{ left, right };
+    if (expected_start != total_layers) return error.InvalidTopologyConfig;
 }
 
 fn getOptionalEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
@@ -184,102 +112,140 @@ fn getOptionalEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8
     };
 }
 
-pub fn resolveCudaTopology(
+fn parseLocalStageBackendKind(raw: []const u8) !LocalStageBackendKind {
+    const token = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(token, "cpu")) return .cpu;
+    if (std.ascii.eqlIgnoreCase(token, "cuda")) return .cuda;
+    if (std.ascii.eqlIgnoreCase(token, "metal")) return .metal;
+    return error.InvalidTopologyConfig;
+}
+
+fn parseLayerBound(raw: []const u8, total_layers: usize) !usize {
+    const token = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(token, "end")) return total_layers;
+    return std.fmt.parseUnsigned(usize, token, 10) catch return error.InvalidTopologyConfig;
+}
+
+fn parseLocalStageEntry(raw: []const u8, total_layers: usize) !LocalStageSpec {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidTopologyConfig;
+    const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidTopologyConfig;
+    const backend_part = trimmed[0..colon];
+    const range_part = trimmed[colon + 1 ..];
+    const range_sep = std.mem.indexOf(u8, range_part, "..") orelse return error.InvalidTopologyConfig;
+    if (std.mem.indexOf(u8, range_part[range_sep + 2 ..], "..") != null) return error.InvalidTopologyConfig;
+
+    const at = std.mem.indexOfScalar(u8, backend_part, '@');
+    const kind_raw = if (at) |index| backend_part[0..index] else backend_part;
+    const kind = try parseLocalStageBackendKind(kind_raw);
+    const device_ordinal: ?usize = if (at) |index| blk: {
+        const device_raw = std.mem.trim(u8, backend_part[index + 1 ..], " \t\r\n");
+        if (device_raw.len == 0) return error.InvalidTopologyConfig;
+        break :blk std.fmt.parseUnsigned(usize, device_raw, 10) catch return error.InvalidTopologyConfig;
+    } else null;
+    if (kind == .cpu and device_ordinal != null) return error.InvalidTopologyConfig;
+    if ((kind == .cuda or kind == .metal) and device_ordinal == null) return error.InvalidTopologyConfig;
+
+    const start = try parseLayerBound(range_part[0..range_sep], total_layers);
+    const end = try parseLayerBound(range_part[range_sep + 2 ..], total_layers);
+    return .{
+        .backend_kind = kind,
+        .device_ordinal = device_ordinal,
+        .layer_start = start,
+        .layer_end = end,
+    };
+}
+
+pub fn parseLocalStageSpecs(
     allocator: std.mem.Allocator,
-    topology_override: ?CudaTopologyConfig,
-) !CudaTopology {
-    var topology = CudaTopology{};
-    if (topology_override) |cfg| {
-        topology.mode = cfg.mode;
-        topology.stage_device_ordinals = cfg.stage_device_ordinals;
-        topology.split_layer = cfg.split_layer;
-        topology.split_layer_stage2 = cfg.split_layer_stage2;
-        return topology;
+    raw: []const u8,
+    total_layers: usize,
+) !LocalStageSpecList {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or total_layers == 0) return error.InvalidTopologyConfig;
+    var count: usize = 1;
+    for (trimmed) |byte| {
+        if (byte == ',') count += 1;
     }
+    const stages = try allocator.alloc(LocalStageSpec, count);
+    errdefer allocator.free(stages);
 
-    const mode_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY");
-    if (mode_raw) |value| {
-        defer allocator.free(value);
-        topology.mode = parseCudaTopologyMode(value) catch |err| {
-            log.err("inference", "Invalid TALU_CUDA_TOPOLOGY", .{ .value = value }, @src());
-            return err;
-        };
-    }
-
-    const devices_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_STAGE_DEVICES");
-    if (devices_raw) |value| {
-        defer allocator.free(value);
-        topology.stage_device_ordinals = parseTwoDeviceOrdinals(value) catch |err| {
-            log.err("inference", "Invalid TALU_CUDA_STAGE_DEVICES; expected '<gpu0>,<gpu1>'", .{ .value = value }, @src());
-            return err;
-        };
-    }
-
-    const single_device_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_DEVICE");
-    if (single_device_raw) |value| {
-        defer allocator.free(value);
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-            log.err("inference", "Invalid TALU_CUDA_DEVICE", .{
-                .value = trimmed,
-                .current = topology.primaryDeviceOrdinal(),
-            }, @src());
+    var iter = std.mem.splitScalar(u8, trimmed, ',');
+    var index: usize = 0;
+    var expected_start: usize = 0;
+    while (iter.next()) |entry| {
+        if (index >= stages.len) return error.InvalidTopologyConfig;
+        stages[index] = try parseLocalStageEntry(entry, total_layers);
+        if (stages[index].layer_start != expected_start) return error.InvalidTopologyConfig;
+        if (stages[index].layer_end <= stages[index].layer_start or stages[index].layer_end > total_layers) {
             return error.InvalidTopologyConfig;
-        };
-        if (topology.mode == .cpu_gpu_gpu) {
-            topology.stage_device_ordinals[1] = parsed;
-        } else {
-            topology.stage_device_ordinals[0] = parsed;
         }
+        expected_start = stages[index].layer_end;
+        index += 1;
     }
+    if (index != stages.len or expected_start != total_layers) return error.InvalidTopologyConfig;
+    return .{ .allocator = allocator, .stages = stages };
+}
 
-    const split_layer_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER");
-    if (split_layer_raw) |value| {
-        defer allocator.free(value);
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-            log.err("inference", "Invalid TALU_CUDA_SPLIT_LAYER", .{
-                .value = trimmed,
-            }, @src());
-            return error.InvalidTopologyConfig;
-        };
-        topology.split_layer = parsed;
+pub fn localStagePlanFromSpecs(stages: []const LocalStageSpec) !LocalStagePlan {
+    if (stages.len == 0 or stages.len > max_local_stage_count) return error.InvalidTopologyConfig;
+    var plan = LocalStagePlan{ .stage_count = stages.len };
+    for (stages, 0..) |stage, index| {
+        plan.stages[index] = stage;
     }
+    return plan;
+}
 
-    const split_layer_stage2_raw = try getOptionalEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER_STAGE2");
-    if (split_layer_stage2_raw) |value| {
-        defer allocator.free(value);
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
-            log.err("inference", "Invalid TALU_CUDA_SPLIT_LAYER_STAGE2", .{
-                .value = trimmed,
-            }, @src());
-            return error.InvalidTopologyConfig;
-        };
-        topology.split_layer_stage2 = parsed;
+pub fn defaultCudaLocalStagePlan(total_layers: usize, device_ordinal: usize) !LocalStagePlan {
+    if (total_layers == 0) return error.InvalidTopologyConfig;
+    return localStagePlanFromSpecs(&.{.{
+        .backend_kind = .cuda,
+        .device_ordinal = device_ordinal,
+        .layer_start = 0,
+        .layer_end = total_layers,
+    }});
+}
+
+pub fn resolveLocalStagePlan(
+    explicit_stages: ?[]const LocalStageSpec,
+    total_layers: usize,
+    default_device_ordinal: usize,
+) !LocalStagePlan {
+    if (explicit_stages) |stages| {
+        return localStagePlanFromSpecs(stages);
     }
+    return defaultCudaLocalStagePlan(total_layers, default_device_ordinal);
+}
 
-    return topology;
+pub fn rootCudaStageIdForLocalPlan(stages: []const LocalStageSpec) !usize {
+    if (stages.len == 0) return error.InvalidTopologyConfig;
+    if (stages[0].backend_kind == .cuda) return 0;
+    var index = stages.len;
+    while (index > 0) {
+        index -= 1;
+        if (stages[index].backend_kind == .cuda) return index;
+    }
+    return error.InvalidTopologyConfig;
 }
 
 // ---------------------------------------------------------------------------
-// Auto topology selection
+// Auto local stage-plan selection
 //
-// When no explicit TALU_CUDA_TOPOLOGY is set, automatically choose the best
-// topology based on available GPU memory and estimated model requirements.
+// When no explicit TALU_LOCAL_STAGES list is set, automatically choose the best
+// stage plan based on available GPU memory and estimated model requirements.
 //
 // Scenarios (see also AGENTS.md):
 //
-//   S0  BACKEND=cpu           → CPU backend, no GPU. Handled before we get here.
-//   S1  TALU_CUDA_TOPOLOGY    → User override. Skip auto-detection.
-//   S2  0 GPUs visible        → Error (caller handles).
-//   S3  1 GPU, model fits     → single.
-//   S4  1 GPU, model !fits    → cpu_gpu. Maximize layers on GPU.
-//   S5  2+ GPUs, fits on 1    → single on best GPU. Avoids pipeline overhead.
-//   S6  2+ GPUs, fits on 2    → pipeline2. Split proportional to free memory.
-//   S7  2+ GPUs, !fits on 2   → cpu_gpu_gpu. CPU takes overflow layers.
-//   S8  Too large for all     → Error (caller handles).
-//   S9  3+ GPUs               → Pick best 2 GPUs, apply S5-S7.
+//   S0  BACKEND=cpu           -> CPU backend, no GPU. Handled before we get here.
+//   S1  TALU_LOCAL_STAGES     -> User override. Skip auto-detection.
+//   S2  0 GPUs visible        -> Error (caller handles).
+//   S3  1 GPU, model fits     -> one CUDA stage.
+//   S4  1 GPU, model !fits    -> CPU prefix plus CUDA suffix.
+//   S5  2+ GPUs, fits on 1    -> one CUDA stage on best GPU.
+//   S6  2+ GPUs, fits on 2    -> two CUDA stages split by free memory.
+//   S7  2+ GPUs, !fits on 2   -> CPU prefix plus two CUDA stages.
+//   S8  Too large for all     -> Error (caller handles).
+//   S9  3+ GPUs               -> Pick best 2 GPUs, apply S5-S7.
 // ---------------------------------------------------------------------------
 
 const GpuMemoryInfo = struct {
@@ -467,22 +433,23 @@ fn utilPerMille(bytes: usize, budget: usize) usize {
     return (bytes *| 1000) / budget;
 }
 
-/// Select topology automatically based on estimated model size and GPU memory.
+/// Select a local stage plan automatically based on estimated model size and GPU memory.
 ///
 /// Uses per-GPU estimation that separates fixed costs (embedding, projection,
 /// activation buffers) from per-layer costs (weights, KV cache).
 /// Intermediate local stages skip embedding/projection at init time.
 ///
 /// Pure logic — no I/O, no side effects. Fully testable with synthetic values.
-/// Returns .single when in doubt (safest default).
+/// Returns one CUDA stage when in doubt.
 ///
 /// gpu_infos must be sorted by ordinal (as returned by probeGpuTotalMemory).
-fn autoSelectTopology(
+fn autoSelectLocalStagePlan(
     p: ModelSizeParams,
     total_layers: usize,
     gpu_infos: []const GpuMemoryInfo,
-) !CudaTopology {
-    if (gpu_infos.len == 0 or total_layers < 2) return .{};
+) !LocalStagePlan {
+    if (gpu_infos.len == 0) return error.InvalidTopologyConfig;
+    if (total_layers < 2) return defaultCudaLocalStagePlan(total_layers, gpu_infos[0].ordinal);
 
     // Find the two GPUs with the most free memory.
     var best0: usize = 0; // index into gpu_infos
@@ -504,29 +471,26 @@ fn autoSelectTopology(
     // S3/S5: Model fits on one GPU (with embedding + projection).
     const single_est = try estimatePerGpuBytes(p, 0, total_layers, true, true);
     if (single_est <= best0_budget) {
-        return .{
-            .mode = .single,
-            .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
-        };
+        return defaultCudaLocalStagePlan(total_layers, gpu_infos[best0].ordinal);
     }
 
     // From here: model doesn't fit on single GPU.
     if (gpu_infos.len == 1) {
-        // S4: cpu_gpu — offload lower layers to CPU.
+        // S4: offload lower layers to CPU.
         // GPU stage: no embedding (CPU does it), has projection (last stage).
         const gpu_layers = std.math.clamp(
             try maxSuffixLayersForBudget(p, best0_budget, total_layers, false, true),
             1,
             total_layers - 1,
         );
-        return .{
-            .mode = .cpu_gpu,
-            .stage_device_ordinals = .{ gpu_infos[0].ordinal, gpu_infos[0].ordinal },
-            .split_layer = total_layers - gpu_layers,
-        };
+        const split = total_layers - gpu_layers;
+        return localStagePlanFromSpecs(&.{
+            .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = split },
+            .{ .backend_kind = .cuda, .device_ordinal = gpu_infos[0].ordinal, .layer_start = split, .layer_end = total_layers },
+        });
     }
 
-    // 2+ GPUs. Ensure ordinals are ordered (lower first for pipeline2).
+    // 2+ GPUs. Ensure ordinals are ordered so stage ids remain stable.
     const ord0 = @min(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
     const ord1 = @max(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
     const free0 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best0].free else gpu_infos[best1].free;
@@ -534,7 +498,7 @@ fn autoSelectTopology(
     const budget0 = if (free0 > AUTO_TOPO_OVERHEAD_BYTES) free0 - AUTO_TOPO_OVERHEAD_BYTES else 0;
     const budget1 = if (free1 > AUTO_TOPO_OVERHEAD_BYTES) free1 - AUTO_TOPO_OVERHEAD_BYTES else 0;
 
-    // S6: Model fits across 2 GPUs (pipeline2).
+    // S6: Model fits across 2 GPUs.
     // GPU0: has embedding, no projection. GPU1: no embedding, has projection.
     // Find best split point where both GPUs fit.
     {
@@ -572,17 +536,16 @@ fn autoSelectTopology(
                 const g0_final = try estimatePerGpuBytes(p, 0, split, true, false);
                 const g1_final = try estimatePerGpuBytes(p, split, total_layers, false, true);
                 if (g0_final <= budget0 and g1_final <= budget1 and split >= 1 and split < total_layers) {
-                    return .{
-                        .mode = .pipeline2,
-                        .stage_device_ordinals = .{ ord0, ord1 },
-                        .split_layer = split,
-                    };
+                    return localStagePlanFromSpecs(&.{
+                        .{ .backend_kind = .cuda, .device_ordinal = ord0, .layer_start = 0, .layer_end = split },
+                        .{ .backend_kind = .cuda, .device_ordinal = ord1, .layer_start = split, .layer_end = total_layers },
+                    });
                 }
             }
         }
     }
 
-    // S7: Doesn't fit on 2 GPUs — cpu_gpu_gpu. CPU takes overflow.
+    // S7: Doesn't fit on 2 GPUs. CPU takes overflow.
     // GPU0: no embedding, no projection (middle stage).
     // GPU1: no embedding, has projection (last stage).
     var best_cpu_layers: usize = 0;
@@ -613,26 +576,25 @@ fn autoSelectTopology(
         }
     }
     if (best_gpu_layers < 2) {
-        // S8: Not enough GPU memory even for cpu_gpu_gpu. Return single and let
+        // S8: Not enough GPU memory even with a CPU prefix. Return single and let
         // the caller handle the OOM or error.
-        return .{};
+        return defaultCudaLocalStagePlan(total_layers, gpu_infos[best0].ordinal);
     }
-    return .{
-        .mode = .cpu_gpu_gpu,
-        .stage_device_ordinals = .{ ord0, ord1 },
-        .split_layer = best_cpu_layers,
-        .split_layer_stage2 = best_split_stage2,
-    };
+    return localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = best_cpu_layers },
+        .{ .backend_kind = .cuda, .device_ordinal = ord0, .layer_start = best_cpu_layers, .layer_end = best_split_stage2 },
+        .{ .backend_kind = .cuda, .device_ordinal = ord1, .layer_start = best_split_stage2, .layer_end = total_layers },
+    });
 }
 
-/// Run full auto-detection: probe GPU memory, estimate model requirements, select topology.
-pub fn autoDetectTopologyForModel(
+/// Run full auto-detection: probe GPU memory, estimate model requirements, select a stage plan.
+pub fn autoDetectLocalStagePlanForModel(
     allocator: std.mem.Allocator,
     loaded: *const LoadedModel,
-) !CudaTopology {
+) !LocalStagePlan {
     const device_count = if (has_cuda)
         compute.cuda.Device.deviceCount() catch |err| {
-            log.err("inference", "CUDA topology auto-detection failed to query device count", .{
+            log.err("inference", "CUDA local stage auto-detection failed to query device count", .{
                 .err = @errorName(err),
             }, @src());
             return error.CudaUnavailable;
@@ -643,7 +605,7 @@ pub fn autoDetectTopologyForModel(
     if (device_count == 0) return error.CudaUnavailable;
 
     const gpu_infos = probeGpuTotalMemory(allocator, device_count) catch |err| {
-        log.err("inference", "CUDA topology auto-detection failed to probe GPU memory", .{
+        log.err("inference", "CUDA local stage auto-detection failed to probe GPU memory", .{
             .err = @errorName(err),
         }, @src());
         return error.InvalidTopologyConfig;
@@ -671,273 +633,16 @@ pub fn autoDetectTopologyForModel(
 
     const estimated = try estimateModelGpuBytes(params);
 
-    const result = try autoSelectTopology(params, loaded.blocks.len, gpu_infos);
+    const result = try autoSelectLocalStagePlan(params, loaded.blocks.len, gpu_infos);
 
     // Log the auto-detection result.
     const estimated_mib = estimated / (1024 * 1024);
-    switch (result.mode) {
-        .single => {
-            const gpu_free_mib = if (gpu_infos.len > result.stage_device_ordinals[0])
-                gpu_infos[result.stage_device_ordinals[0]].free / (1024 * 1024)
-            else
-                0;
-            log.info("inference", "Auto topology: single", .{
-                .estimated_mib = estimated_mib,
-                .gpu = result.stage_device_ordinals[0],
-                .gpu_free_mib = gpu_free_mib,
-            });
-        },
-        .cpu_gpu => log.info("inference", "Auto topology: cpu_gpu", .{
-            .estimated_mib = estimated_mib,
-            .split_layer = result.split_layer orelse 0,
-            .gpu = result.stage_device_ordinals[0],
-            .gpu_free_mib = if (gpu_infos.len > 0) gpu_infos[result.stage_device_ordinals[0]].free / (1024 * 1024) else 0,
-        }),
-        .pipeline2 => log.info("inference", "Auto topology: pipeline2", .{
-            .estimated_mib = estimated_mib,
-            .split_layer = result.split_layer orelse 0,
-            .gpu0 = result.stage_device_ordinals[0],
-            .gpu1 = result.stage_device_ordinals[1],
-            .gpu0_free_mib = if (result.stage_device_ordinals[0] < gpu_infos.len) gpu_infos[result.stage_device_ordinals[0]].free / (1024 * 1024) else 0,
-            .gpu1_free_mib = if (result.stage_device_ordinals[1] < gpu_infos.len) gpu_infos[result.stage_device_ordinals[1]].free / (1024 * 1024) else 0,
-        }),
-        .cpu_gpu_gpu => log.info("inference", "Auto topology: cpu_gpu_gpu", .{
-            .estimated_mib = estimated_mib,
-            .split_layer = result.split_layer orelse 0,
-            .split_layer_stage2 = result.split_layer_stage2 orelse 0,
-            .gpu0 = result.stage_device_ordinals[0],
-            .gpu1 = result.stage_device_ordinals[1],
-        }),
-    }
-
-    return result;
-}
-
-/// Pure-logic topology selection from a requested CPU layer count.
-///
-/// CPU runs layers [0, cpu_layers), GPU(s) run [cpu_layers, total_layers).
-/// With 2+ GPUs, prefer one GPU when the GPU-owned suffix fits there; split the
-/// suffix only when model-aware estimation says one GPU is insufficient.
-///
-/// Returns null when cpu_layers is 0 (all on GPU → auto-detect) or invalid.
-fn topologyFromCpuLayers(
-    cpu_layers: usize,
-    total_layers: usize,
-    gpu_infos: []const GpuMemoryInfo,
-    model_params: ?ModelSizeParams,
-) !?CudaTopology {
-    if (total_layers < 2 or cpu_layers == 0 or cpu_layers >= total_layers) return null;
-    if (gpu_infos.len == 0) return null;
-
-    const gpu_layers = total_layers - cpu_layers;
-
-    var best0: usize = 0;
-    var best1: usize = if (gpu_infos.len > 1) 1 else 0;
-    for (gpu_infos, 0..) |info, i| {
-        if (info.free > gpu_infos[best0].free) {
-            best1 = best0;
-            best0 = i;
-        } else if (gpu_infos.len > 1 and i != best0 and info.free > gpu_infos[best1].free) {
-            best1 = i;
-        }
-    }
-    const best0_budget = if (gpu_infos[best0].free > AUTO_TOPO_OVERHEAD_BYTES)
-        gpu_infos[best0].free - AUTO_TOPO_OVERHEAD_BYTES
-    else
-        0;
-
-    if (model_params) |p| {
-        const one_gpu_est = try estimatePerGpuBytes(p, cpu_layers, total_layers, false, true);
-        if (one_gpu_est <= best0_budget) {
-            return .{
-                .mode = .cpu_gpu,
-                .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
-                .split_layer = cpu_layers,
-            };
-        }
-    } else {
-        // Without model parameters, avoid using a second GPU just because it is
-        // visible. The caller passes model parameters on the normal load path.
-        return .{
-            .mode = .cpu_gpu,
-            .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
-            .split_layer = cpu_layers,
-        };
-    }
-
-    if (gpu_infos.len == 1 or gpu_layers < 2) {
-        // One visible GPU, or only one GPU layer, cannot use a second GPU stage.
-        return .{
-            .mode = .cpu_gpu,
-            .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
-            .split_layer = cpu_layers,
-        };
-    }
-
-    // 2+ GPUs: cpu_gpu_gpu. Pick best 2 GPUs and split.
-    const ord0 = @min(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
-    const ord1 = @max(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
-    const free0 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best0].free else gpu_infos[best1].free;
-    const free1 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best1].free else gpu_infos[best0].free;
-
-    // Model-aware split: GPU0 (middle) has no embed/proj, GPU1 (last) has proj.
-    // Find the split that balances utilization across both GPUs.
-    const gpu0_share = if (model_params) |p| blk: {
-        const budget0 = if (free0 > AUTO_TOPO_OVERHEAD_BYTES) free0 - AUTO_TOPO_OVERHEAD_BYTES else 1;
-        const budget1 = if (free1 > AUTO_TOPO_OVERHEAD_BYTES) free1 - AUTO_TOPO_OVERHEAD_BYTES else 1;
-        // Iterate all possible splits and pick the one that minimizes the
-        // maximum utilization ratio. This accounts for projection asymmetry.
-        var best_split: usize = gpu_layers / 2;
-        var best_max_util: usize = std.math.maxInt(usize);
-        var s: usize = 1;
-        while (s < gpu_layers) : (s += 1) {
-            const split_stage2 = cpu_layers + s;
-            const g0 = try estimatePerGpuBytes(p, cpu_layers, split_stage2, false, false);
-            const g1 = try estimatePerGpuBytes(p, split_stage2, total_layers, false, true);
-            const util0 = utilPerMille(g0, budget0);
-            const util1 = utilPerMille(g1, budget1);
-            const max_util = @max(util0, util1);
-            if (max_util < best_max_util) {
-                best_max_util = max_util;
-                best_split = s;
-            }
-        }
-        break :blk best_split;
-    } else blk: {
-        // Default: proportional by memory (no model info available).
-        const total_free = free0 + free1;
-        break :blk if (total_free > 0)
-            std.math.clamp(gpu_layers * free0 / total_free, 1, gpu_layers - 1)
-        else
-            gpu_layers / 2;
-    };
-
-    return .{
-        .mode = .cpu_gpu_gpu,
-        .stage_device_ordinals = .{ ord0, ord1 },
-        .split_layer = cpu_layers,
-        .split_layer_stage2 = cpu_layers + gpu0_share,
-    };
-}
-
-/// Resolve topology from TALU_CPU_LAYERS env var.
-///
-/// Returns null when the env var is not set or 0 (all on GPU → auto-detect).
-///
-/// When set to N (0 < N < total_layers):
-///   CPU runs layers [0, N), GPU(s) run [N, total_layers).
-///   With 2+ GPUs the GPU portion is auto-split proportional to memory.
-pub fn resolveCpuLayersTopology(
-    allocator: std.mem.Allocator,
-    loaded: *const LoadedModel,
-) !?CudaTopology {
-    const raw = (try getOptionalEnvVarOwned(allocator, "TALU_CPU_LAYERS")) orelse return null;
-    defer allocator.free(raw);
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    const cpu_layers_i = std.fmt.parseInt(i32, trimmed, 10) catch {
-        log.err("inference", "Invalid TALU_CPU_LAYERS", .{ .value = trimmed }, @src());
-        return error.InvalidTopologyConfig;
-    };
-
-    const total_layers = loaded.blocks.len;
-    if (total_layers < 2) {
-        log.err("inference", "TALU_CPU_LAYERS requires at least two decoder layers", .{
-            .total_layers = total_layers,
-        }, @src());
-        return error.InvalidTopologyConfig;
-    }
-    if (cpu_layers_i < 0) {
-        log.err("inference", "Invalid TALU_CPU_LAYERS", .{ .value = trimmed }, @src());
-        return error.InvalidTopologyConfig;
-    }
-    if (cpu_layers_i == 0) return null;
-
-    if (cpu_layers_i >= @as(i32, @intCast(total_layers))) {
-        log.err("inference", "TALU_CPU_LAYERS leaves no layer for CUDA", .{
-            .requested = cpu_layers_i,
-            .total_layers = total_layers,
-        }, @src());
-        return error.InvalidTopologyConfig;
-    }
-    const cpu_layers: usize = @intCast(cpu_layers_i);
-
-    // Query GPU count and memory.
-    const device_count = if (has_cuda)
-        compute.cuda.Device.deviceCount() catch |err| {
-            log.err("inference", "TALU_CPU_LAYERS: failed to query device count", .{
-                .err = @errorName(err),
-            }, @src());
-            return error.CudaUnavailable;
-        }
-    else
-        return error.CudaNotEnabled;
-
-    if (device_count == 0) return error.CudaUnavailable;
-
-    // Build model params for model-aware GPU layer splitting.
-    const model_max_seq: usize = @intCast(@max(@as(i32, 1), loaded.config.max_seq_len));
-    const p = ModelSizeParams{
-        .file_size = loaded.file_size,
-        .vocab_size = @intCast(@max(@as(i32, 1), loaded.config.vocab_size)),
-        .d_model = @intCast(@max(@as(i32, 1), loaded.config.d_model)),
-        .n_kv_heads = @intCast(@max(@as(i32, 0), loaded.config.n_kv_groups)),
-        .head_dim = @intCast(@max(@as(i32, 0), loaded.config.head_dim)),
-        .max_seq_len = resolveMaxSeqLenForEstimation(allocator, model_max_seq),
-        .n_layers = @intCast(@max(@as(i32, 0), loaded.config.n_layers)),
-        .manifest = loaded.manifestPtr(),
-    };
-
-    const gpu_infos = probeGpuTotalMemory(allocator, device_count) catch |err| {
-        log.err("inference", "TALU_CPU_LAYERS: failed to probe GPU memory", .{
-            .err = @errorName(err),
-        }, @src());
-        return error.InvalidTopologyConfig;
-    };
-    defer allocator.free(gpu_infos);
-
-    var result = (try topologyFromCpuLayers(cpu_layers, total_layers, gpu_infos, p)) orelse {
-        log.err("inference", "TALU_CPU_LAYERS produced an invalid topology", .{
-            .cpu_layers = cpu_layers,
-            .total_layers = total_layers,
-            .device_count = device_count,
-        }, @src());
-        return error.InvalidTopologyConfig;
-    };
-
-    // cpu_gpu_gpu splits GPU layers across 2 devices which requires KV shared
-    // source layers to be strictly above cpu_layers (room for GPU1 stage).
-    // When sources are in the CPU range, use cpu_gpu so cross-device KV
-    // replication handles them.
-    if (result.mode == .cpu_gpu_gpu) {
-        if (models.block_geometry.resolveMinSharedKvSourceLayer(loaded.config)) |min_src| {
-            if (cpu_layers >= min_src) {
-                result = .{
-                    .mode = .cpu_gpu,
-                    .stage_device_ordinals = .{ result.stage_device_ordinals[0], result.stage_device_ordinals[0] },
-                    .split_layer = cpu_layers,
-                };
-            }
-        }
-    }
-
-    // Log the resolved topology.
-    const gpu_layers = total_layers - cpu_layers;
-    switch (result.mode) {
-        .cpu_gpu => log.info("inference", "TALU_CPU_LAYERS: cpu_gpu", .{
-            .cpu_layers = cpu_layers,
-            .gpu_layers = gpu_layers,
-            .total_layers = total_layers,
-        }),
-        .cpu_gpu_gpu => log.info("inference", "TALU_CPU_LAYERS: cpu_gpu_gpu", .{
-            .cpu_layers = cpu_layers,
-            .gpu_layers = gpu_layers,
-            .split_layer_stage2 = result.split_layer_stage2 orelse 0,
-            .gpu0 = result.stage_device_ordinals[0],
-            .gpu1 = result.stage_device_ordinals[1],
-            .total_layers = total_layers,
-        }),
-        else => {},
-    }
+    log.info("inference", "Auto local stage plan", .{
+        .estimated_mib = estimated_mib,
+        .stage_count = result.stage_count,
+        .cuda_stage_count = result.cudaStageCount(),
+        .primary_cuda_device = result.primaryDeviceOrdinal(),
+    });
 
     return result;
 }
@@ -999,199 +704,97 @@ test "loadedModelHasPackedNvfp4Weights detects packed tensors in layer maps" {
     try std.testing.expect(loadedModelHasPackedNvfp4Weights(&loaded));
 }
 
-test "parseCudaTopologyMode parses supported modes" {
-    try std.testing.expectEqual(CudaTopologyMode.single, try parseCudaTopologyMode("single"));
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, try parseCudaTopologyMode("pipeline2"));
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, try parseCudaTopologyMode("pipeline_2way"));
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, try parseCudaTopologyMode("gpu_gpu"));
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, try parseCudaTopologyMode("gpu-gpu"));
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, try parseCudaTopologyMode("gpu+gpu"));
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, try parseCudaTopologyMode("cpu_gpu"));
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, try parseCudaTopologyMode("cpu+gpu"));
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, try parseCudaTopologyMode("cpu_gpu_gpu"));
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, try parseCudaTopologyMode("cpu+gpu+gpu"));
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, try parseCudaTopologyMode("pipeline_cpu_gpu_gpu"));
+test "parseLocalStageSpecs parses ordered backend layer ranges" {
+    var specs = try parseLocalStageSpecs(std.testing.allocator, "cpu:0..2,cuda@0:2..7,metal@0:7..end", 9);
+    defer specs.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), specs.stages.len);
+    try std.testing.expectEqual(LocalStageBackendKind.cpu, specs.stages[0].backend_kind);
+    try std.testing.expectEqual(@as(?usize, null), specs.stages[0].device_ordinal);
+    try std.testing.expectEqual(@as(usize, 0), specs.stages[0].layer_start);
+    try std.testing.expectEqual(@as(usize, 2), specs.stages[0].layer_end);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, specs.stages[1].backend_kind);
+    try std.testing.expectEqual(@as(?usize, 0), specs.stages[1].device_ordinal);
+    try std.testing.expectEqual(@as(usize, 2), specs.stages[1].layer_start);
+    try std.testing.expectEqual(@as(usize, 7), specs.stages[1].layer_end);
+    try std.testing.expectEqual(LocalStageBackendKind.metal, specs.stages[2].backend_kind);
+    try std.testing.expectEqual(@as(?usize, 0), specs.stages[2].device_ordinal);
+    try std.testing.expectEqual(@as(usize, 7), specs.stages[2].layer_start);
+    try std.testing.expectEqual(@as(usize, 9), specs.stages[2].layer_end);
 }
 
-test "parseCudaTopologyMode rejects unsupported modes" {
-    try std.testing.expectError(error.InvalidTopologyConfig, parseCudaTopologyMode(""));
-    try std.testing.expectError(error.InvalidTopologyConfig, parseCudaTopologyMode("mesh"));
+test "parseLocalStageSpecs rejects non-contiguous or ambiguous specs" {
+    try std.testing.expectError(error.InvalidTopologyConfig, parseLocalStageSpecs(std.testing.allocator, "", 4));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseLocalStageSpecs(std.testing.allocator, "cpu:0..2,cuda@0:3..end", 4));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseLocalStageSpecs(std.testing.allocator, "cpu@0:0..1,cuda@0:1..end", 4));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseLocalStageSpecs(std.testing.allocator, "cpu:0..1,cuda:1..end", 4));
+    try std.testing.expectError(error.InvalidTopologyConfig, parseLocalStageSpecs(std.testing.allocator, "cpu:0..1,metal:1..end", 4));
 }
 
-test "parseTwoDeviceOrdinals parses gpu pairs" {
-    try std.testing.expectEqualDeep(@as([2]usize, .{ 0, 1 }), try parseTwoDeviceOrdinals("0,1"));
-    try std.testing.expectEqualDeep(@as([2]usize, .{ 3, 9 }), try parseTwoDeviceOrdinals(" 3 , 9 "));
-    try std.testing.expectError(error.InvalidTopologyConfig, parseTwoDeviceOrdinals("0"));
-    try std.testing.expectError(error.InvalidTopologyConfig, parseTwoDeviceOrdinals("a,1"));
-    try std.testing.expectError(error.InvalidTopologyConfig, parseTwoDeviceOrdinals("0,1,2"));
-}
-
-test "resolveCudaTopology honors explicit override" {
-    const topology = try resolveCudaTopology(std.testing.allocator, .{
-        .mode = .pipeline2,
-        .stage_device_ordinals = .{ 4, 5 },
-        .split_layer = 7,
-        .split_layer_stage2 = 11,
+test "localStagePlanFromSpecs preserves ordered generic stages" {
+    const plan = try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 2 },
+        .{ .backend_kind = .cuda, .device_ordinal = 4, .layer_start = 2, .layer_end = 7 },
+        .{ .backend_kind = .cuda, .device_ordinal = 5, .layer_start = 7, .layer_end = 11 },
     });
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, topology.mode);
-    try std.testing.expectEqualDeep(@as([2]usize, .{ 4, 5 }), topology.stage_device_ordinals);
-    try std.testing.expectEqual(@as(?usize, 7), topology.split_layer);
-    try std.testing.expectEqual(@as(?usize, 11), topology.split_layer_stage2);
+
+    try std.testing.expectEqual(@as(usize, 3), plan.stage_count);
+    try std.testing.expectEqual(LocalStageBackendKind.cpu, plan.stages[0].backend_kind);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, plan.stages[1].backend_kind);
+    try std.testing.expectEqual(@as(?usize, 4), plan.stages[1].device_ordinal);
+    try std.testing.expectEqual(@as(usize, 7), plan.stages[1].layer_end);
+    try std.testing.expectEqual(@as(?usize, 5), plan.stages[2].device_ordinal);
 }
 
-test "validateCudaTopologyConfig accepts single topology" {
-    const topology = CudaTopology{
-        .mode = .single,
-        .stage_device_ordinals = .{ 0, 0 },
+test "validateLocalStagePlan accepts single and mixed ordered plans" {
+    try validateLocalStagePlan(try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 0, .layer_end = 1 },
+    }), 1, 1);
+
+    try validateLocalStagePlan(try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 2 },
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 2, .layer_end = 5 },
+        .{ .backend_kind = .metal, .device_ordinal = 0, .layer_start = 5, .layer_end = 8 },
+    }), 8, 2);
+}
+
+test "validateLocalStagePlan rejects invalid generic plans" {
+    try std.testing.expectError(error.LocalStageInsufficientLayers, validateLocalStagePlan(try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 1 },
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 1, .layer_end = 2 },
+        .{ .backend_kind = .cuda, .device_ordinal = 1, .layer_start = 2, .layer_end = 3 },
+    }), 2, 2));
+
+    try std.testing.expectError(error.InvalidTopologyConfig, validateLocalStagePlan(try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 0, .layer_end = 2 },
+        .{ .backend_kind = .cuda, .device_ordinal = 1, .layer_start = 3, .layer_end = 4 },
+    }), 4, 2));
+
+    try std.testing.expectError(error.InvalidTopologyConfig, validateLocalStagePlan(try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cpu, .device_ordinal = 0, .layer_start = 0, .layer_end = 1 },
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 1, .layer_end = 2 },
+    }), 2, 1));
+
+    try std.testing.expectError(error.LocalStageDeviceOrdinalOutOfRange, validateLocalStagePlan(try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .cuda, .device_ordinal = 2, .layer_start = 0, .layer_end = 4 },
+    }), 4, 2));
+
+    try std.testing.expectError(error.LocalStageDeviceOrdinalOutOfRange, validateLocalStagePlan(try localStagePlanFromSpecs(&.{
+        .{ .backend_kind = .metal, .device_ordinal = 1, .layer_start = 0, .layer_end = 2 },
+    }), 2, 1));
+}
+
+test "resolveLocalStagePlan honors explicit generic override" {
+    const explicit = [_]LocalStageSpec{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 3 },
+        .{ .backend_kind = .cuda, .device_ordinal = 2, .layer_start = 3, .layer_end = 8 },
     };
-    try validateCudaTopologyConfig(topology, 1, 1);
-}
+    const plan = try resolveLocalStagePlan(&explicit, 8, 0);
 
-test "validateCudaTopologyConfig rejects pipeline2 with insufficient layers" {
-    const topology = CudaTopology{
-        .mode = .pipeline2,
-        .stage_device_ordinals = .{ 0, 1 },
-    };
-    try std.testing.expectError(
-        error.Pipeline2InsufficientLayers,
-        validateCudaTopologyConfig(topology, 1, 2),
-    );
+    try std.testing.expectEqual(@as(usize, 2), plan.stage_count);
+    try std.testing.expectEqual(LocalStageBackendKind.cpu, plan.stages[0].backend_kind);
+    try std.testing.expectEqual(@as(?usize, 2), plan.stages[1].device_ordinal);
 }
-
-test "validateCudaTopologyConfig rejects pipeline2 with duplicate device ordinals" {
-    const topology = CudaTopology{
-        .mode = .pipeline2,
-        .stage_device_ordinals = .{ 1, 1 },
-    };
-    try std.testing.expectError(
-        error.Pipeline2RequiresDistinctDevices,
-        validateCudaTopologyConfig(topology, 8, 4),
-    );
-}
-
-test "validateCudaTopologyConfig rejects pipeline2 when ordinal is out of range" {
-    const topology = CudaTopology{
-        .mode = .pipeline2,
-        .stage_device_ordinals = .{ 0, 3 },
-    };
-    try std.testing.expectError(
-        error.Pipeline2DeviceOrdinalOutOfRange,
-        validateCudaTopologyConfig(topology, 8, 2),
-    );
-}
-
-test "validateCudaTopologyConfig rejects pipeline2 split layer out of range" {
-    const topology = CudaTopology{
-        .mode = .pipeline2,
-        .stage_device_ordinals = .{ 0, 1 },
-        .split_layer = 8,
-    };
-    try std.testing.expectError(
-        error.Pipeline2InvalidSplitLayer,
-        validateCudaTopologyConfig(topology, 8, 2),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu with insufficient layers" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu,
-        .stage_device_ordinals = .{ 0, 0 },
-    };
-    try std.testing.expectError(
-        error.CpuGpuInsufficientLayers,
-        validateCudaTopologyConfig(topology, 1, 1),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu split layer out of range" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu,
-        .stage_device_ordinals = .{ 0, 0 },
-        .split_layer = 0,
-    };
-    try std.testing.expectError(
-        error.CpuGpuInvalidSplitLayer,
-        validateCudaTopologyConfig(topology, 8, 2),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu when gpu ordinal is out of range" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu,
-        .stage_device_ordinals = .{ 3, 0 },
-    };
-    try std.testing.expectError(
-        error.CpuGpuDeviceOrdinalOutOfRange,
-        validateCudaTopologyConfig(topology, 8, 2),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu_gpu with insufficient layers" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu_gpu,
-        .stage_device_ordinals = .{ 0, 1 },
-    };
-    try std.testing.expectError(
-        error.CpuGpuGpuInsufficientLayers,
-        validateCudaTopologyConfig(topology, 2, 2),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu_gpu split layer ordering" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu_gpu,
-        .stage_device_ordinals = .{ 0, 1 },
-        .split_layer = 5,
-        .split_layer_stage2 = 4,
-    };
-    try std.testing.expectError(
-        error.CpuGpuGpuSplitOrderInvalid,
-        validateCudaTopologyConfig(topology, 12, 2),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu_gpu with duplicate gpu ordinals" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu_gpu,
-        .stage_device_ordinals = .{ 1, 1 },
-        .split_layer = 3,
-        .split_layer_stage2 = 6,
-    };
-    try std.testing.expectError(
-        error.CpuGpuGpuRequiresDistinctDevices,
-        validateCudaTopologyConfig(topology, 10, 4),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu_gpu second split out of range" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu_gpu,
-        .stage_device_ordinals = .{ 0, 1 },
-        .split_layer = 2,
-        .split_layer_stage2 = 10,
-    };
-    try std.testing.expectError(
-        error.CpuGpuGpuInvalidSplitLayerStage2,
-        validateCudaTopologyConfig(topology, 10, 2),
-    );
-}
-
-test "validateCudaTopologyConfig rejects cpu_gpu_gpu when any gpu ordinal is out of range" {
-    const topology = CudaTopology{
-        .mode = .cpu_gpu_gpu,
-        .stage_device_ordinals = .{ 0, 3 },
-        .split_layer = 2,
-        .split_layer_stage2 = 7,
-    };
-    try std.testing.expectError(
-        error.CpuGpuGpuDeviceOrdinalOutOfRange,
-        validateCudaTopologyConfig(topology, 12, 2),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Auto topology selection tests
-// ---------------------------------------------------------------------------
 
 fn testGpuInfos(comptime N: usize, pairs: [N][2]usize) [N]GpuMemoryInfo {
     var infos: [N]GpuMemoryInfo = undefined;
@@ -1277,121 +880,117 @@ test "estimatePerGpuBytes rejects manifest range mismatch" {
     );
 }
 
-test "autoSelectTopology S3: 1 GPU, model fits → single" {
+test "autoSelectLocalStagePlan uses one CUDA stage when the model fits one GPU" {
     const p = testMinimalParams(2 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
-    const result = try autoSelectTopology(p, 32, &infos);
-    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
-    try std.testing.expectEqual(@as(usize, 0), result.stage_device_ordinals[0]);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expect(result.isSingleCudaStage());
+    try std.testing.expectEqual(@as(?usize, 0), result.stages[0].device_ordinal);
 }
 
-test "autoSelectTopology S4: 1 GPU, model too large → cpu_gpu" {
+test "autoSelectLocalStagePlan adds a CPU prefix when one GPU is too small" {
     // 4 GB free, ~10 GB model, 32 layers.
     const p = testMinimalParams(10 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(1, .{.{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 }});
-    const result = try autoSelectTopology(p, 32, &infos);
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
-    // split_layer should leave some layers on GPU.
-    try std.testing.expect(result.split_layer != null);
-    try std.testing.expect(result.split_layer.? > 0);
-    try std.testing.expect(result.split_layer.? < 32);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expectEqual(@as(usize, 2), result.stage_count);
+    try std.testing.expectEqual(LocalStageBackendKind.cpu, result.stages[0].backend_kind);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, result.stages[1].backend_kind);
+    try std.testing.expect(result.stages[0].layer_end > 0);
+    try std.testing.expect(result.stages[0].layer_end < 32);
 }
 
-test "autoSelectTopology S5: 2 GPUs, fits on best single → single on best" {
+test "autoSelectLocalStagePlan chooses the best single GPU" {
     // GPU0: 4 GB free, GPU1: 12 GB free. Model needs ~5 GB.
     const p = testMinimalParams(5 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(2, .{
         .{ 4 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
         .{ 12 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
     });
-    const result = try autoSelectTopology(p, 32, &infos);
-    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
-    // Should pick GPU1 (more free memory).
-    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[0]);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expect(result.isSingleCudaStage());
+    try std.testing.expectEqual(@as(?usize, 1), result.stages[0].device_ordinal);
 }
 
-test "autoSelectTopology S6: 2 GPUs, fits across both → pipeline2" {
+test "autoSelectLocalStagePlan splits across two GPUs when needed" {
     // GPU0: 4 GB free, GPU1: 4 GB free. Model needs ~6 GB.
     const p = testMinimalParams(6 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(2, .{
         .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
         .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
     });
-    const result = try autoSelectTopology(p, 32, &infos);
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, result.mode);
-    try std.testing.expect(result.split_layer != null);
-    // Equal memory → split near middle.
-    try std.testing.expect(result.split_layer.? >= 12 and result.split_layer.? <= 20);
-    try std.testing.expectEqual(@as(usize, 0), result.stage_device_ordinals[0]);
-    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[1]);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expectEqual(@as(usize, 2), result.stage_count);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, result.stages[0].backend_kind);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, result.stages[1].backend_kind);
+    try std.testing.expect(result.stages[0].layer_end >= 12 and result.stages[0].layer_end <= 20);
+    try std.testing.expectEqual(@as(?usize, 0), result.stages[0].device_ordinal);
+    try std.testing.expectEqual(@as(?usize, 1), result.stages[1].device_ordinal);
 }
 
-test "autoSelectTopology S6: pipeline2 split proportional to unequal GPU memory" {
+test "autoSelectLocalStagePlan split tracks unequal GPU memory" {
     // GPU0: 6 GB free, GPU1: 2 GB free. Model needs ~7 GB.
     const p = testMinimalParams(7 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(2, .{
         .{ 6 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
         .{ 2 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
     });
-    const result = try autoSelectTopology(p, 32, &infos);
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, result.mode);
-    // GPU0 has 3x more memory → split should put more layers on GPU0 (higher split_layer).
-    try std.testing.expect(result.split_layer.? >= 18);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expectEqual(@as(usize, 2), result.stage_count);
+    try std.testing.expect(result.stages[0].layer_end >= 18);
 }
 
-test "autoSelectTopology S7: 2 GPUs, doesn't fit → cpu_gpu_gpu" {
+test "autoSelectLocalStagePlan uses CPU plus two GPUs when two GPUs are not enough" {
     // GPU0: 4 GB, GPU1: 4 GB. Model needs ~12 GB.
     const p = testMinimalParams(12 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(2, .{
         .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
         .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
     });
-    const result = try autoSelectTopology(p, 32, &infos);
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
-    // CPU takes some layers, rest split across GPUs.
-    try std.testing.expect(result.split_layer != null);
-    try std.testing.expect(result.split_layer.? > 0);
-    try std.testing.expect(result.split_layer_stage2 != null);
-    try std.testing.expect(result.split_layer_stage2.? > result.split_layer.?);
-    try std.testing.expect(result.split_layer_stage2.? < 32);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expectEqual(@as(usize, 3), result.stage_count);
+    try std.testing.expectEqual(LocalStageBackendKind.cpu, result.stages[0].backend_kind);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, result.stages[1].backend_kind);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, result.stages[2].backend_kind);
+    try std.testing.expect(result.stages[0].layer_end > 0);
+    try std.testing.expect(result.stages[1].layer_end > result.stages[0].layer_end);
+    try std.testing.expect(result.stages[1].layer_end < 32);
 }
 
-test "autoSelectTopology S8: too large for everything → falls back to single" {
+test "autoSelectLocalStagePlan falls back to one CUDA stage when no split fits" {
     // GPU0: 1 GB, GPU1: 1 GB. Model needs ~100 GB.
     const p = testMinimalParams(100 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(2, .{
         .{ 1 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024 },
         .{ 1 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024 },
     });
-    const result = try autoSelectTopology(p, 32, &infos);
-    // Falls back to single (caller handles OOM).
-    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expect(result.isSingleCudaStage());
 }
 
-test "autoSelectTopology with 0 GPUs returns single" {
+test "autoSelectLocalStagePlan with no GPUs rejects the request" {
     const p = testMinimalParams(1024, 32);
     const infos: []const GpuMemoryInfo = &.{};
-    const result = try autoSelectTopology(p, 32, infos);
-    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+    try std.testing.expectError(error.InvalidTopologyConfig, autoSelectLocalStagePlan(p, 32, infos));
 }
 
-test "autoDetectTopologyForModel returns CudaNotEnabled when CUDA is disabled" {
+test "autoDetectLocalStagePlanForModel returns CudaNotEnabled when CUDA is disabled" {
     if (has_cuda) return;
     const loaded: *const LoadedModel = undefined;
     try std.testing.expectError(
         error.CudaNotEnabled,
-        autoDetectTopologyForModel(std.testing.allocator, loaded),
+        autoDetectLocalStagePlanForModel(std.testing.allocator, loaded),
     );
 }
 
-test "autoSelectTopology with 1 layer returns single" {
+test "autoSelectLocalStagePlan with one layer returns one CUDA stage" {
     const p = testMinimalParams(4096, 1);
     const infos = testGpuInfos(1, .{.{ 1024, 2048 }});
-    const result = try autoSelectTopology(p, 1, &infos);
-    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+    const result = try autoSelectLocalStagePlan(p, 1, &infos);
+    try std.testing.expect(result.isSingleCudaStage());
 }
 
-test "autoSelectTopology S9: 3 GPUs, picks best 2" {
+test "autoSelectLocalStagePlan picks the two best GPUs" {
     // GPU0: 2 GB, GPU1: 6 GB, GPU2: 6 GB. Model needs ~8 GB.
     const p = testMinimalParams(8 * 1024 * 1024 * 1024, 32);
     const infos = testGpuInfos(3, .{
@@ -1399,118 +998,8 @@ test "autoSelectTopology S9: 3 GPUs, picks best 2" {
         .{ 6 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
         .{ 6 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
     });
-    const result = try autoSelectTopology(p, 32, &infos);
-    // Should use GPU1 and GPU2 (most free memory), as pipeline2.
-    try std.testing.expectEqual(CudaTopologyMode.pipeline2, result.mode);
-    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[0]);
-    try std.testing.expectEqual(@as(usize, 2), result.stage_device_ordinals[1]);
-}
-
-// ---------------------------------------------------------------------------
-// topologyFromCpuLayers tests
-// ---------------------------------------------------------------------------
-
-test "topologyFromCpuLayers: cpu_layers=0 returns null" {
-    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
-    try std.testing.expect((try topologyFromCpuLayers(0, 32, &infos, null)) == null);
-}
-
-test "topologyFromCpuLayers: cpu_layers >= total_layers returns null" {
-    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
-    try std.testing.expect((try topologyFromCpuLayers(32, 32, &infos, null)) == null);
-    try std.testing.expect((try topologyFromCpuLayers(33, 32, &infos, null)) == null);
-}
-
-test "topologyFromCpuLayers: 1 GPU → cpu_gpu" {
-    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
-    const result = (try topologyFromCpuLayers(8, 32, &infos, null)).?;
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
-    try std.testing.expectEqual(@as(?usize, 8), result.split_layer);
-}
-
-test "topologyFromCpuLayers: 2 GPUs without model params prefer one GPU" {
-    const infos = testGpuInfos(2, .{
-        .{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
-        .{ 16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
-    });
-    const result = (try topologyFromCpuLayers(8, 32, &infos, null)).?;
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
-    try std.testing.expectEqual(@as(?usize, 8), result.split_layer);
-    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[0]);
-    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[1]);
-}
-
-test "topologyFromCpuLayers: 2 GPUs keep GPU suffix on one GPU when it fits" {
-    const gb = 1024 * 1024 * 1024;
-    const infos = testGpuInfos(2, .{
-        .{ 8 * gb, 16 * gb },
-        .{ 8 * gb, 16 * gb },
-    });
-    const p = testMinimalParams(3 * gb, 32);
-    const result = (try topologyFromCpuLayers(1, 32, &infos, p)).?;
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
-    try std.testing.expectEqual(@as(?usize, 1), result.split_layer);
-    try std.testing.expectEqual(@as([2]usize, .{ 0, 0 }), result.stage_device_ordinals);
-}
-
-test "topologyFromCpuLayers: model-aware split uses 2 GPUs when suffix exceeds one GPU" {
-    const gb = 1024 * 1024 * 1024;
-    const infos = testGpuInfos(2, .{
-        .{ 4 * gb, 4 * gb },
-        .{ 4 * gb, 4 * gb },
-    });
-    // Large vocab means projection weight is significant.
-    const p = ModelSizeParams{
-        .file_size = 10 * gb,
-        .vocab_size = 262144,
-        .d_model = 5376,
-        .n_kv_heads = 8,
-        .head_dim = 256,
-        .max_seq_len = 4096,
-        .n_layers = 60,
-    };
-    const result = (try topologyFromCpuLayers(36, 60, &infos, p)).?;
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
-    // GPU0 (no proj) should get more layers than GPU1 (has proj).
-    const gpu0_layers = result.split_layer_stage2.? - 36;
-    const gpu1_layers = 60 - result.split_layer_stage2.?;
-    try std.testing.expect(gpu0_layers > gpu1_layers);
-}
-
-test "topologyFromCpuLayers: 2 GPUs split overflowing suffix by memory" {
-    const gb = 1024 * 1024 * 1024;
-    const infos = testGpuInfos(2, .{
-        .{ 12 * gb, 16 * gb }, // GPU0: 12 GB
-        .{ 4 * gb, 8 * gb }, // GPU1: 4 GB
-    });
-    const p = testMinimalParams(24 * gb, 32);
-    const result = (try topologyFromCpuLayers(12, 32, &infos, p)).?;
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
-    try std.testing.expectEqual(@as(?usize, 12), result.split_layer);
-    // 20 GPU layers, GPU0 has 3x more memory → gets most layers.
-    const stage2 = result.split_layer_stage2.?;
-    try std.testing.expect(stage2 > 12 and stage2 < 32);
-    try std.testing.expect(stage2 >= 24); // GPU0 share ≈ 15
-}
-
-test "topologyFromCpuLayers: only 1 GPU layer → cpu_gpu even with 2 GPUs" {
-    const gb = 1024 * 1024 * 1024;
-    const infos = testGpuInfos(2, .{
-        .{ 8 * gb, 16 * gb },
-        .{ 8 * gb, 16 * gb },
-    });
-    // cpu_layers=31 → only 1 GPU layer, can't split across 2 GPUs.
-    const result = (try topologyFromCpuLayers(31, 32, &infos, null)).?;
-    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
-    try std.testing.expectEqual(@as(?usize, 31), result.split_layer);
-}
-
-test "topologyFromCpuLayers: no GPUs returns null" {
-    const infos = [_]GpuMemoryInfo{};
-    try std.testing.expect((try topologyFromCpuLayers(8, 32, &infos, null)) == null);
-}
-
-test "topologyFromCpuLayers: total_layers < 2 returns null" {
-    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
-    try std.testing.expect((try topologyFromCpuLayers(1, 1, &infos, null)) == null);
+    const result = try autoSelectLocalStagePlan(p, 32, &infos);
+    try std.testing.expectEqual(@as(usize, 2), result.stage_count);
+    try std.testing.expectEqual(@as(?usize, 1), result.stages[0].device_ordinal);
+    try std.testing.expectEqual(@as(?usize, 2), result.stages[1].device_ordinal);
 }

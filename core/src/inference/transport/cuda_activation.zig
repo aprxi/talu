@@ -4,10 +4,25 @@
 //! responsible for extracting concrete devices, buffers, streams, and events.
 
 const std = @import("std");
+const tensor_frame = @import("../bridge/tensor_frame.zig");
+const cuda_kv_mirror = @import("cuda_kv_mirror.zig");
+const local_stage = @import("local_stage.zig");
 
 pub const CudaPeerCopySynchronization = enum {
     source_stream,
     source_event_target_stream,
+};
+
+pub const LocalEndpointTransportOptions = struct {
+    pub const CpuActivationScope = enum {
+        decode_slot,
+        prefill_stage,
+    };
+
+    has_cpu_stage: bool = false,
+    allow_cpu_decode_download: bool = false,
+    prepare_cpu_boundary: bool = false,
+    cpu_activation_scope: CpuActivationScope = .decode_slot,
 };
 
 fn validateEmptyStageInput(input: []const u8) !void {
@@ -114,6 +129,19 @@ pub fn uploadHostSlotActivation(
 ) !void {
     if (byte_count > host_buffer.len) return error.InvalidArgument;
     const target = backend.slotActivationBytesMut(slot_index);
+    if (byte_count > target.len) return error.InvalidArgument;
+    @memcpy(target[0..byte_count], host_buffer[0..byte_count]);
+}
+
+pub fn uploadHostPrefillActivation(
+    backend: anytype,
+    host_buffer: []const u8,
+    byte_count: usize,
+) !void {
+    if (byte_count > host_buffer.len) return error.InvalidArgument;
+    const BackendType = @TypeOf(backend.*);
+    if (comptime !@hasDecl(BackendType, "localPrefillActivationBytesMut")) return error.InvalidTopologyConfig;
+    const target = backend.localPrefillActivationBytesMut(byte_count);
     if (byte_count > target.len) return error.InvalidArgument;
     @memcpy(target[0..byte_count], host_buffer[0..byte_count]);
 }
@@ -301,4 +329,235 @@ pub fn peerCopyCudaActivationHandlesStageSync(
         }
     }
     return false;
+}
+
+pub fn peerCopyCudaActivationRuntime(
+    source_backend: anytype,
+    target_backend: anytype,
+    byte_count: usize,
+    synchronization: CudaPeerCopySynchronization,
+) !void {
+    switch (synchronization) {
+        .source_stream => try peerCopyCudaActivation(source_backend, target_backend, byte_count, .source_stream),
+        .source_event_target_stream => try peerCopyCudaActivation(source_backend, target_backend, byte_count, .source_event_target_stream),
+    }
+}
+
+pub fn peerCopyCudaActivationHandlesStageSyncRuntime(
+    source_backend: anytype,
+    synchronization: CudaPeerCopySynchronization,
+) bool {
+    return switch (synchronization) {
+        .source_stream => peerCopyCudaActivationHandlesStageSync(source_backend, .source_stream),
+        .source_event_target_stream => peerCopyCudaActivationHandlesStageSync(source_backend, .source_event_target_stream),
+    };
+}
+
+pub fn synchronizeLocalEndpoint(stage: anytype) !void {
+    switch (stage.kind) {
+        .cpu => {},
+        .cuda => try synchronizeCudaActivationBackend(stage.cuda_backend orelse return error.InvalidTopologyConfig),
+    }
+}
+
+pub fn prepareCpuBoundaryTransferToCudaEndpoint(
+    stage: anytype,
+    target_ptr: *anyopaque,
+    metadata: *const tensor_frame.TensorFrameMetadata,
+    comptime Endpoint: type,
+    comptime has_cpu_stage: bool,
+) !void {
+    if (stage.kind != .cpu) return;
+    if (comptime !has_cpu_stage) return error.InvalidTopologyConfig;
+    const cpu = stage.cpu_backend orelse return error.InvalidTopologyConfig;
+    const target: *Endpoint = @ptrCast(@alignCast(target_ptr));
+    switch (target.kind) {
+        .cuda => {
+            const cuda_backend = target.cuda_backend orelse return error.InvalidTopologyConfig;
+            for (metadata.batch.entries) |entry| {
+                const slot_index = std.math.cast(usize, entry.slot_id) orelse return error.InvalidArgument;
+                const position = std.math.cast(usize, entry.sequence_start) orelse return error.InvalidArgument;
+                const token_count = std.math.cast(usize, entry.token_count) orelse return error.InvalidArgument;
+                try cuda_kv_mirror.uploadCpuKvToCudaMirrors(cuda_backend, cpu, slot_index, position, token_count);
+            }
+        },
+        .cpu => return error.InvalidTopologyConfig,
+    }
+}
+
+pub fn downloadLocalDecodeEndpointActivation(
+    stage: anytype,
+    host_buf: []u8,
+    byte_count: usize,
+    comptime has_cpu_stage: bool,
+) !void {
+    switch (stage.kind) {
+        .cpu => {
+            if (comptime !has_cpu_stage) return error.InvalidTopologyConfig;
+            try downloadHostSlotActivation(
+                stage.cpu_backend orelse return error.InvalidTopologyConfig,
+                stage.activation_slot_index,
+                host_buf,
+                byte_count,
+            );
+        },
+        .cuda => try downloadCudaActivation(stage.cuda_backend orelse return error.InvalidTopologyConfig, host_buf, byte_count),
+    }
+}
+
+pub fn downloadLocalDeviceEndpointActivation(
+    stage: anytype,
+    host_buf: []u8,
+    byte_count: usize,
+) !void {
+    switch (stage.kind) {
+        .cpu => return error.InvalidTopologyConfig,
+        .cuda => try downloadCudaActivation(stage.cuda_backend orelse return error.InvalidTopologyConfig, host_buf, byte_count),
+    }
+}
+
+pub fn uploadLocalEndpointActivation(
+    stage: anytype,
+    host_buf: []const u8,
+    byte_count: usize,
+    comptime has_cpu_stage: bool,
+    comptime cpu_activation_scope: LocalEndpointTransportOptions.CpuActivationScope,
+) !void {
+    switch (stage.kind) {
+        .cpu => {
+            if (comptime !has_cpu_stage) return error.InvalidTopologyConfig;
+            switch (comptime cpu_activation_scope) {
+                .decode_slot => try uploadHostSlotActivation(stage.cpu_backend orelse return error.InvalidTopologyConfig, stage.activation_slot_index, host_buf, byte_count),
+                .prefill_stage => try uploadHostPrefillActivation(stage.cpu_backend orelse return error.InvalidTopologyConfig, host_buf, byte_count),
+            }
+        },
+        .cuda => try uploadCudaActivation(stage.cuda_backend orelse return error.InvalidTopologyConfig, stage.activation_slot_index, host_buf, byte_count),
+    }
+}
+
+pub fn uploadLocalEndpointActivationSegments(stage: anytype, segments: []const []const u8, byte_count: usize) !void {
+    switch (stage.kind) {
+        .cpu => return error.LocalStageTransportSegmentedUploadUnsupported,
+        .cuda => try uploadCudaActivationSegments(stage.cuda_backend orelse return error.InvalidTopologyConfig, segments, byte_count),
+    }
+}
+
+pub fn peerCopyLocalEndpointActivationTo(
+    stage: anytype,
+    target_ptr: *anyopaque,
+    byte_count: usize,
+    comptime Endpoint: type,
+) !void {
+    if (stage.kind == .cpu) return error.LocalStageTransportPeerCopyUnsupported;
+    const target: *Endpoint = @ptrCast(@alignCast(target_ptr));
+    if (target.kind == .cpu) return error.LocalStageTransportPeerCopyUnsupported;
+    try peerCopyCudaActivationRuntime(
+        stage.cuda_backend orelse return error.InvalidTopologyConfig,
+        target.cuda_backend orelse return error.InvalidTopologyConfig,
+        byte_count,
+        stage.peer_copy_synchronization,
+    );
+}
+
+pub fn localEndpointPeerCopyHandlesStageSync(stage: anytype) bool {
+    return switch (stage.kind) {
+        .cpu => false,
+        .cuda => peerCopyCudaActivationHandlesStageSyncRuntime(stage.cuda_backend orelse return false, stage.peer_copy_synchronization),
+    };
+}
+
+pub fn localEndpointTransportAdapter(
+    comptime Endpoint: type,
+    stage_id: usize,
+    endpoint: *Endpoint,
+    comptime options: LocalEndpointTransportOptions,
+) local_stage.LocalStageTransportEndpoint {
+    const Adapter = struct {
+        fn endpointPtr(ptr: *anyopaque) *Endpoint {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn synchronize(ptr: *anyopaque, receipt: local_stage.StageExecutionReceipt) anyerror!void {
+            _ = receipt;
+            try synchronizeLocalEndpoint(endpointPtr(ptr));
+        }
+
+        fn prepareBoundaryTransferTo(
+            ptr: *anyopaque,
+            target_ptr: *anyopaque,
+            metadata: *const tensor_frame.TensorFrameMetadata,
+        ) anyerror!void {
+            if (comptime !options.prepare_cpu_boundary) return;
+            try prepareCpuBoundaryTransferToCudaEndpoint(
+                endpointPtr(ptr),
+                target_ptr,
+                metadata,
+                Endpoint,
+                options.has_cpu_stage,
+            );
+        }
+
+        fn downloadActivation(ptr: *anyopaque, host_buf: []u8, byte_count: usize) anyerror!void {
+            if (comptime options.allow_cpu_decode_download) {
+                try downloadLocalDecodeEndpointActivation(
+                    endpointPtr(ptr),
+                    host_buf,
+                    byte_count,
+                    options.has_cpu_stage,
+                );
+            } else {
+                try downloadLocalDeviceEndpointActivation(
+                    endpointPtr(ptr),
+                    host_buf,
+                    byte_count,
+                );
+            }
+        }
+
+        fn uploadActivation(ptr: *anyopaque, host_buf: []const u8, byte_count: usize) anyerror!void {
+            try uploadLocalEndpointActivation(
+                endpointPtr(ptr),
+                host_buf,
+                byte_count,
+                options.has_cpu_stage,
+                options.cpu_activation_scope,
+            );
+        }
+
+        fn uploadActivationSegments(ptr: *anyopaque, segments: []const []const u8, byte_count: usize) anyerror!void {
+            try uploadLocalEndpointActivationSegments(
+                endpointPtr(ptr),
+                segments,
+                byte_count,
+            );
+        }
+
+        fn peerCopyActivationTo(ptr: *anyopaque, target_ptr: *anyopaque, byte_count: usize) anyerror!void {
+            try peerCopyLocalEndpointActivationTo(
+                endpointPtr(ptr),
+                target_ptr,
+                byte_count,
+                Endpoint,
+            );
+        }
+
+        fn peerCopyHandlesStageSync(ptr: *anyopaque) bool {
+            return localEndpointPeerCopyHandlesStageSync(endpointPtr(ptr));
+        }
+
+        const vtable = local_stage.LocalStageTransportEndpointVTable{
+            .synchronize = synchronize,
+            .prepare_boundary_transfer_to = if (options.prepare_cpu_boundary) prepareBoundaryTransferTo else null,
+            .download_activation = downloadActivation,
+            .upload_activation = uploadActivation,
+            .upload_activation_segments = uploadActivationSegments,
+            .peer_copy_activation_to = peerCopyActivationTo,
+            .peer_copy_handles_stage_sync = peerCopyHandlesStageSync,
+        };
+    };
+    return .{
+        .stage_id = stage_id,
+        .ptr = endpoint,
+        .vtable = &Adapter.vtable,
+    };
 }

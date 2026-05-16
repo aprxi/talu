@@ -4,7 +4,7 @@ pub const decode_route = @import("decode_route.zig");
 pub const prefill_route = @import("prefill_route.zig");
 pub const kv_capacity = @import("kv_capacity.zig");
 pub const resets = @import("resets.zig");
-pub const stage_adapters = @import("stage_adapters.zig");
+pub const stage_adapters = @import("../../local_stage_adapters.zig");
 
 pub const resolveStagedPrefillChunkRows = prefill_route.resolveStagedPrefillChunkRows;
 pub const executePrefillWithLayerLimit = prefill_route.executePrefillWithLayerLimit;

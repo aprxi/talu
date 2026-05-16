@@ -106,6 +106,41 @@ pub const backend = struct {
     pub const cpu = @import("backend/cpu/root.zig");
     pub const metal = @import("backend/metal/root.zig");
     pub const cuda = @import("backend/cuda/root.zig");
+    pub const local_runtime = @import("backend/local_runtime.zig");
+    pub const local_stage = @import("backend/local_stage.zig");
+    pub const local_stage_adapters = @import("backend/local_stage_adapters.zig");
+    pub const local_decode_pipeline = @import("backend/local_decode_pipeline.zig");
+    pub const local_prefill_pipeline = @import("backend/local_prefill_pipeline.zig");
     // Re-export inference behavioral type used by dump/xray tooling.
     pub const FusedCpuBackend = cpu.FusedCpuBackend;
 };
+
+test "inference backend local_runtime buildPlan bridge-neutral runtime facts" {
+    const local_runtime = backend.local_runtime;
+    const stages = [_]@import("backend/topology.zig").LocalStageSpec{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 1 },
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 1, .layer_end = 3 },
+        .{ .backend_kind = .cpu, .layer_start = 3, .layer_end = 4 },
+    };
+    const caps = [_]local_runtime.StageRuntimeCapability{
+        .{ .stage_id = 0, .backend_kind = .cpu, .max_batch_size = 2, .prefill_chunk_rows_cap = 5, .supported_boundary_dtypes = &.{.f32} },
+        .{ .stage_id = 1, .backend_kind = .cuda, .max_batch_size = 3, .prefill_chunk_rows_cap = 4, .supported_boundary_dtypes = &.{.f32} },
+        .{ .stage_id = 2, .backend_kind = .cpu, .max_batch_size = 1, .prefill_chunk_rows_cap = 6, .supported_boundary_dtypes = &.{.f32} },
+    };
+    var plan = try local_runtime.buildPlan(.{
+        .allocator = std.testing.allocator,
+        .d_model = 8,
+        .total_layers = 4,
+        .stages = &stages,
+        .stage_capabilities = &caps,
+        .boundary_peer_copy_available = &.{ false, false },
+    });
+    defer plan.deinit();
+
+    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, plan.split_points);
+    try std.testing.expectEqual(bridge.HostBackendKind.cpu, plan.stage_specs[0].backend_kind);
+    try std.testing.expectEqual(bridge.HostBackendKind.cuda, plan.stage_specs[1].backend_kind);
+    try std.testing.expectEqual(bridge.HostBackendKind.cpu, plan.stage_specs[2].backend_kind);
+    try std.testing.expect(plan.boundary_runtimes[0].staging != null);
+    try std.testing.expect(plan.boundary_runtimes[1].staging != null);
+}

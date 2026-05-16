@@ -103,6 +103,8 @@ pub const FusedCpuBackend = struct {
 
     /// Per-sequence hidden buffers [max_batch_size][d_model]
     hidden_buffers: []f32,
+    /// Process-local staged prefill activation buffer [rows][d_model].
+    local_prefill_activation: []f32 = &.{},
 
     /// Per-sequence norm output buffers [max_batch_size][d_model]
     norm_buffers: []f32,
@@ -732,6 +734,10 @@ pub const FusedCpuBackend = struct {
         self.allocator.free(self.attn_out_buffers);
         self.allocator.free(self.norm_buffers);
         self.allocator.free(self.hidden_buffers);
+        if (self.local_prefill_activation.len != 0) {
+            self.allocator.free(self.local_prefill_activation);
+            self.local_prefill_activation = &.{};
+        }
         self.allocator.free(self.slot_state_bindings);
         self.allocator.free(self.slot_rope_position_deltas);
         self.model.deinit(self.allocator);
@@ -839,7 +845,7 @@ pub const FusedCpuBackend = struct {
             };
             if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_none) {
                 // Runtime descriptors use local storage to prevent aliasing when
-                // state blocks are shared with another backend (e.g., cpu_gpu topology).
+                // state blocks are shared with another backend in a local stage plan.
                 const block_storage = &binding.local_blocks[idx];
                 if (descriptor.zero_init) @memset(block_storage, 0);
                 var local_handle: runtime_contract.StateBlockHandle = .{
@@ -1193,6 +1199,30 @@ pub const FusedCpuBackend = struct {
         return std.mem.sliceAsBytes(self.getHiddenBuffer(slot_index));
     }
 
+    pub fn slotLogits(self: *FusedCpuBackend, slot_index: usize) []f32 {
+        return self.getLogitsBuffer(slot_index);
+    }
+
+    pub fn ensureLocalPrefillActivationRows(self: *FusedCpuBackend, row_count: usize) ![]f32 {
+        const needed = std.math.mul(usize, row_count, self.d_model) catch return error.InvalidArgument;
+        if (self.local_prefill_activation.len < needed) {
+            self.local_prefill_activation = try self.allocator.realloc(self.local_prefill_activation, needed);
+        }
+        return self.local_prefill_activation[0..needed];
+    }
+
+    pub fn localPrefillActivationBytes(self: *FusedCpuBackend, byte_count: usize) []const u8 {
+        const bytes = std.mem.sliceAsBytes(self.local_prefill_activation);
+        if (byte_count > bytes.len) return &.{};
+        return bytes[0..byte_count];
+    }
+
+    pub fn localPrefillActivationBytesMut(self: *FusedCpuBackend, byte_count: usize) []u8 {
+        const bytes = std.mem.sliceAsBytes(self.local_prefill_activation);
+        if (byte_count > bytes.len) return &.{};
+        return bytes[0..byte_count];
+    }
+
     /// Warmup: do a dummy forward pass to pull weights into CPU cache.
     pub fn warmup(self: *FusedCpuBackend) !void {
         // Suppress trace during warmup so xray doesn't capture warmup records
@@ -1272,7 +1302,7 @@ pub const FusedCpuBackend = struct {
 
     /// Batched prefill through a layer subset. Embeds all tokens, forwards
     /// through layers [0, layer_end), and writes hidden states to `output`.
-    /// Used by the CUDA cpu_gpu pipeline for batched CPU stage0 prefill.
+    /// Used by local stage prefill when a CPU stage owns the initial layer range.
     pub fn prefillSlotLayerRange(
         self: *FusedCpuBackend,
         slot_index: usize,
@@ -1320,6 +1350,69 @@ pub const FusedCpuBackend = struct {
             local_range.start,
             local_range.end,
         );
+    }
+
+    pub fn executePrefillLayerRange(
+        self: *FusedCpuBackend,
+        slot_index: usize,
+        tokens: []const u32,
+        sequence_start: usize,
+        layer_start: usize,
+        layer_end: usize,
+        use_preloaded_input: bool,
+        compute_logits: bool,
+        logits_out_opt: ?[]f32,
+        source_embeddings_out: ?[]f32,
+    ) !void {
+        if (tokens.len == 0) return;
+        const local_range = try self.localLayerRange(layer_start, layer_end);
+        if (compute_logits and !self.build_logits_head) return error.InvalidTopologyConfig;
+        if (compute_logits and logits_out_opt == null) return error.InvalidArgument;
+        if (logits_out_opt) |logits_out| {
+            if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+        }
+
+        try self.ensureSlotStateBlocksBound(slot_index);
+        if (sequence_start == 0) {
+            if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+                layered_cache.resetSlot(slot_index);
+            } else |err| switch (err) {
+                error.UnknownStateDescriptorId => {},
+                else => return err,
+            }
+            self.scratch.resetSlotCaches(slot_index);
+            self.slot_rope_position_deltas[slot_index] = 0;
+        }
+
+        const activation = try self.ensureLocalPrefillActivationRows(tokens.len);
+        try self.scratch.ensureForMode(.prefill, tokens.len);
+        var view = Tensor.view3D(std.mem.sliceAsBytes(activation), tokens.len, self.d_model);
+        if (!use_preloaded_input) {
+            try self.model.embed_tokens.forward(tokens, &view);
+            cpu_rowwise.scaleInPlace(activation, self.loaded.config.embedding_multiplier);
+            if (source_embeddings_out) |se_out| {
+                if (se_out.len < activation.len) return error.InvalidArgument;
+                @memcpy(se_out[0..activation.len], activation);
+            }
+        }
+
+        try self.model.forwardWithBatchedCacheLayerRangeTokenIds(
+            &view,
+            &view,
+            &self.scratch,
+            self.slotStateBlocks(slot_index),
+            slot_index,
+            tokens,
+            false,
+            local_range.start,
+            local_range.end,
+        );
+        if (!compute_logits) return;
+
+        if (self.model.norm) |*n| n.forward(&view, &view);
+        const last_row_start = (tokens.len - 1) * self.d_model;
+        const last_hidden = activation[last_row_start..][0..self.d_model];
+        try self.computeLogitsFromHiddenRows(last_hidden, 1, logits_out_opt.?);
     }
 
     /// Prefill with optional preprocessed vision input.
@@ -2902,6 +2995,23 @@ test "slotActivationBytes and slotActivationBytesMut expose slot hidden storage"
     var bytes_mut = backend.slotActivationBytesMut(0);
     bytes_mut[0] = 0;
     try std.testing.expect(bytes_mut.len == bytes.len);
+}
+
+test "localPrefillActivationBytes expose staged prefill activation storage" {
+    var backend: FusedCpuBackend = undefined;
+    backend.allocator = std.testing.allocator;
+    backend.d_model = 4;
+    backend.local_prefill_activation = &.{};
+    defer if (backend.local_prefill_activation.len != 0) std.testing.allocator.free(backend.local_prefill_activation);
+
+    const rows = try backend.ensureLocalPrefillActivationRows(3);
+    try std.testing.expectEqual(@as(usize, 12), rows.len);
+    const byte_count = rows.len * @sizeOf(f32);
+    var bytes_mut = backend.localPrefillActivationBytesMut(byte_count);
+    try std.testing.expectEqual(byte_count, bytes_mut.len);
+    bytes_mut[0] = 0xaa;
+    const bytes = backend.localPrefillActivationBytes(byte_count);
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
 }
 
 test "initRuntimeRopeHandles preserves logical pairing when rope_dim is smaller than global_head_dim" {

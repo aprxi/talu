@@ -8,27 +8,11 @@ const std = @import("std");
 const compute = @import("compute_pkg");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
-fn topologyModeTag(self: anytype) ?[]const u8 {
-    const SelfType = @TypeOf(self.*);
-    if (comptime !@hasField(SelfType, "topology_mode")) return null;
-    return @tagName(self.topology_mode);
-}
-
-fn rejectUnsupportedStagedPrefillRoute(topology_tag: ?[]const u8) !void {
-    const tag = topology_tag orelse return;
-    if (std.mem.eql(u8, tag, "pipeline2") or
-        std.mem.eql(u8, tag, "cpu_gpu") or
-        std.mem.eql(u8, tag, "cpu_gpu_gpu"))
-    {
-        return error.UnsupportedModel;
-    }
-}
-
 /// Resolve staged prefill chunk rows for a specific request length.
 /// Keeps explicit env override behavior unchanged.
 const common = @import("common.zig");
-const stage_adapters = @import("stage_adapters.zig");
-const staged_prefill = @import("staged_prefill.zig");
+const stage_adapters = @import("../../local_stage_adapters.zig");
+const staged_prefill = @import("../../local_prefill_pipeline.zig");
 const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const prefillMath = common.prefillMath;
 const prefillChunkContext = common.prefillChunkContext;
@@ -67,14 +51,12 @@ pub fn executePrefillWithLayerLimit(
 ) !void {
     const SelfType = @TypeOf(self.*);
 
-    // Compatibility topology labels only reject staged mocks without bridge facts.
     if (comptime @hasField(SelfType, "block_runtime")) {
         if (layer_limit == self.block_runtime.blocks.len) {
             if (try stage_adapters.localPipelineFactsAvailable(self)) {
                 try validatePrefillRequest(self, tokens, slot_index, logits_out);
                 return staged_prefill.executeLocalPrefillPipeline(self, tokens, slot_index, logits_out);
             }
-            try rejectUnsupportedStagedPrefillRoute(topologyModeTag(self));
         }
     }
 
@@ -82,7 +64,7 @@ pub fn executePrefillWithLayerLimit(
         return self.executePrefillWithLayerLimitTestHook(tokens, slot_index, logits_out, layer_limit);
     }
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook") and
-        !@hasDecl(SelfType, "localCpuStage0"))
+        !@hasDecl(SelfType, "localCpuStage"))
     {
         try validatePrefillRequest(self, tokens, slot_index, logits_out);
         if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
@@ -155,16 +137,4 @@ pub fn executePrefillWithLayerLimit(
 
         pos_base += rows;
     }
-}
-
-test "rejectUnsupportedStagedPrefillRoute rejects staged prefill route" {
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        rejectUnsupportedStagedPrefillRoute("pipeline2"),
-    );
-}
-
-test "rejectUnsupportedStagedPrefillRoute allows single-device tag" {
-    try rejectUnsupportedStagedPrefillRoute("single");
-    try rejectUnsupportedStagedPrefillRoute(null);
 }

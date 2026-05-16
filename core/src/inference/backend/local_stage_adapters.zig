@@ -1,11 +1,11 @@
-//! Shared adapter helpers for CUDA staged decode and prefill routes.
+//! Shared adapter helpers for local staged decode and prefill routes.
 //!
 //! This module owns common stage-method validation and stage metadata helpers
 //! used by local staged-route adapters.
 
 const std = @import("std");
-const bridge = @import("../../../bridge/root.zig");
-const transport = @import("../../../transport/root.zig");
+const bridge = @import("../bridge/root.zig");
+const transport = @import("../transport/root.zig");
 
 pub const max_decode_transport_rows: usize = 128;
 
@@ -81,28 +81,28 @@ pub fn backendAllocator(backend: anytype) ?std.mem.Allocator {
     return backend.allocator;
 }
 
-pub fn localTopologyTensorFramePlanRef(backend: anytype) !*const bridge.TensorFramePlanRef {
+pub fn localStageTensorFramePlanRef(backend: anytype) !*const bridge.TensorFramePlanRef {
     const BackendType = @TypeOf(backend.*);
     if (comptime !@hasField(BackendType, "local_tensor_frame_plan_ref")) return error.InvalidTopologyConfig;
     if (backend.local_tensor_frame_plan_ref) |*plan_ref| return plan_ref;
     return error.InvalidTopologyConfig;
 }
 
-pub fn localTopologyPlacementPlan(backend: anytype) !*const bridge.PlacementPlan {
+pub fn localStagePlacementPlan(backend: anytype) !*const bridge.PlacementPlan {
     const BackendType = @TypeOf(backend.*);
     if (comptime !@hasField(BackendType, "local_placement_plan")) return error.InvalidTopologyConfig;
     if (backend.local_placement_plan) |*placement_plan| return placement_plan;
     return error.InvalidTopologyConfig;
 }
 
-pub fn localTopologyStateOwnershipPlan(backend: anytype) ?*const bridge.StageStateOwnershipPlan {
+pub fn localStageStateOwnershipPlan(backend: anytype) ?*const bridge.StageStateOwnershipPlan {
     const BackendType = @TypeOf(backend.*);
     if (comptime !@hasField(BackendType, "local_state_ownership_plan")) return null;
     if (backend.local_state_ownership_plan) |*state_plan| return state_plan;
     return null;
 }
 
-pub fn localTopologyRunnerPlanRef(backend: anytype) !*const bridge.LocalStageRunnerPlanRef {
+pub fn localStageRunnerPlanRef(backend: anytype) !*const bridge.LocalStageRunnerPlanRef {
     const BackendType = @TypeOf(backend.*);
     if (comptime !@hasField(BackendType, "local_stage_runner_plan_ref")) return error.InvalidTopologyConfig;
     if (backend.local_stage_runner_plan_ref) |*plan_ref| return plan_ref;
@@ -112,9 +112,9 @@ pub fn localTopologyRunnerPlanRef(backend: anytype) !*const bridge.LocalStageRun
 pub fn localPipelineContext(backend: anytype) !bridge.LocalPipelineContext {
     return .{
         .allocator = backendAllocator(backend),
-        .plan_ref = try localTopologyRunnerPlanRef(backend),
-        .placement_plan = try localTopologyPlacementPlan(backend),
-        .state_ownership_plan = localTopologyStateOwnershipPlan(backend),
+        .plan_ref = try localStageRunnerPlanRef(backend),
+        .placement_plan = try localStagePlacementPlan(backend),
+        .state_ownership_plan = localStageStateOwnershipPlan(backend),
     };
 }
 
@@ -212,11 +212,8 @@ pub fn localBoundaryActivationByteCount(backend: anytype, boundary_index: usize)
 
 pub fn localLayerOffset(backend: anytype) usize {
     const BackendType = @TypeOf(backend.*);
-    if (comptime @hasDecl(BackendType, "localSplitLayer")) {
-        return backend.localSplitLayer();
-    }
-    if (comptime @hasField(BackendType, "split_layer")) {
-        return backend.split_layer;
+    if (comptime @hasField(BackendType, "local_layer_start")) {
+        return backend.local_layer_start;
     }
     return 0;
 }
@@ -241,7 +238,7 @@ pub fn buildDecodeActivationMetadata(
     const BackendType = @TypeOf(backend.*);
     if (comptime !@hasField(BackendType, "slot_request_ids")) return error.InvalidRequestId;
     return bridge.buildDecodeActivationMetadata(.{
-        .plan_ref = try localTopologyTensorFramePlanRef(backend),
+        .plan_ref = try localStageTensorFramePlanRef(backend),
         .hidden_size = backend.d_model,
         .boundary_index = boundary_index,
         .dtype = boundary_dtype,
@@ -268,7 +265,7 @@ pub fn buildPrefillActivationMetadata(
     const BackendType = @TypeOf(backend.*);
     if (comptime !@hasField(BackendType, "slot_request_ids")) return error.InvalidRequestId;
     return bridge.buildPrefillActivationMetadata(.{
-        .plan_ref = try localTopologyTensorFramePlanRef(backend),
+        .plan_ref = try localStageTensorFramePlanRef(backend),
         .hidden_size = backend.d_model,
         .boundary_index = boundary_index,
         .dtype = boundary_dtype,
@@ -296,6 +293,9 @@ pub fn executeCpuDecodeLayerRange(
     ctx: *const DecodeContext,
     layer_start: usize,
     layer_end: usize,
+    logits_out_opt: ?[]f32,
+    compute_logits: bool,
+    download_logits: bool,
     use_preloaded_input: bool,
 ) !void {
     if (comptime !hasDecl(@TypeOf(backend.*), "executeDecodeLayerRange")) {
@@ -305,11 +305,11 @@ pub fn executeCpuDecodeLayerRange(
         ctx.token,
         ctx.position,
         ctx.slot_index,
-        null,
+        logits_out_opt,
         layer_start,
         layer_end,
-        false,
-        false,
+        compute_logits,
+        download_logits,
         ctx.ensure_kv_capacity,
         use_preloaded_input,
     );
@@ -349,115 +349,32 @@ pub fn executeCudaDecodeLayerRange(
     );
 }
 
-pub fn CpuDecodeSourceStage(
-    comptime CpuBackend: type,
-    comptime GpuBackend: type,
-) type {
-    return struct {
-        backend: CpuBackend,
-        gpu_backend: GpuBackend,
-        ctx: *const DecodeContext,
-
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try validateEmptyInput(input);
-            try executeCpuDecodeLayerRange(stage.backend, stage.ctx, layer_start, layer_end, false);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try transport.uploadCpuKvToCudaMirrors(stage.gpu_backend, stage.backend, stage.ctx.slot_index, stage.ctx.position, 1);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadHostSlotActivation(stage.backend, stage.ctx.slot_index, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(_: *@This(), _: []const u8, _: usize) anyerror!void {
-            return error.InvalidTopologyConfig;
-        }
-    };
-}
-
-pub fn CudaLocalPipelineStage(
-    comptime Backend: type,
-    comptime TargetBackend: type,
-    comptime Work: type,
-) type {
-    return struct {
-        backend: Backend,
-        target_backend: TargetBackend,
-        work: Work,
-        activation_slot_index: usize = 0,
-        peer_copy_synchronization: transport.CudaPeerCopySynchronization = .source_stream,
-
-        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage.work.execute(stage.backend, input, layer_start, layer_end);
-        }
-
-        pub fn synchronize(stage: *@This()) anyerror!void {
-            try transport.synchronizeCudaActivationBackend(stage.backend);
-        }
-
-        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-            try transport.downloadCudaActivation(stage.backend, host_buf, byte_count);
-        }
-
-        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-            try transport.uploadCudaActivation(stage.backend, stage.activation_slot_index, host_buf, byte_count);
-        }
-
-        pub fn uploadActivationSegments(stage: *@This(), segments: []const []const u8, byte_count: usize) anyerror!void {
-            try transport.uploadCudaActivationSegments(stage.backend, segments, byte_count);
-        }
-
-        pub fn peerCopyActivationToErased(stage: *@This(), target_ptr: *anyopaque, byte_count: usize) anyerror!void {
-            _ = target_ptr;
-            switch (stage.peer_copy_synchronization) {
-                .source_stream => try transport.peerCopyCudaActivation(stage.backend, stage.target_backend, byte_count, .source_stream),
-                .source_event_target_stream => try transport.peerCopyCudaActivation(stage.backend, stage.target_backend, byte_count, .source_event_target_stream),
-            }
-        }
-
-        pub fn peerCopyHandlesStageSync(stage: *const @This()) bool {
-            return switch (stage.peer_copy_synchronization) {
-                .source_stream => transport.peerCopyCudaActivationHandlesStageSync(stage.backend, .source_stream),
-                .source_event_target_stream => transport.peerCopyCudaActivationHandlesStageSync(stage.backend, .source_event_target_stream),
-            };
-        }
-    };
-}
-
-pub fn CudaDecodeLayerWork(
-    comptime Backend: type,
-    comptime execute_decode_with_layer_limit: anytype,
-) type {
-    return struct {
-        ctx: *const DecodeContext,
-        compute_logits: bool = false,
-        download_logits: bool = false,
-        logits_out_opt: ?[]f32 = null,
-        hidden_override: ?[]const f32 = null,
-        deepstack_layer_features_opt: ?[]const []const f32 = null,
-        deepstack_feature_index_opt: ?usize = null,
-        use_preloaded_input: bool = false,
-
-        pub fn execute(work: *@This(), backend: Backend, input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try validateEmptyInput(input);
-            try executeCudaDecodeLayerRange(
-                execute_decode_with_layer_limit,
-                backend,
-                work.ctx,
-                layer_start,
-                layer_end,
-                work.logits_out_opt,
-                work.compute_logits,
-                work.download_logits,
-                work.hidden_override,
-                work.deepstack_layer_features_opt,
-                work.deepstack_feature_index_opt,
-                work.use_preloaded_input,
-            );
-        }
-    };
+pub fn executeCpuPrefillLayerRange(
+    backend: anytype,
+    slot_index: usize,
+    tokens: []const u32,
+    sequence_start: usize,
+    layer_start: usize,
+    layer_end: usize,
+    use_preloaded_input: bool,
+    compute_logits: bool,
+    logits_out_opt: ?[]f32,
+    source_embeddings_out: ?[]f32,
+) !void {
+    if (comptime !hasDecl(@TypeOf(backend.*), "executePrefillLayerRange")) {
+        return error.InvalidTopologyConfig;
+    }
+    try backend.executePrefillLayerRange(
+        slot_index,
+        tokens,
+        sequence_start,
+        layer_start,
+        layer_end,
+        use_preloaded_input,
+        compute_logits,
+        logits_out_opt,
+        source_embeddings_out,
+    );
 }
 
 fn hasDecl(comptime T: type, comptime name: []const u8) bool {
@@ -475,7 +392,127 @@ test "validateEmptyInput rejects route payloads" {
     try std.testing.expectError(error.InvalidArgument, validateEmptyInput(&.{1}));
 }
 
-test "localTopologyStateOwnershipPlan returns optional topology ownership plan field" {
+test "executeCpuDecodeLayerRange forwards final logits controls" {
+    const MockCpuBackend = struct {
+        saw_logits: bool = false,
+        compute_logits: bool = false,
+        download_logits: bool = false,
+        use_preloaded_input: bool = false,
+        layer_start: usize = 0,
+        layer_end: usize = 0,
+
+        pub fn executeDecodeLayerRange(
+            self: *@This(),
+            token: u32,
+            position: usize,
+            slot_index: usize,
+            logits_out_opt: ?[]f32,
+            layer_start: usize,
+            layer_end: usize,
+            compute_logits: bool,
+            download_logits: bool,
+            ensure_kv_capacity: bool,
+            use_preloaded_input: bool,
+        ) !void {
+            try std.testing.expectEqual(@as(u32, 17), token);
+            try std.testing.expectEqual(@as(usize, 23), position);
+            try std.testing.expectEqual(@as(usize, 3), slot_index);
+            try std.testing.expect(ensure_kv_capacity);
+            self.saw_logits = logits_out_opt != null;
+            self.compute_logits = compute_logits;
+            self.download_logits = download_logits;
+            self.use_preloaded_input = use_preloaded_input;
+            self.layer_start = layer_start;
+            self.layer_end = layer_end;
+        }
+    };
+
+    var backend = MockCpuBackend{};
+    var logits = [_]f32{0} ** 4;
+    const ctx = DecodeContext{
+        .token = 17,
+        .position = 23,
+        .slot_index = 3,
+        .logits_out_opt = logits[0..],
+        .compute_logits = true,
+        .download_logits = true,
+        .ensure_kv_capacity = true,
+        .trace_seq_len_u32 = 24,
+        .trace_pos_offset = 0,
+    };
+
+    try executeCpuDecodeLayerRange(&backend, &ctx, 4, 7, logits[0..], true, true, true);
+
+    try std.testing.expect(backend.saw_logits);
+    try std.testing.expect(backend.compute_logits);
+    try std.testing.expect(backend.download_logits);
+    try std.testing.expect(backend.use_preloaded_input);
+    try std.testing.expectEqual(@as(usize, 4), backend.layer_start);
+    try std.testing.expectEqual(@as(usize, 7), backend.layer_end);
+}
+
+test "inference.backend local_stage_adapters executeCpuPrefillLayerRange forwards generic prefill controls" {
+    const MockCpuBackend = struct {
+        slot_seen: usize = 0,
+        sequence_start_seen: usize = 0,
+        layer_start_seen: usize = 0,
+        layer_end_seen: usize = 0,
+        use_preloaded_seen: bool = false,
+        compute_logits_seen: bool = false,
+        logits_len_seen: usize = 0,
+        source_embeddings_len_seen: usize = 0,
+
+        pub fn executePrefillLayerRange(
+            self: *@This(),
+            slot_index: usize,
+            tokens: []const u32,
+            sequence_start: usize,
+            layer_start: usize,
+            layer_end: usize,
+            use_preloaded_input: bool,
+            compute_logits: bool,
+            logits_out_opt: ?[]f32,
+            source_embeddings_out: ?[]f32,
+        ) !void {
+            try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, tokens);
+            self.slot_seen = slot_index;
+            self.sequence_start_seen = sequence_start;
+            self.layer_start_seen = layer_start;
+            self.layer_end_seen = layer_end;
+            self.use_preloaded_seen = use_preloaded_input;
+            self.compute_logits_seen = compute_logits;
+            self.logits_len_seen = if (logits_out_opt) |logits| logits.len else 0;
+            self.source_embeddings_len_seen = if (source_embeddings_out) |embeddings| embeddings.len else 0;
+        }
+    };
+
+    var backend = MockCpuBackend{};
+    var logits = [_]f32{0} ** 8;
+    var embeddings = [_]f32{0} ** 12;
+    try executeCpuPrefillLayerRange(
+        &backend,
+        4,
+        &.{ 1, 2, 3 },
+        9,
+        2,
+        5,
+        true,
+        true,
+        logits[0..],
+        embeddings[0..],
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), backend.slot_seen);
+    try std.testing.expectEqual(@as(usize, 9), backend.sequence_start_seen);
+    try std.testing.expectEqual(@as(usize, 2), backend.layer_start_seen);
+    try std.testing.expectEqual(@as(usize, 5), backend.layer_end_seen);
+    try std.testing.expect(backend.use_preloaded_seen);
+    try std.testing.expect(backend.compute_logits_seen);
+    try std.testing.expectEqual(@as(usize, 8), backend.logits_len_seen);
+    try std.testing.expectEqual(@as(usize, 12), backend.source_embeddings_len_seen);
+}
+
+test "localStageStateOwnershipPlan returns optional local stage ownership plan field" {
     const WithoutPlan = struct {
         allocator: std.mem.Allocator = std.testing.allocator,
     };
@@ -485,8 +522,8 @@ test "localTopologyStateOwnershipPlan returns optional topology ownership plan f
     var without_plan = WithoutPlan{};
     var with_plan = WithPlan{};
 
-    try std.testing.expect(localTopologyStateOwnershipPlan(&without_plan) == null);
-    try std.testing.expect(localTopologyStateOwnershipPlan(&with_plan) == null);
+    try std.testing.expect(localStageStateOwnershipPlan(&without_plan) == null);
+    try std.testing.expect(localStageStateOwnershipPlan(&with_plan) == null);
 }
 
 test "localPipelineContext rejects missing bridge contracts" {

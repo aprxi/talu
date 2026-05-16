@@ -382,7 +382,7 @@ Every rule entry uses this REQUIRED schema:
 
 ### A10 Topology Configuration + Validation
 1. Rule ID: `A10`
-2. Normative statement: topology mode selection and split-point configuration MUST be validated at init before layer-dependent allocation starts; each CUDA backend instance MUST initialize with its assigned layer range via `init_layer_range` to avoid temporary full-model GPU allocation; `init_layer_range` values MUST be validated at the `CudaBackend.init` boundary with `error.InvalidTopologyConfig` on failure; stage count, device ordinals, and split-layer ranges MUST be consistent with the selected `CudaTopologyMode`. CPU stages are exempt from range-scoped init (no GPU memory pressure).
+2. Normative statement: local stage-list configuration MUST be validated at init before layer-dependent allocation starts; each CUDA backend instance MUST initialize with its assigned layer range via `init_layer_range` to avoid temporary full-model GPU allocation; `init_layer_range` values MUST be validated at the `CudaBackend.init` boundary with `error.InvalidTopologyConfig` on failure; stage count, backend kinds, device ordinals, and layer ranges MUST be consistent with the selected local stage list. CPU stages are exempt from range-scoped init (no GPU memory pressure).
 3. Enforcement point: `init`, `load`
 4. Typed failure mode: `error.OutOfMemory` for fit check failure; `error.InvalidTopologyConfig` for inconsistent split/device/mode settings
 5. Verification: `zig build test-inference -Drelease`

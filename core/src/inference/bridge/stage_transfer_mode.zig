@@ -64,6 +64,8 @@ pub fn chooseStageTransferMode(
     const boundary_summary = try boundarySummaryForMetadata(request.placement_plan, request.metadata);
     const source_binding = try host_capability.bindingForStage(request.placement_plan, request.metadata.boundary.source_stage_id);
     const target_binding = try host_capability.bindingForStage(request.placement_plan, request.metadata.boundary.target_stage_id);
+    const source_host = try hostSummaryForHost(request.placement_plan, source_binding.host_id);
+    const target_host = try hostSummaryForHost(request.placement_plan, target_binding.host_id);
     const profile = findBoundaryProfile(request.placement_plan, request.metadata, boundary_summary) orelse {
         return error.MissingStageTransferBoundaryProfile;
     };
@@ -78,12 +80,27 @@ pub fn chooseStageTransferMode(
             profile.handoff_mode,
             request.image,
             request.allow_borrow,
-            request.local_device_peer_copy_available,
+            sameDeviceBackendPeerCopyAvailable(
+                source_host.backend_kind,
+                target_host.backend_kind,
+                request.image.location_hint,
+                request.local_device_peer_copy_available,
+            ),
         ),
         .boundary_profile = profile,
         .source_host_id = source_binding.host_id,
         .target_host_id = target_binding.host_id,
     };
+}
+
+fn hostSummaryForHost(
+    placement_plan: *const host_capability.PlacementPlan,
+    host_id: host_capability.HostId,
+) StageTransferModeError!host_capability.PlacementHostSummary {
+    for (placement_plan.host_summaries) |summary| {
+        if (summary.host_id.value == host_id.value) return summary;
+    }
+    return error.StageTransferBoundaryMismatch;
 }
 
 fn placementIdentityMatchesMetadata(
@@ -185,6 +202,21 @@ fn selectMode(
     };
 }
 
+fn sameDeviceBackendPeerCopyAvailable(
+    source_backend_kind: host_capability.HostBackendKind,
+    target_backend_kind: host_capability.HostBackendKind,
+    location_hint: ?tensor_frame.TensorFramePayloadLocationHint,
+    local_device_peer_copy_available: bool,
+) bool {
+    if (!local_device_peer_copy_available) return false;
+    if (source_backend_kind != target_backend_kind) return false;
+    return switch (location_hint orelse return false) {
+        .cuda => source_backend_kind == .cuda,
+        .metal => source_backend_kind == .metal,
+        else => false,
+    };
+}
+
 const all_step_kinds = [_]tensor_frame.TensorFrameStepKind{ .prefill, .decode };
 const prefill_step_kind = [_]tensor_frame.TensorFrameStepKind{.prefill};
 const all_reachability = [_]host_capability.HostReachabilityKind{ .local_in_process, .mock, .remote_declared };
@@ -202,6 +234,8 @@ const ProfileConfig = struct {
     prefill_max_token_count: ?u64 = null,
     decode_max_token_count: ?u64 = null,
     max_activation_payload_bytes: ?u64 = null,
+    source_backend_kind: host_capability.HostBackendKind = .cpu,
+    target_backend_kind: host_capability.HostBackendKind = .cpu,
 };
 
 const PlacementBundle = struct {
@@ -237,7 +271,7 @@ fn buildPlacementBundle(
 
     switch (topology) {
         .same_host => {
-            var capability = try buildTestCapability(allocator, testHostId(1), .local_in_process, mode);
+            var capability = try buildTestCapability(allocator, testHostId(1), .local_in_process, mode, profile_config.source_backend_kind);
             errdefer capability.deinit();
             var residency = try buildTestResidency(allocator, testHostId(1), &plan, &.{ 0, 1 });
             errdefer residency.deinit();
@@ -271,9 +305,9 @@ fn buildPlacementBundle(
                 .two_host_remote => .remote_declared,
                 else => .local_in_process,
             };
-            var source_capability = try buildTestCapability(allocator, testHostId(1), source_reachability, mode);
+            var source_capability = try buildTestCapability(allocator, testHostId(1), source_reachability, mode, profile_config.source_backend_kind);
             errdefer source_capability.deinit();
-            var target_capability = try buildTestCapability(allocator, testHostId(2), target_reachability, mode);
+            var target_capability = try buildTestCapability(allocator, testHostId(2), target_reachability, mode, profile_config.target_backend_kind);
             errdefer target_capability.deinit();
             var source_residency = try buildTestResidency(allocator, testHostId(1), &plan, &.{0});
             errdefer source_residency.deinit();
@@ -357,11 +391,12 @@ fn buildTestCapability(
     host_id: host_capability.HostId,
     reachability: host_capability.HostReachabilityKind,
     mode: host_capability.BoundaryHandoffMode,
+    backend_kind: host_capability.HostBackendKind,
 ) !host_capability.HostCapability {
     const frames = testFrameCapabilities(mode);
     return host_capability.buildHostCapability(allocator, .{
         .host_id = host_id,
-        .backend_kind = if (reachability == .mock) .mock else .cpu,
+        .backend_kind = if (reachability == .mock) .mock else backend_kind,
         .reachability_kind = reachability,
         .supported_graph_contract_versions = &.{stage_plan.graph_identity_contract_version},
         .supported_stage_plan_contract_versions = &.{stage_plan.stage_plan_contract_version},
@@ -768,7 +803,10 @@ test "inference bridge stage_transfer_mode chooseStageTransferMode selects copy_
 test "inference bridge stage_transfer_mode chooseStageTransferMode selects device_download_then_copy for local device resident bytes without peer copy" {
     const allocator = std.testing.allocator;
 
-    var same_host_bundle = try buildPlacementBundle(allocator, .same_host, .same_host_direct, .{});
+    var same_host_bundle = try buildPlacementBundle(allocator, .same_host, .same_host_direct, .{
+        .source_backend_kind = .cuda,
+        .target_backend_kind = .cuda,
+    });
     defer same_host_bundle.deinit();
     var same_host_metadata = try metadataForPlacement(&same_host_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
     same_host_metadata.payload.location_hint = .{ .cuda = 0 };
@@ -780,7 +818,10 @@ test "inference bridge stage_transfer_mode chooseStageTransferMode selects devic
     });
     try expectDecision(same_host_decision, .device_download_then_copy, &same_host_bundle.placement, &same_host_metadata);
 
-    var local_bundle = try buildPlacementBundle(allocator, .two_host_local, .local_in_process, .{});
+    var local_bundle = try buildPlacementBundle(allocator, .two_host_local, .local_in_process, .{
+        .source_backend_kind = .cuda,
+        .target_backend_kind = .cuda,
+    });
     defer local_bundle.deinit();
     var local_metadata = try metadataForPlacement(&local_bundle.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
     local_metadata.payload.location_hint = .{ .cuda = 1 };
@@ -821,6 +862,42 @@ test "inference bridge stage_transfer_mode chooseStageTransferMode selects devic
         .local_device_peer_copy_available = true,
     });
     try expectDecision(local_decision, .device_peer_copy_in_process, &local_bundle.placement, &local_metadata);
+}
+
+test "inference bridge stage_transfer_mode chooseStageTransferMode keeps cross backend device handoff host staged" {
+    const allocator = std.testing.allocator;
+
+    var cuda_to_metal = try buildPlacementBundle(allocator, .two_host_local, .local_in_process, .{
+        .source_backend_kind = .cuda,
+        .target_backend_kind = .metal,
+    });
+    defer cuda_to_metal.deinit();
+    var cuda_metadata = try metadataForPlacement(&cuda_to_metal.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    cuda_metadata.payload.location_hint = .{ .cuda = 0 };
+    const cuda_image = testImage(&cuda_metadata, .device_download_required, null);
+    const cuda_decision = try chooseStageTransferMode(.{
+        .placement_plan = &cuda_to_metal.placement,
+        .metadata = &cuda_metadata,
+        .image = &cuda_image,
+        .local_device_peer_copy_available = true,
+    });
+    try expectDecision(cuda_decision, .device_download_then_copy, &cuda_to_metal.placement, &cuda_metadata);
+
+    var metal_to_cuda = try buildPlacementBundle(allocator, .two_host_local, .local_in_process, .{
+        .source_backend_kind = .metal,
+        .target_backend_kind = .cuda,
+    });
+    defer metal_to_cuda.deinit();
+    var metal_metadata = try metadataForPlacement(&metal_to_cuda.placement, .decode, .f32, .{ 1, 1, 4, 0 }, &decode_entries);
+    metal_metadata.payload.location_hint = .{ .metal = 0 };
+    const metal_image = testImage(&metal_metadata, .device_download_required, null);
+    const metal_decision = try chooseStageTransferMode(.{
+        .placement_plan = &metal_to_cuda.placement,
+        .metadata = &metal_metadata,
+        .image = &metal_image,
+        .local_device_peer_copy_available = true,
+    });
+    try expectDecision(metal_decision, .device_download_then_copy, &metal_to_cuda.placement, &metal_metadata);
 }
 
 test "inference bridge stage_transfer_mode chooseStageTransferMode does not select peer copy for mock or remote device resident bytes" {

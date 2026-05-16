@@ -143,14 +143,20 @@ pub const Selection = enum {
 };
 
 const topology_mod = @import("topology.zig");
-pub const CudaTopologyMode = topology_mod.CudaTopologyMode;
-pub const CudaTopologyConfig = topology_mod.CudaTopologyConfig;
-const CudaTopology = topology_mod.CudaTopology;
-const cuda_topology_capabilities = topology_mod.cuda_topology_capabilities;
-const validateCudaTopologyConfig = topology_mod.validateCudaTopologyConfig;
-const resolveCudaTopology = topology_mod.resolveCudaTopology;
-const autoDetectTopologyForModel = topology_mod.autoDetectTopologyForModel;
-const resolveCpuLayersTopology = topology_mod.resolveCpuLayersTopology;
+pub const local_stage = @import("local_stage.zig");
+pub const local_runtime = @import("local_runtime.zig");
+pub const local_stage_adapters = @import("local_stage_adapters.zig");
+pub const local_decode_pipeline = @import("local_decode_pipeline.zig");
+pub const local_prefill_pipeline = @import("local_prefill_pipeline.zig");
+pub const LocalStageSpec = topology_mod.LocalStageSpec;
+pub const LocalStageBackendKind = topology_mod.LocalStageBackendKind;
+pub const LocalStagePlan = topology_mod.LocalStagePlan;
+const validateLocalStagePlan = topology_mod.validateLocalStagePlan;
+const resolveLocalStagePlan = topology_mod.resolveLocalStagePlan;
+const autoDetectLocalStagePlanForModel = topology_mod.autoDetectLocalStagePlanForModel;
+const localStagePlanFromSpecs = topology_mod.localStagePlanFromSpecs;
+const rootCudaStageIdForLocalPlan = topology_mod.rootCudaStageIdForLocalPlan;
+const parseLocalStageSpecs = topology_mod.parseLocalStageSpecs;
 
 /// Backend initialization options selected at startup/config layer.
 pub const InitOptions = struct {
@@ -165,8 +171,9 @@ pub const InitOptions = struct {
     };
 
     selection: Selection = .auto,
-    /// Multi-stage topology for CUDA backends. When null, single-GPU execution is used.
-    cuda_topology: ?CudaTopologyConfig = null,
+    /// Ordered local stage plan for CUDA-backed local execution. When null,
+    /// CUDA uses a single local stage or auto-detects a local stage plan.
+    local_stage_specs: ?[]const LocalStageSpec = null,
     /// Metal backend startup metadata.
     metal: ?MetalConfig = null,
 };
@@ -360,7 +367,7 @@ pub const Backend = union(enum) {
         switch (selected) {
             .cpu => return initCpu(allocator, loaded, "configured", progress),
             .metal => return initMetal(allocator, loaded, "configured", init_options.metal, progress),
-            .cuda => return initCuda(allocator, loaded, "configured", cuda_probe, init_options.cuda_topology, progress),
+            .cuda => return initCuda(allocator, loaded, "configured", cuda_probe, init_options.local_stage_specs, progress),
             .auto => {},
         }
 
@@ -1105,40 +1112,28 @@ fn publishDeviceLayerSummary(progress: progress_mod.Context, summary: DeviceLaye
     progress.completeLine(2);
 }
 
-const CudaResolvedLayerRange = struct {
-    split_layer: usize = 0,
-    split_layer_stage2: usize = 0,
-};
-
-fn cudaDeviceLayerSummary(topology: CudaTopology, range: CudaResolvedLayerRange, total_layers: usize) DeviceLayerSummary {
-    return switch (topology.mode) {
-        .single => .{
-            .gpu_stage_count = 1,
-            .gpu0_ordinal = topology.primaryDeviceOrdinal(),
-            .gpu0_layers = total_layers,
-        },
-        .pipeline2 => .{
-            .gpu_stage_count = 2,
-            .gpu0_ordinal = topology.stage_device_ordinals[0],
-            .gpu0_layers = range.split_layer,
-            .gpu1_ordinal = topology.stage_device_ordinals[1],
-            .gpu1_layers = total_layers - range.split_layer,
-        },
-        .cpu_gpu => .{
-            .cpu_layers = range.split_layer,
-            .gpu_stage_count = 1,
-            .gpu0_ordinal = topology.stage_device_ordinals[0],
-            .gpu0_layers = total_layers - range.split_layer,
-        },
-        .cpu_gpu_gpu => .{
-            .cpu_layers = range.split_layer,
-            .gpu_stage_count = 2,
-            .gpu0_ordinal = topology.stage_device_ordinals[0],
-            .gpu0_layers = range.split_layer_stage2 - range.split_layer,
-            .gpu1_ordinal = topology.stage_device_ordinals[1],
-            .gpu1_layers = total_layers - range.split_layer_stage2,
-        },
-    };
+fn cudaDeviceLayerSummary(plan: LocalStagePlan) DeviceLayerSummary {
+    var summary = DeviceLayerSummary{};
+    for (plan.stagesSlice()) |stage| {
+        const layer_count = stage.layer_end - stage.layer_start;
+        switch (stage.backend_kind) {
+            .cpu => summary.cpu_layers += layer_count,
+            .metal => summary.metal_layers += layer_count,
+            .cuda => {
+                if (summary.gpu_stage_count == 0) {
+                    summary.gpu0_ordinal = stage.device_ordinal orelse 0;
+                    summary.gpu0_layers = layer_count;
+                } else if (summary.gpu_stage_count == 1) {
+                    summary.gpu1_ordinal = stage.device_ordinal orelse 0;
+                    summary.gpu1_layers = layer_count;
+                } else {
+                    summary.gpu1_layers += layer_count;
+                }
+                summary.gpu_stage_count += 1;
+            },
+        }
+    }
+    return summary;
 }
 
 fn initCuda(
@@ -1146,7 +1141,7 @@ fn initCuda(
     loaded: *LoadedModel,
     reason: []const u8,
     probe: CudaProbe,
-    topology_override: ?CudaTopologyConfig,
+    local_stage_override: ?[]const LocalStageSpec,
     progress: progress_mod.Context,
 ) !Backend {
     if (!has_cuda) {
@@ -1156,223 +1151,111 @@ fn initCuda(
         log.info("inference", "CUDA runtime unavailable", .{ .reason = cudaProbeName(probe) });
         return error.CudaUnavailable;
     }
-    var topology = try resolveCudaTopology(allocator, topology_override);
-    const has_explicit_topology_env = std.process.hasEnvVar(allocator, "TALU_CUDA_TOPOLOGY") catch |err| {
-        log.err("inference", "Failed to query TALU_CUDA_TOPOLOGY", .{ .err = @errorName(err) }, @src());
-        return err;
+    var plan = try resolveLocalStagePlan(local_stage_override, loaded.blocks.len, 0);
+    const explicit_stage_list = std.process.getEnvVarOwned(allocator, "TALU_LOCAL_STAGES") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => {
+            log.err("inference", "Failed to read TALU_LOCAL_STAGES", .{ .err = @errorName(err) }, @src());
+            return err;
+        },
     };
-    const has_explicit_cpu_layers_env = std.process.hasEnvVar(allocator, "TALU_CPU_LAYERS") catch |err| {
-        log.err("inference", "Failed to query TALU_CPU_LAYERS", .{ .err = @errorName(err) }, @src());
-        return err;
-    };
-
-    // Topology resolution priority:
-    //   1. topology_override (programmatic)
-    //   2. TALU_CUDA_TOPOLOGY env var (explicit mode)
-    //   3. TALU_CPU_LAYERS env var (user preference → auto-determines mode)
-    //   4. Auto-detection (probe GPU memory, estimate model size)
-    if (topology_override == null and topology.mode == .single) {
-        if (!has_explicit_topology_env) {
-            if (try resolveCpuLayersTopology(allocator, loaded)) |from_layers| {
-                topology = from_layers;
-            } else if (autoDetectTopologyForModel(allocator, loaded)) |detected| {
-                topology = detected;
-            } else |err| {
-                log.err("inference", "Auto topology detection failed", .{
-                    .err = @errorName(err),
-                }, @src());
-                return err;
-            }
-        }
+    defer if (explicit_stage_list) |value| allocator.free(value);
+    const has_explicit_stage_list = explicit_stage_list != null;
+    if (explicit_stage_list) |raw| {
+        var specs = parseLocalStageSpecs(allocator, raw, loaded.blocks.len) catch |err| {
+            log.err("inference", "Invalid TALU_LOCAL_STAGES", .{
+                .value = std.mem.trim(u8, raw, " \t\r\n"),
+                .expected = "backend[@device]:start..end,...",
+            }, @src());
+            return err;
+        };
+        defer specs.deinit();
+        plan = try localStagePlanFromSpecs(specs.stages);
+    }
+    // Local stage plan resolution priority:
+    //   1. programmatic stage list
+    //   2. TALU_LOCAL_STAGES stage list
+    //   3. Auto-detection (probe GPU memory, estimate model size)
+    if (local_stage_override == null and !has_explicit_stage_list) {
+        plan = autoDetectLocalStagePlanForModel(allocator, loaded) catch |err| {
+            log.err("inference", "Auto local stage detection failed", .{
+                .err = @errorName(err),
+            }, @src());
+            return err;
+        };
     }
 
-    if (topology_override == null and
-        !has_explicit_topology_env and
-        !has_explicit_cpu_layers_env and
-        (topology.mode == .cpu_gpu or topology.mode == .cpu_gpu_gpu) and
+    if (local_stage_override == null and
+        !has_explicit_stage_list and
+        plan.stage_count > plan.cudaStageCount() and
         topology_mod.loadedModelHasPackedNvfp4Weights(loaded))
     {
-        const primary_device = topology.primaryDeviceOrdinal();
-        log.warn("inference", "CUDA auto-topology disabled CPU stages for packed NVFP4 model", .{
-            .requested_topology = @tagName(topology.mode),
-            .selected_topology = @tagName(CudaTopologyMode.single),
+        const primary_device = plan.primaryDeviceOrdinal();
+        log.warn("inference", "CUDA auto local stage plan disabled CPU stages for packed NVFP4 model", .{
+            .requested_stage_count = plan.stage_count,
             .device = primary_device,
         });
-        topology = .{
-            .mode = .single,
-            .stage_device_ordinals = .{ primary_device, primary_device },
-        };
+        plan = try topology_mod.defaultCudaLocalStagePlan(loaded.blocks.len, primary_device);
     }
 
-    if (topology.mode != .single) {
-        const device_count = if (has_cuda)
-            compute.cuda.Device.deviceCount() catch |err| {
-                log.err("inference", "Failed to query CUDA device count for topology validation", .{
-                    .err = @errorName(err),
-                }, @src());
-                return err;
-            }
-        else
-            0;
-        validateCudaTopologyConfig(topology, loaded.blocks.len, device_count) catch |err| switch (err) {
-            error.Pipeline2Unsupported => {
-                log.err("inference", "Pipeline2 topology is not supported by current capability envelope", .{
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.Pipeline2InsufficientLayers => {
-                log.err("inference", "Pipeline2 requires at least two decoder layers", .{
-                    .total_layers = loaded.blocks.len,
-                    .required = cuda_topology_capabilities.min_pipeline2_layers,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.Pipeline2InvalidSplitLayer => {
-                log.err("inference", "Pipeline2 split layer is out of range", .{
-                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.Pipeline2RequiresDistinctDevices => {
-                log.err("inference", "Pipeline2 requires two distinct CUDA device ordinals", .{
-                    .ordinal0 = topology.stage_device_ordinals[0],
-                    .ordinal1 = topology.stage_device_ordinals[1],
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.Pipeline2DeviceOrdinalOutOfRange => {
-                log.err("inference", "Pipeline2 device ordinal out of range", .{
-                    .ordinal0 = topology.stage_device_ordinals[0],
-                    .ordinal1 = topology.stage_device_ordinals[1],
-                    .device_count = device_count,
-                }, @src());
-                return error.CudaInvalidDevice;
-            },
-            error.CpuGpuUnsupported => {
-                log.err("inference", "CPU+GPU topology is not supported by current capability envelope", .{
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuInsufficientLayers => {
-                log.err("inference", "CPU+GPU topology requires at least two decoder layers", .{
-                    .total_layers = loaded.blocks.len,
-                    .required = cuda_topology_capabilities.min_cpu_gpu_layers,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuInvalidSplitLayer => {
-                log.err("inference", "CPU+GPU split layer is out of range", .{
-                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuDeviceOrdinalOutOfRange => {
-                log.err("inference", "CPU+GPU topology device ordinal out of range", .{
-                    .ordinal0 = topology.stage_device_ordinals[0],
-                    .device_count = device_count,
-                }, @src());
-                return error.CudaInvalidDevice;
-            },
-            error.CpuGpuGpuUnsupported => {
-                log.err("inference", "CPU+GPU+GPU topology is not supported by current capability envelope", .{
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuGpuInsufficientLayers => {
-                log.err("inference", "CPU+GPU+GPU topology requires at least three decoder layers", .{
-                    .total_layers = loaded.blocks.len,
-                    .required = cuda_topology_capabilities.min_cpu_gpu_gpu_layers,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuGpuInvalidSplitLayer => {
-                log.err("inference", "CPU+GPU+GPU first split layer is out of range", .{
-                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuGpuInvalidSplitLayerStage2 => {
-                log.err("inference", "CPU+GPU+GPU second split layer is out of range", .{
-                    .split_layer_stage2 = if (topology.split_layer_stage2) |split| split else std.math.maxInt(usize),
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuGpuSplitOrderInvalid => {
-                log.err("inference", "CPU+GPU+GPU split layers must satisfy split0 < split1 < total", .{
-                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
-                    .split_layer_stage2 = if (topology.split_layer_stage2) |split| split else std.math.maxInt(usize),
-                    .total_layers = loaded.blocks.len,
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuGpuRequiresDistinctDevices => {
-                log.err("inference", "CPU+GPU+GPU requires two distinct CUDA device ordinals for gpu stages", .{
-                    .ordinal0 = topology.stage_device_ordinals[0],
-                    .ordinal1 = topology.stage_device_ordinals[1],
-                }, @src());
-                return error.InvalidTopologyConfig;
-            },
-            error.CpuGpuGpuDeviceOrdinalOutOfRange => {
-                log.err("inference", "CPU+GPU+GPU topology device ordinal out of range", .{
-                    .ordinal0 = topology.stage_device_ordinals[0],
-                    .ordinal1 = topology.stage_device_ordinals[1],
-                    .device_count = device_count,
-                }, @src());
-                return error.CudaInvalidDevice;
-            },
-        };
-    }
+    const device_count = if (has_cuda)
+        compute.cuda.Device.deviceCount() catch |err| {
+            log.err("inference", "Failed to query CUDA device count for local stage validation", .{
+                .err = @errorName(err),
+            }, @src());
+            return err;
+        }
+    else
+        0;
+    validateLocalStagePlan(plan, loaded.blocks.len, device_count) catch |err| switch (err) {
+        error.LocalStageDeviceOrdinalOutOfRange => {
+            log.err("inference", "Local stage CUDA device ordinal out of range", .{
+                .device_count = device_count,
+                .stage_count = plan.stage_count,
+            }, @src());
+            return error.CudaInvalidDevice;
+        },
+        else => {
+            log.err("inference", "Invalid local stage plan", .{
+                .err = @errorName(err),
+                .total_layers = loaded.blocks.len,
+                .stage_count = plan.stage_count,
+            }, @src());
+            return error.InvalidTopologyConfig;
+        },
+    };
     const cuda_max_batch_size = resolveMaxBatchSize(.cuda);
     const n_layers = loaded.blocks.len;
-    const resolved_layer_range = try cuda.BackendType.computeInitLayerRange(.{
-        .topology_mode = topology.mode,
-        .stage_device_ordinals = topology.stage_device_ordinals,
-        .split_layer = topology.split_layer,
-        .split_layer_stage2 = topology.split_layer_stage2,
-    }, n_layers, loaded.config);
-    const resolved_summary = cudaDeviceLayerSummary(topology, .{
-        .split_layer = resolved_layer_range.split_layer,
-        .split_layer_stage2 = resolved_layer_range.split_layer_stage2,
-    }, n_layers);
+    const resolved_summary = cudaDeviceLayerSummary(plan);
     const cpu_layer_count = resolved_summary.cpu_layers;
     const gpu_layer_count = resolved_summary.gpu0_layers + resolved_summary.gpu1_layers;
     const gpu0_layer_count = resolved_summary.gpu0_layers;
     const gpu1_layer_count = resolved_summary.gpu1_layers;
-    const split_layer_stage2_value = if (topology.mode == .cpu_gpu_gpu) resolved_layer_range.split_layer_stage2 else n_layers;
+    const root_stage_id = try rootCudaStageIdForLocalPlan(plan.stagesSlice());
     log.info("inference", "CUDA backend init config", .{
         .max_batch = cuda_max_batch_size,
-        .topology = @tagName(topology.mode),
+        .stage_count = plan.stage_count,
         .cpu_layers = cpu_layer_count,
         .gpu_layers = gpu_layer_count,
         .gpu0_layers = gpu0_layer_count,
         .gpu1_layers = gpu1_layer_count,
-        .split_layer = resolved_layer_range.split_layer,
-        .split_layer_stage2 = split_layer_stage2_value,
         .total_layers = n_layers,
-        .device = topology.primaryDeviceOrdinal(),
+        .device = plan.primaryDeviceOrdinal(),
+        .root_stage_id = root_stage_id,
     });
     const total_layers: u64 = @intCast(n_layers);
 
-    // Multi-stage topologies use spinner mode so the completed line can be the
+    // Multi-stage plans use spinner mode so the completed line can be the
     // colored layer ownership summary. Single-GPU keeps the load progress bar
     // during init, then publishes the same summary before completion.
-    const bar_total: u64 = if (topology.mode != .single) 0 else total_layers;
+    const bar_total: u64 = if (!plan.isSingleCudaStage()) 0 else total_layers;
 
     progress.addLine(1, "Loading", bar_total, null, null);
     const cuda_backend_state = if (has_cuda)
         try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size, .{
-            .device_ordinal = topology.primaryDeviceOrdinal(),
-            .topology_mode = topology.mode,
-            .stage_device_ordinals = topology.stage_device_ordinals,
-            .split_layer = topology.split_layer,
-            .split_layer_stage2 = topology.split_layer_stage2,
+            .device_ordinal = plan.stages[root_stage_id].device_ordinal orelse plan.primaryDeviceOrdinal(),
+            .local_stage_specs = plan.stagesSlice(),
+            .local_root_stage_id = root_stage_id,
             .progress = progress,
         })
     else

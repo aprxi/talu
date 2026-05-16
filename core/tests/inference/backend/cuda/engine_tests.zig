@@ -23,6 +23,22 @@ const cuda_testing = main.inference.backend.cuda.testing;
 // --- Types from engine.zig ---
 const engine = cuda_testing.engine;
 const CudaBackend = engine.CudaBackend;
+const CpuBackend = main.inference.backend.cpu.BackendType;
+
+fn clearLocalStages(backend: *CudaBackend) void {
+    backend.local_cuda_stage_backends = &.{};
+    backend.local_cpu_stage_backends = &.{};
+}
+
+fn setSingleLocalCudaStage(backend: *CudaBackend, storage: *[1]?*CudaBackend, stage: *CudaBackend) void {
+    storage.* = .{stage};
+    backend.local_cuda_stage_backends = storage[0..];
+}
+
+fn setSingleLocalCpuStage(backend: *CudaBackend, storage: *[1]?*CpuBackend, stage: *CpuBackend) void {
+    storage.* = .{stage};
+    backend.local_cpu_stage_backends = storage[0..];
+}
 
 fn localTransportRequest(
     placement_plan: *const bridge.PlacementPlan,
@@ -113,7 +129,7 @@ const MockCudaDevice = struct {
     }
 };
 
-fn localTopologyTestConfig(layer_count: usize) models.config.ModelConfig {
+fn localStageTestConfig(layer_count: usize) models.config.ModelConfig {
     return .{
         .vocab_size = 64,
         .d_model = 8,
@@ -130,14 +146,14 @@ fn localTopologyTestConfig(layer_count: usize) models.config.ModelConfig {
     };
 }
 
-fn localTopologyTestArch() models.op_types.Architecture {
+fn localStageTestArch() models.op_types.Architecture {
     return .{
-        .name = "cuda_local_topology_test",
-        .model_types = &.{"cuda_local_topology_test"},
+        .name = "cuda_local_stage_test",
+        .model_types = &.{"cuda_local_stage_test"},
     };
 }
 
-fn localTopologyTestManifest(allocator: std.mem.Allocator, layer_count: usize) !models.manifest.ModelManifest {
+fn localStageTestManifest(allocator: std.mem.Allocator, layer_count: usize) !models.manifest.ModelManifest {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
@@ -192,7 +208,7 @@ fn localTopologyTestManifest(allocator: std.mem.Allocator, layer_count: usize) !
 
     return .{
         .arena = arena,
-        .architecture_id = "cuda_local_topology_test",
+        .architecture_id = "cuda_local_stage_test",
         .layer_count = layer_count,
         .entries = entries,
         .total_checkpoint_bytes = total_bytes,
@@ -200,15 +216,15 @@ fn localTopologyTestManifest(allocator: std.mem.Allocator, layer_count: usize) !
     };
 }
 
-fn buildLocalTopologyTestStagePlan(
+fn buildLocalStageTestStagePlan(
     allocator: std.mem.Allocator,
     layer_count: usize,
     splits: []const usize,
     dependencies: []const models.stage_plan.DependencyOverride,
 ) !models.stage_plan.StagePlan {
-    var arch = localTopologyTestArch();
-    var config = localTopologyTestConfig(layer_count);
-    var manifest = try localTopologyTestManifest(allocator, layer_count);
+    var arch = localStageTestArch();
+    var config = localStageTestConfig(layer_count);
+    var manifest = try localStageTestManifest(allocator, layer_count);
     defer manifest.deinit();
     return models.stage_plan.buildStagePlan(allocator, .{
         .n_layers = layer_count,
@@ -223,7 +239,7 @@ fn buildLocalTopologyTestStagePlan(
     });
 }
 
-const LocalTopologyStateFixture = struct {
+const LocalStageStateFixture = struct {
     plan: bridge.StageStateOwnershipPlan,
     ref: bridge.StageStatePlacementRef,
 
@@ -233,18 +249,18 @@ const LocalTopologyStateFixture = struct {
     }
 };
 
-fn buildLocalTopologyStateFixture(
+fn buildLocalStageStateFixture(
     allocator: std.mem.Allocator,
     plan: *const models.stage_plan.StagePlan,
-) !LocalTopologyStateFixture {
-    var state_plan = try engine.testing.buildLocalTopologyStateOwnershipPlan(allocator, plan);
+) !LocalStageStateFixture {
+    var state_plan = try engine.testing.buildLocalStageStateOwnershipPlan(allocator, plan);
     errdefer state_plan.deinit();
     var state_ref = try bridge.buildStageStatePlacementRef(allocator, &state_plan);
     errdefer state_ref.deinit();
     return .{ .plan = state_plan, .ref = state_ref };
 }
 
-fn expectLocalTopologyPlacement(
+fn expectLocalStagePlacement(
     placement: *const bridge.PlacementPlan,
     d_model: usize,
     stage_count: usize,
@@ -256,7 +272,7 @@ fn expectLocalTopologyPlacement(
     try std.testing.expectEqual(stage_count, placement.stage_host_bindings.len);
     try std.testing.expectEqualSlices(
         bridge.TensorFrameStepKind,
-        &engine.testing.local_topology_required_step_kinds,
+        &engine.testing.local_stage_required_step_kinds,
         placement.required_step_kinds,
     );
 
@@ -265,7 +281,7 @@ fn expectLocalTopologyPlacement(
         try std.testing.expectEqual(@as(u64, @intCast(stage_id + 1)), binding.host_id.value);
     }
 
-    try std.testing.expectEqual(configs.len * engine.testing.local_topology_required_step_kinds.len, placement.boundary_frame_profiles.len);
+    try std.testing.expectEqual(configs.len * engine.testing.local_stage_required_step_kinds.len, placement.boundary_frame_profiles.len);
     for (configs, 0..) |config, boundary_index| {
         const row_bytes = try engine.testing.boundaryRowByteCount(d_model, config.dtype);
         const prefill = placement.boundary_frame_profiles[boundary_index * 2];
@@ -389,7 +405,7 @@ fn expectPlacementBuildFailureCleanup(
     var saw_success = false;
     for (0..64) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var placement_or_error = engine.testing.buildLocalTopologyPlacementPlan(
+        var placement_or_error = engine.testing.buildLocalStagePlacementPlan(
             failing.allocator(),
             d_model,
             plan,
@@ -410,7 +426,7 @@ fn expectPlacementBuildFailureCleanup(
     try std.testing.expect(saw_success);
 }
 
-fn runCpuGpuPrefillTestHook(
+fn runCpuPrefixCudaSuffixPrefillTestHook(
     self: anytype,
     tokens: []const u32,
     slot_index: usize,
@@ -423,11 +439,12 @@ fn runCpuGpuPrefillTestHook(
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
     if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
 
-    const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
+    const cpu_stage0 = self.localCpuStage(0) orelse return error.InvalidTopologyConfig;
+    const cpu_layer_end = self.local_stage_specs[0].layer_end;
     self.activateKvSlot(slot_index);
     const byte_count = try self.localActivationByteCount();
     for (tokens, 0..) |token, position| {
-        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, self.localSplitLayer(), false, false, true, false);
+        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, cpu_layer_end, false, false, true, false);
         const cpu_activation = cpu_stage0.slotActivationBytes(slot_index);
         if (byte_count > cpu_activation.len) return error.InvalidArgument;
         try self.uploadLocalActivationFromHost(slot_index, cpu_activation[0..byte_count], byte_count);
@@ -451,7 +468,7 @@ fn runCpuGpuPrefillTestHook(
     }
 }
 
-fn runCpuGpuGpuPrefillTestHook(
+fn runCpuPrefixTwoCudaPrefillTestHook(
     self: anytype,
     tokens: []const u32,
     slot_index: usize,
@@ -464,13 +481,14 @@ fn runCpuGpuGpuPrefillTestHook(
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
     if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
 
-    const cpu_stage0 = self.localCpuStage0() orelse return error.InvalidTopologyConfig;
-    var stage1 = self.localCudaStage1() orelse return error.InvalidTopologyConfig;
+    const cpu_stage0 = self.localCpuStage(0) orelse return error.InvalidTopologyConfig;
+    var stage1 = self.localCudaStage(1) orelse return error.InvalidTopologyConfig;
+    const cpu_layer_end = self.local_stage_specs[0].layer_end;
     self.activateKvSlot(slot_index);
     stage1.activateKvSlot(slot_index);
     const byte_count = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
     for (tokens, 0..) |token, position| {
-        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, self.localSplitLayer(), false, false, true, false);
+        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, cpu_layer_end, false, false, true, false);
         const cpu_activation = cpu_stage0.slotActivationBytes(slot_index);
         if (byte_count > cpu_activation.len) return error.InvalidArgument;
         try stage1.uploadLocalActivationFromHost(slot_index, cpu_activation[0..byte_count], byte_count);
@@ -529,7 +547,7 @@ test "resolveStagedPrefillChunkRows honors explicit env override behavior" {
     try std.testing.expectEqual(@as(usize, 320), resolveStagedPrefillChunkRows(900, 320, true));
 }
 
-test "inference.backend.cuda 10G-D local topology profile envelopes are exact" {
+test "inference.backend.cuda 10G-D local stage chain profile envelopes are exact" {
     const boundary = models.stage_plan.StageBoundary{
         .source_stage_id = 0,
         .target_stage_id = 1,
@@ -538,7 +556,7 @@ test "inference.backend.cuda 10G-D local topology profile envelopes are exact" {
         .consumer_layer_start = 2,
         .consumer_layer_end = 4,
     };
-    const config = engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 9);
+    const config = engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9);
     const profiles = try engine.testing.boundaryProfilePair(8, 0, boundary, config);
 
     try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, profiles[0].step_kind);
@@ -552,12 +570,12 @@ test "inference.backend.cuda 10G-D local topology profile envelopes are exact" {
     try std.testing.expectEqual(@as(u64, 4 * 8 * @sizeOf(f32)), profiles[1].max_activation_payload_bytes);
 }
 
-test "inference.backend.cuda 10G-D local topology caps use required min rules" {
-    const cuda_cuda_config = engine.testing.localCudaCudaBoundaryConfig(.f16, .row_major, 8, 3, 40, 7);
-    try std.testing.expectEqual(@as(usize, 3), cuda_cuda_config.decode_max_batch_entries);
-    try std.testing.expectEqual(@as(usize, 7), cuda_cuda_config.prefill_max_token_count_per_frame);
+test "inference.backend.cuda 10G-D local stage chain caps use required min rules" {
+    const two_cuda_config = engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7);
+    try std.testing.expectEqual(@as(usize, 3), two_cuda_config.decode_max_batch_entries);
+    try std.testing.expectEqual(@as(usize, 7), two_cuda_config.prefill_max_token_count_per_frame);
 
-    const cpu_gpu_gpu_configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
+    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -567,14 +585,14 @@ test "inference.backend.cuda 10G-D local topology caps use required min rules" {
         16,
         64,
     );
-    try std.testing.expectEqual(@as(usize, 5), cpu_gpu_gpu_configs[0].decode_max_batch_entries);
-    try std.testing.expectEqual(@as(usize, 5), cpu_gpu_gpu_configs[1].decode_max_batch_entries);
-    try std.testing.expectEqual(@as(usize, 16), cpu_gpu_gpu_configs[0].prefill_max_token_count_per_frame);
-    try std.testing.expectEqual(@as(usize, 16), cpu_gpu_gpu_configs[1].prefill_max_token_count_per_frame);
-    try std.testing.expectEqual(@as(u64, 16), try engine.testing.boundaryRowByteCount(8, cpu_gpu_gpu_configs[1].dtype));
+    try std.testing.expectEqual(@as(usize, 5), cpu_then_two_cuda_configs[0].decode_max_batch_entries);
+    try std.testing.expectEqual(@as(usize, 5), cpu_then_two_cuda_configs[1].decode_max_batch_entries);
+    try std.testing.expectEqual(@as(usize, 16), cpu_then_two_cuda_configs[0].prefill_max_token_count_per_frame);
+    try std.testing.expectEqual(@as(usize, 16), cpu_then_two_cuda_configs[1].prefill_max_token_count_per_frame);
+    try std.testing.expectEqual(@as(u64, 16), try engine.testing.boundaryRowByteCount(8, cpu_then_two_cuda_configs[1].dtype));
 }
 
-test "inference.backend.cuda 10G-D local topology host ids are deterministic stage ids" {
+test "inference.backend.cuda 10G-D local stage chain host ids are deterministic stage ids" {
     try std.testing.expectEqual(@as(u64, 1), (try engine.testing.deterministicHostId(0)).value);
     try std.testing.expectEqual(@as(u64, 2), (try engine.testing.deterministicHostId(1)).value);
     try std.testing.expectEqual(@as(u64, 3), (try engine.testing.deterministicHostId(2)).value);
@@ -583,12 +601,12 @@ test "inference.backend.cuda 10G-D local topology host ids are deterministic sta
 
 test "inference.backend.cuda 10G-E buildDecodeActivationMetadata segmentedHostDecodeByteImage buildDecodeTransportContract localTransportRequest uses multi_entry_local host segments" {
     const d_model: usize = 4;
-    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
     const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 8),
+        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 8),
     };
-    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -633,7 +651,7 @@ test "inference.backend.cuda 10G-E buildDecodeActivationMetadata segmentedHostDe
         std.mem.sliceAsBytes(row2[0..]),
     };
     const image = bridge.segmentedHostActivationByteImage(&metadata, &host_segments);
-    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
+    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
     const contract = try bridge.buildActivationTransportContract(
         placement_plan,
         &metadata,
@@ -727,12 +745,12 @@ test "inference.backend.cuda 10G-E buildDecodeActivationMetadata segmentedHostDe
 
 test "inference.backend.cuda 10G-E deviceDecodeByteImage buildDecodeTransportContract keeps peer copy event sync out of source synchronize" {
     const d_model: usize = 4;
-    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
     const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCudaCudaBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
+        engine.testing.localMinBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
     };
-    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -768,7 +786,7 @@ test "inference.backend.cuda 10G-E deviceDecodeByteImage buildDecodeTransportCon
         batch_entries[0..],
     );
     const image = bridge.deviceActivationByteImage(&metadata);
-    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
+    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
     const contract = try bridge.buildActivationTransportContract(
         placement_plan,
         &metadata,
@@ -850,12 +868,12 @@ test "inference.backend.cuda 10G-E deviceDecodeByteImage buildDecodeTransportCon
 
 test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivationByteImage buildActivationTransportContract buildPrefillTransportContract executeLocalStageTransport keeps CPU KV upload outside chunk handoffs" {
     const d_model: usize = 4;
-    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
     const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 8),
+        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 8),
     };
-    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -924,8 +942,8 @@ test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivation
         }
     };
 
-    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
-    const plan_ref = try stage_adapters.localTopologyTensorFramePlanRef(&backend);
+    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
+    const plan_ref = try stage_adapters.localStageTensorFramePlanRef(&backend);
     var trace_state = Trace{};
     var source = Source{ .trace = &trace_state };
     var target = Target{ .trace = &trace_state };
@@ -1000,12 +1018,12 @@ test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivation
 
 test "inference.backend.cuda 10G-F deviceActivationByteImage buildPrefillTransportContract executeLocalStageTransport covers GPU peer copy and host-staged fallback" {
     const d_model: usize = 4;
-    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
+    const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
     const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCudaCudaBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
+        engine.testing.localMinBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
     };
-    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -1039,10 +1057,10 @@ test "inference.backend.cuda 10G-F deviceActivationByteImage buildPrefillTranspo
         3,
         batch_entries[0..],
     );
-    try bridge.validateTensorFrameForPlanBoundary(&metadata, try stage_adapters.localTopologyTensorFramePlanRef(&backend), 0);
+    try bridge.validateTensorFrameForPlanBoundary(&metadata, try stage_adapters.localStageTensorFramePlanRef(&backend), 0);
     try bridge.validatePayloadBufferLength(&metadata, 3 * d_model * @sizeOf(f32));
     const image = bridge.deviceActivationByteImage(&metadata);
-    const placement_plan = try stage_adapters.localTopologyPlacementPlan(&backend);
+    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
 
     const Trace = struct {
         synchronize_calls: usize = 0,
@@ -1163,7 +1181,7 @@ test "inference.backend.cuda 10G-F deviceActivationByteImage buildPrefillTranspo
     try std.testing.expectEqual(@as(u8, 0x7b), trace_state.upload_first_byte);
 }
 
-test "buildLocalTopologyPlacementPlan covers decode and prefill profiles for local topologies" {
+test "buildLocalStagePlacementPlan covers decode and prefill profiles for local stage chains" {
     const d_model: usize = 8;
 
     const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
@@ -1173,45 +1191,45 @@ test "buildLocalTopologyPlacementPlan covers decode and prefill profiles for loc
         .affects_loader_residency = false,
     }};
 
-    var cpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    defer cpu_gpu_plan.deinit();
-    var cpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_plan);
-    defer cpu_gpu_state.deinit();
-    const cpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const cpu_gpu_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 9),
+    var cpu_then_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer cpu_then_cuda_plan.deinit();
+    var cpu_then_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_cuda_plan);
+    defer cpu_then_cuda_state.deinit();
+    const cpu_then_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const cpu_then_cuda_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9),
     };
-    var cpu_gpu_placement = try engine.testing.buildLocalTopologyPlacementPlan(
+    var cpu_then_cuda_placement = try engine.testing.buildLocalStagePlacementPlan(
         std.testing.allocator,
         d_model,
-        &cpu_gpu_plan,
-        &cpu_gpu_kinds,
-        &cpu_gpu_configs,
-        &cpu_gpu_state.ref,
+        &cpu_then_cuda_plan,
+        &cpu_then_cuda_kinds,
+        &cpu_then_cuda_configs,
+        &cpu_then_cuda_state.ref,
     );
-    defer cpu_gpu_placement.deinit();
-    try expectLocalTopologyPlacement(&cpu_gpu_placement, d_model, 2, &cpu_gpu_configs);
-    try std.testing.expectEqual(bridge.StatePlacementMode.validate_ref, cpu_gpu_placement.state_placement_mode);
-    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_placement.state_stage_summaries.len);
+    defer cpu_then_cuda_placement.deinit();
+    try expectLocalStagePlacement(&cpu_then_cuda_placement, d_model, 2, &cpu_then_cuda_configs);
+    try std.testing.expectEqual(bridge.StatePlacementMode.validate_ref, cpu_then_cuda_placement.state_placement_mode);
+    try std.testing.expectEqual(@as(usize, 2), cpu_then_cuda_placement.state_stage_summaries.len);
 
-    var pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    defer pipeline2_plan.deinit();
-    var pipeline2_state = try buildLocalTopologyStateFixture(std.testing.allocator, &pipeline2_plan);
-    defer pipeline2_state.deinit();
-    const pipeline2_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const pipeline2_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCudaCudaBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    var two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer two_cuda_plan.deinit();
+    var two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &two_cuda_plan);
+    defer two_cuda_state.deinit();
+    const two_cuda_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const two_cuda_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
     };
-    var pipeline2_placement = try engine.testing.buildLocalTopologyPlacementPlan(
+    var two_cuda_placement = try engine.testing.buildLocalStagePlacementPlan(
         std.testing.allocator,
         d_model,
-        &pipeline2_plan,
-        &pipeline2_kinds,
-        &pipeline2_configs,
-        &pipeline2_state.ref,
+        &two_cuda_plan,
+        &two_cuda_kinds,
+        &two_cuda_configs,
+        &two_cuda_state.ref,
     );
-    defer pipeline2_placement.deinit();
-    try expectLocalTopologyPlacement(&pipeline2_placement, d_model, 2, &pipeline2_configs);
+    defer two_cuda_placement.deinit();
+    try expectLocalStagePlacement(&two_cuda_placement, d_model, 2, &two_cuda_configs);
 
     const three_stage_deps = [_]models.stage_plan.DependencyOverride{
         .{
@@ -1227,12 +1245,12 @@ test "buildLocalTopologyPlacementPlan covers decode and prefill profiles for loc
             .affects_loader_residency = false,
         },
     };
-    var cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
-    defer cpu_gpu_gpu_plan.deinit();
-    var cpu_gpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_gpu_plan);
-    defer cpu_gpu_gpu_state.deinit();
-    const cpu_gpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const cpu_gpu_gpu_configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
+    var cpu_then_two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    defer cpu_then_two_cuda_plan.deinit();
+    var cpu_then_two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_two_cuda_plan);
+    defer cpu_then_two_cuda_state.deinit();
+    const cpu_then_two_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -1242,36 +1260,36 @@ test "buildLocalTopologyPlacementPlan covers decode and prefill profiles for loc
         16,
         64,
     );
-    var cpu_gpu_gpu_placement = try engine.testing.buildLocalTopologyPlacementPlan(
+    var cpu_then_two_cuda_placement = try engine.testing.buildLocalStagePlacementPlan(
         std.testing.allocator,
         d_model,
-        &cpu_gpu_gpu_plan,
-        &cpu_gpu_gpu_kinds,
-        &cpu_gpu_gpu_configs,
-        &cpu_gpu_gpu_state.ref,
+        &cpu_then_two_cuda_plan,
+        &cpu_then_two_cuda_kinds,
+        &cpu_then_two_cuda_configs,
+        &cpu_then_two_cuda_state.ref,
     );
-    defer cpu_gpu_gpu_placement.deinit();
-    try expectLocalTopologyPlacement(&cpu_gpu_gpu_placement, d_model, 3, &cpu_gpu_gpu_configs);
+    defer cpu_then_two_cuda_placement.deinit();
+    try expectLocalStagePlacement(&cpu_then_two_cuda_placement, d_model, 3, &cpu_then_two_cuda_configs);
 }
 
-test "buildLocalTopologyStateOwnershipPlan covers stateful local topology dependencies" {
+test "buildLocalStageStateOwnershipPlan covers stateful local stage chain dependencies" {
     const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
         .source_stage_id = 0,
         .target_stage_id = 1,
         .reason = .stateful_decoder,
         .affects_loader_residency = false,
     }};
-    var pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    defer pipeline2_plan.deinit();
-    var pipeline2_state = try engine.testing.buildLocalTopologyStateOwnershipPlan(std.testing.allocator, &pipeline2_plan);
-    defer pipeline2_state.deinit();
-    try bridge.validateStageStateOwnershipPlan(&pipeline2_state);
-    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.boundaries.len);
-    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.stateful_dependencies.len);
-    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.partition_facts.len);
-    try std.testing.expectEqual(@as(usize, 0), pipeline2_state.partition_facts[0].boundary_index);
-    try std.testing.expectEqual(@as(usize, 0), pipeline2_state.partition_facts[0].source_stage_id);
-    try std.testing.expectEqual(@as(usize, 1), pipeline2_state.partition_facts[0].target_stage_id);
+    var two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer two_cuda_plan.deinit();
+    var two_cuda_state = try engine.testing.buildLocalStageStateOwnershipPlan(std.testing.allocator, &two_cuda_plan);
+    defer two_cuda_state.deinit();
+    try bridge.validateStageStateOwnershipPlan(&two_cuda_state);
+    try std.testing.expectEqual(@as(usize, 1), two_cuda_state.boundaries.len);
+    try std.testing.expectEqual(@as(usize, 1), two_cuda_state.stateful_dependencies.len);
+    try std.testing.expectEqual(@as(usize, 1), two_cuda_state.partition_facts.len);
+    try std.testing.expectEqual(@as(usize, 0), two_cuda_state.partition_facts[0].boundary_index);
+    try std.testing.expectEqual(@as(usize, 0), two_cuda_state.partition_facts[0].source_stage_id);
+    try std.testing.expectEqual(@as(usize, 1), two_cuda_state.partition_facts[0].target_stage_id);
 
     const three_stage_deps = [_]models.stage_plan.DependencyOverride{
         .{
@@ -1287,22 +1305,22 @@ test "buildLocalTopologyStateOwnershipPlan covers stateful local topology depend
             .affects_loader_residency = false,
         },
     };
-    var cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
-    defer cpu_gpu_gpu_plan.deinit();
-    var cpu_gpu_gpu_state = try engine.testing.buildLocalTopologyStateOwnershipPlan(std.testing.allocator, &cpu_gpu_gpu_plan);
-    defer cpu_gpu_gpu_state.deinit();
-    try bridge.validateStageStateOwnershipPlan(&cpu_gpu_gpu_state);
-    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_gpu_state.boundaries.len);
-    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_gpu_state.stateful_dependencies.len);
-    try std.testing.expectEqual(@as(usize, 2), cpu_gpu_gpu_state.partition_facts.len);
-    for (cpu_gpu_gpu_state.partition_facts, 0..) |fact, boundary_index| {
+    var cpu_then_two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    defer cpu_then_two_cuda_plan.deinit();
+    var cpu_then_two_cuda_state = try engine.testing.buildLocalStageStateOwnershipPlan(std.testing.allocator, &cpu_then_two_cuda_plan);
+    defer cpu_then_two_cuda_state.deinit();
+    try bridge.validateStageStateOwnershipPlan(&cpu_then_two_cuda_state);
+    try std.testing.expectEqual(@as(usize, 2), cpu_then_two_cuda_state.boundaries.len);
+    try std.testing.expectEqual(@as(usize, 2), cpu_then_two_cuda_state.stateful_dependencies.len);
+    try std.testing.expectEqual(@as(usize, 2), cpu_then_two_cuda_state.partition_facts.len);
+    for (cpu_then_two_cuda_state.partition_facts, 0..) |fact, boundary_index| {
         try std.testing.expectEqual(boundary_index, fact.boundary_index);
         try std.testing.expectEqual(boundary_index, fact.source_stage_id);
         try std.testing.expectEqual(boundary_index + 1, fact.target_stage_id);
     }
 }
 
-test "deinitLocalStageTopologyContracts uses reverse local topology contract order and is idempotent" {
+test "deinitLocalStageContracts uses reverse local stage chain contract order and is idempotent" {
     const expected_order = [_]engine.testing.ContractField{
         .local_stage_runner_plan_ref,
         .placement_plan,
@@ -1319,35 +1337,35 @@ test "deinitLocalStageTopologyContracts uses reverse local topology contract ord
         .reason = .stateful_decoder,
         .affects_loader_residency = false,
     }};
-    const cpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const cpu_gpu_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 9),
+    const cpu_then_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const cpu_then_cuda_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9),
     };
-    const cpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    var cpu_gpu_bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+    const cpu_then_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    var cpu_then_cuda_bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         8,
-        cpu_gpu_plan,
-        &cpu_gpu_kinds,
-        &cpu_gpu_configs,
+        cpu_then_cuda_plan,
+        &cpu_then_cuda_kinds,
+        &cpu_then_cuda_configs,
     );
-    defer cpu_gpu_bundle.deinit();
-    engine.testing.deinitLocalTopologyContractBundleThroughBackendTwice(&cpu_gpu_bundle);
+    defer cpu_then_cuda_bundle.deinit();
+    engine.testing.deinitLocalStageContractBundleThroughBackendTwice(&cpu_then_cuda_bundle);
 
-    const pipeline2_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const pipeline2_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCudaCudaBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    const two_cuda_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const two_cuda_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
     };
-    const pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    var pipeline2_bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+    const two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    var two_cuda_bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         8,
-        pipeline2_plan,
-        &pipeline2_kinds,
-        &pipeline2_configs,
+        two_cuda_plan,
+        &two_cuda_kinds,
+        &two_cuda_configs,
     );
-    defer pipeline2_bundle.deinit();
-    engine.testing.deinitLocalTopologyContractBundleThroughBackendTwice(&pipeline2_bundle);
+    defer two_cuda_bundle.deinit();
+    engine.testing.deinitLocalStageContractBundleThroughBackendTwice(&two_cuda_bundle);
 
     const three_stage_deps = [_]models.stage_plan.DependencyOverride{
         .{
@@ -1363,8 +1381,8 @@ test "deinitLocalStageTopologyContracts uses reverse local topology contract ord
             .affects_loader_residency = false,
         },
     };
-    const cpu_gpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const cpu_gpu_gpu_configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
+    const cpu_then_two_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -1374,44 +1392,44 @@ test "deinitLocalStageTopologyContracts uses reverse local topology contract ord
         16,
         64,
     );
-    const cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
-    var cpu_gpu_gpu_bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
+    const cpu_then_two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    var cpu_then_two_cuda_bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         8,
-        cpu_gpu_gpu_plan,
-        &cpu_gpu_gpu_kinds,
-        &cpu_gpu_gpu_configs,
+        cpu_then_two_cuda_plan,
+        &cpu_then_two_cuda_kinds,
+        &cpu_then_two_cuda_configs,
     );
-    defer cpu_gpu_gpu_bundle.deinit();
-    engine.testing.deinitLocalTopologyContractBundleThroughBackendTwice(&cpu_gpu_gpu_bundle);
+    defer cpu_then_two_cuda_bundle.deinit();
+    engine.testing.deinitLocalStageContractBundleThroughBackendTwice(&cpu_then_two_cuda_bundle);
 }
 
-test "buildLocalTopologyPlacementPlan cleans up allocation failures for local topology contract bundles" {
+test "buildLocalStagePlacementPlan cleans up allocation failures for local stage chain contract bundles" {
     const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
         .source_stage_id = 0,
         .target_stage_id = 1,
         .reason = .stateful_decoder,
         .affects_loader_residency = false,
     }};
-    var cpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    defer cpu_gpu_plan.deinit();
-    var cpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_plan);
-    defer cpu_gpu_state.deinit();
-    const cpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const cpu_gpu_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 4, 9),
+    var cpu_then_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer cpu_then_cuda_plan.deinit();
+    var cpu_then_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_cuda_plan);
+    defer cpu_then_cuda_state.deinit();
+    const cpu_then_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
+    const cpu_then_cuda_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9),
     };
-    try expectPlacementBuildFailureCleanup(8, &cpu_gpu_plan, &cpu_gpu_kinds, &cpu_gpu_configs, &cpu_gpu_state.ref);
+    try expectPlacementBuildFailureCleanup(8, &cpu_then_cuda_plan, &cpu_then_cuda_kinds, &cpu_then_cuda_configs, &cpu_then_cuda_state.ref);
 
-    var pipeline2_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    defer pipeline2_plan.deinit();
-    var pipeline2_state = try buildLocalTopologyStateFixture(std.testing.allocator, &pipeline2_plan);
-    defer pipeline2_state.deinit();
-    const pipeline2_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const pipeline2_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCudaCudaBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    var two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
+    defer two_cuda_plan.deinit();
+    var two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &two_cuda_plan);
+    defer two_cuda_state.deinit();
+    const two_cuda_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
+    const two_cuda_configs = [_]engine.testing.BoundaryConfig{
+        engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
     };
-    try expectPlacementBuildFailureCleanup(8, &pipeline2_plan, &pipeline2_kinds, &pipeline2_configs, &pipeline2_state.ref);
+    try expectPlacementBuildFailureCleanup(8, &two_cuda_plan, &two_cuda_kinds, &two_cuda_configs, &two_cuda_state.ref);
 
     const three_stage_deps = [_]models.stage_plan.DependencyOverride{
         .{
@@ -1427,12 +1445,12 @@ test "buildLocalTopologyPlacementPlan cleans up allocation failures for local to
             .affects_loader_residency = false,
         },
     };
-    var cpu_gpu_gpu_plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
-    defer cpu_gpu_gpu_plan.deinit();
-    var cpu_gpu_gpu_state = try buildLocalTopologyStateFixture(std.testing.allocator, &cpu_gpu_gpu_plan);
-    defer cpu_gpu_gpu_state.deinit();
-    const cpu_gpu_gpu_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const cpu_gpu_gpu_configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
+    var cpu_then_two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
+    defer cpu_then_two_cuda_plan.deinit();
+    var cpu_then_two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_two_cuda_plan);
+    defer cpu_then_two_cuda_state.deinit();
+    const cpu_then_two_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
+    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -1442,7 +1460,7 @@ test "buildLocalTopologyPlacementPlan cleans up allocation failures for local to
         16,
         64,
     );
-    try expectPlacementBuildFailureCleanup(8, &cpu_gpu_gpu_plan, &cpu_gpu_gpu_kinds, &cpu_gpu_gpu_configs, &cpu_gpu_gpu_state.ref);
+    try expectPlacementBuildFailureCleanup(8, &cpu_then_two_cuda_plan, &cpu_then_two_cuda_kinds, &cpu_then_two_cuda_configs, &cpu_then_two_cuda_state.ref);
 }
 
 test "finalOutputBuffer returns residual when program ends with add" {
@@ -2590,8 +2608,7 @@ test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
-    backend.local_cuda_stage1_backend = null;
-    backend.local_cpu_stage0_backend = null;
+    clearLocalStages(&backend);
     backend.state_descriptor_count = 4;
     backend.state_descriptors_storage[0] = .{
         .id = 91,
@@ -2685,8 +2702,7 @@ test "bindSlotStateBlocks preserves bound slot index in runtime states" {
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 2;
     backend.block_runtime = undefined;
-    backend.local_cuda_stage1_backend = null;
-    backend.local_cpu_stage0_backend = null;
+    clearLocalStages(&backend);
     backend.state_descriptor_count = 4;
     backend.state_descriptors_storage[0] = .{
         .id = 101,
@@ -2777,7 +2793,7 @@ test "bindSlotStateBlocks rolls back self on cpu stage bind failure" {
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
     backend.state_descriptor_count = 1;
-    backend.local_cuda_stage1_backend = null;
+    backend.local_cuda_stage_backends = &.{};
     backend.state_descriptors_storage[0] = .{
         .id = 111,
         .size_bytes = runtime_contract.builtin_state_block_bytes,
@@ -2795,7 +2811,8 @@ test "bindSlotStateBlocks rolls back self on cpu stage bind failure" {
     const cpu_backend = main.inference.backend.cpu;
     var cpu_stage0_bytes: [@sizeOf(cpu_backend.BackendType)]u8 align(@alignOf(cpu_backend.BackendType)) = @splat(0);
     const cpu_stage0: *cpu_backend.BackendType = @ptrCast(&cpu_stage0_bytes);
-    backend.local_cpu_stage0_backend = cpu_stage0;
+    var local_cpu_stages: [1]?*CpuBackend = undefined;
+    setSingleLocalCpuStage(&backend, &local_cpu_stages, cpu_stage0);
 
     var state_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
     const state_blocks = [_]runtime_contract.StateBlockHandle{
@@ -2818,8 +2835,7 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
-    backend.local_cuda_stage1_backend = null;
-    backend.local_cpu_stage0_backend = null;
+    clearLocalStages(&backend);
     backend.state_descriptor_count = 1;
     backend.state_descriptors_storage[0] = .{
         .id = 111,
@@ -2851,12 +2867,12 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
 }
 
-test "bindSlotStateBlocks accepts scheduler descriptor superset for staged topology" {
+test "bindSlotStateBlocks accepts scheduler descriptor superset for staged local chain" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
-    backend.local_cpu_stage0_backend = null;
+    backend.local_cpu_stage_backends = &.{};
     backend.state_descriptor_count = 1;
     backend.state_descriptors_storage[0] = .{
         .id = 121,
@@ -2872,8 +2888,7 @@ test "bindSlotStateBlocks accepts scheduler descriptor superset for staged topol
     var stage1: CudaBackend = undefined;
     stage1.max_batch_size = 1;
     stage1.block_runtime = undefined;
-    stage1.local_cuda_stage1_backend = null;
-    stage1.local_cpu_stage0_backend = null;
+    clearLocalStages(&stage1);
     stage1.state_descriptor_count = 1;
     stage1.state_descriptors_storage[0] = .{
         .id = 122,
@@ -2885,7 +2900,8 @@ test "bindSlotStateBlocks accepts scheduler descriptor superset for staged topol
     };
     var stage1_slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
     stage1.slot_state_bindings = stage1_slot_state_bindings[0..];
-    backend.local_cuda_stage1_backend = &stage1;
+    var local_cuda_stages: [1]?*CudaBackend = undefined;
+    setSingleLocalCudaStage(&backend, &local_cuda_stages, &stage1);
 
     var kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
     var staged_extra_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
@@ -2919,12 +2935,12 @@ test "bindSlotStateBlocks accepts scheduler descriptor superset for staged topol
     try std.testing.expectEqual(@as(u8, 122), stage1_bound[0].id);
 }
 
-test "bindSlotStateBlocks rejects unknown scheduler descriptor extras for staged topology" {
+test "bindSlotStateBlocks rejects unknown scheduler descriptor extras for staged local chain" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
-    backend.local_cpu_stage0_backend = null;
+    backend.local_cpu_stage_backends = &.{};
     backend.state_descriptor_count = 1;
     backend.state_descriptors_storage[0] = .{
         .id = 131,
@@ -2940,7 +2956,8 @@ test "bindSlotStateBlocks rejects unknown scheduler descriptor extras for staged
     var stage1: CudaBackend = undefined;
     stage1.max_batch_size = 1;
     stage1.state_descriptor_count = 0;
-    backend.local_cuda_stage1_backend = &stage1;
+    var local_cuda_stages: [1]?*CudaBackend = undefined;
+    setSingleLocalCudaStage(&backend, &local_cuda_stages, &stage1);
 
     var kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
     var unknown_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
@@ -2968,8 +2985,7 @@ test "mirrorSlotStateBlocksFrom synthesizes stage-local runtime descriptors with
 
     var source: CudaBackend = undefined;
     source.max_batch_size = 1;
-    source.local_cuda_stage1_backend = null;
-    source.local_cpu_stage0_backend = null;
+    clearLocalStages(&source);
     source.block_runtime = undefined;
     source.state_descriptor_count = 1;
     source.state_descriptors_storage[0] = .{
@@ -2985,8 +3001,7 @@ test "mirrorSlotStateBlocksFrom synthesizes stage-local runtime descriptors with
 
     var target: CudaBackend = undefined;
     target.max_batch_size = 1;
-    target.local_cuda_stage1_backend = null;
-    target.local_cpu_stage0_backend = null;
+    clearLocalStages(&target);
     target.block_runtime = undefined;
     target.state_descriptor_count = 2;
     target.state_descriptors_storage[0] = .{
@@ -3053,8 +3068,7 @@ test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtim
 
     var source: CudaBackend = undefined;
     source.max_batch_size = 1;
-    source.local_cuda_stage1_backend = null;
-    source.local_cpu_stage0_backend = null;
+    clearLocalStages(&source);
     source.block_runtime = undefined;
     source.state_descriptor_count = 1;
     source.state_descriptors_storage[0] = .{
@@ -3070,8 +3084,7 @@ test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtim
 
     var target: CudaBackend = undefined;
     target.max_batch_size = 1;
-    target.local_cuda_stage1_backend = null;
-    target.local_cpu_stage0_backend = null;
+    clearLocalStages(&target);
     target.block_runtime = undefined;
     target.state_descriptor_count = 2;
     target.state_descriptors_storage[0] = .{
@@ -3111,8 +3124,7 @@ test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtim
 test "mirrorSlotStateBlocksFrom synthesizes runtime descriptors when source slot is unbound" {
     var source: CudaBackend = undefined;
     source.max_batch_size = 1;
-    source.local_cuda_stage1_backend = null;
-    source.local_cpu_stage0_backend = null;
+    clearLocalStages(&source);
     source.block_runtime = undefined;
     source.state_descriptor_count = 0;
     var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
@@ -3120,8 +3132,7 @@ test "mirrorSlotStateBlocksFrom synthesizes runtime descriptors when source slot
 
     var target: CudaBackend = undefined;
     target.max_batch_size = 1;
-    target.local_cuda_stage1_backend = null;
-    target.local_cpu_stage0_backend = null;
+    clearLocalStages(&target);
     target.block_runtime = undefined;
     target.state_descriptor_count = 1;
     target.state_descriptors_storage[0] = .{
@@ -3210,3034 +3221,6 @@ test "attentionSeparateDecodeUsesCache uses decode mode only for single-row exec
     try std.testing.expect(!engine_mixers.attentionSeparateDecodeUsesCache(15));
 }
 
-test "computeBatchedDecodeLogits rejects pipeline2 decode without local stage specs" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [3]u8 = [_]u8{0} ** 3,
-        };
-
-        max_batch_size: usize = 4,
-        topology_mode: enum { single, pipeline2 } = .pipeline2,
-        block_runtime: BlockRuntimeMock = .{},
-        vocab_size: usize = 5,
-        slot_logits_storage: [20]f32 = [_]f32{0.0} ** 20,
-        activate_calls: usize = 0,
-        activated_slots: [8]usize = [_]usize{0} ** 8,
-        compute_calls: usize = 0,
-        recorded_tokens: [8]u32 = [_]u32{0} ** 8,
-        recorded_positions: [8]usize = [_]usize{0} ** 8,
-        recorded_slots: [8]usize = [_]usize{0} ** 8,
-        recorded_layer_limits: [8]usize = [_]usize{0} ** 8,
-        recorded_compute_logits: [8]bool = [_]bool{false} ** 8,
-        recorded_download_logits: [8]bool = [_]bool{false} ** 8,
-        recorded_use_preloaded_input: [8]bool = [_]bool{false} ** 8,
-
-        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
-            self.activated_slots[self.activate_calls] = slot_index;
-            self.activate_calls += 1;
-        }
-
-        pub fn slotLogits(self: *@This(), slot_index: usize) []f32 {
-            const offset = slot_index * self.vocab_size;
-            return self.slot_logits_storage[offset .. offset + self.vocab_size];
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            const idx = self.compute_calls;
-            self.compute_calls += 1;
-            self.recorded_tokens[idx] = token;
-            self.recorded_positions[idx] = position;
-            self.recorded_slots[idx] = slot_index;
-            self.recorded_layer_limits[idx] = layer_limit;
-            self.recorded_compute_logits[idx] = compute_logits;
-            self.recorded_download_logits[idx] = download_logits;
-            self.recorded_use_preloaded_input[idx] = use_preloaded_input;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*logit, i| {
-                    logit.* = @floatFromInt(i);
-                }
-            }
-        }
-    };
-
-    var mock = Mock{};
-    const tokens = [_]u32{ 11, 22, 33 };
-    const slot_indices = [_]usize{ 2, 0, 3 };
-    const positions = [_]usize{ 7, 8, 9 };
-
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]),
-    );
-    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
-    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
-}
-
-test "computeBatchedDecodeLogitsDeviceOnly rejects pipeline2 decode without local stage specs" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [3]u8 = [_]u8{0} ** 3,
-        };
-
-        max_batch_size: usize = 4,
-        topology_mode: enum { single, pipeline2 } = .pipeline2,
-        block_runtime: BlockRuntimeMock = .{},
-        activate_calls: usize = 0,
-        activated_slots: [8]usize = [_]usize{0} ** 8,
-        compute_calls: usize = 0,
-        recorded_tokens: [8]u32 = [_]u32{0} ** 8,
-        recorded_positions: [8]usize = [_]usize{0} ** 8,
-        recorded_slots: [8]usize = [_]usize{0} ** 8,
-        recorded_layer_limits: [8]usize = [_]usize{0} ** 8,
-        recorded_compute_logits: [8]bool = [_]bool{false} ** 8,
-        recorded_download_logits: [8]bool = [_]bool{false} ** 8,
-        recorded_has_logits_out: [8]bool = [_]bool{false} ** 8,
-        recorded_use_preloaded_input: [8]bool = [_]bool{false} ** 8,
-
-        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
-            self.activated_slots[self.activate_calls] = slot_index;
-            self.activate_calls += 1;
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            const idx = self.compute_calls;
-            self.compute_calls += 1;
-            self.recorded_tokens[idx] = token;
-            self.recorded_positions[idx] = position;
-            self.recorded_slots[idx] = slot_index;
-            self.recorded_layer_limits[idx] = layer_limit;
-            self.recorded_compute_logits[idx] = compute_logits;
-            self.recorded_download_logits[idx] = download_logits;
-            self.recorded_has_logits_out[idx] = logits_out_opt != null;
-            self.recorded_use_preloaded_input[idx] = use_preloaded_input;
-        }
-    };
-
-    var mock = Mock{};
-    const tokens = [_]u32{ 101, 202, 303 };
-    const slot_indices = [_]usize{ 1, 3, 0 };
-    const positions = [_]usize{ 9, 10, 11 };
-
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        engine_forward.computeBatchedDecodeLogitsDeviceOnly(&mock, tokens[0..], slot_indices[0..], positions[0..]),
-    );
-    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
-    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
-}
-
-test "computeBatchedDecodeLogits rejects cpu_gpu decode without local stage specs" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [3]u8 = [_]u8{0} ** 3,
-        };
-
-        max_batch_size: usize = 4,
-        topology_mode: enum { single, pipeline2, cpu_gpu } = .cpu_gpu,
-        block_runtime: BlockRuntimeMock = .{},
-        vocab_size: usize = 5,
-        slot_logits_storage: [20]f32 = [_]f32{0.0} ** 20,
-        activate_calls: usize = 0,
-        activated_slots: [8]usize = [_]usize{0} ** 8,
-        compute_calls: usize = 0,
-        recorded_tokens: [8]u32 = [_]u32{0} ** 8,
-        recorded_positions: [8]usize = [_]usize{0} ** 8,
-        recorded_slots: [8]usize = [_]usize{0} ** 8,
-        recorded_layer_limits: [8]usize = [_]usize{0} ** 8,
-        recorded_compute_logits: [8]bool = [_]bool{false} ** 8,
-        recorded_download_logits: [8]bool = [_]bool{false} ** 8,
-        recorded_use_preloaded_input: [8]bool = [_]bool{false} ** 8,
-
-        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
-            self.activated_slots[self.activate_calls] = slot_index;
-            self.activate_calls += 1;
-        }
-
-        pub fn slotLogits(self: *@This(), slot_index: usize) []f32 {
-            const offset = slot_index * self.vocab_size;
-            return self.slot_logits_storage[offset .. offset + self.vocab_size];
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            const idx = self.compute_calls;
-            self.compute_calls += 1;
-            self.recorded_tokens[idx] = token;
-            self.recorded_positions[idx] = position;
-            self.recorded_slots[idx] = slot_index;
-            self.recorded_layer_limits[idx] = layer_limit;
-            self.recorded_compute_logits[idx] = compute_logits;
-            self.recorded_download_logits[idx] = download_logits;
-            self.recorded_use_preloaded_input[idx] = use_preloaded_input;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*logit, i| {
-                    logit.* = @floatFromInt(i);
-                }
-            }
-        }
-    };
-
-    var mock = Mock{};
-    const tokens = [_]u32{ 11, 22, 33 };
-    const slot_indices = [_]usize{ 2, 0, 3 };
-    const positions = [_]usize{ 7, 8, 9 };
-
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]),
-    );
-    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
-    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
-}
-
-test "executePrefillWithLayerLimit rejects pipeline2 prefill without local stage specs" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [4]u8 = [_]u8{0} ** 4,
-        };
-
-        topology_mode: enum { single, pipeline2 } = .pipeline2,
-        block_runtime: BlockRuntimeMock = .{},
-        vocab_size: usize = 6,
-        max_seq_len: usize = 32,
-        compute_calls: usize = 0,
-        recorded_download_logits: [16]bool = [_]bool{false} ** 16,
-        recorded_trace_seq_lens: [16]u32 = [_]u32{0} ** 16,
-        recorded_trace_positions: [16]usize = [_]usize{0} ** 16,
-        recorded_logits_out_present: [16]bool = [_]bool{false} ** 16,
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index < 2;
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = layer_limit;
-            _ = compute_logits;
-            _ = ensure_kv_capacity;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            _ = use_preloaded_input;
-            const idx = self.compute_calls;
-            self.compute_calls += 1;
-            self.recorded_download_logits[idx] = download_logits;
-            self.recorded_trace_seq_lens[idx] = trace_seq_len_u32;
-            self.recorded_trace_positions[idx] = trace_pos_offset;
-            self.recorded_logits_out_present[idx] = logits_out_opt != null;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*logit, i| {
-                    logit.* = @floatFromInt(i);
-                }
-            }
-        }
-    };
-
-    var mock = Mock{};
-    const tokens = [_]u32{ 100, 101, 102, 103 };
-    var logits_out: [6]f32 = undefined;
-
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        engine_forward.executePrefillWithLayerLimit(
-            &mock,
-            tokens[0..],
-            0,
-            logits_out[0..],
-            mock.block_runtime.blocks.len,
-        ),
-    );
-
-    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
-}
-
-test "executePrefillWithLayerLimit rejects cpu_gpu prefill without local stage specs" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [4]u8 = [_]u8{0} ** 4,
-        };
-
-        topology_mode: enum { single, pipeline2, cpu_gpu } = .cpu_gpu,
-        block_runtime: BlockRuntimeMock = .{},
-        vocab_size: usize = 6,
-        max_seq_len: usize = 32,
-        compute_calls: usize = 0,
-        recorded_download_logits: [16]bool = [_]bool{false} ** 16,
-        recorded_trace_seq_lens: [16]u32 = [_]u32{0} ** 16,
-        recorded_trace_positions: [16]usize = [_]usize{0} ** 16,
-        recorded_logits_out_present: [16]bool = [_]bool{false} ** 16,
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index < 2;
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = layer_limit;
-            _ = compute_logits;
-            _ = ensure_kv_capacity;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            _ = use_preloaded_input;
-            const idx = self.compute_calls;
-            self.compute_calls += 1;
-            self.recorded_download_logits[idx] = download_logits;
-            self.recorded_trace_seq_lens[idx] = trace_seq_len_u32;
-            self.recorded_trace_positions[idx] = trace_pos_offset;
-            self.recorded_logits_out_present[idx] = logits_out_opt != null;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*logit, i| {
-                    logit.* = @floatFromInt(i);
-                }
-            }
-        }
-    };
-
-    var mock = Mock{};
-    const tokens = [_]u32{ 100, 101, 102, 103 };
-    var logits_out: [6]f32 = undefined;
-
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        engine_forward.executePrefillWithLayerLimit(
-            &mock,
-            tokens[0..],
-            0,
-            logits_out[0..],
-            mock.block_runtime.blocks.len,
-        ),
-    );
-
-    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
-}
-
-test "executeDecodeWithLayerLimit orchestrates pipeline2 stage0 transfer and stage1" {
-    const TraceStep = enum(u8) {
-        mirror,
-        activate,
-        stage0_compute,
-        transfer,
-        stage1_compute,
-    };
-    const SharedTrace = struct {
-        steps: [16]TraceStep = undefined,
-        step_count: usize = 0,
-        mirror_calls: usize = 0,
-        mirror_slot: usize = 0,
-        activate_calls: usize = 0,
-        activated_slot: usize = 0,
-        transfer_calls: usize = 0,
-        transfer_bytes: usize = 0,
-        stage0_compute_calls: usize = 0,
-        stage1_compute_calls: usize = 0,
-        stage0_layer_limit: usize = 0,
-        stage1_layer_limit: usize = 0,
-        stage0_compute_logits: bool = true,
-        stage1_compute_logits: bool = false,
-        stage0_download_logits: bool = true,
-        stage1_download_logits: bool = false,
-        stage0_use_preloaded_input: bool = true,
-        stage1_use_preloaded_input: bool = false,
-        stage0_deepstack_len: usize = 0,
-        stage1_deepstack_len: usize = 0,
-        stage1_logits_out_present: bool = false,
-        stage0_logits_out_present: bool = false,
-
-        fn push(self: *@This(), step: TraceStep) void {
-            self.steps[self.step_count] = step;
-            self.step_count += 1;
-        }
-    };
-
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        trace: *SharedTrace,
-        is_stage1: bool = false,
-        split_layer: usize = 2,
-        d_model: usize = 8,
-        state_descriptor_count: usize = 0,
-        topology_mode: enum { single, pipeline2 } = .single,
-        block_runtime: BlockRuntimeMock = .{},
-        local_cuda_stage1_backend: ?*@This() = null,
-        local_boundary0_staging: ?[]align(64) u8 = null,
-        local_boundary0_dtype: bridge.BoundaryDType = .f32,
-        local_boundary0_layout: bridge.BoundaryLayout = .row_major,
-        local_boundary0_peer_copy_available: bool = false,
-        local_stage_specs: []const engine.testing.StageSpec = &.{},
-        local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [2]?u64 = .{ 101, 202 },
-        device: MockCudaDevice = .{},
-
-        pub fn localCudaStage1(self: *@This()) ?*@This() {
-            return self.local_cuda_stage1_backend;
-        }
-
-        pub fn mirrorSlotStateBlocksFrom(self: *@This(), source: *const @This(), slot_index: usize) !void {
-            _ = source;
-            self.trace.mirror_calls += 1;
-            self.trace.mirror_slot = slot_index;
-            self.trace.push(.mirror);
-        }
-
-        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
-            self.trace.activate_calls += 1;
-            self.trace.activated_slot = slot_index;
-            self.trace.push(.activate);
-        }
-
-        pub fn localActivationByteCount(self: *const @This()) !usize {
-            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
-        }
-
-        pub fn synchronizeLocalActivation(_: *@This()) !void {}
-
-        pub fn downloadLocalActivationToHost(self: *@This(), host_buf: []u8, byte_count: usize) !void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            @memset(host_buf[0..byte_count], if (self.is_stage1) 0x22 else 0x11);
-        }
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            slot_index: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            _ = slot_index;
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            self.trace.transfer_calls += 1;
-            self.trace.transfer_bytes = byte_count;
-            self.trace.push(.transfer);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_feature_index_opt;
-            if (self.is_stage1) {
-                self.trace.stage1_compute_calls += 1;
-                self.trace.stage1_layer_limit = layer_limit;
-                self.trace.stage1_compute_logits = compute_logits;
-                self.trace.stage1_download_logits = download_logits;
-                self.trace.stage1_use_preloaded_input = use_preloaded_input;
-                self.trace.stage1_deepstack_len = if (deepstack_layer_features_opt) |features| features.len else 0;
-                self.trace.stage1_logits_out_present = logits_out_opt != null;
-                self.trace.push(.stage1_compute);
-            } else {
-                self.trace.stage0_compute_calls += 1;
-                self.trace.stage0_layer_limit = layer_limit;
-                self.trace.stage0_compute_logits = compute_logits;
-                self.trace.stage0_download_logits = download_logits;
-                self.trace.stage0_use_preloaded_input = use_preloaded_input;
-                self.trace.stage0_deepstack_len = if (deepstack_layer_features_opt) |features| features.len else 0;
-                self.trace.stage0_logits_out_present = logits_out_opt != null;
-                self.trace.push(.stage0_compute);
-            }
-        }
-    };
-
-    var trace_state = SharedTrace{};
-    var staging: [8 * @sizeOf(f32)]u8 align(64) = undefined;
-    const boundary_runtimes = [_]stage_adapters.LocalBoundaryRuntimeView{.{
-        .boundary_index = 0,
-        .dtype = .f32,
-        .layout = .row_major,
-        .staging = staging[0..],
-    }};
-    const stage_specs = [_]engine.testing.StageSpec{
-        .{ .stage_id = 0, .backend_kind = .cuda, .layer_start = 0, .layer_end = 2, .owns_embedding = true, .owns_projection = false },
-        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 2, .layer_end = 4, .owns_embedding = false, .owns_projection = true },
-    };
-    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
-    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCudaCudaBoundaryConfig(.f32, .row_major, 2, 2, 1, 1),
-    };
-    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
-        std.testing.allocator,
-        8,
-        plan,
-        &stage_backend_kinds,
-        &configs,
-    );
-    defer bundle.deinit();
-    var stage1 = Mock{
-        .trace = &trace_state,
-        .is_stage1 = true,
-        .split_layer = 0,
-        .d_model = 8,
-        .state_descriptor_count = 1,
-        .topology_mode = .single,
-        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-        .local_cuda_stage1_backend = null,
-    };
-    var stage0 = Mock{
-        .trace = &trace_state,
-        .is_stage1 = false,
-        .split_layer = 2,
-        .d_model = 8,
-        .state_descriptor_count = 0,
-        .topology_mode = .pipeline2,
-        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
-        .local_cuda_stage1_backend = &stage1,
-        .local_boundary0_staging = staging[0..],
-        .local_stage_specs = stage_specs[0..],
-        .local_boundary_runtimes = boundary_runtimes[0..],
-        .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-        .local_placement_plan = bundle.placement_plan.?,
-        .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-    };
-
-    var logits: [7]f32 = undefined;
-    const deepstack_features = [_][]const f32{
-        &[_]f32{ 0.1, 0.2 },
-        &[_]f32{ 0.3, 0.4 },
-        &[_]f32{ 0.5, 0.6 },
-        &[_]f32{ 0.7, 0.8 },
-    };
-    try engine_forward.executeDecodeWithLayerLimit(
-        &stage0,
-        123,
-        9,
-        1,
-        logits[0..],
-        stage0.block_runtime.blocks.len,
-        true,
-        true,
-        true,
-        10,
-        9,
-        null,
-        deepstack_features[0..],
-        null,
-        false,
-    );
-
-    try std.testing.expectEqual(@as(usize, 5), trace_state.step_count);
-    try std.testing.expectEqual(TraceStep.mirror, trace_state.steps[0]);
-    try std.testing.expectEqual(TraceStep.activate, trace_state.steps[1]);
-    try std.testing.expectEqual(TraceStep.stage0_compute, trace_state.steps[2]);
-    try std.testing.expectEqual(TraceStep.transfer, trace_state.steps[3]);
-    try std.testing.expectEqual(TraceStep.stage1_compute, trace_state.steps[4]);
-
-    try std.testing.expectEqual(@as(usize, 1), trace_state.mirror_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_state.mirror_slot);
-    try std.testing.expectEqual(@as(usize, 1), trace_state.activate_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_state.activated_slot);
-    try std.testing.expectEqual(@as(usize, 1), trace_state.transfer_calls);
-    try std.testing.expectEqual(stage0.d_model * @sizeOf(f32), trace_state.transfer_bytes);
-
-    try std.testing.expectEqual(@as(usize, 1), trace_state.stage0_compute_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_state.stage1_compute_calls);
-    try std.testing.expectEqual(stage0.split_layer, trace_state.stage0_layer_limit);
-    try std.testing.expectEqual(stage1.block_runtime.blocks.len, trace_state.stage1_layer_limit);
-
-    try std.testing.expect(!trace_state.stage0_compute_logits);
-    try std.testing.expect(!trace_state.stage0_download_logits);
-    try std.testing.expect(!trace_state.stage0_use_preloaded_input);
-    try std.testing.expectEqual(deepstack_features.len, trace_state.stage0_deepstack_len);
-    try std.testing.expect(!trace_state.stage0_logits_out_present);
-
-    try std.testing.expect(trace_state.stage1_compute_logits);
-    try std.testing.expect(trace_state.stage1_download_logits);
-    try std.testing.expect(trace_state.stage1_use_preloaded_input);
-    try std.testing.expectEqual(deepstack_features.len - stage0.split_layer, trace_state.stage1_deepstack_len);
-    try std.testing.expect(trace_state.stage1_logits_out_present);
-}
-
-test "executeDecodeWithLayerLimit orchestrates cpu_gpu stage0 transfer and stage1" {
-    const TraceStep = enum(u8) {
-        stage0_compute,
-        transfer,
-        stage1_compute,
-    };
-    const SharedTrace = struct {
-        steps: [16]TraceStep = undefined,
-        step_count: usize = 0,
-        stage0_compute_calls: usize = 0,
-        stage0_token: u32 = 0,
-        stage0_position: usize = 0,
-        stage0_slot: usize = 0,
-        stage0_layer_start: usize = 0,
-        stage0_layer_end: usize = 0,
-        stage0_compute_logits: bool = true,
-        stage0_download_logits: bool = true,
-        stage0_use_preloaded_input: bool = true,
-        transfer_calls: usize = 0,
-        transfer_slot: usize = 0,
-        transfer_bytes: usize = 0,
-        stage1_compute_calls: usize = 0,
-        stage1_layer_limit: usize = 0,
-        stage1_compute_logits: bool = false,
-        stage1_download_logits: bool = false,
-        stage1_use_preloaded_input: bool = false,
-        stage1_logits_out_present: bool = false,
-
-        fn push(self: *@This(), step: TraceStep) void {
-            self.steps[self.step_count] = step;
-            self.step_count += 1;
-        }
-    };
-
-    const CpuStage0Mock = struct {
-        trace: *SharedTrace,
-        activation: [8]f32 = [_]f32{0.0} ** 8,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            self.trace.stage0_compute_calls += 1;
-            self.trace.stage0_token = token;
-            self.trace.stage0_position = position;
-            self.trace.stage0_slot = slot_index;
-            self.trace.stage0_layer_start = layer_start;
-            self.trace.stage0_layer_end = layer_end;
-            self.trace.stage0_compute_logits = compute_logits;
-            self.trace.stage0_download_logits = download_logits;
-            self.trace.stage0_use_preloaded_input = use_preloaded_input;
-            @memset(self.activation[0..], 1.0);
-            try std.testing.expect(logits_out_opt == null);
-            self.trace.push(.stage0_compute);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), _: usize) []const u8 {
-            return std.mem.sliceAsBytes(self.activation[0..]);
-        }
-    };
-
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        trace: *SharedTrace,
-        cpu_stage0: ?*CpuStage0Mock = null,
-        split_layer: usize = 3,
-        d_model: usize = 8,
-        topology_mode: enum { single, pipeline2, cpu_gpu } = .cpu_gpu,
-        block_runtime: BlockRuntimeMock = .{},
-        local_boundary0_staging: ?[]align(64) u8 = null,
-        local_boundary0_dtype: bridge.BoundaryDType = .f32,
-        local_boundary0_layout: bridge.BoundaryLayout = .row_major,
-        local_stage_specs: []const engine.testing.StageSpec = &.{},
-        local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [2]?u64 = .{ 101, 202 },
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localActivationByteCount(self: *const @This()) !usize {
-            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            slot_index: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            self.trace.transfer_calls += 1;
-            self.trace.transfer_slot = slot_index;
-            self.trace.transfer_bytes = byte_count;
-            self.trace.push(.transfer);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            self.trace.stage1_compute_calls += 1;
-            self.trace.stage1_layer_limit = layer_limit;
-            self.trace.stage1_compute_logits = compute_logits;
-            self.trace.stage1_download_logits = download_logits;
-            self.trace.stage1_use_preloaded_input = use_preloaded_input;
-            self.trace.stage1_logits_out_present = logits_out_opt != null;
-            self.trace.push(.stage1_compute);
-        }
-    };
-
-    var trace_state = SharedTrace{};
-    var cpu_stage0 = CpuStage0Mock{ .trace = &trace_state };
-    const boundary_runtimes = [_]stage_adapters.LocalBoundaryRuntimeView{.{
-        .boundary_index = 0,
-        .dtype = .f32,
-        .layout = .row_major,
-    }};
-    const stage_specs = [_]engine.testing.StageSpec{
-        .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = 3, .owns_embedding = true, .owns_projection = false },
-        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 3, .layer_end = 5, .owns_embedding = false, .owns_projection = true },
-    };
-    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 5, &.{3}, &.{});
-    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, 2, 1),
-    };
-    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
-        std.testing.allocator,
-        8,
-        plan,
-        &stage_backend_kinds,
-        &configs,
-    );
-    defer bundle.deinit();
-    var stage1 = Mock{
-        .trace = &trace_state,
-        .cpu_stage0 = &cpu_stage0,
-        .split_layer = 3,
-        .d_model = 8,
-        .topology_mode = .cpu_gpu,
-        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-        .local_stage_specs = stage_specs[0..],
-        .local_boundary_runtimes = boundary_runtimes[0..],
-        .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-        .local_placement_plan = bundle.placement_plan.?,
-        .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-    };
-    var logits: [7]f32 = undefined;
-
-    try engine_forward.executeDecodeWithLayerLimit(
-        &stage1,
-        123,
-        9,
-        1,
-        logits[0..],
-        stage1.block_runtime.blocks.len,
-        true,
-        true,
-        true,
-        10,
-        9,
-        null,
-        null,
-        null,
-        false,
-    );
-
-    try std.testing.expectEqual(@as(usize, 3), trace_state.step_count);
-    try std.testing.expectEqual(TraceStep.stage0_compute, trace_state.steps[0]);
-    try std.testing.expectEqual(TraceStep.transfer, trace_state.steps[1]);
-    try std.testing.expectEqual(TraceStep.stage1_compute, trace_state.steps[2]);
-
-    try std.testing.expectEqual(@as(usize, 1), trace_state.stage0_compute_calls);
-    try std.testing.expectEqual(@as(u32, 123), trace_state.stage0_token);
-    try std.testing.expectEqual(@as(usize, 9), trace_state.stage0_position);
-    try std.testing.expectEqual(@as(usize, 1), trace_state.stage0_slot);
-    try std.testing.expectEqual(@as(usize, 0), trace_state.stage0_layer_start);
-    try std.testing.expectEqual(@as(usize, 3), trace_state.stage0_layer_end);
-    try std.testing.expect(!trace_state.stage0_compute_logits);
-    try std.testing.expect(!trace_state.stage0_download_logits);
-    try std.testing.expect(!trace_state.stage0_use_preloaded_input);
-
-    try std.testing.expectEqual(@as(usize, 1), trace_state.transfer_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_state.transfer_slot);
-    try std.testing.expectEqual(stage1.d_model * @sizeOf(f32), trace_state.transfer_bytes);
-
-    try std.testing.expectEqual(@as(usize, 1), trace_state.stage1_compute_calls);
-    try std.testing.expectEqual(stage1.block_runtime.blocks.len, trace_state.stage1_layer_limit);
-    try std.testing.expect(trace_state.stage1_compute_logits);
-    try std.testing.expect(trace_state.stage1_download_logits);
-    try std.testing.expect(trace_state.stage1_use_preloaded_input);
-    try std.testing.expect(trace_state.stage1_logits_out_present);
-}
-
-test "executeDecodeWithLayerLimit cpu_gpu returns error when stage0 is missing" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [2]u8 = [_]u8{0} ** 2,
-        };
-        topology_mode: enum { single, pipeline2, cpu_gpu } = .cpu_gpu,
-        split_layer: usize = 1,
-        d_model: usize = 8,
-        block_runtime: BlockRuntimeMock = .{},
-        local_stage_specs: []const engine.testing.StageSpec = &.{},
-
-        pub fn localCpuStage0(_: *@This()) ?*u8 {
-            return null;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            _: *@This(),
-            _: u32,
-            _: usize,
-            _: usize,
-            _: ?[]f32,
-            _: usize,
-            _: bool,
-            _: bool,
-            _: bool,
-            _: u32,
-            _: usize,
-            _: ?[]const f32,
-            _: ?[]const []const f32,
-            _: ?usize,
-            _: bool,
-        ) !void {
-            return;
-        }
-    };
-
-    const stage_specs = [_]engine.testing.StageSpec{
-        .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = 1, .owns_embedding = true, .owns_projection = false },
-        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 1, .layer_end = 2, .owns_embedding = false, .owns_projection = true },
-    };
-    var mock = Mock{ .local_stage_specs = stage_specs[0..] };
-    var logits: [5]f32 = undefined;
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        engine_forward.executeDecodeWithLayerLimit(
-            &mock,
-            1,
-            0,
-            0,
-            logits[0..],
-            mock.block_runtime.blocks.len,
-            true,
-            true,
-            true,
-            1,
-            0,
-            null,
-            null,
-            null,
-            false,
-        ),
-    );
-}
-
-test "cpu_gpu decode parity matches single topology across slots and lifecycle cycles" {
-    const slot_count: usize = 2;
-    const d_model: usize = 4;
-    const vocab: usize = 8;
-    const split_layer: usize = 2;
-
-    const CpuStage0Mock = struct {
-        activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = logits_out_opt;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = use_preloaded_input;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-            const layer_contrib: f32 = @floatFromInt(layer_end - layer_start);
-            const value = base + layer_contrib;
-            @memset(self.activations[slot_index][0..], value);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), slot_index: usize) []const u8 {
-            return std.mem.sliceAsBytes(self.activations[slot_index][0..]);
-        }
-    };
-
-    const MockBackend = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        topology_mode: enum { single, cpu_gpu } = .single,
-        split_layer: usize = split_layer,
-        d_model: usize = d_model,
-        vocab_size: usize = vocab,
-        max_seq_len: usize = 256,
-        max_batch_size: usize = slot_count,
-        block_runtime: BlockRuntimeMock = .{},
-        local_boundary0_staging: ?[]align(64) u8 = null,
-        local_boundary0_dtype: bridge.BoundaryDType = .f32,
-        local_boundary0_layout: bridge.BoundaryLayout = .row_major,
-        local_stage_specs: []const engine.testing.StageSpec = &.{},
-        local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [slot_count]?u64 = .{ 101, 202 },
-        cpu_stage0: ?*CpuStage0Mock = null,
-        device: MockCudaDevice = .{},
-        copy_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
-        copy_u16_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
-        fixed_alloc_mode: bool = false,
-        kv_cache_dtype: KvCacheDtypeForTest = .f16,
-        kv_storage_mode: KvCacheStorageModeForTest = .device,
-        n_kv_heads: usize = 1,
-        kernel_arg_pack: compute.cuda.args.ArgPack = undefined,
-        preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-        slot_in_use: [slot_count]bool = [_]bool{true} ** slot_count,
-        slot_positions: [slot_count]usize = [_]usize{0} ** slot_count,
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localActivationByteCount(self: *const @This()) !usize {
-            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
-        }
-
-        pub fn executePrefillWithLayerLimitTestHook(
-            self: *@This(),
-            tokens: []const u32,
-            slot_index: usize,
-            logits_out: []f32,
-            layer_limit: usize,
-        ) !void {
-            return runCpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
-        }
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            slot_index: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
-        }
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index < slot_count;
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[slot_index][0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-                hidden = base + @as(f32, @floatFromInt(layer_limit));
-                @memset(self.preloaded[slot_index][0..], hidden);
-            }
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    var cycle: usize = 0;
-    while (cycle < 8) : (cycle += 1) {
-        var cpu_stage = CpuStage0Mock{};
-        var staging: [d_model * @sizeOf(f32)]u8 align(64) = undefined;
-        const boundary_runtimes = [_]stage_adapters.LocalBoundaryRuntimeView{.{
-            .boundary_index = 0,
-            .dtype = .f32,
-            .layout = .row_major,
-            .staging = staging[0..],
-        }};
-        const stage_specs = [_]engine.testing.StageSpec{
-            .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = split_layer, .owns_embedding = true, .owns_projection = false },
-            .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = split_layer, .layer_end = 6, .owns_embedding = false, .owns_projection = true },
-        };
-        const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{split_layer}, &.{});
-        const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-        const configs = [_]engine.testing.BoundaryConfig{
-            engine.testing.localCpuCudaBoundaryConfig(.f32, .row_major, slot_count, 1),
-        };
-        var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
-            std.testing.allocator,
-            d_model,
-            plan,
-            &stage_backend_kinds,
-            &configs,
-        );
-        defer bundle.deinit();
-        var single = MockBackend{
-            .topology_mode = .single,
-            .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{}, .{}, .{} } },
-        };
-        var split = MockBackend{
-            .topology_mode = .cpu_gpu,
-            .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
-            .local_boundary0_staging = staging[0..],
-            .cpu_stage0 = &cpu_stage,
-            .local_stage_specs = stage_specs[0..],
-            .local_boundary_runtimes = boundary_runtimes[0..],
-            .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-            .local_placement_plan = bundle.placement_plan.?,
-            .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-        };
-
-        var positions: [slot_count]usize = [_]usize{0} ** slot_count;
-        for (0..6) |step| {
-            for (0..slot_count) |slot_index| {
-                const token: u32 = @intCast(11 + step * 3 + slot_index);
-                var logits_single: [vocab]f32 = undefined;
-                var logits_split: [vocab]f32 = undefined;
-
-                try engine_forward.executeDecodeWithLayerLimit(
-                    &single,
-                    token,
-                    positions[slot_index],
-                    slot_index,
-                    logits_single[0..],
-                    single.block_runtime.blocks.len,
-                    true,
-                    true,
-                    true,
-                    @intCast(positions[slot_index] + 1),
-                    positions[slot_index],
-                    null,
-                    null,
-                    null,
-                    false,
-                );
-                try engine_forward.executeDecodeWithLayerLimit(
-                    &split,
-                    token,
-                    positions[slot_index],
-                    slot_index,
-                    logits_split[0..],
-                    split.block_runtime.blocks.len,
-                    true,
-                    true,
-                    true,
-                    @intCast(positions[slot_index] + 1),
-                    positions[slot_index],
-                    null,
-                    null,
-                    null,
-                    false,
-                );
-                for (logits_single, logits_split) |lhs, rhs| {
-                    try std.testing.expectApproxEqAbs(lhs, rhs, 1.0e-6);
-                }
-                positions[slot_index] += 1;
-            }
-        }
-    }
-}
-
-test "cpu_gpu prefill parity matches single topology across repeated windows" {
-    const d_model: usize = 4;
-    const vocab: usize = 8;
-    const split_layer: usize = 2;
-
-    const CpuStage0Mock = struct {
-        activation: [d_model]f32 = [_]f32{0.0} ** d_model,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = slot_index;
-            _ = logits_out_opt;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = use_preloaded_input;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-            const layer_contrib: f32 = @floatFromInt(layer_end - layer_start);
-            @memset(self.activation[0..], base + layer_contrib);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), _: usize) []const u8 {
-            return std.mem.sliceAsBytes(self.activation[0..]);
-        }
-    };
-
-    const MockBackend = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        topology_mode: enum { single, cpu_gpu } = .single,
-        split_layer: usize = split_layer,
-        d_model: usize = d_model,
-        vocab_size: usize = vocab,
-        max_seq_len: usize = 256,
-        block_runtime: BlockRuntimeMock = .{},
-        cpu_stage0: ?*CpuStage0Mock = null,
-        local_boundary0_staging: ?[]align(64) u8 = null,
-        local_boundary0_dtype: bridge.BoundaryDType = .f32,
-        local_boundary0_layout: bridge.BoundaryLayout = .row_major,
-        local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
-        device: MockCudaDevice = .{},
-        copy_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
-        copy_u16_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
-        fixed_alloc_mode: bool = false,
-        kv_cache_dtype: KvCacheDtypeForTest = .f16,
-        kv_storage_mode: KvCacheStorageModeForTest = .device,
-        n_kv_heads: usize = 1,
-        kernel_arg_pack: compute.cuda.args.ArgPack = undefined,
-        preloaded: [d_model]f32 = [_]f32{0.0} ** d_model,
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index == 0;
-        }
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localActivationByteCount(self: *const @This()) !usize {
-            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
-        }
-
-        pub fn executePrefillWithLayerLimitTestHook(
-            self: *@This(),
-            tokens: []const u32,
-            slot_index: usize,
-            logits_out: []f32,
-            layer_limit: usize,
-        ) !void {
-            return runCpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            _: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[0..]);
-            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = slot_index;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-                hidden = base + @as(f32, @floatFromInt(layer_limit));
-                @memset(self.preloaded[0..], hidden);
-            }
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    const windows = [_][]const u32{
-        &[_]u32{ 3, 5, 7, 11 },
-        &[_]u32{ 13, 17 },
-        &[_]u32{ 19, 23, 29 },
-    };
-
-    var cycle: usize = 0;
-    while (cycle < 6) : (cycle += 1) {
-        var cpu_stage = CpuStage0Mock{};
-        var staging: [d_model * @sizeOf(f32)]u8 align(64) = undefined;
-        const boundary_runtimes = [_]stage_adapters.LocalBoundaryRuntimeView{.{
-            .boundary_index = 0,
-            .dtype = .f32,
-            .layout = .row_major,
-            .staging = staging[0..],
-        }};
-        var split = MockBackend{
-            .topology_mode = .cpu_gpu,
-            .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
-            .cpu_stage0 = &cpu_stage,
-            .local_boundary0_staging = staging[0..],
-            .local_boundary_runtimes = boundary_runtimes[0..],
-        };
-        for (windows) |window_tokens| {
-            var logits_split: [vocab]f32 = undefined;
-            try split.executePrefillWithLayerLimitTestHook(
-                window_tokens,
-                0,
-                logits_split[0..],
-                split.block_runtime.blocks.len,
-            );
-            const last_index = window_tokens.len - 1;
-            const base: f32 = @as(f32, @floatFromInt(window_tokens[last_index])) * 0.5 + @as(f32, @floatFromInt(last_index)) * 0.25;
-            const expected_hidden = base + 6.0;
-            for (logits_split, 0..) |actual, i| {
-                const expected = expected_hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                try std.testing.expectApproxEqAbs(expected, actual, 1.0e-6);
-            }
-        }
-    }
-}
-
-test "cpu_gpu prefill parity remains deterministic across slots and lifecycle cycles" {
-    const slot_count: usize = 2;
-    const d_model: usize = 4;
-    const vocab: usize = 8;
-    const split_layer: usize = 2;
-
-    const CpuStage0Mock = struct {
-        activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = logits_out_opt;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = use_preloaded_input;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-            const layer_contrib: f32 = @floatFromInt(layer_end - layer_start);
-            @memset(self.activations[slot_index][0..], base + layer_contrib);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), slot_index: usize) []const u8 {
-            if (slot_index >= slot_count) @panic("slot_index out of range");
-            return std.mem.sliceAsBytes(self.activations[slot_index][0..]);
-        }
-    };
-
-    const MockBackend = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        topology_mode: enum { single, cpu_gpu } = .single,
-        split_layer: usize = split_layer,
-        d_model: usize = d_model,
-        vocab_size: usize = vocab,
-        max_seq_len: usize = 256,
-        block_runtime: BlockRuntimeMock = .{},
-        cpu_stage0: ?*CpuStage0Mock = null,
-        local_boundary0_staging: ?[]align(64) u8 = null,
-        local_boundary0_dtype: bridge.BoundaryDType = .f32,
-        local_boundary0_layout: bridge.BoundaryLayout = .row_major,
-        local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
-        device: MockCudaDevice = .{},
-        copy_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
-        copy_u16_function: ?compute.cuda.Function = .{ .handle = @ptrFromInt(1) },
-        fixed_alloc_mode: bool = false,
-        kv_cache_dtype: KvCacheDtypeForTest = .f16,
-        kv_storage_mode: KvCacheStorageModeForTest = .device,
-        n_kv_heads: usize = 1,
-        kernel_arg_pack: compute.cuda.args.ArgPack = undefined,
-        preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index < slot_count;
-        }
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localActivationByteCount(self: *const @This()) !usize {
-            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
-        }
-
-        pub fn executePrefillWithLayerLimitTestHook(
-            self: *@This(),
-            tokens: []const u32,
-            slot_index: usize,
-            logits_out: []f32,
-            layer_limit: usize,
-        ) !void {
-            return runCpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            slot_index: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[slot_index][0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-                hidden = base + @as(f32, @floatFromInt(layer_limit));
-                @memset(self.preloaded[slot_index][0..], hidden);
-            }
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    const slot_windows = [_][]const []const u32{
-        &[_][]const u32{
-            &[_]u32{ 3, 5, 7, 11 },
-            &[_]u32{ 13, 17 },
-            &[_]u32{ 19, 23, 29 },
-        },
-        &[_][]const u32{
-            &[_]u32{ 2, 4, 6 },
-            &[_]u32{ 8, 10, 12, 14 },
-            &[_]u32{16},
-        },
-    };
-
-    var cycle: usize = 0;
-    while (cycle < 6) : (cycle += 1) {
-        var cpu_stage = CpuStage0Mock{};
-        var staging: [d_model * @sizeOf(f32)]u8 align(64) = undefined;
-        const boundary_runtimes = [_]stage_adapters.LocalBoundaryRuntimeView{.{
-            .boundary_index = 0,
-            .dtype = .f32,
-            .layout = .row_major,
-            .staging = staging[0..],
-        }};
-        var split = MockBackend{
-            .topology_mode = .cpu_gpu,
-            .split_layer = split_layer,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{} } },
-            .cpu_stage0 = &cpu_stage,
-            .local_boundary0_staging = staging[0..],
-            .local_boundary_runtimes = boundary_runtimes[0..],
-        };
-
-        for (slot_windows, 0..) |windows, slot_index| {
-            for (windows) |window_tokens| {
-                var logits_split: [vocab]f32 = undefined;
-                try split.executePrefillWithLayerLimitTestHook(
-                    window_tokens,
-                    slot_index,
-                    logits_split[0..],
-                    split.block_runtime.blocks.len,
-                );
-                const last_index = window_tokens.len - 1;
-                const base: f32 = @as(f32, @floatFromInt(window_tokens[last_index])) * 0.5 + @as(f32, @floatFromInt(last_index)) * 0.25;
-                const expected_hidden = base + 6.0;
-                for (logits_split, 0..) |actual, i| {
-                    const expected = expected_hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                    try std.testing.expectApproxEqAbs(expected, actual, 1.0e-6);
-                }
-            }
-        }
-    }
-}
-
-test "executeDecodeWithLayerLimit pipeline2 returns error when stage1 is missing" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [4]u8 = [_]u8{0} ** 4,
-        };
-        topology_mode: enum { single, pipeline2 } = .pipeline2,
-        split_layer: usize = 2,
-        d_model: usize = 8,
-        state_descriptor_count: usize = 0,
-        block_runtime: BlockRuntimeMock = .{},
-        local_stage_specs: []const engine.testing.StageSpec = &.{},
-
-        pub fn localCudaStage1(_: *@This()) ?*@This() {
-            return null;
-        }
-
-        pub fn mirrorSlotStateBlocksFrom(_: *@This(), _: *const @This(), _: usize) !void {
-            return;
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            _: *@This(),
-            _: u32,
-            _: usize,
-            _: usize,
-            _: ?[]f32,
-            _: usize,
-            _: bool,
-            _: bool,
-            _: bool,
-            _: u32,
-            _: usize,
-            _: ?[]const f32,
-            _: ?[]const []const f32,
-            _: ?usize,
-            _: bool,
-        ) !void {
-            return;
-        }
-    };
-
-    const stage_specs = [_]engine.testing.StageSpec{
-        .{ .stage_id = 0, .backend_kind = .cuda, .layer_start = 0, .layer_end = 2, .owns_embedding = true, .owns_projection = false },
-        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 2, .layer_end = 4, .owns_embedding = false, .owns_projection = true },
-    };
-    var mock = Mock{ .local_stage_specs = stage_specs[0..] };
-    var logits: [5]f32 = undefined;
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        engine_forward.executeDecodeWithLayerLimit(
-            &mock,
-            1,
-            0,
-            0,
-            logits[0..],
-            mock.block_runtime.blocks.len,
-            true,
-            true,
-            true,
-            1,
-            0,
-            null,
-            null,
-            null,
-            false,
-        ),
-    );
-}
-
-test "computeBatchedDecodeLogits rejects cpu_gpu_gpu decode without local stage specs" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [3]u8 = [_]u8{0} ** 3,
-        };
-
-        max_batch_size: usize = 4,
-        topology_mode: enum { single, pipeline2, cpu_gpu, cpu_gpu_gpu } = .cpu_gpu_gpu,
-        block_runtime: BlockRuntimeMock = .{},
-        vocab_size: usize = 5,
-        slot_logits_storage: [20]f32 = [_]f32{0.0} ** 20,
-        activate_calls: usize = 0,
-        recorded_slots: [8]usize = [_]usize{0} ** 8,
-        compute_calls: usize = 0,
-        recorded_tokens: [8]u32 = [_]u32{0} ** 8,
-        recorded_positions: [8]usize = [_]usize{0} ** 8,
-        recorded_layer_limits: [8]usize = [_]usize{0} ** 8,
-        recorded_compute_logits: [8]bool = [_]bool{false} ** 8,
-        recorded_download_logits: [8]bool = [_]bool{false} ** 8,
-
-        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
-            self.recorded_slots[self.activate_calls] = slot_index;
-            self.activate_calls += 1;
-        }
-
-        pub fn slotLogits(self: *@This(), slot_index: usize) []f32 {
-            const offset = slot_index * self.vocab_size;
-            return self.slot_logits_storage[offset .. offset + self.vocab_size];
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = slot_index;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            _ = use_preloaded_input;
-            const idx = self.compute_calls;
-            self.compute_calls += 1;
-            self.recorded_tokens[idx] = token;
-            self.recorded_positions[idx] = position;
-            self.recorded_layer_limits[idx] = layer_limit;
-            self.recorded_compute_logits[idx] = compute_logits;
-            self.recorded_download_logits[idx] = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*logit, i| {
-                    logit.* = @floatFromInt(i);
-                }
-            }
-        }
-    };
-
-    var mock = Mock{};
-    const tokens = [_]u32{ 11, 22, 33 };
-    const slot_indices = [_]usize{ 2, 0, 3 };
-    const positions = [_]usize{ 7, 8, 9 };
-
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]),
-    );
-    try std.testing.expectEqual(@as(usize, 0), mock.activate_calls);
-    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
-}
-
-test "executeDecodeWithLayerLimit orchestrates cpu_gpu_gpu stage chain" {
-    const TraceStep = enum(u8) {
-        mirror,
-        stage1_activate,
-        stage2_activate,
-        stage0_compute,
-        transfer_01,
-        stage1_compute,
-        transfer_12,
-        stage2_compute,
-    };
-    const SharedTrace = struct {
-        steps: [32]TraceStep = undefined,
-        step_count: usize = 0,
-        transfer01_bytes: usize = 0,
-        transfer12_bytes: usize = 0,
-        stage1_layer_limit: usize = 0,
-        stage2_layer_limit: usize = 0,
-        stage1_use_preloaded_input: bool = false,
-        stage2_use_preloaded_input: bool = false,
-        stage2_logits_present: bool = false,
-
-        fn push(self: *@This(), step: TraceStep) void {
-            self.steps[self.step_count] = step;
-            self.step_count += 1;
-        }
-    };
-
-    const CpuStage0Mock = struct {
-        trace: *SharedTrace,
-        activation: [8]f32 = [_]f32{0.0} ** 8,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = layer_start;
-            _ = layer_end;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = use_preloaded_input;
-            _ = logits_out_opt;
-            self.trace.push(.stage0_compute);
-            @memset(self.activation[0..], 2.0);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), _: usize) []const u8 {
-            return std.mem.sliceAsBytes(self.activation[0..]);
-        }
-    };
-
-    const Stage1Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        trace: *SharedTrace,
-        state_descriptor_count: usize = 0,
-        block_runtime: BlockRuntimeMock = .{},
-        device: MockCudaDevice = .{},
-
-        pub fn mirrorSlotStateBlocksFrom(self: *@This(), _: anytype, _: usize) !void {
-            self.trace.push(.mirror);
-        }
-
-        pub fn activateKvSlot(self: *@This(), _: usize) void {
-            self.trace.push(.stage1_activate);
-        }
-
-        pub fn synchronizeLocalActivation(_: *@This()) !void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            _: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            self.trace.transfer01_bytes = byte_count;
-            self.trace.push(.transfer_01);
-        }
-
-        pub fn downloadLocalActivationToHost(self: *@This(), host_buf: []u8, byte_count: usize) !void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-            self.trace.transfer12_bytes = byte_count;
-            self.trace.push(.transfer_12);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = logits_out_opt;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            self.trace.stage1_layer_limit = layer_limit;
-            self.trace.stage1_use_preloaded_input = use_preloaded_input;
-            self.trace.push(.stage1_compute);
-        }
-    };
-
-    const Stage2Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        trace: *SharedTrace,
-        cpu_stage0: ?*CpuStage0Mock = null,
-        stage1: ?*Stage1Mock = null,
-        split_layer: usize = 2,
-        split_layer_stage2: usize = 4,
-        d_model: usize = 8,
-        topology_mode: enum { single, pipeline2, cpu_gpu, cpu_gpu_gpu } = .cpu_gpu_gpu,
-        block_runtime: BlockRuntimeMock = .{},
-        local_boundary0_staging: ?[]align(64) u8 = null,
-        local_boundary1_staging: ?[]align(64) u8 = null,
-        local_boundary0_dtype: bridge.BoundaryDType = .f32,
-        local_boundary0_layout: bridge.BoundaryLayout = .row_major,
-        local_boundary1_dtype: bridge.BoundaryDType = .f32,
-        local_boundary1_layout: bridge.BoundaryLayout = .row_major,
-        local_boundary0_peer_copy_available: bool = false,
-        local_boundary1_peer_copy_available: bool = false,
-        local_stage_specs: []const engine.testing.StageSpec = &.{},
-        local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [2]?u64 = .{ 101, 202 },
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localCudaStage1(self: *@This()) ?*Stage1Mock {
-            return self.stage1;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localSplitLayerStage2(self: *const @This()) usize {
-            return self.split_layer_stage2;
-        }
-
-        pub fn localActivationByteCount(self: *const @This()) !usize {
-            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
-        }
-
-        pub fn executePrefillWithLayerLimitTestHook(
-            self: *@This(),
-            tokens: []const u32,
-            slot_index: usize,
-            logits_out: []f32,
-            layer_limit: usize,
-        ) !void {
-            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
-        }
-
-        pub fn activateKvSlot(self: *@This(), _: usize) void {
-            self.trace.push(.stage2_activate);
-        }
-
-        pub fn uploadLocalActivationFromHost(
-            _: *@This(),
-            _: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            if (byte_count > host_buf.len) return error.InvalidArgument;
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            self.trace.stage2_layer_limit = layer_limit;
-            self.trace.stage2_use_preloaded_input = use_preloaded_input;
-            self.trace.stage2_logits_present = logits_out_opt != null;
-            self.trace.push(.stage2_compute);
-        }
-    };
-
-    var trace_state = SharedTrace{};
-    var cpu_stage0 = CpuStage0Mock{ .trace = &trace_state };
-    var stage1 = Stage1Mock{
-        .trace = &trace_state,
-        .state_descriptor_count = 1,
-        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-    };
-    var staging12: [8 * @sizeOf(f32)]u8 align(64) = undefined;
-    const boundary_runtimes = [_]stage_adapters.LocalBoundaryRuntimeView{
-        .{
-            .boundary_index = 0,
-            .dtype = .f32,
-            .layout = .row_major,
-        },
-        .{
-            .boundary_index = 1,
-            .dtype = .f32,
-            .layout = .row_major,
-            .staging = staging12[0..],
-        },
-    };
-    const stage_specs = [_]engine.testing.StageSpec{
-        .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = 2, .owns_embedding = true, .owns_projection = false },
-        .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = 2, .layer_end = 4, .owns_embedding = false, .owns_projection = false },
-        .{ .stage_id = 2, .backend_kind = .cuda, .layer_start = 4, .layer_end = 6, .owns_embedding = false, .owns_projection = true },
-    };
-    const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{ 2, 4 }, &.{});
-    const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
-        .f32,
-        .row_major,
-        .f32,
-        .row_major,
-        2,
-        2,
-        1,
-        1,
-    );
-    var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
-        std.testing.allocator,
-        8,
-        plan,
-        &stage_backend_kinds,
-        &configs,
-    );
-    defer bundle.deinit();
-    var stage2 = Stage2Mock{
-        .trace = &trace_state,
-        .cpu_stage0 = &cpu_stage0,
-        .stage1 = &stage1,
-        .split_layer = 2,
-        .split_layer_stage2 = 4,
-        .d_model = 8,
-        .topology_mode = .cpu_gpu_gpu,
-        .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-        .local_boundary1_staging = staging12[0..],
-        .local_stage_specs = stage_specs[0..],
-        .local_boundary_runtimes = boundary_runtimes[0..],
-        .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-        .local_placement_plan = bundle.placement_plan.?,
-        .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-    };
-    var logits: [7]f32 = undefined;
-
-    try engine_forward.executeDecodeWithLayerLimit(
-        &stage2,
-        123,
-        9,
-        1,
-        logits[0..],
-        stage2.block_runtime.blocks.len,
-        true,
-        true,
-        true,
-        10,
-        9,
-        null,
-        null,
-        null,
-        false,
-    );
-
-    try std.testing.expectEqual(@as(usize, 8), trace_state.step_count);
-    try std.testing.expectEqual(TraceStep.mirror, trace_state.steps[0]);
-    try std.testing.expectEqual(TraceStep.stage1_activate, trace_state.steps[1]);
-    try std.testing.expectEqual(TraceStep.stage2_activate, trace_state.steps[2]);
-    try std.testing.expectEqual(TraceStep.stage0_compute, trace_state.steps[3]);
-    try std.testing.expectEqual(TraceStep.transfer_01, trace_state.steps[4]);
-    try std.testing.expectEqual(TraceStep.stage1_compute, trace_state.steps[5]);
-    try std.testing.expectEqual(TraceStep.transfer_12, trace_state.steps[6]);
-    try std.testing.expectEqual(TraceStep.stage2_compute, trace_state.steps[7]);
-    try std.testing.expectEqual(stage2.d_model * @sizeOf(f32), trace_state.transfer01_bytes);
-    try std.testing.expectEqual(stage2.d_model * @sizeOf(f32), trace_state.transfer12_bytes);
-    try std.testing.expectEqual(@as(usize, 2), trace_state.stage1_layer_limit);
-    try std.testing.expectEqual(@as(usize, 2), trace_state.stage2_layer_limit);
-    try std.testing.expect(trace_state.stage1_use_preloaded_input);
-    try std.testing.expect(trace_state.stage2_use_preloaded_input);
-    try std.testing.expect(trace_state.stage2_logits_present);
-}
-
-test "executePrefillWithLayerLimit rejects cpu_gpu_gpu prefill without local stage specs" {
-    const Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: [4]u8 = [_]u8{0} ** 4,
-        };
-
-        topology_mode: enum { single, pipeline2, cpu_gpu, cpu_gpu_gpu } = .cpu_gpu_gpu,
-        block_runtime: BlockRuntimeMock = .{},
-        vocab_size: usize = 6,
-        max_seq_len: usize = 32,
-        compute_calls: usize = 0,
-        recorded_download_logits: [16]bool = [_]bool{false} ** 16,
-        recorded_trace_seq_lens: [16]u32 = [_]u32{0} ** 16,
-        recorded_trace_positions: [16]usize = [_]usize{0} ** 16,
-        recorded_logits_out_present: [16]bool = [_]bool{false} ** 16,
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index < 2;
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = token;
-            _ = position;
-            _ = slot_index;
-            _ = layer_limit;
-            _ = compute_logits;
-            _ = ensure_kv_capacity;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            _ = use_preloaded_input;
-            const idx = self.compute_calls;
-            self.compute_calls += 1;
-            self.recorded_download_logits[idx] = download_logits;
-            self.recorded_trace_seq_lens[idx] = trace_seq_len_u32;
-            self.recorded_trace_positions[idx] = trace_pos_offset;
-            self.recorded_logits_out_present[idx] = logits_out_opt != null;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*logit, i| {
-                    logit.* = @floatFromInt(i);
-                }
-            }
-        }
-    };
-
-    var mock = Mock{};
-    const tokens = [_]u32{ 100, 101, 102, 103 };
-    var logits_out: [6]f32 = undefined;
-
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        engine_forward.executePrefillWithLayerLimit(
-            &mock,
-            tokens[0..],
-            0,
-            logits_out[0..],
-            mock.block_runtime.blocks.len,
-        ),
-    );
-
-    try std.testing.expectEqual(@as(usize, 0), mock.compute_calls);
-}
-
-test "cpu_gpu_gpu decode parity matches single topology across slots and lifecycle cycles" {
-    const slot_count: usize = 2;
-    const d_model: usize = 4;
-    const vocab: usize = 8;
-    const split_layer: usize = 2;
-    const split_layer_stage2: usize = 4;
-
-    const CpuStage0Mock = struct {
-        activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = logits_out_opt;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = use_preloaded_input;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-            const layer_contrib: f32 = @floatFromInt(layer_end - layer_start);
-            const value = base + layer_contrib;
-            @memset(self.activations[slot_index][0..], value);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), slot_index: usize) []const u8 {
-            return std.mem.sliceAsBytes(self.activations[slot_index][0..]);
-        }
-    };
-
-    const Stage1Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        block_runtime: BlockRuntimeMock = .{},
-        state_descriptor_count: usize = 0,
-        preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-        last_slot: usize = 0,
-        device: MockCudaDevice = .{},
-
-        pub fn mirrorSlotStateBlocksFrom(_: *@This(), _: anytype, _: usize) !void {}
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn synchronizeLocalActivation(_: *@This()) !void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            slot_index: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
-        }
-
-        pub fn downloadLocalActivationToHost(self: *@This(), host_buf: []u8, byte_count: usize) !void {
-            const src_bytes = std.mem.sliceAsBytes(self.preloaded[self.last_slot][0..]);
-            if (byte_count > src_bytes.len or byte_count > host_buf.len) return error.InvalidArgument;
-            @memcpy(host_buf[0..byte_count], src_bytes[0..byte_count]);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            self.last_slot = slot_index;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[slot_index][0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                hidden = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25 + @as(f32, @floatFromInt(layer_limit));
-            }
-            // Always write back: the next bridge handoff reads the stage output bytes.
-            @memset(self.preloaded[slot_index][0..], hidden);
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    const MockBackend = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        topology_mode: enum { single, cpu_gpu_gpu } = .single,
-        split_layer: usize = split_layer,
-        split_layer_stage2: usize = split_layer_stage2,
-        d_model: usize = d_model,
-        vocab_size: usize = vocab,
-        max_seq_len: usize = 256,
-        max_batch_size: usize = slot_count,
-        block_runtime: BlockRuntimeMock = .{},
-        local_boundary0_staging: ?[]align(64) u8 = null,
-        local_boundary1_staging: ?[]align(64) u8 = null,
-        local_boundary0_dtype: bridge.BoundaryDType = .f32,
-        local_boundary0_layout: bridge.BoundaryLayout = .row_major,
-        local_boundary1_dtype: bridge.BoundaryDType = .f32,
-        local_boundary1_layout: bridge.BoundaryLayout = .row_major,
-        local_boundary0_peer_copy_available: bool = false,
-        local_boundary1_peer_copy_available: bool = false,
-        local_stage_specs: []const engine.testing.StageSpec = &.{},
-        local_boundary_runtimes: []const stage_adapters.LocalBoundaryRuntimeView = &.{},
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [slot_count]?u64 = .{ 101, 202 },
-        cpu_stage0: ?*CpuStage0Mock = null,
-        stage1: ?*Stage1Mock = null,
-        preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localCudaStage1(self: *@This()) ?*Stage1Mock {
-            return self.stage1;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localSplitLayerStage2(self: *const @This()) usize {
-            return self.split_layer_stage2;
-        }
-
-        pub fn localActivationByteCount(self: *const @This()) !usize {
-            return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
-        }
-
-        pub fn executePrefillWithLayerLimitTestHook(
-            self: *@This(),
-            tokens: []const u32,
-            slot_index: usize,
-            logits_out: []f32,
-            layer_limit: usize,
-        ) !void {
-            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            slot_index: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
-        }
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index < slot_count;
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[slot_index][0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-                hidden = base + @as(f32, @floatFromInt(layer_limit));
-                @memset(self.preloaded[slot_index][0..], hidden);
-            }
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    var cycle: usize = 0;
-    while (cycle < 8) : (cycle += 1) {
-        var cpu_stage = CpuStage0Mock{};
-        var stage1 = Stage1Mock{
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-        };
-        var staging12: [d_model * @sizeOf(f32)]u8 align(64) = undefined;
-        const boundary_runtimes = [_]stage_adapters.LocalBoundaryRuntimeView{
-            .{
-                .boundary_index = 0,
-                .dtype = .f32,
-                .layout = .row_major,
-            },
-            .{
-                .boundary_index = 1,
-                .dtype = .f32,
-                .layout = .row_major,
-                .staging = staging12[0..],
-            },
-        };
-        const stage_specs = [_]engine.testing.StageSpec{
-            .{ .stage_id = 0, .backend_kind = .cpu, .layer_start = 0, .layer_end = split_layer, .owns_embedding = true, .owns_projection = false },
-            .{ .stage_id = 1, .backend_kind = .cuda, .layer_start = split_layer, .layer_end = split_layer_stage2, .owns_embedding = false, .owns_projection = false },
-            .{ .stage_id = 2, .backend_kind = .cuda, .layer_start = split_layer_stage2, .layer_end = 6, .owns_embedding = false, .owns_projection = true },
-        };
-        const plan = try buildLocalTopologyTestStagePlan(std.testing.allocator, 6, &.{ split_layer, split_layer_stage2 }, &.{});
-        const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-        const configs = engine.testing.localCpuCudaCudaBoundaryConfigs(
-            .f32,
-            .row_major,
-            .f32,
-            .row_major,
-            slot_count,
-            slot_count,
-            1,
-            1,
-        );
-        var bundle = try engine.testing.buildLocalTopologyContractBundleFromOwnedPlan(
-            std.testing.allocator,
-            d_model,
-            plan,
-            &stage_backend_kinds,
-            &configs,
-        );
-        defer bundle.deinit();
-        var single = MockBackend{
-            .topology_mode = .single,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{}, .{}, .{}, .{}, .{} } },
-        };
-        var split = MockBackend{
-            .topology_mode = .cpu_gpu_gpu,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-            .local_boundary1_staging = staging12[0..],
-            .cpu_stage0 = &cpu_stage,
-            .stage1 = &stage1,
-            .local_stage_specs = stage_specs[0..],
-            .local_boundary_runtimes = boundary_runtimes[0..],
-            .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-            .local_placement_plan = bundle.placement_plan.?,
-            .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-        };
-
-        var positions: [slot_count]usize = [_]usize{0} ** slot_count;
-        for (0..6) |step| {
-            for (0..slot_count) |slot_index| {
-                const token: u32 = @intCast(11 + step * 3 + slot_index);
-                var logits_single: [vocab]f32 = undefined;
-                var logits_split: [vocab]f32 = undefined;
-
-                try engine_forward.executeDecodeWithLayerLimit(
-                    &single,
-                    token,
-                    positions[slot_index],
-                    slot_index,
-                    logits_single[0..],
-                    single.block_runtime.blocks.len,
-                    true,
-                    true,
-                    true,
-                    @intCast(positions[slot_index] + 1),
-                    positions[slot_index],
-                    null,
-                    null,
-                    null,
-                    false,
-                );
-                try engine_forward.executeDecodeWithLayerLimit(
-                    &split,
-                    token,
-                    positions[slot_index],
-                    slot_index,
-                    logits_split[0..],
-                    split.block_runtime.blocks.len,
-                    true,
-                    true,
-                    true,
-                    @intCast(positions[slot_index] + 1),
-                    positions[slot_index],
-                    null,
-                    null,
-                    null,
-                    false,
-                );
-                for (logits_single, logits_split) |lhs, rhs| {
-                    try std.testing.expectApproxEqAbs(lhs, rhs, 1.0e-6);
-                }
-                positions[slot_index] += 1;
-            }
-        }
-    }
-}
-
-test "cpu_gpu_gpu prefill parity matches single topology across repeated windows" {
-    const d_model: usize = 4;
-    const vocab: usize = 8;
-    const split_layer: usize = 2;
-    const split_layer_stage2: usize = 4;
-
-    const CpuStage0Mock = struct {
-        activation: [d_model]f32 = [_]f32{0.0} ** d_model,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = slot_index;
-            _ = logits_out_opt;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = use_preloaded_input;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-            const layer_contrib: f32 = @floatFromInt(layer_end - layer_start);
-            @memset(self.activation[0..], base + layer_contrib);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), _: usize) []const u8 {
-            return std.mem.sliceAsBytes(self.activation[0..]);
-        }
-    };
-
-    const Stage1Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        block_runtime: BlockRuntimeMock = .{},
-        state_descriptor_count: usize = 0,
-        preloaded: [d_model]f32 = [_]f32{0.0} ** d_model,
-
-        pub fn mirrorSlotStateBlocksFrom(_: *@This(), _: anytype, _: usize) !void {}
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            _: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[0..]);
-            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
-        }
-
-        pub fn copyLocalActivationTo(self: *@This(), dst: anytype, _: usize, byte_count: usize) !void {
-            const src_bytes = std.mem.sliceAsBytes(self.preloaded[0..]);
-            const dst_bytes = std.mem.sliceAsBytes(dst.preloaded[0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = slot_index;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-                hidden = base + @as(f32, @floatFromInt(layer_limit));
-            }
-            // Always write back: the next bridge handoff reads the stage output bytes.
-            @memset(self.preloaded[0..], hidden);
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    const MockBackend = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        topology_mode: enum { single, cpu_gpu_gpu } = .single,
-        split_layer: usize = split_layer,
-        split_layer_stage2: usize = split_layer_stage2,
-        d_model: usize = d_model,
-        vocab_size: usize = vocab,
-        max_seq_len: usize = 256,
-        block_runtime: BlockRuntimeMock = .{},
-        local_boundary1_staging: ?[]align(64) u8 = null,
-        cpu_stage0: ?*CpuStage0Mock = null,
-        stage1: ?*Stage1Mock = null,
-        preloaded: [d_model]f32 = [_]f32{0.0} ** d_model,
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index == 0;
-        }
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localCudaStage1(self: *@This()) ?*Stage1Mock {
-            return self.stage1;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localSplitLayerStage2(self: *const @This()) usize {
-            return self.split_layer_stage2;
-        }
-
-        pub fn executePrefillWithLayerLimitTestHook(
-            self: *@This(),
-            tokens: []const u32,
-            slot_index: usize,
-            logits_out: []f32,
-            layer_limit: usize,
-        ) !void {
-            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = slot_index;
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-                hidden = base + @as(f32, @floatFromInt(layer_limit));
-                @memset(self.preloaded[0..], hidden);
-            }
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    const windows = [_][]const u32{
-        &[_]u32{ 3, 5, 7, 11 },
-        &[_]u32{ 13, 17 },
-        &[_]u32{ 19, 23, 29 },
-    };
-
-    var cycle: usize = 0;
-    while (cycle < 6) : (cycle += 1) {
-        var cpu_stage = CpuStage0Mock{};
-        var stage1 = Stage1Mock{
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-        };
-        var split = MockBackend{
-            .topology_mode = .cpu_gpu_gpu,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-            .cpu_stage0 = &cpu_stage,
-            .stage1 = &stage1,
-        };
-        for (windows) |window_tokens| {
-            var logits_split: [vocab]f32 = undefined;
-            try split.executePrefillWithLayerLimitTestHook(
-                window_tokens,
-                0,
-                logits_split[0..],
-                split.block_runtime.blocks.len,
-            );
-            const last_index = window_tokens.len - 1;
-            const base: f32 = @as(f32, @floatFromInt(window_tokens[last_index])) * 0.5 + @as(f32, @floatFromInt(last_index)) * 0.25;
-            const expected_hidden = base + 6.0;
-            for (logits_split, 0..) |actual, i| {
-                const expected = expected_hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                try std.testing.expectApproxEqAbs(expected, actual, 1.0e-6);
-            }
-        }
-    }
-}
-
-test "cpu_gpu_gpu prefill parity remains deterministic across slots and lifecycle cycles" {
-    const slot_count: usize = 2;
-    const d_model: usize = 4;
-    const vocab: usize = 8;
-    const split_layer: usize = 2;
-    const split_layer_stage2: usize = 4;
-
-    const CpuStage0Mock = struct {
-        activations: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-
-        pub fn executeDecodeLayerRange(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_start: usize,
-            layer_end: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = logits_out_opt;
-            _ = compute_logits;
-            _ = download_logits;
-            _ = ensure_kv_capacity;
-            _ = use_preloaded_input;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            if (layer_end < layer_start) return error.InvalidArgument;
-            const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-            const layer_contrib: f32 = @floatFromInt(layer_end - layer_start);
-            @memset(self.activations[slot_index][0..], base + layer_contrib);
-        }
-
-        pub fn slotActivationBytes(self: *@This(), slot_index: usize) []const u8 {
-            if (slot_index >= slot_count) @panic("slot_index out of range");
-            return std.mem.sliceAsBytes(self.activations[slot_index][0..]);
-        }
-    };
-
-    const Stage1Mock = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        block_runtime: BlockRuntimeMock = .{},
-        state_descriptor_count: usize = 0,
-        preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-        last_slot: usize = 0,
-
-        pub fn mirrorSlotStateBlocksFrom(_: *@This(), _: anytype, _: usize) !void {}
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn uploadLocalActivationFromHost(
-            self: *@This(),
-            slot_index: usize,
-            host_buf: []const u8,
-            byte_count: usize,
-        ) !void {
-            const dst_bytes = std.mem.sliceAsBytes(self.preloaded[slot_index][0..]);
-            if (byte_count > host_buf.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], host_buf[0..byte_count]);
-        }
-
-        pub fn copyLocalActivationTo(self: *@This(), dst: anytype, _: usize, byte_count: usize) !void {
-            const src_bytes = std.mem.sliceAsBytes(self.preloaded[self.last_slot][0..]);
-            const dst_bytes = std.mem.sliceAsBytes(dst.preloaded[self.last_slot][0..]);
-            if (byte_count > src_bytes.len or byte_count > dst_bytes.len) return error.InvalidArgument;
-            @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
-        }
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            self.last_slot = slot_index;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[slot_index][0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                hidden = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25 + @as(f32, @floatFromInt(layer_limit));
-            }
-            // Always write back: the next bridge handoff reads the stage output bytes.
-            @memset(self.preloaded[slot_index][0..], hidden);
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    const MockBackend = struct {
-        const BlockRuntimeMock = struct {
-            blocks: []const BlockRuntimeLayerForTest = &.{},
-        };
-
-        topology_mode: enum { single, cpu_gpu_gpu } = .single,
-        split_layer: usize = split_layer,
-        split_layer_stage2: usize = split_layer_stage2,
-        d_model: usize = d_model,
-        vocab_size: usize = vocab,
-        max_seq_len: usize = 256,
-        block_runtime: BlockRuntimeMock = .{},
-        local_boundary1_staging: ?[]align(64) u8 = null,
-        cpu_stage0: ?*CpuStage0Mock = null,
-        stage1: ?*Stage1Mock = null,
-        preloaded: [slot_count][d_model]f32 = [_][d_model]f32{[_]f32{0.0} ** d_model} ** slot_count,
-
-        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
-            return slot_index < slot_count;
-        }
-
-        pub fn localCpuStage0(self: *@This()) ?*CpuStage0Mock {
-            return self.cpu_stage0;
-        }
-
-        pub fn localCudaStage1(self: *@This()) ?*Stage1Mock {
-            return self.stage1;
-        }
-
-        pub fn localSplitLayer(self: *const @This()) usize {
-            return self.split_layer;
-        }
-
-        pub fn localSplitLayerStage2(self: *const @This()) usize {
-            return self.split_layer_stage2;
-        }
-
-        pub fn executePrefillWithLayerLimitTestHook(
-            self: *@This(),
-            tokens: []const u32,
-            slot_index: usize,
-            logits_out: []f32,
-            layer_limit: usize,
-        ) !void {
-            return runCpuGpuGpuPrefillTestHook(self, tokens, slot_index, logits_out, layer_limit);
-        }
-
-        pub fn activateKvSlot(_: *@This(), _: usize) void {}
-
-        pub fn executeDecodeWithLayerLimitTestHook(
-            self: *@This(),
-            token: u32,
-            position: usize,
-            slot_index: usize,
-            logits_out_opt: ?[]f32,
-            layer_limit: usize,
-            compute_logits: bool,
-            download_logits: bool,
-            ensure_kv_capacity: bool,
-            trace_seq_len_u32: u32,
-            trace_pos_offset: usize,
-            hidden_override: ?[]const f32,
-            deepstack_layer_features_opt: ?[]const []const f32,
-            deepstack_feature_index_opt: ?usize,
-            use_preloaded_input: bool,
-        ) !void {
-            _ = ensure_kv_capacity;
-            _ = trace_seq_len_u32;
-            _ = trace_pos_offset;
-            _ = hidden_override;
-            _ = deepstack_layer_features_opt;
-            _ = deepstack_feature_index_opt;
-            if (slot_index >= slot_count) return error.InvalidArgument;
-            var hidden: f32 = 0.0;
-            if (use_preloaded_input) {
-                hidden = self.preloaded[slot_index][0] + @as(f32, @floatFromInt(layer_limit));
-            } else {
-                const base: f32 = @as(f32, @floatFromInt(token)) * 0.5 + @as(f32, @floatFromInt(position)) * 0.25;
-                hidden = base + @as(f32, @floatFromInt(layer_limit));
-                @memset(self.preloaded[slot_index][0..], hidden);
-            }
-            if (!compute_logits) return;
-            _ = download_logits;
-            if (logits_out_opt) |logits_out| {
-                for (logits_out, 0..) |*v, i| {
-                    v.* = hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                }
-            }
-        }
-    };
-
-    const slot_windows = [_][]const []const u32{
-        &[_][]const u32{
-            &[_]u32{ 3, 5, 7, 11 },
-            &[_]u32{ 13, 17 },
-            &[_]u32{ 19, 23, 29 },
-        },
-        &[_][]const u32{
-            &[_]u32{ 2, 4, 6 },
-            &[_]u32{ 8, 10, 12, 14 },
-            &[_]u32{16},
-        },
-    };
-
-    var cycle: usize = 0;
-    while (cycle < 6) : (cycle += 1) {
-        var cpu_stage = CpuStage0Mock{};
-        var stage1 = Stage1Mock{
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-        };
-        var split = MockBackend{
-            .topology_mode = .cpu_gpu_gpu,
-            .block_runtime = .{ .blocks = &[_]BlockRuntimeLayerForTest{ .{}, .{} } },
-            .cpu_stage0 = &cpu_stage,
-            .stage1 = &stage1,
-        };
-
-        for (slot_windows, 0..) |windows, slot_index| {
-            for (windows) |window_tokens| {
-                var logits_split: [vocab]f32 = undefined;
-                try split.executePrefillWithLayerLimitTestHook(
-                    window_tokens,
-                    slot_index,
-                    logits_split[0..],
-                    split.block_runtime.blocks.len,
-                );
-                const last_index = window_tokens.len - 1;
-                const base: f32 = @as(f32, @floatFromInt(window_tokens[last_index])) * 0.5 + @as(f32, @floatFromInt(last_index)) * 0.25;
-                const expected_hidden = base + 6.0;
-                for (logits_split, 0..) |actual, i| {
-                    const expected = expected_hidden + @as(f32, @floatFromInt(i)) * 0.01;
-                    try std.testing.expectApproxEqAbs(expected, actual, 1.0e-6);
-                }
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Phase 9: Lifecycle + Safety Hardening
 // ---------------------------------------------------------------------------
@@ -6248,8 +3231,7 @@ test "unbindSlotStateBlocks is idempotent" {
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
     backend.state_descriptor_count = 1;
-    backend.local_cuda_stage1_backend = null;
-    backend.local_cpu_stage0_backend = null;
+    clearLocalStages(&backend);
     backend.state_descriptors_storage[0] = .{
         .id = 51,
         .size_bytes = runtime_contract.builtin_state_block_bytes,
@@ -6304,8 +3286,7 @@ test "unbindSlotStateBlocks fans out to local stage and is idempotent" {
     stage1.max_batch_size = 1;
     stage1.block_runtime = undefined;
     stage1.state_descriptor_count = 1;
-    stage1.local_cuda_stage1_backend = null;
-    stage1.local_cpu_stage0_backend = null;
+    clearLocalStages(&stage1);
     stage1.state_descriptors_storage[0] = .{
         .id = 52,
         .size_bytes = runtime_contract.builtin_state_block_bytes,
@@ -6317,10 +3298,11 @@ test "unbindSlotStateBlocks fans out to local stage and is idempotent" {
     var stage1_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
     stage1.slot_state_bindings = stage1_bindings[0..];
 
-    source.local_cuda_stage1_backend = &stage1;
+    var local_cuda_stages: [1]?*CudaBackend = undefined;
+    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
     // CPU stage not wired during bind — bind fans out to CPU and would fail
     // on the zero-init stub. Wire it after bind so only unbind exercises CPU fan-out.
-    source.local_cpu_stage0_backend = null;
+    source.local_cpu_stage_backends = &.{};
 
     var state_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
     const state_blocks = [_]runtime_contract.StateBlockHandle{
@@ -6335,7 +3317,8 @@ test "unbindSlotStateBlocks fans out to local stage and is idempotent" {
     const cpu_backend = main.inference.backend.cpu;
     var cpu_stage0_bytes: [@sizeOf(cpu_backend.BackendType)]u8 align(@alignOf(cpu_backend.BackendType)) = @splat(0);
     const cpu_stage0: *cpu_backend.BackendType = @ptrCast(&cpu_stage0_bytes);
-    source.local_cpu_stage0_backend = cpu_stage0;
+    var local_cpu_stages: [1]?*CpuBackend = undefined;
+    setSingleLocalCpuStage(&source, &local_cpu_stages, cpu_stage0);
     try std.testing.expect(source.slot_state_bindings[0].bound);
     try std.testing.expect(stage1.slot_state_bindings[0].bound);
 
@@ -6357,7 +3340,7 @@ test "resetSlot is safe on unbound and bound slots with local stage" {
     var source: CudaBackend = undefined;
     source.max_batch_size = 1;
     source.state_descriptor_count = 0;
-    source.local_cpu_stage0_backend = null;
+    source.local_cpu_stage_backends = &.{};
     var source_positions: [1]usize = .{42};
     var source_deltas: [1]isize = .{7};
     var source_in_use: [1]bool = .{true};
@@ -6372,8 +3355,7 @@ test "resetSlot is safe on unbound and bound slots with local stage" {
     var stage1: CudaBackend = undefined;
     stage1.max_batch_size = 1;
     stage1.state_descriptor_count = 0;
-    stage1.local_cuda_stage1_backend = null;
-    stage1.local_cpu_stage0_backend = null;
+    clearLocalStages(&stage1);
     var stage1_positions: [1]usize = .{99};
     var stage1_deltas: [1]isize = .{-3};
     var stage1_in_use: [1]bool = .{true};
@@ -6384,7 +3366,8 @@ test "resetSlot is safe on unbound and bound slots with local stage" {
     stage1.decode_ptr_tables_cached_rows = 0;
     stage1.decode_ptr_tables_dirty = false;
 
-    source.local_cuda_stage1_backend = &stage1;
+    var local_cuda_stages: [1]?*CudaBackend = undefined;
+    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
 
     // Reset on slot with non-zero positions — must fan out to stage1.
     source.resetSlot(0);
@@ -6407,7 +3390,7 @@ test "bind-unbind-rebind produces independent runtime state across local stages"
     source.max_batch_size = 1;
     source.block_runtime = undefined;
     source.state_descriptor_count = 1;
-    source.local_cpu_stage0_backend = null;
+    source.local_cpu_stage_backends = &.{};
     source.state_descriptors_storage[0] = .{
         .id = 53,
         .size_bytes = runtime_contract.builtin_state_block_bytes,
@@ -6424,8 +3407,7 @@ test "bind-unbind-rebind produces independent runtime state across local stages"
     stage1.max_batch_size = 1;
     stage1.block_runtime = undefined;
     stage1.state_descriptor_count = 1;
-    stage1.local_cuda_stage1_backend = null;
-    stage1.local_cpu_stage0_backend = null;
+    clearLocalStages(&stage1);
     stage1.state_descriptors_storage[0] = .{
         .id = 53,
         .size_bytes = runtime_contract.builtin_state_block_bytes,
@@ -6437,7 +3419,8 @@ test "bind-unbind-rebind produces independent runtime state across local stages"
     var stage1_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
     stage1.slot_state_bindings = stage1_bindings[0..];
 
-    source.local_cuda_stage1_backend = &stage1;
+    var local_cuda_stages: [1]?*CudaBackend = undefined;
+    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
 
     // --- First bind ---
     var storage_a: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
@@ -6494,7 +3477,7 @@ test "interleaved multi-slot lifecycle with local stage" {
     source.max_batch_size = 2;
     source.block_runtime = undefined;
     source.state_descriptor_count = 1;
-    source.local_cpu_stage0_backend = null;
+    source.local_cpu_stage_backends = &.{};
     source.state_descriptors_storage[0] = .{
         .id = 54,
         .size_bytes = runtime_contract.builtin_state_block_bytes,
@@ -6511,8 +3494,7 @@ test "interleaved multi-slot lifecycle with local stage" {
     stage1.max_batch_size = 2;
     stage1.block_runtime = undefined;
     stage1.state_descriptor_count = 1;
-    stage1.local_cuda_stage1_backend = null;
-    stage1.local_cpu_stage0_backend = null;
+    clearLocalStages(&stage1);
     stage1.state_descriptors_storage[0] = .{
         .id = 54,
         .size_bytes = runtime_contract.builtin_state_block_bytes,
@@ -6524,7 +3506,8 @@ test "interleaved multi-slot lifecycle with local stage" {
     var stage1_bindings: [2]CudaBackend.SlotStateBinding = .{ .{}, .{} };
     stage1.slot_state_bindings = stage1_bindings[0..];
 
-    source.local_cuda_stage1_backend = &stage1;
+    var local_cuda_stages: [1]?*CudaBackend = undefined;
+    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
 
     var storage_s0: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
     var storage_s1: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
@@ -6587,17 +3570,16 @@ test "interleaved multi-slot lifecycle with local stage" {
 }
 
 // ---------------------------------------------------------------------------
-// computeInitLayerRange — A10 regression tests (range-scoped init invariant)
+// computeInitLayerRange — range-scoped init invariant
 // ---------------------------------------------------------------------------
 //
 // These tests exercise the pure validation function that CudaBackend.init()
 // calls to determine its layer range. The debug.assert in init() then verifies
-// BlockRuntime.initRange produced the matching block count. Together they
-// ensure no full-model GPU allocation occurs for staged topologies.
+// BlockRuntime.initRange produced the matching block count.
 
 const computeInitLayerRange = CudaBackend.computeInitLayerRange;
-const InitOptions = CudaBackend.InitOptions;
-const buildCpuStage0InitOptions = CudaBackend.buildCpuStage0InitOptions;
+const buildCpuStageInitOptions = CudaBackend.buildCpuStageInitOptions;
+const RootLocalStageSpec = main.inference.backend.LocalStageSpec;
 const no_sharing_config: models.config.ModelConfig = .{
     .vocab_size = 1000,
     .d_model = 256,
@@ -6612,131 +3594,16 @@ const no_sharing_config: models.config.ModelConfig = .{
     .gaffine_group_size = 32,
 };
 
-test "computeInitLayerRange: single topology uses full range" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .single }, 32, no_sharing_config);
+test "computeInitLayerRange uses full range without a local stage plan" {
+    const r = try computeInitLayerRange(.{}, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 0), r.start);
     try std.testing.expectEqual(@as(usize, 32), r.end);
     try std.testing.expectEqual(@as(usize, 0), r.split_layer);
     try std.testing.expectEqual(@as(usize, 0), r.split_layer_stage2);
 }
 
-test "computeInitLayerRange: pipeline2 default split is n/2" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2 }, 32, no_sharing_config);
-    try std.testing.expectEqual(@as(usize, 0), r.start);
-    try std.testing.expectEqual(@as(usize, 16), r.end);
-    try std.testing.expectEqual(@as(usize, 16), r.split_layer);
-}
-
-test "computeInitLayerRange: pipeline2 explicit split" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 10 }, 32, no_sharing_config);
-    try std.testing.expectEqual(@as(usize, 0), r.start);
-    try std.testing.expectEqual(@as(usize, 10), r.end);
-    try std.testing.expectEqual(@as(usize, 10), r.split_layer);
-}
-
-test "computeInitLayerRange: pipeline2 rejects split_layer=0" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 0 }, 32, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: pipeline2 rejects split_layer>=total" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 32 }, 32, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: pipeline2 rejects 1 layer" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .pipeline2 }, 1, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: cpu_gpu default split returns upper half" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu }, 32, no_sharing_config);
-    try std.testing.expectEqual(@as(usize, 16), r.start);
-    try std.testing.expectEqual(@as(usize, 32), r.end);
-    try std.testing.expectEqual(@as(usize, 16), r.split_layer);
-}
-
-test "computeInitLayerRange: cpu_gpu explicit split" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 8 }, 32, no_sharing_config);
-    try std.testing.expectEqual(@as(usize, 8), r.start);
-    try std.testing.expectEqual(@as(usize, 32), r.end);
-    try std.testing.expectEqual(@as(usize, 8), r.split_layer);
-}
-
-test "computeInitLayerRange: cpu_gpu rejects split_layer=0" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 0 }, 32, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: cpu_gpu rejects 1 layer" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .cpu_gpu }, 1, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: cpu_gpu_gpu default splits 3-way" {
-    // 12 layers: split=max(1,12/3)=4, split_stage2=4+max(1,(12-4)/2)=4+4=8.
-    // Self backend gets [8, 12).
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu_gpu }, 12, no_sharing_config);
-    try std.testing.expectEqual(@as(usize, 8), r.start);
-    try std.testing.expectEqual(@as(usize, 12), r.end);
-    try std.testing.expectEqual(@as(usize, 4), r.split_layer);
-    try std.testing.expectEqual(@as(usize, 8), r.split_layer_stage2);
-}
-
-test "computeInitLayerRange: cpu_gpu_gpu explicit splits" {
+test "computeInitLayerRange accepts explicit internal layer range" {
     const r = try computeInitLayerRange(.{
-        .topology_mode = .cpu_gpu_gpu,
-        .split_layer = 4,
-        .split_layer_stage2 = 8,
-    }, 12, no_sharing_config);
-    try std.testing.expectEqual(@as(usize, 8), r.start);
-    try std.testing.expectEqual(@as(usize, 12), r.end);
-    try std.testing.expectEqual(@as(usize, 4), r.split_layer);
-    try std.testing.expectEqual(@as(usize, 8), r.split_layer_stage2);
-}
-
-test "computeInitLayerRange: cpu_gpu_gpu rejects split_stage2<=split" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{
-            .topology_mode = .cpu_gpu_gpu,
-            .split_layer = 5,
-            .split_layer_stage2 = 5,
-        }, 12, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: cpu_gpu_gpu rejects split_stage2>=total" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{
-            .topology_mode = .cpu_gpu_gpu,
-            .split_layer = 4,
-            .split_layer_stage2 = 12,
-        }, 12, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: cpu_gpu_gpu rejects fewer than 3 layers" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .cpu_gpu_gpu }, 2, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: explicit init_layer_range with single mode" {
-    const r = try computeInitLayerRange(.{
-        .topology_mode = .single,
         .init_layer_range = .{ .start = 5, .end = 10 },
     }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 5), r.start);
@@ -6745,28 +3612,16 @@ test "computeInitLayerRange: explicit init_layer_range with single mode" {
     try std.testing.expectEqual(@as(usize, 0), r.split_layer_stage2);
 }
 
-test "computeInitLayerRange: rejects init_layer_range with staged topology" {
-    // init_layer_range is internal for stage backends, which must be .single.
+test "computeInitLayerRange rejects combining explicit range and stage plan" {
+    const specs = [_]RootLocalStageSpec{
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 0, .layer_end = 8 },
+    };
     try std.testing.expectError(
         error.InvalidTopologyConfig,
         computeInitLayerRange(.{
-            .topology_mode = .pipeline2,
+            .local_stage_specs = specs[0..],
             .init_layer_range = .{ .start = 5, .end = 10 },
-        }, 32, no_sharing_config),
-    );
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{
-            .topology_mode = .cpu_gpu,
-            .init_layer_range = .{ .start = 5, .end = 10 },
-        }, 32, no_sharing_config),
-    );
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{
-            .topology_mode = .cpu_gpu_gpu,
-            .init_layer_range = .{ .start = 5, .end = 10 },
-        }, 32, no_sharing_config),
+        }, 8, no_sharing_config),
     );
 }
 
@@ -6788,83 +3643,39 @@ test "computeInitLayerRange: rejects init_layer_range with end>total_layers" {
     );
 }
 
-// Structural invariant: split points partition [0, total_layers) consistently
-// with the self-backend range. The topology switch relies on this relationship,
-// and breaking it would cause stage backends to receive wrong layer ranges.
-test "computeInitLayerRange: pipeline2 split points cover full model" {
+test "computeInitLayerRange selects root CUDA stage from a generic plan" {
     const total: usize = 24;
-    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 10 }, total, no_sharing_config);
-    // Self [0, split) + stage1 [split, total) == [0, total).
-    try std.testing.expectEqual(@as(usize, 0), r.start);
-    try std.testing.expectEqual(r.split_layer, r.end);
-    try std.testing.expect(r.split_layer > 0 and r.split_layer < total);
+    const specs = [_]RootLocalStageSpec{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 6 },
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 6, .layer_end = 16 },
+        .{ .backend_kind = .cuda, .device_ordinal = 1, .layer_start = 16, .layer_end = 24 },
+    };
+    const r = try computeInitLayerRange(.{ .local_stage_specs = specs[0..], .local_root_stage_id = 2 }, total, no_sharing_config);
+    try std.testing.expectEqual(@as(usize, 16), r.start);
+    try std.testing.expectEqual(@as(usize, 24), r.end);
+    try std.testing.expectEqual(@as(usize, 6), r.split_layer);
+    try std.testing.expectEqual(@as(usize, 16), r.split_layer_stage2);
 }
 
-test "computeInitLayerRange: cpu_gpu split points cover full model" {
-    const total: usize = 24;
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 10 }, total, no_sharing_config);
-    // CPU [0, split) + self [split, total) == [0, total).
-    try std.testing.expectEqual(r.split_layer, r.start);
-    try std.testing.expectEqual(total, r.end);
-    try std.testing.expect(r.split_layer > 0 and r.split_layer < total);
+test "computeInitLayerRange rejects non-contiguous generic plans" {
+    const specs = [_]RootLocalStageSpec{
+        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 0, .layer_end = 6 },
+        .{ .backend_kind = .cuda, .device_ordinal = 1, .layer_start = 7, .layer_end = 24 },
+    };
+    try std.testing.expectError(error.InvalidTopologyConfig, computeInitLayerRange(.{ .local_stage_specs = specs[0..], .local_root_stage_id = 0 }, 24, no_sharing_config));
 }
 
-test "buildCpuStage0InitOptions uses CPU-owned prefix without logits head" {
-    const opts = buildCpuStage0InitOptions(3, 512, 7);
+test "buildCpuStageInitOptions uses stage CPU-owned range and explicit logits ownership" {
+    const opts = buildCpuStageInitOptions(3, 512, 2, 7, false);
     const range = opts.layer_range orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 3), opts.max_batch_size);
     try std.testing.expectEqual(@as(usize, 512), opts.max_sequence_len);
-    try std.testing.expectEqual(@as(usize, 0), range.start);
+    try std.testing.expectEqual(@as(usize, 2), range.start);
     try std.testing.expectEqual(@as(usize, 7), range.end);
     try std.testing.expect(!opts.build_logits_head);
-}
 
-test "cpu_gpu staged init derives CPU stage0 options from split layer" {
-    const total: usize = 24;
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 10 }, total, no_sharing_config);
-    const opts = buildCpuStage0InitOptions(2, 1024, r.split_layer);
-    const range = opts.layer_range orelse return error.TestUnexpectedResult;
-
-    try std.testing.expectEqual(@as(usize, 10), r.start);
-    try std.testing.expectEqual(@as(usize, 0), range.start);
-    try std.testing.expectEqual(@as(usize, 10), range.end);
-    try std.testing.expect(!opts.build_logits_head);
-}
-
-test "cpu_gpu_gpu staged init derives CPU stage0 options from first split layer" {
-    const total: usize = 24;
-    const r = try computeInitLayerRange(.{
-        .topology_mode = .cpu_gpu_gpu,
-        .split_layer = 6,
-        .split_layer_stage2 = 16,
-    }, total, no_sharing_config);
-    const opts = buildCpuStage0InitOptions(2, 1024, r.split_layer);
-    const range = opts.layer_range orelse return error.TestUnexpectedResult;
-
-    try std.testing.expectEqual(@as(usize, 16), r.start);
-    try std.testing.expectEqual(@as(usize, 0), range.start);
-    try std.testing.expectEqual(@as(usize, 6), range.end);
-    try std.testing.expect(!opts.build_logits_head);
-}
-
-test "computeInitLayerRange: cpu_gpu_gpu split points cover full model" {
-    const total: usize = 24;
-    const r = try computeInitLayerRange(.{
-        .topology_mode = .cpu_gpu_gpu,
-        .split_layer = 6,
-        .split_layer_stage2 = 16,
-    }, total, no_sharing_config);
-    // CPU [0, split) + GPU0 [split, split_stage2) + self [split_stage2, total) == [0, total).
-    try std.testing.expect(r.split_layer > 0);
-    try std.testing.expect(r.split_layer < r.split_layer_stage2);
-    try std.testing.expect(r.split_layer_stage2 < total);
-    try std.testing.expectEqual(r.split_layer_stage2, r.start);
-    try std.testing.expectEqual(total, r.end);
-    // Layer counts per stage.
-    const cpu_layers = r.split_layer;
-    const gpu0_layers = r.split_layer_stage2 - r.split_layer;
-    const gpu1_layers = r.end - r.start;
-    try std.testing.expectEqual(total, cpu_layers + gpu0_layers + gpu1_layers);
+    const final_opts = buildCpuStageInitOptions(3, 512, 7, 9, true);
+    try std.testing.expect(final_opts.build_logits_head);
 }
 
 test "Nvfp4LinearWeight.cublasLtScaleTensorSize computes padded VEC16 layout bytes" {

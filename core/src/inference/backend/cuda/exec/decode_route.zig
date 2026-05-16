@@ -31,35 +31,18 @@ const tryPopulateHiddenFromToken = engine_weights.tryPopulateHiddenFromToken;
 const saturatingU64FromU128 = engine_types.saturatingU64FromU128;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 
-fn topologyModeTag(self: anytype) ?[]const u8 {
-    const SelfType = @TypeOf(self.*);
-    if (comptime !@hasField(SelfType, "topology_mode")) return null;
-    return @tagName(self.topology_mode);
-}
-
-fn rejectUnsupportedStagedBatchedDecodeRoute(topology_tag: ?[]const u8) !void {
-    const tag = topology_tag orelse return;
-    if (std.mem.eql(u8, tag, "pipeline2") or
-        std.mem.eql(u8, tag, "cpu_gpu") or
-        std.mem.eql(u8, tag, "cpu_gpu_gpu"))
-    {
-        return error.UnsupportedModel;
-    }
-}
-
 /// Resolve staged prefill chunk rows for a specific request length.
 /// Keeps explicit env override behavior unchanged.
 const common = @import("common.zig");
 const prefill_route = @import("prefill_route.zig");
 const kv_capacity = @import("kv_capacity.zig");
 const resets = @import("resets.zig");
-const stage_adapters = @import("stage_adapters.zig");
-const local_decode = @import("local_decode_pipeline.zig");
+const stage_adapters = @import("../../local_stage_adapters.zig");
+const local_decode = @import("../../local_decode_pipeline.zig");
 const resolveStagedPrefillChunkRows = prefill_route.resolveStagedPrefillChunkRows;
 const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const dumpHiddenState = common.dumpHiddenState;
 const applyHostLogitsPostProcess = common.applyHostLogitsPostProcess;
-const executeCpuStage0LayerRange = common.executeCpuStage0LayerRange;
 const logDecodeInventoryOnce = common.logDecodeInventoryOnce;
 const ensureKvCapacity = kv_capacity.ensureKvCapacity;
 const resetShortConvStates = resets.resetShortConvStates;
@@ -474,15 +457,15 @@ pub fn executeDecodeWithLayerLimit(
     // Graph capture eliminates per-kernel launch overhead by recording the layer
     // sequence and replaying it as a single launch.  Re-captures every decode step
     // to pick up changed arguments (position, seq_len); graphExecUpdate patches
-    // the existing exec in-place when topology matches (very fast).
+    // the existing exec in-place when graph shape matches (very fast).
     // Restricted to single-row decode: prefill has synchronous KV operations and
-    // varying row counts that break graph topology stability.
+    // varying row counts that break graph shape stability.
     // local CUDA target stage excluded: receives activation via external transfer.
     // Persistent graph replay: on the first decode step, capture the layer
     // sequence into a CUDA graph and instantiate it. On subsequent steps,
     // replay the existing graph without re-capture — the position/seq_len
     // data lives in device buffers updated before this function, so the graph
-    // topology is identical every token. All setup (embedding lookup, pointer
+    // shape is identical every token. All setup (embedding lookup, pointer
     // table uploads) runs before the graph region and before persistent replay.
     const event_timing_enabled = if (comptime @hasField(@TypeOf(self.*), "phase_event_timing_enabled"))
         self.phase_event_timing_enabled
@@ -864,91 +847,17 @@ fn executeSingleTokenLocalDecodePipeline(
     });
 }
 
-fn preserveBatchedDecodeStageFailure(
-    root_backend: anytype,
-    boundary_index: usize,
-    boundary_dtype: bridge.BoundaryDType,
-    boundary_layout: bridge.BoundaryLayout,
-    location_hint: ?bridge.TensorFramePayloadLocationHint,
-    slot_indices: []const usize,
-    positions: []const usize,
-    active_side: DecodeBoundaryStageSide,
-    source_error: anyerror,
-) anyerror {
-    const allocator = stage_adapters.backendAllocator(root_backend) orelse return source_error;
-    var batch_entry_scratch = stage_adapters.DecodeBatchEntryScratch.init(allocator, slot_indices.len) catch return source_error;
-    defer batch_entry_scratch.deinit();
-    const metadata = stage_adapters.buildDecodeActivationMetadata(
-        root_backend,
-        boundary_index,
-        boundary_dtype,
-        boundary_layout,
-        location_hint,
-        slot_indices,
-        positions,
-        batch_entry_scratch.slice(slot_indices.len),
-    ) catch return source_error;
-    const placement_plan = stage_adapters.localTopologyPlacementPlan(root_backend) catch return source_error;
-    return bridge.preserveLocalStageExecutionError(allocator, .{
-        .placement_plan = placement_plan,
-        .state_ownership_plan = stage_adapters.localTopologyStateOwnershipPlan(root_backend),
-        .metadata = &metadata,
-        .active_stage_id = switch (active_side) {
-            .source => metadata.boundary.source_stage_id,
-            .target => metadata.boundary.target_stage_id,
-        },
-        .source_error = source_error,
-    });
-}
-
 fn elapsedNsSince(start_ns: i128) u64 {
     const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
     return if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
 }
 
 fn batchedDecodeModeLabel(self: anytype, output_mode: BatchedDecodeOutputMode) []const u8 {
-    const tag = topologyModeTag(self) orelse return "decode_local_chain";
-    if (std.mem.eql(u8, tag, "pipeline2")) {
-        return switch (output_mode) {
-            .host_logits => "decode_pipeline2",
-            .device_only => "decode_device_only_pipeline2",
-        };
-    }
-    if (std.mem.eql(u8, tag, "cpu_gpu")) {
-        return switch (output_mode) {
-            .host_logits => "decode_cpu_gpu",
-            .device_only => "decode_device_only_cpu_gpu",
-        };
-    }
-    if (std.mem.eql(u8, tag, "cpu_gpu_gpu")) {
-        return switch (output_mode) {
-            .host_logits => "decode_cpu_gpu_gpu",
-            .device_only => "decode_device_only_cpu_gpu_gpu",
-        };
-    }
-    return "decode_local_chain";
-}
-
-fn preserveDecodeBoundaryFailure(
-    root_backend: anytype,
-    boundary: stage_adapters.LocalBoundaryRuntimeView,
-    location_hint: ?bridge.TensorFramePayloadLocationHint,
-    slot_indices: []const usize,
-    positions: []const usize,
-    active_side: DecodeBoundaryStageSide,
-    source_error: anyerror,
-) anyerror {
-    return preserveBatchedDecodeStageFailure(
-        root_backend,
-        boundary.boundary_index,
-        boundary.dtype,
-        boundary.layout,
-        location_hint,
-        slot_indices,
-        positions,
-        active_side,
-        source_error,
-    );
+    _ = self;
+    return switch (output_mode) {
+        .host_logits => "decode_local_chain",
+        .device_only => "decode_device_only_local_chain",
+    };
 }
 
 fn computeBatchedDecodeStageOrPreserve(
@@ -964,75 +873,8 @@ fn computeBatchedDecodeStageOrPreserve(
     plan: BatchedDecodeExecutionPlan,
 ) !void {
     computeBatchedDecodeLogitsWithPlan(stage_backend, tokens, slot_indices, positions, output_mode, plan) catch |err| {
-        return preserveDecodeBoundaryFailure(root_backend, boundary, location_hint, slot_indices, positions, active_side, err);
+        return local_decode.preserveDecodeBoundaryFailure(root_backend, boundary, location_hint, slot_indices, positions, active_side, err);
     };
-}
-
-fn copyBatchedDecodeHostLogitsFromStage(root_backend: anytype, source_backend: anytype, rows: usize) !void {
-    const src_vocab = source_backend.runtime_buffers.projected_vocab;
-    const dst_vocab = root_backend.runtime_buffers.projected_vocab;
-    if (src_vocab == 0 or dst_vocab == 0) return;
-    for (0..rows) |row| {
-        const src_row_start = std.math.mul(usize, row, src_vocab) catch continue;
-        const src_row_end = std.math.add(usize, src_row_start, src_vocab) catch continue;
-        const dst_row_start = std.math.mul(usize, row, dst_vocab) catch continue;
-        const dst_row_end = std.math.add(usize, dst_row_start, dst_vocab) catch continue;
-        if (src_row_end > source_backend.runtime_buffers.projected_logits_batch_host.len or
-            dst_row_end > root_backend.runtime_buffers.projected_logits_batch_host.len)
-        {
-            continue;
-        }
-        const src_row = source_backend.runtime_buffers.projected_logits_batch_host[src_row_start..src_row_end];
-        const dst_row = root_backend.runtime_buffers.projected_logits_batch_host[dst_row_start..dst_row_end];
-        const copy_len = @min(src_row.len, dst_row.len);
-        @memset(dst_row, -1.0e9);
-        @memcpy(dst_row[0..copy_len], src_row[0..copy_len]);
-    }
-}
-
-fn prepareCpuBatchedDecodeSegments(
-    root_backend: anytype,
-    cpu_stage0: anytype,
-    activate_intermediate: bool,
-    intermediate_backend: anytype,
-    boundary0: stage_adapters.LocalBoundaryRuntimeView,
-    tokens: []const u32,
-    slot_indices: []const usize,
-    positions: []const usize,
-    split_layer: usize,
-    row_bytes: usize,
-    host_segments: [][]const u8,
-) !void {
-    for (0..tokens.len) |row_i| {
-        const token = tokens[row_i];
-        const slot_index = slot_indices[row_i];
-        const position = positions[row_i];
-        if (activate_intermediate) intermediate_backend.activateKvSlot(slot_index);
-        root_backend.activateKvSlot(slot_index);
-        executeCpuStage0LayerRange(
-            cpu_stage0,
-            token,
-            position,
-            slot_index,
-            split_layer,
-            true,
-        ) catch |err| {
-            const row_slot_indices = [_]usize{slot_index};
-            const row_positions = [_]usize{position};
-            return preserveDecodeBoundaryFailure(
-                root_backend,
-                boundary0,
-                .{ .cpu = {} },
-                &row_slot_indices,
-                &row_positions,
-                .source,
-                err,
-            );
-        };
-        const src_row = cpu_stage0.slotActivationBytes(slot_index);
-        if (src_row.len < row_bytes) return error.InvalidTopologyConfig;
-        host_segments[row_i] = src_row[0..row_bytes];
-    }
 }
 
 fn computeBatchedDecodeLocalWithMode(
@@ -1044,8 +886,6 @@ fn computeBatchedDecodeLocalWithMode(
 ) !void {
     return local_decode.executeBatchedDecodePipeline(
         computeBatchedDecodeStageOrPreserve,
-        copyBatchedDecodeHostLogitsFromStage,
-        prepareCpuBatchedDecodeSegments,
         self,
         tokens,
         slot_indices,
@@ -1069,7 +909,6 @@ fn computeBatchedDecodeLogitsWithMode(
         }
         return error.InvalidTopologyConfig;
     }
-    try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook")) {
         if (tokens.len != slot_indices.len or tokens.len != positions.len) return error.InvalidArgument;
         if (tokens.len == 0) return;
@@ -1139,7 +978,7 @@ fn computeBatchedDecodeLogitsWithPlan(
         false;
     const n_usize = tokens.len;
     if (n_usize == 0) return;
-    if (!plan.allow_staged_internal_execution) try rejectUnsupportedStagedBatchedDecodeRoute(topologyModeTag(self));
+    _ = plan.allow_staged_internal_execution;
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
@@ -1755,16 +1594,4 @@ pub fn computeBatchedDecodeLogitsDeviceOnly(
     positions: []const usize,
 ) !void {
     return computeBatchedDecodeLogitsWithMode(self, tokens, slot_indices, positions, .device_only);
-}
-
-test "rejectUnsupportedStagedBatchedDecodeRoute rejects staged batch route" {
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        rejectUnsupportedStagedBatchedDecodeRoute("cpu_gpu"),
-    );
-}
-
-test "rejectUnsupportedStagedBatchedDecodeRoute allows single-device tag" {
-    try rejectUnsupportedStagedBatchedDecodeRoute("single");
-    try rejectUnsupportedStagedBatchedDecodeRoute(null);
 }

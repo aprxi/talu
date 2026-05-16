@@ -461,6 +461,7 @@ pub const LocalStageRunResult = union(enum) {
 
 pub const LocalStageBoundaryRunRequest = struct {
     plan_ref: *const LocalStageRunnerPlanRef,
+    placement_plan: *const host_capability.PlacementPlan,
     step: LocalStageBoundaryStep,
     host_staging: ?[]align(64) u8,
     stage0_input: []const u8 = &.{},
@@ -468,110 +469,115 @@ pub const LocalStageBoundaryRunRequest = struct {
     touched_stage_scratch: []LocalStageTouchedRef,
 };
 
-pub const LocalStageChainStageVTable = struct {
-    execute_layers: *const fn (*anyopaque, []const u8, usize, usize) anyerror!void,
-    synchronize: *const fn (*anyopaque) anyerror!void,
-    download_activation: *const fn (*anyopaque, []u8, usize) anyerror!void,
-    upload_activation: *const fn (*anyopaque, []const u8, usize) anyerror!void,
-    upload_activation_segments: ?*const fn (*anyopaque, []const []const u8, usize) anyerror!void = null,
-    peer_copy_activation_to: ?*const fn (*anyopaque, *anyopaque, usize) anyerror!void = null,
-    peer_copy_handles_stage_sync: ?*const fn (*anyopaque) bool = null,
+pub const LocalStageEndpointVTable = struct {
+    execute_decode_layer_range: *const fn (*anyopaque, []const u8, usize, usize) anyerror!void,
+    execute_prefill_layer_range: *const fn (*anyopaque, []const u8, usize, usize) anyerror!void,
+    project_final_logits: ?*const fn (*anyopaque) anyerror!void = null,
 };
 
-pub const LocalStageChainStage = struct {
+pub const LocalStageEndpoint = struct {
     stage_id: usize,
     ptr: *anyopaque,
-    vtable: *const LocalStageChainStageVTable,
+    vtable: *const LocalStageEndpointVTable,
+    transport_endpoint: ?local_stage_transport.LocalStageTransportEndpoint = null,
 
-    pub fn executeLayers(self: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-        return self.vtable.execute_layers(self.ptr, input, layer_start, layer_end);
+    pub fn executeLayers(self: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!local_stage_transport.StageExecutionReceipt {
+        return self.executeDecodeLayerRange(input, layer_start, layer_end);
     }
 
-    pub fn synchronize(self: *@This()) anyerror!void {
-        return self.vtable.synchronize(self.ptr);
+    pub fn executeDecodeLayerRange(self: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!local_stage_transport.StageExecutionReceipt {
+        try self.vtable.execute_decode_layer_range(self.ptr, input, layer_start, layer_end);
+        return local_stage_transport.StageExecutionReceipt.completed(self.stage_id);
     }
 
-    pub fn downloadActivation(self: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
-        return self.vtable.download_activation(self.ptr, host_buf, byte_count);
+    pub fn executePrefillLayerRange(self: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!local_stage_transport.StageExecutionReceipt {
+        try self.vtable.execute_prefill_layer_range(self.ptr, input, layer_start, layer_end);
+        return local_stage_transport.StageExecutionReceipt.completed(self.stage_id);
     }
 
-    pub fn uploadActivation(self: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
-        return self.vtable.upload_activation(self.ptr, host_buf, byte_count);
-    }
-
-    pub fn uploadActivationSegments(self: *@This(), host_segments: []const []const u8, byte_count: usize) anyerror!void {
-        const upload_segments = self.vtable.upload_activation_segments orelse return error.LocalStageTransportSegmentedUploadUnsupported;
-        return upload_segments(self.ptr, host_segments, byte_count);
-    }
-
-    pub fn peerCopyActivationTo(self: *@This(), target: anytype, byte_count: usize) anyerror!void {
-        const peer_copy = self.vtable.peer_copy_activation_to orelse return error.LocalStageTransportPeerCopyUnsupported;
-        return peer_copy(self.ptr, target.ptr, byte_count);
-    }
-
-    pub fn peerCopyHandlesStageSync(self: *const @This()) bool {
-        const handles_sync = self.vtable.peer_copy_handles_stage_sync orelse return false;
-        return handles_sync(self.ptr);
+    pub fn projectFinalLogits(self: *@This()) anyerror!void {
+        const project = self.vtable.project_final_logits orelse return;
+        return project(self.ptr);
     }
 };
 
-pub fn localStageAdapter(comptime Stage: type, stage_id: usize, stage: *Stage) LocalStageChainStage {
+pub const LocalStageChainStageVTable = LocalStageEndpointVTable;
+pub const LocalStageChainStage = LocalStageEndpoint;
+
+pub const LocalStageEndpointRegistry = struct {
+    endpoints: []LocalStageEndpoint,
+    transport_endpoints: []local_stage_transport.LocalStageTransportEndpoint = &.{},
+
+    pub fn endpointForStageId(self: *@This(), stage_id: usize) LocalStageRunnerError!*LocalStageEndpoint {
+        var found: ?*LocalStageEndpoint = null;
+        for (self.endpoints) |*endpoint| {
+            if (endpoint.stage_id != stage_id) continue;
+            if (found != null) return error.DuplicateStageRef;
+            found = endpoint;
+        }
+        return found orelse error.MissingStageRef;
+    }
+
+    pub fn endpointForStageIdConst(self: *const @This(), stage_id: usize) LocalStageRunnerError!*const LocalStageEndpoint {
+        var found: ?*const LocalStageEndpoint = null;
+        for (self.endpoints) |*endpoint| {
+            if (endpoint.stage_id != stage_id) continue;
+            if (found != null) return error.DuplicateStageRef;
+            found = endpoint;
+        }
+        return found orelse error.MissingStageRef;
+    }
+
+    pub fn transportEndpointForStageId(self: *@This(), stage_id: usize) LocalStageRunnerError!*local_stage_transport.LocalStageTransportEndpoint {
+        if (self.transport_endpoints.len != 0) {
+            var transport_registry = local_stage_transport.LocalStageTransportEndpointRegistry{
+                .endpoints = self.transport_endpoints,
+            };
+            return transport_registry.endpointForStageId(stage_id);
+        }
+        const endpoint = try self.endpointForStageId(stage_id);
+        if (endpoint.transport_endpoint) |*transport_endpoint| return transport_endpoint;
+        return error.MissingStageRef;
+    }
+};
+
+pub fn localStageAdapter(comptime Stage: type, stage_id: usize, stage: *Stage) LocalStageEndpoint {
     const Adapter = struct {
         fn stagePtr(ptr: *anyopaque) *Stage {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn executeLayers(ptr: *anyopaque, input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+        fn executeDecodeLayerRange(ptr: *anyopaque, input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "executeDecodeLayerRange")) {
+                return stagePtr(ptr).executeDecodeLayerRange(input, layer_start, layer_end);
+            }
             return stagePtr(ptr).executeLayers(input, layer_start, layer_end);
         }
 
-        fn synchronize(ptr: *anyopaque) anyerror!void {
-            return stagePtr(ptr).synchronize();
-        }
-
-        fn downloadActivation(ptr: *anyopaque, host_buf: []u8, byte_count: usize) anyerror!void {
-            return stagePtr(ptr).downloadActivation(host_buf, byte_count);
-        }
-
-        fn uploadActivation(ptr: *anyopaque, host_buf: []const u8, byte_count: usize) anyerror!void {
-            return stagePtr(ptr).uploadActivation(host_buf, byte_count);
-        }
-
-        fn uploadActivationSegments(ptr: *anyopaque, host_segments: []const []const u8, byte_count: usize) anyerror!void {
-            if (comptime @hasDecl(Stage, "uploadActivationSegments")) {
-                return stagePtr(ptr).uploadActivationSegments(host_segments, byte_count);
+        fn executePrefillLayerRange(ptr: *anyopaque, input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "executePrefillLayerRange")) {
+                return stagePtr(ptr).executePrefillLayerRange(input, layer_start, layer_end);
             }
-            return error.LocalStageTransportSegmentedUploadUnsupported;
+            return stagePtr(ptr).executeLayers(input, layer_start, layer_end);
         }
 
-        fn peerCopyActivationTo(ptr: *anyopaque, target_ptr: *anyopaque, byte_count: usize) anyerror!void {
-            if (comptime @hasDecl(Stage, "peerCopyActivationToErased")) {
-                return stagePtr(ptr).peerCopyActivationToErased(target_ptr, byte_count);
+        fn projectFinalLogits(ptr: *anyopaque) anyerror!void {
+            if (comptime @hasDecl(Stage, "projectFinalLogits")) {
+                return stagePtr(ptr).projectFinalLogits();
             }
-            return error.LocalStageTransportPeerCopyUnsupported;
         }
 
-        fn peerCopyHandlesStageSync(ptr: *anyopaque) bool {
-            if (comptime @hasDecl(Stage, "peerCopyHandlesStageSync")) {
-                return stagePtr(ptr).peerCopyHandlesStageSync();
-            }
-            return false;
-        }
-
-        const vtable = LocalStageChainStageVTable{
-            .execute_layers = executeLayers,
-            .synchronize = synchronize,
-            .download_activation = downloadActivation,
-            .upload_activation = uploadActivation,
-            .upload_activation_segments = if (@hasDecl(Stage, "uploadActivationSegments")) uploadActivationSegments else null,
-            .peer_copy_activation_to = if (@hasDecl(Stage, "peerCopyActivationToErased")) peerCopyActivationTo else null,
-            .peer_copy_handles_stage_sync = if (@hasDecl(Stage, "peerCopyHandlesStageSync")) peerCopyHandlesStageSync else null,
+        const vtable = LocalStageEndpointVTable{
+            .execute_decode_layer_range = executeDecodeLayerRange,
+            .execute_prefill_layer_range = executePrefillLayerRange,
+            .project_final_logits = if (@hasDecl(Stage, "projectFinalLogits")) projectFinalLogits else null,
         };
     };
     return .{
         .stage_id = stage_id,
         .ptr = stage,
         .vtable = &Adapter.vtable,
+        .transport_endpoint = local_stage_transport.localStageTransportAdapter(Stage, stage_id, stage),
     };
 }
 
@@ -594,41 +600,80 @@ pub const LocalStageChainRequest = struct {
     stages: []LocalStageChainStage,
     boundaries: []const LocalStageChainBoundaryStep,
     stage_inputs: []const []const u8 = &.{},
+    project_final_logits: bool = false,
+};
+
+pub const LocalStageEndpointRegistryChainRequest = struct {
+    allocator: ?Allocator = null,
+    plan_ref: *const LocalStageRunnerPlanRef,
+    placement_plan: *const host_capability.PlacementPlan,
+    state_ownership_plan: ?*const state_ownership.StageStateOwnershipPlan = null,
+    cleanup_obligations: []const state_ownership.StateCleanupObligation = &.{},
+    registry: LocalStageEndpointRegistry,
+    boundaries: []const LocalStageChainBoundaryStep,
+    stage_inputs: []const []const u8 = &.{},
+    project_final_logits: bool = false,
 };
 
 pub fn executeLocalStageChain(request: LocalStageChainRequest) anyerror!void {
-    try validateLocalStageChainRequestShape(request);
+    return executeLocalStageEndpointRegistryChain(.{
+        .allocator = request.allocator,
+        .plan_ref = request.plan_ref,
+        .placement_plan = request.placement_plan,
+        .state_ownership_plan = request.state_ownership_plan,
+        .cleanup_obligations = request.cleanup_obligations,
+        .registry = .{ .endpoints = request.stages },
+        .boundaries = request.boundaries,
+        .stage_inputs = request.stage_inputs,
+        .project_final_logits = request.project_final_logits,
+    });
+}
+
+pub fn executeLocalStageEndpointRegistryChain(request: LocalStageEndpointRegistryChainRequest) anyerror!void {
+    try validateLocalStageEndpointRegistryChainRequestShape(request);
+    var registry = request.registry;
 
     for (request.boundaries, 0..) |step, boundary_position| {
         const boundary = try request.plan_ref.boundary(step.boundary_index);
+        _ = try registry.endpointForStageId(boundary.source_stage_id);
+        _ = try registry.endpointForStageId(boundary.target_stage_id);
+        _ = try registry.transportEndpointForStageId(boundary.source_stage_id);
+        _ = try registry.transportEndpointForStageId(boundary.target_stage_id);
+        try validateLocalStageChainBoundaryStatic(request, boundary, step, boundary_position);
+        try validateLocalStageChainBoundaryImageBeforeMutation(step);
+        if (step.image.host_segments == null) {
+            _ = try buildLocalStageChainTransportEnvelope(request, step);
+        }
+    }
+
+    var current_source_receipt: ?local_stage_transport.StageExecutionReceipt = null;
+    for (request.boundaries, 0..) |step, boundary_position| {
+        const boundary = try request.plan_ref.boundary(step.boundary_index);
+        const source_stage = try registry.endpointForStageId(boundary.source_stage_id);
+        const target_stage = try registry.endpointForStageId(boundary.target_stage_id);
+        const source_transport = try registry.transportEndpointForStageId(boundary.source_stage_id);
+        const target_transport = try registry.transportEndpointForStageId(boundary.target_stage_id);
         if (boundary_position == 0) {
-            try request.stages[0].executeLayers(
+            current_source_receipt = try executeEndpointForStep(
+                source_stage,
+                step.step_kind,
                 stageInput(request, 0),
                 boundary.producer_layer_start,
                 boundary.producer_layer_end,
             );
         }
+        const source_receipt = current_source_receipt orelse return error.StageRunnerPlanIdentityMismatch;
+        if (source_receipt.stage_id != boundary.source_stage_id) return error.StageRunnerPlanIdentityMismatch;
 
-        try validateLocalStageChainBoundary(request, boundary, step, boundary_position);
-
-        const decision = try stage_transfer_mode.chooseStageTransferMode(.{
-            .placement_plan = request.placement_plan,
-            .metadata = step.metadata,
-            .image = step.image,
-            .allow_borrow = step.allow_borrow,
-            .local_device_peer_copy_available = step.local_device_peer_copy_available,
-        });
-        const envelope = try stage_transport.buildStageTransportActivationEnvelope(.{
-            .metadata = step.metadata,
-            .image = step.image,
-            .decision = decision,
-        });
+        try validateLocalStageChainBoundaryImage(step);
+        const contract = try buildLocalStageChainTransportEnvelope(request, step);
         const transport_request = local_stage_transport.LocalStageTransportRequest{
             .placement_plan = request.placement_plan,
             .metadata = step.metadata,
             .image = step.image,
-            .decision = decision,
-            .envelope = &envelope,
+            .decision = contract.decision,
+            .envelope = &contract.envelope,
+            .source_receipt = source_receipt,
             .staging = step.staging,
             .allow_borrow = step.allow_borrow,
             .local_device_peer_copy_available = step.local_device_peer_copy_available,
@@ -640,29 +685,59 @@ pub fn executeLocalStageChain(request: LocalStageChainRequest) anyerror!void {
             var failure_capture = local_stage_transport.LocalStageTransportFailureCapture.init(allocator);
             defer failure_capture.deinit();
             try local_stage_transport.executeLocalStageTransportWithFailureCapture(
-                LocalStageChainStage,
-                LocalStageChainStage,
-                &request.stages[boundary_position],
-                &request.stages[boundary_position + 1],
+                local_stage_transport.LocalStageTransportEndpoint,
+                local_stage_transport.LocalStageTransportEndpoint,
+                source_transport,
+                target_transport,
                 transport_request,
                 &failure_capture,
             );
         } else {
             try local_stage_transport.executeLocalStageTransport(
-                LocalStageChainStage,
-                LocalStageChainStage,
-                &request.stages[boundary_position],
-                &request.stages[boundary_position + 1],
+                local_stage_transport.LocalStageTransportEndpoint,
+                local_stage_transport.LocalStageTransportEndpoint,
+                source_transport,
+                target_transport,
                 transport_request,
             );
         }
 
-        try request.stages[boundary_position + 1].executeLayers(
+        current_source_receipt = try executeEndpointForStep(
+            target_stage,
+            step.step_kind,
             stageInput(request, boundary_position + 1),
             boundary.consumer_layer_start,
             boundary.consumer_layer_end,
         );
     }
+
+    if (request.project_final_logits) {
+        const final_stage_ref = request.plan_ref.stages[request.plan_ref.stages.len - 1];
+        const final_endpoint = try registry.endpointForStageId(final_stage_ref.stage_id);
+        try final_endpoint.projectFinalLogits();
+    }
+}
+
+fn buildLocalStageChainTransportEnvelope(
+    request: LocalStageEndpointRegistryChainRequest,
+    step: LocalStageChainBoundaryStep,
+) anyerror!ActivationTransportContract {
+    const decision = try stage_transfer_mode.chooseStageTransferMode(.{
+        .placement_plan = request.placement_plan,
+        .metadata = step.metadata,
+        .image = step.image,
+        .allow_borrow = step.allow_borrow,
+        .local_device_peer_copy_available = step.local_device_peer_copy_available,
+    });
+    const envelope = try stage_transport.buildStageTransportActivationEnvelope(.{
+        .metadata = step.metadata,
+        .image = step.image,
+        .decision = decision,
+    });
+    return .{
+        .decision = decision,
+        .envelope = envelope,
+    };
 }
 
 // Private regression harness for the pre-chain one-boundary runner contract.
@@ -738,20 +813,54 @@ fn executeLocalStageBoundary(
     if (source.executeLayers(request.stage0_input, boundary.producer_layer_start, boundary.producer_layer_end)) |_| {} else |err| {
         return stageFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, boundary.source_stage_id, boundary.source_host_id, err, request.touched_stage_scratch[0..touched_len]);
     }
-    if (source.synchronize()) |_| {} else |err| {
+
+    var transport_metadata = request.step.metadata;
+    transport_metadata.payload.location_hint = .{ .cuda = 0 };
+    var image = deviceActivationByteImage(&transport_metadata);
+    const decision = stage_transfer_mode.chooseStageTransferMode(.{
+        .placement_plan = request.placement_plan,
+        .metadata = &transport_metadata,
+        .image = &image,
+        .allow_borrow = false,
+    }) catch |err| {
+        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, err, request.touched_stage_scratch[0..touched_len], .validation_before_mutation);
+    };
+    const envelope = stage_transport.buildStageTransportActivationEnvelope(.{
+        .metadata = &transport_metadata,
+        .image = &image,
+        .decision = decision,
+    }) catch |err| {
+        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, err, request.touched_stage_scratch[0..touched_len], .validation_before_mutation);
+    };
+    var source_transport = local_stage_transport.localStageTransportAdapter(SourceStageType, boundary.source_stage_id, &source);
+    var target_transport = local_stage_transport.localStageTransportAdapter(TargetStageType, boundary.target_stage_id, &target);
+    var failure_capture = local_stage_transport.LocalStageTransportFailureCapture.init(std.heap.page_allocator);
+    defer failure_capture.deinit();
+    local_stage_transport.executeLocalStageTransportWithFailureCapture(
+        local_stage_transport.LocalStageTransportEndpoint,
+        local_stage_transport.LocalStageTransportEndpoint,
+        &source_transport,
+        &target_transport,
+        .{
+            .placement_plan = request.placement_plan,
+            .metadata = &transport_metadata,
+            .image = &image,
+            .decision = decision,
+            .envelope = &envelope,
+            .source_receipt = local_stage_transport.StageExecutionReceipt.completed(boundary.source_stage_id),
+            .staging = staging,
+            .allow_borrow = false,
+        },
+        &failure_capture,
+    ) catch |err| {
+        touched_len = localBoundaryTouchedFromTransportFailure(request, boundary, batch_entry, &failure_capture);
         return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, err, request.touched_stage_scratch[0..touched_len], .frame_handoff);
-    }
-    if (source.downloadActivation(staging[0..request.step.activation_byte_count], request.step.activation_byte_count)) |_| {} else |err| {
-        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, err, request.touched_stage_scratch[0..touched_len], .frame_handoff);
-    }
+    };
 
     request.touched_stage_scratch[1] = touchedRef(boundary.target_stage_id, boundary.target_host_id, batch_entry, .{
         .receiver_payload_mutation_started = true,
     });
     touched_len = 2;
-    if (target.uploadActivation(staging[0..request.step.activation_byte_count], request.step.activation_byte_count)) |_| {} else |err| {
-        return transportFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, err, request.touched_stage_scratch[0..touched_len], .frame_handoff);
-    }
     if (tensor_frame.emitTensorFrame(request.step.observer, request.step.observer_mode, &request.step.metadata)) |_| {} else |err| {
         return observerFailure(request.plan_ref, boundary, batch_entry, tensor_frame_id, err, request.touched_stage_scratch[0..touched_len]);
     }
@@ -765,6 +874,30 @@ fn executeLocalStageBoundary(
         .request_id = batch_entry.request_id,
         .slot_id = batch_entry.slot_id,
     } };
+}
+
+fn localBoundaryTouchedFromTransportFailure(
+    request: LocalStageBoundaryRunRequest,
+    boundary: *const LocalStageRunnerBoundaryRef,
+    batch_entry: tensor_frame.TensorFrameBatchEntry,
+    failure_capture: *const local_stage_transport.LocalStageTransportFailureCapture,
+) usize {
+    var touched_len: usize = 1;
+    if (failure_capture.report) |report| {
+        if (report.entries.len != 0) {
+            touched_len = @min(report.entries[0].touched_stages.len, @as(usize, 2));
+        }
+    }
+    if (touched_len == 0) return 0;
+    request.touched_stage_scratch[0] = touchedRef(boundary.source_stage_id, boundary.source_host_id, batch_entry, .{
+        .execution_started = true,
+    });
+    if (touched_len >= 2) {
+        request.touched_stage_scratch[1] = touchedRef(boundary.target_stage_id, boundary.target_host_id, batch_entry, .{
+            .receiver_payload_mutation_started = true,
+        });
+    }
+    return touched_len;
 }
 
 pub const LocalStageExecutionFailureEntry = struct {
@@ -1053,25 +1186,52 @@ fn deriveLocalStageExecutionCleanupObligationsForTouched(
     return allocator.dupe(state_ownership.StateCleanupObligation, obligations);
 }
 
-fn validateLocalStageChainRequestShape(request: LocalStageChainRequest) anyerror!void {
+fn validateLocalStageEndpointRegistryChainRequestShape(request: LocalStageEndpointRegistryChainRequest) anyerror!void {
     try validateLocalStageRunnerPlanRef(request.plan_ref);
     try host_capability.validatePlacementPlan(request.placement_plan);
-    if (request.stages.len < 2) return error.InvalidStageRange;
-    if (request.boundaries.len + 1 != request.stages.len) return error.InvalidStepRequest;
-    if (request.stage_inputs.len != 0 and request.stage_inputs.len != request.stages.len) {
+    if (request.registry.endpoints.len < 2) return error.InvalidStageRange;
+    if (request.registry.endpoints.len != request.plan_ref.stages.len) return error.InvalidStepRequest;
+    if (request.boundaries.len + 1 != request.plan_ref.stages.len) return error.InvalidStepRequest;
+    if (request.stage_inputs.len != 0 and request.stage_inputs.len != request.plan_ref.stages.len) {
         return error.InvalidStepRequest;
     }
-    for (request.stages, 0..) |stage, stage_index| {
-        const expected = stageRef(request.plan_ref.stages, stage.stage_id) orelse return error.MissingStageRef;
-        if (stage_index > 0 and request.stages[stage_index - 1].stage_id >= stage.stage_id) {
-            return error.DuplicateStageRef;
+    var registry = request.registry;
+    for (request.plan_ref.stages) |stage_ref| {
+        const endpoint = try registry.endpointForStageId(stage_ref.stage_id);
+        if (endpoint.stage_id != stage_ref.stage_id) {
+            return error.StageRunnerPlanIdentityMismatch;
         }
-        _ = expected;
+    }
+    for (request.registry.endpoints, 0..) |endpoint, endpoint_index| {
+        _ = stageRef(request.plan_ref.stages, endpoint.stage_id) orelse return error.MissingStageRef;
+        for (request.registry.endpoints[endpoint_index + 1 ..]) |other| {
+            if (other.stage_id == endpoint.stage_id) return error.DuplicateStageRef;
+        }
+    }
+    if (request.registry.transport_endpoints.len != 0) {
+        if (request.registry.transport_endpoints.len != request.plan_ref.stages.len) return error.InvalidStepRequest;
+        var transport_registry = local_stage_transport.LocalStageTransportEndpointRegistry{
+            .endpoints = request.registry.transport_endpoints,
+        };
+        for (request.plan_ref.stages) |stage_ref| {
+            const endpoint = try transport_registry.endpointForStageId(stage_ref.stage_id);
+            if (endpoint.stage_id != stage_ref.stage_id) return error.StageRunnerPlanIdentityMismatch;
+        }
+        for (request.registry.transport_endpoints, 0..) |endpoint, endpoint_index| {
+            _ = stageRef(request.plan_ref.stages, endpoint.stage_id) orelse return error.MissingStageRef;
+            for (request.registry.transport_endpoints[endpoint_index + 1 ..]) |other| {
+                if (other.stage_id == endpoint.stage_id) return error.DuplicateStageRef;
+            }
+        }
+    } else {
+        for (request.registry.endpoints) |endpoint| {
+            if (endpoint.transport_endpoint == null) return error.MissingStageRef;
+        }
     }
 }
 
-fn validateLocalStageChainBoundary(
-    request: LocalStageChainRequest,
+fn validateLocalStageChainBoundaryStatic(
+    request: LocalStageEndpointRegistryChainRequest,
     boundary: *const LocalStageRunnerBoundaryRef,
     step: LocalStageChainBoundaryStep,
     boundary_position: usize,
@@ -1079,8 +1239,8 @@ fn validateLocalStageChainBoundary(
     if (boundary_position > 0 and step.boundary_index != request.boundaries[boundary_position - 1].boundary_index + 1) {
         return error.BoundaryIndexOutOfRange;
     }
-    if (request.stages[boundary_position].stage_id != boundary.source_stage_id or
-        request.stages[boundary_position + 1].stage_id != boundary.target_stage_id)
+    if (request.plan_ref.stages[boundary_position].stage_id != boundary.source_stage_id or
+        request.plan_ref.stages[boundary_position + 1].stage_id != boundary.target_stage_id)
     {
         return error.StageRunnerPlanIdentityMismatch;
     }
@@ -1097,11 +1257,38 @@ fn validateLocalStageChainBoundary(
     try validateTensorFrameAgainstRunnerPlan(request.plan_ref, step.metadata, step.boundary_index);
     try tensor_frame.validatePayloadBufferLength(step.metadata, step.image.byte_count);
     try validateTensorFrameAgainstBoundaryProfile(step.metadata, profile);
+}
+
+fn validateLocalStageChainBoundaryImageBeforeMutation(
+    step: LocalStageChainBoundaryStep,
+) anyerror!void {
+    try boundary_byte_image.validateBoundaryByteImage(step.image, .{
+        .allow_pending_host_segments = step.image.host_segments != null,
+    });
+    if (step.image.metadata != step.metadata) return error.BoundaryTensorContractMismatch;
+}
+
+fn validateLocalStageChainBoundaryImage(
+    step: LocalStageChainBoundaryStep,
+) anyerror!void {
     try boundary_byte_image.validateBoundaryByteImage(step.image, .{});
     if (step.image.metadata != step.metadata) return error.BoundaryTensorContractMismatch;
 }
 
-fn stageInput(request: LocalStageChainRequest, stage_index: usize) []const u8 {
+fn executeEndpointForStep(
+    endpoint: *LocalStageEndpoint,
+    step_kind: tensor_frame.TensorFrameStepKind,
+    input: []const u8,
+    layer_start: usize,
+    layer_end: usize,
+) anyerror!local_stage_transport.StageExecutionReceipt {
+    return switch (step_kind) {
+        .decode => endpoint.executeDecodeLayerRange(input, layer_start, layer_end),
+        .prefill => endpoint.executePrefillLayerRange(input, layer_start, layer_end),
+    };
+}
+
+fn stageInput(request: anytype, stage_index: usize) []const u8 {
     if (request.stage_inputs.len == 0) return &.{};
     return request.stage_inputs[stage_index];
 }
@@ -2206,6 +2393,7 @@ test "executeLocalStageBoundary rejects boundary execution for one stage runner"
     const frame = try testDecodeFrame(&frame_fixture.plan_ref, 0, 1);
     try expectFailureSource(error.BoundaryIndexOutOfRange, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &frame_fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2233,6 +2421,7 @@ test "executeLocalStageBoundary returns runner plan validation failures as failu
     runner.version = local_stage_runner_contract_version + 1;
     try expectFailureSourceFrameId(error.InvalidLocalStageRunnerContractVersion, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2244,6 +2433,7 @@ test "executeLocalStageBoundary returns runner plan validation failures as failu
     runner.plan_id = computeLocalStageRunnerPlanId(&runner);
     try expectFailureSourceFrameId(error.DuplicateBoundaryRef, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2271,6 +2461,7 @@ test "executeLocalStageBoundary executes mock handoff through host staging and p
 
     const result = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{
             .boundary_index = 0,
             .step_kind = .decode,
@@ -2428,6 +2619,7 @@ test "executeLocalStageBoundary accepts three stage plans and executes nonzero p
     const frame = try testDecodeFrame(&fixture.plan_ref, 1, 1);
     const result = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{
             .boundary_index = 1,
             .step_kind = .decode,
@@ -2446,18 +2638,14 @@ test "executeLocalStageBoundary accepts three stage plans and executes nonzero p
 
 test "executeLocalStageBoundary validates frame from copied runner facts without original plan ref" {
     const allocator = std.testing.allocator;
-    var runner: LocalStageRunnerPlanRef = undefined;
-    var frame: tensor_frame.TensorFrameMetadata = undefined;
-    {
-        var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
-        runner = try buildLocalStageRunnerPlanRef(allocator, .{
-            .stage_plan = &fixture.plan,
-            .tensor_frame_plan_ref = &fixture.plan_ref,
-            .placement_plan = &fixture.placement,
-        });
-        frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
-        fixture.deinit();
-    }
+    var fixture = try TestFixture.init(allocator, &.{2}, .local_in_process, false);
+    defer fixture.deinit();
+    var runner = try buildLocalStageRunnerPlanRef(allocator, .{
+        .stage_plan = &fixture.plan,
+        .tensor_frame_plan_ref = &fixture.plan_ref,
+        .placement_plan = &fixture.placement,
+    });
+    const frame = try testDecodeFrame(&fixture.plan_ref, 0, 1);
     defer runner.deinit();
 
     var source_trace = MockTrace{};
@@ -2466,6 +2654,7 @@ test "executeLocalStageBoundary validates frame from copied runner facts without
     var touched: [2]LocalStageTouchedRef = undefined;
     const result = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2496,6 +2685,7 @@ test "executeLocalStageBoundary enforces selected boundary profile facts before 
     wrong_step.shape_context.expected_step_kind = .prefill;
     try expectFailureSourceFrameId(error.InvalidStepKind, wrong_step.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = wrong_step, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2506,6 +2696,7 @@ test "executeLocalStageBoundary enforces selected boundary profile facts before 
     runner.plan_id = computeLocalStageRunnerPlanId(&runner);
     try expectFailureSourceFrameId(error.InvalidDType, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2516,6 +2707,7 @@ test "executeLocalStageBoundary enforces selected boundary profile facts before 
     runner.plan_id = computeLocalStageRunnerPlanId(&runner);
     try expectFailureSourceFrameId(error.UnsupportedTensorLayout, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2526,6 +2718,7 @@ test "executeLocalStageBoundary enforces selected boundary profile facts before 
     runner.plan_id = computeLocalStageRunnerPlanId(&runner);
     try expectFailureSourceFrameId(error.InvalidBatch, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2536,6 +2729,7 @@ test "executeLocalStageBoundary enforces selected boundary profile facts before 
     runner.plan_id = computeLocalStageRunnerPlanId(&runner);
     try expectFailureSourceFrameId(error.InvalidSequenceRange, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2546,6 +2740,7 @@ test "executeLocalStageBoundary enforces selected boundary profile facts before 
     runner.plan_id = computeLocalStageRunnerPlanId(&runner);
     try expectFailureSourceFrameId(error.InvalidPayloadByteCount, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2573,36 +2768,42 @@ test "executeLocalStageBoundary returns exact source_error for validation failur
 
     try expectFailureSourceFrameId(error.LocalStageTransferNotInitialized, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = null,
         .touched_stage_scratch = &touched,
     }));
     try expectFailureSource(error.LocalStageTransferBufferTooSmall, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..4],
         .touched_stage_scratch = &touched,
     }));
     try expectFailureSourceFrameId(error.InvalidRequestId, frame.frame_id, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8, .expected_request_id = 999 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
     }));
     try expectFailureSource(error.BoundaryIndexOutOfRange, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 99, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
     }));
     try expectFailureSource(error.MissingBoundaryFrameProfile, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .prefill, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
     }));
     try expectFailureSource(error.PayloadBufferLengthMismatch, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 + 4 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2610,6 +2811,7 @@ test "executeLocalStageBoundary returns exact source_error for validation failur
     frame.batch = .{ .entries = &.{} };
     try expectFailureSource(error.InvalidBatch, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2617,6 +2819,7 @@ test "executeLocalStageBoundary returns exact source_error for validation failur
     frame = try testDecodeFrame(&fixture.plan_ref, 0, 2);
     try expectFailureSource(error.InvalidBatch, try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @as(usize, @intCast(frame.payload.byte_count)) },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2643,6 +2846,7 @@ test "executeLocalStageBoundary reports transfer and target mutation touched sta
 
     const transfer_result = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace, .fail_download = error.DiskQuota }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2655,6 +2859,7 @@ test "executeLocalStageBoundary reports transfer and target mutation touched sta
     target_trace = .{};
     const upload_result = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace, .fail_upload = error.AccessDenied }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2682,6 +2887,7 @@ test "executeLocalStageBoundary classifies out of memory and transfer cancellati
 
     const stage_oom = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace, .fail_execute = error.OutOfMemory }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2693,6 +2899,7 @@ test "executeLocalStageBoundary classifies out of memory and transfer cancellati
     target_trace = .{};
     const transport_cancelled = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace, .fail_synchronize = error.RequestCancelled }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2703,6 +2910,7 @@ test "executeLocalStageBoundary classifies out of memory and transfer cancellati
     target_trace = .{};
     const transport_oom = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace, .fail_download = error.OutOfMemory }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8 },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2729,6 +2937,7 @@ test "executeLocalStageBoundary preserves observer best effort and strict modes"
 
     const best_effort = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8, .observer = observer },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,
@@ -2739,6 +2948,7 @@ test "executeLocalStageBoundary preserves observer best effort and strict modes"
     target_trace = .{};
     const strict = try executeLocalStageBoundary(MockStage, MockStage, .{ .trace = &source_trace }, .{ .trace = &target_trace }, .{
         .plan_ref = &runner,
+        .placement_plan = &fixture.placement,
         .step = .{ .boundary_index = 0, .step_kind = .decode, .metadata = frame, .activation_byte_count = @sizeOf(f32) * 8, .observer = observer, .observer_mode = .strict },
         .host_staging = staging[0..],
         .touched_stage_scratch = &touched,

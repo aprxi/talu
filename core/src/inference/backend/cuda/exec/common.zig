@@ -200,32 +200,6 @@ pub fn prepareCudaPrefillBackend(backend: anytype, total_rows: usize) !void {
     resetGatedDeltaStates(backend);
 }
 
-pub fn executeCpuStage0LayerRange(
-    stage0: anytype,
-    token: u32,
-    position: usize,
-    slot_index: usize,
-    split_layer: usize,
-    ensure_kv_capacity: bool,
-) !void {
-    const Stage0Type = @TypeOf(stage0.*);
-    if (comptime !typeHasDecl(Stage0Type, "executeDecodeLayerRange")) {
-        return error.InvalidTopologyConfig;
-    }
-    try stage0.executeDecodeLayerRange(
-        token,
-        position,
-        slot_index,
-        null,
-        0,
-        split_layer,
-        false,
-        false,
-        ensure_kv_capacity,
-        false,
-    );
-}
-
 pub fn localActivationByteCountFor(self: anytype) !usize {
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "localActivationByteCount")) {

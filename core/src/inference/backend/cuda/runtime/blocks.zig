@@ -940,7 +940,7 @@ pub fn validateCompiledLayerPlanForCuda(
 }
 
 /// Describes a CPU source layer whose KV cache is replicated to a mirror
-/// entry on the GPU. Used when cpu_gpu topology places KV-shared source
+/// entry on the GPU. Used when a local stage plan places KV-shared source
 /// layers on CPU while consumer layers run on GPU.
 pub const ReplicatedKvSource = struct {
     /// Global (model-wide) layer index of the CPU source layer.

@@ -57,6 +57,10 @@ pub const LocalStageChainBoundaryStep = local_stage_runner.LocalStageChainBounda
 pub const LocalStageChainRequest = local_stage_runner.LocalStageChainRequest;
 pub const LocalStageChainStage = local_stage_runner.LocalStageChainStage;
 pub const LocalStageChainStageVTable = local_stage_runner.LocalStageChainStageVTable;
+pub const LocalStageEndpoint = local_stage_runner.LocalStageEndpoint;
+pub const LocalStageEndpointRegistry = local_stage_runner.LocalStageEndpointRegistry;
+pub const LocalStageEndpointRegistryChainRequest = local_stage_runner.LocalStageEndpointRegistryChainRequest;
+pub const LocalStageEndpointVTable = local_stage_runner.LocalStageEndpointVTable;
 pub const LocalPipelineBoundaryPayload = local_pipeline.LocalPipelineBoundaryPayload;
 pub const LocalPipelineBoundaryRuntime = local_pipeline.LocalPipelineBoundaryRuntime;
 pub const LocalPipelineContext = local_pipeline.LocalPipelineContext;
@@ -197,10 +201,15 @@ pub const descriptorSetForStage = state_ownership.descriptorSetForStage;
 pub const dtypeByteSize = tensor_frame.dtypeByteSize;
 pub const emitTensorFrame = tensor_frame.emitTensorFrame;
 pub const executeLocalStageChain = local_stage_runner.executeLocalStageChain;
+pub const executeLocalStageEndpointRegistryChain = local_stage_runner.executeLocalStageEndpointRegistryChain;
 pub const executeLocalPipelineChain = local_pipeline.executeLocalPipelineChain;
+pub const executeLocalPipelineEndpointRegistryChain = local_pipeline.executeLocalPipelineEndpointRegistryChain;
 pub const executeLocalDecodePipelineStep = local_pipeline.executeLocalDecodePipelineStep;
+pub const executeLocalDecodePipelineStepWithEndpointRegistry = local_pipeline.executeLocalDecodePipelineStepWithEndpointRegistry;
 pub const executeLocalPrefillPipelineStep = local_pipeline.executeLocalPrefillPipelineStep;
+pub const executeLocalPrefillPipelineStepWithEndpointRegistry = local_pipeline.executeLocalPrefillPipelineStepWithEndpointRegistry;
 pub const executeLocalPipelineStep = local_pipeline.executeLocalPipelineStep;
+pub const executeLocalPipelineStepWithEndpointRegistry = local_pipeline.executeLocalPipelineStepWithEndpointRegistry;
 pub const validateLocalPipelineStageBindings = local_pipeline.validateLocalPipelineStageBindings;
 pub const executeLocalStageLayers = local_stage_runner.executeLocalStageLayers;
 pub const fromComputeDType = tensor_frame.fromComputeDType;
@@ -317,6 +326,13 @@ test "inference bridge root exports staged_error contract" {
 
 test "inference bridge root exports local_stage_runner contract" {
     _ = local_stage_runner.LocalStageRunnerPlanRef;
+    _ = LocalStageChainBoundaryStep;
+    _ = LocalStageChainRequest;
+    _ = LocalStageChainStage;
+    _ = LocalStageEndpoint;
+    _ = LocalStageEndpointRegistry;
+    _ = LocalStageEndpointRegistryChainRequest;
+    _ = LocalStageEndpointVTable;
     _ = LocalPipelineBoundaryPayload;
     _ = LocalPipelineBoundaryRuntime;
     _ = LocalPipelineContext;
@@ -332,10 +348,15 @@ test "inference bridge root exports local_stage_runner contract" {
     _ = buildLocalStageRunnerPlanRef;
     _ = validateLocalStageRunnerPlanRef;
     _ = executeLocalStageChain;
+    _ = executeLocalStageEndpointRegistryChain;
     _ = executeLocalPipelineChain;
+    _ = executeLocalPipelineEndpointRegistryChain;
     _ = executeLocalDecodePipelineStep;
+    _ = executeLocalDecodePipelineStepWithEndpointRegistry;
     _ = executeLocalPrefillPipelineStep;
+    _ = executeLocalPrefillPipelineStepWithEndpointRegistry;
     _ = executeLocalPipelineStep;
+    _ = executeLocalPipelineStepWithEndpointRegistry;
     _ = validateLocalPipelineStageBindings;
     _ = localStageRunnerPlanIdEql;
 }

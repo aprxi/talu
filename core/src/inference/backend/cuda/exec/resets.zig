@@ -31,17 +31,6 @@ const tryPopulateHiddenFromToken = engine_weights.tryPopulateHiddenFromToken;
 const saturatingU64FromU128 = engine_types.saturatingU64FromU128;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 
-fn topologyModeTag(self: anytype) ?[]const u8 {
-    const SelfType = @TypeOf(self.*);
-    if (comptime !@hasField(SelfType, "topology_mode")) return null;
-    return @tagName(self.topology_mode);
-}
-
-fn topologyModeIs(self: anytype, comptime expected: []const u8) bool {
-    const tag = topologyModeTag(self) orelse return false;
-    return std.mem.eql(u8, tag, expected);
-}
-
 /// Resolve staged prefill chunk rows for a specific request length.
 /// Keeps explicit env override behavior unchanged.
 pub fn resetShortConvStates(self: anytype) !void {

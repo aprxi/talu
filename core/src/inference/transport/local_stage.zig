@@ -1,8 +1,8 @@
 //! Local staged activation transport executor.
 //!
 //! This module validates bridge-owned handoff contracts and executes one
-//! adjacent process-local activation transfer through caller-owned adapters. It
-//! does not own adapters, allocate transport buffers, or choose backend routes.
+//! adjacent process-local activation transfer through transport endpoint
+//! adapters. It does not allocate transport buffers or choose backend routes.
 
 const std = @import("std");
 
@@ -32,18 +32,188 @@ pub const LocalStageTransportValidationError =
         LocalStageTransportRemoteModeUnsupported,
     };
 
+pub const StageExecutionFence = union(enum) {
+    none,
+};
+
+pub const StageExecutionReceipt = struct {
+    stage_id: usize,
+    fence: StageExecutionFence = .none,
+
+    pub fn completed(stage_id: usize) @This() {
+        return .{ .stage_id = stage_id };
+    }
+};
+
 pub const LocalStageTransportRequest = struct {
     placement_plan: *const host_capability.PlacementPlan,
     metadata: *const tensor_frame.TensorFrameMetadata,
     image: *const boundary_byte_image.BoundaryByteImageRef,
     decision: stage_transfer_mode.StageTransferModeDecision,
     envelope: *const stage_transport.StageTransportEnvelope,
+    source_receipt: ?StageExecutionReceipt = null,
     staging: ?[]align(64) u8 = null,
     allow_borrow: bool = true,
     local_device_peer_copy_available: bool = false,
     state_ownership_plan: ?*const state_ownership.StageStateOwnershipPlan = null,
     cleanup_obligations: []const state_ownership.StateCleanupObligation = &.{},
 };
+
+pub const LocalStageTransportEndpointVTable = struct {
+    synchronize: *const fn (*anyopaque, StageExecutionReceipt) anyerror!void,
+    prepare_boundary_transfer_to: ?*const fn (*anyopaque, *anyopaque, *const tensor_frame.TensorFrameMetadata) anyerror!void = null,
+    download_activation: *const fn (*anyopaque, []u8, usize) anyerror!void,
+    upload_activation: *const fn (*anyopaque, []const u8, usize) anyerror!void,
+    upload_activation_segments: ?*const fn (*anyopaque, []const []const u8, usize) anyerror!void = null,
+    consume_borrowed_activation: ?*const fn (*anyopaque, []const u8, usize) anyerror!void = null,
+    peer_copy_activation_to: ?*const fn (*anyopaque, *anyopaque, usize) anyerror!void = null,
+    peer_copy_handles_stage_sync: ?*const fn (*anyopaque) bool = null,
+};
+
+pub const LocalStageTransportEndpoint = struct {
+    stage_id: usize,
+    ptr: *anyopaque,
+    vtable: *const LocalStageTransportEndpointVTable,
+
+    pub fn synchronize(self: *@This(), receipt: StageExecutionReceipt) anyerror!void {
+        if (receipt.stage_id != self.stage_id) return error.StageTransferBoundaryMismatch;
+        return self.vtable.synchronize(self.ptr, receipt);
+    }
+
+    pub fn prepareBoundaryTransferTo(
+        self: *@This(),
+        target: *@This(),
+        metadata: *const tensor_frame.TensorFrameMetadata,
+    ) anyerror!void {
+        const prepare = self.vtable.prepare_boundary_transfer_to orelse return;
+        return prepare(self.ptr, target.ptr, metadata);
+    }
+
+    pub fn downloadActivation(self: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+        return self.vtable.download_activation(self.ptr, host_buf, byte_count);
+    }
+
+    pub fn uploadActivation(self: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+        return self.vtable.upload_activation(self.ptr, host_buf, byte_count);
+    }
+
+    pub fn uploadActivationSegments(self: *@This(), host_segments: []const []const u8, byte_count: usize) anyerror!void {
+        const upload_segments = self.vtable.upload_activation_segments orelse return error.LocalStageTransportSegmentedUploadUnsupported;
+        return upload_segments(self.ptr, host_segments, byte_count);
+    }
+
+    pub fn consumeBorrowedActivation(self: *@This(), host_bytes: []const u8, byte_count: usize) anyerror!void {
+        const consume = self.vtable.consume_borrowed_activation orelse return error.LocalStageTransportBorrowUnsupported;
+        return consume(self.ptr, host_bytes, byte_count);
+    }
+
+    pub fn peerCopyActivationTo(self: *@This(), target: anytype, byte_count: usize) anyerror!void {
+        const peer_copy = self.vtable.peer_copy_activation_to orelse return error.LocalStageTransportPeerCopyUnsupported;
+        return peer_copy(self.ptr, target.ptr, byte_count);
+    }
+
+    pub fn peerCopyHandlesStageSync(self: *const @This()) bool {
+        const handles_sync = self.vtable.peer_copy_handles_stage_sync orelse return false;
+        return handles_sync(self.ptr);
+    }
+};
+
+pub const LocalStageTransportEndpointRegistry = struct {
+    endpoints: []LocalStageTransportEndpoint,
+
+    pub fn endpointForStageId(self: *@This(), stage_id: usize) error{ DuplicateStageRef, MissingStageRef }!*LocalStageTransportEndpoint {
+        var found: ?*LocalStageTransportEndpoint = null;
+        for (self.endpoints) |*endpoint| {
+            if (endpoint.stage_id != stage_id) continue;
+            if (found != null) return error.DuplicateStageRef;
+            found = endpoint;
+        }
+        return found orelse error.MissingStageRef;
+    }
+};
+
+pub fn localStageTransportAdapter(comptime Stage: type, stage_id: usize, stage: *Stage) LocalStageTransportEndpoint {
+    const Adapter = struct {
+        fn stagePtr(ptr: *anyopaque) *Stage {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn synchronize(ptr: *anyopaque, receipt: StageExecutionReceipt) anyerror!void {
+            _ = receipt;
+            if (comptime @hasDecl(Stage, "synchronize")) {
+                return stagePtr(ptr).synchronize();
+            }
+        }
+
+        fn prepareBoundaryTransferTo(
+            ptr: *anyopaque,
+            target_ptr: *anyopaque,
+            metadata: *const tensor_frame.TensorFrameMetadata,
+        ) anyerror!void {
+            if (comptime @hasDecl(Stage, "prepareBoundaryTransferToErased")) {
+                return stagePtr(ptr).prepareBoundaryTransferToErased(target_ptr, metadata);
+            }
+        }
+
+        fn downloadActivation(ptr: *anyopaque, host_buf: []u8, byte_count: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "downloadActivation")) {
+                return stagePtr(ptr).downloadActivation(host_buf, byte_count);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        fn uploadActivation(ptr: *anyopaque, host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "uploadActivation")) {
+                return stagePtr(ptr).uploadActivation(host_buf, byte_count);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        fn uploadActivationSegments(ptr: *anyopaque, host_segments: []const []const u8, byte_count: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "uploadActivationSegments")) {
+                return stagePtr(ptr).uploadActivationSegments(host_segments, byte_count);
+            }
+            return error.LocalStageTransportSegmentedUploadUnsupported;
+        }
+
+        fn consumeBorrowedActivation(ptr: *anyopaque, host_bytes: []const u8, byte_count: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "consumeBorrowedActivation")) {
+                return stagePtr(ptr).consumeBorrowedActivation(host_bytes, byte_count);
+            }
+            return error.LocalStageTransportBorrowUnsupported;
+        }
+
+        fn peerCopyActivationTo(ptr: *anyopaque, target_ptr: *anyopaque, byte_count: usize) anyerror!void {
+            if (comptime @hasDecl(Stage, "peerCopyActivationToErased")) {
+                return stagePtr(ptr).peerCopyActivationToErased(target_ptr, byte_count);
+            }
+            return error.LocalStageTransportPeerCopyUnsupported;
+        }
+
+        fn peerCopyHandlesStageSync(ptr: *anyopaque) bool {
+            if (comptime @hasDecl(Stage, "peerCopyHandlesStageSync")) {
+                return stagePtr(ptr).peerCopyHandlesStageSync();
+            }
+            return false;
+        }
+
+        const vtable = LocalStageTransportEndpointVTable{
+            .synchronize = synchronize,
+            .prepare_boundary_transfer_to = if (@hasDecl(Stage, "prepareBoundaryTransferToErased")) prepareBoundaryTransferTo else null,
+            .download_activation = downloadActivation,
+            .upload_activation = uploadActivation,
+            .upload_activation_segments = if (@hasDecl(Stage, "uploadActivationSegments")) uploadActivationSegments else null,
+            .consume_borrowed_activation = if (@hasDecl(Stage, "consumeBorrowedActivation")) consumeBorrowedActivation else null,
+            .peer_copy_activation_to = if (@hasDecl(Stage, "peerCopyActivationToErased")) peerCopyActivationTo else null,
+            .peer_copy_handles_stage_sync = if (@hasDecl(Stage, "peerCopyHandlesStageSync")) peerCopyHandlesStageSync else null,
+        };
+    };
+    return .{
+        .stage_id = stage_id,
+        .ptr = stage,
+        .vtable = &Adapter.vtable,
+    };
+}
 
 pub const LocalStageTransportEntryFailure = struct {
     primary_failure: staged_error.StagedFailure,
@@ -181,18 +351,14 @@ pub fn executeLocalStageTransportWithFailureCapture(
             if (comptime !@hasDecl(TargetStage, "consumeBorrowedActivation")) {
                 return failWithCapture(failure_capture, request, error.LocalStageTransportBorrowUnsupported, .validation_before_mutation, .validation, .none);
             }
-            source.synchronize() catch |err| {
-                return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source);
-            };
+            try prepareSourceBoundaryTransfer(SourceStage, TargetStage, source, target, request, failure_capture, true);
             target.consumeBorrowedActivation(host_bytes, byte_count) catch |err| {
                 return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source_target);
             };
         },
         .copy_in_process => {
             if (request.image.host_bytes) |host_bytes| {
-                source.synchronize() catch |err| {
-                    return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source);
-                };
+                try prepareSourceBoundaryTransfer(SourceStage, TargetStage, source, target, request, failure_capture, true);
                 target.uploadActivation(host_bytes, byte_count) catch |err| {
                     return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source_target);
                 };
@@ -200,9 +366,7 @@ pub fn executeLocalStageTransportWithFailureCapture(
                 if (comptime !@hasDecl(TargetStage, "uploadActivationSegments")) {
                     return failWithCapture(failure_capture, request, error.LocalStageTransportSegmentedUploadUnsupported, .validation_before_mutation, .validation, .none);
                 }
-                source.synchronize() catch |err| {
-                    return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source);
-                };
+                try prepareSourceBoundaryTransfer(SourceStage, TargetStage, source, target, request, failure_capture, true);
                 target.uploadActivationSegments(host_segments, byte_count) catch |err| {
                     return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source_target);
                 };
@@ -218,9 +382,7 @@ pub fn executeLocalStageTransportWithFailureCapture(
                 return failWithCapture(failure_capture, request, error.LocalStageTransportBufferTooSmall, .validation_before_mutation, .validation, .none);
             }
             const transfer_buf = staging[0..byte_count];
-            source.synchronize() catch |err| {
-                return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source);
-            };
+            try prepareSourceBoundaryTransfer(SourceStage, TargetStage, source, target, request, failure_capture, true);
             source.downloadActivation(transfer_buf, byte_count) catch |err| {
                 return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source);
             };
@@ -236,11 +398,7 @@ pub fn executeLocalStageTransportWithFailureCapture(
                 source.peerCopyHandlesStageSync()
             else
                 false;
-            if (!peer_copy_handles_sync) {
-                source.synchronize() catch |err| {
-                    return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source);
-                };
-            }
+            try prepareSourceBoundaryTransfer(SourceStage, TargetStage, source, target, request, failure_capture, !peer_copy_handles_sync);
             source.peerCopyActivationTo(target, byte_count) catch |err| {
                 return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source_target);
             };
@@ -249,6 +407,40 @@ pub fn executeLocalStageTransportWithFailureCapture(
             return failWithCapture(failure_capture, request, error.LocalStageTransportRemoteModeUnsupported, .validation_before_mutation, .validation, .none);
         },
     }
+}
+
+fn prepareSourceBoundaryTransfer(
+    comptime SourceStage: type,
+    comptime TargetStage: type,
+    source: *SourceStage,
+    target: *TargetStage,
+    request: LocalStageTransportRequest,
+    failure_capture: ?*LocalStageTransportFailureCapture,
+    synchronize_source: bool,
+) anyerror!void {
+    if (synchronize_source) {
+        const receipt = request.source_receipt orelse StageExecutionReceipt.completed(request.metadata.boundary.source_stage_id);
+        synchronizeSource(SourceStage, source, receipt) catch |err| {
+            return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source);
+        };
+    }
+    if (comptime @hasDecl(SourceStage, "prepareBoundaryTransferTo")) {
+        source.prepareBoundaryTransferTo(target, request.metadata) catch |err| {
+            return failWithCapture(failure_capture, request, err, .frame_handoff, .transport, .source_target);
+        };
+    }
+}
+
+fn synchronizeSource(
+    comptime SourceStage: type,
+    source: *SourceStage,
+    receipt: StageExecutionReceipt,
+) anyerror!void {
+    const synchronize_info = @typeInfo(@TypeOf(SourceStage.synchronize)).@"fn";
+    if (comptime synchronize_info.params.len == 2) {
+        return source.synchronize(receipt);
+    }
+    return source.synchronize();
 }
 
 fn requireStageAdapter(comptime Stage: type) void {
@@ -589,6 +781,7 @@ fn deriveCleanupObligationsForTouched(
 
 const TraceEvent = enum {
     source_synchronize,
+    source_prepare,
     source_download,
     source_peer_copy,
     target_upload,
@@ -656,6 +849,37 @@ const TestSourceStageNoPeer = struct {
 
     pub fn downloadActivation(self: *@This(), _: []u8, _: usize) anyerror!void {
         self.trace.record(.source_download);
+    }
+
+    pub fn uploadActivation(self: *@This(), _: []const u8, _: usize) anyerror!void {
+        _ = self;
+        unreachable;
+    }
+};
+
+const TestPreparingSourceStage = struct {
+    trace: *Trace,
+    fail_prepare: ?anyerror = null,
+    prepared_slot_id: u64 = 0,
+
+    pub fn synchronize(self: *@This()) anyerror!void {
+        self.trace.record(.source_synchronize);
+    }
+
+    pub fn prepareBoundaryTransferTo(
+        self: *@This(),
+        target: anytype,
+        metadata: *const tensor_frame.TensorFrameMetadata,
+    ) anyerror!void {
+        _ = target;
+        self.trace.record(.source_prepare);
+        self.prepared_slot_id = metadata.batch.entries[0].slot_id;
+        if (self.fail_prepare) |err| return err;
+    }
+
+    pub fn downloadActivation(self: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+        self.trace.record(.source_download);
+        @memset(host_buf[0..byte_count], 0x5a);
     }
 
     pub fn uploadActivation(self: *@This(), _: []const u8, _: usize) anyerror!void {
@@ -784,14 +1008,38 @@ const test_decode_entries_two = [_]tensor_frame.TensorFrameBatchEntry{
     .{ .batch_index = 1, .request_id = 102, .slot_id = 89, .sequence_start = 12, .token_count = 1 },
 };
 
+const TestImageKind = enum { host, segments, device };
+
 fn buildTestBundle(
     allocator: std.mem.Allocator,
     handoff_mode: host_capability.BoundaryHandoffMode,
-    image_kind: enum { host, segments, device },
+    image_kind: TestImageKind,
     allow_borrow: bool,
     peer_copy_available: bool,
 ) !TestBundle {
-    var placement = try buildTestPlacement(allocator, handoff_mode);
+    return buildTestBundleWithBackends(
+        allocator,
+        handoff_mode,
+        image_kind,
+        allow_borrow,
+        peer_copy_available,
+        .cuda,
+        .cuda,
+        .{ .cuda = 0 },
+    );
+}
+
+fn buildTestBundleWithBackends(
+    allocator: std.mem.Allocator,
+    handoff_mode: host_capability.BoundaryHandoffMode,
+    image_kind: TestImageKind,
+    allow_borrow: bool,
+    peer_copy_available: bool,
+    source_backend_kind: host_capability.HostBackendKind,
+    target_backend_kind: host_capability.HostBackendKind,
+    device_location_hint: tensor_frame.TensorFramePayloadLocationHint,
+) !TestBundle {
+    var placement = try buildTestPlacementWithBackends(allocator, handoff_mode, source_backend_kind, target_backend_kind);
     errdefer placement.deinit();
     const entries = if (image_kind == .segments) &test_decode_entries_two else &test_decode_entry;
     const arena_allocator = placement.arena.allocator();
@@ -811,7 +1059,7 @@ fn buildTestBundle(
         .host => testImage(metadata, .host_readable_now, host_payload),
         .segments => testSegmentedImage(metadata, segments),
         .device => blk: {
-            metadata.payload.location_hint = .{ .cuda = 0 };
+            metadata.payload.location_hint = device_location_hint;
             break :blk testImage(metadata, .device_download_required, null);
         },
     };
@@ -918,6 +1166,15 @@ fn buildTestPlacement(
     allocator: std.mem.Allocator,
     handoff_mode: host_capability.BoundaryHandoffMode,
 ) !host_capability.PlacementPlan {
+    return buildTestPlacementWithBackends(allocator, handoff_mode, .cuda, .cuda);
+}
+
+fn buildTestPlacementWithBackends(
+    allocator: std.mem.Allocator,
+    handoff_mode: host_capability.BoundaryHandoffMode,
+    source_backend_kind: host_capability.HostBackendKind,
+    target_backend_kind: host_capability.HostBackendKind,
+) !host_capability.PlacementPlan {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
@@ -948,12 +1205,14 @@ fn buildTestPlacement(
     const hosts = try arena_allocator.alloc(host_capability.PlacementHostSummary, host_count);
     hosts[0] = .{
         .host_id = .{ .value = 1 },
+        .backend_kind = source_backend_kind,
         .capability_id = .{ .digest = testDigest(0x10) },
         .residency_snapshot_id = .{ .digest = testDigest(0x20) },
     };
     if (host_count == 2) {
         hosts[1] = .{
             .host_id = .{ .value = 2 },
+            .backend_kind = target_backend_kind,
             .capability_id = .{ .digest = testDigest(0x30) },
             .residency_snapshot_id = .{ .digest = testDigest(0x40) },
         };
@@ -1092,6 +1351,7 @@ fn writeTestStageHostBinding(encoder: *TestHashEncoder, binding: host_capability
 
 fn writeTestPlacementHostSummary(encoder: *TestHashEncoder, summary: host_capability.PlacementHostSummary) void {
     encoder.writeU64(summary.host_id.value);
+    encoder.writeU8(@intFromEnum(summary.backend_kind));
     encoder.writeBytes(&summary.capability_id.digest);
     encoder.writeBytes(&summary.residency_snapshot_id.digest);
 }
@@ -1193,6 +1453,37 @@ test "inference bridge local_stage_transport executeLocalStageTransport borrows 
     try std.testing.expectEqual(@as(u8, 0x31), target.upload_first_byte);
 }
 
+test "inference bridge local_stage_transport endpoint registry waits on matching source receipt" {
+    var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .device, false, false);
+    defer bundle.deinit();
+    var staging: [16]u8 align(64) = undefined;
+    var request = bundle.request();
+    request.staging = staging[0..];
+    request.source_receipt = StageExecutionReceipt.completed(bundle.metadata.boundary.source_stage_id);
+
+    var trace = Trace{};
+    var source_stage = TestSourceStage{ .trace = &trace };
+    var target_stage = TestTargetStage{ .trace = &trace };
+    var endpoints = [_]LocalStageTransportEndpoint{
+        localStageTransportAdapter(TestSourceStage, bundle.metadata.boundary.source_stage_id, &source_stage),
+        localStageTransportAdapter(TestTargetStage, bundle.metadata.boundary.target_stage_id, &target_stage),
+    };
+    var registry = LocalStageTransportEndpointRegistry{ .endpoints = endpoints[0..] };
+    const source = try registry.endpointForStageId(bundle.metadata.boundary.source_stage_id);
+    const target = try registry.endpointForStageId(bundle.metadata.boundary.target_stage_id);
+
+    try executeLocalStageTransport(LocalStageTransportEndpoint, LocalStageTransportEndpoint, source, target, request);
+    try trace.expect(&.{ .source_synchronize, .source_download, .target_upload });
+
+    trace = .{};
+    request.source_receipt = StageExecutionReceipt.completed(bundle.metadata.boundary.target_stage_id);
+    try std.testing.expectError(
+        error.StageTransferBoundaryMismatch,
+        executeLocalStageTransport(LocalStageTransportEndpoint, LocalStageTransportEndpoint, source, target, request),
+    );
+    try std.testing.expectEqual(@as(usize, 0), trace.count);
+}
+
 test "inference bridge local_stage_transport executeLocalStageTransportWithFailureCapture reports target mutation failure and preserves source error" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
     defer bundle.deinit();
@@ -1290,6 +1581,51 @@ test "inference bridge local_stage_transport executeLocalStageTransport copies h
     try trace.expect(&.{.source_synchronize});
 }
 
+test "inference bridge local_stage_transport executeLocalStageTransport prepares source before target mutation" {
+    var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
+    defer bundle.deinit();
+    var trace = Trace{};
+    var source = TestPreparingSourceStage{ .trace = &trace };
+    var target = TestTargetStage{ .trace = &trace };
+
+    try executeLocalStageTransport(TestPreparingSourceStage, TestTargetStage, &source, &target, bundle.request());
+
+    try trace.expect(&.{ .source_synchronize, .source_prepare, .target_upload });
+    try std.testing.expectEqual(test_decode_entry[0].slot_id, source.prepared_slot_id);
+    try std.testing.expectEqual(@as(usize, 16), target.upload_byte_count);
+}
+
+test "inference bridge local_stage_transport executeLocalStageTransportWithFailureCapture preserves source prepare errors" {
+    var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
+    defer bundle.deinit();
+    var trace = Trace{};
+    var source = TestPreparingSourceStage{ .trace = &trace, .fail_prepare = error.InjectedPrepareFailure };
+    var target = TestTargetStage{ .trace = &trace };
+    var capture = LocalStageTransportFailureCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    try std.testing.expectError(
+        error.InjectedPrepareFailure,
+        executeLocalStageTransportWithFailureCapture(
+            TestPreparingSourceStage,
+            TestTargetStage,
+            &source,
+            &target,
+            bundle.request(),
+            &capture,
+        ),
+    );
+
+    const report = capture.report orelse return error.MissingFailureReport;
+    try std.testing.expectEqual(error.InjectedPrepareFailure, report.source_error);
+    try std.testing.expectEqual(@as(usize, 1), report.entries.len);
+    try std.testing.expectEqual(staged_error.StagedFailureKind.transfer_failed, report.entries[0].primary_failure.kind);
+    try std.testing.expectEqual(staged_error.StagedFailurePhase.frame_handoff, report.entries[0].primary_failure.phase);
+    try std.testing.expectEqual(@as(usize, 2), report.entries[0].touched_stages.len);
+    try std.testing.expectEqual(@as(usize, 0), target.upload_byte_count);
+    try trace.expect(&.{ .source_synchronize, .source_prepare });
+}
+
 test "inference bridge local_stage_transport executeLocalStageTransport uploads host segments only with target support" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .segments, true, false);
     defer bundle.deinit();
@@ -1384,6 +1720,57 @@ test "inference bridge local_stage_transport executeLocalStageTransport executes
     target = .{ .trace = &trace };
     try std.testing.expectError(error.LocalStageTransportPeerCopyUnsupported, executeLocalStageTransport(TestSourceStageNoPeer, TestTargetStage, &no_peer_source, &target, request));
     try trace.expect(&.{});
+}
+
+fn expectTransportMatrixCase(
+    source_backend_kind: host_capability.HostBackendKind,
+    target_backend_kind: host_capability.HostBackendKind,
+    image_kind: TestImageKind,
+    location_hint: tensor_frame.TensorFramePayloadLocationHint,
+    peer_copy_available: bool,
+    allow_borrow: bool,
+    handoff_mode: host_capability.BoundaryHandoffMode,
+    expected_mode: stage_transfer_mode.StageTransferMode,
+    expected_trace: []const TraceEvent,
+) !void {
+    var bundle = try buildTestBundleWithBackends(
+        std.testing.allocator,
+        handoff_mode,
+        image_kind,
+        allow_borrow,
+        peer_copy_available,
+        source_backend_kind,
+        target_backend_kind,
+        location_hint,
+    );
+    defer bundle.deinit();
+    try std.testing.expectEqual(expected_mode, bundle.decision.mode);
+
+    var trace = Trace{};
+    var source = TestSourceStage{ .trace = &trace };
+    var target = TestTargetStage{ .trace = &trace };
+    var staging_storage: [64]u8 align(64) = [_]u8{0} ** 64;
+    var request = bundle.request();
+    request.local_device_peer_copy_available = peer_copy_available;
+    if (expected_mode == .device_download_then_copy) {
+        request.staging = staging_storage[0..];
+    }
+
+    try executeLocalStageTransport(TestSourceStage, TestTargetStage, &source, &target, request);
+    try trace.expect(expected_trace);
+}
+
+test "inference bridge local_stage_transport executeLocalStageTransport covers local backend transfer matrix" {
+    try expectTransportMatrixCase(.cpu, .cpu, .host, .cpu, false, true, .same_host_direct, .borrow_in_process, &.{ .source_synchronize, .target_borrow });
+    try expectTransportMatrixCase(.cpu, .cuda, .host, .cpu, false, false, .local_in_process, .copy_in_process, &.{ .source_synchronize, .target_upload });
+    try expectTransportMatrixCase(.cpu, .metal, .host, .cpu, false, false, .local_in_process, .copy_in_process, &.{ .source_synchronize, .target_upload });
+    try expectTransportMatrixCase(.cuda, .cpu, .device, .{ .cuda = 0 }, false, false, .local_in_process, .device_download_then_copy, &.{ .source_synchronize, .source_download, .target_upload });
+    try expectTransportMatrixCase(.metal, .cpu, .device, .{ .metal = 0 }, false, false, .local_in_process, .device_download_then_copy, &.{ .source_synchronize, .source_download, .target_upload });
+    try expectTransportMatrixCase(.cuda, .cuda, .device, .{ .cuda = 0 }, true, false, .local_in_process, .device_peer_copy_in_process, &.{ .source_synchronize, .source_peer_copy });
+    try expectTransportMatrixCase(.cuda, .cuda, .device, .{ .cuda = 0 }, false, false, .local_in_process, .device_download_then_copy, &.{ .source_synchronize, .source_download, .target_upload });
+    try expectTransportMatrixCase(.cuda, .metal, .device, .{ .cuda = 0 }, true, false, .local_in_process, .device_download_then_copy, &.{ .source_synchronize, .source_download, .target_upload });
+    try expectTransportMatrixCase(.metal, .cuda, .device, .{ .metal = 0 }, true, false, .local_in_process, .device_download_then_copy, &.{ .source_synchronize, .source_download, .target_upload });
+    try expectTransportMatrixCase(.metal, .metal, .device, .{ .metal = 0 }, true, false, .local_in_process, .device_peer_copy_in_process, &.{ .source_synchronize, .source_peer_copy });
 }
 
 test "inference bridge local_stage_transport executeLocalStageTransport rejects remote modes before synchronization" {

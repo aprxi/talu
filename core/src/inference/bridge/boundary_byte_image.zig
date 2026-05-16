@@ -44,6 +44,7 @@ pub const BoundaryByteImageRef = struct {
 pub const BoundaryByteImageValidationOptions = struct {
     require_host_readable: bool = false,
     allow_opaque_local: bool = true,
+    allow_pending_host_segments: bool = false,
 };
 
 pub fn validateBoundaryByteImage(
@@ -72,7 +73,7 @@ pub fn validateBoundaryByteImage(
         return error.InvalidPayloadLifetime;
     }
 
-    try validateHostReadableBytes(image);
+    try validateHostReadableBytes(image, options);
 
     try validateReadinessLocationMatrix(image);
 
@@ -120,7 +121,10 @@ fn validateReadinessLocationMatrix(image: *const BoundaryByteImageRef) BoundaryB
     }
 }
 
-fn validateHostReadableBytes(image: *const BoundaryByteImageRef) BoundaryByteImageError!void {
+fn validateHostReadableBytes(
+    image: *const BoundaryByteImageRef,
+    options: BoundaryByteImageValidationOptions,
+) BoundaryByteImageError!void {
     if (image.host_bytes != null and image.host_segments != null) {
         return error.InvalidPayloadReadiness;
     }
@@ -133,6 +137,7 @@ fn validateHostReadableBytes(image: *const BoundaryByteImageRef) BoundaryByteIma
     if (image.host_segments) |host_segments| {
         const expected_len = std.math.cast(usize, image.byte_count) orelse return error.HostReadableLengthMismatch;
         if (host_segments.len == 0) return error.HostReadableLengthMismatch;
+        if (options.allow_pending_host_segments) return;
         var total_len: usize = 0;
         for (host_segments) |segment| {
             if (segment.len == 0) return error.HostReadableLengthMismatch;
@@ -348,6 +353,16 @@ test "inference bridge boundary_byte_image validateBoundaryByteImage rejects inv
     const short_segments = [_][]const u8{&first};
     image = testSegmentedImage(&metadata, .host_readable_now, &short_segments);
     try std.testing.expectError(error.HostReadableLengthMismatch, validateBoundaryByteImage(&image, .{}));
+}
+
+test "inference bridge boundary_byte_image validateBoundaryByteImage accepts pending host_segments when allowed" {
+    const metadata = try testMetadata(.cpu);
+    const pending = [_]u8{};
+    const segments = [_][]const u8{&pending};
+    const image = testSegmentedImage(&metadata, .host_readable_now, &segments);
+
+    try std.testing.expectError(error.HostReadableLengthMismatch, validateBoundaryByteImage(&image, .{}));
+    try validateBoundaryByteImage(&image, .{ .allow_pending_host_segments = true });
 }
 
 test "inference bridge boundary_byte_image validateBoundaryByteImage rejects invalid payload byte count" {

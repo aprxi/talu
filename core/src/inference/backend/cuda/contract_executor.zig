@@ -3,12 +3,12 @@
 //! This module currently provides contract-shape types only. Runtime execution
 //! lives in `engine.zig`.
 
-const topology = @import("models_pkg").op_types;
+const op_types = @import("models_pkg").op_types;
 const kernels = @import("contract_kernels.zig");
 const std = @import("std");
 
 pub const weights = struct {
-    pub const BlockType = topology.BlockKind;
+    pub const BlockType = op_types.BlockKind;
     pub const FfnLayer = struct {};
 };
 
