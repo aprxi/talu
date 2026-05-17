@@ -9,7 +9,6 @@ const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
-const bridge = @import("../../../bridge/root.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 // --- Shared types from engine_types.zig ---
@@ -37,8 +36,6 @@ const common = @import("common.zig");
 const prefill_route = @import("prefill_route.zig");
 const kv_capacity = @import("kv_capacity.zig");
 const resets = @import("resets.zig");
-const stage_adapters = @import("../../local_stage_adapters.zig");
-const local_decode = @import("../../local_decode_pipeline.zig");
 const resolveStagedPrefillChunkRows = prefill_route.resolveStagedPrefillChunkRows;
 const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const dumpHiddenState = common.dumpHiddenState;
@@ -50,8 +47,18 @@ const resetGatedDeltaStates = resets.resetGatedDeltaStates;
 const resetAttentionCpuStates = resets.resetAttentionCpuStates;
 const ensureGatedDeltaHostStageCapacity = resets.ensureGatedDeltaHostStageCapacity;
 
-const DecodeBoundaryStageSide = local_decode.DecodeBoundaryStageSide;
-const BatchedDecodeExecutionPlan = local_decode.BatchedDecodeExecutionPlan;
+const BatchedDecodeExecutionPlan = struct {
+    use_preloaded_input: bool = false,
+    compute_logits: bool = true,
+    emit_decode_summary: bool = true,
+    summary_label_override: ?[]const u8 = null,
+};
+
+fn stageLayerOffset(self: anytype) usize {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "stage_layer_start")) return self.stage_layer_start;
+    return 0;
+}
 
 pub fn executeDecodeWithLayerLimit(
     self: anytype,
@@ -71,28 +78,6 @@ pub fn executeDecodeWithLayerLimit(
     use_preloaded_input: bool,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    const local_pipeline_available = if (layer_limit == self.block_runtime.blocks.len and compute_logits and !use_preloaded_input)
-        try stage_adapters.localPipelineFactsAvailable(self)
-    else
-        false;
-    if (local_pipeline_available) {
-        try executeSingleTokenLocalDecodePipeline(
-            self,
-            token,
-            position,
-            slot_index,
-            logits_out_opt,
-            compute_logits,
-            download_logits,
-            ensure_kv_capacity,
-            trace_seq_len_u32,
-            trace_pos_offset,
-            hidden_override,
-            deepstack_layer_features_opt,
-            deepstack_feature_index_opt,
-        );
-        return;
-    }
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook")) {
         return self.executeDecodeWithLayerLimitTestHook(
             token,
@@ -313,8 +298,8 @@ pub fn executeDecodeWithLayerLimit(
     var per_layer_source_embeddings_opt: ?compute.cuda.Buffer = null;
     if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
         if (use_preloaded_input) {
-            // local-stage mode: input_dev has post-CPU-layer hidden states, not raw
-            // embeddings. Look up the raw embedding on host and upload.
+            // Bridge handoff mode: input_dev starts with prior-stage hidden
+            // states. Per-layer branch features still need source embeddings.
             if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
                 per_layer_source_embeddings_opt = per_layer_branch_feature.capturePerLayerSourceEmbeddingsForLocalStage(self, token) catch |err| blk: {
                     log.warn("inference", "CUDA capturePerLayerSourceEmbeddingsForLocalStage failed", .{
@@ -330,9 +315,8 @@ pub fn executeDecodeWithLayerLimit(
     }
     const gemma_token_id_single = [_]u32{token};
 
-    // local-stage boundary: input_dev was populated by a host→device copy on
-    // the default stream (cu_memcpy_htod). Synchronize compute_stream so kernels
-    // on the named stream see the uploaded data before executing.
+    // Bridge handoff mode: input_dev was populated by transport before this
+    // stage runs. Synchronize compute_stream before reading that input.
     if (use_preloaded_input) {
         if (self.compute_stream) |stream| {
             try self.device.synchronizeStream(stream);
@@ -502,7 +486,7 @@ pub fn executeDecodeWithLayerLimit(
         if (@import("env_pkg").getenv("TALU_DUMP_HIDDEN") != null) {
             log.warn("inference", "GPU_LOOP_ENTRY", .{
                 .layer_limit = layer_limit,
-                .split_layer = stage_adapters.localLayerOffset(self),
+                .layer_offset = stageLayerOffset(self),
                 .blocks_len = self.block_runtime.blocks.len,
                 .use_preloaded = use_preloaded_input,
                 .d_model = self.d_model,
@@ -581,7 +565,7 @@ pub fn executeDecodeWithLayerLimit(
             if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
             if (layer.gated_delta_binding != null) batch_info.gd_layer_index += 1;
             if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
-            dumpHiddenState(self, &self.runtime_buffers.input_dev, stage_adapters.localLayerOffset(self) + layer_idx, "post_layer", self.d_model, 1);
+            dumpHiddenState(self, &self.runtime_buffers.input_dev, stageLayerOffset(self) + layer_idx, "post_layer", self.d_model, 1);
             if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
                 if (per_layer_source_embeddings_opt) |*per_layer_source_embeddings| {
                     try per_layer_branch_feature.applyPerLayerBranch(
@@ -592,7 +576,7 @@ pub fn executeDecodeWithLayerLimit(
                         &self.runtime_buffers.input_dev,
                     );
                     final_hidden = self.runtime_buffers.input_dev;
-                    dumpHiddenState(self, &self.runtime_buffers.input_dev, stage_adapters.localLayerOffset(self) + layer_idx, "post_ple", self.d_model, 1);
+                    dumpHiddenState(self, &self.runtime_buffers.input_dev, stageLayerOffset(self) + layer_idx, "post_ple", self.d_model, 1);
                 } else if (per_layer_branch_feature.hasStandaloneLayerScalars(self)) {
                     try per_layer_branch_feature.applyStandaloneLayerScalar(self, layer_idx, &self.runtime_buffers.input_dev, 1);
                 }
@@ -816,83 +800,9 @@ fn copySingleBatchedDecodeLogitsToOutput(self: anytype, logits_out_opt: ?[]f32, 
     }
 }
 
-fn executeSingleTokenLocalDecodePipeline(
-    self: anytype,
-    token: u32,
-    position: usize,
-    slot_index: usize,
-    logits_out_opt: ?[]f32,
-    compute_logits: bool,
-    download_logits: bool,
-    ensure_kv_capacity: bool,
-    trace_seq_len_u32: u32,
-    trace_pos_offset: usize,
-    hidden_override: ?[]const f32,
-    deepstack_layer_features_opt: ?[]const []const f32,
-    deepstack_feature_index_opt: ?usize,
-) !void {
-    try local_decode.executeSingleTokenDecodePipeline(executeDecodeWithLayerLimit, self, .{
-        .token = token,
-        .position = position,
-        .slot_index = slot_index,
-        .logits_out_opt = logits_out_opt,
-        .compute_logits = compute_logits,
-        .download_logits = download_logits,
-        .ensure_kv_capacity = ensure_kv_capacity,
-        .trace_seq_len_u32 = trace_seq_len_u32,
-        .trace_pos_offset = trace_pos_offset,
-        .hidden_override = hidden_override,
-        .deepstack_layer_features_opt = deepstack_layer_features_opt,
-        .deepstack_feature_index_opt = deepstack_feature_index_opt,
-    });
-}
-
 fn elapsedNsSince(start_ns: i128) u64 {
     const elapsed_i128 = std.time.nanoTimestamp() - start_ns;
     return if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
-}
-
-fn batchedDecodeModeLabel(self: anytype, output_mode: BatchedDecodeOutputMode) []const u8 {
-    _ = self;
-    return switch (output_mode) {
-        .host_logits => "decode_local_chain",
-        .device_only => "decode_device_only_local_chain",
-    };
-}
-
-fn computeBatchedDecodeStageOrPreserve(
-    root_backend: anytype,
-    stage_backend: anytype,
-    boundary: stage_adapters.LocalBoundaryRuntimeView,
-    location_hint: ?bridge.TensorFramePayloadLocationHint,
-    slot_indices: []const usize,
-    positions: []const usize,
-    active_side: DecodeBoundaryStageSide,
-    tokens: []const u32,
-    output_mode: BatchedDecodeOutputMode,
-    plan: BatchedDecodeExecutionPlan,
-) !void {
-    computeBatchedDecodeLogitsWithPlan(stage_backend, tokens, slot_indices, positions, output_mode, plan) catch |err| {
-        return local_decode.preserveDecodeBoundaryFailure(root_backend, boundary, location_hint, slot_indices, positions, active_side, err);
-    };
-}
-
-fn computeBatchedDecodeLocalWithMode(
-    self: anytype,
-    tokens: []const u32,
-    slot_indices: []const usize,
-    positions: []const usize,
-    output_mode: BatchedDecodeOutputMode,
-) !void {
-    return local_decode.executeBatchedDecodePipeline(
-        computeBatchedDecodeStageOrPreserve,
-        self,
-        tokens,
-        slot_indices,
-        positions,
-        output_mode,
-        batchedDecodeModeLabel(self, output_mode),
-    );
 }
 
 fn computeBatchedDecodeLogitsWithMode(
@@ -903,12 +813,6 @@ fn computeBatchedDecodeLogitsWithMode(
     output_mode: BatchedDecodeOutputMode,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    if (try stage_adapters.localPipelineFactsAvailable(self)) {
-        if (comptime @hasField(SelfType, "device")) {
-            return computeBatchedDecodeLocalWithMode(self, tokens, slot_indices, positions, output_mode);
-        }
-        return error.InvalidTopologyConfig;
-    }
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook")) {
         if (tokens.len != slot_indices.len or tokens.len != positions.len) return error.InvalidArgument;
         if (tokens.len == 0) return;
@@ -978,7 +882,6 @@ fn computeBatchedDecodeLogitsWithPlan(
         false;
     const n_usize = tokens.len;
     if (n_usize == 0) return;
-    _ = plan.allow_staged_internal_execution;
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;

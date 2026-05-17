@@ -19,26 +19,13 @@ const transport = main.inference.transport;
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 const cuda_testing = main.inference.backend.cuda.testing;
+const local_stage_testing = @import("local_stage_test_helpers.zig");
 
 // --- Types from engine.zig ---
 const engine = cuda_testing.engine;
 const CudaBackend = engine.CudaBackend;
-const CpuBackend = main.inference.backend.cpu.BackendType;
 
-fn clearLocalStages(backend: *CudaBackend) void {
-    backend.local_cuda_stage_backends = &.{};
-    backend.local_cpu_stage_backends = &.{};
-}
-
-fn setSingleLocalCudaStage(backend: *CudaBackend, storage: *[1]?*CudaBackend, stage: *CudaBackend) void {
-    storage.* = .{stage};
-    backend.local_cuda_stage_backends = storage[0..];
-}
-
-fn setSingleLocalCpuStage(backend: *CudaBackend, storage: *[1]?*CpuBackend, stage: *CpuBackend) void {
-    storage.* = .{stage};
-    backend.local_cpu_stage_backends = storage[0..];
-}
+fn clearLocalStages(_: *CudaBackend) void {}
 
 fn localTransportRequest(
     placement_plan: *const bridge.PlacementPlan,
@@ -113,7 +100,6 @@ const engine_ops = cuda_testing.operators;
 const engine_mixers = cuda_testing.operators;
 const engine_forward = cuda_testing.exec;
 const resolveStagedPrefillChunkRows = engine_forward.resolveStagedPrefillChunkRows;
-const stage_adapters = engine_forward.stage_adapters;
 
 const MockCudaDevice = struct {
     launch_phase: compute.cuda.device.LaunchPhase = .none,
@@ -253,7 +239,7 @@ fn buildLocalStageStateFixture(
     allocator: std.mem.Allocator,
     plan: *const models.stage_plan.StagePlan,
 ) !LocalStageStateFixture {
-    var state_plan = try engine.testing.buildLocalStageStateOwnershipPlan(allocator, plan);
+    var state_plan = try local_stage_testing.buildLocalStageStateOwnershipPlan(allocator, plan);
     errdefer state_plan.deinit();
     var state_ref = try bridge.buildStageStatePlacementRef(allocator, &state_plan);
     errdefer state_ref.deinit();
@@ -264,7 +250,7 @@ fn expectLocalStagePlacement(
     placement: *const bridge.PlacementPlan,
     d_model: usize,
     stage_count: usize,
-    configs: []const engine.testing.BoundaryConfig,
+    configs: []const local_stage_testing.BoundaryConfig,
 ) !void {
     try bridge.validatePlacementPlan(placement);
     try std.testing.expectEqual(stage_count, placement.stage_summaries.len);
@@ -272,7 +258,7 @@ fn expectLocalStagePlacement(
     try std.testing.expectEqual(stage_count, placement.stage_host_bindings.len);
     try std.testing.expectEqualSlices(
         bridge.TensorFrameStepKind,
-        &engine.testing.local_stage_required_step_kinds,
+        &local_stage_testing.bridge_stage_required_step_kinds,
         placement.required_step_kinds,
     );
 
@@ -281,9 +267,9 @@ fn expectLocalStagePlacement(
         try std.testing.expectEqual(@as(u64, @intCast(stage_id + 1)), binding.host_id.value);
     }
 
-    try std.testing.expectEqual(configs.len * engine.testing.local_stage_required_step_kinds.len, placement.boundary_frame_profiles.len);
+    try std.testing.expectEqual(configs.len * local_stage_testing.bridge_stage_required_step_kinds.len, placement.boundary_frame_profiles.len);
     for (configs, 0..) |config, boundary_index| {
-        const row_bytes = try engine.testing.boundaryRowByteCount(d_model, config.dtype);
+        const row_bytes = try local_stage_testing.boundaryRowByteCount(d_model, config.dtype);
         const prefill = placement.boundary_frame_profiles[boundary_index * 2];
         try std.testing.expectEqual(boundary_index, prefill.boundary_index);
         try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, prefill.step_kind);
@@ -312,7 +298,7 @@ fn expectLocalStagePlacement(
 }
 
 test "validateLocalStageSpecs accepts only contiguous local stage chains" {
-    const valid = [_]engine.testing.StageSpec{
+    const valid = [_]local_stage_testing.StageSpec{
         .{
             .stage_id = 0,
             .backend_kind = .cpu,
@@ -338,31 +324,31 @@ test "validateLocalStageSpecs accepts only contiguous local stage chains" {
             .owns_projection = true,
         },
     };
-    try engine.testing.validateStageSpecs(4, &valid);
+    try local_stage_testing.validateStageSpecs(4, &valid);
 
     var gap = valid;
     gap[1].layer_start = 2;
-    try std.testing.expectError(error.InvalidTopologyConfig, engine.testing.validateStageSpecs(4, &gap));
+    try std.testing.expectError(error.InvalidTopologyConfig, local_stage_testing.validateStageSpecs(4, &gap));
 
     var wrong_stage_id = valid;
     wrong_stage_id[1].stage_id = 7;
-    try std.testing.expectError(error.InvalidTopologyConfig, engine.testing.validateStageSpecs(4, &wrong_stage_id));
+    try std.testing.expectError(error.InvalidTopologyConfig, local_stage_testing.validateStageSpecs(4, &wrong_stage_id));
 
     var wrong_embedding_owner = valid;
     wrong_embedding_owner[1].owns_embedding = true;
-    try std.testing.expectError(error.InvalidTopologyConfig, engine.testing.validateStageSpecs(4, &wrong_embedding_owner));
+    try std.testing.expectError(error.InvalidTopologyConfig, local_stage_testing.validateStageSpecs(4, &wrong_embedding_owner));
 
     var wrong_projection_owner = valid;
     wrong_projection_owner[2].owns_projection = false;
-    try std.testing.expectError(error.InvalidTopologyConfig, engine.testing.validateStageSpecs(4, &wrong_projection_owner));
+    try std.testing.expectError(error.InvalidTopologyConfig, local_stage_testing.validateStageSpecs(4, &wrong_projection_owner));
 
     var missing_tail = valid;
     missing_tail[2].layer_end = 3;
-    try std.testing.expectError(error.InvalidTopologyConfig, engine.testing.validateStageSpecs(4, &missing_tail));
+    try std.testing.expectError(error.InvalidTopologyConfig, local_stage_testing.validateStageSpecs(4, &missing_tail));
 }
 
 test "validateLocalBoundaryRuntimes matches adjacent stage boundary count and order" {
-    const valid = [_]engine.testing.BoundaryRuntime{
+    const valid = [_]local_stage_testing.BoundaryRuntime{
         .{
             .boundary_index = 0,
             .dtype = .f32,
@@ -375,23 +361,23 @@ test "validateLocalBoundaryRuntimes matches adjacent stage boundary count and or
             .local_device_peer_copy_available = true,
         },
     };
-    try engine.testing.validateBoundaryRuntimes(3, &valid);
+    try local_stage_testing.validateBoundaryRuntimes(3, &valid);
 
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        engine.testing.validateBoundaryRuntimes(3, valid[0..1]),
+        local_stage_testing.validateBoundaryRuntimes(3, valid[0..1]),
     );
 
     var wrong_order = valid;
     wrong_order[1].boundary_index = 7;
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        engine.testing.validateBoundaryRuntimes(3, &wrong_order),
+        local_stage_testing.validateBoundaryRuntimes(3, &wrong_order),
     );
 
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        engine.testing.validateBoundaryRuntimes(0, &.{}),
+        local_stage_testing.validateBoundaryRuntimes(0, &.{}),
     );
 }
 
@@ -399,13 +385,13 @@ fn expectPlacementBuildFailureCleanup(
     d_model: usize,
     plan: *const models.stage_plan.StagePlan,
     stage_backend_kinds: []const bridge.HostBackendKind,
-    configs: []const engine.testing.BoundaryConfig,
+    configs: []const local_stage_testing.BoundaryConfig,
     state_ref: ?*const bridge.StageStatePlacementRef,
 ) !void {
     var saw_success = false;
     for (0..64) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var placement_or_error = engine.testing.buildLocalStagePlacementPlan(
+        var placement_or_error = local_stage_testing.buildLocalStagePlacementPlan(
             failing.allocator(),
             d_model,
             plan,
@@ -424,109 +410,6 @@ fn expectPlacementBuildFailureCleanup(
         }
     }
     try std.testing.expect(saw_success);
-}
-
-fn runCpuPrefixCudaSuffixPrefillTestHook(
-    self: anytype,
-    tokens: []const u32,
-    slot_index: usize,
-    logits_out: []f32,
-    layer_limit: usize,
-) !void {
-    if (tokens.len == 0) return error.InvalidArgument;
-    if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
-    if (logits_out.len != self.vocab_size) return error.InvalidArgument;
-    if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-    if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
-
-    const cpu_stage0 = self.localCpuStage(0) orelse return error.InvalidTopologyConfig;
-    const cpu_layer_end = self.local_stage_specs[0].layer_end;
-    self.activateKvSlot(slot_index);
-    const byte_count = try self.localActivationByteCount();
-    for (tokens, 0..) |token, position| {
-        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, cpu_layer_end, false, false, true, false);
-        const cpu_activation = cpu_stage0.slotActivationBytes(slot_index);
-        if (byte_count > cpu_activation.len) return error.InvalidArgument;
-        try self.uploadLocalActivationFromHost(slot_index, cpu_activation[0..byte_count], byte_count);
-        const is_last = position + 1 == tokens.len;
-        try self.executeDecodeWithLayerLimitTestHook(
-            token,
-            position,
-            slot_index,
-            if (is_last) logits_out else null,
-            layer_limit,
-            true,
-            is_last,
-            true,
-            @intCast(position + 1),
-            position,
-            null,
-            null,
-            null,
-            true,
-        );
-    }
-}
-
-fn runCpuPrefixTwoCudaPrefillTestHook(
-    self: anytype,
-    tokens: []const u32,
-    slot_index: usize,
-    logits_out: []f32,
-    layer_limit: usize,
-) !void {
-    if (tokens.len == 0) return error.InvalidArgument;
-    if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
-    if (logits_out.len != self.vocab_size) return error.InvalidArgument;
-    if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-    if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
-
-    const cpu_stage0 = self.localCpuStage(0) orelse return error.InvalidTopologyConfig;
-    var stage1 = self.localCudaStage(1) orelse return error.InvalidTopologyConfig;
-    const cpu_layer_end = self.local_stage_specs[0].layer_end;
-    self.activateKvSlot(slot_index);
-    stage1.activateKvSlot(slot_index);
-    const byte_count = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
-    for (tokens, 0..) |token, position| {
-        try cpu_stage0.executeDecodeLayerRange(token, position, slot_index, null, 0, cpu_layer_end, false, false, true, false);
-        const cpu_activation = cpu_stage0.slotActivationBytes(slot_index);
-        if (byte_count > cpu_activation.len) return error.InvalidArgument;
-        try stage1.uploadLocalActivationFromHost(slot_index, cpu_activation[0..byte_count], byte_count);
-        try stage1.executeDecodeWithLayerLimitTestHook(
-            token,
-            position,
-            slot_index,
-            null,
-            stage1.block_runtime.blocks.len,
-            true,
-            false,
-            true,
-            @intCast(position + 1),
-            position,
-            null,
-            null,
-            null,
-            true,
-        );
-        try stage1.copyLocalActivationTo(self, slot_index, byte_count);
-        const is_last = position + 1 == tokens.len;
-        try self.executeDecodeWithLayerLimitTestHook(
-            token,
-            position,
-            slot_index,
-            if (is_last) logits_out else null,
-            layer_limit,
-            true,
-            is_last,
-            true,
-            @intCast(position + 1),
-            position,
-            null,
-            null,
-            null,
-            true,
-        );
-    }
 }
 
 test "resolveDenseInOutLayout keeps [in,out] orientation" {
@@ -556,8 +439,8 @@ test "inference.backend.cuda 10G-D local stage chain profile envelopes are exact
         .consumer_layer_start = 2,
         .consumer_layer_end = 4,
     };
-    const config = engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9);
-    const profiles = try engine.testing.boundaryProfilePair(8, 0, boundary, config);
+    const config = local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 9);
+    const profiles = try local_stage_testing.boundaryProfilePair(8, 0, boundary, config);
 
     try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, profiles[0].step_kind);
     try std.testing.expectEqual(@as(u64, 1), profiles[0].max_batch_entries);
@@ -571,11 +454,11 @@ test "inference.backend.cuda 10G-D local stage chain profile envelopes are exact
 }
 
 test "inference.backend.cuda 10G-D local stage chain caps use required min rules" {
-    const two_cuda_config = engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7);
+    const two_cuda_config = local_stage_testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7);
     try std.testing.expectEqual(@as(usize, 3), two_cuda_config.decode_max_batch_entries);
     try std.testing.expectEqual(@as(usize, 7), two_cuda_config.prefill_max_token_count_per_frame);
 
-    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
+    const cpu_then_two_cuda_configs = local_stage_testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -589,24 +472,24 @@ test "inference.backend.cuda 10G-D local stage chain caps use required min rules
     try std.testing.expectEqual(@as(usize, 5), cpu_then_two_cuda_configs[1].decode_max_batch_entries);
     try std.testing.expectEqual(@as(usize, 16), cpu_then_two_cuda_configs[0].prefill_max_token_count_per_frame);
     try std.testing.expectEqual(@as(usize, 16), cpu_then_two_cuda_configs[1].prefill_max_token_count_per_frame);
-    try std.testing.expectEqual(@as(u64, 16), try engine.testing.boundaryRowByteCount(8, cpu_then_two_cuda_configs[1].dtype));
+    try std.testing.expectEqual(@as(u64, 16), try local_stage_testing.boundaryRowByteCount(8, cpu_then_two_cuda_configs[1].dtype));
 }
 
 test "inference.backend.cuda 10G-D local stage chain host ids are deterministic stage ids" {
-    try std.testing.expectEqual(@as(u64, 1), (try engine.testing.deterministicHostId(0)).value);
-    try std.testing.expectEqual(@as(u64, 2), (try engine.testing.deterministicHostId(1)).value);
-    try std.testing.expectEqual(@as(u64, 3), (try engine.testing.deterministicHostId(2)).value);
-    try std.testing.expectError(error.InvalidTopologyConfig, engine.testing.deterministicHostId(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(u64, 1), (try local_stage_testing.deterministicHostId(0)).value);
+    try std.testing.expectEqual(@as(u64, 2), (try local_stage_testing.deterministicHostId(1)).value);
+    try std.testing.expectEqual(@as(u64, 3), (try local_stage_testing.deterministicHostId(2)).value);
+    try std.testing.expectError(error.InvalidTopologyConfig, local_stage_testing.deterministicHostId(std.math.maxInt(usize)));
 }
 
 test "inference.backend.cuda 10G-E buildDecodeActivationMetadata segmentedHostDecodeByteImage buildDecodeTransportContract localTransportRequest uses multi_entry_local host segments" {
     const d_model: usize = 4;
     const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 8),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 8),
     };
-    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -615,32 +498,22 @@ test "inference.backend.cuda 10G-E buildDecodeActivationMetadata segmentedHostDe
     );
     defer bundle.deinit();
 
-    const MockBackend = struct {
-        d_model: usize = d_model,
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [4]?u64 = .{ 101, 202, 303, 404 },
-    };
-    var backend = MockBackend{
-        .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-        .local_placement_plan = bundle.placement_plan.?,
-        .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-    };
-
     const slot_indices = [_]usize{ 0, 1, 3 };
     const positions = [_]usize{ 7, 8, 9 };
-    var batch_entries: [stage_adapters.max_decode_transport_rows]bridge.TensorFrameBatchEntry = undefined;
-    const metadata = try stage_adapters.buildDecodeActivationMetadata(
-        &backend,
-        0,
-        .f32,
-        .row_major,
-        .{ .cpu = {} },
-        &slot_indices,
-        &positions,
-        batch_entries[0..],
-    );
+    const slot_request_ids = [_]?u64{ 101, 202, 303, 404 };
+    var batch_entries: [slot_indices.len]bridge.TensorFrameBatchEntry = undefined;
+    const metadata = try bridge.buildDecodeActivationMetadata(.{
+        .plan_ref = &bundle.tensor_frame_plan_ref.?,
+        .hidden_size = d_model,
+        .boundary_index = 0,
+        .dtype = .f32,
+        .layout = .row_major,
+        .location_hint = .{ .cpu = {} },
+        .slot_request_ids = &slot_request_ids,
+        .slot_indices = &slot_indices,
+        .positions = &positions,
+        .batch_entries = batch_entries[0..],
+    });
 
     var row0 = [_]f32{ 1, 2, 3, 4 };
     var row1 = [_]f32{ 5, 6, 7, 8 };
@@ -651,7 +524,7 @@ test "inference.backend.cuda 10G-E buildDecodeActivationMetadata segmentedHostDe
         std.mem.sliceAsBytes(row2[0..]),
     };
     const image = bridge.segmentedHostActivationByteImage(&metadata, &host_segments);
-    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
+    const placement_plan = &bundle.placement_plan.?;
     const contract = try bridge.buildActivationTransportContract(
         placement_plan,
         &metadata,
@@ -747,10 +620,10 @@ test "inference.backend.cuda 10G-E deviceDecodeByteImage buildDecodeTransportCon
     const d_model: usize = 4;
     const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localMinBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localMinBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
     };
-    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -759,34 +632,24 @@ test "inference.backend.cuda 10G-E deviceDecodeByteImage buildDecodeTransportCon
     );
     defer bundle.deinit();
 
-    const MockBackend = struct {
-        d_model: usize = d_model,
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [4]?u64 = .{ 101, 202, 303, 404 },
-    };
-    var backend = MockBackend{
-        .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-        .local_placement_plan = bundle.placement_plan.?,
-        .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-    };
-
     const slot_indices = [_]usize{ 0, 2 };
     const positions = [_]usize{ 5, 6 };
-    var batch_entries: [stage_adapters.max_decode_transport_rows]bridge.TensorFrameBatchEntry = undefined;
-    const metadata = try stage_adapters.buildDecodeActivationMetadata(
-        &backend,
-        0,
-        .f32,
-        .row_major,
-        .{ .cuda = 0 },
-        &slot_indices,
-        &positions,
-        batch_entries[0..],
-    );
+    const slot_request_ids = [_]?u64{ 101, 202, 303, 404 };
+    var batch_entries: [slot_indices.len]bridge.TensorFrameBatchEntry = undefined;
+    const metadata = try bridge.buildDecodeActivationMetadata(.{
+        .plan_ref = &bundle.tensor_frame_plan_ref.?,
+        .hidden_size = d_model,
+        .boundary_index = 0,
+        .dtype = .f32,
+        .layout = .row_major,
+        .location_hint = .{ .cuda = 0 },
+        .slot_request_ids = &slot_request_ids,
+        .slot_indices = &slot_indices,
+        .positions = &positions,
+        .batch_entries = batch_entries[0..],
+    });
     const image = bridge.deviceActivationByteImage(&metadata);
-    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
+    const placement_plan = &bundle.placement_plan.?;
     const contract = try bridge.buildActivationTransportContract(
         placement_plan,
         &metadata,
@@ -870,10 +733,10 @@ test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivation
     const d_model: usize = 4;
     const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 8),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 8),
     };
-    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -882,18 +745,7 @@ test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivation
     );
     defer bundle.deinit();
 
-    const MockBackend = struct {
-        d_model: usize = d_model,
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [2]?u64 = .{ 101, 202 },
-    };
-    var backend = MockBackend{
-        .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-        .local_placement_plan = bundle.placement_plan.?,
-        .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-    };
+    const slot_request_ids = [_]?u64{ 101, 202 };
 
     var payload_rows: [6 * d_model]f32 = undefined;
     for (&payload_rows, 0..) |*value, index| value.* = @floatFromInt(index);
@@ -942,8 +794,8 @@ test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivation
         }
     };
 
-    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
-    const plan_ref = try stage_adapters.localStageTensorFramePlanRef(&backend);
+    const placement_plan = &bundle.placement_plan.?;
+    const plan_ref = &bundle.tensor_frame_plan_ref.?;
     var trace_state = Trace{};
     var source = Source{ .trace = &trace_state };
     var target = Target{ .trace = &trace_state };
@@ -957,17 +809,19 @@ test "inference.backend.cuda 10G-F buildPrefillActivationMetadata hostActivation
         expected_payload_bytes += chunk_bytes.len;
 
         var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
-        const metadata = try stage_adapters.buildPrefillActivationMetadata(
-            &backend,
-            0,
-            .f32,
-            .row_major,
-            .{ .cpu = {} },
-            0,
-            chunk.sequence_start,
-            chunk.rows,
-            batch_entries[0..],
-        );
+        const metadata = try bridge.buildPrefillActivationMetadata(.{
+            .plan_ref = plan_ref,
+            .hidden_size = d_model,
+            .boundary_index = 0,
+            .dtype = .f32,
+            .layout = .row_major,
+            .location_hint = .{ .cpu = {} },
+            .slot_request_ids = &slot_request_ids,
+            .slot_index = 0,
+            .sequence_start = chunk.sequence_start,
+            .token_count = chunk.rows,
+            .batch_entries = batch_entries[0..],
+        });
         try bridge.validateTensorFrameForPlanBoundary(&metadata, plan_ref, 0);
         try bridge.validatePayloadBufferLength(&metadata, chunk_bytes.len);
         try std.testing.expectEqual(bridge.TensorFrameStepKind.prefill, metadata.step_kind);
@@ -1020,10 +874,10 @@ test "inference.backend.cuda 10G-F deviceActivationByteImage buildPrefillTranspo
     const d_model: usize = 4;
     const plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &.{});
     const stage_backend_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localMinBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localMinBoundaryConfig(.f32, .row_major, 4, 4, 8, 8),
     };
-    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         d_model,
         plan,
@@ -1032,35 +886,26 @@ test "inference.backend.cuda 10G-F deviceActivationByteImage buildPrefillTranspo
     );
     defer bundle.deinit();
 
-    const MockBackend = struct {
-        d_model: usize = d_model,
-        local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-        local_placement_plan: ?bridge.PlacementPlan = null,
-        local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
-        slot_request_ids: [2]?u64 = .{ 101, 202 },
-    };
-    var backend = MockBackend{
-        .local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref.?,
-        .local_placement_plan = bundle.placement_plan.?,
-        .local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref.?,
-    };
+    const slot_request_ids = [_]?u64{ 101, 202 };
 
     var batch_entries: [1]bridge.TensorFrameBatchEntry = undefined;
-    const metadata = try stage_adapters.buildPrefillActivationMetadata(
-        &backend,
-        0,
-        .f32,
-        .row_major,
-        .{ .cuda = 0 },
-        1,
-        5,
-        3,
-        batch_entries[0..],
-    );
-    try bridge.validateTensorFrameForPlanBoundary(&metadata, try stage_adapters.localStageTensorFramePlanRef(&backend), 0);
+    const metadata = try bridge.buildPrefillActivationMetadata(.{
+        .plan_ref = &bundle.tensor_frame_plan_ref.?,
+        .hidden_size = d_model,
+        .boundary_index = 0,
+        .dtype = .f32,
+        .layout = .row_major,
+        .location_hint = .{ .cuda = 0 },
+        .slot_request_ids = &slot_request_ids,
+        .slot_index = 1,
+        .sequence_start = 5,
+        .token_count = 3,
+        .batch_entries = batch_entries[0..],
+    });
+    try bridge.validateTensorFrameForPlanBoundary(&metadata, &bundle.tensor_frame_plan_ref.?, 0);
     try bridge.validatePayloadBufferLength(&metadata, 3 * d_model * @sizeOf(f32));
     const image = bridge.deviceActivationByteImage(&metadata);
-    const placement_plan = try stage_adapters.localStagePlacementPlan(&backend);
+    const placement_plan = &bundle.placement_plan.?;
 
     const Trace = struct {
         synchronize_calls: usize = 0,
@@ -1196,10 +1041,10 @@ test "buildLocalStagePlacementPlan covers decode and prefill profiles for local 
     var cpu_then_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_cuda_plan);
     defer cpu_then_cuda_state.deinit();
     const cpu_then_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const cpu_then_cuda_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9),
+    const cpu_then_cuda_configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 9),
     };
-    var cpu_then_cuda_placement = try engine.testing.buildLocalStagePlacementPlan(
+    var cpu_then_cuda_placement = try local_stage_testing.buildLocalStagePlacementPlan(
         std.testing.allocator,
         d_model,
         &cpu_then_cuda_plan,
@@ -1217,10 +1062,10 @@ test "buildLocalStagePlacementPlan covers decode and prefill profiles for local 
     var two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &two_cuda_plan);
     defer two_cuda_state.deinit();
     const two_cuda_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const two_cuda_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    const two_cuda_configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
     };
-    var two_cuda_placement = try engine.testing.buildLocalStagePlacementPlan(
+    var two_cuda_placement = try local_stage_testing.buildLocalStagePlacementPlan(
         std.testing.allocator,
         d_model,
         &two_cuda_plan,
@@ -1250,7 +1095,7 @@ test "buildLocalStagePlacementPlan covers decode and prefill profiles for local 
     var cpu_then_two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_two_cuda_plan);
     defer cpu_then_two_cuda_state.deinit();
     const cpu_then_two_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
+    const cpu_then_two_cuda_configs = local_stage_testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -1260,7 +1105,7 @@ test "buildLocalStagePlacementPlan covers decode and prefill profiles for local 
         16,
         64,
     );
-    var cpu_then_two_cuda_placement = try engine.testing.buildLocalStagePlacementPlan(
+    var cpu_then_two_cuda_placement = try local_stage_testing.buildLocalStagePlacementPlan(
         std.testing.allocator,
         d_model,
         &cpu_then_two_cuda_plan,
@@ -1281,7 +1126,7 @@ test "buildLocalStageStateOwnershipPlan covers stateful local stage chain depend
     }};
     var two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
     defer two_cuda_plan.deinit();
-    var two_cuda_state = try engine.testing.buildLocalStageStateOwnershipPlan(std.testing.allocator, &two_cuda_plan);
+    var two_cuda_state = try local_stage_testing.buildLocalStageStateOwnershipPlan(std.testing.allocator, &two_cuda_plan);
     defer two_cuda_state.deinit();
     try bridge.validateStageStateOwnershipPlan(&two_cuda_state);
     try std.testing.expectEqual(@as(usize, 1), two_cuda_state.boundaries.len);
@@ -1307,7 +1152,7 @@ test "buildLocalStageStateOwnershipPlan covers stateful local stage chain depend
     };
     var cpu_then_two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
     defer cpu_then_two_cuda_plan.deinit();
-    var cpu_then_two_cuda_state = try engine.testing.buildLocalStageStateOwnershipPlan(std.testing.allocator, &cpu_then_two_cuda_plan);
+    var cpu_then_two_cuda_state = try local_stage_testing.buildLocalStageStateOwnershipPlan(std.testing.allocator, &cpu_then_two_cuda_plan);
     defer cpu_then_two_cuda_state.deinit();
     try bridge.validateStageStateOwnershipPlan(&cpu_then_two_cuda_state);
     try std.testing.expectEqual(@as(usize, 2), cpu_then_two_cuda_state.boundaries.len);
@@ -1321,7 +1166,7 @@ test "buildLocalStageStateOwnershipPlan covers stateful local stage chain depend
 }
 
 test "deinitLocalStageContracts uses reverse local stage chain contract order and is idempotent" {
-    const expected_order = [_]engine.testing.ContractField{
+    const expected_order = [_]local_stage_testing.ContractField{
         .local_stage_runner_plan_ref,
         .placement_plan,
         .state_placement_ref,
@@ -1329,7 +1174,7 @@ test "deinitLocalStageContracts uses reverse local stage chain contract order an
         .tensor_frame_plan_ref,
         .stage_plan,
     };
-    try std.testing.expectEqualSlices(engine.testing.ContractField, &expected_order, &engine.testing.contract_deinit_order);
+    try std.testing.expectEqualSlices(local_stage_testing.ContractField, &expected_order, &local_stage_testing.contract_deinit_order);
 
     const two_stage_deps = [_]models.stage_plan.DependencyOverride{.{
         .source_stage_id = 0,
@@ -1338,11 +1183,11 @@ test "deinitLocalStageContracts uses reverse local stage chain contract order an
         .affects_loader_residency = false,
     }};
     const cpu_then_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const cpu_then_cuda_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9),
+    const cpu_then_cuda_configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 9),
     };
     const cpu_then_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    var cpu_then_cuda_bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var cpu_then_cuda_bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         8,
         cpu_then_cuda_plan,
@@ -1350,14 +1195,14 @@ test "deinitLocalStageContracts uses reverse local stage chain contract order an
         &cpu_then_cuda_configs,
     );
     defer cpu_then_cuda_bundle.deinit();
-    engine.testing.deinitLocalStageContractBundleThroughBackendTwice(&cpu_then_cuda_bundle);
+    local_stage_testing.deinitLocalStageContractBundleTwice(&cpu_then_cuda_bundle);
 
     const two_cuda_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const two_cuda_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    const two_cuda_configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
     };
     const two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 4, &.{2}, &two_stage_deps);
-    var two_cuda_bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var two_cuda_bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         8,
         two_cuda_plan,
@@ -1365,7 +1210,7 @@ test "deinitLocalStageContracts uses reverse local stage chain contract order an
         &two_cuda_configs,
     );
     defer two_cuda_bundle.deinit();
-    engine.testing.deinitLocalStageContractBundleThroughBackendTwice(&two_cuda_bundle);
+    local_stage_testing.deinitLocalStageContractBundleTwice(&two_cuda_bundle);
 
     const three_stage_deps = [_]models.stage_plan.DependencyOverride{
         .{
@@ -1382,7 +1227,7 @@ test "deinitLocalStageContracts uses reverse local stage chain contract order an
         },
     };
     const cpu_then_two_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
+    const cpu_then_two_cuda_configs = local_stage_testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -1393,7 +1238,7 @@ test "deinitLocalStageContracts uses reverse local stage chain contract order an
         64,
     );
     const cpu_then_two_cuda_plan = try buildLocalStageTestStagePlan(std.testing.allocator, 5, &.{ 1, 3 }, &three_stage_deps);
-    var cpu_then_two_cuda_bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var cpu_then_two_cuda_bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         8,
         cpu_then_two_cuda_plan,
@@ -1401,7 +1246,7 @@ test "deinitLocalStageContracts uses reverse local stage chain contract order an
         &cpu_then_two_cuda_configs,
     );
     defer cpu_then_two_cuda_bundle.deinit();
-    engine.testing.deinitLocalStageContractBundleThroughBackendTwice(&cpu_then_two_cuda_bundle);
+    local_stage_testing.deinitLocalStageContractBundleTwice(&cpu_then_two_cuda_bundle);
 }
 
 test "buildLocalStagePlacementPlan cleans up allocation failures for local stage chain contract bundles" {
@@ -1416,8 +1261,8 @@ test "buildLocalStagePlacementPlan cleans up allocation failures for local stage
     var cpu_then_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_cuda_plan);
     defer cpu_then_cuda_state.deinit();
     const cpu_then_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const cpu_then_cuda_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 9),
+    const cpu_then_cuda_configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 9),
     };
     try expectPlacementBuildFailureCleanup(8, &cpu_then_cuda_plan, &cpu_then_cuda_kinds, &cpu_then_cuda_configs, &cpu_then_cuda_state.ref);
 
@@ -1426,8 +1271,8 @@ test "buildLocalStagePlacementPlan cleans up allocation failures for local stage
     var two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &two_cuda_plan);
     defer two_cuda_state.deinit();
     const two_cuda_kinds = [_]bridge.HostBackendKind{ .cuda, .cuda };
-    const two_cuda_configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
+    const two_cuda_configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localMinBoundaryConfig(.f16, .row_major, 8, 3, 40, 7),
     };
     try expectPlacementBuildFailureCleanup(8, &two_cuda_plan, &two_cuda_kinds, &two_cuda_configs, &two_cuda_state.ref);
 
@@ -1450,7 +1295,7 @@ test "buildLocalStagePlacementPlan cleans up allocation failures for local stage
     var cpu_then_two_cuda_state = try buildLocalStageStateFixture(std.testing.allocator, &cpu_then_two_cuda_plan);
     defer cpu_then_two_cuda_state.deinit();
     const cpu_then_two_cuda_kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const cpu_then_two_cuda_configs = engine.testing.localTwoBoundaryConfigs(
+    const cpu_then_two_cuda_configs = local_stage_testing.localTwoBoundaryConfigs(
         .f32,
         .row_major,
         .f16,
@@ -2787,55 +2632,11 @@ test "bindSlotStateBlocks preserves bound slot index in runtime states" {
     try std.testing.expectEqual(@as(usize, 1), gated_delta_state.slot_index);
 }
 
-test "bindSlotStateBlocks rolls back self on cpu stage bind failure" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-    var backend: CudaBackend = undefined;
-    backend.max_batch_size = 1;
-    backend.block_runtime = undefined;
-    backend.state_descriptor_count = 1;
-    backend.local_cuda_stage_backends = &.{};
-    backend.state_descriptors_storage[0] = .{
-        .id = 111,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_none,
-    };
-    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    backend.slot_state_bindings = slot_state_bindings[0..];
-
-    // Zero-initialized CPU backend stub: slot_state_bindings.len == 0
-    // triggers the bounds check in CPU bindSlotStateBlocks before any other field access.
-    // Uses aligned byte buffer to satisfy the struct's natural alignment requirement.
-    const cpu_backend = main.inference.backend.cpu;
-    var cpu_stage0_bytes: [@sizeOf(cpu_backend.BackendType)]u8 align(@alignOf(cpu_backend.BackendType)) = @splat(0);
-    const cpu_stage0: *cpu_backend.BackendType = @ptrCast(&cpu_stage0_bytes);
-    var local_cpu_stages: [1]?*CpuBackend = undefined;
-    setSingleLocalCpuStage(&backend, &local_cpu_stages, cpu_stage0);
-
-    var state_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const state_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = 111,
-            .ptr = state_storage[0..].ptr,
-            .size = runtime_contract.builtin_state_block_bytes,
-            .align_bytes = 64,
-        },
-    };
-
-    // Bind should fail because CPU stage rejects slot_index 0 (empty bindings slice).
-    try std.testing.expectError(error.InvalidArgument, backend.bindSlotStateBlocks(0, state_blocks[0..]));
-    // Self-binding must be rolled back: slot should not be marked bound.
-    try std.testing.expect(!backend.slot_state_bindings[0].bound);
-}
-
 test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind none" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
-    clearLocalStages(&backend);
     backend.state_descriptor_count = 1;
     backend.state_descriptors_storage[0] = .{
         .id = 111,
@@ -2865,296 +2666,6 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     try std.testing.expectEqual(@intFromPtr(state_blocks[0].ptr), @intFromPtr(bound[0].ptr));
     try std.testing.expectEqual(state_blocks[0].size, bound[0].size);
     try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
-}
-
-test "bindSlotStateBlocks accepts scheduler descriptor superset for staged local chain" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-    var backend: CudaBackend = undefined;
-    backend.max_batch_size = 1;
-    backend.block_runtime = undefined;
-    backend.local_cpu_stage_backends = &.{};
-    backend.state_descriptor_count = 1;
-    backend.state_descriptors_storage[0] = .{
-        .id = 121,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    backend.slot_state_bindings = slot_state_bindings[0..];
-
-    var stage1: CudaBackend = undefined;
-    stage1.max_batch_size = 1;
-    stage1.block_runtime = undefined;
-    clearLocalStages(&stage1);
-    stage1.state_descriptor_count = 1;
-    stage1.state_descriptors_storage[0] = .{
-        .id = 122,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_gated_delta_cache,
-    };
-    var stage1_slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    stage1.slot_state_bindings = stage1_slot_state_bindings[0..];
-    var local_cuda_stages: [1]?*CudaBackend = undefined;
-    setSingleLocalCudaStage(&backend, &local_cuda_stages, &stage1);
-
-    var kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    var staged_extra_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const state_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = 121,
-            .ptr = kv_storage[0..].ptr,
-            .size = runtime_contract.builtin_state_block_bytes,
-            .align_bytes = 64,
-        },
-        .{
-            .id = 122,
-            .ptr = staged_extra_storage[0..].ptr,
-            .size = runtime_contract.builtin_state_block_bytes,
-            .align_bytes = 64,
-        },
-    };
-
-    try backend.bindSlotStateBlocks(0, state_blocks[0..]);
-    defer backend.unbindSlotStateBlocks(0);
-
-    const bound = backend.slotStateBlocks(0);
-    try std.testing.expectEqual(@as(usize, 1), bound.len);
-    try std.testing.expectEqual(@as(u8, 121), bound[0].id);
-    const kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, &bound[0]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(kv_state.block_runtime));
-    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
-
-    const stage1_bound = stage1.slotStateBlocks(0);
-    try std.testing.expectEqual(@as(usize, 1), stage1_bound.len);
-    try std.testing.expectEqual(@as(u8, 122), stage1_bound[0].id);
-}
-
-test "bindSlotStateBlocks rejects unknown scheduler descriptor extras for staged local chain" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-    var backend: CudaBackend = undefined;
-    backend.max_batch_size = 1;
-    backend.block_runtime = undefined;
-    backend.local_cpu_stage_backends = &.{};
-    backend.state_descriptor_count = 1;
-    backend.state_descriptors_storage[0] = .{
-        .id = 131,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    backend.slot_state_bindings = slot_state_bindings[0..];
-
-    var stage1: CudaBackend = undefined;
-    stage1.max_batch_size = 1;
-    stage1.state_descriptor_count = 0;
-    var local_cuda_stages: [1]?*CudaBackend = undefined;
-    setSingleLocalCudaStage(&backend, &local_cuda_stages, &stage1);
-
-    var kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    var unknown_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const state_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = 131,
-            .ptr = kv_storage[0..].ptr,
-            .size = runtime_contract.builtin_state_block_bytes,
-            .align_bytes = 64,
-        },
-        .{
-            .id = 132,
-            .ptr = unknown_storage[0..].ptr,
-            .size = runtime_contract.builtin_state_block_bytes,
-            .align_bytes = 64,
-        },
-    };
-
-    try std.testing.expectError(error.UnknownStateDescriptorId, backend.bindSlotStateBlocks(0, state_blocks[0..]));
-    try std.testing.expect(!backend.slot_state_bindings[0].bound);
-}
-
-test "mirrorSlotStateBlocksFrom synthesizes stage-local runtime descriptors without aliasing source" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-
-    var source: CudaBackend = undefined;
-    source.max_batch_size = 1;
-    clearLocalStages(&source);
-    source.block_runtime = undefined;
-    source.state_descriptor_count = 1;
-    source.state_descriptors_storage[0] = .{
-        .id = 201,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    source.slot_state_bindings = source_slot_bindings[0..];
-
-    var target: CudaBackend = undefined;
-    target.max_batch_size = 1;
-    clearLocalStages(&target);
-    target.block_runtime = undefined;
-    target.state_descriptor_count = 2;
-    target.state_descriptors_storage[0] = .{
-        .id = 201,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    target.state_descriptors_storage[1] = .{
-        .id = 202,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = true,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
-    };
-    var target_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    target.slot_state_bindings = target_slot_bindings[0..];
-
-    var source_kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const source_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = 201,
-            .ptr = source_kv_storage[0..].ptr,
-            .size = runtime_contract.builtin_state_block_bytes,
-            .align_bytes = 64,
-        },
-    };
-    try source.bindSlotStateBlocks(0, source_blocks[0..]);
-    defer source.unbindSlotStateBlocks(0);
-    const source_before = source.slotStateBlocks(0);
-    const source_before_kv = runtime_contract.findStateBlock(source_before, 201) orelse return error.TestUnexpectedResult;
-    const source_before_kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, source_before_kv) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&source.block_runtime), @intFromPtr(source_before_kv_state.block_runtime));
-
-    try target.mirrorSlotStateBlocksFrom(&source, 0);
-    defer target.unbindSlotStateBlocks(0);
-
-    const mirrored = target.slotStateBlocks(0);
-    try std.testing.expectEqual(@as(usize, 2), mirrored.len);
-
-    const mirrored_kv = runtime_contract.findStateBlock(mirrored, 201) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(@intFromPtr(source_blocks[0].ptr) != @intFromPtr(mirrored_kv.ptr));
-    const kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, mirrored_kv) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
-    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
-    try std.testing.expectEqual(@intFromPtr(&target.block_runtime), @intFromPtr(kv_state.block_runtime));
-    const source_after = source.slotStateBlocks(0);
-    const source_after_kv = runtime_contract.findStateBlock(source_after, 201) orelse return error.TestUnexpectedResult;
-    const source_after_kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, source_after_kv) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&source.block_runtime), @intFromPtr(source_after_kv_state.block_runtime));
-
-    const mirrored_mamba = runtime_contract.findStateBlock(mirrored, 202) orelse return error.TestUnexpectedResult;
-    const mamba_state = runtime_contract.stateValueFromBlock(*MambaRuntimeState, mirrored_mamba) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
-    try std.testing.expectEqual(@as(usize, 0), mamba_state.slot_index);
-    try std.testing.expectEqual(@intFromPtr(&target.block_runtime), @intFromPtr(mamba_state.block_runtime));
-}
-
-test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtime synthesis" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-
-    var source: CudaBackend = undefined;
-    source.max_batch_size = 1;
-    clearLocalStages(&source);
-    source.block_runtime = undefined;
-    source.state_descriptor_count = 1;
-    source.state_descriptors_storage[0] = .{
-        .id = 211,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    source.slot_state_bindings = source_slot_bindings[0..];
-
-    var target: CudaBackend = undefined;
-    target.max_batch_size = 1;
-    clearLocalStages(&target);
-    target.block_runtime = undefined;
-    target.state_descriptor_count = 2;
-    target.state_descriptors_storage[0] = .{
-        .id = 211,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    target.state_descriptors_storage[1] = .{
-        .id = 212,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_none,
-    };
-    var target_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    target.slot_state_bindings = target_slot_bindings[0..];
-
-    var source_kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const source_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = 211,
-            .ptr = source_kv_storage[0..].ptr,
-            .size = runtime_contract.builtin_state_block_bytes,
-            .align_bytes = 64,
-        },
-    };
-    try source.bindSlotStateBlocks(0, source_blocks[0..]);
-    defer source.unbindSlotStateBlocks(0);
-
-    try std.testing.expectError(error.InvalidStateDescriptorBinding, target.mirrorSlotStateBlocksFrom(&source, 0));
-}
-
-test "mirrorSlotStateBlocksFrom synthesizes runtime descriptors when source slot is unbound" {
-    var source: CudaBackend = undefined;
-    source.max_batch_size = 1;
-    clearLocalStages(&source);
-    source.block_runtime = undefined;
-    source.state_descriptor_count = 0;
-    var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    source.slot_state_bindings = source_slot_bindings[0..];
-
-    var target: CudaBackend = undefined;
-    target.max_batch_size = 1;
-    clearLocalStages(&target);
-    target.block_runtime = undefined;
-    target.state_descriptor_count = 1;
-    target.state_descriptors_storage[0] = .{
-        .id = 221,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = true,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
-    };
-    var target_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    target.slot_state_bindings = target_slot_bindings[0..];
-
-    try target.mirrorSlotStateBlocksFrom(&source, 0);
-    defer target.unbindSlotStateBlocks(0);
-
-    const mirrored = target.slotStateBlocks(0);
-    try std.testing.expectEqual(@as(usize, 1), mirrored.len);
-    const mamba_state = runtime_contract.stateValueFromBlock(*MambaRuntimeState, &mirrored[0]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
-    try std.testing.expectEqual(@as(usize, 0), mamba_state.slot_index);
-    try std.testing.expectEqual(@intFromPtr(&target.block_runtime), @intFromPtr(mamba_state.block_runtime));
 }
 
 test "expectedAttentionQProjectionDim uses packed query width only for query-gated attention" {
@@ -3262,313 +2773,6 @@ test "unbindSlotStateBlocks is idempotent" {
     try std.testing.expectEqual(@as(u8, 0), backend.slot_state_bindings[0].count);
 }
 
-test "unbindSlotStateBlocks fans out to local stage and is idempotent" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-
-    // Source backend (stage2 / main).
-    var source: CudaBackend = undefined;
-    source.max_batch_size = 1;
-    source.block_runtime = undefined;
-    source.state_descriptor_count = 1;
-    source.state_descriptors_storage[0] = .{
-        .id = 52,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var source_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    source.slot_state_bindings = source_bindings[0..];
-
-    // Stage1 backend.
-    var stage1: CudaBackend = undefined;
-    stage1.max_batch_size = 1;
-    stage1.block_runtime = undefined;
-    stage1.state_descriptor_count = 1;
-    clearLocalStages(&stage1);
-    stage1.state_descriptors_storage[0] = .{
-        .id = 52,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var stage1_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    stage1.slot_state_bindings = stage1_bindings[0..];
-
-    var local_cuda_stages: [1]?*CudaBackend = undefined;
-    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
-    // CPU stage not wired during bind — bind fans out to CPU and would fail
-    // on the zero-init stub. Wire it after bind so only unbind exercises CPU fan-out.
-    source.local_cpu_stage_backends = &.{};
-
-    var state_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const state_blocks = [_]runtime_contract.StateBlockHandle{
-        .{ .id = 52, .ptr = state_storage[0..].ptr, .size = runtime_contract.builtin_state_block_bytes, .align_bytes = 64 },
-    };
-
-    // Bind — mirrors to stage1 (no CPU stage wired yet).
-    try source.bindSlotStateBlocks(0, state_blocks[0..]);
-
-    // Now wire the zero-init CPU stub so unbind exercises the CPU fan-out path.
-    // Uses aligned byte buffer to satisfy the struct's natural alignment requirement.
-    const cpu_backend = main.inference.backend.cpu;
-    var cpu_stage0_bytes: [@sizeOf(cpu_backend.BackendType)]u8 align(@alignOf(cpu_backend.BackendType)) = @splat(0);
-    const cpu_stage0: *cpu_backend.BackendType = @ptrCast(&cpu_stage0_bytes);
-    var local_cpu_stages: [1]?*CpuBackend = undefined;
-    setSingleLocalCpuStage(&source, &local_cpu_stages, cpu_stage0);
-    try std.testing.expect(source.slot_state_bindings[0].bound);
-    try std.testing.expect(stage1.slot_state_bindings[0].bound);
-
-    // First unbind — fans out to stage1 + CPU.
-    source.unbindSlotStateBlocks(0);
-    try std.testing.expect(!source.slot_state_bindings[0].bound);
-    try std.testing.expectEqual(@as(u8, 0), source.slot_state_bindings[0].count);
-    try std.testing.expect(!stage1.slot_state_bindings[0].bound);
-    try std.testing.expectEqual(@as(u8, 0), stage1.slot_state_bindings[0].count);
-
-    // Second unbind — idempotent across all stages.
-    source.unbindSlotStateBlocks(0);
-    try std.testing.expect(!source.slot_state_bindings[0].bound);
-    try std.testing.expect(!stage1.slot_state_bindings[0].bound);
-}
-
-test "resetSlot is safe on unbound and bound slots with local stage" {
-    // Source backend.
-    var source: CudaBackend = undefined;
-    source.max_batch_size = 1;
-    source.state_descriptor_count = 0;
-    source.local_cpu_stage_backends = &.{};
-    var source_positions: [1]usize = .{42};
-    var source_deltas: [1]isize = .{7};
-    var source_in_use: [1]bool = .{true};
-    source.slot_positions = source_positions[0..];
-    source.slot_rope_position_deltas = source_deltas[0..];
-    source.slot_in_use = source_in_use[0..];
-    source.batched_decode_graph_exec = null;
-    source.decode_ptr_tables_cached_rows = 0;
-    source.decode_ptr_tables_dirty = false;
-
-    // Stage1 backend.
-    var stage1: CudaBackend = undefined;
-    stage1.max_batch_size = 1;
-    stage1.state_descriptor_count = 0;
-    clearLocalStages(&stage1);
-    var stage1_positions: [1]usize = .{99};
-    var stage1_deltas: [1]isize = .{-3};
-    var stage1_in_use: [1]bool = .{true};
-    stage1.slot_positions = stage1_positions[0..];
-    stage1.slot_rope_position_deltas = stage1_deltas[0..];
-    stage1.slot_in_use = stage1_in_use[0..];
-    stage1.batched_decode_graph_exec = null;
-    stage1.decode_ptr_tables_cached_rows = 0;
-    stage1.decode_ptr_tables_dirty = false;
-
-    var local_cuda_stages: [1]?*CudaBackend = undefined;
-    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
-
-    // Reset on slot with non-zero positions — must fan out to stage1.
-    source.resetSlot(0);
-    try std.testing.expectEqual(@as(usize, 0), source.slot_positions[0]);
-    try std.testing.expectEqual(@as(isize, 0), source.slot_rope_position_deltas[0]);
-    try std.testing.expectEqual(@as(usize, 0), stage1.slot_positions[0]);
-    try std.testing.expectEqual(@as(isize, 0), stage1.slot_rope_position_deltas[0]);
-
-    // Second reset — idempotent, positions stay zero.
-    source.resetSlot(0);
-    try std.testing.expectEqual(@as(usize, 0), source.slot_positions[0]);
-    try std.testing.expectEqual(@as(usize, 0), stage1.slot_positions[0]);
-}
-
-test "bind-unbind-rebind produces independent runtime state across local stages" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-
-    // Source backend.
-    var source: CudaBackend = undefined;
-    source.max_batch_size = 1;
-    source.block_runtime = undefined;
-    source.state_descriptor_count = 1;
-    source.local_cpu_stage_backends = &.{};
-    source.state_descriptors_storage[0] = .{
-        .id = 53,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var source_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    source.slot_state_bindings = source_bindings[0..];
-
-    // Stage1 backend.
-    var stage1: CudaBackend = undefined;
-    stage1.max_batch_size = 1;
-    stage1.block_runtime = undefined;
-    stage1.state_descriptor_count = 1;
-    clearLocalStages(&stage1);
-    stage1.state_descriptors_storage[0] = .{
-        .id = 53,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var stage1_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
-    stage1.slot_state_bindings = stage1_bindings[0..];
-
-    var local_cuda_stages: [1]?*CudaBackend = undefined;
-    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
-
-    // --- First bind ---
-    var storage_a: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const blocks_a = [_]runtime_contract.StateBlockHandle{
-        .{ .id = 53, .ptr = storage_a[0..].ptr, .size = runtime_contract.builtin_state_block_bytes, .align_bytes = 64 },
-    };
-    try source.bindSlotStateBlocks(0, blocks_a[0..]);
-
-    // Stage1 kv runtime must use stage1's block_runtime, not source's.
-    const mirrored_a = stage1.slotStateBlocks(0);
-    const kv_a = runtime_contract.stateValueFromBlock(*KvRuntimeState, &mirrored_a[0]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&stage1.block_runtime), @intFromPtr(kv_a.block_runtime));
-
-    // Source kv runtime must use source's block_runtime.
-    const source_bound_a = source.slotStateBlocks(0);
-    const source_kv_a = runtime_contract.stateValueFromBlock(*KvRuntimeState, &source_bound_a[0]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&source.block_runtime), @intFromPtr(source_kv_a.block_runtime));
-
-    // No cross-stage pointer aliasing (ADR Rule 7).
-    try std.testing.expect(@intFromPtr(mirrored_a[0].ptr) != @intFromPtr(source_bound_a[0].ptr));
-
-    // --- Unbind ---
-    source.unbindSlotStateBlocks(0);
-    try std.testing.expect(!source.slot_state_bindings[0].bound);
-    try std.testing.expect(!stage1.slot_state_bindings[0].bound);
-
-    // --- Rebind with different backing memory ---
-    var storage_b: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const blocks_b = [_]runtime_contract.StateBlockHandle{
-        .{ .id = 53, .ptr = storage_b[0..].ptr, .size = runtime_contract.builtin_state_block_bytes, .align_bytes = 64 },
-    };
-    try source.bindSlotStateBlocks(0, blocks_b[0..]);
-    defer source.unbindSlotStateBlocks(0);
-
-    // Stage1 kv runtime must be freshly synthesized (not stale from first bind).
-    const mirrored_b = stage1.slotStateBlocks(0);
-    const kv_b = runtime_contract.stateValueFromBlock(*KvRuntimeState, &mirrored_b[0]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&stage1.block_runtime), @intFromPtr(kv_b.block_runtime));
-
-    // Source kv runtime still uses source's block_runtime.
-    const source_bound_b = source.slotStateBlocks(0);
-    const source_kv_b = runtime_contract.stateValueFromBlock(*KvRuntimeState, &source_bound_b[0]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&source.block_runtime), @intFromPtr(source_kv_b.block_runtime));
-
-    // No cross-stage aliasing after rebind.
-    try std.testing.expect(@intFromPtr(mirrored_b[0].ptr) != @intFromPtr(source_bound_b[0].ptr));
-}
-
-test "interleaved multi-slot lifecycle with local stage" {
-    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
-
-    // Source backend — 2 slots.
-    var source: CudaBackend = undefined;
-    source.max_batch_size = 2;
-    source.block_runtime = undefined;
-    source.state_descriptor_count = 1;
-    source.local_cpu_stage_backends = &.{};
-    source.state_descriptors_storage[0] = .{
-        .id = 54,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var source_bindings: [2]CudaBackend.SlotStateBinding = .{ .{}, .{} };
-    source.slot_state_bindings = source_bindings[0..];
-
-    // Stage1 backend — 2 slots.
-    var stage1: CudaBackend = undefined;
-    stage1.max_batch_size = 2;
-    stage1.block_runtime = undefined;
-    stage1.state_descriptor_count = 1;
-    clearLocalStages(&stage1);
-    stage1.state_descriptors_storage[0] = .{
-        .id = 54,
-        .size_bytes = runtime_contract.builtin_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = false,
-        .lifecycle = .slot_persistent,
-        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
-    };
-    var stage1_bindings: [2]CudaBackend.SlotStateBinding = .{ .{}, .{} };
-    stage1.slot_state_bindings = stage1_bindings[0..];
-
-    var local_cuda_stages: [1]?*CudaBackend = undefined;
-    setSingleLocalCudaStage(&source, &local_cuda_stages, &stage1);
-
-    var storage_s0: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    var storage_s1: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
-    const blocks_s0 = [_]runtime_contract.StateBlockHandle{
-        .{ .id = 54, .ptr = storage_s0[0..].ptr, .size = runtime_contract.builtin_state_block_bytes, .align_bytes = 64 },
-    };
-    const blocks_s1 = [_]runtime_contract.StateBlockHandle{
-        .{ .id = 54, .ptr = storage_s1[0..].ptr, .size = runtime_contract.builtin_state_block_bytes, .align_bytes = 64 },
-    };
-
-    // Step 1: Bind slot 0 — only slot 0 bound.
-    try source.bindSlotStateBlocks(0, blocks_s0[0..]);
-    try std.testing.expect(source.slot_state_bindings[0].bound);
-    try std.testing.expect(!source.slot_state_bindings[1].bound);
-    try std.testing.expect(stage1.slot_state_bindings[0].bound);
-    try std.testing.expect(!stage1.slot_state_bindings[1].bound);
-
-    // Step 2: Bind slot 1 — both slots bound.
-    try source.bindSlotStateBlocks(1, blocks_s1[0..]);
-    try std.testing.expect(source.slot_state_bindings[0].bound);
-    try std.testing.expect(source.slot_state_bindings[1].bound);
-    try std.testing.expect(stage1.slot_state_bindings[0].bound);
-    try std.testing.expect(stage1.slot_state_bindings[1].bound);
-
-    // Step 3: Unbind slot 0 — slot 1 stays bound.
-    source.unbindSlotStateBlocks(0);
-    try std.testing.expect(!source.slot_state_bindings[0].bound);
-    try std.testing.expect(source.slot_state_bindings[1].bound);
-    try std.testing.expect(!stage1.slot_state_bindings[0].bound);
-    try std.testing.expect(stage1.slot_state_bindings[1].bound);
-
-    // Step 4: Rebind slot 0 — both slots bound again.
-    try source.bindSlotStateBlocks(0, blocks_s0[0..]);
-    try std.testing.expect(source.slot_state_bindings[0].bound);
-    try std.testing.expect(source.slot_state_bindings[1].bound);
-
-    // Step 5: Verify independent runtime state pointers per slot on stage1.
-    const s0_blocks = stage1.slotStateBlocks(0);
-    const s1_blocks = stage1.slotStateBlocks(1);
-    const s0_kv = runtime_contract.stateValueFromBlock(*KvRuntimeState, &s0_blocks[0]) orelse return error.TestUnexpectedResult;
-    const s1_kv = runtime_contract.stateValueFromBlock(*KvRuntimeState, &s1_blocks[0]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 0), s0_kv.slot_index);
-    try std.testing.expectEqual(@as(usize, 1), s1_kv.slot_index);
-    try std.testing.expectEqual(@intFromPtr(&stage1.block_runtime), @intFromPtr(s0_kv.block_runtime));
-    try std.testing.expectEqual(@intFromPtr(&stage1.block_runtime), @intFromPtr(s1_kv.block_runtime));
-
-    // Step 6: Unbind slot 1 — slot 0 stays bound.
-    source.unbindSlotStateBlocks(1);
-    try std.testing.expect(source.slot_state_bindings[0].bound);
-    try std.testing.expect(!source.slot_state_bindings[1].bound);
-    try std.testing.expect(stage1.slot_state_bindings[0].bound);
-    try std.testing.expect(!stage1.slot_state_bindings[1].bound);
-
-    // Step 7: Unbind slot 0 — both slots unbound.
-    source.unbindSlotStateBlocks(0);
-    try std.testing.expect(!source.slot_state_bindings[0].bound);
-    try std.testing.expect(!source.slot_state_bindings[1].bound);
-    try std.testing.expect(!stage1.slot_state_bindings[0].bound);
-    try std.testing.expect(!stage1.slot_state_bindings[1].bound);
-}
-
 // ---------------------------------------------------------------------------
 // computeInitLayerRange — range-scoped init invariant
 // ---------------------------------------------------------------------------
@@ -3578,8 +2782,6 @@ test "interleaved multi-slot lifecycle with local stage" {
 // BlockRuntime.initRange produced the matching block count.
 
 const computeInitLayerRange = CudaBackend.computeInitLayerRange;
-const buildCpuStageInitOptions = CudaBackend.buildCpuStageInitOptions;
-const RootLocalStageSpec = main.inference.backend.LocalStageSpec;
 const no_sharing_config: models.config.ModelConfig = .{
     .vocab_size = 1000,
     .d_model = 256,
@@ -3598,84 +2800,32 @@ test "computeInitLayerRange uses full range without a local stage plan" {
     const r = try computeInitLayerRange(.{}, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 0), r.start);
     try std.testing.expectEqual(@as(usize, 32), r.end);
-    try std.testing.expectEqual(@as(usize, 0), r.split_layer);
-    try std.testing.expectEqual(@as(usize, 0), r.split_layer_stage2);
 }
 
 test "computeInitLayerRange accepts explicit internal layer range" {
     const r = try computeInitLayerRange(.{
-        .init_layer_range = .{ .start = 5, .end = 10 },
+        .layer_range = .{ .start = 5, .end = 10 },
     }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 5), r.start);
     try std.testing.expectEqual(@as(usize, 10), r.end);
-    try std.testing.expectEqual(@as(usize, 0), r.split_layer);
-    try std.testing.expectEqual(@as(usize, 0), r.split_layer_stage2);
 }
 
-test "computeInitLayerRange rejects combining explicit range and stage plan" {
-    const specs = [_]RootLocalStageSpec{
-        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 0, .layer_end = 8 },
-    };
+test "computeInitLayerRange rejects layer_range with start>=end" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
         computeInitLayerRange(.{
-            .local_stage_specs = specs[0..],
-            .init_layer_range = .{ .start = 5, .end = 10 },
-        }, 8, no_sharing_config),
-    );
-}
-
-test "computeInitLayerRange: rejects init_layer_range with start>=end" {
-    try std.testing.expectError(
-        error.InvalidTopologyConfig,
-        computeInitLayerRange(.{
-            .init_layer_range = .{ .start = 10, .end = 10 },
+            .layer_range = .{ .start = 10, .end = 10 },
         }, 32, no_sharing_config),
     );
 }
 
-test "computeInitLayerRange: rejects init_layer_range with end>total_layers" {
+test "computeInitLayerRange rejects layer_range with end>total_layers" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
         computeInitLayerRange(.{
-            .init_layer_range = .{ .start = 0, .end = 33 },
+            .layer_range = .{ .start = 0, .end = 33 },
         }, 32, no_sharing_config),
     );
-}
-
-test "computeInitLayerRange selects root CUDA stage from a generic plan" {
-    const total: usize = 24;
-    const specs = [_]RootLocalStageSpec{
-        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 6 },
-        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 6, .layer_end = 16 },
-        .{ .backend_kind = .cuda, .device_ordinal = 1, .layer_start = 16, .layer_end = 24 },
-    };
-    const r = try computeInitLayerRange(.{ .local_stage_specs = specs[0..], .local_root_stage_id = 2 }, total, no_sharing_config);
-    try std.testing.expectEqual(@as(usize, 16), r.start);
-    try std.testing.expectEqual(@as(usize, 24), r.end);
-    try std.testing.expectEqual(@as(usize, 6), r.split_layer);
-    try std.testing.expectEqual(@as(usize, 16), r.split_layer_stage2);
-}
-
-test "computeInitLayerRange rejects non-contiguous generic plans" {
-    const specs = [_]RootLocalStageSpec{
-        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 0, .layer_end = 6 },
-        .{ .backend_kind = .cuda, .device_ordinal = 1, .layer_start = 7, .layer_end = 24 },
-    };
-    try std.testing.expectError(error.InvalidTopologyConfig, computeInitLayerRange(.{ .local_stage_specs = specs[0..], .local_root_stage_id = 0 }, 24, no_sharing_config));
-}
-
-test "buildCpuStageInitOptions uses stage CPU-owned range and explicit logits ownership" {
-    const opts = buildCpuStageInitOptions(3, 512, 2, 7, false);
-    const range = opts.layer_range orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 3), opts.max_batch_size);
-    try std.testing.expectEqual(@as(usize, 512), opts.max_sequence_len);
-    try std.testing.expectEqual(@as(usize, 2), range.start);
-    try std.testing.expectEqual(@as(usize, 7), range.end);
-    try std.testing.expect(!opts.build_logits_head);
-
-    const final_opts = buildCpuStageInitOptions(3, 512, 7, 9, true);
-    try std.testing.expect(final_opts.build_logits_head);
 }
 
 test "Nvfp4LinearWeight.cublasLtScaleTensorSize computes padded VEC16 layout bytes" {

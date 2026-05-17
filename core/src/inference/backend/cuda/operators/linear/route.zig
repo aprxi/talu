@@ -40,6 +40,21 @@ fn phaseEventTimingEnabled(self: anytype) bool {
     return false;
 }
 
+fn nvfp4FallbackDebugEnabled() bool {
+    const raw = @import("env_pkg").getenv("TALU_CUDA_NVFP4_FALLBACK_DEBUG") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
+fn nvfp4Bf16FallbackEnabled() bool {
+    const raw = @import("env_pkg").getenv("TALU_CUDA_NVFP4_BF16_FALLBACK") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
+fn nvfp4NativeBlasEnabled() bool {
+    const raw = @import("env_pkg").getenv("TALU_CUDA_NVFP4_NATIVE") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
 fn makeLinearContext(
     self: anytype,
     diagnostics: *cuda_linear.Diagnostics,
@@ -83,6 +98,9 @@ fn makeLinearContext(
         .nvfp4_matvec_function = self.nvfp4_matvec_function,
         .nvfp4_matvec_tile8_function = self.nvfp4_matvec_tile8_function,
         .quantize_f32_to_nvfp4_function = self.quantize_f32_to_nvfp4_function,
+        .nvfp4_dequant_to_bf16_function = self.nvfp4_dequant_to_bf16_function,
+        .nvfp4_native_blas_supported = nvfp4NativeBlasEnabled(),
+        .nvfp4_bf16_fallback_enabled = nvfp4Bf16FallbackEnabled(),
         .u16_blas_f16_supported = self.u16_blas_f16_supported,
         .u16_blas_bf16_supported = self.u16_blas_bf16_supported,
         .i8_blas_supported = self.i8_blas_supported,
@@ -130,6 +148,24 @@ fn emitLinearDiagnostics(
     }
     if (diagnostics.nvfp4_matvec_unavailable) {
         log.warn("inference", "CUDA NVFP4 matvec kernel unavailable", .{});
+    }
+    if (nvfp4FallbackDebugEnabled()) {
+        if (diagnostics.nvfp4_bf16_skip) |reason| {
+            switch (weight.*) {
+                .nvfp4 => |w| log.warn("inference", "CUDA NVFP4 BF16 fallback skipped", .{
+                    .reason = @tagName(reason),
+                    .rows = rows,
+                    .in_dim = w.rows,
+                    .out_dim = w.cols,
+                    .activation_scratch = self.runtime_buffers.activation_u16_dev.size,
+                    .auxiliary_scratch = self.runtime_buffers.dequant_f16_dev.size,
+                    .has_dequant_fn = @as(u8, @intFromBool(self.nvfp4_dequant_to_bf16_function != null)),
+                    .has_cast_fn = @as(u8, @intFromBool(self.cast_f32_to_bf16_function != null)),
+                    .bf16_blas = @as(u8, @intFromBool(self.u16_blas_bf16_supported)),
+                }),
+                else => {},
+            }
+        }
     }
     if (diagnostics.nvfp4_route) |route| {
         recordNvfp4LinearRoute(self, route);

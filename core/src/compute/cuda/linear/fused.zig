@@ -74,6 +74,7 @@ pub const CapabilityFlags = struct {
     nvfp4_pair_multi_row_supported: bool = false,
     nvfp4_triple_multi_row_supported: bool = false,
     nvfp4_custom_supported: bool = true,
+    nvfp4_native_cublaslt_supported: bool = false,
 
     pub fn disableI8Blas(self: *CapabilityFlags) void {
         self.i8_blas_supported = false;
@@ -226,6 +227,7 @@ pub fn tryPairNvfp4Lt(
     outputs: PairOutputs,
 ) !bool {
     ctx.diagnostics.reset();
+    if (!ctx.capabilities.nvfp4_native_cublaslt_supported) return false;
     if (rows <= 32) return false;
     var blas_lt = ctx.blas_lt orelse return false;
     const first = switch (first_weight.*) {
@@ -302,6 +304,7 @@ pub fn tryTripleNvfp4Lt(
     outputs: TripleOutputs,
 ) !bool {
     ctx.diagnostics.reset();
+    if (!ctx.capabilities.nvfp4_native_cublaslt_supported) return false;
     if (rows <= 32) return false;
     var blas_lt = ctx.blas_lt orelse return false;
     const first = switch (first_weight.*) {

@@ -748,12 +748,13 @@ pub const LocalEngine = struct {
         }
 
         // Warmup: CPU backend performs a real forward pass during warmup.
-        // Metal/CUDA warmup is currently a no-op and does not require state
-        // descriptor binding during engine construction.
+        // Metal/CUDA and bridge-owned local pipelines warm up without a real
+        // forward pass, so they do not need temporary state binding here.
         const warmup_needs_state_bindings = switch (compute_backend) {
             .cpu => true,
             .metal => false,
             .cuda => false,
+            .local_pipeline => false,
         };
         var warmup_bindings = TemporaryStateBindings{};
         defer warmup_bindings.deinit(allocator);

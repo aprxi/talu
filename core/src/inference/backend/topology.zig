@@ -206,6 +206,25 @@ pub fn defaultCudaLocalStagePlan(total_layers: usize, device_ordinal: usize) !Lo
     }});
 }
 
+pub fn cpuPrefixCudaLocalStagePlan(total_layers: usize, cpu_layers: usize, device_ordinal: usize) !LocalStagePlan {
+    if (total_layers == 0) return error.InvalidTopologyConfig;
+    if (cpu_layers == 0) return defaultCudaLocalStagePlan(total_layers, device_ordinal);
+    if (cpu_layers >= total_layers) return error.InvalidTopologyConfig;
+    return localStagePlanFromSpecs(&.{
+        .{
+            .backend_kind = .cpu,
+            .layer_start = 0,
+            .layer_end = cpu_layers,
+        },
+        .{
+            .backend_kind = .cuda,
+            .device_ordinal = device_ordinal,
+            .layer_start = cpu_layers,
+            .layer_end = total_layers,
+        },
+    });
+}
+
 pub fn resolveLocalStagePlan(
     explicit_stages: ?[]const LocalStageSpec,
     total_layers: usize,
@@ -794,6 +813,28 @@ test "resolveLocalStagePlan honors explicit generic override" {
     try std.testing.expectEqual(@as(usize, 2), plan.stage_count);
     try std.testing.expectEqual(LocalStageBackendKind.cpu, plan.stages[0].backend_kind);
     try std.testing.expectEqual(@as(?usize, 2), plan.stages[1].device_ordinal);
+}
+
+test "cpuPrefixCudaLocalStagePlan builds explicit CPU prefix plan" {
+    const plan = try cpuPrefixCudaLocalStagePlan(32, 5, 1);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.stage_count);
+    try std.testing.expectEqual(LocalStageBackendKind.cpu, plan.stages[0].backend_kind);
+    try std.testing.expectEqual(@as(usize, 0), plan.stages[0].layer_start);
+    try std.testing.expectEqual(@as(usize, 5), plan.stages[0].layer_end);
+    try std.testing.expectEqual(LocalStageBackendKind.cuda, plan.stages[1].backend_kind);
+    try std.testing.expectEqual(@as(?usize, 1), plan.stages[1].device_ordinal);
+    try std.testing.expectEqual(@as(usize, 5), plan.stages[1].layer_start);
+    try std.testing.expectEqual(@as(usize, 32), plan.stages[1].layer_end);
+}
+
+test "cpuPrefixCudaLocalStagePlan accepts zero and rejects all-CPU CUDA plan" {
+    const single = try cpuPrefixCudaLocalStagePlan(32, 0, 0);
+    try std.testing.expect(single.isSingleCudaStage());
+    try std.testing.expectEqual(@as(?usize, 0), single.stages[0].device_ordinal);
+
+    try std.testing.expectError(error.InvalidTopologyConfig, cpuPrefixCudaLocalStagePlan(32, 32, 0));
+    try std.testing.expectError(error.InvalidTopologyConfig, cpuPrefixCudaLocalStagePlan(32, 33, 0));
 }
 
 fn testGpuInfos(comptime N: usize, pairs: [N][2]usize) [N]GpuMemoryInfo {

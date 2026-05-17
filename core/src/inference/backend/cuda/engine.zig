@@ -13,9 +13,6 @@ const opcode_map = models.plan.opcode_map;
 const plan_compiler = models.plan.compiler;
 const rope_scaling = models.rope_scaling;
 const runtime_contract = @import("runtime_contract_pkg");
-const backend_root = @import("../root.zig");
-const local_stage = @import("../local_stage.zig");
-const local_runtime = @import("../local_runtime.zig");
 const contract = @import("../contract.zig");
 const compute = @import("compute_pkg");
 const tensor = @import("compute_pkg").tensor;
@@ -32,7 +29,6 @@ const attention_mod = @import("attention_path.zig");
 const decode_mod = @import("decode.zig");
 const prefill_mod = @import("prefill.zig");
 const preflight = @import("route_preflight.zig");
-const cpu_backend = @import("../cpu/root.zig");
 const shared_scheduler = @import("../../scheduler/contracts.zig");
 const progress_mod = @import("progress_pkg");
 const sampling_mod = @import("../../sampling.zig");
@@ -47,180 +43,7 @@ const GateUpLayout = models.runtime_blocks.GateUpLayout;
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 
-const LocalStageSpec = local_stage.StageSpec;
-const LocalStageBoundaryConfig = local_stage.BoundaryConfig;
-const LocalStageContractField = local_stage.ContractField;
-const local_stage_contract_deinit_order = local_stage.contract_deinit_order;
-const LocalBoundaryRuntime = local_runtime.BoundaryRuntime;
-
-fn validateLocalBoundaryRuntimes(stage_count: usize, boundaries: anytype) !void {
-    return local_stage.validateBoundaryRuntimes(stage_count, boundaries);
-}
-
-fn localCudaPeerCopyAvailable(source: anytype, target: anytype) bool {
-    if (!target.device.canAccessPeer(&source.device)) return false;
-    target.device.enablePeerAccess(&source.device) catch {};
-    source.device.enablePeerAccess(&target.device) catch {};
-    return source.probeLocalCudaPeerCopy(target);
-}
-
-fn localBoundaryConfig(
-    dtype_value: bridge.BoundaryDType,
-    layout: bridge.BoundaryLayout,
-    decode_max_batch_entries: usize,
-    prefill_max_token_count_per_frame: usize,
-) LocalStageBoundaryConfig {
-    return local_stage.boundaryConfig(dtype_value, layout, decode_max_batch_entries, prefill_max_token_count_per_frame);
-}
-
-fn makeLocalBoundaryConfigForCaps(
-    dtype_value: bridge.BoundaryDType,
-    layout: bridge.BoundaryLayout,
-    max_batch_size: usize,
-    prefill_chunk_rows_cap: usize,
-) LocalStageBoundaryConfig {
-    return localBoundaryConfig(dtype_value, layout, max_batch_size, prefill_chunk_rows_cap);
-}
-
-fn makeLocalMinBoundaryConfigForCaps(
-    dtype_value: bridge.BoundaryDType,
-    layout: bridge.BoundaryLayout,
-    stage0_max_batch_size: usize,
-    stage1_max_batch_size: usize,
-    stage0_prefill_chunk_rows_cap: usize,
-    stage1_prefill_chunk_rows_cap: usize,
-) LocalStageBoundaryConfig {
-    return localBoundaryConfig(
-        dtype_value,
-        layout,
-        @min(stage0_max_batch_size, stage1_max_batch_size),
-        @min(stage0_prefill_chunk_rows_cap, stage1_prefill_chunk_rows_cap),
-    );
-}
-
-fn makeLocalTwoBoundaryConfigsForCaps(
-    boundary01_dtype: bridge.BoundaryDType,
-    boundary01_layout: bridge.BoundaryLayout,
-    boundary12_dtype: bridge.BoundaryDType,
-    boundary12_layout: bridge.BoundaryLayout,
-    gpu_stage1_max_batch_size: usize,
-    gpu_stage2_max_batch_size: usize,
-    gpu_stage1_prefill_chunk_rows_cap: usize,
-    gpu_stage2_prefill_chunk_rows_cap: usize,
-) [2]LocalStageBoundaryConfig {
-    const decode_batch_entries = @min(gpu_stage1_max_batch_size, gpu_stage2_max_batch_size);
-    const prefill_token_count = @min(gpu_stage1_prefill_chunk_rows_cap, gpu_stage2_prefill_chunk_rows_cap);
-    return .{
-        localBoundaryConfig(boundary01_dtype, boundary01_layout, decode_batch_entries, prefill_token_count),
-        localBoundaryConfig(boundary12_dtype, boundary12_layout, decode_batch_entries, prefill_token_count),
-    };
-}
-
-fn localBoundaryRowByteCount(d_model: usize, boundary_dtype: bridge.BoundaryDType) !u64 {
-    return local_stage.boundaryRowByteCount(d_model, boundary_dtype);
-}
-
-fn localStageBoundaryProfilePair(
-    d_model: usize,
-    boundary_index: usize,
-    boundary: models.stage_plan.StageBoundary,
-    config: LocalStageBoundaryConfig,
-) ![2]bridge.BoundaryFrameProfile {
-    return local_stage.boundaryProfilePair(d_model, boundary_index, boundary, config);
-}
-
-pub const testing = if (builtin.is_test) struct {
-    pub const local_stage_required_step_kinds = local_stage.required_step_kinds;
-    pub const BoundaryConfig = LocalStageBoundaryConfig;
-    pub const StageBackendKind = bridge.HostBackendKind;
-    pub const StageSpec = LocalStageSpec;
-    pub const BoundaryRuntime = local_stage.BoundaryRuntime;
-    pub const deterministicHostId = local_stage.deterministicHostId;
-    pub const localBoundaryConfig = makeLocalBoundaryConfigForCaps;
-    pub const localMinBoundaryConfig = makeLocalMinBoundaryConfigForCaps;
-    pub const localTwoBoundaryConfigs = makeLocalTwoBoundaryConfigsForCaps;
-    pub const testLocalCudaPeerCopyAvailable = localCudaPeerCopyAvailable;
-    pub const validateStageSpecs = local_stage.validateStageSpecs;
-    pub const validateBoundaryRuntimes = validateLocalBoundaryRuntimes;
-    pub const boundaryRowByteCount = localBoundaryRowByteCount;
-    pub const boundaryProfilePair = localStageBoundaryProfilePair;
-    pub const ContractField = LocalStageContractField;
-    pub const contract_deinit_order = local_stage_contract_deinit_order;
-
-    pub const LocalStageContractBundle = local_stage.ContractBundle;
-
-    pub fn buildLocalStageStateOwnershipPlan(
-        allocator: std.mem.Allocator,
-        plan: *const models.stage_plan.StagePlan,
-    ) !bridge.StageStateOwnershipPlan {
-        return local_stage.buildStateOwnershipPlan(allocator, plan);
-    }
-
-    pub fn buildLocalStagePlacementPlan(
-        allocator: std.mem.Allocator,
-        d_model: usize,
-        plan: *const models.stage_plan.StagePlan,
-        stage_backend_kinds: []const bridge.HostBackendKind,
-        boundary_configs: []const LocalStageBoundaryConfig,
-        state_ref: ?*const bridge.StageStatePlacementRef,
-    ) !bridge.PlacementPlan {
-        return local_stage.buildPlacementPlan(allocator, d_model, plan, stage_backend_kinds, boundary_configs, state_ref);
-    }
-
-    pub fn buildLocalStageContractBundleFromOwnedPlan(
-        allocator: std.mem.Allocator,
-        d_model: usize,
-        plan: models.stage_plan.StagePlan,
-        stage_backend_kinds: []const bridge.HostBackendKind,
-        boundary_configs: []const LocalStageBoundaryConfig,
-    ) !LocalStageContractBundle {
-        var bundle = LocalStageContractBundle{ .stage_plan = plan };
-        errdefer bundle.deinit();
-
-        const plan_ptr = &bundle.stage_plan.?;
-        bundle.tensor_frame_plan_ref = try bridge.TensorFramePlanRef.fromStagePlan(allocator, plan_ptr);
-
-        if (local_stage.countStatefulDependencies(plan_ptr) > 0) {
-            bundle.state_ownership_plan = try local_stage.buildStateOwnershipPlan(allocator, plan_ptr);
-            if (bundle.state_ownership_plan) |*state_plan| {
-                bundle.state_placement_ref = try bridge.buildStageStatePlacementRef(allocator, state_plan);
-            }
-        }
-
-        const state_ref_ptr: ?*const bridge.StageStatePlacementRef = if (bundle.state_placement_ref) |*state_ref| state_ref else null;
-        bundle.placement_plan = try local_stage.buildPlacementPlan(
-            allocator,
-            d_model,
-            plan_ptr,
-            stage_backend_kinds,
-            boundary_configs,
-            state_ref_ptr,
-        );
-        const state_plan_ptr: ?*const bridge.StageStateOwnershipPlan = if (bundle.state_ownership_plan) |*state_plan| state_plan else null;
-        bundle.local_stage_runner_plan_ref = try bridge.buildLocalStageRunnerPlanRef(allocator, .{
-            .stage_plan = plan_ptr,
-            .tensor_frame_plan_ref = &bundle.tensor_frame_plan_ref.?,
-            .placement_plan = &bundle.placement_plan.?,
-            .state_ownership_plan = state_plan_ptr,
-        });
-        return bundle;
-    }
-
-    pub fn deinitLocalStageContractBundleThroughBackendTwice(bundle: *LocalStageContractBundle) void {
-        // This partial backend owns only the contract fields exercised by the deinit helper.
-        var backend: CudaBackend = undefined;
-        backend.local_stage_plan = bundle.stage_plan;
-        backend.local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref;
-        backend.local_state_ownership_plan = bundle.state_ownership_plan;
-        backend.local_state_placement_ref = bundle.state_placement_ref;
-        backend.local_placement_plan = bundle.placement_plan;
-        backend.local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref;
-        bundle.* = .{};
-
-        backend.deinitLocalStageContracts();
-        backend.deinitLocalStageContracts();
-    }
-} else struct {};
+pub const testing = if (builtin.is_test) struct {} else struct {};
 
 // --- Re-exported types from engine_types.zig ---
 const engine_types = @import("runtime/root.zig");
@@ -654,29 +477,8 @@ pub const CudaBackend = struct {
     next_slot_request_id: u64 = 1,
     cpu_rope_global: ?*cpu_kernels.RoPE = null,
     cpu_rope_local: ?*cpu_kernels.RoPE = null,
-    /// Stage id executed by this backend when a local pipeline is active.
-    local_root_stage_id: usize = 0,
-    /// Global model layer index for local layer 0 in this backend.
-    local_layer_start: usize = 0,
-    /// Process-local CPU stage backends indexed by stage id. The root CUDA
-    /// stage has no entry here.
-    local_cpu_stage_backends: []?*cpu_backend.BackendType = &.{},
-    /// Process-local CUDA stage backends indexed by stage id. The root CUDA
-    /// stage has a null entry and is represented by `self`.
-    local_cuda_stage_backends: []?*CudaBackend = &.{},
-    /// Event for non-blocking CUDA local-stage synchronization. Recorded on the
-    /// source compute stream after layer execution; the target stream waits on it
-    /// before reading the transferred activation.
-    local_stage_peer_copy_event: ?compute.cuda.EventHandle = null,
-    local_boundary_staging: []?[]align(4096) u8 = &.{},
-    local_stage_specs: []LocalStageSpec = &.{},
-    local_boundary_runtimes: []LocalBoundaryRuntime = &.{},
-    local_stage_plan: ?models.stage_plan.StagePlan = null,
-    local_tensor_frame_plan_ref: ?bridge.TensorFramePlanRef = null,
-    local_state_ownership_plan: ?bridge.StageStateOwnershipPlan = null,
-    local_state_placement_ref: ?bridge.StageStatePlacementRef = null,
-    local_placement_plan: ?bridge.PlacementPlan = null,
-    local_stage_runner_plan_ref: ?bridge.LocalStageRunnerPlanRef = null,
+    /// Global model layer index for local layer 0 in this backend instance.
+    stage_layer_start: usize = 0,
 
     kv_storage_mode: KvCacheStorageMode = .device,
     kv_init_tokens: usize = initial_kv_cache_tokens,
@@ -831,31 +633,13 @@ pub const CudaBackend = struct {
 
     pub const InitOptions = struct {
         device_ordinal: usize = 0,
-        local_stage_specs: []const backend_root.LocalStageSpec = &.{},
-        local_root_stage_id: usize = 0,
-        /// Internal: restricts layer-dependent allocations to [start, end).
-        /// Used by local stage init to create non-root CUDA stage backends
-        /// without full-model allocation.
-        init_layer_range: ?struct { start: usize, end: usize } = null,
+        /// Restricts layer-dependent allocations to [start, end). Multi-stage
+        /// bridge runtimes pass this for CUDA stage executors; single-stage
+        /// CUDA leaves it null and owns the full model range.
+        layer_range: ?struct { start: usize, end: usize } = null,
         /// Progress context for "Devices" progress bar.
         progress: progress_mod.Context = progress_mod.Context.NONE,
     };
-
-    pub fn buildCpuStageInitOptions(
-        max_batch_size: usize,
-        max_sequence_len: usize,
-        layer_start: usize,
-        layer_end: usize,
-        build_logits_head: bool,
-    ) cpu_backend.BackendType.InitOptions {
-        return .{
-            .max_batch_size = max_batch_size,
-            .max_sequence_len = max_sequence_len,
-            .layer_range = .{ .start = layer_start, .end = layer_end },
-            .build_logits_head = build_logits_head,
-            .progress = progress_mod.Context.NONE,
-        };
-    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -871,11 +655,11 @@ pub const CudaBackend = struct {
         const resolved_kv_init_tokens = resolveCudaInitialKvCacheTokens(resolved_max_seq_len);
         const resolved_prefill_chunk_rows_cap = resolveCudaPrefillChunkRowsCap(resolved_max_seq_len);
         const prefill_chunk_rows_override = @import("env_pkg").getenv("TALU_CUDA_PREFILL_CHUNK_ROWS") != null;
-        const is_local_stage_runtime = init_options.local_stage_specs.len > 1 or init_options.init_layer_range != null;
+        const is_stage_restricted_runtime = init_options.layer_range != null;
         // Local multi-stage topologies benefit from smaller prefill chunks to
         // enable overlap between stages. Keep single-device default unchanged,
         // and always respect explicit env overrides.
-        const staged_prefill_chunk_rows_cap: usize = if (is_local_stage_runtime and !prefill_chunk_rows_override)
+        const staged_prefill_chunk_rows_cap: usize = if (is_stage_restricted_runtime and !prefill_chunk_rows_override)
             @min(resolved_prefill_chunk_rows_cap, @as(usize, 256))
         else
             resolved_prefill_chunk_rows_cap;
@@ -1092,7 +876,7 @@ pub const CudaBackend = struct {
         // from the split points so BlockRuntime only allocates the needed layers.
         const total_layers = loaded.blocks.len;
         const layer_range = try computeInitLayerRange(init_options, total_layers, loaded.config);
-        backend.local_layer_start = layer_range.start;
+        backend.stage_layer_start = layer_range.start;
         backend.block_runtime = BlockRuntime.initRange(
             allocator,
             &backend.device,
@@ -1451,7 +1235,7 @@ pub const CudaBackend = struct {
             try smoke_checks.runKernelSmoke(&backend);
         }
 
-        try backend.initLocalStagePlanRuntime(loaded, max_batch_size, init_options, total_layers);
+        init_options.progress.updateLine(1, @intCast(total_layers), null);
 
         const kv_ready_footprint = backend.kvFootprintSummary();
         log.info("inference", "CUDA decode path ready", .{
@@ -1583,51 +1367,26 @@ pub const CudaBackend = struct {
         return backend;
     }
 
-    /// Resolved layer range and first boundary points for a backend instance.
+    /// Resolved layer range for a backend instance.
     pub const LayerRangeResult = struct {
         /// Layer range for this backend instance: [start, end).
         start: usize,
         end: usize,
-        /// First stage boundary when present.
-        split_layer: usize = 0,
-        /// Second stage boundary when present.
-        split_layer_stage2: usize = 0,
     };
 
-    /// Compute the layer range and resolved boundary points from an ordered
-    /// local stage plan and optional explicit range override.
+    /// Compute the layer range from an optional explicit stage range.
     /// Pure validation — no GPU or allocator dependencies.
     pub fn computeInitLayerRange(
         opts: InitOptions,
         total_layers: usize,
         config: models.config.ModelConfig,
     ) error{InvalidTopologyConfig}!LayerRangeResult {
-        if (opts.init_layer_range) |r| {
-            // init_layer_range is internal: used by local stage init to create
-            // non-root CUDA stage backends.
-            if (opts.local_stage_specs.len != 0) return error.InvalidTopologyConfig;
+        _ = config;
+        if (opts.layer_range) |r| {
             if (r.start >= r.end or r.end > total_layers) return error.InvalidTopologyConfig;
             return .{ .start = r.start, .end = r.end };
         }
-        if (opts.local_stage_specs.len == 0) return .{ .start = 0, .end = total_layers };
-        if (opts.local_root_stage_id >= opts.local_stage_specs.len) return error.InvalidTopologyConfig;
-        const root_spec = opts.local_stage_specs[opts.local_root_stage_id];
-        if (root_spec.backend_kind != .cuda) return error.InvalidTopologyConfig;
-        if (root_spec.layer_start >= root_spec.layer_end or root_spec.layer_end > total_layers) return error.InvalidTopologyConfig;
-        var expected_start: usize = 0;
-        for (opts.local_stage_specs) |stage| {
-            if (stage.layer_start != expected_start) return error.InvalidTopologyConfig;
-            if (stage.layer_end <= stage.layer_start or stage.layer_end > total_layers) return error.InvalidTopologyConfig;
-            expected_start = stage.layer_end;
-        }
-        if (expected_start != total_layers) return error.InvalidTopologyConfig;
-        _ = config;
-        return .{
-            .start = root_spec.layer_start,
-            .end = root_spec.layer_end,
-            .split_layer = if (opts.local_stage_specs.len > 1) opts.local_stage_specs[0].layer_end else 0,
-            .split_layer_stage2 = if (opts.local_stage_specs.len > 2) opts.local_stage_specs[1].layer_end else 0,
-        };
+        return .{ .start = 0, .end = total_layers };
     }
 
     pub fn deinit(self: *CudaBackend) void {
@@ -1697,42 +1456,6 @@ pub const CudaBackend = struct {
         if (self.attn_scores_workspace_dev) |*buf| buf.deinit(&self.device);
         if (self.attn_u16_workspace_dev) |*buf| buf.deinit(&self.device);
         if (self.flash_decode_partial_dev) |*buf| buf.deinit(&self.device);
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| {
-                stage.deinit();
-                self.allocator.destroy(stage);
-            }
-        }
-        if (self.local_cuda_stage_backends.len > 0) {
-            self.allocator.free(self.local_cuda_stage_backends);
-            self.local_cuda_stage_backends = &.{};
-        }
-        for (self.local_cpu_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| {
-                stage.deinit();
-                self.allocator.destroy(stage);
-            }
-        }
-        if (self.local_cpu_stage_backends.len > 0) {
-            self.allocator.free(self.local_cpu_stage_backends);
-            self.local_cpu_stage_backends = &.{};
-        }
-        self.deinitLocalStageRuntime();
-        self.deinitLocalStageContracts();
-        for (self.local_boundary_staging) |*staging| {
-            if (staging.*) |buf| {
-                self.allocator.free(buf);
-                staging.* = null;
-            }
-        }
-        if (self.local_boundary_staging.len > 0) {
-            self.allocator.free(self.local_boundary_staging);
-            self.local_boundary_staging = &.{};
-        }
-        if (self.local_stage_peer_copy_event) |event| {
-            self.device.destroyEvent(event);
-            self.local_stage_peer_copy_event = null;
-        }
         if (self.phase_linear_start_event) |event| {
             self.device.destroyEvent(event);
             self.phase_linear_start_event = null;
@@ -1775,42 +1498,6 @@ pub const CudaBackend = struct {
         try self.device.synchronize();
     }
 
-    pub fn localCudaStage(self: *const CudaBackend, stage_id: usize) ?*CudaBackend {
-        return self.localCudaStageForIdConst(stage_id);
-    }
-
-    pub fn localCpuStage(self: *const CudaBackend, stage_id: usize) ?*cpu_backend.BackendType {
-        return self.localCpuStageForIdConst(stage_id);
-    }
-
-    fn hasLocalStageRuntime(self: *const CudaBackend) bool {
-        return self.local_stage_specs.len != 0;
-    }
-
-    fn localCudaChildStageCount(self: *const CudaBackend) usize {
-        var count: usize = 0;
-        for (self.local_cuda_stage_backends) |stage| {
-            if (stage != null) count += 1;
-        }
-        return count;
-    }
-
-    fn finalCudaStageForLocalOutput(self: *CudaBackend) !*CudaBackend {
-        if (self.local_stage_specs.len == 0) return self;
-        const final_spec = self.local_stage_specs[self.local_stage_specs.len - 1];
-        if (final_spec.backend_kind != .cuda) return error.InvalidTopologyConfig;
-        if (final_spec.stage_id == self.local_root_stage_id) return self;
-        return self.localCudaStageForIdMutable(final_spec.stage_id) orelse error.InvalidTopologyConfig;
-    }
-
-    fn finalCudaStageForLocalOutputConst(self: *const CudaBackend) !*CudaBackend {
-        if (self.local_stage_specs.len == 0) return @constCast(self);
-        const final_spec = self.local_stage_specs[self.local_stage_specs.len - 1];
-        if (final_spec.backend_kind != .cuda) return error.InvalidTopologyConfig;
-        if (final_spec.stage_id == self.local_root_stage_id) return @constCast(self);
-        return self.localCudaStageForIdConst(final_spec.stage_id) orelse error.InvalidTopologyConfig;
-    }
-
     pub fn bindSlotRequestId(self: *CudaBackend, slot_index: usize, request_id: u64) !void {
         if (request_id == 0 or slot_index >= self.slot_request_ids.len) return error.InvalidArgument;
         self.slot_request_ids[slot_index] = request_id;
@@ -1819,347 +1506,6 @@ pub const CudaBackend = struct {
     pub fn unbindSlotRequestId(self: *CudaBackend, slot_index: usize) void {
         if (slot_index >= self.slot_request_ids.len) return;
         self.slot_request_ids[slot_index] = null;
-    }
-
-    fn boundaryActivationByteCount(self: *const CudaBackend, boundary_dtype: bridge.BoundaryDType) !usize {
-        const element_bytes: usize = switch (boundary_dtype) {
-            .bf16, .f16 => @sizeOf(u16),
-            .f32 => @sizeOf(f32),
-        };
-        return std.math.mul(usize, self.d_model, element_bytes) catch error.InvalidArgument;
-    }
-
-    pub fn localActivationByteCount(self: *const CudaBackend) !usize {
-        const boundary_dtype = if (self.local_boundary_runtimes.len > 0)
-            self.local_boundary_runtimes[0].dtype
-        else
-            .f32;
-        return self.boundaryActivationByteCount(boundary_dtype);
-    }
-
-    fn bridgeBackendKind(kind: backend_root.LocalStageBackendKind) bridge.HostBackendKind {
-        return local_runtime.bridgeBackendKind(kind);
-    }
-
-    fn localStageMaxBatchSize(self: *const CudaBackend, stage_id: usize) !usize {
-        if (stage_id == self.local_root_stage_id) return self.max_batch_size;
-        if (stage_id < self.local_cuda_stage_backends.len) {
-            if (self.local_cuda_stage_backends[stage_id]) |stage| return stage.max_batch_size;
-        }
-        if (stage_id < self.local_cpu_stage_backends.len) {
-            if (self.local_cpu_stage_backends[stage_id]) |stage| return stage.max_batch_size;
-        }
-        return error.InvalidTopologyConfig;
-    }
-
-    fn localStagePrefillChunkRowsCap(self: *const CudaBackend, stage_id: usize) !usize {
-        if (stage_id == self.local_root_stage_id) return self.prefill_chunk_rows_cap;
-        if (stage_id < self.local_cuda_stage_backends.len) {
-            if (self.local_cuda_stage_backends[stage_id]) |stage| return stage.prefill_chunk_rows_cap;
-        }
-        if (stage_id < self.local_cpu_stage_backends.len) {
-            if (self.local_cpu_stage_backends[stage_id] != null) return self.prefill_chunk_rows_cap;
-        }
-        return error.InvalidTopologyConfig;
-    }
-
-    fn localCudaStageForIdMutable(self: *CudaBackend, stage_id: usize) ?*CudaBackend {
-        if (stage_id == self.local_root_stage_id) return self;
-        if (stage_id >= self.local_cuda_stage_backends.len) return null;
-        return self.local_cuda_stage_backends[stage_id];
-    }
-
-    fn localCudaStageForIdConst(self: *const CudaBackend, stage_id: usize) ?*CudaBackend {
-        if (stage_id == self.local_root_stage_id) return @constCast(self);
-        if (stage_id >= self.local_cuda_stage_backends.len) return null;
-        return self.local_cuda_stage_backends[stage_id];
-    }
-
-    fn localCpuStageForIdConst(self: *const CudaBackend, stage_id: usize) ?*cpu_backend.BackendType {
-        if (stage_id >= self.local_cpu_stage_backends.len) return null;
-        return self.local_cpu_stage_backends[stage_id];
-    }
-
-    fn localBoundaryPeerCopyAvailable(self: *CudaBackend, source_stage_id: usize, target_stage_id: usize) bool {
-        const source = self.localCudaStageForIdMutable(source_stage_id) orelse return false;
-        const target = self.localCudaStageForIdMutable(target_stage_id) orelse return false;
-        return localCudaPeerCopyAvailable(source, target);
-    }
-
-    fn initLocalStagePlanRuntime(
-        self: *CudaBackend,
-        loaded: *LoadedModel,
-        max_batch_size: usize,
-        init_options: InitOptions,
-        total_layers: usize,
-    ) !void {
-        const input_specs = init_options.local_stage_specs;
-        if (input_specs.len <= 1) {
-            init_options.progress.updateLine(1, @intCast(total_layers), null);
-            return;
-        }
-        if (init_options.local_root_stage_id >= input_specs.len) return error.InvalidTopologyConfig;
-        self.local_root_stage_id = init_options.local_root_stage_id;
-        self.local_cpu_stage_backends = try self.allocator.alloc(?*cpu_backend.BackendType, input_specs.len);
-        errdefer {
-            self.allocator.free(self.local_cpu_stage_backends);
-            self.local_cpu_stage_backends = &.{};
-        }
-        @memset(self.local_cpu_stage_backends, null);
-        self.local_cuda_stage_backends = try self.allocator.alloc(?*CudaBackend, input_specs.len);
-        errdefer {
-            self.allocator.free(self.local_cuda_stage_backends);
-            self.local_cuda_stage_backends = &.{};
-        }
-        @memset(self.local_cuda_stage_backends, null);
-        self.local_boundary_staging = try self.allocator.alloc(?[]align(4096) u8, input_specs.len - 1);
-        errdefer {
-            self.allocator.free(self.local_boundary_staging);
-            self.local_boundary_staging = &.{};
-        }
-        @memset(self.local_boundary_staging, null);
-
-        for (input_specs, 0..) |spec, stage_id| {
-            if (stage_id == self.local_root_stage_id) {
-                init_options.progress.updateLine(1, @intCast(spec.layer_end), null);
-                continue;
-            }
-            switch (spec.backend_kind) {
-                .cpu => {
-                    const stage_ptr = try self.allocator.create(cpu_backend.BackendType);
-                    var initialized = false;
-                    errdefer if (!initialized) self.allocator.destroy(stage_ptr);
-                    stage_ptr.* = try cpu_backend.BackendType.init(
-                        self.allocator,
-                        loaded,
-                        buildCpuStageInitOptions(
-                            max_batch_size,
-                            backend_root.resolveCpuMaxSeqLenForRuntime(
-                                self.allocator,
-                                @intCast(@max(@as(i32, 1), loaded.config.max_seq_len)),
-                            ),
-                            spec.layer_start,
-                            spec.layer_end,
-                            stage_id + 1 == input_specs.len,
-                        ),
-                    );
-                    initialized = true;
-                    errdefer {
-                        stage_ptr.deinit();
-                        self.allocator.destroy(stage_ptr);
-                    }
-                    self.local_cpu_stage_backends[stage_id] = stage_ptr;
-                },
-                .cuda => {
-                    const stage_ptr = try self.allocator.create(CudaBackend);
-                    var initialized = false;
-                    errdefer if (!initialized) self.allocator.destroy(stage_ptr);
-                    stage_ptr.* = try CudaBackend.init(
-                        self.allocator,
-                        loaded,
-                        max_batch_size,
-                        .{
-                            .device_ordinal = spec.device_ordinal orelse return error.InvalidTopologyConfig,
-                            .init_layer_range = .{ .start = spec.layer_start, .end = spec.layer_end },
-                            .progress = init_options.progress,
-                        },
-                    );
-                    initialized = true;
-                    errdefer {
-                        stage_ptr.deinit();
-                        self.allocator.destroy(stage_ptr);
-                    }
-                    self.local_cuda_stage_backends[stage_id] = stage_ptr;
-                },
-                .metal => return error.InvalidTopologyConfig,
-            }
-            init_options.progress.updateLine(1, @intCast(spec.layer_end), null);
-        }
-
-        const boundary_count = input_specs.len - 1;
-        const stage_capabilities = try self.allocator.alloc(local_runtime.StageRuntimeCapability, input_specs.len);
-        defer self.allocator.free(stage_capabilities);
-        const boundary_peer_copy_available = try self.allocator.alloc(bool, boundary_count);
-        defer self.allocator.free(boundary_peer_copy_available);
-
-        for (input_specs, 0..) |spec, stage_id| {
-            stage_capabilities[stage_id] = .{
-                .stage_id = stage_id,
-                .backend_kind = bridgeBackendKind(spec.backend_kind),
-                .max_batch_size = try self.localStageMaxBatchSize(stage_id),
-                .prefill_chunk_rows_cap = try self.localStagePrefillChunkRowsCap(stage_id),
-                .supported_boundary_dtypes = local_runtime.supportedBoundaryDTypes(spec.backend_kind),
-            };
-        }
-        for (0..boundary_count) |boundary_index| {
-            const source = input_specs[boundary_index];
-            const target = input_specs[boundary_index + 1];
-            boundary_peer_copy_available[boundary_index] = source.backend_kind == .cuda and
-                target.backend_kind == .cuda and
-                self.localBoundaryPeerCopyAvailable(boundary_index, boundary_index + 1);
-        }
-
-        var runtime_plan = try local_runtime.buildPlan(.{
-            .allocator = self.allocator,
-            .d_model = self.d_model,
-            .total_layers = total_layers,
-            .stages = input_specs,
-            .stage_capabilities = stage_capabilities,
-            .boundary_peer_copy_available = boundary_peer_copy_available,
-        });
-        defer runtime_plan.deinit();
-
-        try self.initLocalStageBridgeContracts(.{
-            .allocator = self.allocator,
-            .loaded = self.loaded,
-            .d_model = self.d_model,
-            .total_layers = total_layers,
-            .split_points = runtime_plan.split_points,
-            .stage_backend_kinds = runtime_plan.stage_backend_kinds,
-            .boundary_configs = runtime_plan.boundary_configs,
-            .load_semantics = models.stage_plan.LoadSemantics.fromLoadOptions(
-                backend_root.defaultModelLoadOptions(.{ .selection = .cuda }),
-            ),
-        });
-        errdefer self.deinitLocalStageContracts();
-        try self.initLocalStageRuntime(total_layers, runtime_plan.stage_specs, runtime_plan.boundary_runtimes);
-        errdefer self.deinitLocalStageRuntime();
-        self.local_boundary_staging = runtime_plan.boundary_staging;
-        runtime_plan.boundary_staging = &.{};
-
-        if (self.device.supportsEvents()) {
-            self.local_stage_peer_copy_event = self.device.createEvent() catch null;
-        }
-
-        log.info("inference", "CUDA local stage plan ready", .{
-            .stage_count = input_specs.len,
-            .boundary_count = boundary_count,
-            .root_stage_id = self.local_root_stage_id,
-        });
-        init_options.progress.updateLine(1, @intCast(total_layers), null);
-    }
-
-    fn initLocalStageRuntime(
-        self: *CudaBackend,
-        total_layers: usize,
-        specs: []const LocalStageSpec,
-        boundaries: []const LocalBoundaryRuntime,
-    ) !void {
-        if (self.local_stage_specs.len != 0 or self.local_boundary_runtimes.len != 0) {
-            return error.InvalidTopologyConfig;
-        }
-        try local_stage.validateStageSpecs(total_layers, specs);
-        try validateLocalBoundaryRuntimes(specs.len, boundaries);
-        self.local_stage_specs = try self.allocator.dupe(LocalStageSpec, specs);
-        errdefer {
-            self.allocator.free(self.local_stage_specs);
-            self.local_stage_specs = &.{};
-        }
-        self.local_boundary_runtimes = try self.allocator.dupe(LocalBoundaryRuntime, boundaries);
-        errdefer {
-            self.allocator.free(self.local_boundary_runtimes);
-            self.local_boundary_runtimes = &.{};
-        }
-    }
-
-    fn deinitLocalStageRuntime(self: *CudaBackend) void {
-        if (self.local_boundary_runtimes.len != 0) {
-            self.allocator.free(self.local_boundary_runtimes);
-            self.local_boundary_runtimes = &.{};
-        }
-        if (self.local_stage_specs.len != 0) {
-            self.allocator.free(self.local_stage_specs);
-            self.local_stage_specs = &.{};
-        }
-    }
-
-    pub fn localBoundaryRuntime(self: *const CudaBackend, boundary_index: usize) !*const LocalBoundaryRuntime {
-        if (boundary_index >= self.local_boundary_runtimes.len) return error.InvalidTopologyConfig;
-        const boundary = &self.local_boundary_runtimes[boundary_index];
-        if (boundary.boundary_index != boundary_index) return error.InvalidTopologyConfig;
-        return boundary;
-    }
-
-    fn initLocalStageBridgeContracts(
-        self: *CudaBackend,
-        request: local_stage.ContractBuildRequest,
-    ) !void {
-        if (self.local_stage_plan != null or
-            self.local_tensor_frame_plan_ref != null or
-            self.local_state_ownership_plan != null or
-            self.local_state_placement_ref != null or
-            self.local_placement_plan != null or
-            self.local_stage_runner_plan_ref != null)
-        {
-            return error.InvalidTopologyConfig;
-        }
-        var bundle = try local_stage.buildContractBundle(request);
-        errdefer bundle.deinit();
-
-        self.local_stage_plan = bundle.stage_plan;
-        bundle.stage_plan = null;
-        self.local_tensor_frame_plan_ref = bundle.tensor_frame_plan_ref;
-        bundle.tensor_frame_plan_ref = null;
-        self.local_state_ownership_plan = bundle.state_ownership_plan;
-        bundle.state_ownership_plan = null;
-        self.local_state_placement_ref = bundle.state_placement_ref;
-        bundle.state_placement_ref = null;
-        self.local_placement_plan = bundle.placement_plan;
-        bundle.placement_plan = null;
-        self.local_stage_runner_plan_ref = bundle.local_stage_runner_plan_ref;
-        bundle.local_stage_runner_plan_ref = null;
-    }
-
-    fn deinitLocalStageContracts(self: *CudaBackend) void {
-        inline for (local_stage_contract_deinit_order) |field| {
-            switch (field) {
-                .local_stage_runner_plan_ref => if (self.local_stage_runner_plan_ref) |*plan_ref| {
-                    plan_ref.deinit();
-                    self.local_stage_runner_plan_ref = null;
-                },
-                .placement_plan => if (self.local_placement_plan) |*plan| {
-                    plan.deinit();
-                    self.local_placement_plan = null;
-                },
-                .state_placement_ref => if (self.local_state_placement_ref) |*state_ref| {
-                    state_ref.deinit();
-                    self.local_state_placement_ref = null;
-                },
-                .state_ownership_plan => if (self.local_state_ownership_plan) |*state_plan| {
-                    state_plan.deinit();
-                    self.local_state_ownership_plan = null;
-                },
-                .tensor_frame_plan_ref => if (self.local_tensor_frame_plan_ref) |*plan_ref| {
-                    plan_ref.deinit();
-                    self.local_tensor_frame_plan_ref = null;
-                },
-                .stage_plan => if (self.local_stage_plan) |*plan| {
-                    plan.deinit();
-                    self.local_stage_plan = null;
-                },
-            }
-        }
-    }
-
-    fn probeLocalCudaPeerCopy(self: *CudaBackend, dst: *CudaBackend) bool {
-        const src_size = self.runtime_buffers.input_dev.size;
-        const dst_size = dst.runtime_buffers.input_dev.size;
-        const min_size = @min(src_size, dst_size);
-        if (min_size == 0) return false;
-        const probe_bytes = @min(min_size, @as(usize, 256));
-        self.device.memcpyPeerAsync(
-            &dst.device,
-            &dst.runtime_buffers.input_dev,
-            &self.runtime_buffers.input_dev,
-            probe_bytes,
-            self.compute_stream,
-        ) catch return false;
-        if (self.compute_stream) |stream| {
-            self.device.synchronizeStream(stream) catch return false;
-        } else {
-            self.device.synchronize() catch return false;
-        }
-        return true;
     }
 
     pub fn maxBatchSize(self: *const CudaBackend) usize {
@@ -2819,7 +2165,6 @@ pub const CudaBackend = struct {
     }
 
     fn ensureDecodeMetricEvents(self: *CudaBackend) bool {
-        if (self.hasLocalStageRuntime()) return false;
         if (!self.device.supportsEventTiming()) return false;
         if (self.decode_metric_start_event != null and self.decode_metric_stop_event != null) return true;
 
@@ -3066,6 +2411,38 @@ pub const CudaBackend = struct {
         }
     }
 
+    fn extractTopKFromBatchedHostLogits(
+        self: *CudaBackend,
+        batch_rows: usize,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+        candidate_counts_out: []usize,
+    ) !void {
+        const topk_shape = try preflight.requireTopKCandidateBuffers(
+            batch_rows,
+            top_k,
+            candidate_logits_out.len,
+            candidate_ids_out.len,
+            candidate_counts_out.len,
+            256,
+        );
+        if (self.loaded.config.logits_scaling <= 0.0) return error.UnsupportedModel;
+
+        for (0..batch_rows) |row_index| {
+            const row_logits = self.batchedHostLogitsRow(row_index) orelse return error.InvalidTopologyConfig;
+            const row_start = std.math.mul(usize, row_index, top_k) catch return error.InvalidArgument;
+            const row_end = std.math.add(usize, row_start, top_k) catch return error.InvalidArgument;
+            if (row_end > topk_shape.total_candidates) return error.InvalidArgument;
+            candidate_counts_out[row_index] = try bridge.local_stage_runtime.extractTopKFromHostLogitsRow(
+                row_logits,
+                top_k,
+                candidate_logits_out[row_start..row_end],
+                candidate_ids_out[row_start..row_end],
+            );
+        }
+    }
+
     pub fn decodeBatchTopKCandidates(
         self: *CudaBackend,
         requests: []const contract.DecodeRequest,
@@ -3111,11 +2488,12 @@ pub const CudaBackend = struct {
             positions_buf[0..],
             raw_positions_buf[0..],
         );
-        self.computeBatchedDecodeLogitsDeviceOnly(
+        const decode_result = self.computeBatchedDecodeLogitsDeviceOnly(
             tokens_buf[0..requests.len],
             slot_indices_buf[0..requests.len],
             positions_buf[0..requests.len],
-        ) catch |err| {
+        );
+        decode_result catch |err| {
             log.warn("inference", "CUDA decodeBatchTopKCandidates batched decode failed", .{
                 .batch_rows = requests.len,
                 .slot0 = slot_indices_buf[0],
@@ -3132,9 +2510,7 @@ pub const CudaBackend = struct {
             self.slot_positions[req.slot_index] = raw_positions_buf[i] + 1;
         }
 
-        const topk_source_backend = try self.finalCudaStageForLocalOutput();
-
-        try topk_source_backend.extractTopKFromBatchedDeviceLogits(
+        try self.extractTopKFromBatchedDeviceLogits(
             requests.len,
             top_k,
             candidate_logits_out,
@@ -3166,11 +2542,12 @@ pub const CudaBackend = struct {
         var positions_buf = [_]usize{effective_position};
         var wall_timer = std.time.Timer.start() catch unreachable;
         const metric_active = self.beginDecodeMetric();
-        self.computeBatchedDecodeLogitsDeviceOnly(
+        const decode_result = self.computeBatchedDecodeLogitsDeviceOnly(
             tokens_buf[0..],
             slot_indices_buf[0..],
             positions_buf[0..],
-        ) catch |err| {
+        );
+        decode_result catch |err| {
             log.warn("inference", "CUDA decodeTopKCandidates decode failed", .{
                 .slot = slot_index,
                 .raw_pos = raw_position,
@@ -3192,10 +2569,8 @@ pub const CudaBackend = struct {
             return 1;
         }
 
-        const topk_source_backend = try self.finalCudaStageForLocalOutput();
-
         var counts: [1]usize = .{0};
-        try topk_source_backend.extractTopKFromBatchedDeviceLogits(
+        try self.extractTopKFromBatchedDeviceLogits(
             1,
             top_k,
             candidate_logits_out[0..top_k],
@@ -3208,81 +2583,17 @@ pub const CudaBackend = struct {
 
     pub fn allocSlot(self: *CudaBackend) ?usize {
         const slot_index = decode_mod.allocSlot(self) orelse return null;
-        var allocated_cuda_until: usize = 0;
-        for (self.local_cuda_stage_backends, 0..) |stage_opt, index| {
-            const stage = stage_opt orelse continue;
-            const child_slot_index = stage.allocSlot() orelse {
-                for (self.local_cuda_stage_backends[0..allocated_cuda_until]) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.freeSlot(slot_index);
-                }
-                decode_mod.freeSlot(self, slot_index);
-                self.unbindSlotStateBlocks(slot_index);
-                return null;
-            };
-            if (child_slot_index != slot_index) {
-                stage.freeSlot(child_slot_index);
-                for (self.local_cuda_stage_backends[0..allocated_cuda_until]) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.freeSlot(slot_index);
-                }
-                decode_mod.freeSlot(self, slot_index);
-                self.unbindSlotStateBlocks(slot_index);
-                return null;
-            }
-            stage.unbindSlotStateBlocks(slot_index);
-            allocated_cuda_until = index + 1;
-        }
-        var allocated_cpu_until: usize = 0;
-        for (self.local_cpu_stage_backends, 0..) |stage_opt, index| {
-            const cpu_stage = stage_opt orelse continue;
-            const cpu_slot_index = cpu_stage.allocSlot() orelse {
-                for (self.local_cpu_stage_backends[0..allocated_cpu_until]) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.freeSlot(slot_index);
-                }
-                for (self.local_cuda_stage_backends) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.freeSlot(slot_index);
-                }
-                decode_mod.freeSlot(self, slot_index);
-                self.unbindSlotStateBlocks(slot_index);
-                return null;
-            };
-            if (cpu_slot_index != slot_index) {
-                cpu_stage.freeSlot(cpu_slot_index);
-                for (self.local_cpu_stage_backends[0..allocated_cpu_until]) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.freeSlot(slot_index);
-                }
-                for (self.local_cuda_stage_backends) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.freeSlot(slot_index);
-                }
-                decode_mod.freeSlot(self, slot_index);
-                self.unbindSlotStateBlocks(slot_index);
-                return null;
-            }
-            cpu_stage.unbindSlotStateBlocks(slot_index);
-            allocated_cpu_until = index + 1;
-        }
         self.unbindSlotStateBlocks(slot_index);
         return slot_index;
     }
 
     pub fn freeSlot(self: *CudaBackend, slot_index: usize) void {
         decode_mod.freeSlot(self, slot_index);
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.freeSlot(slot_index);
-        }
-        for (self.local_cpu_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.freeSlot(slot_index);
-        }
         self.unbindSlotStateBlocks(slot_index);
     }
 
     pub fn resetSlot(self: *CudaBackend, slot_index: usize) void {
         decode_mod.resetSlot(self, slot_index);
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.resetSlot(slot_index);
-        }
-        for (self.local_cpu_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.resetSlot(slot_index);
-        }
         if (self.state_descriptor_count == 0) return;
         if (!self.slotIndexSupported(slot_index)) return;
         if (!self.slot_state_bindings[slot_index].bound) return;
@@ -3334,99 +2645,6 @@ pub const CudaBackend = struct {
         };
     }
 
-    fn synthesizeRuntimeStateBlockForDescriptor(
-        self: *CudaBackend,
-        binding: *SlotStateBinding,
-        descriptor: runtime_contract.StateDescriptor,
-        slot_index: usize,
-        binding_index: usize,
-    ) !runtime_contract.StateBlockHandle {
-        const block_storage = &binding.local_blocks[binding_index];
-        switch (descriptor.runtime_kind) {
-            runtime_contract.state_runtime_kind_kv_cache,
-            runtime_contract.state_runtime_kind_shortconv_cache,
-            runtime_contract.state_runtime_kind_mamba_cache,
-            runtime_contract.state_runtime_kind_gated_delta_cache,
-            => {},
-            else => return error.InvalidStateDescriptorBinding,
-        }
-        if (descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
-        if (descriptor.size_bytes > block_storage.len) return error.InvalidStateDescriptorBinding;
-        if (descriptor.zero_init) @memset(block_storage, 0);
-
-        var local_handle: runtime_contract.StateBlockHandle = .{
-            .id = descriptor.id,
-            .ptr = block_storage[0..].ptr,
-            .size = block_storage.len,
-            .align_bytes = 64,
-        };
-        try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &local_handle);
-        return local_handle;
-    }
-
-    fn validateStateBlocksCoverDescriptors(
-        descriptors: []const runtime_contract.StateDescriptor,
-        state_blocks: []const runtime_contract.StateBlockHandle,
-    ) !void {
-        var desc_seen: [256]bool = [_]bool{false} ** 256;
-        var block_seen: [256]bool = [_]bool{false} ** 256;
-
-        for (descriptors) |descriptor| {
-            if (desc_seen[descriptor.id]) return error.DuplicateStateDescriptorId;
-            desc_seen[descriptor.id] = true;
-            if (descriptor.align_bytes == 0) return error.InvalidStateAlignment;
-        }
-
-        for (state_blocks) |state_block| {
-            if (state_block.align_bytes == 0 or state_block.size == 0) return error.InvalidStateDescriptorBinding;
-            if (block_seen[state_block.id]) return error.InvalidStateDescriptorBinding;
-            block_seen[state_block.id] = true;
-        }
-
-        for (descriptors) |descriptor| {
-            const state_block = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            if (state_block.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
-            if (descriptor.size_bytes > 0 and state_block.size < descriptor.size_bytes) {
-                return error.InvalidStateDescriptorBinding;
-            }
-        }
-    }
-
-    fn descriptorSliceContainsId(descriptors: []const runtime_contract.StateDescriptor, state_id: u8) bool {
-        for (descriptors) |descriptor| {
-            if (descriptor.id == state_id) return true;
-        }
-        return false;
-    }
-
-    fn localStageDescriptorIdAllowed(self: *const CudaBackend, state_id: u8) bool {
-        if (descriptorSliceContainsId(self.stateDescriptors(), state_id)) return true;
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| {
-                if (descriptorSliceContainsId(stage.stateDescriptors(), state_id)) return true;
-            }
-        }
-        for (self.local_cpu_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| {
-                if (descriptorSliceContainsId(stage.stateDescriptors(), state_id)) return true;
-            }
-        }
-        return false;
-    }
-
-    fn validateLocalStageStateBlocks(
-        self: *const CudaBackend,
-        descriptors: []const runtime_contract.StateDescriptor,
-        state_blocks: []const runtime_contract.StateBlockHandle,
-    ) !void {
-        try validateStateBlocksCoverDescriptors(descriptors, state_blocks);
-        for (state_blocks) |state_block| {
-            if (!self.localStageDescriptorIdAllowed(state_block.id)) return error.UnknownStateDescriptorId;
-        }
-    }
-
     pub fn bindSlotStateBlocks(
         self: *CudaBackend,
         slot_index: usize,
@@ -3434,12 +2652,7 @@ pub const CudaBackend = struct {
     ) !void {
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         const descriptors = self.stateDescriptors();
-        const has_local_stage = self.local_cuda_stage_backends.len != 0 or self.local_cpu_stage_backends.len != 0;
-        const validation_result = if (has_local_stage)
-            self.validateLocalStageStateBlocks(descriptors, state_blocks)
-        else
-            runtime_contract.validateStateBlocksForDescriptors(descriptors, state_blocks);
-        validation_result catch |err| return err;
+        try runtime_contract.validateStateBlocksForDescriptors(descriptors, state_blocks);
         var binding = &self.slot_state_bindings[slot_index];
         if (descriptors.len > binding.handles.len) {
             log.warn("inference", "CUDA bindSlotStateBlocks too many state blocks", .{
@@ -3457,98 +2670,37 @@ pub const CudaBackend = struct {
                 });
                 return error.InvalidStateDescriptorBinding;
             };
-            var bound = incoming.*;
-            try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &bound);
-            binding.handles[idx] = .{
-                .id = descriptor.id,
-                .ptr = bound.ptr,
-                .size = bound.size,
-                .align_bytes = bound.align_bytes,
-            };
+            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_none) {
+                if (descriptor.align_bytes > 64 or descriptor.size_bytes > binding.local_blocks[idx].len) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+                const block_storage = &binding.local_blocks[idx];
+                if (descriptor.zero_init) @memset(block_storage, 0);
+                var local_handle: runtime_contract.StateBlockHandle = .{
+                    .id = descriptor.id,
+                    .ptr = block_storage[0..].ptr,
+                    .size = block_storage.len,
+                    .align_bytes = 64,
+                };
+                try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &local_handle);
+                binding.handles[idx] = local_handle;
+            } else {
+                var bound = incoming.*;
+                try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &bound);
+                binding.handles[idx] = .{
+                    .id = bound.id,
+                    .ptr = bound.ptr,
+                    .size = bound.size,
+                    .align_bytes = bound.align_bytes,
+                };
+            }
         }
         binding.count = @intCast(descriptors.len);
-        binding.bound = true;
-        var mirrored_cuda_until: usize = 0;
-        for (self.local_cuda_stage_backends, 0..) |stage_opt, index| {
-            const stage = stage_opt orelse continue;
-            stage.mirrorSlotStateBlocksFrom(self, slot_index) catch |err| {
-                // Rollback: unbind self before propagating.
-                for (self.local_cuda_stage_backends[0..mirrored_cuda_until]) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.unbindSlotStateBlocks(slot_index);
-                }
-                self.slot_state_bindings[slot_index].reset();
-                return err;
-            };
-            mirrored_cuda_until = index + 1;
-        }
-        var bound_cpu_until: usize = 0;
-        for (self.local_cpu_stage_backends, 0..) |stage_opt, index| {
-            const cpu_stage = stage_opt orelse continue;
-            cpu_stage.bindLocalRuntimeStateBlocks(slot_index) catch |err| {
-                for (self.local_cpu_stage_backends[0..bound_cpu_until]) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.unbindSlotStateBlocks(slot_index);
-                }
-                for (self.local_cuda_stage_backends) |rollback_opt| {
-                    if (rollback_opt) |rollback| rollback.unbindSlotStateBlocks(slot_index);
-                }
-                self.slot_state_bindings[slot_index].reset();
-                return err;
-            };
-            bound_cpu_until = index + 1;
-        }
-    }
-
-    pub fn mirrorSlotStateBlocksFrom(
-        self: *CudaBackend,
-        source: *const CudaBackend,
-        slot_index: usize,
-    ) !void {
-        if (!self.slotIndexSupported(slot_index) or !source.slotIndexSupported(slot_index)) return error.InvalidArgument;
-        if (self.state_descriptor_count == 0) return;
-        const source_binding = &source.slot_state_bindings[slot_index];
-
-        var binding = &self.slot_state_bindings[slot_index];
-        binding.reset();
-        const source_blocks: []const runtime_contract.StateBlockHandle = if (source_binding.bound)
-            source.slotStateBlocks(slot_index)
-        else
-            &.{};
-        for (self.stateDescriptors(), 0..) |descriptor, idx| {
-            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_none) {
-                // Runtime descriptors are always rebound into stage-local wrapper blocks.
-                // Rebinding shared source blocks mutates their payload and can alias state
-                // across stages, so stage1 must never reuse stage0 runtime block pointers.
-                binding.handles[idx] = try synthesizeRuntimeStateBlockForDescriptor(
-                    self,
-                    binding,
-                    descriptor,
-                    slot_index,
-                    idx,
-                );
-                continue;
-            }
-            const incoming = runtime_contract.findStateBlock(source_blocks, descriptor.id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            binding.handles[idx] = .{
-                .id = descriptor.id,
-                .ptr = incoming.ptr,
-                .size = incoming.size,
-                .align_bytes = incoming.align_bytes,
-            };
-        }
-        binding.count = self.state_descriptor_count;
         binding.bound = true;
     }
 
     pub fn unbindSlotStateBlocks(self: *CudaBackend, slot_index: usize) void {
         if (!self.slotIndexSupported(slot_index)) return;
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.unbindSlotStateBlocks(slot_index);
-        }
-        for (self.local_cpu_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.unbindSlotStateBlocks(slot_index);
-        }
         self.slot_state_bindings[slot_index].reset();
     }
 
@@ -3850,7 +3002,7 @@ pub const CudaBackend = struct {
     }
 
     pub fn selectNextTokenFromDeviceLogitsImpl(self: *CudaBackend) !u32 {
-        return selectNextTokenFromDeviceLogits(try self.finalCudaStageForLocalOutput());
+        return selectNextTokenFromDeviceLogits(self);
     }
 
     pub fn shouldDownloadPrefillLogitsImpl(self: *const CudaBackend, token_index: usize, token_count: usize) bool {
@@ -3922,17 +3074,10 @@ pub const CudaBackend = struct {
 
     pub fn beginNvfp4RouteWindow(self: *CudaBackend) void {
         self.nvfp4_route_window_start = self.nvfp4_route_counters;
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.beginNvfp4RouteWindow();
-        }
     }
 
     pub fn nvfp4RouteWindowDelta(self: *const CudaBackend) Nvfp4RouteCounters {
-        var total = Nvfp4RouteCounters.delta(self.nvfp4_route_counters, self.nvfp4_route_window_start);
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| total = mergeNvfp4RouteCounters(total, stage.nvfp4RouteWindowDelta());
-        }
-        return total;
+        return Nvfp4RouteCounters.delta(self.nvfp4_route_counters, self.nvfp4_route_window_start);
     }
 
     pub fn logDecodeInventorySummaryImpl(self: *const CudaBackend, mode: []const u8, token_count: usize, batch_rows: usize) void {
@@ -3943,8 +3088,6 @@ pub const CudaBackend = struct {
             .tokens = token_count,
             .batch_rows = batch_rows,
             .architecture_id = arch_id,
-            .local_stage_count = self.local_stage_specs.len,
-            .local_cuda_stage_count = self.localCudaChildStageCount() + 1,
             .kv_dtype = @tagName(self.kv_cache_dtype),
             .kv_storage = @tagName(self.kv_storage_mode),
             .d_model = self.d_model,
@@ -3984,17 +3127,10 @@ pub const CudaBackend = struct {
 
     pub fn beginPhaseBudgetWindow(self: *CudaBackend) void {
         self.nvfp4_phase_window_start = self.nvfp4_phase_counters;
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| stage.beginPhaseBudgetWindow();
-        }
     }
 
     pub fn phaseBudgetWindowDelta(self: *const CudaBackend) Nvfp4PhaseBudgetCounters {
-        var total = Nvfp4PhaseBudgetCounters.delta(self.nvfp4_phase_counters, self.nvfp4_phase_window_start);
-        for (self.local_cuda_stage_backends) |stage_opt| {
-            if (stage_opt) |stage| total = mergeNvfp4PhaseBudgetCounters(total, stage.phaseBudgetWindowDelta());
-        }
-        return total;
+        return Nvfp4PhaseBudgetCounters.delta(self.nvfp4_phase_counters, self.nvfp4_phase_window_start);
     }
 
     pub fn logPhaseBudgetSummaryImpl(self: *const CudaBackend, mode: []const u8, token_count: usize, elapsed_ns: u64) void {
@@ -4142,6 +3278,41 @@ pub const CudaBackend = struct {
         return engine_forward.executeDecodeWithLayerLimit(self, token, position, slot_index, logits_out_opt, layer_limit, compute_logits, download_logits, ensure_kv_capacity, trace_seq_len_u32, trace_pos_offset, hidden_override, deepstack_layer_features_opt, deepstack_feature_index_opt, use_preloaded_input);
     }
 
+    pub fn executeDecodeLayerRange(
+        self: *CudaBackend,
+        token: u32,
+        position: usize,
+        slot_index: usize,
+        logits_out_opt: ?[]f32,
+        layer_start: usize,
+        layer_end: usize,
+        compute_logits: bool,
+        download_logits: bool,
+        ensure_kv_capacity: bool,
+        use_preloaded_input: bool,
+    ) !void {
+        if (layer_end < layer_start) return error.InvalidArgument;
+        if (layer_start != self.stage_layer_start) return error.InvalidArgument;
+        const layer_limit = layer_end - layer_start;
+        if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
+        return self.executeDecodeWithLayerLimit(
+            token,
+            position,
+            slot_index,
+            logits_out_opt,
+            layer_limit,
+            compute_logits,
+            download_logits,
+            ensure_kv_capacity,
+            @intCast(position + 1),
+            position,
+            null,
+            null,
+            null,
+            use_preloaded_input,
+        );
+    }
+
     pub fn computeBatchedDecodeLogits(
         self: *CudaBackend,
         tokens: []const u32,
@@ -4161,12 +3332,13 @@ pub const CudaBackend = struct {
     }
 
     pub fn batchedHostLogitsRow(self: *CudaBackend, row_index: usize) ?[]f32 {
-        const vocab = self.runtime_buffers.projected_vocab;
+        const source_backend = self;
+        const vocab = source_backend.runtime_buffers.projected_vocab;
         if (vocab == 0) return null;
         const start = std.math.mul(usize, row_index, vocab) catch return null;
         const end = std.math.add(usize, start, vocab) catch return null;
-        if (end > self.runtime_buffers.projected_logits_batch_host.len) return null;
-        return self.runtime_buffers.projected_logits_batch_host[start..end];
+        if (end > source_backend.runtime_buffers.projected_logits_batch_host.len) return null;
+        return source_backend.runtime_buffers.projected_logits_batch_host[start..end];
     }
 
     pub fn executePrefillWithLayerLimit(
@@ -4177,6 +3349,32 @@ pub const CudaBackend = struct {
         layer_limit: usize,
     ) !void {
         return engine_forward.executePrefillWithLayerLimit(self, tokens, slot_index, logits_out, layer_limit);
+    }
+
+    pub fn executePrefillLayerRange(
+        self: *CudaBackend,
+        slot_index: usize,
+        tokens: []const u32,
+        sequence_start: usize,
+        layer_start: usize,
+        layer_end: usize,
+        use_preloaded_input: bool,
+        compute_logits: bool,
+        logits_out_opt: ?[]f32,
+        source_embeddings_out: ?[]f32,
+    ) !void {
+        return engine_forward.executePrefillLayerRange(
+            self,
+            slot_index,
+            tokens,
+            sequence_start,
+            layer_start,
+            layer_end,
+            use_preloaded_input,
+            compute_logits,
+            logits_out_opt,
+            source_embeddings_out,
+        );
     }
 
     pub fn ensureKvCapacity(self: *CudaBackend, required_tokens: usize) !void {
@@ -4728,3 +3926,58 @@ fn deviceSupportsFp8KvCache(device: *compute.cuda.Device) !bool {
 }
 const gaffineScaleBiasToF32 = engine_weights.gaffineScaleBiasToF32;
 const gaffineValueAt = engine_weights.gaffineValueAt;
+
+test "CUDA bindSlotStateBlocks wraps runtime descriptors in slot-local storage" {
+    const state_block_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+    var backend: CudaBackend = undefined;
+    backend.max_batch_size = 1;
+    backend.block_runtime = undefined;
+    backend.state_descriptor_count = 2;
+    backend.state_descriptors_storage[0] = .{
+        .id = 9,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_none,
+    };
+    backend.state_descriptors_storage[1] = runtime_contract.defaultStateDescriptor(.gated_delta);
+    backend.slot_state_bindings = try std.testing.allocator.alloc(CudaBackend.SlotStateBinding, 1);
+    defer std.testing.allocator.free(backend.slot_state_bindings);
+    backend.slot_state_bindings[0] = .{};
+
+    var opaque_storage: [state_block_bytes]u8 align(64) = undefined;
+    var runtime_storage: [state_block_bytes]u8 align(64) = undefined;
+    @memset(&opaque_storage, 0x5A);
+    @memset(&runtime_storage, 0xA5);
+    const state_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 9,
+            .ptr = opaque_storage[0..].ptr,
+            .size = opaque_storage.len,
+            .align_bytes = 64,
+        },
+        .{
+            .id = runtime_contract.gated_delta_state_id,
+            .ptr = runtime_storage[0..].ptr,
+            .size = runtime_storage.len,
+            .align_bytes = 64,
+        },
+    };
+
+    try backend.bindSlotStateBlocks(0, state_blocks[0..]);
+    defer backend.unbindSlotStateBlocks(0);
+
+    const bound = backend.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 2), bound.len);
+    try std.testing.expectEqual(@intFromPtr(state_blocks[0].ptr), @intFromPtr(bound[0].ptr));
+    try std.testing.expect(@intFromPtr(state_blocks[1].ptr) != @intFromPtr(bound[1].ptr));
+    try std.testing.expectEqual(@as(u8, 0xA5), runtime_storage[0]);
+
+    const recurrent_state = runtime_contract.stateValueFromBlock(*GatedDeltaRuntimeState, &bound[1]) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_gated_delta_cache, recurrent_state.runtime_kind);
+    try std.testing.expect(recurrent_state.block_runtime == &backend.block_runtime);
+    try std.testing.expectEqual(@as(usize, 0), recurrent_state.slot_index);
+}

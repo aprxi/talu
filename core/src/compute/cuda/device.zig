@@ -859,6 +859,25 @@ pub const Device = struct {
             });
             return error.CudaKernelLaunchFailed;
         }
+        if (@import("env_pkg").getenv("TALU_CUDA_DEBUG_SYNC")) |raw| {
+            if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true")) {
+                self.synchronize() catch |err| {
+                    log.warn("compute", "CUDA kernel debug sync failed after launch", .{
+                        .phase = @tagName(self.launch_phase),
+                        .family = @tagName(self.launch_family),
+                        .grid_x = grid_x,
+                        .grid_y = grid_y,
+                        .grid_z = grid_z,
+                        .block_x = block_x,
+                        .block_y = block_y,
+                        .block_z = block_z,
+                        .shared_mem = shared_mem_bytes,
+                        .reason = @errorName(err),
+                    });
+                    return error.CudaKernelLaunchFailed;
+                };
+            }
+        }
         if (self.launch_stats_enabled) {
             const launch_elapsed_ns = monotonicNowNs() - launch_start_ns;
             const family_idx: usize = @intFromEnum(self.launch_family);

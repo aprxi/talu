@@ -1,4 +1,4 @@
-//! Local stage-chain adapter integration tests.
+//! CUDA backend interface integration tests for bridge stage-chain execution.
 
 const std = @import("std");
 const main = @import("main");
@@ -7,10 +7,11 @@ const bridge = main.inference.bridge;
 const transport = main.inference.transport;
 const models = main.models.dispatcher;
 const cuda_testing = main.inference.backend.cuda.testing;
+const local_stage_testing = @import("local_stage_test_helpers.zig");
 const engine = cuda_testing.engine;
-const stage_adapters = cuda_testing.exec.stage_adapters;
+const stage_executor = cuda_testing.interface.stage_executor;
 
-test "peerCopyCudaActivation issues event ordered device peer copy" {
+test "peerCopyCudaActivation source-event mode falls back to source-stream synchronization" {
     const Trace = struct {
         record_calls: usize = 0,
         wait_calls: usize = 0,
@@ -68,14 +69,12 @@ test "peerCopyCudaActivation issues event ordered device peer copy" {
         device: Device,
         runtime_buffers: RuntimeBuffers = .{},
         compute_stream: ?usize,
-        local_stage_peer_copy_event: ?usize = null,
     };
 
     var trace_data = Trace{};
     var source = Backend{
         .device = .{ .trace = &trace_data },
         .compute_stream = 11,
-        .local_stage_peer_copy_event = 99,
     };
     var target = Backend{
         .device = .{ .trace = &trace_data },
@@ -84,77 +83,22 @@ test "peerCopyCudaActivation issues event ordered device peer copy" {
 
     try transport.peerCopyCudaActivation(&source, &target, 64, .source_event_target_stream);
 
-    try std.testing.expectEqual(@as(usize, 1), trace_data.record_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_data.wait_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_data.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace_data.record_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace_data.wait_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace_data.make_current_calls);
     try std.testing.expectEqual(@as(usize, 1), trace_data.peer_calls);
     try std.testing.expectEqual(@as(usize, 64), trace_data.peer_bytes);
-    try std.testing.expectEqual(@as(?usize, 22), trace_data.peer_stream);
-    try std.testing.expectEqual(@as(usize, 0), trace_data.sync_calls);
-    try std.testing.expect(transport.peerCopyCudaActivationHandlesStageSync(&source, .source_event_target_stream));
+    try std.testing.expectEqual(@as(?usize, 11), trace_data.peer_stream);
+    try std.testing.expectEqual(@as(usize, 1), trace_data.sync_calls);
+    try std.testing.expect(!transport.peerCopyCudaActivationHandlesStageSync(&source, .source_event_target_stream));
 }
 
-test "peerCopyCudaActivationHandlesStageSync reports only event-synchronized copies" {
-    const Backend = struct {
-        local_stage_peer_copy_event: ?usize = null,
-    };
-    var without_event = Backend{};
-    var with_event = Backend{ .local_stage_peer_copy_event = 99 };
+test "peerCopyCudaActivationHandlesStageSync reports transport-owned source sync" {
+    const Backend = struct {};
+    var backend = Backend{};
 
-    try std.testing.expect(!transport.peerCopyCudaActivationHandlesStageSync(&without_event, .source_event_target_stream));
-    try std.testing.expect(transport.peerCopyCudaActivationHandlesStageSync(&with_event, .source_event_target_stream));
-    try std.testing.expect(!transport.peerCopyCudaActivationHandlesStageSync(&with_event, .source_stream));
-}
-
-test "localCudaPeerCopyAvailable matches bridge adapter peer-copy direction" {
-    const Trace = struct {
-        source_enable_calls: usize = 0,
-        target_enable_calls: usize = 0,
-        probe_calls: usize = 0,
-    };
-    const Device = struct {
-        trace: *Trace,
-        is_target: bool,
-        can_access_peer: bool,
-
-        pub fn canAccessPeer(device: *@This(), _: *@This()) bool {
-            return device.can_access_peer;
-        }
-
-        pub fn enablePeerAccess(device: *@This(), _: *@This()) !void {
-            if (device.is_target) {
-                device.trace.target_enable_calls += 1;
-            } else {
-                device.trace.source_enable_calls += 1;
-            }
-        }
-    };
-    const Backend = struct {
-        device: Device,
-        probe_result: bool = true,
-
-        pub fn probeLocalCudaPeerCopy(backend: *@This(), _: *@This()) bool {
-            backend.device.trace.probe_calls += 1;
-            return backend.probe_result;
-        }
-    };
-
-    var trace_data = Trace{};
-    var source = Backend{
-        .device = .{ .trace = &trace_data, .is_target = false, .can_access_peer = true },
-    };
-    var target = Backend{
-        .device = .{ .trace = &trace_data, .is_target = true, .can_access_peer = false },
-    };
-
-    try std.testing.expect(!engine.testing.testLocalCudaPeerCopyAvailable(&source, &target));
-    try std.testing.expectEqual(@as(usize, 0), trace_data.probe_calls);
-
-    target.device.can_access_peer = true;
-    try std.testing.expect(engine.testing.testLocalCudaPeerCopyAvailable(&source, &target));
-    try std.testing.expectEqual(@as(usize, 1), trace_data.source_enable_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_data.target_enable_calls);
-    try std.testing.expectEqual(@as(usize, 1), trace_data.probe_calls);
+    try std.testing.expect(!transport.peerCopyCudaActivationHandlesStageSync(&backend, .source_event_target_stream));
+    try std.testing.expect(!transport.peerCopyCudaActivationHandlesStageSync(&backend, .source_stream));
 }
 
 test "executeLocalStageChain moves decode activation through selected bridge mode" {
@@ -167,7 +111,7 @@ test "executeLocalStageChain moves decode activation through selected bridge mod
         trace: *Trace,
 
         pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
         }
 
         pub fn synchronize(stage: *@This()) anyerror!void {
@@ -228,7 +172,7 @@ test "executeLocalStageChain moves prefill activation through selected bridge mo
         trace: *Trace,
 
         pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
         }
 
         pub fn synchronize(stage: *@This()) anyerror!void {
@@ -288,7 +232,7 @@ test "executeLocalStageChain uses peer copy when selected by bridge" {
         trace: *Trace,
 
         pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
         }
 
         pub fn synchronize(stage: *@This()) anyerror!void {
@@ -313,7 +257,7 @@ test "executeLocalStageChain uses peer copy when selected by bridge" {
         trace: *Trace,
 
         pub fn executeLayers(_: *@This(), input: []const u8, _: usize, _: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
         }
 
         pub fn synchronize(_: *@This()) anyerror!void {}
@@ -544,7 +488,7 @@ test "executeLocalPipelineStep runs erased source prepare before target upload" 
         prepared_boundary: usize = std.math.maxInt(usize),
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
             try std.testing.expect(layer_end > layer_start);
             stage.trace.push(if (stage.id == 0) TraceStep.stage0_execute else TraceStep.stage1_execute);
         }
@@ -688,7 +632,7 @@ test "executeLocalPipelineStep executes three adjacent boundaries in order" {
         id: usize,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
             try std.testing.expect(layer_end > layer_start);
             stage.trace.push(switch (stage.id) {
                 0 => TraceStep.stage0_execute,
@@ -797,7 +741,7 @@ test "executeLocalDecodePipelineStep accepts generic four stage local chain" {
         id: usize,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
             try std.testing.expect(layer_end > layer_start);
             stage.trace.push(switch (stage.id) {
                 0 => TraceStep.stage0_execute,
@@ -917,7 +861,7 @@ test "executeLocalDecodePipelineStep validates host segments after source execut
         host_segments: ?[][]const u8 = null,
 
         pub fn executeDecodeLayerRange(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
             try std.testing.expect(layer_end > layer_start);
             if (stage.id == 0) {
                 const segments = stage.host_segments orelse return error.InvalidTopologyConfig;
@@ -1019,7 +963,7 @@ test "executeLocalPipelineStepWithEndpointRegistry executes five stage chain by 
         id: usize,
 
         pub fn executeDecodeLayerRange(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
             try std.testing.expect(layer_end > layer_start);
             stage.trace.push(stage.id, .execute);
         }
@@ -1271,7 +1215,7 @@ test "executeLocalPrefillPipelineStep builds prefill activation handoff" {
         id: usize,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
             try std.testing.expect(layer_end > layer_start);
             stage.trace.push(if (stage.id == 0) TraceStep.stage0_execute else TraceStep.stage1_execute);
         }
@@ -1389,7 +1333,7 @@ fn chainStage(comptime Trace: type, comptime TraceStep: type) type {
         fail_upload: bool = false,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
-            try stage_adapters.validateEmptyInput(input);
+            try stage_executor.validateEmptyInput(input);
             try std.testing.expect(layer_end > layer_start);
             stage.trace.push(switch (stage.id) {
                 0 => TraceStep.stage0_execute,
@@ -1424,14 +1368,14 @@ const test_entries = [_]bridge.TensorFrameBatchEntry{.{
     .token_count = 1,
 }};
 
-fn buildPlacement(step_kind: bridge.TensorFrameStepKind) !engine.testing.LocalStageContractBundle {
+fn buildPlacement(step_kind: bridge.TensorFrameStepKind) !local_stage_testing.LocalStageContractBundle {
     _ = step_kind;
     const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{2});
     const kinds = [_]bridge.HostBackendKind{ .cpu, .cuda };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
     };
-    var bundle = try engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    var bundle = try local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         4,
         plan,
@@ -1442,20 +1386,20 @@ fn buildPlacement(step_kind: bridge.TensorFrameStepKind) !engine.testing.LocalSt
     return bundle;
 }
 
-fn buildTwoCudaStagePlacement() !engine.testing.LocalStageContractBundle {
+fn buildTwoCudaStagePlacement() !local_stage_testing.LocalStageContractBundle {
     return buildTwoStagePlacementWithKinds(.cuda, .cuda);
 }
 
 fn buildTwoStagePlacementWithKinds(
     source_kind: bridge.HostBackendKind,
     target_kind: bridge.HostBackendKind,
-) !engine.testing.LocalStageContractBundle {
+) !local_stage_testing.LocalStageContractBundle {
     const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{2});
     const kinds = [_]bridge.HostBackendKind{ source_kind, target_kind };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
     };
-    return engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    return local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         4,
         plan,
@@ -1464,11 +1408,11 @@ fn buildTwoStagePlacementWithKinds(
     );
 }
 
-fn buildThreeStagePlacement() !engine.testing.LocalStageContractBundle {
+fn buildThreeStagePlacement() !local_stage_testing.LocalStageContractBundle {
     const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{ 2, 3 });
     const kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .cuda };
-    const configs = engine.testing.localTwoBoundaryConfigs(.f32, .row_major, .f32, .row_major, 4, 4, 1, 1);
-    return engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    const configs = local_stage_testing.localTwoBoundaryConfigs(.f32, .row_major, .f32, .row_major, 4, 4, 1, 1);
+    return local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         4,
         plan,
@@ -1477,15 +1421,15 @@ fn buildThreeStagePlacement() !engine.testing.LocalStageContractBundle {
     );
 }
 
-fn buildFourStagePlacement() !engine.testing.LocalStageContractBundle {
+fn buildFourStagePlacement() !local_stage_testing.LocalStageContractBundle {
     const plan = try buildTestStagePlan(std.testing.allocator, 4, &.{ 1, 2, 3 });
     const kinds = [_]bridge.HostBackendKind{ .cuda, .cpu, .cuda, .cpu };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
     };
-    return engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    return local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         4,
         plan,
@@ -1494,16 +1438,16 @@ fn buildFourStagePlacement() !engine.testing.LocalStageContractBundle {
     );
 }
 
-fn buildFiveStagePlacement() !engine.testing.LocalStageContractBundle {
+fn buildFiveStagePlacement() !local_stage_testing.LocalStageContractBundle {
     const plan = try buildTestStagePlan(std.testing.allocator, 5, &.{ 1, 2, 3, 4 });
     const kinds = [_]bridge.HostBackendKind{ .cpu, .cuda, .metal, .cuda, .cpu };
-    const configs = [_]engine.testing.BoundaryConfig{
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
-        engine.testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+    const configs = [_]local_stage_testing.BoundaryConfig{
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
+        local_stage_testing.localBoundaryConfig(.f32, .row_major, 4, 1),
     };
-    return engine.testing.buildLocalStageContractBundleFromOwnedPlan(
+    return local_stage_testing.buildLocalStageContractBundleFromOwnedPlan(
         std.testing.allocator,
         4,
         plan,

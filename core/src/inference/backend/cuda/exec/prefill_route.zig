@@ -11,8 +11,6 @@ const per_layer_branch_feature = @import("../per_layer_branch.zig");
 /// Resolve staged prefill chunk rows for a specific request length.
 /// Keeps explicit env override behavior unchanged.
 const common = @import("common.zig");
-const stage_adapters = @import("../../local_stage_adapters.zig");
-const staged_prefill = @import("../../local_prefill_pipeline.zig");
 const buildAttentionKernelSet = common.buildAttentionKernelSet;
 const prefillMath = common.prefillMath;
 const prefillChunkContext = common.prefillChunkContext;
@@ -51,20 +49,11 @@ pub fn executePrefillWithLayerLimit(
 ) !void {
     const SelfType = @TypeOf(self.*);
 
-    if (comptime @hasField(SelfType, "block_runtime")) {
-        if (layer_limit == self.block_runtime.blocks.len) {
-            if (try stage_adapters.localPipelineFactsAvailable(self)) {
-                try validatePrefillRequest(self, tokens, slot_index, logits_out);
-                return staged_prefill.executeLocalPrefillPipeline(self, tokens, slot_index, logits_out);
-            }
-        }
-    }
-
     if (comptime @hasDecl(SelfType, "executePrefillWithLayerLimitTestHook")) {
         return self.executePrefillWithLayerLimitTestHook(tokens, slot_index, logits_out, layer_limit);
     }
     if (comptime @hasDecl(SelfType, "executeDecodeWithLayerLimitTestHook") and
-        !@hasDecl(SelfType, "localCpuStage"))
+        !@hasDecl(SelfType, "executePrefillWithLayerLimitTestHook"))
     {
         try validatePrefillRequest(self, tokens, slot_index, logits_out);
         if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
@@ -136,5 +125,90 @@ pub fn executePrefillWithLayerLimit(
         }
 
         pos_base += rows;
+    }
+}
+
+pub fn executePrefillLayerRange(
+    self: anytype,
+    slot_index: usize,
+    tokens: []const u32,
+    sequence_start: usize,
+    layer_start: usize,
+    layer_end: usize,
+    use_preloaded_input: bool,
+    compute_logits: bool,
+    logits_out_opt: ?[]f32,
+    source_embeddings_out: ?[]f32,
+) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
+    if (tokens.len == 0) return error.InvalidArgument;
+    if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+    if (layer_end <= layer_start) return error.InvalidArgument;
+    if (comptime @hasField(SelfType, "stage_layer_start")) {
+        if (layer_start != self.stage_layer_start) return error.InvalidArgument;
+    }
+    const layer_limit = layer_end - layer_start;
+    if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
+    if (compute_logits and logits_out_opt == null) return error.InvalidArgument;
+    if (logits_out_opt) |logits_out| {
+        if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+    }
+
+    const previous_launch_phase = self.device.setLaunchPhase(.prefill);
+    defer _ = self.device.setLaunchPhase(previous_launch_phase);
+
+    const required_tokens = std.math.add(usize, sequence_start, tokens.len) catch return error.InvalidArgument;
+    if (sequence_start == 0) {
+        try prepareCudaPrefillBackend(self, required_tokens);
+    } else {
+        try self.ensureKvCapacity(required_tokens);
+    }
+
+    const rows = tokens.len;
+    try self.runtime_buffers.ensureRowCapacity(&self.device, rows, self.fixed_alloc_mode);
+    try self.ensureLayerProgramSlotRowCapacity(rows, self.fixed_alloc_mode);
+    const math = try prefillMath(self);
+    const attention_kernels = buildAttentionKernelSet(self) catch return error.CudaKernelUnavailable;
+    const chunk = try prefillChunkContext(sequence_start, rows);
+
+    if (!use_preloaded_input) {
+        try populateCudaPrefillInputRows(self, tokens, rows, math.row_bytes);
+        if (source_embeddings_out) |out| {
+            const hidden_count = std.math.mul(usize, rows, self.d_model) catch return error.InvalidArgument;
+            if (out.len < hidden_count) return error.InvalidArgument;
+            try self.runtime_buffers.input_dev.download(&self.device, std.mem.sliceAsBytes(out[0..hidden_count]));
+        }
+    } else if (source_embeddings_out != null) {
+        return error.InvalidTopologyConfig;
+    }
+
+    var per_layer_source_embeddings_opt: ?compute.cuda.Buffer = null;
+    if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
+        per_layer_source_embeddings_opt = try per_layer_branch_feature.maybeCapturePerLayerSourceEmbeddings(self, rows);
+    }
+    const final_hidden_rows = try executeGpuPrefillLayers(
+        self,
+        slot_index,
+        tokens,
+        math,
+        chunk,
+        attention_kernels,
+        per_layer_source_embeddings_opt,
+        per_layer_branch_feature.hasPerLayerBranchRuntime(self),
+        null,
+        layer_limit,
+    );
+
+    if (compute_logits) {
+        try projectFinalLogitsFromCudaStage(
+            self,
+            final_hidden_rows,
+            rows,
+            math.row_bytes,
+            chunk.last_position,
+            logits_out_opt.?,
+            "cuda_final_norm_host",
+        );
     }
 }

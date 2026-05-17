@@ -7,6 +7,7 @@ const std = @import("std");
 const compute = @import("compute_pkg");
 const log = @import("log_pkg");
 const trace = @import("xray_pkg").trace;
+const transport = @import("../../../transport/root.zig");
 const per_layer_branch_feature = @import("../per_layer_branch.zig");
 
 const engine_ops = @import("../operators/root.zig");
@@ -64,7 +65,6 @@ pub fn dumpHiddenState(
         return;
     };
 
-    // Download full row to hidden_host using raw cu_memcpy_dtoh.
     const n = @min(d_model, self.runtime_buffers.hidden_host.len);
     if (n == 0) return;
     const download_bytes = n * @sizeOf(f32);
@@ -80,25 +80,22 @@ pub fn dumpHiddenState(
         return;
     }
 
-    self.device.makeCurrent() catch |err| {
-        log.warn("inference", "DUMP_HIDDEN_SKIP", .{ .layer = global_layer_idx, .label = label, .reason = "make_current_err", .err = @intFromError(err) });
-        return;
-    };
-
-    const host_ptr: *anyopaque = @ptrCast(self.runtime_buffers.hidden_host.ptr);
-    const rc = self.device.api.cu_memcpy_dtoh(host_ptr, buf.pointer, download_bytes);
-    if (rc != 0) {
+    transport.downloadCudaBufferToHostBytes(
+        &self.device,
+        buf,
+        std.mem.sliceAsBytes(self.runtime_buffers.hidden_host[0..n]),
+    ) catch |err| {
         log.warn("inference", "DUMP_HIDDEN_SKIP", .{
             .layer = global_layer_idx,
             .label = label,
-            .reason = "cu_memcpy_rc",
-            .rc = rc,
+            .reason = "transport_download_err",
+            .err = @errorName(err),
             .dev_ptr = buf.pointer,
             .buf_size = buf.size,
             .download_bytes = download_bytes,
         });
         return;
-    }
+    };
 
     const host = self.runtime_buffers.hidden_host[0..n];
     var sum: f64 = 0.0;

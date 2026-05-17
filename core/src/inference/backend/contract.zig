@@ -180,10 +180,28 @@ pub fn assertBackendModuleLayout(comptime M: type, comptime backend_name: []cons
         requireLayoutDecl(M, backend_name, "BackendType");
         requireLayoutDecl(M, backend_name, "executor");
         requireLayoutDecl(M, backend_name, "kernels");
+        requireLayoutDecl(M, backend_name, "interface");
         requireLayoutDecl(M, backend_name, "engine");
         requireLayoutDecl(M, backend_name, "vision");
         requireLayoutDecl(M, backend_name, "scheduler");
         requireLayoutDecl(M, backend_name, "sampling");
+    }
+}
+
+/// Assert backend interface module layout symmetry.
+pub fn assertInterfaceModuleLayout(comptime I: type, comptime backend_name: []const u8) void {
+    comptime {
+        const owner = backend_name ++ ".interface";
+        requireLayoutDecl(I, owner, "stage_executor");
+        requireLayoutDecl(I, owner, "transport_endpoint");
+        requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "supports_local_stage_execution");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "supports_transport_endpoint_descriptors");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "deviceLocationHint");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "hostDecodeActivationSlice");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "hostPrefillActivationSlice");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "decodeInputBuffer");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "prefillInputBuffer");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "sideInputBuffer");
     }
 }
 
@@ -524,6 +542,11 @@ pub fn assertBackendType(comptime T: type) void {
 test "assertBackendModuleLayout validates CPU backend module layout" {
     const cpu = @import("cpu/root.zig");
     assertBackendModuleLayout(cpu, "cpu");
+}
+
+test "assertInterfaceModuleLayout validates CPU backend interface layout" {
+    const cpu = @import("cpu/root.zig");
+    assertInterfaceModuleLayout(cpu.interface, "cpu");
 }
 
 test "assertVisionModuleLayout validates CPU vision module layout" {

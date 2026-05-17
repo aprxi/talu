@@ -1199,6 +1199,68 @@ pub const FusedCpuBackend = struct {
         return std.mem.sliceAsBytes(self.getHiddenBuffer(slot_index));
     }
 
+    pub fn prepareBatchedDecodeSegments(
+        self: *FusedCpuBackend,
+        comptime preserve_decode_boundary_failure: anytype,
+        root_backend: anytype,
+        activate_intermediate: bool,
+        intermediate_backend: anytype,
+        boundary: anytype,
+        tokens: []const u32,
+        slot_indices: []const usize,
+        positions: []const usize,
+        layer_start: usize,
+        layer_end: usize,
+        use_preloaded_input: bool,
+        compute_logits: bool,
+        row_bytes: usize,
+        host_segments: [][]const u8,
+    ) !void {
+        for (0..tokens.len) |row_i| {
+            const token = tokens[row_i];
+            const slot_index = slot_indices[row_i];
+            const position = positions[row_i];
+            if (activate_intermediate) intermediate_backend.activateKvSlot(slot_index);
+            root_backend.activateKvSlot(slot_index);
+            const logits_out_opt: ?[]f32 = if (compute_logits) blk: {
+                const RootType = @TypeOf(root_backend.*);
+                if (comptime !@hasField(RootType, "runtime_buffers")) return error.InvalidTopologyConfig;
+                const projected_vocab = root_backend.runtime_buffers.projected_vocab;
+                const row_start = std.math.mul(usize, row_i, projected_vocab) catch return error.InvalidArgument;
+                const row_end = std.math.add(usize, row_start, projected_vocab) catch return error.InvalidArgument;
+                if (row_end > root_backend.runtime_buffers.projected_logits_batch_host.len) return error.InvalidArgument;
+                break :blk root_backend.runtime_buffers.projected_logits_batch_host[row_start..row_end];
+            } else null;
+            self.executeDecodeLayerRange(
+                token,
+                position,
+                slot_index,
+                logits_out_opt,
+                layer_start,
+                layer_end,
+                compute_logits,
+                false,
+                true,
+                use_preloaded_input,
+            ) catch |err| {
+                const row_slot_indices = [_]usize{slot_index};
+                const row_positions = [_]usize{position};
+                return preserve_decode_boundary_failure(
+                    root_backend,
+                    boundary,
+                    .{ .cpu = {} },
+                    &row_slot_indices,
+                    &row_positions,
+                    .source,
+                    err,
+                );
+            };
+            const src_row = self.slotActivationBytes(slot_index);
+            if (src_row.len < row_bytes) return error.InvalidTopologyConfig;
+            host_segments[row_i] = src_row[0..row_bytes];
+        }
+    }
+
     pub fn slotLogits(self: *FusedCpuBackend, slot_index: usize) []f32 {
         return self.getLogitsBuffer(slot_index);
     }
@@ -1215,6 +1277,15 @@ pub const FusedCpuBackend = struct {
         const bytes = std.mem.sliceAsBytes(self.local_prefill_activation);
         if (byte_count > bytes.len) return &.{};
         return bytes[0..byte_count];
+    }
+
+    pub fn ensureLocalPrefillActivationBytes(self: *FusedCpuBackend, byte_count: usize) ![]const u8 {
+        if (byte_count == 0) return &.{};
+        if (self.d_model == 0 or byte_count % @sizeOf(f32) != 0) return error.InvalidArgument;
+        const element_count = byte_count / @sizeOf(f32);
+        if (element_count % self.d_model != 0) return error.InvalidArgument;
+        _ = try self.ensureLocalPrefillActivationRows(element_count / self.d_model);
+        return self.localPrefillActivationBytes(byte_count);
     }
 
     pub fn localPrefillActivationBytesMut(self: *FusedCpuBackend, byte_count: usize) []u8 {
@@ -3012,6 +3083,22 @@ test "localPrefillActivationBytes expose staged prefill activation storage" {
     bytes_mut[0] = 0xaa;
     const bytes = backend.localPrefillActivationBytes(byte_count);
     try std.testing.expectEqual(@as(u8, 0xaa), bytes[0]);
+}
+
+test "ensureLocalPrefillActivationBytes allocates staged host prefill storage" {
+    var backend: FusedCpuBackend = undefined;
+    backend.allocator = std.testing.allocator;
+    backend.d_model = 4;
+    backend.local_prefill_activation = &.{};
+    defer if (backend.local_prefill_activation.len != 0) std.testing.allocator.free(backend.local_prefill_activation);
+
+    const byte_count = 3 * backend.d_model * @sizeOf(f32);
+    const bytes = try backend.ensureLocalPrefillActivationBytes(byte_count);
+    try std.testing.expectEqual(byte_count, bytes.len);
+    try std.testing.expectEqual(@as(usize, 12), backend.local_prefill_activation.len);
+
+    try std.testing.expectError(error.InvalidArgument, backend.ensureLocalPrefillActivationBytes(byte_count - 1));
+    try std.testing.expectError(error.InvalidArgument, backend.ensureLocalPrefillActivationBytes(byte_count + @sizeOf(f32)));
 }
 
 test "initRuntimeRopeHandles preserves logical pairing when rope_dim is smaller than global_head_dim" {

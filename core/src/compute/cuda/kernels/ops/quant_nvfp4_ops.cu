@@ -99,12 +99,6 @@ extern "C" __global__ void talu_quantize_f32_to_nvfp4(
 #if defined(__CUDA_ARCH__)
 
 static __device__ __forceinline__ float nvfp4_fp8e4m3_to_f32(unsigned char x) {
-#if __CUDA_ARCH__ >= 890
-    __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(x), __NV_E4M3);
-    __half h;
-    memcpy(&h, &hr, sizeof(h));
-    return __half2float(h);
-#else
     const unsigned int bits = x;
     const unsigned int sign = bits >> 7;
     const unsigned int exponent = (bits >> 3) & 0x0Fu;
@@ -126,7 +120,6 @@ static __device__ __forceinline__ float nvfp4_fp8e4m3_to_f32(unsigned char x) {
         ((exponent + 120u) << 23) |
         (mantissa << 20);
     return __uint_as_float(f32_bits);
-#endif
 }
 
 static __device__ __forceinline__ void nvfp4_lut_init(float* lut, unsigned int tid) {
@@ -268,7 +261,7 @@ extern "C" __global__ void talu_nvfp4_to_i8(
 
 // Dequantize NVFP4 weights to BF16 for cuBLAS GEMM prefill path.
 // Each thread processes one element: unpack nibble, fp4→f32, scale, f32→bf16.
-// Launch: grid=(ceil(in_dim/256), out_dim), block=(256)
+// Launch: grid=(ceil(in_dim*out_dim/256)), block=(256)
 extern "C" __global__ void talu_dequant_nvfp4_to_bf16(
     const unsigned char* __restrict__ weight_packed,  // [out_dim × packed_cols] (2 FP4 per byte)
     const unsigned char* __restrict__ scales,         // [out_dim × scale_cols] FP8 E4M3
@@ -278,9 +271,13 @@ extern "C" __global__ void talu_dequant_nvfp4_to_bf16(
     unsigned int scale_cols,
     float weight_global_scale
 ) {
-    const unsigned int row = blockIdx.y;
-    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= out_dim || col >= in_dim) return;
+    const unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long total = (unsigned long long)in_dim * out_dim;
+    if (idx >= total) return;
+
+    const unsigned int row = static_cast<unsigned int>(idx / in_dim);
+    const unsigned int col = static_cast<unsigned int>(idx - (unsigned long long)row * in_dim);
 
     const unsigned int packed_cols = (in_dim + 1u) >> 1;
     const unsigned long long byte_idx = (unsigned long long)row * packed_cols + (col >> 1);
@@ -292,12 +289,10 @@ extern "C" __global__ void talu_dequant_nvfp4_to_bf16(
     const float val = fp4_val * scale / weight_global_scale;
 
     // F32 → BF16: round-to-nearest-even (same as FP8 dequant kernel).
-    unsigned int fbits;
-    memcpy(&fbits, &val, sizeof(fbits));
+    const unsigned int fbits = __float_as_uint(val);
     const unsigned int lsb = (fbits >> 16) & 1u;
     const unsigned int rounding_bias = 0x7FFFu + lsb;
-    const unsigned long long out_idx = (unsigned long long)row * in_dim + col;
-    out_bf16[out_idx] = static_cast<unsigned short>((fbits + rounding_bias) >> 16);
+    out_bf16[idx] = static_cast<unsigned short>((fbits + rounding_bias) >> 16);
 }
 
 // Inner-batch NVFP4 GEMV: vectorized 64-bit weight loads + float4 input loads.

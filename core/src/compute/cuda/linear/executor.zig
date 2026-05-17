@@ -30,8 +30,23 @@ pub const Nvfp4LinearRouteKind = enum {
     small_rows_i8_matvec,
 };
 
+pub const Nvfp4Bf16FallbackSkip = enum {
+    missing_dequant_kernel,
+    missing_cast_kernel,
+    missing_matmul_kernel,
+    blas_bf16_disabled,
+    missing_scales,
+    invalid_shape,
+    weight_scratch_too_small,
+    input_scratch_too_small,
+    invalid_grid,
+    arg_pack_failed,
+    cublas_failed,
+};
+
 pub const Diagnostics = struct {
     nvfp4_route: ?Nvfp4LinearRouteKind = null,
+    nvfp4_bf16_skip: ?Nvfp4Bf16FallbackSkip = null,
     mxfp8_lt_error: ?anyerror = null,
     nvfp4_native_quant_error: ?anyerror = null,
     nvfp4_native_single_row_skipped: bool = false,
@@ -78,6 +93,9 @@ pub const Context = struct {
     nvfp4_matvec_function: ?module.Function = null,
     nvfp4_matvec_tile8_function: ?module.Function = null,
     quantize_f32_to_nvfp4_function: ?module.Function = null,
+    nvfp4_dequant_to_bf16_function: ?module.Function = null,
+    nvfp4_native_blas_supported: bool = false,
+    nvfp4_bf16_fallback_enabled: bool = false,
 
     u16_blas_f16_supported: bool,
     u16_blas_bf16_supported: bool,
@@ -184,6 +202,22 @@ pub fn executeRows(
                 );
                 return;
             }
+            if (!blas_supported and w.dtype == .bf16 and rows > 4) {
+                const max_bf16_matvec_rows: usize = 1;
+                var row_offset: usize = 0;
+                while (row_offset < rows) {
+                    const chunk_rows = @min(max_bf16_matvec_rows, rows - row_offset);
+                    const input_offset = std.math.mul(usize, row_offset, input_row_bytes) catch return error.InvalidArgument;
+                    const output_offset = std.math.mul(usize, row_offset, output_row_bytes) catch return error.InvalidArgument;
+                    const chunk_input_bytes = std.math.mul(usize, chunk_rows, input_row_bytes) catch return error.InvalidArgument;
+                    const chunk_output_bytes = std.math.mul(usize, chunk_rows, output_row_bytes) catch return error.InvalidArgument;
+                    var input_chunk = try bufferSlice(&packed_input, input_offset, chunk_input_bytes);
+                    var output_chunk = try bufferSlice(&packed_out, output_offset, chunk_output_bytes);
+                    try executeRows(ctx, &input_chunk, chunk_rows, weight, &output_chunk);
+                    row_offset += chunk_rows;
+                }
+                return;
+            }
             if (blas_supported) {
                 const input_u16_count = std.math.mul(usize, rows, w.rows) catch return error.InvalidArgument;
                 const input_u16_bytes = std.math.mul(usize, input_u16_count, @sizeOf(u16)) catch return error.InvalidArgument;
@@ -217,6 +251,22 @@ pub fn executeRows(
                         .f16 => ctx.u16_blas_f16_supported = false,
                         .bf16 => ctx.u16_blas_bf16_supported = false,
                     }
+                    if (w.dtype == .bf16 and rows > 4) {
+                        const max_bf16_matvec_rows: usize = 1;
+                        var row_offset: usize = 0;
+                        while (row_offset < rows) {
+                            const chunk_rows = @min(max_bf16_matvec_rows, rows - row_offset);
+                            const input_offset = std.math.mul(usize, row_offset, input_row_bytes) catch return error.InvalidArgument;
+                            const output_offset = std.math.mul(usize, row_offset, output_row_bytes) catch return error.InvalidArgument;
+                            const chunk_input_bytes = std.math.mul(usize, chunk_rows, input_row_bytes) catch return error.InvalidArgument;
+                            const chunk_output_bytes = std.math.mul(usize, chunk_rows, output_row_bytes) catch return error.InvalidArgument;
+                            var input_chunk = try bufferSlice(&packed_input, input_offset, chunk_input_bytes);
+                            var output_chunk = try bufferSlice(&packed_out, output_offset, chunk_output_bytes);
+                            try executeRows(ctx, &input_chunk, chunk_rows, weight, &output_chunk);
+                            row_offset += chunk_rows;
+                        }
+                        return;
+                    }
                     try matmul_u16.runWithFunction(
                         ctx.kernel_arg_pack,
                         ctx.device,
@@ -245,6 +295,22 @@ pub fn executeRows(
                     switch (w.dtype) {
                         .f16 => ctx.u16_blas_f16_supported = false,
                         .bf16 => ctx.u16_blas_bf16_supported = false,
+                    }
+                    if (w.dtype == .bf16 and rows > 4) {
+                        const max_bf16_matvec_rows: usize = 1;
+                        var row_offset: usize = 0;
+                        while (row_offset < rows) {
+                            const chunk_rows = @min(max_bf16_matvec_rows, rows - row_offset);
+                            const input_offset = std.math.mul(usize, row_offset, input_row_bytes) catch return error.InvalidArgument;
+                            const output_offset = std.math.mul(usize, row_offset, output_row_bytes) catch return error.InvalidArgument;
+                            const chunk_input_bytes = std.math.mul(usize, chunk_rows, input_row_bytes) catch return error.InvalidArgument;
+                            const chunk_output_bytes = std.math.mul(usize, chunk_rows, output_row_bytes) catch return error.InvalidArgument;
+                            var input_chunk = try bufferSlice(&packed_input, input_offset, chunk_input_bytes);
+                            var output_chunk = try bufferSlice(&packed_out, output_offset, chunk_output_bytes);
+                            try executeRows(ctx, &input_chunk, chunk_rows, weight, &output_chunk);
+                            row_offset += chunk_rows;
+                        }
+                        return;
                     }
                     try matmul_u16.runWithFunction(
                         ctx.kernel_arg_pack,
@@ -1161,11 +1227,152 @@ pub fn executeRows(
             return error.CudaKernelUnavailable;
         },
         .nvfp4 => |w| {
+            const max_direct_nvfp4_rows: usize = 4;
+            if (rows > 1 and ctx.nvfp4_bf16_fallback_enabled) nvfp4_dequant_blas: {
+                const dequant_fn = ctx.nvfp4_dequant_to_bf16_function orelse {
+                    ctx.diagnostics.nvfp4_bf16_skip = .missing_dequant_kernel;
+                    break :nvfp4_dequant_blas;
+                };
+                if (w.scales_buffer.pointer == 0 or w.scales_buffer.size == 0) {
+                    ctx.diagnostics.nvfp4_bf16_skip = .missing_scales;
+                    break :nvfp4_dequant_blas;
+                }
+
+                const in_dim = w.rows;
+                const out_dim = w.cols;
+                const weight_elems = std.math.mul(usize, in_dim, out_dim) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .invalid_shape;
+                    break :nvfp4_dequant_blas;
+                };
+                const weight_bf16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .invalid_shape;
+                    break :nvfp4_dequant_blas;
+                };
+                if (ctx.workspace.auxiliary_scratch.size < weight_bf16_bytes) {
+                    ctx.diagnostics.nvfp4_bf16_skip = .weight_scratch_too_small;
+                    break :nvfp4_dequant_blas;
+                }
+
+                const input_elems = std.math.mul(usize, rows, in_dim) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .invalid_shape;
+                    break :nvfp4_dequant_blas;
+                };
+                const input_bf16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .invalid_shape;
+                    break :nvfp4_dequant_blas;
+                };
+                if (ctx.workspace.activation_scratch.size < input_bf16_bytes) {
+                    ctx.diagnostics.nvfp4_bf16_skip = .input_scratch_too_small;
+                    break :nvfp4_dequant_blas;
+                }
+
+                var dequant_weight = bufferSlice(&ctx.workspace.auxiliary_scratch, 0, weight_bf16_bytes) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .invalid_shape;
+                    break :nvfp4_dequant_blas;
+                };
+                const grid_x = std.math.cast(u32, std.math.divCeil(usize, weight_elems, 256) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .invalid_grid;
+                    break :nvfp4_dequant_blas;
+                }) orelse {
+                    ctx.diagnostics.nvfp4_bf16_skip = .invalid_grid;
+                    break :nvfp4_dequant_blas;
+                };
+                ctx.kernel_arg_pack.reset();
+                ctx.kernel_arg_pack.appendBufferPtr(&w.buffer) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .arg_pack_failed;
+                    break :nvfp4_dequant_blas;
+                };
+                ctx.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .arg_pack_failed;
+                    break :nvfp4_dequant_blas;
+                };
+                ctx.kernel_arg_pack.appendBufferPtr(&dequant_weight) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .arg_pack_failed;
+                    break :nvfp4_dequant_blas;
+                };
+                ctx.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .arg_pack_failed;
+                    break :nvfp4_dequant_blas;
+                };
+                ctx.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .arg_pack_failed;
+                    break :nvfp4_dequant_blas;
+                };
+                ctx.kernel_arg_pack.appendScalar(u32, @intCast(w.scale_cols)) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .arg_pack_failed;
+                    break :nvfp4_dequant_blas;
+                };
+                ctx.kernel_arg_pack.appendScalar(f32, w.weight_global_scale) catch {
+                    ctx.diagnostics.nvfp4_bf16_skip = .arg_pack_failed;
+                    break :nvfp4_dequant_blas;
+                };
+                try launch.launchWithFamily(ctx.device, dequant_fn, .{
+                    .grid_x = grid_x,
+                    .block_x = 256,
+                }, ctx.kernel_arg_pack, .other);
+
+                if (ctx.u16_blas_bf16_supported) nvfp4_bf16_cublas: {
+                    const cast_fn = ctx.cast_f32_to_bf16_function orelse break :nvfp4_bf16_cublas;
+                    if (ctx.workspace.activation_scratch.size < input_bf16_bytes) break :nvfp4_bf16_cublas;
+                    var input_bf16_dev = bufferSlice(&ctx.workspace.activation_scratch, 0, input_bf16_bytes) catch break :nvfp4_bf16_cublas;
+                    try cast_f32_to_bf16.runWithFunction(
+                        ctx.kernel_arg_pack,
+                        ctx.device,
+                        cast_fn,
+                        &packed_input,
+                        &input_bf16_dev,
+                        @intCast(input_elems),
+                    );
+
+                    ctx.blas.matmulU16U16F32(
+                        ctx.device,
+                        &input_bf16_dev,
+                        .bf16,
+                        rows,
+                        in_dim,
+                        &dequant_weight,
+                        .bf16,
+                        out_dim,
+                        &packed_out,
+                    ) catch {
+                        ctx.u16_blas_bf16_supported = false;
+                        break :nvfp4_bf16_cublas;
+                    };
+                    return;
+                }
+
+                if (ctx.matmul_bf16_function) |matmul_kernel| {
+                    try matmul_u16.runWithFunction(
+                        ctx.kernel_arg_pack,
+                        ctx.device,
+                        matmul_kernel,
+                        &packed_input,
+                        &dequant_weight,
+                        &packed_out,
+                        @intCast(rows),
+                        @intCast(in_dim),
+                        @intCast(out_dim),
+                    );
+                    return;
+                }
+
+                if (!ctx.u16_blas_bf16_supported) {
+                    ctx.diagnostics.nvfp4_bf16_skip = .blas_bf16_disabled;
+                } else if (ctx.cast_f32_to_bf16_function == null) {
+                    ctx.diagnostics.nvfp4_bf16_skip = .missing_cast_kernel;
+                } else if (ctx.workspace.activation_scratch.size < input_bf16_bytes) {
+                    ctx.diagnostics.nvfp4_bf16_skip = .input_scratch_too_small;
+                } else {
+                    ctx.diagnostics.nvfp4_bf16_skip = .missing_matmul_kernel;
+                }
+                break :nvfp4_dequant_blas;
+            }
+
             // Native FP4 tensor core path for larger row groups (Blackwell SM_100+):
             // Quantize F32 input → FP4, then cuBLASLt FP4×FP4 → F32 GEMM.
             // Native cuBLASLt FP4×FP4 → BF16 GEMM + BF16→F32 cast (Blackwell SM_100+).
             const prefer_native_single_row = rows == 1 and w.cols >= 65536;
-            if ((rows > 4 or prefer_native_single_row) and w.scales_lt_buffer.size > 0) nvfp4_native_blas: {
+            if (ctx.nvfp4_native_blas_supported and (rows > 4 or prefer_native_single_row) and w.scales_lt_buffer.size > 0) nvfp4_native_blas: {
                 const quant_fn = ctx.quantize_f32_to_nvfp4_function orelse break :nvfp4_native_blas;
                 var blas_lt = ctx.blas_lt orelse break :nvfp4_native_blas;
 
@@ -1228,6 +1435,22 @@ pub fn executeRows(
 
             if (prefer_native_single_row and ctx.report_nvfp4_native_single_row_skip) {
                 ctx.diagnostics.nvfp4_native_single_row_skipped = true;
+            }
+
+            if (rows > max_direct_nvfp4_rows) {
+                var row_offset: usize = 0;
+                while (row_offset < rows) {
+                    const chunk_rows = @min(max_direct_nvfp4_rows, rows - row_offset);
+                    const input_offset = std.math.mul(usize, row_offset, input_row_bytes) catch return error.InvalidArgument;
+                    const output_offset = std.math.mul(usize, row_offset, output_row_bytes) catch return error.InvalidArgument;
+                    const chunk_input_bytes = std.math.mul(usize, chunk_rows, input_row_bytes) catch return error.InvalidArgument;
+                    const chunk_output_bytes = std.math.mul(usize, chunk_rows, output_row_bytes) catch return error.InvalidArgument;
+                    var input_chunk = try bufferSlice(&packed_input, input_offset, chunk_input_bytes);
+                    var output_chunk = try bufferSlice(&packed_out, output_offset, chunk_output_bytes);
+                    try executeRows(ctx, &input_chunk, chunk_rows, weight, &output_chunk);
+                    row_offset += chunk_rows;
+                }
+                return;
             }
 
             // Small-batch path: native weight-only GEMV kernels.
@@ -1357,6 +1580,7 @@ test "executeRows rejects empty and undersized linear inputs before launch" {
 test "executeRows resets diagnostics before validation failures" {
     var diagnostics = Diagnostics{
         .nvfp4_route = .native_cublaslt,
+        .nvfp4_bf16_skip = .missing_dequant_kernel,
         .mxfp8_lt_error = error.CudaKernelUnavailable,
         .nvfp4_native_quant_error = error.CudaKernelUnavailable,
         .nvfp4_native_single_row_skipped = true,
@@ -1378,6 +1602,7 @@ test "executeRows resets diagnostics before validation failures" {
 
     try std.testing.expectError(error.InvalidArgument, executeRows(&ctx, &input, 0, &weight, &output));
     try std.testing.expectEqual(@as(?Nvfp4LinearRouteKind, null), diagnostics.nvfp4_route);
+    try std.testing.expectEqual(@as(?Nvfp4Bf16FallbackSkip, null), diagnostics.nvfp4_bf16_skip);
     try std.testing.expectEqual(@as(?anyerror, null), diagnostics.mxfp8_lt_error);
     try std.testing.expectEqual(@as(?anyerror, null), diagnostics.nvfp4_native_quant_error);
     try std.testing.expect(!diagnostics.nvfp4_native_single_row_skipped);

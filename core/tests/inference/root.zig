@@ -36,4 +36,7 @@ test {
 
     // Backend submodules
     _ = @import("backend/root.zig");
+
+    // Bridge submodules
+    _ = @import("bridge/root.zig");
 }

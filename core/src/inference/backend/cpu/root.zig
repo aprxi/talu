@@ -21,6 +21,7 @@ pub const engine = engine_mod;
 pub const vision = @import("vision/root.zig");
 pub const executor = @import("executor/root.zig");
 pub const kernels = @import("kernels/root.zig");
+pub const interface = @import("interface/root.zig");
 pub const stage_capabilities = @import("stage_capabilities.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const sampling = @import("../../sampling.zig");

@@ -165,6 +165,7 @@ pub fn uploadCudaActivation(backend: anytype, slot_index: usize, host_buffer: []
         return backend.uploadLocalActivationFromHost(slot_index, host_buffer[0..byte_count], byte_count);
     }
     if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+        try ensureCudaActivationUploadCapacity(backend, byte_count);
         return backend.runtime_buffers.input_dev.upload(&backend.device, host_buffer[0..byte_count]);
     }
     return error.InvalidTopologyConfig;
@@ -175,6 +176,7 @@ pub fn uploadCudaActivationSegments(backend: anytype, host_segments: []const []c
     if (comptime !@hasField(BackendType, "runtime_buffers") or !@hasField(BackendType, "device")) {
         return error.InvalidTopologyConfig;
     }
+    try ensureCudaActivationUploadCapacity(backend, byte_count);
     var offset: usize = 0;
     for (host_segments) |segment| {
         offset = std.math.add(usize, offset, segment.len) catch return error.InvalidArgument;
@@ -186,6 +188,21 @@ pub fn uploadCudaActivationSegments(backend: anytype, host_segments: []const []c
     if (offset != byte_count) return error.InvalidArgument;
 }
 
+fn ensureCudaActivationUploadCapacity(backend: anytype, byte_count: usize) !void {
+    if (byte_count == 0) return;
+    if (byte_count <= backend.runtime_buffers.input_dev.size) return;
+    const BackendType = @TypeOf(backend.*);
+    if (comptime !@hasField(BackendType, "d_model")) return error.InvalidTopologyConfig;
+    const row_bytes = std.math.mul(usize, backend.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+    if (row_bytes == 0 or byte_count % row_bytes != 0) return error.InvalidArgument;
+    const required_rows = byte_count / row_bytes;
+    const fixed_alloc_mode = if (comptime @hasField(BackendType, "fixed_alloc_mode"))
+        backend.fixed_alloc_mode
+    else
+        false;
+    try backend.runtime_buffers.ensureRowCapacity(&backend.device, required_rows, fixed_alloc_mode);
+}
+
 pub fn cudaBufferSlice(buffer: anytype, byte_offset: usize, byte_len: usize) !@TypeOf(buffer.*) {
     if (byte_offset > buffer.size) return error.InvalidArgument;
     const end = std.math.add(usize, byte_offset, byte_len) catch return error.InvalidArgument;
@@ -195,6 +212,26 @@ pub fn cudaBufferSlice(buffer: anytype, byte_offset: usize, byte_len: usize) !@T
     sliced.pointer = ptr;
     sliced.size = byte_len;
     return sliced;
+}
+
+pub fn uploadCudaBufferFromHostBytes(
+    device: anytype,
+    buffer: anytype,
+    byte_offset: usize,
+    host_bytes: []const u8,
+) !@TypeOf(buffer.*) {
+    var target = try cudaBufferSlice(buffer, byte_offset, host_bytes.len);
+    try target.upload(device, host_bytes);
+    return target;
+}
+
+pub fn downloadCudaBufferToHostBytes(
+    device: anytype,
+    buffer: anytype,
+    host_bytes: []u8,
+) !void {
+    if (host_bytes.len > buffer.size) return error.InvalidArgument;
+    try buffer.download(device, host_bytes);
 }
 
 pub fn synchronizeCudaActivationBackend(backend: anytype) !void {
@@ -246,6 +283,33 @@ pub fn copyCudaPeerActivation(
     }
 }
 
+pub fn probeCudaPeerActivation(source_backend: anytype, target_backend: anytype) bool {
+    const SourceType = @TypeOf(source_backend.*);
+    const TargetType = @TypeOf(target_backend.*);
+    if (comptime !@hasField(SourceType, "device") or
+        !@hasField(SourceType, "runtime_buffers") or
+        !@hasField(SourceType, "compute_stream") or
+        !@hasField(TargetType, "device") or
+        !@hasField(TargetType, "runtime_buffers"))
+    {
+        return false;
+    }
+    const src_size = source_backend.runtime_buffers.input_dev.size;
+    const dst_size = target_backend.runtime_buffers.input_dev.size;
+    const min_size = @min(src_size, dst_size);
+    if (min_size == 0) return false;
+    const probe_bytes = @min(min_size, @as(usize, 256));
+    copyCudaPeerActivation(
+        &source_backend.device,
+        &target_backend.device,
+        &target_backend.runtime_buffers.input_dev,
+        &source_backend.runtime_buffers.input_dev,
+        source_backend.compute_stream,
+        probe_bytes,
+    ) catch return false;
+    return true;
+}
+
 pub fn copyCudaPeerActivationAfterEvent(
     source_device: anytype,
     target_device: anytype,
@@ -292,20 +356,6 @@ pub fn peerCopyCudaActivation(
 
     if (comptime synchronization == .source_event_target_stream) {
         if (comptime !@hasField(TargetType, "compute_stream")) return error.InvalidTopologyConfig;
-        if (comptime @hasField(SourceType, "local_stage_peer_copy_event")) {
-            if (source_backend.local_stage_peer_copy_event) |event| {
-                return copyCudaPeerActivationAfterEvent(
-                    &source_backend.device,
-                    &target_backend.device,
-                    &target_backend.runtime_buffers.input_dev,
-                    &source_backend.runtime_buffers.input_dev,
-                    source_backend.compute_stream,
-                    target_backend.compute_stream,
-                    event,
-                    byte_count,
-                );
-            }
-        }
     }
 
     try copyCudaPeerActivation(
@@ -322,12 +372,8 @@ pub fn peerCopyCudaActivationHandlesStageSync(
     source_backend: anytype,
     comptime synchronization: CudaPeerCopySynchronization,
 ) bool {
-    if (comptime synchronization == .source_event_target_stream) {
-        const SourceType = @TypeOf(source_backend.*);
-        if (comptime @hasField(SourceType, "local_stage_peer_copy_event")) {
-            return source_backend.local_stage_peer_copy_event != null;
-        }
-    }
+    _ = source_backend;
+    _ = synchronization;
     return false;
 }
 

@@ -147,7 +147,6 @@ const MockPeerRuntimeBuffers = struct {
 const MockPeerBackend = struct {
     device: MockDevice,
     compute_stream: ?usize = null,
-    local_stage_peer_copy_event: ?*MockEvent = null,
     runtime_buffers: MockPeerRuntimeBuffers,
 };
 
@@ -248,6 +247,35 @@ test "cuda activation segment upload slices contiguous target buffer" {
     try std.testing.expectError(error.InvalidArgument, cuda_activation.uploadCudaActivationSegments(&backend, segments[0..], 4));
 }
 
+test "uploadCudaBufferFromHostBytes uploads a bounded buffer slice" {
+    var trace = MockCudaActivationTrace{};
+    var device = MockCudaActivationDevice{ .trace = &trace };
+    var buffer = MockCudaDeviceBuffer{ .pointer = 100, .size = 16, .trace = &trace };
+    const bytes = [_]u8{ 9, 8, 7, 6 };
+
+    const uploaded = try cuda_activation.uploadCudaBufferFromHostBytes(&device, &buffer, 3, bytes[0..]);
+
+    try std.testing.expectEqual(@as(u64, 103), uploaded.pointer);
+    try std.testing.expectEqual(@as(usize, 4), uploaded.size);
+    try std.testing.expectEqual(@as(usize, 1), trace.upload_calls);
+    try std.testing.expectEqual(@as(usize, 4), trace.upload_lengths[0]);
+    try std.testing.expectError(error.InvalidArgument, cuda_activation.uploadCudaBufferFromHostBytes(&device, &buffer, 14, bytes[0..]));
+}
+
+test "downloadCudaBufferToHostBytes downloads a bounded buffer slice" {
+    var trace = MockCudaActivationTrace{};
+    var device = MockCudaActivationDevice{ .trace = &trace };
+    var buffer = MockCudaDeviceBuffer{ .pointer = 100, .size = 16, .trace = &trace };
+    var bytes: [6]u8 = undefined;
+
+    try cuda_activation.downloadCudaBufferToHostBytes(&device, &buffer, bytes[0..]);
+
+    try std.testing.expectEqual(@as(usize, 1), trace.download_calls);
+    try std.testing.expectEqual(@as(usize, 6), trace.download_length);
+    var too_large: [17]u8 = undefined;
+    try std.testing.expectError(error.InvalidArgument, cuda_activation.downloadCudaBufferToHostBytes(&device, &buffer, too_large[0..]));
+}
+
 test "cuda activation stage uploads segmented bridge payloads" {
     var trace = MockCudaActivationTrace{};
     var backend = MockCudaActivationBackend{
@@ -283,14 +311,12 @@ test "copyCudaPeerActivation copies on source stream and synchronizes" {
     try std.testing.expectEqual(@as(usize, 1), target_counters.enable_peer_calls);
 }
 
-test "cuda peer activation stage issues event ordered peer copy" {
+test "cuda peer activation stage falls back to source-stream peer copy" {
     var source_counters = MockCounters{};
     var target_counters = MockCounters{};
-    var event = MockEvent{};
     var source_backend = MockPeerBackend{
         .device = .{ .counters = &source_counters },
         .compute_stream = 3,
-        .local_stage_peer_copy_event = &event,
         .runtime_buffers = .{ .input_dev = .{ .id = 1 } },
     };
     var target_backend = MockPeerBackend{
@@ -307,13 +333,13 @@ test "cuda peer activation stage issues event ordered peer copy" {
     var source_stage = SourceStage{ .backend = &source_backend, .target_backend = &target_backend };
     var target_stage = TargetStage{ .backend = &target_backend };
 
-    try std.testing.expect(source_stage.peerCopyHandlesStageSync());
+    try std.testing.expect(!source_stage.peerCopyHandlesStageSync());
     try source_stage.peerCopyActivationToErased(&target_stage, 64);
 
-    try std.testing.expectEqual(@as(usize, 1), source_counters.record_event_calls);
-    try std.testing.expectEqual(@as(usize, 1), target_counters.wait_event_calls);
+    try std.testing.expectEqual(@as(usize, 0), source_counters.record_event_calls);
+    try std.testing.expectEqual(@as(usize, 0), target_counters.wait_event_calls);
     try std.testing.expectEqual(@as(usize, 1), source_counters.copy_calls);
-    try std.testing.expectEqual(@as(usize, 0), source_counters.synchronize_stream_calls);
+    try std.testing.expectEqual(@as(usize, 1), source_counters.synchronize_stream_calls);
 }
 
 test "copyCudaPeerActivation rejects missing peer access" {

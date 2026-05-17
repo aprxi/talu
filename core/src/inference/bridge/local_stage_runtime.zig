@@ -7,11 +7,15 @@
 
 const std = @import("std");
 
-const bridge = @import("../bridge/root.zig");
-const cpu_stage_capabilities = @import("cpu/stage_capabilities.zig");
-const cuda_stage_capabilities = @import("cuda/stage_capabilities.zig");
-const local_stage = @import("local_stage.zig");
-const topology = @import("topology.zig");
+const host_capability = @import("host_capability.zig");
+const pipeline = @import("pipeline.zig");
+const local_stage = @import("local_stage_contract.zig");
+
+const bridge = struct {
+    const BoundaryDType = pipeline.BoundaryDType;
+    const HostBackendKind = host_capability.HostBackendKind;
+    const negotiateBoundaryContract = pipeline.negotiateBoundaryContract;
+};
 
 pub const StageSpec = local_stage.StageSpec;
 pub const BoundaryConfig = local_stage.BoundaryConfig;
@@ -52,25 +56,73 @@ pub const BuildRequest = struct {
     allocator: std.mem.Allocator,
     d_model: usize,
     total_layers: usize,
-    stages: []const topology.LocalStageSpec,
+    stages: []const StageInputSpec,
     stage_capabilities: []const StageRuntimeCapability,
     boundary_peer_copy_available: []const bool,
 };
 
-pub fn bridgeBackendKind(kind: topology.LocalStageBackendKind) bridge.HostBackendKind {
-    return switch (kind) {
-        .cpu => .cpu,
-        .cuda => .cuda,
-        .metal => .metal,
-    };
+pub const StageInputSpec = struct {
+    backend_kind: bridge.HostBackendKind,
+    layer_start: usize,
+    layer_end: usize,
+};
+
+fn hostLogitCandidateBetter(
+    logit: f32,
+    token_id: u32,
+    existing_logit: f32,
+    existing_token_id: u32,
+) bool {
+    return logit > existing_logit or (logit == existing_logit and token_id < existing_token_id);
 }
 
-pub fn supportedBoundaryDTypes(kind: topology.LocalStageBackendKind) []const bridge.BoundaryDType {
-    return switch (kind) {
-        .cpu => cpu_stage_capabilities.supported_boundary_dtypes[0..],
-        .cuda => cuda_stage_capabilities.supported_boundary_dtypes[0..],
-        .metal => &.{.f32},
-    };
+fn insertHostTopKCandidate(
+    logits: []f32,
+    ids: []u32,
+    count: *usize,
+    max_count: usize,
+    logit: f32,
+    token_id: u32,
+) void {
+    if (max_count == 0) return;
+    var insert_at = count.*;
+    if (insert_at == max_count and !hostLogitCandidateBetter(logit, token_id, logits[max_count - 1], ids[max_count - 1])) {
+        return;
+    }
+    if (insert_at < max_count) count.* += 1;
+    if (insert_at >= max_count) insert_at = max_count - 1;
+    while (insert_at > 0 and hostLogitCandidateBetter(logit, token_id, logits[insert_at - 1], ids[insert_at - 1])) {
+        logits[insert_at] = logits[insert_at - 1];
+        ids[insert_at] = ids[insert_at - 1];
+        insert_at -= 1;
+    }
+    logits[insert_at] = logit;
+    ids[insert_at] = token_id;
+}
+
+pub fn extractTopKFromHostLogitsRow(
+    logits: []const f32,
+    top_k: usize,
+    candidate_logits_out: []f32,
+    candidate_ids_out: []u32,
+) !usize {
+    if (top_k == 0 or top_k > 256) return error.InvalidArgument;
+    if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
+    if (logits.len == 0 or logits.len > std.math.maxInt(u32)) return error.InvalidArgument;
+    const count_limit = @min(top_k, logits.len);
+    var count: usize = 0;
+    for (logits, 0..) |logit, token_index| {
+        insertHostTopKCandidate(
+            candidate_logits_out,
+            candidate_ids_out,
+            &count,
+            count_limit,
+            logit,
+            @intCast(token_index),
+        );
+    }
+    if (top_k == 1 and count == 1) candidate_logits_out[0] = 0.0;
+    return count;
 }
 
 pub fn buildPlan(request: BuildRequest) !Plan {
@@ -95,12 +147,11 @@ pub fn buildPlan(request: BuildRequest) !Plan {
 
     for (request.stages, request.stage_capabilities, 0..) |stage, capability, stage_id| {
         if (capability.stage_id != stage_id) return error.InvalidTopologyConfig;
-        const backend_kind = bridgeBackendKind(stage.backend_kind);
-        if (capability.backend_kind != backend_kind) return error.InvalidTopologyConfig;
-        plan.stage_backend_kinds[stage_id] = backend_kind;
+        if (capability.backend_kind != stage.backend_kind) return error.InvalidTopologyConfig;
+        plan.stage_backend_kinds[stage_id] = stage.backend_kind;
         plan.stage_specs[stage_id] = .{
             .stage_id = stage_id,
-            .backend_kind = backend_kind,
+            .backend_kind = stage.backend_kind,
             .layer_start = stage.layer_start,
             .layer_end = stage.layer_end,
             .owns_embedding = stage_id == 0,
@@ -155,10 +206,10 @@ pub fn buildPlan(request: BuildRequest) !Plan {
     return plan;
 }
 
-test "inference backend local_runtime buildPlan builds generic CPU CUDA CPU runtime facts" {
-    const stages = [_]topology.LocalStageSpec{
+test "local_stage_runtime buildPlan builds generic mixed runtime facts" {
+    const stages = [_]StageInputSpec{
         .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 1 },
-        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 1, .layer_end = 3 },
+        .{ .backend_kind = .cuda, .layer_start = 1, .layer_end = 3 },
         .{ .backend_kind = .cpu, .layer_start = 3, .layer_end = 4 },
     };
     const caps = [_]StageRuntimeCapability{
@@ -186,10 +237,10 @@ test "inference backend local_runtime buildPlan builds generic CPU CUDA CPU runt
     try std.testing.expect(plan.boundary_runtimes[1].staging != null);
 }
 
-test "inference backend local_runtime buildPlan skips host staging for peer-copy boundary" {
-    const stages = [_]topology.LocalStageSpec{
-        .{ .backend_kind = .cuda, .device_ordinal = 0, .layer_start = 0, .layer_end = 1 },
-        .{ .backend_kind = .cuda, .device_ordinal = 1, .layer_start = 1, .layer_end = 2 },
+test "local_stage_runtime buildPlan skips host staging for peer-copy boundary" {
+    const stages = [_]StageInputSpec{
+        .{ .backend_kind = .cuda, .layer_start = 0, .layer_end = 1 },
+        .{ .backend_kind = .cuda, .layer_start = 1, .layer_end = 2 },
     };
     const caps = [_]StageRuntimeCapability{
         .{ .stage_id = 0, .backend_kind = .cuda, .max_batch_size = 2, .prefill_chunk_rows_cap = 5, .supported_boundary_dtypes = &.{.f32} },
@@ -208,4 +259,87 @@ test "inference backend local_runtime buildPlan skips host staging for peer-copy
     try std.testing.expectEqual(@as(usize, 1), plan.boundary_runtimes.len);
     try std.testing.expect(plan.boundary_runtimes[0].local_device_peer_copy_available);
     try std.testing.expect(plan.boundary_runtimes[0].staging == null);
+}
+
+test "local_stage_runtime extractTopKFromHostLogitsRow returns deterministic candidates" {
+    const logits = [_]f32{ 1.0, 8.0, 3.0, 8.0, -2.0, 5.0 };
+    var candidate_logits: [3]f32 = undefined;
+    var candidate_ids: [3]u32 = undefined;
+
+    const count = try extractTopKFromHostLogitsRow(
+        logits[0..],
+        3,
+        candidate_logits[0..],
+        candidate_ids[0..],
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3, 5 }, candidate_ids[0..]);
+    try std.testing.expectEqualSlices(f32, &.{ 8.0, 8.0, 5.0 }, candidate_logits[0..]);
+}
+
+fn testCapability(stage_id: usize, kind: bridge.HostBackendKind) StageRuntimeCapability {
+    return .{
+        .stage_id = stage_id,
+        .backend_kind = kind,
+        .max_batch_size = 4,
+        .prefill_chunk_rows_cap = 8,
+        .supported_boundary_dtypes = &.{.f32},
+    };
+}
+
+test "local_stage_runtime buildPlan accepts ordered mixed chain shapes" {
+    const Case = struct {
+        stages: []const StageInputSpec,
+        caps: []const StageRuntimeCapability,
+        split_points: []const usize,
+    };
+    const chain_a_stages = [_]StageInputSpec{
+        .{ .backend_kind = .cpu, .layer_start = 0, .layer_end = 1 },
+        .{ .backend_kind = .cuda, .layer_start = 1, .layer_end = 4 },
+    };
+    const chain_a_caps = [_]StageRuntimeCapability{
+        testCapability(0, .cpu),
+        testCapability(1, .cuda),
+    };
+    const chain_b_stages = [_]StageInputSpec{
+        .{ .backend_kind = .cuda, .layer_start = 0, .layer_end = 3 },
+        .{ .backend_kind = .cpu, .layer_start = 3, .layer_end = 4 },
+    };
+    const chain_b_caps = [_]StageRuntimeCapability{
+        testCapability(0, .cuda),
+        testCapability(1, .cpu),
+    };
+    const chain_c_stages = [_]StageInputSpec{
+        .{ .backend_kind = .cuda, .layer_start = 0, .layer_end = 1 },
+        .{ .backend_kind = .cpu, .layer_start = 1, .layer_end = 3 },
+        .{ .backend_kind = .cuda, .layer_start = 3, .layer_end = 5 },
+    };
+    const chain_c_caps = [_]StageRuntimeCapability{
+        testCapability(0, .cuda),
+        testCapability(1, .cpu),
+        testCapability(2, .cuda),
+    };
+    const cases = [_]Case{
+        .{ .stages = chain_a_stages[0..], .caps = chain_a_caps[0..], .split_points = &.{1} },
+        .{ .stages = chain_b_stages[0..], .caps = chain_b_caps[0..], .split_points = &.{3} },
+        .{ .stages = chain_c_stages[0..], .caps = chain_c_caps[0..], .split_points = &.{ 1, 3 } },
+    };
+
+    for (cases) |case| {
+        const no_peer_copy = [_]bool{ false, false };
+        var plan = try buildPlan(.{
+            .allocator = std.testing.allocator,
+            .d_model = 8,
+            .total_layers = case.stages[case.stages.len - 1].layer_end,
+            .stages = case.stages,
+            .stage_capabilities = case.caps,
+            .boundary_peer_copy_available = no_peer_copy[0 .. case.stages.len - 1],
+        });
+        defer plan.deinit();
+
+        try std.testing.expectEqualSlices(usize, case.split_points, plan.split_points);
+        try std.testing.expectEqual(case.stages.len, plan.stage_specs.len);
+        try std.testing.expectEqual(case.stages.len - 1, plan.boundary_runtimes.len);
+    }
 }

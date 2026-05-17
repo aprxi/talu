@@ -7,8 +7,43 @@
 
 const std = @import("std");
 
-const bridge = @import("../bridge/root.zig");
+const host_capability = @import("host_capability.zig");
+const local_stage_runner = @import("local_stage_runner.zig");
+const pipeline = @import("pipeline.zig");
+const state_ownership = @import("state_ownership.zig");
+const tensor_frame = @import("tensor_frame.zig");
 const models = @import("models_pkg");
+
+const bridge = struct {
+    const BoundaryDType = pipeline.BoundaryDType;
+    const BoundaryFrameEndpointRole = host_capability.BoundaryFrameEndpointRole;
+    const BoundaryFrameProfile = host_capability.BoundaryFrameProfile;
+    const BoundaryLayout = pipeline.BoundaryLayout;
+    const HostBackendKind = host_capability.HostBackendKind;
+    const HostCapability = host_capability.HostCapability;
+    const HostFrameCapability = host_capability.HostFrameCapability;
+    const HostId = host_capability.HostId;
+    const HostResidencySnapshot = host_capability.HostResidencySnapshot;
+    const LocalStageRunnerPlanRef = local_stage_runner.LocalStageRunnerPlanRef;
+    const PlacementPlan = host_capability.PlacementPlan;
+    const ResidentStageEntry = host_capability.ResidentStageEntry;
+    const StageHostBinding = host_capability.StageHostBinding;
+    const StageStateDescriptorSet = state_ownership.StageStateDescriptorSet;
+    const StageStateOwnershipPlan = state_ownership.StageStateOwnershipPlan;
+    const StageStateOwnershipPlanId = state_ownership.StageStateOwnershipPlanId;
+    const StageStatePartitionFact = state_ownership.StageStatePartitionFact;
+    const StageStatePlacementRef = host_capability.StageStatePlacementRef;
+    const TensorFramePlanRef = tensor_frame.TensorFramePlanRef;
+    const TensorFrameStepKind = tensor_frame.TensorFrameStepKind;
+    const buildHostCapability = host_capability.buildHostCapability;
+    const buildHostResidencySnapshot = host_capability.buildHostResidencySnapshot;
+    const buildLocalStageRunnerPlanRef = local_stage_runner.buildLocalStageRunnerPlanRef;
+    const buildPlacementPlan = host_capability.buildPlacementPlan;
+    const buildStageStateOwnershipPlan = state_ownership.buildStageStateOwnershipPlan;
+    const buildStageStatePlacementRef = host_capability.buildStageStatePlacementRef;
+    const dtypeByteSize = tensor_frame.dtypeByteSize;
+    const state_ownership_contract_version = state_ownership.state_ownership_contract_version;
+};
 
 pub const required_step_kinds = [_]bridge.TensorFrameStepKind{ .prefill, .decode };
 
@@ -125,6 +160,11 @@ pub fn validateBoundaryRuntimes(stage_count: usize, boundaries: anytype) !void {
     for (boundaries, 0..) |boundary, index| {
         if (boundary.boundary_index != index) return error.InvalidTopologyConfig;
     }
+}
+
+pub fn finalStageHasBackendKind(specs: []const StageSpec, kind: bridge.HostBackendKind) bool {
+    if (specs.len == 0) return false;
+    return specs[specs.len - 1].backend_kind == kind;
 }
 
 pub fn deterministicHostId(stage_id: usize) !bridge.HostId {

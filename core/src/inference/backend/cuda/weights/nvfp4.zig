@@ -18,6 +18,25 @@ inline fn ue8m0ToScale(e8m0: u8) f32 {
     return @bitCast(exp_bits);
 }
 
+fn copyNvfp4ScaleRowsCompact(
+    dst: []u8,
+    src: []const u8,
+    row_count: usize,
+    source_scale_cols: usize,
+    required_scale_cols: usize,
+) !void {
+    if (required_scale_cols == 0 or source_scale_cols < required_scale_cols) return error.InvalidArgument;
+    const required_dst_len = std.math.mul(usize, row_count, required_scale_cols) catch return error.InvalidArgument;
+    const required_src_len = std.math.mul(usize, row_count, source_scale_cols) catch return error.InvalidArgument;
+    if (dst.len < required_dst_len or src.len < required_src_len) return error.InvalidArgument;
+
+    for (0..row_count) |row| {
+        const src_start = row * source_scale_cols;
+        const dst_start = row * required_scale_cols;
+        @memcpy(dst[dst_start .. dst_start + required_scale_cols], src[src_start .. src_start + required_scale_cols]);
+    }
+}
+
 // --- Shared types from engine_types.zig ---
 const engine_types = @import("../runtime/root.zig");
 const KvCacheDtype = engine_types.KvCacheDtype;
@@ -50,8 +69,11 @@ pub fn uploadLinearWeightNvfp4(
     const src_bytes = src.data();
     if (src_bytes.len < weight_byte_count) return error.InvalidArgument;
 
+    const group_size: usize = @intCast(meta.group_size);
+    if (group_size == 0) return error.InvalidArgument;
+    const required_scale_cols = std.math.divCeil(usize, in_dim, group_size) catch return error.InvalidArgument;
     const scale_cols: usize = @intCast(meta.scale_cols);
-    if (scale_cols == 0) return error.InvalidArgument;
+    if (scale_cols < required_scale_cols) return error.InvalidArgument;
     const scale_byte_count = std.math.mul(usize, out_dim, scale_cols) catch return error.InvalidArgument;
     const scales_ptr = meta.block_scales_data orelse return error.MissingScales;
     if (meta.block_scales_len < scale_byte_count) return error.InvalidArgument;
@@ -60,14 +82,24 @@ pub fn uploadLinearWeightNvfp4(
     errdefer buffer.deinit(device);
     try buffer.upload(device, src_bytes[0..weight_byte_count]);
 
-    var scales_buffer = try device.allocBuffer(scale_byte_count);
+    const compact_scale_byte_count = std.math.mul(usize, out_dim, required_scale_cols) catch return error.InvalidArgument;
+    var compact_scales: ?[]u8 = null;
+    defer if (compact_scales) |buf| allocator.free(buf);
+    const upload_scales = if (scale_cols == required_scale_cols)
+        scales_ptr[0..compact_scale_byte_count]
+    else blk: {
+        const buf = try allocator.alloc(u8, compact_scale_byte_count);
+        try copyNvfp4ScaleRowsCompact(buf, scales_ptr[0..scale_byte_count], out_dim, scale_cols, required_scale_cols);
+        compact_scales = buf;
+        break :blk buf;
+    };
+
+    var scales_buffer = try device.allocBuffer(compact_scale_byte_count);
     errdefer scales_buffer.deinit(device);
-    try scales_buffer.upload(device, scales_ptr[0..scale_byte_count]);
+    try scales_buffer.upload(device, upload_scales);
 
     var scales_lt_buffer: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 };
     if (meta.group_size == 16) {
-        const required_scale_cols = (in_dim + 15) / 16;
-        if (scale_cols < required_scale_cols) return error.InvalidArgument;
         const padded_scale_bytes = engine_types.Nvfp4LinearWeight.cublasLtScaleTensorSize(in_dim, out_dim);
         const padded_sf_k = engine_types.Nvfp4LinearWeight.roundoff(required_scale_cols, 4);
         const n_col_tiles = padded_sf_k / 4;
@@ -100,8 +132,24 @@ pub fn uploadLinearWeightNvfp4(
         .scales_buffer = scales_buffer,
         .scales_lt_buffer = scales_lt_buffer,
         .packed_cols = meta.packed_cols,
-        .scale_cols = meta.scale_cols,
+        .scale_cols = @intCast(required_scale_cols),
         .group_size = meta.group_size,
         .weight_global_scale = meta.weight_global_scale,
     } };
+}
+
+test "copyNvfp4ScaleRowsCompact removes padded source stride" {
+    const src = [_]u8{
+        1, 2, 3, 9, 9,
+        4, 5, 6, 8, 8,
+    };
+    var dst = [_]u8{0} ** 6;
+    try copyNvfp4ScaleRowsCompact(&dst, &src, 2, 5, 3);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6 }, &dst);
+}
+
+test "copyNvfp4ScaleRowsCompact rejects undersized scale rows" {
+    const src = [_]u8{ 1, 2, 3, 4 };
+    var dst = [_]u8{0} ** 4;
+    try std.testing.expectError(error.InvalidArgument, copyNvfp4ScaleRowsCompact(&dst, &src, 2, 1, 2));
 }

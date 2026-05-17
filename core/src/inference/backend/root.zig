@@ -31,6 +31,8 @@ const log = @import("log_pkg");
 const progress_mod = @import("progress_pkg");
 const compute = @import("compute_pkg");
 const runtime_contract = @import("runtime_contract_pkg");
+const bridge = @import("../bridge/root.zig");
+const transport = @import("../transport/root.zig");
 const ModelConfig = models.config.ModelConfig;
 const dtype_mod = @import("compute_pkg").dtype;
 const DType = dtype_mod.DType;
@@ -58,6 +60,7 @@ const shared_scheduler = @import("../scheduler/contracts.zig");
 
 comptime {
     contract.assertBackendModuleLayout(cpu, "cpu");
+    contract.assertInterfaceModuleLayout(cpu.interface, "cpu");
     contract.assertVisionModuleLayout(cpu.vision, "cpu");
     contract.assertExecutorModuleLayout(cpu.executor, "cpu");
     contract.assertExecutorSymbolLayout(cpu.executor, "cpu");
@@ -70,6 +73,7 @@ comptime {
     contract.assertBackendType(cpu.BackendType);
     if (has_metal) {
         contract.assertBackendModuleLayout(metal, "metal");
+        contract.assertInterfaceModuleLayout(metal.interface, "metal");
         contract.assertVisionModuleLayout(metal.vision, "metal");
         contract.assertExecutorModuleLayout(metal.executor, "metal");
         contract.assertExecutorSymbolLayout(metal.executor, "metal");
@@ -83,6 +87,7 @@ comptime {
     }
     if (has_cuda) {
         contract.assertBackendModuleLayout(cuda, "cuda");
+        contract.assertInterfaceModuleLayout(cuda.interface, "cuda");
         contract.assertVisionModuleLayout(cuda.vision, "cuda");
         contract.assertExecutorModuleLayout(cuda.executor, "cuda");
         contract.assertExecutorSymbolLayout(cuda.executor, "cuda");
@@ -143,11 +148,6 @@ pub const Selection = enum {
 };
 
 const topology_mod = @import("topology.zig");
-pub const local_stage = @import("local_stage.zig");
-pub const local_runtime = @import("local_runtime.zig");
-pub const local_stage_adapters = @import("local_stage_adapters.zig");
-pub const local_decode_pipeline = @import("local_decode_pipeline.zig");
-pub const local_prefill_pipeline = @import("local_prefill_pipeline.zig");
 pub const LocalStageSpec = topology_mod.LocalStageSpec;
 pub const LocalStageBackendKind = topology_mod.LocalStageBackendKind;
 pub const LocalStagePlan = topology_mod.LocalStagePlan;
@@ -155,8 +155,8 @@ const validateLocalStagePlan = topology_mod.validateLocalStagePlan;
 const resolveLocalStagePlan = topology_mod.resolveLocalStagePlan;
 const autoDetectLocalStagePlanForModel = topology_mod.autoDetectLocalStagePlanForModel;
 const localStagePlanFromSpecs = topology_mod.localStagePlanFromSpecs;
-const rootCudaStageIdForLocalPlan = topology_mod.rootCudaStageIdForLocalPlan;
 const parseLocalStageSpecs = topology_mod.parseLocalStageSpecs;
+const cpuPrefixCudaLocalStagePlan = topology_mod.cpuPrefixCudaLocalStagePlan;
 
 /// Backend initialization options selected at startup/config layer.
 pub const InitOptions = struct {
@@ -303,6 +303,8 @@ pub const Backend = union(enum) {
     metal: if (has_metal) metal.BackendType else void,
     /// CUDA backend (Linux/Windows when built with CUDA support).
     cuda: if (has_cuda) cuda.BackendType else void,
+    /// Bridge-owned local CPU/CUDA pipeline runtime.
+    local_pipeline: if (has_cuda) bridge.LocalPipelineRuntime else void,
 
     /// Vision input type for prefillSlotWithVision (shared across backends)
     pub const PrefillVisionInput = cpu.BackendType.PrefillVisionInput;
@@ -333,6 +335,7 @@ pub const Backend = union(enum) {
             else
                 false,
             .cuda => false,
+            .local_pipeline => false,
         };
     }
 
@@ -387,6 +390,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| b.deinit(),
             .metal => |*b| if (has_metal) b.deinit() else unreachable,
             .cuda => |*b| if (has_cuda) b.deinit() else unreachable,
+            .local_pipeline => |*b| if (has_cuda) b.deinit() else unreachable,
         }
     }
 
@@ -402,6 +406,7 @@ pub const Backend = union(enum) {
             .cpu => {},
             .metal => |*b| if (has_metal) b.synchronize() else unreachable,
             .cuda => |*b| if (has_cuda) try b.synchronize() else unreachable,
+            .local_pipeline => |*b| if (has_cuda) try b.synchronize() else unreachable,
         }
     }
 
@@ -413,6 +418,7 @@ pub const Backend = union(enum) {
             .cpu => {},
             .metal => |*b| if (has_metal) b.cleanupExecutionThreadState() else unreachable,
             .cuda => {},
+            .local_pipeline => {},
         }
     }
 
@@ -427,6 +433,7 @@ pub const Backend = union(enum) {
             .cpu => {},
             .metal => |*b| if (has_metal) b.teardownExecutionThreadState() else unreachable,
             .cuda => {},
+            .local_pipeline => {},
         }
     }
 
@@ -437,6 +444,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| try b.prefill(tokens, logits_out),
             .metal => |*b| if (has_metal) try b.prefill(tokens, logits_out) else unreachable,
             .cuda => |*b| if (has_cuda) try b.prefill(tokens, logits_out) else unreachable,
+            .local_pipeline => |*b| if (has_cuda) try b.prefill(tokens, logits_out) else unreachable,
         }
     }
 
@@ -447,6 +455,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| try b.decode(token, position, logits_out),
             .metal => |*b| if (has_metal) try b.decode(token, position, logits_out) else unreachable,
             .cuda => |*b| if (has_cuda) try b.decode(token, position, logits_out) else unreachable,
+            .local_pipeline => |*b| if (has_cuda) try b.decode(token, position, logits_out) else unreachable,
         }
     }
 
@@ -479,6 +488,7 @@ pub const Backend = union(enum) {
                 );
             } else unreachable,
             .cuda => return error.UnsupportedModel,
+            .local_pipeline => return error.UnsupportedModel,
         }
     }
 
@@ -496,6 +506,7 @@ pub const Backend = union(enum) {
                 b.shouldUseSchedulerTopKCandidateRoute(plan)
             else
                 false,
+            .local_pipeline => false,
         };
     }
 
@@ -510,6 +521,7 @@ pub const Backend = union(enum) {
             else
                 unreachable,
             .cuda => false,
+            .local_pipeline => false,
         };
     }
 
@@ -521,6 +533,7 @@ pub const Backend = union(enum) {
                 b.lastDecodeComputeNs()
             else
                 null,
+            .local_pipeline => null,
         };
     }
 
@@ -539,6 +552,10 @@ pub const Backend = union(enum) {
             else
                 unreachable,
             .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "decodeTopKCandidates"))
+                b.decodeTopKCandidates(slot_index, token, top_k, candidate_logits_out, candidate_ids_out)
+            else
+                error.InvalidArgument,
+            .local_pipeline => |*b| if (has_cuda)
                 b.decodeTopKCandidates(slot_index, token, top_k, candidate_logits_out, candidate_ids_out)
             else
                 error.InvalidArgument,
@@ -566,6 +583,7 @@ pub const Backend = union(enum) {
             else
                 unreachable,
             .cuda => error.InvalidArgument,
+            .local_pipeline => error.InvalidArgument,
         };
     }
 
@@ -583,6 +601,7 @@ pub const Backend = union(enum) {
                 b.shouldUseSchedulerBatchedTopKDecodeRoute(plan)
             else
                 false,
+            .local_pipeline => false,
         };
     }
 
@@ -604,6 +623,10 @@ pub const Backend = union(enum) {
                 return b.decodeBatchTopKCandidates(requests, top_k, candidate_logits_out, candidate_ids_out, candidate_counts_out)
             else
                 return error.InvalidArgument,
+            .local_pipeline => |*b| if (has_cuda)
+                return b.decodeBatchTopKCandidates(requests, top_k, candidate_logits_out, candidate_ids_out, candidate_counts_out)
+            else
+                return error.InvalidArgument,
         }
     }
     /// Get vocab size for this model
@@ -612,6 +635,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| return b.vocab_size,
             .metal => |*b| if (has_metal) return b.vocabSize() else unreachable,
             .cuda => |*b| if (has_cuda) return b.vocab_size else unreachable,
+            .local_pipeline => |*b| if (has_cuda) return b.vocab_size else unreachable,
         }
     }
 
@@ -622,6 +646,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| try b.warmup(),
             .metal => |*b| if (has_metal) try b.warmup() else unreachable,
             .cuda => {},
+            .local_pipeline => {},
         }
     }
 
@@ -647,6 +672,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| try b.embed(tokens, pooling, normalize, embedding_buffer),
             .metal => |*b| if (has_metal) try b.embed(tokens, pooling, normalize, embedding_buffer) else unreachable,
             .cuda => return error.EmbeddingNotSupported,
+            .local_pipeline => return error.EmbeddingNotSupported,
         }
     }
 
@@ -656,6 +682,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| return b.embeddingDim(),
             .metal => |*b| if (has_metal) return b.embeddingDim() else unreachable,
             .cuda => |*b| if (has_cuda) return b.d_model else unreachable,
+            .local_pipeline => |*b| if (has_cuda) return b.d_model else unreachable,
         }
     }
 
@@ -668,6 +695,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| return b.max_batch_size,
             .metal => |*b| if (has_metal) return b.maxBatchSize() else unreachable,
             .cuda => |*b| if (has_cuda) return b.max_batch_size else unreachable,
+            .local_pipeline => |*b| if (has_cuda) return b.max_batch_size else unreachable,
         }
     }
 
@@ -676,6 +704,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| return b.allocSlot(),
             .metal => |*b| if (has_metal) return b.allocSlot() else unreachable,
             .cuda => |*b| if (has_cuda) return b.allocSlot() else unreachable,
+            .local_pipeline => |*b| if (has_cuda) return b.allocSlot() else unreachable,
         }
     }
 
@@ -684,6 +713,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| b.freeSlot(slot_index),
             .metal => |*b| if (has_metal) b.freeSlot(slot_index) else unreachable,
             .cuda => |*b| if (has_cuda) b.freeSlot(slot_index) else unreachable,
+            .local_pipeline => |*b| if (has_cuda) b.freeSlot(slot_index) else unreachable,
         }
     }
 
@@ -692,6 +722,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| return b.stateDescriptors(),
             .metal => |*b| if (has_metal) return b.stateDescriptors() else unreachable,
             .cuda => |*b| if (has_cuda) return b.stateDescriptors() else unreachable,
+            .local_pipeline => |*b| if (has_cuda) return b.stateDescriptors() else unreachable,
         }
     }
 
@@ -710,6 +741,10 @@ pub const Backend = union(enum) {
                 try b.bindSlotStateBlocks(slot_index, state_blocks)
             else
                 unreachable,
+            .local_pipeline => |*b| if (has_cuda)
+                try b.bindSlotStateBlocks(slot_index, state_blocks)
+            else
+                unreachable,
         }
     }
 
@@ -718,6 +753,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| b.unbindSlotStateBlocks(slot_index),
             .metal => |*b| if (has_metal) b.unbindSlotStateBlocks(slot_index) else unreachable,
             .cuda => |*b| if (has_cuda) b.unbindSlotStateBlocks(slot_index) else unreachable,
+            .local_pipeline => |*b| if (has_cuda) b.unbindSlotStateBlocks(slot_index) else unreachable,
         }
     }
 
@@ -731,6 +767,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| try b.prefillSlot(slot_index, tokens, logits_out),
             .metal => |*b| if (has_metal) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
             .cuda => |*b| if (has_cuda) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
+            .local_pipeline => |*b| if (has_cuda) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
         }
     }
 
@@ -758,6 +795,9 @@ pub const Backend = union(enum) {
                     try b.prefillSlot(request.slot_index, request.prompt_tokens, request.logits_out);
                 }
             } else unreachable,
+            .local_pipeline => |*b| if (has_cuda) {
+                try b.prefillBatch(requests);
+            } else unreachable,
         }
     }
 
@@ -773,6 +813,7 @@ pub const Backend = union(enum) {
             else
                 error.InvalidArgument,
             .cuda => error.InvalidArgument,
+            .local_pipeline => error.InvalidArgument,
         };
     }
 
@@ -793,6 +834,10 @@ pub const Backend = union(enum) {
                 try b.prefillSlotWithVision(slot_index, tokens, vision_input, logits_out)
             else
                 unreachable,
+            .local_pipeline => |*b| if (has_cuda) {
+                const erased: ?*const anyopaque = if (vision_input) |input| @ptrCast(input) else null;
+                try b.prefillSlotWithVision(slot_index, tokens, erased, logits_out);
+            } else unreachable,
         }
     }
 
@@ -804,6 +849,7 @@ pub const Backend = union(enum) {
             else
                 0,
             .cuda => 0,
+            .local_pipeline => 0,
         };
     }
 
@@ -816,6 +862,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| try b.decodeBatch(requests, results),
             .metal => |*b| if (has_metal) try b.decodeBatch(requests, results) else unreachable,
             .cuda => |*b| if (has_cuda) try b.decodeBatch(requests, results) else unreachable,
+            .local_pipeline => |*b| if (has_cuda) try b.decodeBatch(requests, results) else unreachable,
         }
     }
 
@@ -832,6 +879,7 @@ pub const Backend = union(enum) {
             },
             .metal => {},
             .cuda => {},
+            .local_pipeline => {},
         }
     }
 
@@ -841,6 +889,7 @@ pub const Backend = union(enum) {
             .cpu => |*b| b.stop_flag = flag,
             .metal => {},
             .cuda => {},
+            .local_pipeline => {},
         }
     }
 
@@ -850,6 +899,7 @@ pub const Backend = union(enum) {
             .cpu => cpu.vision.maxPixels(),
             .metal => if (has_metal) metal.vision.maxPixels() else unreachable,
             .cuda => if (has_cuda) cuda.vision.maxPixels() else unreachable,
+            .local_pipeline => if (has_cuda) cuda.vision.maxPixels() else unreachable,
         };
     }
 };
@@ -1152,13 +1202,16 @@ fn initCuda(
         return error.CudaUnavailable;
     }
     var plan = try resolveLocalStagePlan(local_stage_override, loaded.blocks.len, 0);
-    const explicit_stage_list = std.process.getEnvVarOwned(allocator, "TALU_LOCAL_STAGES") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => {
-            log.err("inference", "Failed to read TALU_LOCAL_STAGES", .{ .err = @errorName(err) }, @src());
-            return err;
-        },
-    };
+    const explicit_stage_list = if (local_stage_override == null)
+        std.process.getEnvVarOwned(allocator, "TALU_LOCAL_STAGES") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => {
+                log.err("inference", "Failed to read TALU_LOCAL_STAGES", .{ .err = @errorName(err) }, @src());
+                return err;
+            },
+        }
+    else
+        null;
     defer if (explicit_stage_list) |value| allocator.free(value);
     const has_explicit_stage_list = explicit_stage_list != null;
     if (explicit_stage_list) |raw| {
@@ -1172,11 +1225,42 @@ fn initCuda(
         defer specs.deinit();
         plan = try localStagePlanFromSpecs(specs.stages);
     }
+    const explicit_cpu_layers = if (local_stage_override == null and !has_explicit_stage_list)
+        std.process.getEnvVarOwned(allocator, "TALU_CPU_LAYERS") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => {
+                log.err("inference", "Failed to read TALU_CPU_LAYERS", .{ .err = @errorName(err) }, @src());
+                return err;
+            },
+        }
+    else
+        null;
+    defer if (explicit_cpu_layers) |value| allocator.free(value);
+    const has_explicit_cpu_layers = explicit_cpu_layers != null;
+    if (explicit_cpu_layers) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        const cpu_layers = std.fmt.parseUnsigned(usize, trimmed, 10) catch |err| {
+            log.err("inference", "Invalid TALU_CPU_LAYERS", .{
+                .value = trimmed,
+                .err = @errorName(err),
+            }, @src());
+            return error.InvalidTopologyConfig;
+        };
+        plan = cpuPrefixCudaLocalStagePlan(loaded.blocks.len, cpu_layers, 0) catch |err| {
+            log.err("inference", "Invalid TALU_CPU_LAYERS", .{
+                .value = trimmed,
+                .total_layers = loaded.blocks.len,
+                .err = @errorName(err),
+            }, @src());
+            return err;
+        };
+    }
     // Local stage plan resolution priority:
     //   1. programmatic stage list
     //   2. TALU_LOCAL_STAGES stage list
-    //   3. Auto-detection (probe GPU memory, estimate model size)
-    if (local_stage_override == null and !has_explicit_stage_list) {
+    //   3. TALU_CPU_LAYERS CPU-prefix shorthand
+    //   4. Auto-detection (probe GPU memory, estimate model size)
+    if (local_stage_override == null and !has_explicit_stage_list and !has_explicit_cpu_layers) {
         plan = autoDetectLocalStagePlanForModel(allocator, loaded) catch |err| {
             log.err("inference", "Auto local stage detection failed", .{
                 .err = @errorName(err),
@@ -1187,6 +1271,7 @@ fn initCuda(
 
     if (local_stage_override == null and
         !has_explicit_stage_list and
+        !has_explicit_cpu_layers and
         plan.stage_count > plan.cudaStageCount() and
         topology_mod.loadedModelHasPackedNvfp4Weights(loaded))
     {
@@ -1231,7 +1316,6 @@ fn initCuda(
     const gpu_layer_count = resolved_summary.gpu0_layers + resolved_summary.gpu1_layers;
     const gpu0_layer_count = resolved_summary.gpu0_layers;
     const gpu1_layer_count = resolved_summary.gpu1_layers;
-    const root_stage_id = try rootCudaStageIdForLocalPlan(plan.stagesSlice());
     log.info("inference", "CUDA backend init config", .{
         .max_batch = cuda_max_batch_size,
         .stage_count = plan.stage_count,
@@ -1241,7 +1325,7 @@ fn initCuda(
         .gpu1_layers = gpu1_layer_count,
         .total_layers = n_layers,
         .device = plan.primaryDeviceOrdinal(),
-        .root_stage_id = root_stage_id,
+        .bridge_pipeline = @as(u8, @intFromBool(!plan.isSingleCudaStage())),
     });
     const total_layers: u64 = @intCast(n_layers);
 
@@ -1251,11 +1335,15 @@ fn initCuda(
     const bar_total: u64 = if (!plan.isSingleCudaStage()) 0 else total_layers;
 
     progress.addLine(1, "Loading", bar_total, null, null);
+    if (!plan.isSingleCudaStage()) {
+        return initLocalPipeline(allocator, loaded, reason, plan, cuda_max_batch_size, resolved_summary, progress);
+    }
+
+    const single_stage = plan.stages[0];
     const cuda_backend_state = if (has_cuda)
         try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size, .{
-            .device_ordinal = plan.stages[root_stage_id].device_ordinal orelse plan.primaryDeviceOrdinal(),
-            .local_stage_specs = plan.stagesSlice(),
-            .local_root_stage_id = root_stage_id,
+            .device_ordinal = single_stage.device_ordinal orelse plan.primaryDeviceOrdinal(),
+            .layer_range = .{ .start = single_stage.layer_start, .end = single_stage.layer_end },
             .progress = progress,
         })
     else
@@ -1266,6 +1354,434 @@ fn initCuda(
     log.info("inference", "Backend selected: cuda", .{ .reason = reason });
     return .{ .cuda = cuda_backend_state };
 }
+
+fn hostKindForLocalStage(kind: LocalStageBackendKind) bridge.HostBackendKind {
+    return switch (kind) {
+        .cpu => .cpu,
+        .cuda => .cuda,
+        .metal => .metal,
+    };
+}
+
+fn supportedBoundaryDTypesForStage(kind: LocalStageBackendKind) []const bridge.BoundaryDType {
+    return switch (kind) {
+        .cpu => cpu.stage_capabilities.supported_boundary_dtypes[0..],
+        .cuda => if (comptime has_cuda) cuda.stage_capabilities.supported_boundary_dtypes[0..] else &.{.f32},
+        .metal => &.{.f32},
+    };
+}
+
+fn initLocalPipeline(
+    allocator: std.mem.Allocator,
+    loaded: *LoadedModel,
+    reason: []const u8,
+    plan: LocalStagePlan,
+    max_batch_size: usize,
+    summary: DeviceLayerSummary,
+    progress: progress_mod.Context,
+) !Backend {
+    if (!has_cuda) return error.CudaNotEnabled;
+    if (plan.stage_count < 2) return error.InvalidTopologyConfig;
+
+    const stage_count = plan.stage_count;
+    var handles = try allocator.alloc(bridge.LocalPipelineStageHandle, stage_count);
+    errdefer allocator.free(handles);
+    var created_count: usize = 0;
+    errdefer {
+        for (handles[0..created_count]) |*handle| handle.deinit(allocator);
+    }
+
+    var stage_inputs = try allocator.alloc(bridge.LocalPipelineStageInputSpec, stage_count);
+    defer allocator.free(stage_inputs);
+    var stage_capabilities = try allocator.alloc(bridge.LocalPipelineStageRuntimeCapability, stage_count);
+    defer allocator.free(stage_capabilities);
+    const boundary_peer_copy_available = try allocator.alloc(bool, stage_count - 1);
+    defer allocator.free(boundary_peer_copy_available);
+    @memset(boundary_peer_copy_available, false);
+
+    const model_max_seq: usize = @intCast(@max(@as(i32, 1), loaded.config.max_seq_len));
+    const cpu_max_seq_len = resolveCpuMaxSeqLenForRuntime(allocator, model_max_seq);
+
+    for (plan.stagesSlice(), 0..) |stage, stage_id| {
+        const host_kind = hostKindForLocalStage(stage.backend_kind);
+        stage_inputs[stage_id] = .{
+            .backend_kind = host_kind,
+            .layer_start = stage.layer_start,
+            .layer_end = stage.layer_end,
+        };
+
+        handles[stage_id] = switch (stage.backend_kind) {
+            .cpu => blk: {
+                const ptr = try allocator.create(cpu.BackendType);
+                var ptr_owned = true;
+                errdefer if (ptr_owned) allocator.destroy(ptr);
+                ptr.* = try cpu.BackendType.init(allocator, loaded, .{
+                    .max_batch_size = max_batch_size,
+                    .max_sequence_len = cpu_max_seq_len,
+                    .layer_range = .{ .start = stage.layer_start, .end = stage.layer_end },
+                    .build_logits_head = stage_id + 1 == stage_count,
+                    .progress = progress_mod.Context.NONE,
+                });
+                ptr_owned = false;
+                break :blk .{
+                    .stage_id = stage_id,
+                    .backend_kind = host_kind,
+                    .layer_start = stage.layer_start,
+                    .layer_end = stage.layer_end,
+                    .supported_boundary_dtypes = supportedBoundaryDTypesForStage(stage.backend_kind),
+                    .ptr = ptr,
+                    .vtable = &cpu_stage_vtable,
+                };
+            },
+            .cuda => blk: {
+                const ptr = try allocator.create(cuda.BackendType);
+                var ptr_owned = true;
+                errdefer if (ptr_owned) allocator.destroy(ptr);
+                ptr.* = try cuda.BackendType.init(allocator, loaded, max_batch_size, .{
+                    .device_ordinal = stage.device_ordinal orelse plan.primaryDeviceOrdinal(),
+                    .layer_range = .{ .start = stage.layer_start, .end = stage.layer_end },
+                    .progress = progress_mod.Context.NONE,
+                });
+                ptr_owned = false;
+                break :blk .{
+                    .stage_id = stage_id,
+                    .backend_kind = host_kind,
+                    .layer_start = stage.layer_start,
+                    .layer_end = stage.layer_end,
+                    .supported_boundary_dtypes = supportedBoundaryDTypesForStage(stage.backend_kind),
+                    .ptr = ptr,
+                    .vtable = &cuda_stage_vtable,
+                };
+            },
+            .metal => return error.UnsupportedModel,
+        };
+        created_count += 1;
+        stage_capabilities[stage_id] = .{
+            .stage_id = stage_id,
+            .backend_kind = host_kind,
+            .max_batch_size = handles[stage_id].vtable.max_batch_size(handles[stage_id].ptr),
+            .prefill_chunk_rows_cap = handles[stage_id].vtable.prefill_chunk_rows_cap(handles[stage_id].ptr),
+            .supported_boundary_dtypes = handles[stage_id].supported_boundary_dtypes,
+        };
+    }
+
+    for (boundary_peer_copy_available, 0..) |*available, boundary_index| {
+        const source = &handles[boundary_index];
+        const target = &handles[boundary_index + 1];
+        available.* = source.backend_kind == .cuda and
+            target.backend_kind == .cuda and
+            transport.probeCudaPeerActivation(cudaStage(source.ptr), cudaStage(target.ptr));
+    }
+
+    const load_semantics = models.stage_plan.LoadSemantics.fromLoadOptions(defaultModelLoadOptions(.{ .selection = .cuda }));
+    const runtime = try bridge.LocalPipelineRuntime.init(.{
+        .allocator = allocator,
+        .loaded = loaded,
+        .d_model = @intCast(loaded.config.d_model),
+        .vocab_size = @intCast(loaded.config.vocab_size),
+        .total_layers = loaded.blocks.len,
+        .stages = handles,
+        .stage_inputs = stage_inputs,
+        .stage_capabilities = stage_capabilities,
+        .boundary_peer_copy_available = boundary_peer_copy_available,
+        .load_semantics = load_semantics,
+    });
+    created_count = 0;
+
+    progress.completeLine(1);
+    publishDeviceLayerSummary(progress, summary);
+    log.info("inference", "Backend selected: local_pipeline", .{
+        .reason = reason,
+        .stage_count = stage_count,
+    });
+    return .{ .local_pipeline = runtime };
+}
+
+fn cpuStage(ptr: *anyopaque) *cpu.BackendType {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn cpuStageConst(ptr: *const anyopaque) *const cpu.BackendType {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn cudaStage(ptr: *anyopaque) *cuda.BackendType {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn cudaStageConst(ptr: *const anyopaque) *const cuda.BackendType {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn deinitCpuStage(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+    const backend = cpuStage(ptr);
+    backend.deinit();
+    allocator.destroy(backend);
+}
+
+fn deinitCudaStage(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+    const backend = cudaStage(ptr);
+    backend.deinit();
+    allocator.destroy(backend);
+}
+
+fn cpuStageMaxBatch(ptr: *const anyopaque) usize {
+    return cpuStageConst(ptr).max_batch_size;
+}
+
+fn cudaStageMaxBatch(ptr: *const anyopaque) usize {
+    return cudaStageConst(ptr).max_batch_size;
+}
+
+fn cpuStagePrefillChunkRowsCap(ptr: *const anyopaque) usize {
+    _ = ptr;
+    return 1024;
+}
+
+fn cudaStagePrefillChunkRowsCap(ptr: *const anyopaque) usize {
+    return cudaStageConst(ptr).prefill_chunk_rows_cap;
+}
+
+fn cpuStageStateDescriptors(ptr: *const anyopaque) []const runtime_contract.StateDescriptor {
+    return cpuStageConst(ptr).stateDescriptors();
+}
+
+fn cudaStageStateDescriptors(ptr: *const anyopaque) []const runtime_contract.StateDescriptor {
+    return cudaStageConst(ptr).stateDescriptors();
+}
+
+fn cpuStageAllocSlot(ptr: *anyopaque) ?usize {
+    return cpuStage(ptr).allocSlot();
+}
+
+fn cudaStageAllocSlot(ptr: *anyopaque) ?usize {
+    return cudaStage(ptr).allocSlot();
+}
+
+fn cpuStageFreeSlot(ptr: *anyopaque, slot_index: usize) void {
+    cpuStage(ptr).freeSlot(slot_index);
+}
+
+fn cudaStageFreeSlot(ptr: *anyopaque, slot_index: usize) void {
+    cudaStage(ptr).freeSlot(slot_index);
+}
+
+fn cpuStageResetSlot(ptr: *anyopaque, slot_index: usize) void {
+    cpuStage(ptr).resetSlot(slot_index);
+}
+
+fn cudaStageResetSlot(ptr: *anyopaque, slot_index: usize) void {
+    cudaStage(ptr).resetSlot(slot_index);
+}
+
+fn cpuStageBindSlotStateBlocks(ptr: *anyopaque, slot_index: usize, blocks: []const runtime_contract.StateBlockHandle) anyerror!void {
+    try cpuStage(ptr).bindSlotStateBlocks(slot_index, blocks);
+}
+
+fn cudaStageBindSlotStateBlocks(ptr: *anyopaque, slot_index: usize, blocks: []const runtime_contract.StateBlockHandle) anyerror!void {
+    try cudaStage(ptr).bindSlotStateBlocks(slot_index, blocks);
+}
+
+fn cpuStageUnbindSlotStateBlocks(ptr: *anyopaque, slot_index: usize) void {
+    cpuStage(ptr).unbindSlotStateBlocks(slot_index);
+}
+
+fn cudaStageUnbindSlotStateBlocks(ptr: *anyopaque, slot_index: usize) void {
+    cudaStage(ptr).unbindSlotStateBlocks(slot_index);
+}
+
+fn cpuStageExecuteDecode(ptr: *anyopaque, request: bridge.local_pipeline_runtime.StageDecodeRequest) anyerror!void {
+    try cpuStage(ptr).executeDecodeLayerRange(
+        request.token,
+        request.position,
+        request.slot_index,
+        request.logits_out_opt,
+        request.layer_start,
+        request.layer_end,
+        request.compute_logits,
+        request.download_logits,
+        request.ensure_kv_capacity,
+        request.use_preloaded_input,
+    );
+}
+
+fn cudaStageExecuteDecode(ptr: *anyopaque, request: bridge.local_pipeline_runtime.StageDecodeRequest) anyerror!void {
+    try cudaStage(ptr).executeDecodeLayerRange(
+        request.token,
+        request.position,
+        request.slot_index,
+        request.logits_out_opt,
+        request.layer_start,
+        request.layer_end,
+        request.compute_logits,
+        request.download_logits,
+        request.ensure_kv_capacity,
+        request.use_preloaded_input,
+    );
+}
+
+fn cpuStageExecutePrefill(ptr: *anyopaque, request: bridge.local_pipeline_runtime.StagePrefillRequest) anyerror!void {
+    try cpuStage(ptr).executePrefillLayerRange(
+        request.slot_index,
+        request.tokens,
+        request.sequence_start,
+        request.layer_start,
+        request.layer_end,
+        request.use_preloaded_input,
+        request.compute_logits,
+        request.logits_out_opt,
+        request.source_embeddings_out,
+    );
+}
+
+fn cudaStageExecutePrefill(ptr: *anyopaque, request: bridge.local_pipeline_runtime.StagePrefillRequest) anyerror!void {
+    try cudaStage(ptr).executePrefillLayerRange(
+        request.slot_index,
+        request.tokens,
+        request.sequence_start,
+        request.layer_start,
+        request.layer_end,
+        request.use_preloaded_input,
+        request.compute_logits,
+        request.logits_out_opt,
+        request.source_embeddings_out,
+    );
+}
+
+fn cpuStageSynchronize(_: *anyopaque, _: transport.StageExecutionReceipt) anyerror!void {}
+
+fn cudaStageSynchronize(ptr: *anyopaque, _: transport.StageExecutionReceipt) anyerror!void {
+    try cudaStage(ptr).synchronize();
+}
+
+fn cpuStageDownloadDecodeActivation(ptr: *anyopaque, slot_index: usize, host_buf: []u8, byte_count: usize) anyerror!void {
+    const source = cpuStage(ptr).slotActivationBytes(slot_index);
+    if (byte_count > host_buf.len or byte_count > source.len) return error.InvalidArgument;
+    @memcpy(host_buf[0..byte_count], source[0..byte_count]);
+}
+
+fn cudaStageDownloadDecodeActivation(ptr: *anyopaque, _: usize, host_buf: []u8, byte_count: usize) anyerror!void {
+    try transport.downloadCudaActivation(cudaStage(ptr), host_buf, byte_count);
+}
+
+fn cpuStageDownloadPrefillActivation(ptr: *anyopaque, host_buf: []u8, byte_count: usize) anyerror!void {
+    const source = cpuStage(ptr).localPrefillActivationBytes(byte_count);
+    if (byte_count > host_buf.len or byte_count > source.len) return error.InvalidArgument;
+    @memcpy(host_buf[0..byte_count], source[0..byte_count]);
+}
+
+fn cudaStageDownloadPrefillActivation(ptr: *anyopaque, host_buf: []u8, byte_count: usize) anyerror!void {
+    try transport.downloadCudaActivation(cudaStage(ptr), host_buf, byte_count);
+}
+
+fn cpuStageUploadDecodeActivation(ptr: *anyopaque, slot_index: usize, host_buf: []const u8, byte_count: usize) anyerror!void {
+    if (byte_count > host_buf.len) return error.InvalidArgument;
+    const target = cpuStage(ptr).slotActivationBytesMut(slot_index);
+    if (byte_count > target.len) return error.InvalidArgument;
+    @memcpy(target[0..byte_count], host_buf[0..byte_count]);
+}
+
+fn cudaStageUploadDecodeActivation(ptr: *anyopaque, slot_index: usize, host_buf: []const u8, byte_count: usize) anyerror!void {
+    try transport.uploadCudaActivation(cudaStage(ptr), slot_index, host_buf, byte_count);
+}
+
+fn cpuStageUploadPrefillActivation(ptr: *anyopaque, host_buf: []const u8, byte_count: usize) anyerror!void {
+    if (byte_count > host_buf.len) return error.InvalidArgument;
+    const target = cpuStage(ptr).localPrefillActivationBytesMut(byte_count);
+    if (byte_count > target.len) return error.InvalidArgument;
+    @memcpy(target[0..byte_count], host_buf[0..byte_count]);
+}
+
+fn cudaStageUploadPrefillActivation(ptr: *anyopaque, host_buf: []const u8, byte_count: usize) anyerror!void {
+    try transport.uploadCudaActivation(cudaStage(ptr), 0, host_buf, byte_count);
+}
+
+fn cudaStageUploadActivationSegments(ptr: *anyopaque, host_segments: []const []const u8, byte_count: usize) anyerror!void {
+    try transport.uploadCudaActivationSegments(cudaStage(ptr), host_segments, byte_count);
+}
+
+fn cudaStagePeerCopyActivationTo(ptr: *anyopaque, target_ptr: *anyopaque, byte_count: usize) anyerror!void {
+    try transport.peerCopyCudaActivationRuntime(cudaStage(ptr), cudaStage(target_ptr), byte_count, .source_stream);
+}
+
+fn cudaStagePeerCopyHandlesStageSync(_: *const anyopaque) bool {
+    return false;
+}
+
+fn cpuStageHostDecodeActivation(ptr: *anyopaque, slot_index: usize, byte_count: usize) anyerror![]const u8 {
+    const bytes = cpuStage(ptr).slotActivationBytes(slot_index);
+    if (byte_count > bytes.len) return error.InvalidArgument;
+    return bytes[0..byte_count];
+}
+
+fn cudaStageHostDecodeActivation(_: *anyopaque, _: usize, _: usize) anyerror![]const u8 {
+    return error.InvalidTopologyConfig;
+}
+
+fn cpuStageHostPrefillActivation(ptr: *anyopaque, byte_count: usize) anyerror![]const u8 {
+    return cpuStage(ptr).ensureLocalPrefillActivationBytes(byte_count);
+}
+
+fn cudaStageHostPrefillActivation(_: *anyopaque, _: usize) anyerror![]const u8 {
+    return error.InvalidTopologyConfig;
+}
+
+fn cpuStageDeviceLocationHint(_: *const anyopaque) ?bridge.TensorFramePayloadLocationHint {
+    return .{ .cpu = {} };
+}
+
+fn cudaStageDeviceLocationHint(ptr: *const anyopaque) ?bridge.TensorFramePayloadLocationHint {
+    const backend = cudaStageConst(ptr);
+    const ordinal = backend.device.ordinal();
+    return .{ .cuda = std.math.cast(u16, ordinal) orelse return null };
+}
+
+const cpu_stage_vtable = bridge.LocalPipelineStageVTable{
+    .deinit = deinitCpuStage,
+    .max_batch_size = cpuStageMaxBatch,
+    .prefill_chunk_rows_cap = cpuStagePrefillChunkRowsCap,
+    .state_descriptors = cpuStageStateDescriptors,
+    .alloc_slot = cpuStageAllocSlot,
+    .free_slot = cpuStageFreeSlot,
+    .reset_slot = cpuStageResetSlot,
+    .bind_slot_state_blocks = cpuStageBindSlotStateBlocks,
+    .unbind_slot_state_blocks = cpuStageUnbindSlotStateBlocks,
+    .execute_decode = cpuStageExecuteDecode,
+    .execute_prefill = cpuStageExecutePrefill,
+    .synchronize = cpuStageSynchronize,
+    .download_decode_activation = cpuStageDownloadDecodeActivation,
+    .download_prefill_activation = cpuStageDownloadPrefillActivation,
+    .upload_decode_activation = cpuStageUploadDecodeActivation,
+    .upload_prefill_activation = cpuStageUploadPrefillActivation,
+    .host_decode_activation = cpuStageHostDecodeActivation,
+    .host_prefill_activation = cpuStageHostPrefillActivation,
+    .device_location_hint = cpuStageDeviceLocationHint,
+};
+
+const cuda_stage_vtable = bridge.LocalPipelineStageVTable{
+    .deinit = deinitCudaStage,
+    .max_batch_size = cudaStageMaxBatch,
+    .prefill_chunk_rows_cap = cudaStagePrefillChunkRowsCap,
+    .state_descriptors = cudaStageStateDescriptors,
+    .alloc_slot = cudaStageAllocSlot,
+    .free_slot = cudaStageFreeSlot,
+    .reset_slot = cudaStageResetSlot,
+    .bind_slot_state_blocks = cudaStageBindSlotStateBlocks,
+    .unbind_slot_state_blocks = cudaStageUnbindSlotStateBlocks,
+    .execute_decode = cudaStageExecuteDecode,
+    .execute_prefill = cudaStageExecutePrefill,
+    .synchronize = cudaStageSynchronize,
+    .download_decode_activation = cudaStageDownloadDecodeActivation,
+    .download_prefill_activation = cudaStageDownloadPrefillActivation,
+    .upload_decode_activation = cudaStageUploadDecodeActivation,
+    .upload_prefill_activation = cudaStageUploadPrefillActivation,
+    .upload_activation_segments = cudaStageUploadActivationSegments,
+    .peer_copy_activation_to = cudaStagePeerCopyActivationTo,
+    .peer_copy_handles_stage_sync = cudaStagePeerCopyHandlesStageSync,
+    .host_decode_activation = cudaStageHostDecodeActivation,
+    .host_prefill_activation = cudaStageHostPrefillActivation,
+    .device_location_hint = cudaStageDeviceLocationHint,
+};
 
 // ============================================================================
 // Tests

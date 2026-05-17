@@ -25,7 +25,8 @@ test {
     _ = @import("gated_delta_ssm_test.zig");
     _ = @import("transport_cuda_activation_test.zig");
     _ = @import("transport_cuda_kv_mirror_test.zig");
-    _ = @import("stage_adapters_chain_tests.zig");
+    _ = @import("interface_transport_endpoint_test.zig");
+    _ = @import("interface_stage_chain_tests.zig");
     if (comptime has_cuda) {
         _ = @import("engine_tests.zig");
     }

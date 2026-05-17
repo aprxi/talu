@@ -17,6 +17,8 @@ pub const engine = engine_mod;
 pub const vision = @import("vision.zig");
 pub const executor = @import("contract_executor.zig");
 pub const kernels = @import("contract_kernels.zig");
+pub const interface = @import("interface/root.zig");
+pub const stage_capabilities = @import("stage_capabilities.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const sampling = @import("../../sampling.zig");
 
@@ -26,6 +28,7 @@ pub const testing = if (builtin.is_test) struct {
     pub const weights = @import("weights/root.zig");
     pub const operators = @import("operators/root.zig");
     pub const exec = @import("exec/root.zig");
+    pub const interface = @import("interface/root.zig");
 } else struct {};
 
 test "inference.backend.cuda fused projection wrapper tag policies" {

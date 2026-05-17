@@ -510,6 +510,16 @@ pub fn runGatedDeltaMixerStep(
         });
         return err;
     };
+    if (debugKernelSyncEnabled()) {
+        self.device.synchronize() catch |err| {
+            log.warn("inference", "CUDA debug sync failed after gated-delta in_proj", .{
+                .seq_len = seq_len,
+                .proj_len = proj_len,
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+    }
     const prev_trace_position_offset = block.kernel.trace_position_offset;
     block.kernel.trace_position_offset = if (self.parity_prefill_seq_len > 1 and seq_len == 1)
         self.parity_prefill_token_index
@@ -567,17 +577,14 @@ pub fn runGatedDeltaMixerStep(
     const beta_offset_elems = qkv_len + d_inner;
     const a_offset_elems = beta_offset_elems + n_v_heads;
     const quantized_ssm_state = block.ssm_state_format == .i8_per_column_scale;
-    const use_rows_conv_silu = if (quantized_ssm_state)
-        self.gated_delta_conv_silu_rows_function != null
-    else
-        seq_len > 1 and self.gated_delta_conv_silu_rows_function != null;
-    const use_token_conv_silu = !trace_enabled and !quantized_ssm_state and self.gated_delta_conv_silu_function != null;
+    const use_rows_conv_silu = !quantized_ssm_state and seq_len > 1 and self.gated_delta_conv_silu_rows_function != null;
+    const use_token_conv_silu = !trace_enabled and self.gated_delta_conv_silu_function != null;
     const use_rows_ssm = if (quantized_ssm_state)
         self.gated_delta_ssm_rows_i8_function != null
     else
         seq_len > 1 and self.gated_delta_ssm_rows_function != null;
-    if (quantized_ssm_state and !use_rows_conv_silu) return error.CudaKernelUnavailable;
     if (quantized_ssm_state and !use_rows_ssm) return error.CudaKernelUnavailable;
+    if (use_rows_ssm and !use_rows_conv_silu and self.gated_delta_conv_function == null and !use_token_conv_silu) return error.CudaKernelUnavailable;
     const head_bytes = std.math.mul(usize, d_head, @sizeOf(f32)) catch return error.InvalidArgument;
     const fused_norm_gate_supported = self.gated_delta_rmsnorm_silu_mul_function != null and
         ((block.norm_weight.buffer.size == head_bytes) or (block.norm_weight.buffer.size == ssm_bytes));
@@ -607,6 +614,54 @@ pub fn runGatedDeltaMixerStep(
             @intCast(proj_len),
         );
         block.conv_ring_head = @intCast((@as(usize, block.conv_ring_head) + seq_len) % d_conv);
+    }
+    const conv_materialized_for_rows = use_rows_conv_silu or use_rows_ssm;
+    if (!use_rows_conv_silu and use_rows_ssm) {
+        for (0..seq_len) |t| {
+            var proj_row_dev = try logicalF32RowSlice(&proj_dev, seq_len, t, proj_len);
+            var qkv_dev = try bufferSlice(&proj_row_dev, 0, qkv_bytes);
+            if (use_token_conv_silu) {
+                try compute.cuda.gated_delta_conv_silu.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.gated_delta_conv_silu_function.?,
+                    &qkv_dev,
+                    &block.conv_state_dev,
+                    &block.conv_weight_time_major.buffer,
+                    if (block.conv_bias) |*bias| &bias.buffer else null,
+                    &qkv_dev,
+                    @intCast(qkv_len),
+                    @intCast(d_conv),
+                    block.conv_ring_head,
+                );
+            } else {
+                try compute.cuda.gated_delta_conv.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.gated_delta_conv_function orelse return error.CudaKernelUnavailable,
+                    &qkv_dev,
+                    &block.conv_state_dev,
+                    &block.conv_weight_time_major.buffer,
+                    if (block.conv_bias) |*bias| &bias.buffer else null,
+                    &qkv_dev,
+                    @intCast(qkv_len),
+                    @intCast(d_conv),
+                    block.conv_ring_head,
+                );
+                try compute.cuda.silu.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.silu_function orelse return error.CudaKernelUnavailable,
+                    &qkv_dev,
+                    &qkv_dev,
+                    @intCast(qkv_len),
+                );
+            }
+            block.conv_ring_head = if (block.conv_ring_head + 1 >= @as(u32, @intCast(d_conv)))
+                0
+            else
+                block.conv_ring_head + 1;
+        }
     }
     if (use_rows_ssm) {
         var qkv_all_dev = try bufferSlice(&proj_dev, 0, proj_bytes);
@@ -682,7 +737,7 @@ pub fn runGatedDeltaMixerStep(
         var proj_row_dev = try logicalF32RowSlice(&proj_dev, seq_len, t, proj_len);
 
         var qkv_dev = try bufferSlice(&proj_row_dev, 0, qkv_bytes);
-        if (!use_rows_conv_silu) {
+        if (!conv_materialized_for_rows) {
             if (use_token_conv_silu) {
                 try compute.cuda.gated_delta_conv_silu.runWithFunction(
                     &self.kernel_arg_pack,
@@ -734,7 +789,7 @@ pub fn runGatedDeltaMixerStep(
                 null,
             );
         }
-        if (!use_rows_conv_silu and !use_token_conv_silu) {
+        if (!conv_materialized_for_rows and !use_token_conv_silu) {
             try compute.cuda.silu.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
