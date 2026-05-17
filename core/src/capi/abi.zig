@@ -14,7 +14,7 @@
 //! Both use LP64 data model with 8-byte pointers, so sizes are identical.
 
 const std = @import("std");
-const capi_bridge = @import("../responses/capi_bridge.zig");
+const capi_boundary = @import("../responses/capi_boundary.zig");
 const responses = @import("responses/root.zig");
 const capi_types = @import("types.zig");
 
@@ -73,10 +73,10 @@ fn assertSize(comptime name: []const u8, comptime T: type, comptime expected: us
 
 comptime {
     // Router/generation structs
-    assertSize("RouterGenerateConfig", capi_bridge.CGenerateConfig, EXPECTED_SIZES.RouterGenerateConfig);
-    assertSize("CToolCallRef", capi_bridge.CToolCallRef, EXPECTED_SIZES.CToolCallRef);
-    assertSize("CLogitBiasEntry", capi_bridge.CLogitBiasEntry, EXPECTED_SIZES.CLogitBiasEntry);
-    assertSize("CGenerateVisionImage", capi_bridge.CGenerateVisionImage, EXPECTED_SIZES.CGenerateVisionImage);
+    assertSize("RouterGenerateConfig", capi_boundary.CGenerateConfig, EXPECTED_SIZES.RouterGenerateConfig);
+    assertSize("CToolCallRef", capi_boundary.CToolCallRef, EXPECTED_SIZES.CToolCallRef);
+    assertSize("CLogitBiasEntry", capi_boundary.CLogitBiasEntry, EXPECTED_SIZES.CLogitBiasEntry);
+    assertSize("CGenerateVisionImage", capi_boundary.CGenerateVisionImage, EXPECTED_SIZES.CGenerateVisionImage);
 
     // Conversation/Items structs
     assertSize("CItem", responses.CItem, EXPECTED_SIZES.CItem);

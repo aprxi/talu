@@ -17,6 +17,7 @@ test {
     // Scheduler types
     _ = @import("scheduler_test.zig");
     _ = @import("request_test.zig");
+    _ = @import("scheduler_execution_target.zig");
 
     // Backend types
     _ = @import("fused_cpu_backend_test.zig");
@@ -37,6 +38,9 @@ test {
     // Backend submodules
     _ = @import("backend/root.zig");
 
-    // Bridge submodules
-    _ = @import("bridge/root.zig");
+    // Pipeline submodules
+    _ = @import("pipeline/root.zig");
+
+    // Transport submodules
+    _ = @import("transport/root.zig");
 }

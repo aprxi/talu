@@ -14,7 +14,7 @@ from typing import Any
 from .._bindings import check, get_lib
 
 # =============================================================================
-# ctypes Structures (mirror Zig extern structs from capi_bridge.zig)
+# ctypes Structures (mirror Zig extern structs from capi_boundary.zig)
 # =============================================================================
 
 

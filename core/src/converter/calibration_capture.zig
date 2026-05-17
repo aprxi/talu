@@ -9,9 +9,9 @@ const dtype_mod = @import("compute_pkg").dtype;
 const log = @import("log_pkg");
 const xray = @import("xray_pkg");
 const responses_local = @import("../responses/local.zig");
-const backend_root = @import("inference_pkg").backend;
+const inference_scheduler = @import("inference_pkg").scheduler;
 const progress_mod = @import("progress_pkg");
-const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
+const xray_pipeline_enabled: bool = if (@hasDecl(build_options, "xray_pipeline")) build_options.xray_pipeline else true;
 
 pub const CaptureOptions = struct {
     seed: u64 = 42,
@@ -19,7 +19,7 @@ pub const CaptureOptions = struct {
     max_rows_per_key: usize = 512,
     max_records: usize = 0,
     memory_limit_bytes: usize = 512 * 1024 * 1024,
-    backend_selection: backend_root.Selection = .cpu,
+    backend_selection: inference_scheduler.TargetSelection = .cpu,
 };
 
 pub const SampledActivations = struct {
@@ -179,7 +179,7 @@ pub const LayerActivationCache = struct {
 };
 
 pub fn isAvailable() bool {
-    return xray_bridge_enabled;
+    return xray_pipeline_enabled;
 }
 
 const RowsCols = struct {
@@ -386,7 +386,7 @@ pub noinline fn captureFromInference(
     var cache = LayerActivationCache.init(allocator);
     errdefer cache.deinit();
 
-    if (!xray_bridge_enabled) return cache;
+    if (!xray_pipeline_enabled) return cache;
     if (prompt_tokens.len == 0 or options.max_prompt_tokens == 0) return cache;
 
     var engine = try responses_local.LocalEngine.initWithSeedAndResolutionConfig(

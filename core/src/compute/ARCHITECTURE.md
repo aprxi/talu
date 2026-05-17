@@ -41,7 +41,7 @@ Domain-specific language leaks context and restricts reusability. Computations m
 | `Llama3`, `YaRN` | (None, precompute upstream) | `initFromInvFreq` |
 | `MoE`, `SSM`, `Mamba` | `sparse_gating`, `state_scan` | `stateScanF32` |
 
-*(Note: Minor exceptions exist inside legacy C++ interop boundaries or specific inference-bridge adapters, but all new/pure compute code must adhere to the math vocabulary).*
+*(Note: Minor exceptions exist inside legacy C++ interop boundaries or specific inference-pipeline adapters, but all new/pure compute code must adhere to the math vocabulary).*
 
 ### The Metal / GPU Boundary
 For hardware backends like Apple Silicon (Metal/MLX), `compute` **does not** define fused model topologies. 

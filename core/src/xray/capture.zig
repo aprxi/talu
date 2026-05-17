@@ -8,7 +8,7 @@ const build_options = @import("build_options");
 const trace = @import("trace.zig");
 const stats_mod = @import("stats.zig");
 const handler_slot_mod = @import("handler_slot.zig");
-const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
+const xray_pipeline_enabled: bool = if (@hasDecl(build_options, "xray_pipeline")) build_options.xray_pipeline else true;
 
 pub const TensorStats = stats_mod.TensorStats;
 
@@ -826,7 +826,7 @@ test "enable/disable global capture" {
 
     enable(&cap);
     try std.testing.expect(isEnabled());
-    try std.testing.expectEqual(xray_bridge_enabled, trace.isEnabled());
+    try std.testing.expectEqual(xray_pipeline_enabled, trace.isEnabled());
 
     disable();
     try std.testing.expect(!isEnabled());

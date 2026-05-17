@@ -12,7 +12,7 @@ const std = @import("std");
 const batch_mod = @import("../responses/batch.zig");
 const spec_mod = @import("../responses/spec.zig");
 const local_mod = @import("../responses/local.zig");
-const capi_bridge = @import("../responses/capi_bridge.zig");
+const capi_boundary = @import("../responses/capi_boundary.zig");
 const router_capi = @import("responses/root.zig");
 const capi_error = @import("error.zig");
 const responses_capi = @import("responses/root.zig");
@@ -68,7 +68,7 @@ pub const CBatchResult = extern struct {
     finish_reason: u8 = 0,
     _pad: [7]u8 = .{0} ** 7,
     text: ?[*:0]u8 = null,
-    tool_calls: ?[*]const capi_bridge.CToolCallRef = null,
+    tool_calls: ?[*]const capi_boundary.CToolCallRef = null,
     tool_call_count: usize = 0,
     error_code: i32 = 0,
     _pad2: [4]u8 = .{0} ** 4,
@@ -139,7 +139,7 @@ pub export fn talu_batch_destroy(handle: ?*TaluBatch) callconv(.c) void {
 pub export fn talu_batch_submit(
     handle: ?*TaluBatch,
     chat_handle: ?*ChatHandle,
-    config: ?*const capi_bridge.CGenerateConfig,
+    config: ?*const capi_boundary.CGenerateConfig,
 ) callconv(.c) u64 {
     capi_error.clearError();
 
@@ -283,7 +283,7 @@ pub export fn talu_batch_take_result(
     // Transfer tool calls (already in C format).
     if (internal_result.tool_calls) |calls| {
         // Duplicate the array (internal_result will free its copy).
-        const c_calls = allocator.alloc(capi_bridge.CToolCallRef, calls.len) catch {
+        const c_calls = allocator.alloc(capi_boundary.CToolCallRef, calls.len) catch {
             if (c_result.text) |t| {
                 allocator.free(t[0 .. std.mem.len(t) + 1]);
             }
@@ -292,7 +292,7 @@ pub export fn talu_batch_take_result(
             return null;
         };
         for (calls, 0..) |call, i| {
-            var c_call = std.mem.zeroes(capi_bridge.CToolCallRef);
+            var c_call = std.mem.zeroes(capi_boundary.CToolCallRef);
             c_call.item_index = call.item_index;
             if (call.call_id) |cid| c_call.call_id = allocator.dupeZ(u8, std.mem.span(cid)) catch null;
             if (call.name) |n| c_call.name = allocator.dupeZ(u8, std.mem.span(n)) catch null;

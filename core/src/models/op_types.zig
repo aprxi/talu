@@ -342,7 +342,7 @@ pub const MAX_SUPPORTED_GAFFINE_GROUPS: usize = 1024;
 pub const Architecture = struct {
     name: []const u8,
     model_types: []const []const u8,
-    /// Model-owned bridge between inference-facing xray points and
+    /// Model-owned boundary between inference-facing xray points and
     /// compute-facing bench rows. Consumers MUST read this metadata instead of
     /// hardcoding architecture-specific performance mappings outside `models/`.
     performance_hints: ?*const perf_hints.PerfHints = null,
@@ -407,7 +407,7 @@ pub const Architecture = struct {
     norm_weight_offset: f32 = 0.0,
     explicit_qk_norm_ops: bool = false,
     /// When true, published weights already include the (1+w) norm offset and
-    /// the bridge must NOT apply an additional shift during weight sanitization.
+    /// the runtime must NOT apply an additional shift during weight sanitization.
     norm_weights_pre_shifted: bool = false,
 
     // Pre-block flags

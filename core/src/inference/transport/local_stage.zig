@@ -1,18 +1,19 @@
 //! Local staged activation transport executor.
 //!
-//! This module validates bridge-owned handoff contracts and executes one
+//! This module validates pipeline-owned handoff contracts and executes one
 //! adjacent process-local activation transfer through transport endpoint
 //! adapters. It does not allocate transport buffers or choose backend routes.
 
 const std = @import("std");
+const log = @import("log_pkg");
 
-const boundary_byte_image = @import("../bridge/boundary_byte_image.zig");
-const host_capability = @import("../bridge/host_capability.zig");
-const staged_error = @import("../bridge/staged_error.zig");
-const stage_transport = @import("../bridge/stage_transport.zig");
-const stage_transfer_mode = @import("../bridge/stage_transfer_mode.zig");
-const state_ownership = @import("../bridge/state_ownership.zig");
-const tensor_frame = @import("../bridge/tensor_frame.zig");
+const boundary_byte_image = @import("../pipeline/boundary_byte_image.zig");
+const host_capability = @import("../pipeline/host_capability.zig");
+const staged_error = @import("../pipeline/staged_error.zig");
+const stage_transport = @import("../pipeline/stage_transport.zig");
+const stage_transfer_mode = @import("../pipeline/stage_transfer_mode.zig");
+const state_ownership = @import("../pipeline/state_ownership.zig");
+const tensor_frame = @import("../pipeline/tensor_frame.zig");
 
 pub const LocalStageTransportValidationError =
     stage_transfer_mode.StageTransferModeError ||
@@ -44,6 +45,29 @@ pub const StageExecutionReceipt = struct {
         return .{ .stage_id = stage_id };
     }
 };
+
+pub fn copyHostActivationToBuffer(host_bytes: []const u8, host_buf: []u8, byte_count: usize) !void {
+    if (byte_count > host_bytes.len or byte_count > host_buf.len) return error.InvalidArgument;
+    @memcpy(host_buf[0..byte_count], host_bytes[0..byte_count]);
+}
+
+pub fn copyHostBufferToActivationTarget(target_bytes: []u8, host_buf: []const u8, byte_count: usize) !void {
+    if (byte_count > target_bytes.len or byte_count > host_buf.len) return error.InvalidArgument;
+    @memcpy(target_bytes[0..byte_count], host_buf[0..byte_count]);
+}
+
+test "copyHostActivationToBuffer copyHostBufferToActivationTarget move bounded host bytes" {
+    var source = [_]u8{ 1, 2, 3, 4 };
+    var target = [_]u8{0} ** 4;
+    try copyHostActivationToBuffer(source[0..], target[0..], 3);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, target[0..3]);
+
+    var roundtrip = [_]u8{0} ** 4;
+    try copyHostBufferToActivationTarget(roundtrip[0..], target[0..], 2);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, roundtrip[0..2]);
+    try std.testing.expectError(error.InvalidArgument, copyHostActivationToBuffer(source[0..2], target[0..], 3));
+    try std.testing.expectError(error.InvalidArgument, copyHostBufferToActivationTarget(roundtrip[0..1], target[0..], 2));
+}
 
 pub const LocalStageTransportRequest = struct {
     placement_plan: *const host_capability.PlacementPlan,
@@ -342,6 +366,8 @@ pub fn executeLocalStageTransportWithFailureCapture(
     const byte_count = std.math.cast(usize, request.image.byte_count) orelse {
         return failWithCapture(failure_capture, request, error.LocalStageTransportPayloadByteCountMismatch, .validation_before_mutation, .validation, .none);
     };
+    const log_transfer = backendSwitchTransferInfoEnabled();
+    const transfer_start_ns = if (log_transfer) std.time.nanoTimestamp() else 0;
 
     switch (request.decision.mode) {
         .borrow_in_process => {
@@ -406,6 +432,10 @@ pub fn executeLocalStageTransportWithFailureCapture(
         .remote_stream, .device_download_then_remote_stream => {
             return failWithCapture(failure_capture, request, error.LocalStageTransportRemoteModeUnsupported, .validation_before_mutation, .validation, .none);
         },
+    }
+
+    if (log_transfer) {
+        logBackendSwitchTransfer(request, byte_count, elapsedNanosSince(transfer_start_ns));
     }
 }
 
@@ -476,6 +506,190 @@ fn boundaryFrameProfilesEql(
         lhs.max_token_count_per_frame == rhs.max_token_count_per_frame and
         lhs.max_activation_payload_bytes == rhs.max_activation_payload_bytes and
         lhs.handoff_mode == rhs.handoff_mode;
+}
+
+const BackendSwitchTransferFacts = struct {
+    boundary_index: usize,
+    boundary_layer: usize,
+    source_stage_id: usize,
+    target_stage_id: usize,
+    source_host_id: u64,
+    target_host_id: u64,
+    source_backend_kind: host_capability.HostBackendKind,
+    target_backend_kind: host_capability.HostBackendKind,
+    source_layer_start: usize,
+    source_layer_end: usize,
+    target_layer_start: usize,
+    target_layer_end: usize,
+    payload_bytes: usize,
+    copied_bytes: usize,
+    copy_operations: u8,
+    sequence_start: ?u64,
+    token_count: u64,
+    stage_switched: bool,
+    backend_kind_switched: bool,
+    host_switched: bool,
+    transfer_mode: stage_transfer_mode.StageTransferMode,
+    step_kind: tensor_frame.TensorFrameStepKind,
+};
+
+fn backendSwitchTransferFacts(
+    request: LocalStageTransportRequest,
+    byte_count: usize,
+) host_capability.PlacementError!BackendSwitchTransferFacts {
+    const boundary = request.metadata.boundary;
+    const source_host = try host_capability.hostSummaryForStage(request.placement_plan, boundary.source_stage_id);
+    const target_host = try host_capability.hostSummaryForStage(request.placement_plan, boundary.target_stage_id);
+    const token_count = transportTokenCount(request.metadata);
+    const sequence_start = transportSequenceStart(request.metadata);
+    return .{
+        .boundary_index = boundary.boundary_index,
+        .boundary_layer = boundary.consumer_layer_start,
+        .source_stage_id = boundary.source_stage_id,
+        .target_stage_id = boundary.target_stage_id,
+        .source_host_id = source_host.host_id.value,
+        .target_host_id = target_host.host_id.value,
+        .source_backend_kind = source_host.backend_kind,
+        .target_backend_kind = target_host.backend_kind,
+        .source_layer_start = boundary.producer_layer_start,
+        .source_layer_end = boundary.producer_layer_end,
+        .target_layer_start = boundary.consumer_layer_start,
+        .target_layer_end = boundary.consumer_layer_end,
+        .payload_bytes = byte_count,
+        .copied_bytes = transportCopiedByteCount(request.decision.mode, byte_count),
+        .copy_operations = transportCopyOperationCount(request.decision.mode),
+        .sequence_start = sequence_start,
+        .token_count = token_count,
+        .stage_switched = boundary.source_stage_id != boundary.target_stage_id,
+        .backend_kind_switched = source_host.backend_kind != target_host.backend_kind,
+        .host_switched = source_host.host_id.value != target_host.host_id.value,
+        .transfer_mode = request.decision.mode,
+        .step_kind = request.metadata.step_kind,
+    };
+}
+
+fn transportTokenCount(metadata: *const tensor_frame.TensorFrameMetadata) u64 {
+    var token_count: u64 = 0;
+    for (metadata.batch.entries) |entry| {
+        token_count = std.math.add(u64, token_count, entry.token_count) catch return std.math.maxInt(u64);
+    }
+    return token_count;
+}
+
+fn transportSequenceStart(metadata: *const tensor_frame.TensorFrameMetadata) ?u64 {
+    if (metadata.batch.entries.len != 1) return null;
+    return metadata.batch.entries[0].sequence_start;
+}
+
+fn transportCopiedByteCount(mode: stage_transfer_mode.StageTransferMode, payload_bytes: usize) usize {
+    return switch (mode) {
+        .borrow_in_process => 0,
+        .copy_in_process, .device_peer_copy_in_process, .remote_stream => payload_bytes,
+        .device_download_then_copy, .device_download_then_remote_stream => std.math.mul(usize, payload_bytes, 2) catch std.math.maxInt(usize),
+    };
+}
+
+fn transportCopyOperationCount(mode: stage_transfer_mode.StageTransferMode) u8 {
+    return switch (mode) {
+        .borrow_in_process => 0,
+        .copy_in_process, .device_peer_copy_in_process, .remote_stream => 1,
+        .device_download_then_copy, .device_download_then_remote_stream => 2,
+    };
+}
+
+fn backendSwitchTransferInfoEnabled() bool {
+    return @intFromEnum(log.Level.info) >= @intFromEnum(log.getLogLevel());
+}
+
+fn elapsedNanosSince(start_ns: i128) u64 {
+    const end_ns = std.time.nanoTimestamp();
+    if (end_ns <= start_ns) return 0;
+    return std.math.cast(u64, end_ns - start_ns) orelse std.math.maxInt(u64);
+}
+
+fn formatPipelineStage(buf: []u8, step_kind: tensor_frame.TensorFrameStepKind) []const u8 {
+    return std.fmt.bufPrint(buf, "stage={s}", .{@tagName(step_kind)}) catch "stage=overflow";
+}
+
+fn formatBoundaryLayer(buf: []u8, layer: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "layer={d}", .{layer}) catch "layer=overflow";
+}
+
+fn formatSourceBackend(buf: []u8, backend_kind: host_capability.HostBackendKind) []const u8 {
+    return std.fmt.bufPrint(buf, "src={s}", .{@tagName(backend_kind)}) catch "src=overflow";
+}
+
+fn formatDestinationBackend(buf: []u8, backend_kind: host_capability.HostBackendKind) []const u8 {
+    return std.fmt.bufPrint(buf, "dst={s}", .{@tagName(backend_kind)}) catch "dst=overflow";
+}
+
+fn formatCopiedBytes(buf: []u8, bytes: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "bytes={d}", .{bytes}) catch "bytes=overflow";
+}
+
+fn formatTokenCount(buf: []u8, token_count: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "tokens={d}", .{token_count}) catch "tokens=overflow";
+}
+
+fn formatSequenceSpan(buf: []u8, sequence_start: ?u64, token_count: u64) []const u8 {
+    const start = sequence_start orelse return "seq=mixed";
+    return std.fmt.bufPrint(buf, "seq={d}+{d}", .{ start, token_count }) catch "seq=overflow";
+}
+
+fn formatLatency(buf: []u8, latency_ns: u64) []const u8 {
+    if (latency_ns < std.time.ns_per_us) {
+        return std.fmt.bufPrint(buf, "latency={d}ns", .{latency_ns}) catch "latency=overflow";
+    }
+    return std.fmt.bufPrint(buf, "latency={d}.{d:0>3}us", .{
+        latency_ns / std.time.ns_per_us,
+        latency_ns % std.time.ns_per_us,
+    }) catch "latency=overflow";
+}
+
+fn logBackendSwitchTransfer(request: LocalStageTransportRequest, byte_count: usize, latency_ns: u64) void {
+    const facts = backendSwitchTransferFacts(request, byte_count) catch return;
+    var stage_buf: [24]u8 = undefined;
+    var layer_buf: [24]u8 = undefined;
+    var src_buf: [24]u8 = undefined;
+    var dst_buf: [24]u8 = undefined;
+    var bytes_buf: [32]u8 = undefined;
+    var tokens_buf: [32]u8 = undefined;
+    var seq_buf: [32]u8 = undefined;
+    var latency_buf: [32]u8 = undefined;
+    log.info("inference", "Backend switch", .{
+        .stage = formatPipelineStage(&stage_buf, facts.step_kind),
+        .layer_text = formatBoundaryLayer(&layer_buf, facts.boundary_layer),
+        .src = formatSourceBackend(&src_buf, facts.source_backend_kind),
+        .dst = formatDestinationBackend(&dst_buf, facts.target_backend_kind),
+        .bytes_text = formatCopiedBytes(&bytes_buf, facts.copied_bytes),
+        .tokens = formatTokenCount(&tokens_buf, facts.token_count),
+        .seq = formatSequenceSpan(&seq_buf, facts.sequence_start, facts.token_count),
+        .latency = formatLatency(&latency_buf, latency_ns),
+        .pipeline_stage = @intFromEnum(facts.step_kind),
+        .layer = facts.boundary_layer,
+        .src_backend = @intFromEnum(facts.source_backend_kind),
+        .dst_backend = @intFromEnum(facts.target_backend_kind),
+        .transfer_mode = @intFromEnum(facts.transfer_mode),
+        .copied_bytes = facts.copied_bytes,
+        .payload_bytes = facts.payload_bytes,
+        .copy_operations = facts.copy_operations,
+        .sequence_start = facts.sequence_start orelse std.math.maxInt(u64),
+        .token_count = facts.token_count,
+        .latency_ns = latency_ns,
+        .latency_us = @as(f64, @floatFromInt(latency_ns)) / @as(f64, @floatFromInt(std.time.ns_per_us)),
+        .boundary_index = facts.boundary_index,
+        .source_stage_id = facts.source_stage_id,
+        .target_stage_id = facts.target_stage_id,
+        .source_host_id = facts.source_host_id,
+        .target_host_id = facts.target_host_id,
+        .source_layer_start = facts.source_layer_start,
+        .source_layer_end = facts.source_layer_end,
+        .target_layer_start = facts.target_layer_start,
+        .target_layer_end = facts.target_layer_end,
+        .stage_switched = facts.stage_switched,
+        .backend_kind_switched = facts.backend_kind_switched,
+        .host_switched = facts.host_switched,
+    });
 }
 
 const FailureSource = enum {
@@ -995,6 +1209,88 @@ const TestBundle = struct {
     }
 };
 
+test "backendSwitchTransferFacts records boundary layer and transport copy volume" {
+    var bundle = try buildTestBundleWithBackends(
+        std.testing.allocator,
+        .local_in_process,
+        .device,
+        true,
+        false,
+        .cuda,
+        .cpu,
+        .{ .cuda = 0 },
+    );
+    defer bundle.deinit();
+
+    const byte_count = @as(usize, @intCast(bundle.image.byte_count));
+    const facts = try backendSwitchTransferFacts(bundle.request(), byte_count);
+
+    try std.testing.expectEqual(@as(usize, 0), facts.boundary_index);
+    try std.testing.expectEqual(@as(usize, 2), facts.boundary_layer);
+    try std.testing.expectEqual(@as(usize, 0), facts.source_stage_id);
+    try std.testing.expectEqual(@as(usize, 1), facts.target_stage_id);
+    try std.testing.expectEqual(@as(u64, 1), facts.source_host_id);
+    try std.testing.expectEqual(@as(u64, 2), facts.target_host_id);
+    try std.testing.expectEqual(host_capability.HostBackendKind.cuda, facts.source_backend_kind);
+    try std.testing.expectEqual(host_capability.HostBackendKind.cpu, facts.target_backend_kind);
+    try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.device_download_then_copy, facts.transfer_mode);
+    try std.testing.expectEqual(byte_count, facts.payload_bytes);
+    try std.testing.expectEqual(byte_count * 2, facts.copied_bytes);
+    try std.testing.expectEqual(@as(u8, 2), facts.copy_operations);
+    try std.testing.expectEqual(@as(u64, 12), facts.sequence_start.?);
+    try std.testing.expectEqual(@as(u64, 1), facts.token_count);
+    try std.testing.expectEqual(tensor_frame.TensorFrameStepKind.decode, facts.step_kind);
+    try std.testing.expect(facts.stage_switched);
+    try std.testing.expect(facts.backend_kind_switched);
+    try std.testing.expect(facts.host_switched);
+}
+
+test "transportCopiedByteCount accounts for local handoff modes" {
+    const payload_bytes: usize = 16;
+
+    try std.testing.expectEqual(@as(usize, 0), transportCopiedByteCount(.borrow_in_process, payload_bytes));
+    try std.testing.expectEqual(payload_bytes, transportCopiedByteCount(.copy_in_process, payload_bytes));
+    try std.testing.expectEqual(payload_bytes, transportCopiedByteCount(.device_peer_copy_in_process, payload_bytes));
+    try std.testing.expectEqual(payload_bytes * 2, transportCopiedByteCount(.device_download_then_copy, payload_bytes));
+}
+
+test "human-readable transport metrics stay short enough for info logs" {
+    var bundle = try buildTestBundleWithBackends(
+        std.testing.allocator,
+        .local_in_process,
+        .device,
+        true,
+        false,
+        .cuda,
+        .cpu,
+        .{ .cuda = 0 },
+    );
+    defer bundle.deinit();
+
+    const byte_count = @as(usize, @intCast(bundle.image.byte_count));
+    const facts = try backendSwitchTransferFacts(bundle.request(), byte_count);
+    var stage_buf: [24]u8 = undefined;
+    var layer_buf: [24]u8 = undefined;
+    var src_buf: [24]u8 = undefined;
+    var dst_buf: [24]u8 = undefined;
+    var bytes_buf: [32]u8 = undefined;
+    var tokens_buf: [32]u8 = undefined;
+    var seq_buf: [32]u8 = undefined;
+    var latency_buf: [32]u8 = undefined;
+
+    try std.testing.expectEqualStrings("stage=decode", formatPipelineStage(&stage_buf, facts.step_kind));
+    try std.testing.expectEqualStrings("stage=prefill", formatPipelineStage(&stage_buf, .prefill));
+    try std.testing.expectEqualStrings("layer=2", formatBoundaryLayer(&layer_buf, facts.boundary_layer));
+    try std.testing.expectEqualStrings("src=cuda", formatSourceBackend(&src_buf, facts.source_backend_kind));
+    try std.testing.expectEqualStrings("dst=cpu", formatDestinationBackend(&dst_buf, facts.target_backend_kind));
+    try std.testing.expectEqualStrings("bytes=32", formatCopiedBytes(&bytes_buf, facts.copied_bytes));
+    try std.testing.expectEqualStrings("tokens=1", formatTokenCount(&tokens_buf, facts.token_count));
+    try std.testing.expectEqualStrings("seq=12+1", formatSequenceSpan(&seq_buf, facts.sequence_start, facts.token_count));
+    try std.testing.expectEqualStrings("seq=mixed", formatSequenceSpan(&seq_buf, null, 2));
+    try std.testing.expectEqualStrings("latency=999ns", formatLatency(&latency_buf, 999));
+    try std.testing.expectEqualStrings("latency=1.234us", formatLatency(&latency_buf, 1234));
+}
+
 const test_decode_entry = [_]tensor_frame.TensorFrameBatchEntry{.{
     .batch_index = 0,
     .request_id = 101,
@@ -1438,7 +1734,7 @@ const TestHashEncoder = struct {
     }
 };
 
-test "inference bridge local_stage_transport executeLocalStageTransport borrows host bytes with target support" {
+test "inference pipeline local_stage_transport executeLocalStageTransport borrows host bytes with target support" {
     var bundle = try buildTestBundle(std.testing.allocator, .same_host_direct, .host, true, false);
     defer bundle.deinit();
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.borrow_in_process, bundle.decision.mode);
@@ -1453,7 +1749,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport borrows 
     try std.testing.expectEqual(@as(u8, 0x31), target.upload_first_byte);
 }
 
-test "inference bridge local_stage_transport endpoint registry waits on matching source receipt" {
+test "inference pipeline local_stage_transport endpoint registry waits on matching source receipt" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .device, false, false);
     defer bundle.deinit();
     var staging: [16]u8 align(64) = undefined;
@@ -1484,7 +1780,7 @@ test "inference bridge local_stage_transport endpoint registry waits on matching
     try std.testing.expectEqual(@as(usize, 0), trace.count);
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransportWithFailureCapture reports target mutation failure and preserves source error" {
+test "inference pipeline local_stage_transport executeLocalStageTransportWithFailureCapture reports target mutation failure and preserves source error" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
     defer bundle.deinit();
     var trace = Trace{};
@@ -1523,7 +1819,7 @@ test "inference bridge local_stage_transport executeLocalStageTransportWithFailu
     try trace.expect(&.{ .source_synchronize, .target_upload });
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransportWithFailureCapture records batched source cancellation before target mutation" {
+test "inference pipeline local_stage_transport executeLocalStageTransportWithFailureCapture records batched source cancellation before target mutation" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .segments, true, false);
     defer bundle.deinit();
     var trace = Trace{};
@@ -1560,7 +1856,7 @@ test "inference bridge local_stage_transport executeLocalStageTransportWithFailu
     try trace.expect(&.{.source_synchronize});
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport copies host bytes and preserves source sync errors" {
+test "inference pipeline local_stage_transport executeLocalStageTransport copies host bytes and preserves source sync errors" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
     defer bundle.deinit();
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.copy_in_process, bundle.decision.mode);
@@ -1581,7 +1877,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport copies h
     try trace.expect(&.{.source_synchronize});
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport prepares source before target mutation" {
+test "inference pipeline local_stage_transport executeLocalStageTransport prepares source before target mutation" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
     defer bundle.deinit();
     var trace = Trace{};
@@ -1595,7 +1891,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport prepares
     try std.testing.expectEqual(@as(usize, 16), target.upload_byte_count);
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransportWithFailureCapture preserves source prepare errors" {
+test "inference pipeline local_stage_transport executeLocalStageTransportWithFailureCapture preserves source prepare errors" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
     defer bundle.deinit();
     var trace = Trace{};
@@ -1626,7 +1922,7 @@ test "inference bridge local_stage_transport executeLocalStageTransportWithFailu
     try trace.expect(&.{ .source_synchronize, .source_prepare });
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport uploads host segments only with target support" {
+test "inference pipeline local_stage_transport executeLocalStageTransport uploads host segments only with target support" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .segments, true, false);
     defer bundle.deinit();
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.copy_in_process, bundle.decision.mode);
@@ -1647,7 +1943,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport uploads 
     try trace.expect(&.{});
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport downloads device bytes through caller staging" {
+test "inference pipeline local_stage_transport executeLocalStageTransport downloads device bytes through caller staging" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .device, true, false);
     defer bundle.deinit();
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.device_download_then_copy, bundle.decision.mode);
@@ -1684,7 +1980,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport download
     try trace.expect(&.{ .source_synchronize, .source_download });
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport executes peer copy without host staging" {
+test "inference pipeline local_stage_transport executeLocalStageTransport executes peer copy without host staging" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .device, true, true);
     defer bundle.deinit();
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.device_peer_copy_in_process, bundle.decision.mode);
@@ -1760,7 +2056,7 @@ fn expectTransportMatrixCase(
     try trace.expect(expected_trace);
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport covers local backend transfer matrix" {
+test "inference pipeline local_stage_transport executeLocalStageTransport covers local backend transfer matrix" {
     try expectTransportMatrixCase(.cpu, .cpu, .host, .cpu, false, true, .same_host_direct, .borrow_in_process, &.{ .source_synchronize, .target_borrow });
     try expectTransportMatrixCase(.cpu, .cuda, .host, .cpu, false, false, .local_in_process, .copy_in_process, &.{ .source_synchronize, .target_upload });
     try expectTransportMatrixCase(.cpu, .metal, .host, .cpu, false, false, .local_in_process, .copy_in_process, &.{ .source_synchronize, .target_upload });
@@ -1773,7 +2069,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport covers l
     try expectTransportMatrixCase(.metal, .metal, .device, .{ .metal = 0 }, true, false, .local_in_process, .device_peer_copy_in_process, &.{ .source_synchronize, .source_peer_copy });
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport rejects remote modes before synchronization" {
+test "inference pipeline local_stage_transport executeLocalStageTransport rejects remote modes before synchronization" {
     var host_remote = try buildTestBundle(std.testing.allocator, .remote_declared, .host, true, false);
     defer host_remote.deinit();
     try std.testing.expectEqual(stage_transfer_mode.StageTransferMode.remote_stream, host_remote.decision.mode);
@@ -1796,7 +2092,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport rejects 
     try trace.expect(&.{});
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport validates envelope and recomputed decision before mutation" {
+test "inference pipeline local_stage_transport executeLocalStageTransport validates envelope and recomputed decision before mutation" {
     var bundle = try buildTestBundle(std.testing.allocator, .local_in_process, .host, true, false);
     defer bundle.deinit();
     var larger_payload = try buildTestBundle(std.testing.allocator, .local_in_process, .segments, true, false);
@@ -1846,7 +2142,7 @@ test "inference bridge local_stage_transport executeLocalStageTransport validate
     try trace.expect(&.{});
 }
 
-test "inference bridge local_stage_transport executeLocalStageTransport rejects missing optional borrow target before synchronization" {
+test "inference pipeline local_stage_transport executeLocalStageTransport rejects missing optional borrow target before synchronization" {
     var bundle = try buildTestBundle(std.testing.allocator, .same_host_direct, .host, true, false);
     defer bundle.deinit();
     var trace = Trace{};

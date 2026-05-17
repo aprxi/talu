@@ -803,7 +803,7 @@ void* mlx_lazy_fused_expert_mix_ffn_affine_fused_gate_up(
 
 // ---------------------------------------------------------------------------
 // Routing-only helper: computes top-k expert selection without expert matmuls.
-// Used by bridge to split routing from expert compute for custom decode kernels.
+// Used by runtime to split routing from expert compute for custom decode kernels.
 // ---------------------------------------------------------------------------
 struct MoeRouteResult {
     array top_k_indices;

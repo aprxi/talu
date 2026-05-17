@@ -80,6 +80,64 @@ pub fn applyCandidateLogitMutations(
     }
 }
 
+fn hostLogitCandidateBetter(
+    logit: f32,
+    token_id: u32,
+    existing_logit: f32,
+    existing_token_id: u32,
+) bool {
+    return logit > existing_logit or (logit == existing_logit and token_id < existing_token_id);
+}
+
+fn insertHostTopKCandidate(
+    logits: []f32,
+    ids: []u32,
+    count: *usize,
+    max_count: usize,
+    logit: f32,
+    token_id: u32,
+) void {
+    if (max_count == 0) return;
+    var insert_at = count.*;
+    if (insert_at == max_count and !hostLogitCandidateBetter(logit, token_id, logits[max_count - 1], ids[max_count - 1])) {
+        return;
+    }
+    if (insert_at < max_count) count.* += 1;
+    if (insert_at >= max_count) insert_at = max_count - 1;
+    while (insert_at > 0 and hostLogitCandidateBetter(logit, token_id, logits[insert_at - 1], ids[insert_at - 1])) {
+        logits[insert_at] = logits[insert_at - 1];
+        ids[insert_at] = ids[insert_at - 1];
+        insert_at -= 1;
+    }
+    logits[insert_at] = logit;
+    ids[insert_at] = token_id;
+}
+
+pub fn extractTopKFromHostLogitsRow(
+    logits: []const f32,
+    top_k: usize,
+    candidate_logits_out: []f32,
+    candidate_ids_out: []u32,
+) !usize {
+    if (top_k == 0 or top_k > 256) return error.InvalidArgument;
+    if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
+    if (logits.len == 0 or logits.len > std.math.maxInt(u32)) return error.InvalidArgument;
+    const count_limit = @min(top_k, logits.len);
+    var count: usize = 0;
+    for (logits, 0..) |logit, token_index| {
+        insertHostTopKCandidate(
+            candidate_logits_out,
+            candidate_ids_out,
+            &count,
+            count_limit,
+            logit,
+            @intCast(token_index),
+        );
+    }
+    if (top_k == 1 and count == 1) candidate_logits_out[0] = 0.0;
+    return count;
+}
+
 pub fn isBoundedTopKRoute(config: *const SamplingConfig, top_k_capacity: usize) bool {
     return config.strategy == .top_k and
         config.top_k > 0 and
@@ -154,6 +212,23 @@ test "inference sampling policy applyLogitMutations and applyCandidateLogitMutat
         try std.testing.expectApproxEqAbs(want, candidate, 1e-6);
     }
     try std.testing.expectError(error.InvalidArgument, applyCandidateLogitMutations(candidate_logits[0..2], candidate_ids[0..1], &config));
+}
+
+test "inference sampling policy extractTopKFromHostLogitsRow returns deterministic candidates" {
+    const logits = [_]f32{ 1.0, 8.0, 3.0, 8.0, -2.0, 5.0 };
+    var candidate_logits: [3]f32 = undefined;
+    var candidate_ids: [3]u32 = undefined;
+
+    const count = try extractTopKFromHostLogitsRow(
+        logits[0..],
+        3,
+        candidate_logits[0..],
+        candidate_ids[0..],
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3, 5 }, candidate_ids[0..]);
+    try std.testing.expectEqualSlices(f32, &.{ 8.0, 8.0, 5.0 }, candidate_logits[0..]);
 }
 
 test "inference sampling policy canUseDirectGreedyCandidate isBoundedTopKRoute isTopKOrGreedyCandidateRoute contracts" {

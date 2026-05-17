@@ -1,5 +1,5 @@
 """
-Items - FFI bridge and container for Open Responses Items.
+Items - FFI boundary and container for Open Responses Items.
 
 This module provides:
 - ConversationItems: Read-only Sequence view into Zig conversation memory.

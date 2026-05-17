@@ -16,14 +16,14 @@ const allocator = std.heap.c_allocator;
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
-const capi_bridge = responses_mod.capi_bridge;
+const capi_boundary = responses_mod.capi_boundary;
 const embeddings_mod = responses_mod.embeddings;
 
 /// Logit bias entry for generation.
-pub const CLogitBiasEntry = capi_bridge.CLogitBiasEntry;
+pub const CLogitBiasEntry = capi_boundary.CLogitBiasEntry;
 
 /// Generation configuration.
-pub const RouterGenerateConfig = capi_bridge.CGenerateConfig;
+pub const RouterGenerateConfig = capi_boundary.CGenerateConfig;
 
 /// Pooling strategy for embeddings.
 pub const CPoolingStrategy = enum(u8) {

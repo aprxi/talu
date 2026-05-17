@@ -18,7 +18,7 @@ const dump_npz_mod = @import("dump/npz.zig");
 const core_dtype = @import("compute_pkg").dtype;
 const handler_slot_mod = @import("handler_slot.zig");
 const log = @import("log_pkg");
-const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
+const xray_pipeline_enabled: bool = if (@hasDecl(build_options, "xray_pipeline")) build_options.xray_pipeline else true;
 
 const TraceEmission = trace.TraceEmission;
 const TensorStats = stats_mod.TensorStats;
@@ -1253,7 +1253,7 @@ test "enableVerifyCapture routes emissions and disableVerifyCapture stops them" 
         1,
         "unit_test_host",
     );
-    if (xray_bridge_enabled) {
+    if (xray_pipeline_enabled) {
         try std.testing.expectEqual(@as(usize, 1), recorder.stats_records.items.len);
     } else {
         try std.testing.expectEqual(@as(usize, 0), recorder.stats_records.items.len);
@@ -1270,7 +1270,7 @@ test "enableVerifyCapture routes emissions and disableVerifyCapture stops them" 
         1,
         "unit_test_host",
     );
-    if (xray_bridge_enabled) {
+    if (xray_pipeline_enabled) {
         try std.testing.expectEqual(@as(usize, 1), recorder.stats_records.items.len);
     } else {
         try std.testing.expectEqual(@as(usize, 0), recorder.stats_records.items.len);

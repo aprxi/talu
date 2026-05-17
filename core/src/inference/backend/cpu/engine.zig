@@ -141,8 +141,8 @@ pub const FusedCpuBackend = struct {
     supports_batched_decode_slots: bool,
     /// Global decoder-layer range owned by this CPU backend instance.
     layer_range: LayerRange,
-    /// False for CPU stage0 in staged CUDA topologies; such stages only
-    /// produce hidden activations for the next backend.
+    /// False when this instance is assigned only layer execution and should
+    /// return hidden activations instead of final logits.
     build_logits_head: bool,
 
     // Optional prefill progress callback (set by caller before generation)
@@ -844,8 +844,8 @@ pub const FusedCpuBackend = struct {
                 return error.UnknownStateDescriptorId;
             };
             if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_none) {
-                // Runtime descriptors use local storage to prevent aliasing when
-                // state blocks are shared with another backend in a local stage plan.
+                // Runtime descriptors use local storage so a stage never aliases
+                // mutable execution state owned outside this backend instance.
                 const block_storage = &binding.local_blocks[idx];
                 if (descriptor.zero_init) @memset(block_storage, 0);
                 var local_handle: runtime_contract.StateBlockHandle = .{
@@ -1108,7 +1108,8 @@ pub const FusedCpuBackend = struct {
     }
 
     /// Execute a decode-style layer range [layer_start, layer_end) for one slot.
-    /// Used by staged heterogeneous topology orchestration.
+    /// Pipeline/transport code prepares any external activation input before this
+    /// CPU-owned work begins.
     pub fn executeDecodeLayerRange(
         self: *FusedCpuBackend,
         token: u32,
@@ -1197,68 +1198,6 @@ pub const FusedCpuBackend = struct {
 
     pub fn slotActivationBytesMut(self: *FusedCpuBackend, slot_index: usize) []u8 {
         return std.mem.sliceAsBytes(self.getHiddenBuffer(slot_index));
-    }
-
-    pub fn prepareBatchedDecodeSegments(
-        self: *FusedCpuBackend,
-        comptime preserve_decode_boundary_failure: anytype,
-        root_backend: anytype,
-        activate_intermediate: bool,
-        intermediate_backend: anytype,
-        boundary: anytype,
-        tokens: []const u32,
-        slot_indices: []const usize,
-        positions: []const usize,
-        layer_start: usize,
-        layer_end: usize,
-        use_preloaded_input: bool,
-        compute_logits: bool,
-        row_bytes: usize,
-        host_segments: [][]const u8,
-    ) !void {
-        for (0..tokens.len) |row_i| {
-            const token = tokens[row_i];
-            const slot_index = slot_indices[row_i];
-            const position = positions[row_i];
-            if (activate_intermediate) intermediate_backend.activateKvSlot(slot_index);
-            root_backend.activateKvSlot(slot_index);
-            const logits_out_opt: ?[]f32 = if (compute_logits) blk: {
-                const RootType = @TypeOf(root_backend.*);
-                if (comptime !@hasField(RootType, "runtime_buffers")) return error.InvalidTopologyConfig;
-                const projected_vocab = root_backend.runtime_buffers.projected_vocab;
-                const row_start = std.math.mul(usize, row_i, projected_vocab) catch return error.InvalidArgument;
-                const row_end = std.math.add(usize, row_start, projected_vocab) catch return error.InvalidArgument;
-                if (row_end > root_backend.runtime_buffers.projected_logits_batch_host.len) return error.InvalidArgument;
-                break :blk root_backend.runtime_buffers.projected_logits_batch_host[row_start..row_end];
-            } else null;
-            self.executeDecodeLayerRange(
-                token,
-                position,
-                slot_index,
-                logits_out_opt,
-                layer_start,
-                layer_end,
-                compute_logits,
-                false,
-                true,
-                use_preloaded_input,
-            ) catch |err| {
-                const row_slot_indices = [_]usize{slot_index};
-                const row_positions = [_]usize{position};
-                return preserve_decode_boundary_failure(
-                    root_backend,
-                    boundary,
-                    .{ .cpu = {} },
-                    &row_slot_indices,
-                    &row_positions,
-                    .source,
-                    err,
-                );
-            };
-            const src_row = self.slotActivationBytes(slot_index);
-            if (src_row.len < row_bytes) return error.InvalidTopologyConfig;
-            host_segments[row_i] = src_row[0..row_bytes];
-        }
     }
 
     pub fn slotLogits(self: *FusedCpuBackend, slot_index: usize) []f32 {

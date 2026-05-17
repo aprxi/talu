@@ -50,7 +50,7 @@ pub const ModelRuntime = struct {
     explicit_qk_norm_ops: bool = false,
     use_swiglu_variant: bool = false, // SwiGLU variant: alpha=1.702, clipping, (up+1) formulation
     use_transposed_mxfp4: bool = false,
-    norm_weights_pre_shifted: bool = false, // Weights already include norm offset; skip bridge sanitization
+    norm_weights_pre_shifted: bool = false, // Weights already include norm offset; skip runtime sanitization
 };
 
 pub const ModelConfig = struct {

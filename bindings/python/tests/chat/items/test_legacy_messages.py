@@ -1,9 +1,9 @@
-"""Tests for the chat.messages property (OpenAI-format compatibility bridge).
+"""Tests for the chat.messages property (OpenAI-format compatibility adapter).
 
 The `messages` property provides a read-only view of conversation Items
 in the industry-standard OpenAI format: [{"role": "...", "content": "..."}, ...]
 
-This is a compatibility bridge for:
+This is a compatibility adapter for:
 - Debugging ("What does the LLM see?")
 - Interoperability with other APIs
 - Familiarity for users coming from OpenAI/Anthropic/LangChain

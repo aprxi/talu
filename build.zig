@@ -276,7 +276,7 @@ fn mlxIncludeFingerprintFlag(b: *std.Build) []const u8 {
 }
 
 fn isAllowedInferenceBoundaryImport(rel_path: []const u8, import_path: []const u8) bool {
-    if (std.mem.eql(u8, rel_path, "responses/inference_bridge.zig")) {
+    if (std.mem.eql(u8, rel_path, "responses/inference_boundary.zig")) {
         return std.mem.eql(u8, import_path, "inference_pkg");
     }
     if (std.mem.eql(u8, rel_path, "converter/calibration_capture.zig")) {
@@ -331,7 +331,7 @@ fn validateInferenceBoundaryImports(b: *std.Build) void {
 
             has_violations = true;
             std.debug.print(
-                "inference boundary violation: core/src/{s} imports {s}; route via inference_pkg bridge\n",
+                "inference boundary violation: core/src/{s} imports {s}; route via inference boundary\n",
                 .{ normalized_path, import_path },
             );
         }
@@ -686,11 +686,11 @@ fn addMetalSupport(
 
     mod.addIncludePath(b.path("core/src/compute/metal"));
     mod.addIncludePath(b.path("core/src/compute/metal/mlx"));
-    mod.addIncludePath(b.path("core/src/inference/backend/metal/mlx_bridge"));
+    mod.addIncludePath(b.path("core/src/inference/backend/metal/mlx_runtime"));
     mod.addIncludePath(b.path("deps/mlx/include"));
     artifact.addIncludePath(b.path("core/src/compute/metal"));
     artifact.addIncludePath(b.path("core/src/compute/metal/mlx"));
-    artifact.addIncludePath(b.path("core/src/inference/backend/metal/mlx_bridge"));
+    artifact.addIncludePath(b.path("core/src/inference/backend/metal/mlx_runtime"));
     artifact.addIncludePath(b.path("deps/mlx/include"));
 
     artifact.linkFramework("Metal");
@@ -719,8 +719,8 @@ fn addMetalSupport(
             "core/src/compute/metal/mlx/ops.cpp",
             "core/src/compute/metal/mlx/cache.cpp",
             "core/src/compute/metal/mlx/fused_ops.cpp",
-            "core/src/inference/backend/metal/mlx_bridge/config_parse.cpp",
-            "core/src/inference/backend/metal/mlx_bridge/bridge.cpp",
+            "core/src/inference/backend/metal/mlx_runtime/config_parse.cpp",
+            "core/src/inference/backend/metal/mlx_runtime/runtime.cpp",
         },
         .flags = &.{
             "-std=c++17",
@@ -845,8 +845,8 @@ pub fn build(b: *std.Build) void {
     const debug_matmul = b.option(bool, "debug-matmul", "Enable matmul debug instrumentation (slow)") orelse false;
     const cuda_startup_selftests = b.option(bool, "cuda-startup-selftests", "Run CUDA startup smoke/parity checks in backend init (slow)") orelse false;
     const dump_tensors = b.option(bool, "dump-tensors", "Enable full tensor dump (for debugging, produces talu-dump binary)") orelse false;
-    const xray_bridge_default = true;
-    const xray_bridge = b.option(bool, "xray_bridge", "Enable xray bridge instrumentation hooks (default: on)") orelse xray_bridge_default;
+    const xray_pipeline_default = true;
+    const xray_pipeline = b.option(bool, "xray_pipeline", "Enable xray pipeline instrumentation hooks (default: on)") orelse xray_pipeline_default;
     const version = getVersion(b);
 
     // Enforce inference modular boundary for non-inference modules.
@@ -896,7 +896,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
     build_options.addOption(bool, "debug_matmul", debug_matmul);
     build_options.addOption(bool, "dump_tensors", dump_tensors);
-    build_options.addOption(bool, "xray_bridge", xray_bridge);
+    build_options.addOption(bool, "xray_pipeline", xray_pipeline);
     build_options.addOption([]const u8, "version", version);
     const build_options_mod = build_options.createModule();
 
@@ -1209,7 +1209,7 @@ pub fn build(b: *std.Build) void {
         dump_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
         dump_build_options.addOption(bool, "debug_matmul", debug_matmul);
         dump_build_options.addOption(bool, "dump_tensors", true); // Always true for dump binary
-        dump_build_options.addOption(bool, "xray_bridge", xray_bridge);
+        dump_build_options.addOption(bool, "xray_pipeline", xray_pipeline);
         dump_build_options.addOption([]const u8, "version", version);
 
         // Static library with dump instrumentation
@@ -1272,7 +1272,7 @@ pub fn build(b: *std.Build) void {
     unit_test_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
     unit_test_build_options.addOption(bool, "debug_matmul", debug_matmul);
     unit_test_build_options.addOption(bool, "dump_tensors", dump_tensors);
-    unit_test_build_options.addOption(bool, "xray_bridge", xray_bridge);
+    unit_test_build_options.addOption(bool, "xray_pipeline", xray_pipeline);
     unit_test_build_options.addOption([]const u8, "version", version);
     const unit_test_build_options_mod = unit_test_build_options.createModule();
     const unit_core_pkgs = prepareCorePackages(
@@ -1430,7 +1430,7 @@ pub fn build(b: *std.Build) void {
         "Vision",
         "layer program",
     });
-    ut.addLazy("inference", b.path("core/src/inference/sampling.zig"), &.{
+    ut.addLazy("inference", b.path("core/src/inference/sampling/root.zig"), &.{
         "inference sampling",
     });
     ut.addLazy("inference-cpu", b.path("core/src/lib_dev.zig"), &.{
@@ -1475,7 +1475,7 @@ pub fn build(b: *std.Build) void {
         "TrainingConfig",
         "StepMetrics",
         "TrainingSession",
-        "capi_bridge",
+        "capi_boundary",
     });
     // Build integration tests against a separate copy of core/src/lib_dev.zig.
     // Keep integration on CPU-only to avoid MLX/Metal runtime coupling and
@@ -1486,7 +1486,7 @@ pub fn build(b: *std.Build) void {
     integration_build_options.addOption(bool, "cuda_startup_selftests", false);
     integration_build_options.addOption(bool, "debug_matmul", debug_matmul);
     integration_build_options.addOption(bool, "dump_tensors", dump_tensors);
-    integration_build_options.addOption(bool, "xray_bridge", xray_bridge);
+    integration_build_options.addOption(bool, "xray_pipeline", xray_pipeline);
     integration_build_options.addOption([]const u8, "version", version);
     const integration_build_options_mod = integration_build_options.createModule();
     const integration_core_pkgs = prepareCorePackages(
@@ -1551,7 +1551,7 @@ pub fn build(b: *std.Build) void {
         integration_metal_build_options.addOption(bool, "cuda_startup_selftests", false);
         integration_metal_build_options.addOption(bool, "debug_matmul", debug_matmul);
         integration_metal_build_options.addOption(bool, "dump_tensors", dump_tensors);
-        integration_metal_build_options.addOption(bool, "xray_bridge", xray_bridge);
+        integration_metal_build_options.addOption(bool, "xray_pipeline", xray_pipeline);
         integration_metal_build_options.addOption([]const u8, "version", version);
         const integration_metal_build_options_mod = integration_metal_build_options.createModule();
         const integration_metal_core_pkgs = prepareCorePackages(
@@ -1636,7 +1636,7 @@ pub fn build(b: *std.Build) void {
         integration_cuda_build_options.addOption(bool, "cuda_startup_selftests", false);
         integration_cuda_build_options.addOption(bool, "debug_matmul", debug_matmul);
         integration_cuda_build_options.addOption(bool, "dump_tensors", dump_tensors);
-        integration_cuda_build_options.addOption(bool, "xray_bridge", xray_bridge);
+        integration_cuda_build_options.addOption(bool, "xray_pipeline", xray_pipeline);
         integration_cuda_build_options.addOption([]const u8, "version", version);
         const integration_cuda_build_options_mod = integration_cuda_build_options.createModule();
         const integration_cuda_core_pkgs = prepareCorePackages(

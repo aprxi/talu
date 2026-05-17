@@ -339,7 +339,7 @@ pub const UnifiedSafeTensors = union(enum) {
 
     /// Load only tensor metadata (names, dtypes, shapes) without memory-mapping
     /// weight data. Sufficient for config/dtype detection when weights will be
-    /// loaded separately (e.g., by the MLX C++ bridge).
+    /// loaded separately (e.g., by the MLX C++ runtime).
     pub fn loadMetadataOnly(allocator: std.mem.Allocator, path: []const u8) !UnifiedSafeTensors {
         if (std.mem.endsWith(u8, path, ".index.json")) {
             var sharded_tensors = try ShardedSafeTensors.load(allocator, path);

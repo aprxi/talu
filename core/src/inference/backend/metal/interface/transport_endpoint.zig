@@ -1,37 +1,37 @@
-//! Metal transport endpoint interface placeholder.
+//! Metal external activation surface interface placeholder.
 
-const bridge = @import("../../../bridge/root.zig");
+const pipeline = @import("../../../pipeline/root.zig");
 
 pub const supports_transport_endpoint_descriptors = false;
 
-pub const HostActivationSlice = struct {
+pub const HostActivationOutput = struct {
     bytes: []const u8,
 };
 
-pub const HostActivationTarget = struct {
+pub const HostActivationInput = struct {
     bytes: []u8,
 };
 
-pub fn deviceLocationHint(_: anytype) !bridge.TensorFramePayloadLocationHint {
+pub fn deviceLocationHint(_: anytype) !pipeline.TensorFramePayloadLocationHint {
     return error.UnsupportedBackend;
 }
 
-pub fn hostDecodeActivationSlice(_: anytype, _: usize, _: usize) !HostActivationSlice {
+pub fn decodeExternalOutput(_: anytype, _: usize, _: usize) !HostActivationOutput {
     return error.UnsupportedBackend;
 }
 
-pub fn hostPrefillActivationSlice(_: anytype, _: usize) !HostActivationSlice {
+pub fn prefillExternalOutput(_: anytype, _: usize) !HostActivationOutput {
     return error.UnsupportedBackend;
 }
 
-pub fn decodeInputBuffer(_: anytype, _: usize, _: usize) !HostActivationTarget {
+pub fn decodeExternalInput(_: anytype, _: usize, _: usize) !HostActivationInput {
     return error.UnsupportedBackend;
 }
 
-pub fn prefillInputBuffer(_: anytype, _: usize) !HostActivationTarget {
+pub fn prefillExternalInput(_: anytype, _: usize) !HostActivationInput {
     return error.UnsupportedBackend;
 }
 
-pub fn sideInputBuffer(_: anytype, _: usize) !HostActivationTarget {
+pub fn sideExternalInput(_: anytype, _: usize) !HostActivationInput {
     return error.UnsupportedBackend;
 }

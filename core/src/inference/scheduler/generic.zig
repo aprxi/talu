@@ -11,8 +11,8 @@
 //!
 //! Usage:
 //! ```zig
-//! const Scheduler = GenericScheduler(BackendType);
-//! var scheduler = try Scheduler.init(allocator, backend, .{});
+//! const Scheduler = GenericScheduler(ExecutionTarget);
+//! var scheduler = try Scheduler.init(allocator, target, .{});
 //! defer scheduler.deinit();
 //!
 //! // Submit requests
@@ -33,7 +33,7 @@ const scheduler_contracts = @import("contracts.zig");
 const DecodeRequest = scheduler_contracts.DecodeRequest;
 const DecodeResult = scheduler_contracts.DecodeResult;
 const PrefillBatchRequest = scheduler_contracts.PrefillBatchRequest;
-const sampling = @import("../sampling.zig");
+const sampling = @import("../sampling/root.zig");
 const sampling_policy = sampling.policy;
 const log = @import("log_pkg");
 const validate = @import("validate_pkg");
@@ -63,7 +63,7 @@ pub const SchedulerBatchedTopKRoutePlan = scheduler_contracts.SchedulerBatchedTo
 /// decode steps for efficiency while allowing requests to join/leave at
 /// any token boundary.
 ///
-/// The backend type must implement:
+/// The execution target type must implement:
 /// - `maxBatchSize(*const T) usize` - maximum concurrent slots
 /// - `vocabSize(*const T) usize` - vocabulary size for logits
 /// - `allocSlot(*T) ?usize` - allocate a slot, returns null if full
@@ -73,16 +73,16 @@ pub const SchedulerBatchedTopKRoutePlan = scheduler_contracts.SchedulerBatchedTo
 /// - `prefillSlot(*T, usize, []const u32, []f32) !void` - prefill
 /// - optional: `prefillSlotWithVision(*T, usize, []const u32, ?*const PrefillVisionInput, []f32) !void`
 /// - optional: `prefillBatch(*T, []const PrefillBatchRequest) !void`
-/// - optional: backend-owned tail streaming via `supportsSchedulerBackendStreamingRoute`/`decodeSchedulerStreaming`
+/// - optional: target-owned tail streaming via `supportsSchedulerBackendStreamingRoute`/`decodeSchedulerStreaming`
 /// - optional: candidate logits via `shouldUseSchedulerTopKCandidateRoute`/`decodeTopKCandidates`
 /// - optional: batched candidate logits via `decodeBatchTopKCandidates` and `shouldUseSchedulerBatchedTopKDecodeRoute`
 /// - `decodeBatch(*T, []const DecodeRequest, []DecodeResult) !void` - batch decode
-pub fn GenericScheduler(comptime BackendType: type) type {
+pub fn GenericScheduler(comptime ExecutionTarget: type) type {
     return struct {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        backend: *BackendType,
+        target: *ExecutionTarget,
         config: SchedulerConfig,
 
         /// All tracked requests (active + queued + completed)
@@ -152,11 +152,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
         pub fn init(
             allocator: std.mem.Allocator,
-            backend: *BackendType,
+            target: *ExecutionTarget,
             config: SchedulerConfig,
         ) !Self {
-            const max_batch = backend.maxBatchSize();
-            const vocab = backend.vocabSize();
+            const max_batch = target.maxBatchSize();
+            const vocab = target.vocabSize();
             const requested_max_batch = config.max_concurrent orelse max_batch;
             const effective_batch_size = @min(requested_max_batch, max_batch);
 
@@ -228,7 +228,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             return Self{
                 .allocator = allocator,
-                .backend = backend,
+                .target = target,
                 .config = config,
                 .requests = std.AutoHashMap(u64, *Request).init(allocator),
                 .pending_queue = .{},
@@ -262,10 +262,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     if (request_entry.slot_index) |slot_index| {
                         // Scheduler owns the backing storage for both request-
                         // scoped and slot-persistent state blocks. Before that
-                        // storage is released, backend slot ownership must end
-                        // so no backend can retain detached aliases into freed
+                        // storage is released, target slot ownership must end
+                        // so no target can retain detached aliases into freed
                         // state blocks across independent runs.
-                        self.backend.freeSlot(slot_index);
+                        self.target.freeSlot(slot_index);
                     }
                 }
                 entry.value_ptr.deinit(self.allocator);
@@ -274,12 +274,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             var slot_state_iter = self.slot_state_blocks.iterator();
             while (slot_state_iter.next()) |entry| {
-                // `freeSlot()` above can leave a backend with a detached
+                // `freeSlot()` above can leave a target with a detached
                 // binding that still references slot-persistent storage until
                 // the next explicit unbind. Scheduler teardown is the lifecycle
                 // boundary where that storage is about to be freed, so clear
-                // the backend view first.
-                self.backend.unbindSlotStateBlocks(entry.key_ptr.*);
+                // the target view first.
+                self.target.unbindSlotStateBlocks(entry.key_ptr.*);
                 var state_blocks = entry.value_ptr.*;
                 self.applyLifecycleActionToRequestStateBlocks(&state_blocks, .evict) catch {};
                 state_blocks.deinit(self.allocator);
@@ -436,7 +436,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 "inference",
                 "PARITY logits",
                 .{
-                    .backend = @typeName(BackendType),
+                    .target_type = @typeName(ExecutionTarget),
                     .phase = phase,
                     .pos = position,
                     .slot = slot_index,
@@ -464,7 +464,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             sampling_config: sampling.SamplingConfig,
         ) !u32 {
             // Teacher forcing tokens are vocabulary IDs, not indices into the
-            // backend-provided top-k candidate subset. Handle them directly.
+            // Target-provided top-k candidate subset. Handle them directly.
             if (xray.getNextForcedToken()) |forced_token| {
                 if (trace.isEnabled()) {
                     trace.emitFinal(
@@ -714,7 +714,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (slot_index < self.slot_request_ids.len) {
                     self.slot_request_ids[slot_index] = null;
                 }
-                self.backend.freeSlot(slot_index);
+                self.target.freeSlot(slot_index);
                 request_entry.slot_index = null;
             }
 
@@ -776,33 +776,33 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
         }
 
-        fn backendAllowsTopKCandidateRoute(self: *Self, plan: *const SchedulerTopKCandidateRoutePlan) bool {
-            if (comptime @hasDecl(BackendType, "shouldUseSchedulerTopKCandidateRoute")) {
-                return self.backend.shouldUseSchedulerTopKCandidateRoute(plan);
+        fn targetAllowsTopKCandidateRoute(self: *Self, plan: *const SchedulerTopKCandidateRoutePlan) bool {
+            if (comptime @hasDecl(ExecutionTarget, "shouldUseSchedulerTopKCandidateRoute")) {
+                return self.target.shouldUseSchedulerTopKCandidateRoute(plan);
             } else {
                 return false;
             }
         }
 
-        fn backendAllowsBatchedTopKRoute(self: *Self, plan: *const SchedulerBatchedTopKRoutePlan) bool {
-            if (comptime @hasDecl(BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute")) {
-                return self.backend.shouldUseSchedulerBatchedTopKDecodeRoute(plan);
+        fn targetAllowsBatchedTopKRoute(self: *Self, plan: *const SchedulerBatchedTopKRoutePlan) bool {
+            if (comptime @hasDecl(ExecutionTarget, "shouldUseSchedulerBatchedTopKDecodeRoute")) {
+                return self.target.shouldUseSchedulerBatchedTopKDecodeRoute(plan);
             } else {
                 return false;
             }
         }
 
-        fn backendDecodeMetricNs(self: *Self, host_elapsed_ns: u64) u64 {
-            if (comptime @hasDecl(BackendType, "lastDecodeComputeNs")) {
-                return self.backend.lastDecodeComputeNs() orelse host_elapsed_ns;
+        fn targetDecodeMetricNs(self: *Self, host_elapsed_ns: u64) u64 {
+            if (comptime @hasDecl(ExecutionTarget, "lastDecodeComputeNs")) {
+                return self.target.lastDecodeComputeNs() orelse host_elapsed_ns;
             }
             return host_elapsed_ns;
         }
 
         fn resolveBatchedTopKRoute(self: *Self, decode_batch_size: usize) ?usize {
             const use_batched_topk = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeBatchTopKCandidates")) break :blk false;
-                if (!@hasDecl(BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "decodeBatchTopKCandidates")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "shouldUseSchedulerBatchedTopKDecodeRoute")) break :blk false;
                 break :blk true;
             };
             if (!use_batched_topk) return null;
@@ -827,7 +827,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .route_top_k = route_top_k,
                     .sampling_config = &request_entry.sampling_config,
                 };
-                if (!self.backendAllowsBatchedTopKRoute(&plan)) return null;
+                if (!self.targetAllowsBatchedTopKRoute(&plan)) return null;
                 if (common_top_k == 0) {
                     common_top_k = route_top_k;
                 } else if (common_top_k != route_top_k) {
@@ -844,7 +844,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             completed_before: usize,
             prefill_completed: usize,
         ) ![]const TokenEvent {
-            const use_batched_topk = comptime @hasDecl(BackendType, "decodeBatchTopKCandidates");
+            const use_batched_topk = comptime @hasDecl(ExecutionTarget, "decodeBatchTopKCandidates");
             if (!use_batched_topk) return error.NotEligible;
             if (decode_batch_size == 0) return &.{};
             if (top_k == 0 or top_k > 256) return error.InvalidArgument;
@@ -865,7 +865,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             var decode_timer = std.time.Timer.start() catch unreachable;
-            try self.backend.decodeBatchTopKCandidates(
+            try self.target.decodeBatchTopKCandidates(
                 self.decode_requests[0..decode_batch_size],
                 top_k,
                 self.decode_candidate_logits[0..needed_candidates],
@@ -874,7 +874,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             );
             const decode_step_ns = decode_timer.read();
             self.addDecodeTimeToGeneratingRequests(if (decode_batch_size == 1)
-                self.backendDecodeMetricNs(decode_step_ns)
+                self.targetDecodeMetricNs(decode_step_ns)
             else
                 decode_step_ns);
 
@@ -1004,12 +1004,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             // Fast path: when there is exactly one generating request, let the
-            // backend decide whether candidate logits beat full-logits decode for
+            // target decide whether candidate logits beat full-logits decode for
             // this sampling/callback shape.
             if (decode_batch_size == 1) {
                 const use_topk = comptime blk: {
-                    if (!@hasDecl(BackendType, "decodeTopKCandidates")) break :blk false;
-                    if (!@hasDecl(BackendType, "shouldUseSchedulerTopKCandidateRoute")) break :blk false;
+                    if (!@hasDecl(ExecutionTarget, "decodeTopKCandidates")) break :blk false;
+                    if (!@hasDecl(ExecutionTarget, "shouldUseSchedulerTopKCandidateRoute")) break :blk false;
                     break :blk true;
                 };
                 if (use_topk) {
@@ -1027,12 +1027,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                         const topk_candidate_semantic_eligible = request_entry.grammar_sampler == null and
                             !request_entry.capture_final_logits and
                             sampling_policy.isTopKOrGreedyCandidateRoute(&request_entry.sampling_config, 256);
-                        const topk_candidate_backend_supported = self.backendAllowsTopKCandidateRoute(&.{
+                        const topk_candidate_target_supported = self.targetAllowsTopKCandidateRoute(&.{
                             .sampling_config = &request_entry.sampling_config,
                             .has_callback = request_entry.callback != null,
                         });
 
-                        if (topk_candidate_semantic_eligible and topk_candidate_backend_supported) {
+                        if (topk_candidate_semantic_eligible and topk_candidate_target_supported) {
                             return try self.stepTopKCandidate(
                                 request_entry,
                                 req.slot_index,
@@ -1054,7 +1054,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             // Run batched decode
             var decode_timer = std.time.Timer.start() catch unreachable;
-            try self.backend.decodeBatch(
+            try self.target.decodeBatch(
                 self.decode_requests[0..decode_batch_size],
                 self.decode_results[0..decode_batch_size],
             );
@@ -1170,16 +1170,16 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             var candidate_logits_buf: [256]f32 = undefined;
             var candidate_ids_buf: [256]u32 = undefined;
 
-            // Decode: backend returns bounded candidates for scheduler sampling.
+            // Decode: target returns bounded candidates for scheduler sampling.
             var decode_timer = std.time.Timer.start() catch unreachable;
-            const candidate_count = try self.backend.decodeTopKCandidates(
+            const candidate_count = try self.target.decodeTopKCandidates(
                 slot_index,
                 last_token,
                 top_k,
                 candidate_logits_buf[0..top_k],
                 candidate_ids_buf[0..top_k],
             );
-            request_entry.decode_ns += self.backendDecodeMetricNs(decode_timer.read());
+            request_entry.decode_ns += self.targetDecodeMetricNs(decode_timer.read());
 
             // Sample from the K candidates (penalties applied to K entries only).
             var next_token = try self.sampleTopKCandidateTokenForRequest(
@@ -1242,12 +1242,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (top_k == 0 or top_k > 256) return error.NotEligible;
 
             const use_topk = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeTopKCandidates")) break :blk false;
-                if (!@hasDecl(BackendType, "shouldUseSchedulerTopKCandidateRoute")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "decodeTopKCandidates")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "shouldUseSchedulerTopKCandidateRoute")) break :blk false;
                 break :blk true;
             };
             if (!use_topk) return error.NotEligible;
-            if (!self.backendAllowsTopKCandidateRoute(&.{
+            if (!self.targetAllowsTopKCandidateRoute(&.{
                 .sampling_config = &re.sampling_config,
                 .has_callback = re.callback != null,
             }))
@@ -1283,14 +1283,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     return error.InvalidArgument;
 
                 var decode_timer = std.time.Timer.start() catch unreachable;
-                const count = try self.backend.decodeTopKCandidates(
+                const count = try self.target.decodeTopKCandidates(
                     slot,
                     last_token,
                     top_k,
                     candidate_logits[0..top_k],
                     candidate_ids[0..top_k],
                 );
-                re.decode_ns += self.backendDecodeMetricNs(decode_timer.read());
+                re.decode_ns += self.targetDecodeMetricNs(decode_timer.read());
                 if (count == 0) return error.InvalidArgument;
 
                 const next_token = try self.sampleDecodeLoopTopKRequestToken(
@@ -1326,8 +1326,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             per_token_cb: *const fn (u64, u32, bool, bool, ?*anyopaque) callconv(.c) void,
             cb_data: ?*anyopaque,
         ) !bool {
-            if (comptime @hasDecl(BackendType, "decodeSchedulerStreaming") and
-                @hasDecl(BackendType, "supportsSchedulerBackendStreamingRoute"))
+            if (comptime @hasDecl(ExecutionTarget, "decodeSchedulerStreaming") and
+                @hasDecl(ExecutionTarget, "supportsSchedulerBackendStreamingRoute"))
             {
                 if (pending_flag) |f| if (f.load(.acquire)) return false;
                 const slot_index = request_entry.slot_index orelse return false;
@@ -1343,7 +1343,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     request_entry.stop_sequences.len != 0 or
                     request_entry.max_thinking_tokens != 0 or
                     request_entry.max_completion_tokens_limit != 0 or
-                    !self.backend.supportsSchedulerBackendStreamingRoute(&request_entry.sampling_config))
+                    !self.target.supportsSchedulerBackendStreamingRoute(&request_entry.sampling_config))
                 {
                     return false;
                 }
@@ -1389,7 +1389,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 const current_token = request_entry.generated_tokens.items[request_entry.generated_tokens.items.len - 1];
                 var backend_decode_ns: u64 = 0;
-                const tail_count = try self.backend.decodeSchedulerStreaming(
+                const tail_count = try self.target.decodeSchedulerStreaming(
                     current_token,
                     generated_len + 1,
                     remaining_token_budget,
@@ -1469,19 +1469,19 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         ) !GenerateSyncResult {
             const submit_config = options orelse SubmitOptions{};
             const effective_sampling = submit_config.sampling orelse self.config.default_sampling;
-            const backend_has_streaming = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeSchedulerStreaming")) break :blk false;
+            const target_has_streaming = comptime blk: {
+                if (!@hasDecl(ExecutionTarget, "decodeSchedulerStreaming")) break :blk false;
                 break :blk true;
             };
-            const backend_has_top_k_candidates = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeTopKCandidates")) break :blk false;
+            const target_has_top_k_candidates = comptime blk: {
+                if (!@hasDecl(ExecutionTarget, "decodeTopKCandidates")) break :blk false;
                 break :blk true;
             };
-            const backend_supports_streaming = comptime blk: {
-                if (!@hasDecl(BackendType, "supportsSchedulerBackendStreamingRoute")) break :blk false;
+            const target_supports_streaming = comptime blk: {
+                if (!@hasDecl(ExecutionTarget, "supportsSchedulerBackendStreamingRoute")) break :blk false;
                 break :blk true;
             };
-            const backend_streaming_semantic_eligible = prompt_tokens.len > 0 and
+            const target_streaming_semantic_eligible = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
                 submit_config.vision_input == null and
@@ -1490,7 +1490,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 !submit_config.return_final_logits and
                 submit_config.max_thinking_tokens == 0 and // thinking budget needs per-token control
                 !xray.isTeacherForcingEnabled() and
-                backend_has_streaming;
+                target_has_streaming;
             const top_k_candidate_semantic_eligible = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
@@ -1500,17 +1500,17 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
                 sampling_policy.isTopKOrGreedyCandidateRoute(&effective_sampling, 256) and
-                backend_has_top_k_candidates;
-            const backend_streaming_backend_supported = if (backend_supports_streaming)
-                self.backend.supportsSchedulerBackendStreamingRoute(&effective_sampling)
+                target_has_top_k_candidates;
+            const target_streaming_supported = if (target_supports_streaming)
+                self.target.supportsSchedulerBackendStreamingRoute(&effective_sampling)
             else
                 false;
-            const top_k_candidate_backend_supported = self.backendAllowsTopKCandidateRoute(&.{
+            const top_k_candidate_target_supported = self.targetAllowsTopKCandidateRoute(&.{
                 .sampling_config = &effective_sampling,
                 .has_callback = submit_config.callback != null,
             });
 
-            if (backend_streaming_semantic_eligible and backend_streaming_backend_supported) {
+            if (target_streaming_semantic_eligible and target_streaming_supported) {
                 log.debug("inference", "Scheduler decode route selected", .{
                     .route = "backend_streaming",
                     .strategy = @tagName(effective_sampling.strategy),
@@ -1527,7 +1527,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 return self.generateSyncBackendStreamingRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
             }
 
-            if (top_k_candidate_semantic_eligible and top_k_candidate_backend_supported) {
+            if (top_k_candidate_semantic_eligible and top_k_candidate_target_supported) {
                 log.debug("inference", "Scheduler decode route selected", .{
                     .route = "topk_candidate",
                     .strategy = @tagName(effective_sampling.strategy),
@@ -1627,7 +1627,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
         /// Begin teacher-forced scoring for an already-tokenized prompt.
         ///
-        /// The returned cursor owns a backend slot and associated request-scoped
+        /// The returned cursor owns a target slot and associated request-scoped
         /// state blocks until `endTeacherForced` is called.
         pub fn beginTeacherForced(
             self: *Self,
@@ -1636,8 +1636,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (prompt_tokens.len == 0) return error.InvalidArgument;
 
             const request_id = try self.reserveInternalRequestId();
-            const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
-            errdefer self.backend.freeSlot(slot_index);
+            const slot_index = self.target.allocSlot() orelse return error.NoSlotsAvailable;
+            errdefer self.target.freeSlot(slot_index);
 
             try self.bindAndTrackRequestStateBlocks(request_id, slot_index);
             errdefer self.releaseRequestStateBlocks(request_id, slot_index);
@@ -1683,7 +1683,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }};
 
             var decode_timer = std.time.Timer.start() catch unreachable;
-            try self.backend.decodeBatch(decode_request[0..], decode_result[0..]);
+            try self.target.decodeBatch(decode_request[0..], decode_result[0..]);
             cursor.decode_ns += decode_timer.read();
         }
 
@@ -1694,11 +1694,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         ) void {
             if (!cursor.started) return;
             self.releaseRequestStateBlocks(cursor.request_id, cursor.slot_index);
-            self.backend.freeSlot(cursor.slot_index);
+            self.target.freeSlot(cursor.slot_index);
             cursor.started = false;
         }
 
-        /// Score teacher-forced autoregressive targets in one backend pass.
+        /// Score teacher-forced autoregressive targets in one execution-target pass.
         ///
         /// This uses the scheduler's canonical slot/state lifecycle (same binding
         /// path as generation) and avoids per-token re-prefill overhead.
@@ -1782,8 +1782,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             var stream_cb_ctx: ?SyncStreamCallbackContext = null;
-            var backend_stream_cb: ?*const fn (u32, ?*anyopaque) void = null;
-            var backend_stream_cb_data: ?*anyopaque = null;
+            var target_stream_cb: ?*const fn (u32, ?*anyopaque) void = null;
+            var target_stream_cb_data: ?*anyopaque = null;
             if (submit_config.callback) |cb| {
                 stream_cb_ctx = .{
                     .submit_callback = cb,
@@ -1791,20 +1791,20 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .eos_token_ids = eos_token_ids,
                     .max_tail_tokens = remaining_token_budget,
                 };
-                backend_stream_cb = SyncStreamCallbackContext.onToken;
-                backend_stream_cb_data = @ptrCast(&stream_cb_ctx.?);
+                target_stream_cb = SyncStreamCallbackContext.onToken;
+                target_stream_cb_data = @ptrCast(&stream_cb_ctx.?);
             }
 
             var decode_ns: u64 = 0;
-            const tail_count = try self.backend.decodeSchedulerStreaming(
+            const tail_count = try self.target.decodeSchedulerStreaming(
                 current_token,
                 generated.items.len + 1,
                 remaining_token_budget,
                 eos_token_ids,
                 sampling_config,
                 generated_tail,
-                backend_stream_cb,
-                backend_stream_cb_data,
+                target_stream_cb,
+                target_stream_cb_data,
                 &decode_ns,
             );
             try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
@@ -1876,25 +1876,25 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .top_k => sampling_config.top_k,
                 else => return error.NotEligible,
             };
-            const max_candidate_count = @min(route_top_k, self.backend.vocabSize());
+            const max_candidate_count = @min(route_top_k, self.target.vocabSize());
             var candidate_logits = try self.allocator.alloc(f32, max_candidate_count);
             defer self.allocator.free(candidate_logits);
             var candidate_ids = try self.allocator.alloc(u32, max_candidate_count);
             defer self.allocator.free(candidate_ids);
             const use_batched_topk_single = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeBatchTopKCandidates")) break :blk false;
-                if (!@hasDecl(BackendType, "shouldUseSchedulerBatchedTopKDecodeRoute")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "decodeBatchTopKCandidates")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "shouldUseSchedulerBatchedTopKDecodeRoute")) break :blk false;
                 break :blk true;
             };
             const use_topk_candidate_sampling_single = comptime blk: {
-                if (!@hasDecl(BackendType, "decodeTopKCandidatesWithSampling")) break :blk false;
-                if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKCandidateSamplingRoute")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "decodeTopKCandidatesWithSampling")) break :blk false;
+                if (!@hasDecl(ExecutionTarget, "supportsSchedulerBackendTopKCandidateSamplingRoute")) break :blk false;
                 break :blk true;
             };
             const can_use_topk_candidate_sampling_single = use_topk_candidate_sampling_single and
-                self.backend.supportsSchedulerBackendTopKCandidateSamplingRoute(sampling_config);
+                self.target.supportsSchedulerBackendTopKCandidateSamplingRoute(sampling_config);
             const use_batched_topk_for_single = use_batched_topk_single and
-                self.backendAllowsBatchedTopKRoute(&.{
+                self.targetAllowsBatchedTopKRoute(&.{
                     .decode_batch_size = 1,
                     .route_top_k = max_candidate_count,
                     .sampling_config = sampling_config,
@@ -1913,13 +1913,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 var topk_sample_cfg = sampling_config.*;
                 topk_sample_cfg.context_tokens = generated.items;
-                const use_backend_penalty_path = can_use_topk_candidate_sampling_single and
+                const use_target_penalty_path = can_use_topk_candidate_sampling_single and
                     sampling_policy.hasLogitMutations(topk_sample_cfg) and
                     topk_sample_cfg.logit_bias == null;
                 // Run forward pass (updates KV cache with current_token).
                 var candidate_count: usize = 0;
-                if (use_backend_penalty_path) {
-                    candidate_count = try self.backend.decodeTopKCandidatesWithSampling(
+                if (use_target_penalty_path) {
+                    candidate_count = try self.target.decodeTopKCandidatesWithSampling(
                         slot_index,
                         current_token,
                         &topk_sample_cfg,
@@ -1929,7 +1929,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 } else if (use_batched_topk_for_single) {
                     single_decode_request[0].token = current_token;
                     single_candidate_count[0] = 0;
-                    try self.backend.decodeBatchTopKCandidates(
+                    try self.target.decodeBatchTopKCandidates(
                         single_decode_request[0..],
                         max_candidate_count,
                         candidate_logits,
@@ -1938,7 +1938,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     );
                     candidate_count = single_candidate_count[0];
                 } else {
-                    candidate_count = try self.backend.decodeTopKCandidates(
+                    candidate_count = try self.target.decodeTopKCandidates(
                         slot_index,
                         current_token,
                         max_candidate_count,
@@ -1954,7 +1954,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     // Normal sampling.
                     current_token = if (sampling_policy.canUseDirectGreedyCandidate(topk_sample_cfg, candidate_count))
                         candidate_ids[0]
-                    else if (use_backend_penalty_path)
+                    else if (use_target_penalty_path)
                         try self.sampleTopKCandidateTokenPrePenalized(
                             candidate_logits[0..candidate_count],
                             candidate_ids[0..candidate_count],
@@ -2108,10 +2108,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             request_state_blocks: RequestStateBlocks,
 
             fn deinit(self: *@This()) void {
-                self.scheduler.backend.unbindSlotStateBlocks(self.slot_index);
+                self.scheduler.target.unbindSlotStateBlocks(self.slot_index);
                 self.scheduler.applyLifecycleActionToRequestStateBlocks(&self.request_state_blocks, .evict) catch {};
                 self.request_state_blocks.deinit(self.scheduler.allocator);
-                self.scheduler.backend.freeSlot(self.slot_index);
+                self.scheduler.target.freeSlot(self.slot_index);
                 self.* = undefined;
             }
         };
@@ -2261,8 +2261,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         }
 
         fn bindSyncSlotState(self: *Self) !SyncSlotStateBinding {
-            const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
-            errdefer self.backend.freeSlot(slot_index);
+            const slot_index = self.target.allocSlot() orelse return error.NoSlotsAvailable;
+            errdefer self.target.freeSlot(slot_index);
 
             const slot_blocks = if (self.slot_persistent_descs.len > 0)
                 try self.slotStateBlocksForSlot(slot_index)
@@ -2288,7 +2288,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             if (merge_count > 0) {
-                try self.backend.bindSlotStateBlocks(slot_index, merged[0..merge_count]);
+                try self.target.bindSlotStateBlocks(slot_index, merged[0..merge_count]);
             }
 
             return .{
@@ -2602,9 +2602,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         }
 
         fn bindAndTrackRequestStateBlocks(self: *Self, request_id: u64, slot_index: usize) !void {
-            if (comptime @hasDecl(BackendType, "bindSlotRequestId")) {
-                try self.backend.bindSlotRequestId(slot_index, request_id);
-                errdefer self.backend.unbindSlotRequestId(slot_index);
+            if (comptime @hasDecl(ExecutionTarget, "bindSlotRequestId")) {
+                try self.target.bindSlotRequestId(slot_index, request_id);
+                errdefer self.target.unbindSlotRequestId(slot_index);
             }
 
             var merged: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
@@ -2635,15 +2635,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             // 3. Bind merged handles
             if (count > 0) {
-                try self.backend.bindSlotStateBlocks(slot_index, merged[0..count]);
+                try self.target.bindSlotStateBlocks(slot_index, merged[0..count]);
             }
         }
 
         fn releaseRequestStateBlocks(self: *Self, request_id: u64, slot_index: ?usize) void {
             if (slot_index) |slot| {
-                self.backend.unbindSlotStateBlocks(slot);
-                if (comptime @hasDecl(BackendType, "unbindSlotRequestId")) {
-                    self.backend.unbindSlotRequestId(slot);
+                self.target.unbindSlotStateBlocks(slot);
+                if (comptime @hasDecl(ExecutionTarget, "unbindSlotRequestId")) {
+                    self.target.unbindSlotRequestId(slot);
                 }
             }
             // Free only non-persistent blocks; slot-persistent blocks remain in slot_state_blocks
@@ -2670,8 +2670,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
 
                 // Try to allocate a slot
-                if (self.backend.allocSlot()) |slot_index| {
-                    errdefer self.backend.freeSlot(slot_index);
+                if (self.target.allocSlot()) |slot_index| {
+                    errdefer self.target.freeSlot(slot_index);
                     try self.bindAndTrackRequestStateBlocks(pending_request_id, slot_index);
                     errdefer self.releaseRequestStateBlocks(pending_request_id, slot_index);
                     request_entry.slot_index = slot_index;
@@ -2801,7 +2801,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         }
 
         fn prefillBatchEligibleRequestCount(self: *Self) usize {
-            if (!(comptime @hasDecl(BackendType, "prefillBatch"))) return 0;
+            if (!(comptime @hasDecl(ExecutionTarget, "prefillBatch"))) return 0;
 
             var count: usize = 0;
             for (self.active_requests.items) |active_request_id| {
@@ -2817,10 +2817,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         }
 
         fn runBatchedPrefills(self: *Self, candidate_count: usize) !void {
-            if (!(comptime @hasDecl(BackendType, "prefillBatch"))) return;
+            if (!(comptime @hasDecl(ExecutionTarget, "prefillBatch"))) return;
             if (candidate_count == 0) return;
 
-            const vocab = self.backend.vocabSize();
+            const vocab = self.target.vocabSize();
 
             for (0..candidate_count) |idx| {
                 const request_id = self.prefill_request_ids[idx];
@@ -2837,7 +2837,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             var prefill_timer = std.time.Timer.start() catch unreachable;
-            try self.backend.prefillBatch(self.prefill_requests[0..candidate_count]);
+            try self.target.prefillBatch(self.prefill_requests[0..candidate_count]);
             const prefill_ns = prefill_timer.read();
 
             for (0..candidate_count) |idx| {
@@ -2899,7 +2899,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         }
 
         fn runPrefills(self: *Self) !void {
-            // Batch prefill requests when backend supports it and there is more
+            // Batch prefill requests when the target supports it and there is more
             // than one pending prefill. This removes per-request prefill
             // synchronization barriers and allows requests to enter decode
             // together at the next token boundary.
@@ -2925,7 +2925,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (slot_index < self.slot_request_ids.len) {
                     self.slot_request_ids[slot_index] = null;
                 }
-                self.backend.freeSlot(slot_index);
+                self.target.freeSlot(slot_index);
                 request_entry.slot_index = null;
             }
 
@@ -3012,12 +3012,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 log.debug("inference", "Scheduler prefill dispatch", .{
                     .slot_index = slot_index,
                     .prompt_tokens = prompt_tokens.len,
-                    .has_prefill_with_vision = @as(u8, @intFromBool(@hasDecl(BackendType, "prefillSlotWithVision"))),
-                    .has_prefill_vision_type = @as(u8, @intFromBool(@hasDecl(BackendType, "PrefillVisionInput"))),
+                    .has_prefill_with_vision = @as(u8, @intFromBool(@hasDecl(ExecutionTarget, "prefillSlotWithVision"))),
+                    .has_prefill_vision_type = @as(u8, @intFromBool(@hasDecl(ExecutionTarget, "PrefillVisionInput"))),
                 }, @src());
-                if (comptime @hasDecl(BackendType, "prefillSlotWithVision") and @hasDecl(BackendType, "PrefillVisionInput")) {
-                    const typed_input: *const BackendType.PrefillVisionInput = @ptrCast(@alignCast(opaque_ptr));
-                    try self.backend.prefillSlotWithVision(
+                if (comptime @hasDecl(ExecutionTarget, "prefillSlotWithVision") and @hasDecl(ExecutionTarget, "PrefillVisionInput")) {
+                    const typed_input: *const ExecutionTarget.PrefillVisionInput = @ptrCast(@alignCast(opaque_ptr));
+                    try self.target.prefillSlotWithVision(
                         slot_index,
                         prompt_tokens,
                         typed_input,
@@ -3029,13 +3029,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     }, @src());
                     return;
                 }
-                log.warn("inference", "Scheduler backend lacks vision prefill support", .{
+                log.warn("inference", "Scheduler target lacks vision prefill support", .{
                     .slot_index = slot_index,
                 });
                 return error.UnsupportedContentType;
             }
 
-            return self.backend.prefillSlot(slot_index, prompt_tokens, self.logits_buffer);
+            return self.target.prefillSlot(slot_index, prompt_tokens, self.logits_buffer);
         }
     };
 }
@@ -4739,8 +4739,8 @@ test "Scheduler.init - creates with default config" {
     var scheduler = try MockScheduler.init(alloc, &backend, .{});
     defer scheduler.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1000), scheduler.backend.vocab_size);
-    try std.testing.expectEqual(@as(usize, 4), scheduler.backend.max_batch_size);
+    try std.testing.expectEqual(@as(usize, 1000), scheduler.target.vocab_size);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.target.max_batch_size);
     try std.testing.expectEqual(@as(u64, 1), scheduler.next_request_id);
     try std.testing.expectEqual(@as(usize, 0), scheduler.requests.count());
 }

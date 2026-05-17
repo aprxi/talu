@@ -1,7 +1,7 @@
 """
 Tests for talu/chat/items.py.
 
-Tests for ConversationItems FFI bridge and C struct compatibility.
+Tests for ConversationItems FFI boundary and C struct compatibility.
 Pure data model tests (enums, content parts, items) live in tests/talu_types/test_items.py.
 """
 

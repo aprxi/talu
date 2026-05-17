@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const train_mod = @import("../train/root.zig");
-const capi_bridge = train_mod.capi_bridge;
+const capi_boundary = train_mod.capi_boundary;
 
 const FullTrainingSession = train_mod.FullTrainingSession;
 const FullSessionConfig = train_mod.FullSessionConfig;
@@ -19,8 +19,8 @@ const FullSessionInfo = train_mod.FullSessionInfo;
 const TransformerConfig = train_mod.TransformerConfig;
 const StepMetrics = train_mod.StepMetrics;
 
-const CStepMetrics = capi_bridge.CStepMetrics;
-const CStepCallback = capi_bridge.CStepCallback;
+const CStepMetrics = capi_boundary.CStepMetrics;
+const CStepCallback = capi_boundary.CStepCallback;
 
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
@@ -315,7 +315,7 @@ pub export fn talu_train_full_step(
     };
 
     if (out_metrics) |out| {
-        out.* = capi_bridge.toCStepMetrics(metrics);
+        out.* = capi_boundary.toCStepMetrics(metrics);
     }
 
     return 0;
@@ -546,7 +546,7 @@ pub export fn talu_train_full_load_optimizer_state_f32(
 // Callback Wrapper
 // =============================================================================
 
-/// Bridges the Zig StepCallback signature to a C CStepCallback.
+/// Adapts the Zig StepCallback signature to a C CStepCallback.
 const CallbackWrapper = struct {
     c_callback: CStepCallback,
     c_user_data: ?*anyopaque,
@@ -554,7 +554,7 @@ const CallbackWrapper = struct {
 
 fn bridgeCallback(metrics: StepMetrics, user_data: ?*anyopaque) i32 {
     const wrapper: *CallbackWrapper = @ptrCast(@alignCast(user_data));
-    var c_metrics = capi_bridge.toCStepMetrics(metrics);
+    var c_metrics = capi_boundary.toCStepMetrics(metrics);
     return wrapper.c_callback(&c_metrics, wrapper.c_user_data);
 }
 

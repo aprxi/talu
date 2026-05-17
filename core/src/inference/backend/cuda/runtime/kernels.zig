@@ -219,7 +219,7 @@ pub const Nvfp4PhaseBudgetCounters = struct {
     gate_up_unfused_calls: u64 = 0,
     attention_fused_heads_f16_kv: u64 = 0,
     attention_heads_f16_kv: u64 = 0,
-    attention_heads_lowbit_bridge_f16_kv: u64 = 0,
+    attention_heads_lowbit_dequant_f16_kv: u64 = 0,
     attention_fused_heads_i8_kv: u64 = 0,
     attention_heads_i8_kv: u64 = 0,
     attention_fused_heads_fp8_kv: u64 = 0,
@@ -227,7 +227,7 @@ pub const Nvfp4PhaseBudgetCounters = struct {
     attention_heads_f32_kv: u64 = 0,
     attention_fused_heads_f16_kv_ns: u64 = 0,
     attention_heads_f16_kv_ns: u64 = 0,
-    attention_heads_lowbit_bridge_f16_kv_ns: u64 = 0,
+    attention_heads_lowbit_dequant_f16_kv_ns: u64 = 0,
     attention_fused_heads_i8_kv_ns: u64 = 0,
     attention_heads_i8_kv_ns: u64 = 0,
     attention_fused_heads_fp8_kv_ns: u64 = 0,
@@ -259,9 +259,9 @@ pub const Nvfp4PhaseBudgetCounters = struct {
                 self.attention_heads_f16_kv = saturatingAddU64(self.attention_heads_f16_kv, 1);
                 self.attention_heads_f16_kv_ns = saturatingAddU64(self.attention_heads_f16_kv_ns, elapsed_ns);
             },
-            .heads_lowbit_bridge_f16_kv => {
-                self.attention_heads_lowbit_bridge_f16_kv = saturatingAddU64(self.attention_heads_lowbit_bridge_f16_kv, 1);
-                self.attention_heads_lowbit_bridge_f16_kv_ns = saturatingAddU64(self.attention_heads_lowbit_bridge_f16_kv_ns, elapsed_ns);
+            .heads_lowbit_dequant_f16_kv => {
+                self.attention_heads_lowbit_dequant_f16_kv = saturatingAddU64(self.attention_heads_lowbit_dequant_f16_kv, 1);
+                self.attention_heads_lowbit_dequant_f16_kv_ns = saturatingAddU64(self.attention_heads_lowbit_dequant_f16_kv_ns, elapsed_ns);
             },
             .fused_heads_i8_kv => {
                 self.attention_fused_heads_i8_kv = saturatingAddU64(self.attention_fused_heads_i8_kv, 1);
@@ -347,12 +347,12 @@ pub const Nvfp4PhaseBudgetCounters = struct {
     /// Contract note:
     /// `heads_f16_kv` is the GEMM-based f16 route used by the current
     /// tensor-core-oriented attention implementation.
-    /// `heads_lowbit_bridge_f16_kv` is also GEMM-based (`1-byte KV -> f16`).
+    /// `heads_lowbit_dequant_f16_kv` is also GEMM-based (`1-byte KV -> f16`).
     /// Custom fused kernels (`fused_heads_*`) are intentionally tracked in
     /// separate buckets and are not counted as tensor-core here.
     pub fn attentionTensorCoreNsApprox(self: *const Nvfp4PhaseBudgetCounters) u64 {
         const total_u128 = @as(u128, self.attention_heads_f16_kv_ns) +
-            @as(u128, self.attention_heads_lowbit_bridge_f16_kv_ns);
+            @as(u128, self.attention_heads_lowbit_dequant_f16_kv_ns);
         return saturatingU64FromU128(total_u128);
     }
 
@@ -398,7 +398,7 @@ pub const Nvfp4PhaseBudgetCounters = struct {
             .gate_up_unfused_calls = saturatingSub(current.gate_up_unfused_calls, start.gate_up_unfused_calls),
             .attention_fused_heads_f16_kv = saturatingSub(current.attention_fused_heads_f16_kv, start.attention_fused_heads_f16_kv),
             .attention_heads_f16_kv = saturatingSub(current.attention_heads_f16_kv, start.attention_heads_f16_kv),
-            .attention_heads_lowbit_bridge_f16_kv = saturatingSub(current.attention_heads_lowbit_bridge_f16_kv, start.attention_heads_lowbit_bridge_f16_kv),
+            .attention_heads_lowbit_dequant_f16_kv = saturatingSub(current.attention_heads_lowbit_dequant_f16_kv, start.attention_heads_lowbit_dequant_f16_kv),
             .attention_fused_heads_i8_kv = saturatingSub(current.attention_fused_heads_i8_kv, start.attention_fused_heads_i8_kv),
             .attention_heads_i8_kv = saturatingSub(current.attention_heads_i8_kv, start.attention_heads_i8_kv),
             .attention_fused_heads_fp8_kv = saturatingSub(current.attention_fused_heads_fp8_kv, start.attention_fused_heads_fp8_kv),
@@ -406,7 +406,7 @@ pub const Nvfp4PhaseBudgetCounters = struct {
             .attention_heads_f32_kv = saturatingSub(current.attention_heads_f32_kv, start.attention_heads_f32_kv),
             .attention_fused_heads_f16_kv_ns = saturatingSub(current.attention_fused_heads_f16_kv_ns, start.attention_fused_heads_f16_kv_ns),
             .attention_heads_f16_kv_ns = saturatingSub(current.attention_heads_f16_kv_ns, start.attention_heads_f16_kv_ns),
-            .attention_heads_lowbit_bridge_f16_kv_ns = saturatingSub(current.attention_heads_lowbit_bridge_f16_kv_ns, start.attention_heads_lowbit_bridge_f16_kv_ns),
+            .attention_heads_lowbit_dequant_f16_kv_ns = saturatingSub(current.attention_heads_lowbit_dequant_f16_kv_ns, start.attention_heads_lowbit_dequant_f16_kv_ns),
             .attention_fused_heads_i8_kv_ns = saturatingSub(current.attention_fused_heads_i8_kv_ns, start.attention_fused_heads_i8_kv_ns),
             .attention_heads_i8_kv_ns = saturatingSub(current.attention_heads_i8_kv_ns, start.attention_heads_i8_kv_ns),
             .attention_fused_heads_fp8_kv_ns = saturatingSub(current.attention_fused_heads_fp8_kv_ns, start.attention_fused_heads_fp8_kv_ns),
@@ -427,8 +427,8 @@ pub const AttentionPath = enum {
     fused_heads_f16_kv,
     /// GEMM-based f16 heads path (tensor-core-oriented bucket).
     heads_f16_kv,
-    /// Low-bit KV prefill bridge route: dequant to f16 + GEMM f16 heads.
-    heads_lowbit_bridge_f16_kv,
+    /// Low-bit KV prefill dequant route: dequant to f16 + GEMM f16 heads.
+    heads_lowbit_dequant_f16_kv,
     /// Custom fused i8 KV kernel family.
     fused_heads_i8_kv,
     /// Heads-family i8 KV path (currently non-GEMM/scalar-style kernels).

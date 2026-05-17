@@ -1,6 +1,6 @@
 // MLX Runtime State - compute-owned model/cache containers.
 //
-// These structs represent runtime state used by the Metal MLX compute bridge.
+// These structs represent runtime state used by the Metal MLX compute pipeline.
 // Keep this header local to core/src/compute/metal/mlx so compute does not rely
 // on inference include paths.
 

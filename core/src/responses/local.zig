@@ -4,28 +4,27 @@
 //! can share a single engine for efficient multi-user serving.
 //!
 //! Batch generation lives in `responses/batch.zig`; LocalEngine owns model
-//! loading, tokenization, prompt rendering, and backend scheduler creation.
+//! loading, tokenization, prompt rendering, and scheduler creation.
 
 const std = @import("std");
-const inference_bridge = @import("inference_bridge.zig");
-const inference = inference_bridge.root;
+const inference_boundary = @import("inference_boundary.zig");
 const models = @import("models_pkg");
 const conversation_mod = @import("conversation/root.zig");
 const Chat = conversation_mod.Chat;
 const protocol = @import("protocol/root.zig");
-const sampler = inference.sampling;
-const inference_types = inference.types;
+const sampler = inference_boundary.sampling;
+const inference_types = inference_boundary.types;
 const FinishReason = inference_types.FinishReason;
-const backend_root = inference_bridge.backend;
-const Backend = backend_root.Backend;
-const vision_types = inference.vision_types;
+const scheduler_root = inference_boundary.scheduler;
+const ExecutionTarget = scheduler_root.ExecutionTarget;
+const vision_types = inference_boundary.vision_types;
 const log = @import("log_pkg");
-pub const PoolingStrategy = backend_root.PoolingStrategy;
+pub const PoolingStrategy = scheduler_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const io = @import("io_pkg");
 const repository = @import("io_pkg").repository.root;
 const io_json = @import("io_pkg").json;
-const gen_config_mod = inference_bridge.generation_config;
+const gen_config_mod = inference_boundary.generation_config;
 const preproc_mod = models.config.preprocessor;
 const validate_mod = @import("validate_pkg");
 const error_context = @import("error_context_pkg");
@@ -34,21 +33,21 @@ const tool_schema_mod = @import("tool_schema.zig");
 const chat_template = @import("../template/chat_template.zig");
 const template_mod = @import("../template/root.zig");
 const progress_mod = @import("progress_pkg");
-const runtime_contract = inference.runtime_contract;
+const runtime_contract = inference_boundary.runtime_contract;
 
 pub const ResolutionConfig = repository.ResolutionConfig;
-pub const BackendInitOptions = backend_root.InitOptions;
+pub const ExecutionTargetInitOptions = scheduler_root.ExecutionTargetInitOptions;
 
 // Re-export scheduler types for response-serving APIs.
-pub const BackendScheduler = inference.scheduler.GenericScheduler(Backend);
-pub const Scheduler = BackendScheduler;
-pub const SchedulerConfig = inference.SchedulerConfig;
-pub const SchedulerRequest = inference.Request;
-pub const SchedulerRequestState = inference.RequestState;
-pub const SchedulerTokenEvent = inference.TokenEvent;
-pub const SchedulerSubmitOptions = BackendScheduler.SubmitOptions;
-pub const SamplingStrategy = inference.SamplingStrategy;
-pub const SamplingConfig = inference.SamplingConfig;
+pub const ExecutionScheduler = inference_boundary.scheduler.GenericScheduler(ExecutionTarget);
+pub const Scheduler = ExecutionScheduler;
+pub const SchedulerConfig = inference_boundary.SchedulerConfig;
+pub const SchedulerRequest = inference_boundary.Request;
+pub const SchedulerRequestState = inference_boundary.RequestState;
+pub const SchedulerTokenEvent = inference_boundary.TokenEvent;
+pub const SchedulerSubmitOptions = ExecutionScheduler.SubmitOptions;
+pub const SamplingStrategy = inference_boundary.SamplingStrategy;
+pub const SamplingConfig = inference_boundary.SamplingConfig;
 
 fn isRecoverableMetalInitError(err: anyerror) bool {
     return err == error.MoENotSupported or
@@ -63,9 +62,9 @@ fn isRecoverableMetalInitError(err: anyerror) bool {
         err == error.DecodeModelUnavailable;
 }
 
-fn shouldUseMetadataOnlyLoad(backend_init_options: BackendInitOptions) bool {
-    return switch (backend_root.effectiveLoadSelection(backend_init_options.selection)) {
-        .auto => backend_root.has_metal,
+fn shouldUseMetadataOnlyLoad(execution_target_options: ExecutionTargetInitOptions) bool {
+    return switch (scheduler_root.effectiveLoadSelection(execution_target_options.selection)) {
+        .auto => scheduler_root.has_metal,
         .metal => true,
         .cpu, .cuda => false,
     };
@@ -290,8 +289,8 @@ pub const LocalEngine = struct {
     /// Sampler for token selection.
     samp: sampler.Sampler,
 
-    /// Compute backend.
-    backend: Backend,
+    /// Scheduler-facing compute target.
+    execution_target: ExecutionTarget,
 
     /// Generation config from model (EOS tokens, etc).
     gen_config: gen_config_mod.GenerationConfig,
@@ -305,8 +304,8 @@ pub const LocalEngine = struct {
     cached_chat_template: ?CachedChatTemplate,
     /// Plan-derived descriptor contract for scheduler state allocation.
     scheduler_state_descriptors: []runtime_contract.StateDescriptor,
-    /// Backend init options used to (re)build the backend when required.
-    backend_init_options: BackendInitOptions,
+    /// Execution-target options used to rebuild compute execution when required.
+    execution_target_options: ExecutionTargetInitOptions,
 
     const CachedChatTemplate = struct {
         template_source: []const u8,
@@ -512,7 +511,7 @@ pub const LocalEngine = struct {
         model_path: []const u8,
         seed: u64,
         config: ResolutionConfig,
-        backend_init_options: BackendInitOptions,
+        execution_target_options: ExecutionTargetInitOptions,
         progress: progress_mod.Context,
     ) !LocalEngine {
         var timing_start_ns: i128 = std.time.nanoTimestamp();
@@ -554,12 +553,12 @@ pub const LocalEngine = struct {
         // Load preprocessor config (pixel limits for vision smart resize)
         const preproc_config = preproc_mod.loadPreprocessorConfig(allocator, resolved_model_path);
 
-        const model_load_options = backend_root.defaultModelLoadOptions(backend_init_options);
-        const cpu_load_options = backend_root.defaultModelLoadOptions(.{ .selection = .cpu });
+        const model_load_options = scheduler_root.defaultModelLoadOptions(execution_target_options);
+        const cpu_load_options = scheduler_root.defaultModelLoadOptions(.{ .selection = .cpu });
 
         // Keep Metal startup fast and mmap-first for text workloads:
         // load metadata only during engine construction.
-        const metal_metadata_only = shouldUseMetadataOnlyLoad(backend_init_options);
+        const metal_metadata_only = shouldUseMetadataOnlyLoad(execution_target_options);
 
         // Start model loading in background thread
         const ModelLoaderThread = struct {
@@ -677,26 +676,26 @@ pub const LocalEngine = struct {
             timing_start_ns = now;
         }
 
-        // Create backend (progress bar emitted from buildBlocks inside)
+        // Create the scheduler execution target (progress bar emitted from buildBlocks inside).
         progress.addLine(
             1,
             "Loading",
             2,
-            "Initializing backend (large models may take longer)...",
+            "Initializing execution target (large models may take longer)...",
             null,
         );
-        var backend_options = backend_init_options;
-        backend_options.metal = .{
+        var execution_options = execution_target_options;
+        execution_options.metal = .{
             .model_path = resolved_model_path,
             .model_id = model_path,
             .weights_path = wp,
         };
-        const effective_backend_selection = backend_root.effectiveLoadSelection(backend_init_options.selection);
-        var compute_backend = blk: {
-            if (loaded_metadata_only_model and effective_backend_selection == .auto) {
-                var metal_options = backend_options;
+        const effective_target_selection = scheduler_root.effectiveLoadSelection(execution_target_options.selection);
+        var execution_target = blk: {
+            if (loaded_metadata_only_model and effective_target_selection == .auto) {
+                var metal_options = execution_options;
                 metal_options.selection = .metal;
-                break :blk Backend.init(allocator, loaded_model, metal_options, progress) catch |err| {
+                break :blk ExecutionTarget.init(allocator, loaded_model, metal_options, progress) catch |err| {
                     if (!isRecoverableMetalInitError(err)) return err;
                     log.warn("inference", "Auto Metal init failed; retrying with full model load", .{
                         .reason = @errorName(err),
@@ -704,37 +703,30 @@ pub const LocalEngine = struct {
                     loaded_model.deinit();
                     loaded_model.* = try models.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
                     loaded_metadata_only_model = false;
-                    break :blk try Backend.init(allocator, loaded_model, backend_options, progress);
+                    break :blk try ExecutionTarget.init(allocator, loaded_model, execution_options, progress);
                 };
             }
-            break :blk try Backend.init(allocator, loaded_model, backend_options, progress);
+            break :blk try ExecutionTarget.init(allocator, loaded_model, execution_options, progress);
         };
-        errdefer compute_backend.deinit();
+        errdefer execution_target.deinit();
 
         // Keep metadata-only behavior to preserve fast Metal startup.
-        // Native vision prefill is routed in the backend without lazy CPU
+        // Native vision prefill is routed through the execution target without lazy CPU
         // delegate re-hydration.
 
-        // If we loaded metadata-only but backend fell back to CPU, re-load full weights.
-        if (loaded_metadata_only_model and compute_backend != .metal) {
+        // If we loaded metadata-only but target selection fell back to CPU, re-load full weights.
+        if (loaded_metadata_only_model and execution_target != .metal) {
             log.info("inference", "CPU fallback with metadata-only load; re-loading full weights", .{});
             loaded_model.deinit();
             loaded_model.* = try models.loadModel(allocator, model_bundle.config_path(), wp, cpu_load_options, progress);
             loaded_metadata_only_model = false;
         }
 
-        progress.updateLine(1, 1, "Backend initialized, preparing runtime...");
+        progress.updateLine(1, 1, "Execution target initialized, preparing scheduler...");
         const scheduler_state_descriptors = try collectSchedulerStateDescriptors(allocator, loaded_model);
         errdefer if (scheduler_state_descriptors.len > 0) allocator.free(scheduler_state_descriptors);
-        const can_release_loaded_after_backend_init = switch (compute_backend) {
-            .metal => |*backend| if (comptime backend_root.metal.BackendType != void and
-                @hasDecl(backend_root.metal.BackendType, "canReleaseLoadedModel"))
-                backend.canReleaseLoadedModel()
-            else
-                false,
-            else => false,
-        };
-        if (can_release_loaded_after_backend_init) {
+        const can_release_loaded_after_target_init = execution_target.canReleaseLoadedModel();
+        if (can_release_loaded_after_target_init) {
             loaded_model.deinit();
             allocator.destroy(loaded_model);
             retained_loaded_model = null;
@@ -743,14 +735,14 @@ pub const LocalEngine = struct {
         {
             const now = std.time.nanoTimestamp();
             const duration_ms = @as(f64, @floatFromInt(now - timing_start_ns)) / 1_000_000.0;
-            log.debug("inference", "Backend initialized", .{ .duration_ms = duration_ms }, @src());
+            log.debug("inference", "Execution target initialized", .{ .duration_ms = duration_ms }, @src());
             timing_start_ns = now;
         }
 
         // Warmup: CPU backend performs a real forward pass during warmup.
-        // Metal/CUDA and bridge-owned local pipelines warm up without a real
+        // Metal/CUDA and pipeline-owned local pipelines warm up without a real
         // forward pass, so they do not need temporary state binding here.
-        const warmup_needs_state_bindings = switch (compute_backend) {
+        const warmup_needs_state_bindings = switch (execution_target) {
             .cpu => true,
             .metal => false,
             .cuda => false,
@@ -759,14 +751,14 @@ pub const LocalEngine = struct {
         var warmup_bindings = TemporaryStateBindings{};
         defer warmup_bindings.deinit(allocator);
         var warmup_slot_bound = false;
-        defer if (warmup_slot_bound) compute_backend.unbindSlotStateBlocks(0);
+        defer if (warmup_slot_bound) execution_target.unbindSlotStateBlocks(0);
         if (warmup_needs_state_bindings and scheduler_state_descriptors.len > 0) {
             warmup_bindings = try allocateTemporaryStateBindingsForDescriptors(
                 allocator,
                 scheduler_state_descriptors,
             );
             if (warmup_bindings.handles.len > 0) {
-                compute_backend.bindSlotStateBlocks(0, warmup_bindings.handles) catch |err| {
+                execution_target.bindSlotStateBlocks(0, warmup_bindings.handles) catch |err| {
                     log.warn("inference", "Warmup state bind failed", .{
                         .reason = @errorName(err),
                         .state_blocks = warmup_bindings.handles.len,
@@ -776,8 +768,8 @@ pub const LocalEngine = struct {
                 warmup_slot_bound = true;
             }
         }
-        compute_backend.warmup() catch |err| {
-            log.warn("inference", "Backend warmup failed", .{
+        execution_target.warmup() catch |err| {
+            log.warn("inference", "Execution target warmup failed", .{
                 .reason = @errorName(err),
             });
             return err;
@@ -799,19 +791,19 @@ pub const LocalEngine = struct {
             .model_weight_dtype_tag = model_weight_dtype_tag_snapshot,
             .tok = tokenizer_instance,
             .samp = sampler_instance,
-            .backend = compute_backend,
+            .execution_target = execution_target,
             .gen_config = generation_config,
             .preproc_config = preproc_config,
             .model_path = resolved_model_path,
             .cached_chat_template = cached_chat_template,
             .scheduler_state_descriptors = scheduler_state_descriptors,
-            .backend_init_options = backend_options,
+            .execution_target_options = execution_options,
         };
     }
 
     /// Free all resources.
     pub fn deinit(self: *LocalEngine) void {
-        self.backend.deinit();
+        self.execution_target.deinit();
         self.samp.deinit();
         if (self.loaded) |loaded| {
             loaded.deinit();
@@ -827,7 +819,7 @@ pub const LocalEngine = struct {
 
     /// Explicit backend/device barrier for xray-style capture finalization.
     pub fn synchronize(self: *LocalEngine) !void {
-        try self.backend.synchronize();
+        try self.execution_target.synchronize();
     }
 
     /// Get EOS token IDs.
@@ -895,7 +887,7 @@ pub const LocalEngine = struct {
 
     /// Get vocabulary size.
     pub fn vocabSize(self: *const LocalEngine) usize {
-        return self.backend.vocabSize();
+        return self.execution_target.vocabSize();
     }
 
     const VisionBoundaryTokens = struct {
@@ -1056,7 +1048,7 @@ pub const LocalEngine = struct {
     ) !inference_types.InferenceState {
         // Raw inference runs share the same scheduler path and need the same
         // explicit execution-thread cleanup boundary as chat generation.
-        defer self.backend.cleanupExecutionThreadState();
+        defer self.execution_target.cleanupExecutionThreadState();
 
         // Tokenize prompt
         const encoded_tokens = try self.tok.encode(prompt);
@@ -1079,7 +1071,7 @@ pub const LocalEngine = struct {
         const prompt_len = prompt_tokens.len;
 
         // Create scheduler for this request
-        var scheduler = try BackendScheduler.init(self.allocator, &self.backend, .{
+        var scheduler = try ExecutionScheduler.init(self.allocator, &self.execution_target, .{
             .default_eos_token_ids = config.eos_token_ids,
             .default_sampling = config.sampling,
             .state_descriptors = self.scheduler_state_descriptors,
@@ -1138,7 +1130,7 @@ pub const LocalEngine = struct {
         @memcpy(all_tokens[0..prompt_len], prompt_tokens);
         @memcpy(all_tokens[prompt_len..], result.tokens);
 
-        if (result.final_logits.len != self.backend.vocabSize()) {
+        if (result.final_logits.len != self.execution_target.vocabSize()) {
             return error.InvalidStateDescriptorBinding;
         }
         const final_logits = result.final_logits;
@@ -1166,20 +1158,20 @@ pub const LocalEngine = struct {
     ///
     /// The returned scheduler borrows the engine's backend - the engine must
     /// outlive the scheduler.
-    pub fn createScheduler(self: *LocalEngine, config: SchedulerConfig) !BackendScheduler {
+    pub fn createScheduler(self: *LocalEngine, config: SchedulerConfig) !ExecutionScheduler {
         // Merge config with engine's default EOS tokens
         var merged_config = config;
         if (merged_config.default_eos_token_ids.len == 0) {
             merged_config.default_eos_token_ids = self.gen_config.eos_token_ids;
         }
         if (merged_config.tokenizer == null) {
-            merged_config.tokenizer = inference.scheduler.TokenizerView.fromTokenizer(&self.tok);
+            merged_config.tokenizer = inference_boundary.scheduler.TokenizerView.fromTokenizer(&self.tok);
         }
         if (merged_config.state_descriptors.len == 0) {
             merged_config.state_descriptors = self.scheduler_state_descriptors;
         }
 
-        return BackendScheduler.init(self.allocator, &self.backend, merged_config);
+        return ExecutionScheduler.init(self.allocator, &self.execution_target, merged_config);
     }
 
     const TemporaryStateBindings = struct {
@@ -1299,16 +1291,16 @@ pub const LocalEngine = struct {
         defer temp_bindings.deinit(self.allocator);
 
         if (temp_bindings.handles.len > 0) {
-            try self.backend.bindSlotStateBlocks(0, temp_bindings.handles);
-            defer self.backend.unbindSlotStateBlocks(0);
+            try self.execution_target.bindSlotStateBlocks(0, temp_bindings.handles);
+            defer self.execution_target.unbindSlotStateBlocks(0);
         }
 
-        try self.backend.embed(tokens, pooling, normalize, embedding_out);
+        try self.execution_target.embed(tokens, pooling, normalize, embedding_out);
     }
 
     /// Returns the embedding dimension (d_model) for this model.
     pub fn embeddingDim(self: *const LocalEngine) usize {
-        return self.backend.embeddingDim();
+        return self.execution_target.embeddingDim();
     }
 
     /// Count tokens for the current chat history, optionally with an additional message.
@@ -1711,7 +1703,7 @@ test "loadCachedChatTemplate reads inline template and special tokens" {
 }
 
 test "shouldUseMetadataOnlyLoad keeps metadata-only startup only when auto can resolve to metal" {
-    try std.testing.expectEqual(backend_root.has_metal, shouldUseMetadataOnlyLoad(.{ .selection = .auto }));
+    try std.testing.expectEqual(scheduler_root.has_metal, shouldUseMetadataOnlyLoad(.{ .selection = .auto }));
     try std.testing.expect(shouldUseMetadataOnlyLoad(.{ .selection = .metal }));
 }
 

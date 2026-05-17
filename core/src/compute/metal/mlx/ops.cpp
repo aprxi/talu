@@ -1,4 +1,4 @@
-// MLX Bridge - Basic Lazy Operations
+// MLX Runtime - Basic Lazy Operations
 //
 // Provides C-callable wrappers for MLX array operations.
 // All operations are "lazy" - they build a computation graph without executing.

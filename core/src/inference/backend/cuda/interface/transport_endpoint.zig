@@ -1,54 +1,42 @@
-//! CUDA implementation of the backend transport endpoint descriptor interface.
+//! CUDA implementation of the backend external activation surface interface.
+//!
+//! These functions expose only CUDA-owned activation inputs/outputs. They do not
+//! select routes, inspect adjacent stages, or perform handoff copies.
 
 const std = @import("std");
-const bridge = @import("../../../bridge/root.zig");
+const pipeline = @import("../../../pipeline/root.zig");
+const transport = @import("../../../transport/root.zig");
 
 pub const supports_transport_endpoint_descriptors = true;
 
-pub const HostActivationSlice = struct {
-    bytes: []const u8,
-};
+pub const CudaExternalActivation = transport.CudaBufferDescriptor;
 
-pub const CudaBufferDescriptor = struct {
-    buffer: *anyopaque,
-    device: *anyopaque,
-    device_ordinal: u16,
-    stream: ?*anyopaque,
-    byte_count: usize,
-};
-
-pub fn deviceLocationHint(backend: anytype) !bridge.TensorFramePayloadLocationHint {
+pub fn deviceLocationHint(backend: anytype) !pipeline.TensorFramePayloadLocationHint {
     const ordinal = backend.device.ordinal();
     return .{ .cuda = std.math.cast(u16, ordinal) orelse return error.InvalidTopologyConfig };
 }
 
-pub fn hostDecodeActivationSlice(_: anytype, _: usize, _: usize) !HostActivationSlice {
-    return error.InvalidTopologyConfig;
+pub fn decodeExternalOutput(backend: anytype, slot_index: usize, byte_count: usize) !CudaExternalActivation {
+    return cudaActivationSurface(backend, slot_index, byte_count);
 }
 
-pub fn hostPrefillActivationSlice(_: anytype, _: usize) !HostActivationSlice {
-    return error.InvalidTopologyConfig;
+pub fn prefillExternalOutput(backend: anytype, byte_count: usize) !CudaExternalActivation {
+    return cudaActivationSurface(backend, 0, byte_count);
 }
 
-pub fn decodeInputBuffer(backend: anytype, _: usize, byte_count: usize) !CudaBufferDescriptor {
-    return cudaInputBuffer(backend, byte_count);
+pub fn decodeExternalInput(backend: anytype, slot_index: usize, byte_count: usize) !CudaExternalActivation {
+    return cudaActivationSurface(backend, slot_index, byte_count);
 }
 
-pub fn prefillInputBuffer(backend: anytype, byte_count: usize) !CudaBufferDescriptor {
-    return cudaInputBuffer(backend, byte_count);
+pub fn prefillExternalInput(backend: anytype, byte_count: usize) !CudaExternalActivation {
+    return cudaActivationSurface(backend, 0, byte_count);
 }
 
-pub fn sideInputBuffer(_: anytype, _: usize) !CudaBufferDescriptor {
+pub fn sideExternalInput(_: anytype, _: usize) !CudaExternalActivation {
     return error.UnsupportedContentType;
 }
 
-fn cudaInputBuffer(backend: anytype, byte_count: usize) !CudaBufferDescriptor {
+fn cudaActivationSurface(backend: anytype, slot_index: usize, byte_count: usize) !CudaExternalActivation {
     _ = try deviceLocationHint(backend);
-    return .{
-        .buffer = @ptrCast(&backend.runtime_buffers.input_dev),
-        .device = @ptrCast(&backend.device),
-        .device_ordinal = std.math.cast(u16, backend.device.ordinal()) orelse return error.InvalidTopologyConfig,
-        .stream = backend.compute_stream,
-        .byte_count = byte_count,
-    };
+    return transport.cudaActivationBufferDescriptor(@TypeOf(backend.*), backend, slot_index, byte_count);
 }

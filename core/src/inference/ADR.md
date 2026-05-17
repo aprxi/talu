@@ -28,8 +28,13 @@ This ADR governs text and multimodal routes that execute `ExecutionPlan` instruc
 
 `inference/` MUST own:
 - scheduler lifecycle
+- scheduler-facing execution-target selection under `core/src/inference/scheduler/`
 - register/state routing and validation
 - adapter-table orchestration
+- concrete backend implementations under `core/src/inference/backend/`
+- ordered local-stage pipeline topology, layer ranges, and boundary metadata under `core/src/inference/pipeline/`
+- inter-stage/inter-backend activation movement under `core/src/inference/transport/`
+- inference-owned diagnostic adapters under `core/src/inference/diagnostics/`
 
 `compute/` MUST own:
 - math kernels
@@ -230,14 +235,17 @@ CUDA backend:
 3. Once promoted, the new shipping implementation MUST become the backend baseline reference.
 
 Mixed-backend staged topologies (`cpu+gpu`, `gpu+gpu`, `cpu+gpu+gpu` roadmap):
-1. Topology capability/split validation MUST complete successfully before backend runtime initialization starts.
+1. Topology capability/split validation MUST complete successfully before backend initialization starts.
 2. Stage-boundary activation dtype/layout MUST be negotiated from stage-advertised support sets.
 3. Any boundary conversion MUST be explicit and accounted for in the selected topology plan; implicit widening/narrowing in hot paths is forbidden.
-4. KV/state blocks MUST remain backend-local to the stage that owns the executed layer range.
-5. Inter-stage KV/state migration over PCIe MUST NOT occur in v1 staged routes.
-6. Slot lifecycle operations (alloc, bind, reset, unbind, free) MUST fan out deterministically to every stage participating in the topology.
-7. Cross-stage runtime-state pointer aliasing MUST NOT occur; stages requiring runtime payload rebinding MUST synthesize stage-local wrapper blocks.
-8. CUDA backend init for staged topologies MUST allocate layer-dependent GPU resources (BlockRuntime, KV cache, runtime buffers) only for the stage's assigned layer range via `init_layer_range`; full-model GPU allocation followed by repartition MUST NOT occur. CPU stages are exempt (no GPU memory pressure).
+4. Inter-stage activation movement MUST execute through `core/src/inference/transport`. Pipeline modules build the ordered handoff contract, tensor-frame metadata, and transfer decision; transport modules move bytes between host/CUDA/peer targets and are the authority for the exact byte image crossing a stage boundary; backends expose only their own external activation input/output surfaces.
+5. Backends MUST NOT inspect adjacent stages, select source/target routes, or perform backend-to-backend copies. Backend init consumes explicit stage facts (`layer_range`, `owns_embedding`, `owns_projection`) selected by the topology plan and then executes only that assigned range.
+6. Concrete backend engines MUST NOT import pipeline internals. Only scheduler execution-target construction, backend stage interface modules, and backend stage capability declarations may reference pipeline stage contract types.
+7. KV/state blocks MUST remain backend-local to the stage that owns the executed layer range.
+8. Inter-stage KV/state migration over PCIe MUST NOT occur in v1 staged routes.
+9. Slot lifecycle operations (alloc, bind, reset, unbind, free) MUST fan out deterministically to every stage participating in the topology.
+10. Cross-stage runtime-state pointer aliasing MUST NOT occur; stages requiring runtime payload rebinding MUST synthesize stage-local wrapper blocks.
+11. CUDA backend init for staged topologies MUST allocate layer-dependent GPU resources (BlockRuntime, KV cache, runtime buffers) only for the stage's assigned `layer_range`; full-model GPU allocation followed by repartition MUST NOT occur. CPU stages are exempt (no GPU memory pressure).
 
 ## Vision Staged Plan Contract
 Multimodal-capable models MUST represent staged plans through `ModelPlans`:
@@ -256,7 +264,7 @@ Register allocation is REQUIRED to be two-stage:
 1. Compile-time stage (`models/`):
 - compiler assigns logical registers
 - compiler produces liveness map (`register_last_read`, `kill_after_instruction`)
-2. Runtime/backend-init stage (`inference/` + backend):
+2. Execution/backend-init stage (`inference/` + backend):
 - backend builds physical mapping from plan + liveness
 - allocation MUST size from plan and mapping, not hardcoded caps
 
@@ -303,7 +311,7 @@ Every rule entry uses this REQUIRED schema:
 4. Typed failure mode: `error.InvalidStateDescriptorBinding`, `error.InvalidStateLifecycleAction`
 5. Verification: `zig build test-inference -Drelease`, scheduler lifecycle tests
 
-### R6 Single Runtime Path
+### R6 Single Execution Path
 1. Rule ID: `R6`
 2. Normative statement: each backend route MUST have one orchestration path and MUST NOT contain hidden fallback or compatibility execution loops.
 3. Enforcement point: `execute`
@@ -382,7 +390,7 @@ Every rule entry uses this REQUIRED schema:
 
 ### A10 Topology Configuration + Validation
 1. Rule ID: `A10`
-2. Normative statement: local stage-list configuration MUST be validated at init before layer-dependent allocation starts; each CUDA backend instance MUST initialize with its assigned layer range via `init_layer_range` to avoid temporary full-model GPU allocation; `init_layer_range` values MUST be validated at the `CudaBackend.init` boundary with `error.InvalidTopologyConfig` on failure; stage count, backend kinds, device ordinals, and layer ranges MUST be consistent with the selected local stage list. CPU stages are exempt from range-scoped init (no GPU memory pressure).
+2. Normative statement: local stage-list configuration MUST be validated at init before layer-dependent allocation starts; each CUDA backend instance MUST initialize with its assigned `layer_range` to avoid temporary full-model GPU allocation; `layer_range` values MUST be validated at the `CudaBackend.init` boundary with `error.InvalidTopologyConfig` on failure; stage count, backend kinds, device ordinals, layer ranges, `owns_embedding`, and `owns_projection` MUST be consistent with the selected local stage list. CPU stages are exempt from range-scoped GPU allocation pressure.
 3. Enforcement point: `init`, `load`
 4. Typed failure mode: `error.OutOfMemory` for fit check failure; `error.InvalidTopologyConfig` for inconsistent split/device/mode settings
 5. Verification: `zig build test-inference -Drelease`
@@ -400,6 +408,20 @@ Every rule entry uses this REQUIRED schema:
 3. Enforcement point: `review`
 4. Typed failure mode: gate failure for contract or benchmark non-compliance
 5. Verification: `zig build test-inference -Drelease`, deterministic parity checks, repository benchmark suite
+
+### A13 Transport-Owned Stage Handoff
+1. Rule ID: `A13`
+2. Normative statement: backend-to-backend activation movement MUST be owned by `core/src/inference/transport`. Pipeline code may call transport handoff entry points; backend code may expose self-owned activation surfaces only. Direct source-to-target copies, CUDA peer copies, host staging uploads/downloads, or KV mirror movement outside transport are forbidden.
+3. Enforcement point: `execute`, `build`, `lint`
+4. Typed failure mode: gate failure for transport-authority lint violation; `error.InvalidTopologyConfig` for unsupported transfer surfaces or modes
+5. Verification: `zig build test-inference -Drelease`, `zig build test-lint -Drelease`
+
+### A14 Diagnostics Do Not Own Execution Policy
+1. Rule ID: `A14`
+2. Normative statement: xray and other diagnostics MUST NOT own scheduler policy, topology selection, transfer decisions, or backend routing. Transport-boundary diagnostics may observe the exact activation bytes moved through transport; deeper backend trace points may remain for kernel/layer debugging, but they MUST remain diagnostic emissions and MUST NOT become copy, routing, or scheduling authority.
+3. Enforcement point: `execute`, `build`, `review`
+4. Typed failure mode: gate failure for diagnostic-policy boundary violations
+5. Verification: `zig build test-inference -Drelease`, `zig build test-xray -Drelease`, `zig build test-lint -Drelease`
 
 ## Validation and Change Discipline
 1. Validation gates MUST follow repository policy in `AGENTS.md` and `core/POLICY.md`.

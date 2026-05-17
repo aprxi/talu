@@ -1,4 +1,4 @@
-// MLX Bridge - Fused Neural Network Operations
+// MLX Runtime - Fused Neural Network Operations
 //
 // This file is intentionally a single translation unit to preserve current
 // build wiring and symbol/linkage behavior, while implementation is split into

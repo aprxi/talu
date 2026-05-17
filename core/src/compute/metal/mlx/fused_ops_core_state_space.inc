@@ -2105,7 +2105,7 @@ static inline array gated_delta_mixer_forward_core(
     // repeat: [k0,k0,k1,k1,...] not block repeat [k0,k1,...,k0,k1,...].
     const int groups_per_key = n_heads / n_kh;
 
-    // Decode fast path: seq_len is always 1 for the fused bridge route.
+    // Decode fast path: seq_len is always 1 for the fused runtime route.
     // Skip per-token vectors/concats and dispatch a single recurrence step.
     if (seq_len == 1 && capture_out == nullptr) {
         std::vector<array> batch_outputs;

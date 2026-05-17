@@ -1,4 +1,4 @@
-// MLX Bridge - Compute-level common types and utilities.
+// MLX Runtime - Compute-level common types and utilities.
 // This header is intentionally model-agnostic.
 //
 // It only exposes:
@@ -7,7 +7,7 @@
 // - shared compile-time constants
 //
 // Runtime state containers for the MLX backend live in model_state.h alongside
-// this compute bridge code to keep includes local to core/src/compute/metal/mlx.
+// this compute runtime code to keep includes local to core/src/compute/metal/mlx.
 
 #pragma once
 

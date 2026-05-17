@@ -189,19 +189,30 @@ pub fn assertBackendModuleLayout(comptime M: type, comptime backend_name: []cons
 }
 
 /// Assert backend interface module layout symmetry.
+///
+/// Backend interfaces are self-only contracts. Stage executors run the backend's
+/// own layer range; transport endpoints expose that backend's external
+/// activation inputs and outputs. Pipeline/transport code owns all routing,
+/// adjacent-stage decisions, and cross-backend movement.
 pub fn assertInterfaceModuleLayout(comptime I: type, comptime backend_name: []const u8) void {
     comptime {
         const owner = backend_name ++ ".interface";
         requireLayoutDecl(I, owner, "stage_executor");
         requireLayoutDecl(I, owner, "transport_endpoint");
         requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "supports_local_stage_execution");
+        requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "backendKind");
+        requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "maxBatchSize");
+        requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "prefillChunkRowsCap");
+        requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "supportedBoundaryDTypes");
+        requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "executeDecodeLayerRange");
+        requireLayoutDecl(I.stage_executor, owner ++ ".stage_executor", "executePrefillLayerRange");
         requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "supports_transport_endpoint_descriptors");
         requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "deviceLocationHint");
-        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "hostDecodeActivationSlice");
-        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "hostPrefillActivationSlice");
-        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "decodeInputBuffer");
-        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "prefillInputBuffer");
-        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "sideInputBuffer");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "decodeExternalOutput");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "prefillExternalOutput");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "decodeExternalInput");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "prefillExternalInput");
+        requireLayoutDecl(I.transport_endpoint, owner ++ ".transport_endpoint", "sideExternalInput");
     }
 }
 

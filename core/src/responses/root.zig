@@ -8,7 +8,7 @@ const std = @import("std");
 const progress_mod = @import("progress_pkg");
 
 pub const local = @import("local.zig");
-pub const capi_bridge = @import("capi_bridge.zig");
+pub const capi_boundary = @import("capi_boundary.zig");
 pub const conversation = @import("conversation/root.zig");
 pub const embeddings = @import("embeddings.zig");
 pub const spec = @import("spec.zig");
@@ -16,7 +16,7 @@ pub const protocol = @import("protocol/root.zig");
 pub const tool_schema = @import("tool_schema.zig");
 pub const commit = @import("commit.zig");
 pub const batch = @import("batch.zig");
-const inference_bridge = @import("inference_bridge.zig");
+const inference_boundary = @import("inference_boundary.zig");
 
 // Model specification exports (from spec.zig)
 pub const CanonicalSpec = spec.CanonicalSpec;
@@ -41,9 +41,9 @@ pub const ParsedToolCall = tool_schema.ParsedToolCall;
 pub const ToolSchemaError = tool_schema.ToolSchemaError;
 
 // Inference types (for LocalEngine.run)
-pub const InferenceConfig = inference_bridge.types.InferenceConfig;
-pub const InferenceState = inference_bridge.types.InferenceState;
-pub const FinishReason = inference_bridge.types.FinishReason;
+pub const InferenceConfig = inference_boundary.types.InferenceConfig;
+pub const InferenceState = inference_boundary.types.InferenceState;
+pub const FinishReason = inference_boundary.types.FinishReason;
 
 // Scheduler exports (continuous batching via LocalEngine.createScheduler)
 pub const Scheduler = local.Scheduler;
@@ -84,15 +84,15 @@ pub fn getOrCreateEngineWithConfig(
     model_id: []const u8,
     config: ResolutionConfig,
 ) !*LocalEngine {
-    return getOrCreateEngineWithBackendConfig(allocator, model_id, config, .{});
+    return getOrCreateEngineWithExecutionConfig(allocator, model_id, config, .{});
 }
 
-/// Get or create an engine for a model identifier with resolution and backend config.
-pub fn getOrCreateEngineWithBackendConfig(
+/// Get or create an engine for a model identifier with resolution and execution config.
+pub fn getOrCreateEngineWithExecutionConfig(
     allocator: std.mem.Allocator,
     model_id: []const u8,
     config: ResolutionConfig,
-    backend_init_options: local.BackendInitOptions,
+    execution_target_options: local.ExecutionTargetInitOptions,
 ) !*LocalEngine {
     engine_cache_mutex.lock();
     defer engine_cache_mutex.unlock();
@@ -110,7 +110,7 @@ pub fn getOrCreateEngineWithBackendConfig(
         model_id,
         42,
         config,
-        backend_init_options,
+        execution_target_options,
         progress_mod.Context.NONE,
     );
 

@@ -1,4 +1,4 @@
-// MLX Bridge - Array Pool and Memory Management
+// MLX Runtime - Array Pool and Memory Management
 //
 // Provides array object pooling to eliminate per-step heap allocations.
 // Also handles MLX initialization and memory cache management.

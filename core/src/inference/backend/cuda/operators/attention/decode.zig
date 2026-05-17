@@ -617,13 +617,13 @@ pub fn runBatchedDecodeAttentionMixer(
         (prefer_batched_fused_decode or !use_batched_separate_decode_attention);
     const use_batched_separate_decode_path = use_batched_separate_decode_attention and
         !use_batched_fused_decode_path;
-    // Low-bit GEMM bridge dequantizes KV to f16 each decode step, so prefer it
+    // Low-bit GEMM dequant dequantizes KV to f16 each decode step, so prefer it
     // only when native low-bit decode kernels are absent.
     const use_lowbit_gemm_decode_path = can_lowbit_gemm_decode and n_rows == 1 and
         !use_flash_decode and !use_batched_separate_decode_path and !use_batched_fused_decode_path;
     if (@import("env_pkg").getenv("TALU_CUDA_LOG_DECODE_PATH") != null) {
         const route = if (use_lowbit_gemm_decode_path)
-            "lowbit_gemm_bridge"
+            "lowbit_gemm_dequant"
         else if (use_flash_decode)
             "flash"
         else if (use_batched_fused_decode_path)
@@ -653,7 +653,7 @@ pub fn runBatchedDecodeAttentionMixer(
             .prefer_batched_fused_decode_u32 = @as(u32, @intFromBool(prefer_batched_fused_decode)),
             .allow_lowbit_single_row_flash_u32 = @as(u32, @intFromBool(allow_lowbit_single_row_flash)),
             .n_rows_eq_1_u32 = @as(u32, @intFromBool(n_rows == 1)),
-            .lowbit_gemm_bridge_u32 = @as(u32, @intFromBool(use_lowbit_gemm_decode_path)),
+            .lowbit_gemm_runtime_u32 = @as(u32, @intFromBool(use_lowbit_gemm_decode_path)),
             .flash_u32 = @as(u32, @intFromBool(use_flash_decode)),
             .separate_u32 = @as(u32, @intFromBool(use_batched_separate_decode_path)),
             .fused_u32 = @as(u32, @intFromBool(use_batched_fused_decode_path)),
@@ -1039,7 +1039,7 @@ pub fn runBatchedDecodeAttentionMixer(
                 ),
             }
         }
-        recordDecodeAttentionPhase(self, .heads_lowbit_bridge_f16_kv, decode_attention_start_ns, cfg.is_causal);
+        recordDecodeAttentionPhase(self, .heads_lowbit_dequant_f16_kv, decode_attention_start_ns, cfg.is_causal);
     } else if (use_flash_decode) {
         // Flash decode with split-K: partition sequence across blocks for
         // occupancy when n_kv_heads is small. GQA-aware, does RoPE on Q

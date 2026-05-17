@@ -5,18 +5,18 @@
 //!   talu_train_configure, talu_train_load_data, talu_train_run,
 //!   talu_train_save_checkpoint, talu_train_get_info
 //!
-//! Each function: clearError → validate → delegate to capi_bridge → catch → setError → return code.
+//! Each function: clearError → validate → delegate to capi_boundary → catch → setError → return code.
 
 const std = @import("std");
 const train_mod = @import("../train/root.zig");
-const capi_bridge = train_mod.capi_bridge;
+const capi_boundary = train_mod.capi_boundary;
 const session_mod = train_mod.session;
 
 const TrainingSession = session_mod.TrainingSession;
-const CLoraConfig = capi_bridge.CLoraConfig;
-const CTrainingConfig = capi_bridge.CTrainingConfig;
-const CTrainingInfo = capi_bridge.CTrainingInfo;
-const CStepCallback = capi_bridge.CStepCallback;
+const CLoraConfig = capi_boundary.CLoraConfig;
+const CTrainingConfig = capi_boundary.CTrainingConfig;
+const CTrainingInfo = capi_boundary.CTrainingInfo;
+const CStepCallback = capi_boundary.CStepCallback;
 
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
@@ -46,7 +46,7 @@ pub export fn talu_train_create(
     };
     out_ptr.* = null;
 
-    const session = capi_bridge.createSession(allocator) catch {
+    const session = capi_boundary.createSession(allocator) catch {
         capi_error.setErrorWithCode(.out_of_memory, "failed to allocate training session", .{});
         return @intFromEnum(ErrorCode.out_of_memory);
     };
@@ -60,7 +60,7 @@ pub export fn talu_train_destroy(
     handle: ?*TaluTrainSession,
 ) callconv(.c) void {
     const session: *TrainingSession = @ptrCast(@alignCast(handle orelse return));
-    capi_bridge.destroySession(allocator, session);
+    capi_boundary.destroySession(allocator, session);
 }
 
 // =============================================================================
@@ -94,7 +94,7 @@ pub export fn talu_train_load_model(
     _ = session;
 
     // Model loading requires integration with model I/O subsystem.
-    // For now, use talu_train_set_adapter (or call setAdapter via the bridge)
+    // For now, use talu_train_set_adapter (or call setAdapter via the boundary)
     // to set up adapters explicitly.
     capi_error.setErrorWithCode(.train_model_load_failed, "model loading not yet implemented; use explicit adapter setup", .{});
     return @intFromEnum(ErrorCode.train_model_load_failed);
@@ -120,7 +120,7 @@ pub export fn talu_train_configure(
         return @intFromEnum(ErrorCode.invalid_argument);
     };
 
-    capi_bridge.configureSession(session, cfg) catch |err| {
+    capi_boundary.configureSession(session, cfg) catch |err| {
         capi_error.setError(err, "configure failed", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -152,7 +152,7 @@ pub export fn talu_train_load_data(
         return @intFromEnum(ErrorCode.invalid_argument);
     };
 
-    capi_bridge.loadData(session, path) catch |err| {
+    capi_boundary.loadData(session, path) catch |err| {
         capi_error.setError(err, "data loading failed", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -183,7 +183,7 @@ pub export fn talu_train_run(
         return @intFromEnum(ErrorCode.invalid_argument);
     }));
 
-    capi_bridge.trainSession(session, callback, user_data) catch |err| {
+    capi_boundary.trainSession(session, callback, user_data) catch |err| {
         capi_error.setError(err, "training failed", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -239,6 +239,6 @@ pub export fn talu_train_get_info(
         return @intFromEnum(ErrorCode.invalid_argument);
     };
 
-    out.* = capi_bridge.getInfo(session);
+    out.* = capi_boundary.getInfo(session);
     return 0;
 }

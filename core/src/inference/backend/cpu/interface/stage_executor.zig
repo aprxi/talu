@@ -1,6 +1,9 @@
 //! CPU implementation of the backend stage executor interface.
+//!
+//! This interface executes only CPU-owned layer ranges. It assumes any external
+//! activation input has already been prepared by pipeline/transport code.
 
-const bridge = @import("../../../bridge/root.zig");
+const pipeline = @import("../../../pipeline/root.zig");
 const cpu_stage_capabilities = @import("../stage_capabilities.zig");
 
 pub const supports_local_stage_execution = true;
@@ -10,7 +13,7 @@ pub const StageLayerRange = struct {
     end: usize,
 };
 
-pub fn backendKind() bridge.HostBackendKind {
+pub fn backendKind() pipeline.HostBackendKind {
     return .cpu;
 }
 
@@ -30,7 +33,7 @@ pub fn prefillChunkRowsCap(backend: anytype) usize {
     return 1024;
 }
 
-pub fn supportedBoundaryDTypes() []const bridge.BoundaryDType {
+pub fn supportedBoundaryDTypes() []const pipeline.BoundaryDType {
     return cpu_stage_capabilities.supported_boundary_dtypes[0..];
 }
 
@@ -58,44 +61,6 @@ pub fn executeDecodeLayerRange(
         download_logits,
         ctx.ensure_kv_capacity,
         use_preloaded_input,
-    );
-}
-
-pub fn prepareBatchedDecodeSegments(
-    comptime preserve_decode_boundary_failure: anytype,
-    root_backend: anytype,
-    cpu_stage: anytype,
-    activate_intermediate: bool,
-    intermediate_backend: anytype,
-    boundary: anytype,
-    tokens: []const u32,
-    slot_indices: []const usize,
-    positions: []const usize,
-    layer_start: usize,
-    layer_end: usize,
-    use_preloaded_input: bool,
-    compute_logits: bool,
-    row_bytes: usize,
-    host_segments: [][]const u8,
-) !void {
-    if (comptime !hasDecl(@TypeOf(cpu_stage.*), "prepareBatchedDecodeSegments")) {
-        return error.InvalidTopologyConfig;
-    }
-    try cpu_stage.prepareBatchedDecodeSegments(
-        preserve_decode_boundary_failure,
-        root_backend,
-        activate_intermediate,
-        intermediate_backend,
-        boundary,
-        tokens,
-        slot_indices,
-        positions,
-        layer_start,
-        layer_end,
-        use_preloaded_input,
-        compute_logits,
-        row_bytes,
-        host_segments,
     );
 }
 

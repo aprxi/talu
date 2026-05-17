@@ -32,7 +32,7 @@ pub const data = @import("data.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const loop = @import("loop.zig");
 pub const session = @import("session.zig");
-pub const capi_bridge = @import("capi_bridge.zig");
+pub const capi_boundary = @import("capi_boundary.zig");
 
 pub const model_config = @import("model_config.zig");
 pub const model_weights = @import("model_weights.zig");
@@ -86,7 +86,7 @@ test {
     _ = checkpoint;
     _ = loop;
     _ = session;
-    _ = capi_bridge;
+    _ = capi_boundary;
     _ = model_config;
     _ = model_weights;
     _ = activations;

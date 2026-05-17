@@ -134,8 +134,8 @@ fn runDirectJointFast(
     var model_scheduler = try model_engine.createScheduler(SchedulerConfig{});
     defer model_scheduler.deinit();
 
-    const reference_vocab = reference_scheduler.backend.vocabSize();
-    const model_vocab = model_scheduler.backend.vocabSize();
+    const reference_vocab = reference_scheduler.target.vocabSize();
+    const model_vocab = model_scheduler.target.vocabSize();
     if (reference_vocab != model_vocab) return error.InvalidArgument;
     const ref_exp_scratch = try reference_engine.allocator.alloc(f64, reference_vocab);
     defer reference_engine.allocator.free(ref_exp_scratch);
@@ -407,8 +407,8 @@ pub export fn talu_scheduler_score_tokens_joint(
     };
     defer model_scheduler.deinit();
 
-    const reference_vocab = reference_scheduler.backend.vocabSize();
-    const model_vocab = model_scheduler.backend.vocabSize();
+    const reference_vocab = reference_scheduler.target.vocabSize();
+    const model_vocab = model_scheduler.target.vocabSize();
     if (reference_vocab != model_vocab) {
         capi_error.setErrorWithCode(
             .invalid_argument,

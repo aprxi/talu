@@ -4,7 +4,7 @@
 //! responsible for extracting concrete devices, buffers, streams, and events.
 
 const std = @import("std");
-const tensor_frame = @import("../bridge/tensor_frame.zig");
+const tensor_frame = @import("../pipeline/tensor_frame.zig");
 const cuda_kv_mirror = @import("cuda_kv_mirror.zig");
 const local_stage = @import("local_stage.zig");
 
@@ -12,6 +12,248 @@ pub const CudaPeerCopySynchronization = enum {
     source_stream,
     source_event_target_stream,
 };
+
+pub const CudaActivationBufferVTable = struct {
+    synchronize: *const fn (*anyopaque) anyerror!void,
+    download_to_host: *const fn (*anyopaque, []u8, usize) anyerror!void,
+    upload_from_host: *const fn (*anyopaque, usize, []const u8, usize) anyerror!void,
+    upload_segments_from_host: *const fn (*anyopaque, []const []const u8, usize) anyerror!void,
+    peer_copy_to: *const fn (*anyopaque, *anyopaque, usize, CudaPeerCopySynchronization) anyerror!void,
+    peer_copy_handles_stage_sync: *const fn (*anyopaque, CudaPeerCopySynchronization) bool,
+};
+
+pub const CudaBufferDescriptor = struct {
+    backend: *anyopaque,
+    buffer: *anyopaque,
+    device: *anyopaque,
+    device_ordinal: u16,
+    stream: ?*anyopaque,
+    slot_index: usize,
+    byte_count: usize,
+    vtable: *const CudaActivationBufferVTable,
+};
+
+pub fn cudaActivationBufferDescriptor(
+    comptime Backend: type,
+    backend: *Backend,
+    slot_index: usize,
+    byte_count: usize,
+) !CudaBufferDescriptor {
+    if (comptime !@hasField(Backend, "runtime_buffers") or !@hasField(Backend, "device")) {
+        return error.InvalidTopologyConfig;
+    }
+
+    const Adapter = struct {
+        fn backendPtr(ptr: *anyopaque) *Backend {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn synchronize(ptr: *anyopaque) anyerror!void {
+            try synchronizeCudaActivationBackend(backendPtr(ptr));
+        }
+
+        fn downloadToHost(ptr: *anyopaque, host_buf: []u8, count: usize) anyerror!void {
+            try downloadCudaActivation(backendPtr(ptr), host_buf, count);
+        }
+
+        fn uploadFromHost(ptr: *anyopaque, target_slot_index: usize, host_buf: []const u8, count: usize) anyerror!void {
+            try uploadCudaActivation(backendPtr(ptr), target_slot_index, host_buf, count);
+        }
+
+        fn uploadSegmentsFromHost(ptr: *anyopaque, host_segments: []const []const u8, count: usize) anyerror!void {
+            try uploadCudaActivationSegments(backendPtr(ptr), host_segments, count);
+        }
+
+        fn peerCopyTo(
+            ptr: *anyopaque,
+            target_ptr: *anyopaque,
+            count: usize,
+            synchronization: CudaPeerCopySynchronization,
+        ) anyerror!void {
+            try peerCopyCudaActivationRuntime(backendPtr(ptr), backendPtr(target_ptr), count, synchronization);
+        }
+
+        fn peerCopyHandlesStageSync(ptr: *anyopaque, synchronization: CudaPeerCopySynchronization) bool {
+            return peerCopyCudaActivationHandlesStageSyncRuntime(backendPtr(ptr), synchronization);
+        }
+
+        const vtable = CudaActivationBufferVTable{
+            .synchronize = synchronize,
+            .download_to_host = downloadToHost,
+            .upload_from_host = uploadFromHost,
+            .upload_segments_from_host = uploadSegmentsFromHost,
+            .peer_copy_to = peerCopyTo,
+            .peer_copy_handles_stage_sync = peerCopyHandlesStageSync,
+        };
+    };
+
+    return .{
+        .backend = backend,
+        .buffer = @ptrCast(&backend.runtime_buffers.input_dev),
+        .device = @ptrCast(&backend.device),
+        .device_ordinal = std.math.cast(u16, backend.device.ordinal()) orelse return error.InvalidTopologyConfig,
+        .stream = if (comptime @hasField(Backend, "compute_stream"))
+            if (backend.compute_stream) |stream| @ptrCast(stream) else null
+        else
+            null,
+        .slot_index = slot_index,
+        .byte_count = byte_count,
+        .vtable = &Adapter.vtable,
+    };
+}
+
+pub fn synchronizeCudaActivationDescriptor(descriptor: CudaBufferDescriptor) !void {
+    try descriptor.vtable.synchronize(descriptor.backend);
+}
+
+pub fn downloadCudaActivationDescriptor(
+    descriptor: CudaBufferDescriptor,
+    host_buf: []u8,
+    byte_count: usize,
+) !void {
+    if (byte_count > host_buf.len or byte_count > descriptor.byte_count) return error.InvalidArgument;
+    try descriptor.vtable.download_to_host(descriptor.backend, host_buf, byte_count);
+}
+
+pub fn uploadCudaActivationDescriptor(
+    descriptor: CudaBufferDescriptor,
+    host_buf: []const u8,
+    byte_count: usize,
+) !void {
+    if (byte_count > host_buf.len or byte_count > descriptor.byte_count) return error.InvalidArgument;
+    try descriptor.vtable.upload_from_host(descriptor.backend, descriptor.slot_index, host_buf, byte_count);
+}
+
+pub fn uploadCudaActivationSegmentsDescriptor(
+    descriptor: CudaBufferDescriptor,
+    host_segments: []const []const u8,
+    byte_count: usize,
+) !void {
+    if (byte_count > descriptor.byte_count) return error.InvalidArgument;
+    try descriptor.vtable.upload_segments_from_host(descriptor.backend, host_segments, byte_count);
+}
+
+pub fn peerCopyCudaActivationDescriptorTo(
+    source: CudaBufferDescriptor,
+    target: CudaBufferDescriptor,
+    byte_count: usize,
+    synchronization: CudaPeerCopySynchronization,
+) !void {
+    if (byte_count > source.byte_count or byte_count > target.byte_count) return error.InvalidArgument;
+    try source.vtable.peer_copy_to(source.backend, target.backend, byte_count, synchronization);
+}
+
+pub fn probeCudaActivationDescriptorPeerCopy(
+    source: CudaBufferDescriptor,
+    target: CudaBufferDescriptor,
+) bool {
+    const min_size = @min(source.byte_count, target.byte_count);
+    if (min_size == 0) return false;
+    const probe_bytes = @min(min_size, @as(usize, 256));
+    peerCopyCudaActivationDescriptorTo(source, target, probe_bytes, .source_stream) catch return false;
+    return true;
+}
+
+pub fn peerCopyCudaActivationDescriptorHandlesStageSync(
+    source: CudaBufferDescriptor,
+    synchronization: CudaPeerCopySynchronization,
+) bool {
+    return source.vtable.peer_copy_handles_stage_sync(source.backend, synchronization);
+}
+
+test "cudaActivationBufferDescriptor downloadCudaActivationDescriptor uploadCudaActivationDescriptor uploadCudaActivationSegmentsDescriptor peerCopyCudaActivationDescriptorTo probeCudaActivationDescriptorPeerCopy peerCopyCudaActivationDescriptorHandlesStageSync synchronizeCudaActivationDescriptor operate on backend descriptor" {
+    const Trace = struct {
+        downloads: usize = 0,
+        uploads: usize = 0,
+        uploaded_bytes: usize = 0,
+        peer_calls: usize = 0,
+        sync_calls: usize = 0,
+    };
+    const Device = struct {
+        trace: *Trace,
+
+        pub fn ordinal(_: *const @This()) usize {
+            return 2;
+        }
+
+        pub fn synchronize(device: *@This()) !void {
+            device.trace.sync_calls += 1;
+        }
+
+        pub fn canAccessPeer(_: *@This(), _: *@This()) bool {
+            return true;
+        }
+
+        pub fn enablePeerAccess(_: *@This(), _: *@This()) !void {}
+
+        pub fn memcpyPeerAsync(
+            device: *@This(),
+            _: *@This(),
+            _: anytype,
+            _: anytype,
+            byte_count: usize,
+            _: ?*anyopaque,
+        ) !void {
+            try std.testing.expect(byte_count > 0);
+            device.trace.peer_calls += 1;
+        }
+    };
+    const Buffer = struct {
+        trace: *Trace,
+        size: usize = 64,
+        pointer: u64 = 0,
+
+        pub fn download(buffer: *@This(), _: anytype, host_buf: []u8) !void {
+            buffer.trace.downloads += 1;
+            for (host_buf, 0..) |*byte, index| byte.* = @intCast(index + 1);
+        }
+
+        pub fn upload(buffer: *@This(), _: anytype, host_buf: []const u8) !void {
+            buffer.trace.uploads += 1;
+            buffer.trace.uploaded_bytes += host_buf.len;
+        }
+    };
+    const RuntimeBuffers = struct {
+        input_dev: Buffer,
+    };
+    const Backend = struct {
+        device: Device,
+        runtime_buffers: RuntimeBuffers,
+        compute_stream: ?*anyopaque = null,
+    };
+
+    var trace_data = Trace{};
+    var backend = Backend{
+        .device = .{ .trace = &trace_data },
+        .runtime_buffers = .{ .input_dev = .{ .trace = &trace_data } },
+    };
+    var target_backend = Backend{
+        .device = .{ .trace = &trace_data },
+        .runtime_buffers = .{ .input_dev = .{ .trace = &trace_data } },
+    };
+
+    const descriptor = try cudaActivationBufferDescriptor(Backend, &backend, 3, 16);
+    try std.testing.expectEqual(@as(u16, 2), descriptor.device_ordinal);
+    try std.testing.expectEqual(@as(usize, 3), descriptor.slot_index);
+
+    var host = [_]u8{0} ** 16;
+    try downloadCudaActivationDescriptor(descriptor, host[0..], 4);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, host[0..4]);
+    try uploadCudaActivationDescriptor(descriptor, host[0..], 4);
+    try uploadCudaActivationSegmentsDescriptor(descriptor, &.{ host[0..2], host[2..4] }, 4);
+
+    const target_descriptor = try cudaActivationBufferDescriptor(Backend, &target_backend, 0, 16);
+    try peerCopyCudaActivationDescriptorTo(descriptor, target_descriptor, 4, .source_stream);
+    try std.testing.expect(probeCudaActivationDescriptorPeerCopy(descriptor, target_descriptor));
+    try std.testing.expect(!peerCopyCudaActivationDescriptorHandlesStageSync(descriptor, .source_stream));
+    try synchronizeCudaActivationDescriptor(descriptor);
+
+    try std.testing.expectEqual(@as(usize, 1), trace_data.downloads);
+    try std.testing.expectEqual(@as(usize, 3), trace_data.uploads);
+    try std.testing.expectEqual(@as(usize, 8), trace_data.uploaded_bytes);
+    try std.testing.expectEqual(@as(usize, 2), trace_data.peer_calls);
+    try std.testing.expectEqual(@as(usize, 2), trace_data.sync_calls);
+}
 
 pub const LocalEndpointTransportOptions = struct {
     pub const CpuActivationScope = enum {

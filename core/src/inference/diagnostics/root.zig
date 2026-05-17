@@ -1,3 +1,3 @@
 //! Inference-owned diagnostic adapters.
 
-pub const xray_bridge = @import("xray_bridge.zig");
+pub const pipeline_xray = @import("pipeline_xray.zig");

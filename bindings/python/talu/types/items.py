@@ -262,7 +262,7 @@ def normalize_content(
     Normalize content to a list of dictionaries.
 
     This function converts various content formats to the dictionary format
-    expected by the Zig bridge and storage backends.
+    expected by the Zig boundary and storage backends.
 
     Parameters
     ----------
@@ -274,7 +274,7 @@ def normalize_content(
     Returns
     -------
     list[dict]
-        List of content dictionaries suitable for Zig bridge.
+        List of content dictionaries suitable for Zig pipeline.
 
     Examples
     --------
@@ -405,7 +405,7 @@ class InputText(_ContentPartBase):
     text: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary format for Zig bridge serialization."""
+        """Convert to dictionary format for Zig boundary serialization."""
         return {"type": "input_text", "text": self.text}
 
 
@@ -562,7 +562,7 @@ class InputImage(_ContentPartBase):
 
     def to_dict(self) -> dict[str, Any]:
         """
-        Convert to dictionary format for Zig bridge serialization.
+        Convert to dictionary format for Zig boundary serialization.
 
         Returns
         -------
@@ -696,7 +696,7 @@ class InputAudio(_ContentPartBase):
 
     def to_dict(self) -> dict[str, Any]:
         """
-        Convert to dictionary format for Zig bridge serialization.
+        Convert to dictionary format for Zig boundary serialization.
 
         Returns
         -------
@@ -827,7 +827,7 @@ class InputVideo(_ContentPartBase):
 
     def to_dict(self) -> dict[str, Any]:
         """
-        Convert to dictionary format for Zig bridge serialization.
+        Convert to dictionary format for Zig boundary serialization.
 
         Returns
         -------
@@ -856,7 +856,7 @@ class InputFile(_ContentPartBase):
     file_url: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary format for Zig bridge serialization."""
+        """Convert to dictionary format for Zig boundary serialization."""
         result: dict[str, Any] = {"type": "input_file"}
         if self.filename is not None:
             result["filename"] = self.filename

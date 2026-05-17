@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const xray_bridge_enabled: bool = if (@hasDecl(build_options, "xray_bridge")) build_options.xray_bridge else true;
+const xray_pipeline_enabled: bool = if (@hasDecl(build_options, "xray_pipeline")) build_options.xray_pipeline else true;
 
 /// Trace points in the inference pipeline.
 /// Names correspond to actual method signatures in the codebase.
@@ -292,7 +292,7 @@ pub const ExactEmissionFilter = struct {
 
 /// Set the trace handler. Called by inspection system on setup.
 pub fn setHandler(h: ?Handler) void {
-    if (!xray_bridge_enabled) {
+    if (!xray_pipeline_enabled) {
         handler_atomic.store(null, .release);
         built_in_point_mask_atomic.store(0, .release);
         exact_filter_enabled_atomic.store(false, .release);
@@ -307,12 +307,12 @@ pub fn setHandler(h: ?Handler) void {
 
 /// Set the active built-in trace-point mask for the current handler.
 pub fn setActiveBuiltInPointMask(mask: u64) void {
-    if (!xray_bridge_enabled) return;
+    if (!xray_pipeline_enabled) return;
     built_in_point_mask_atomic.store(mask, .release);
 }
 
 pub fn setActiveExactEmissionFilter(filter: ?ExactEmissionFilter) void {
-    if (!xray_bridge_enabled) return;
+    if (!xray_pipeline_enabled) return;
     if (filter) |value| {
         exact_filter_point_atomic.store(@intFromEnum(value.point), .release);
         exact_filter_layer_atomic.store(value.layer, .release);
@@ -325,7 +325,7 @@ pub fn setActiveExactEmissionFilter(filter: ?ExactEmissionFilter) void {
 
 /// Get current handler (for inspection system to check if enabled).
 pub fn getHandler() ?Handler {
-    if (!xray_bridge_enabled) return null;
+    if (!xray_pipeline_enabled) return null;
     return handler_atomic.load(.acquire);
 }
 
@@ -339,14 +339,14 @@ pub fn setBackendContext(backend: Backend) Backend {
 
 /// Check if tracing is enabled (for conditional expensive operations).
 pub inline fn isEnabled() bool {
-    if (!xray_bridge_enabled) return false;
+    if (!xray_pipeline_enabled) return false;
     return handler_atomic.load(.acquire) != null;
 }
 
 /// Check whether a specific trace point should be emitted by the backend.
 /// This is the correct guard for expensive host materialization.
 pub inline fn shouldEmit(point: TracePoint) bool {
-    if (!xray_bridge_enabled) return false;
+    if (!xray_pipeline_enabled) return false;
     if (handler_atomic.load(.acquire) == null) return false;
     const point_idx = @intFromEnum(point);
     if (point_idx >= 64) return true;
@@ -359,7 +359,7 @@ pub inline fn shouldEmit(point: TracePoint) bool {
 /// runs: it preserves the production compute path while avoiding host copies
 /// for checkpoints that the verifier will never inspect.
 pub inline fn shouldEmitEmission(point: TracePoint, layer: u16, position: u32) bool {
-    if (!xray_bridge_enabled) return false;
+    if (!xray_pipeline_enabled) return false;
     if (!shouldEmit(point)) return false;
     if (!exact_filter_enabled_atomic.load(.acquire)) return true;
     return exact_filter_point_atomic.load(.acquire) == @intFromEnum(point) and
@@ -396,7 +396,7 @@ pub inline fn emitWithWork(
     kernel_name: ?[]const u8,
     work: Work,
 ) void {
-    if (!xray_bridge_enabled) return;
+    if (!xray_pipeline_enabled) return;
     const h = handler_atomic.load(.acquire) orelse return;
     var name_buf: [48]u8 = std.mem.zeroes([48]u8);
     if (kernel_name) |name| {
@@ -505,7 +505,7 @@ test "trace handler receives emissions" {
     setHandler(&TestCapture.handler);
     defer setHandler(null);
 
-    if (!xray_bridge_enabled) {
+    if (!xray_pipeline_enabled) {
         try std.testing.expect(!isEnabled());
         emit(.attn_out, 5, 0, 10, @ptrFromInt(0x2000), .bf16, .{ 1, 8, 64, 0 }, 3, null);
         try std.testing.expectEqual(@as(usize, 0), TestCapture.call_count);
@@ -536,7 +536,7 @@ test "shouldEmit honors active built-in point mask" {
     setActiveBuiltInPointMask((@as(u64, 1) << @intFromEnum(TracePoint.lm_head)));
     defer setActiveBuiltInPointMask(0);
 
-    if (!xray_bridge_enabled) {
+    if (!xray_pipeline_enabled) {
         try std.testing.expect(!shouldEmit(.lm_head));
         try std.testing.expect(!shouldEmit(.token_select));
         try std.testing.expect(!shouldEmit(.gdelta_out));
@@ -564,7 +564,7 @@ test "shouldEmitEmission honors exact checkpoint filter" {
     });
     defer setActiveExactEmissionFilter(null);
 
-    if (!xray_bridge_enabled) {
+    if (!xray_pipeline_enabled) {
         try std.testing.expect(!shouldEmitEmission(.gdelta_out, 22, 10));
         try std.testing.expect(!shouldEmitEmission(.gdelta_out, 22, 11));
         try std.testing.expect(!shouldEmitEmission(.gdelta_out, 21, 10));

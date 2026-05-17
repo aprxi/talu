@@ -5,7 +5,7 @@ const models = @import("models_pkg");
 const safetensors_root = @import("io_pkg").safetensors.root;
 const log = @import("log_pkg");
 const metal_vision = @import("vision/root.zig");
-const sampling = @import("../../sampling.zig");
+const sampling = @import("../../sampling/root.zig");
 const sampling_policy = sampling.policy;
 const shared_scheduler = @import("../../scheduler/contracts.zig");
 const trace = @import("xray_pkg").trace;
@@ -324,7 +324,7 @@ pub const MetalBackend = struct {
     model_path_z: [:0]u8,
     weights_path: ?[]u8 = null,
     seed: c_int,
-    bridge_flags: MlxModelFlags,
+    runtime_flags: MlxModelFlags,
 
     vocab_size: usize,
     d_model: usize,
@@ -664,7 +664,7 @@ pub const MetalBackend = struct {
             }
         }
         if (created == null) {
-            created = mlx_create_with_flags(self.model_id_z.ptr, self.model_path_z.ptr, self.seed, &self.bridge_flags);
+            created = mlx_create_with_flags(self.model_id_z.ptr, self.model_path_z.ptr, self.seed, &self.runtime_flags);
         }
         const ctx = created orelse {
             log.warn("inference", "metal slot context creation failed", .{
@@ -1109,7 +1109,7 @@ pub const MetalBackend = struct {
             .model_path_z = model_path_z,
             .weights_path = weights_path_owned,
             .seed = seed,
-            .bridge_flags = model_flags,
+            .runtime_flags = model_flags,
             .vocab_size = vocab_size,
             .d_model = d_model,
             .max_batch_size = max_batch_size,
@@ -1236,7 +1236,7 @@ pub const MetalBackend = struct {
                 if (sampling_policy.hasLogitMutations(sampling_config.*)) return error.InvalidArgument;
                 if (callback != null) {
                     // Per-token decode loop: fire callback after each token for true
-                    // streaming. The bulk bridge path generates all tokens internally.
+                    // streaming. The bulk pipeline path generates all tokens internally.
                     var decode_timer = std.time.Timer.start() catch unreachable;
                     var produced: usize = 0;
                     var current_token = first_token;
@@ -1278,7 +1278,7 @@ pub const MetalBackend = struct {
                 if (!self.supportsSchedulerBackendStreamingRoute(sampling_config)) return error.InvalidArgument;
                 if (callback != null) {
                     // Per-token decode loop with host-side TopK sampling for true
-                    // streaming. The bulk bridge path generates all tokens internally.
+                    // streaming. The bulk pipeline path generates all tokens internally.
                     var produced: usize = 0;
                     var current_token = first_token;
                     const logits_buf = try self.allocator.alloc(f32, self.vocab_size);
@@ -1904,7 +1904,7 @@ pub const MetalBackend = struct {
             return error.InvalidArgument;
         }
 
-        const bridge_vision_input = MlxPrefillVisionInput{
+        const runtime_vision_input = MlxPrefillVisionInput{
             .merged_embeddings = encoded_vision_output.merged_embeddings.ptr,
             .merged_value_count = @intCast(encoded_vision_output.merged_embeddings.len),
             .image_token_id = vision.image_token_id,
@@ -1914,16 +1914,16 @@ pub const MetalBackend = struct {
         self.resetCtx(slot_index);
         self.clearSlotState(slot_index);
 
-        const bridge_prefill_start_ns: i128 = std.time.nanoTimestamp();
+        const runtime_prefill_start_ns: i128 = std.time.nanoTimestamp();
         const status = mlx_prefill_logits_with_vision(
             ctx,
             @ptrCast(prompt_i32.ptr),
             @intCast(prompt_i32.len),
-            &bridge_vision_input,
+            &runtime_vision_input,
             @ptrCast(logits_out.ptr),
             @intCast(self.vocab_size),
         );
-        const bridge_prefill_done_ns: i128 = std.time.nanoTimestamp();
+        const runtime_prefill_done_ns: i128 = std.time.nanoTimestamp();
         if (status == 0) {
             const err_msg = resolveLastError();
             log.warn("inference", "metal prefill_logits_with_vision failed", .{
@@ -1942,7 +1942,7 @@ pub const MetalBackend = struct {
             .images = vision.images.len,
             .merged_values = encoded_vision_output.merged_embeddings.len,
             .encode_ms = @as(f64, @floatFromInt(encode_elapsed_ns)) / 1_000_000.0,
-            .bridge_prefill_ms = @as(f64, @floatFromInt(bridge_prefill_done_ns - bridge_prefill_start_ns)) / 1_000_000.0,
+            .runtime_prefill_ms = @as(f64, @floatFromInt(runtime_prefill_done_ns - runtime_prefill_start_ns)) / 1_000_000.0,
         }, @src());
 
         const slot_logits = self.slotLogitsSlice(slot_index);

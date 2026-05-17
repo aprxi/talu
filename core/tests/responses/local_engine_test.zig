@@ -37,13 +37,13 @@ test "LocalEngine has expected fields" {
     var has_model_weight_dtype_tag = false;
     var has_tok = false;
     var has_samp = false;
-    var has_backend = false;
+    var has_execution_target = false;
     var has_gen_config = false;
     var has_preproc_config = false;
     var has_model_path = false;
     var has_cached_chat_template = false;
     var has_scheduler_state_descriptors = false;
-    var has_backend_init_options = false;
+    var has_execution_target_options = false;
 
     inline for (fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "allocator")) has_allocator = true;
@@ -54,13 +54,13 @@ test "LocalEngine has expected fields" {
         if (comptime std.mem.eql(u8, field.name, "model_weight_dtype_tag")) has_model_weight_dtype_tag = true;
         if (comptime std.mem.eql(u8, field.name, "tok")) has_tok = true;
         if (comptime std.mem.eql(u8, field.name, "samp")) has_samp = true;
-        if (comptime std.mem.eql(u8, field.name, "backend")) has_backend = true;
+        if (comptime std.mem.eql(u8, field.name, "execution_target")) has_execution_target = true;
         if (comptime std.mem.eql(u8, field.name, "gen_config")) has_gen_config = true;
         if (comptime std.mem.eql(u8, field.name, "preproc_config")) has_preproc_config = true;
         if (comptime std.mem.eql(u8, field.name, "model_path")) has_model_path = true;
         if (comptime std.mem.eql(u8, field.name, "cached_chat_template")) has_cached_chat_template = true;
         if (comptime std.mem.eql(u8, field.name, "scheduler_state_descriptors")) has_scheduler_state_descriptors = true;
-        if (comptime std.mem.eql(u8, field.name, "backend_init_options")) has_backend_init_options = true;
+        if (comptime std.mem.eql(u8, field.name, "execution_target_options")) has_execution_target_options = true;
     }
 
     try std.testing.expect(has_allocator);
@@ -71,13 +71,13 @@ test "LocalEngine has expected fields" {
     try std.testing.expect(has_model_weight_dtype_tag);
     try std.testing.expect(has_tok);
     try std.testing.expect(has_samp);
-    try std.testing.expect(has_backend);
+    try std.testing.expect(has_execution_target);
     try std.testing.expect(has_gen_config);
     try std.testing.expect(has_preproc_config);
     try std.testing.expect(has_model_path);
     try std.testing.expect(has_cached_chat_template);
     try std.testing.expect(has_scheduler_state_descriptors);
-    try std.testing.expect(has_backend_init_options);
+    try std.testing.expect(has_execution_target_options);
 }
 
 // =============================================================================

@@ -260,7 +260,7 @@ impl From<u32> for QuantLevel {
     }
 }
 
-/// Source: core/src/responses/capi_bridge.zig
+/// Source: core/src/responses/capi_boundary.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CFinishReason {
@@ -519,7 +519,7 @@ impl Default for BatchEncodeResult {
     }
 }
 
-/// Source: core/src/responses/capi_bridge.zig
+/// Source: core/src/responses/capi_boundary.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CLogitBiasEntry {
@@ -684,7 +684,7 @@ impl Default for GenerationConfigInfo {
     }
 }
 
-/// Source: core/src/responses/capi_bridge.zig
+/// Source: core/src/responses/capi_boundary.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CGenerateVisionImage {
@@ -963,7 +963,7 @@ impl Default for DownloadOptions {
     }
 }
 
-/// Source: core/src/responses/capi_bridge.zig
+/// Source: core/src/responses/capi_boundary.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CToolCallRef {
@@ -1070,7 +1070,7 @@ impl Default for CContentPart {
     }
 }
 
-/// Source: core/src/responses/capi_bridge.zig
+/// Source: core/src/responses/capi_boundary.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CGenerateConfig {

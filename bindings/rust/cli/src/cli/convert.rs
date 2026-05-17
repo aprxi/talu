@@ -777,7 +777,7 @@ Custom parameters (active):
       Post multiplier on selected global scale.
   replay=weighted|xray
       weighted: weight-domain fast path.
-      xray: activation-capture replay path (requires xray bridge).
+      xray: activation-capture replay path (requires xray pipeline).
   seed=INT
       Reproducibility only.
 

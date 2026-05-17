@@ -23,8 +23,8 @@ fn isInferenceProductionSourcePath(path: []const u8) bool {
     if (std.mem.endsWith(u8, path, "_test.zig")) return false;
     if (std.mem.endsWith(u8, path, "_tests.zig")) return false;
     if (std.mem.indexOf(u8, path, "/testdata/") != null) return false;
-    if (std.mem.indexOf(u8, path, "/bridge_tests_") != null) return false;
-    if (std.mem.endsWith(u8, path, "/bridge_config_test.cpp")) return false;
+    if (std.mem.indexOf(u8, path, "/runtime_tests_") != null) return false;
+    if (std.mem.endsWith(u8, path, "/runtime_config_test.cpp")) return false;
     return true;
 }
 
@@ -38,6 +38,18 @@ fn isInferenceBackendVisionPath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, "/vision.zig");
 }
 
+fn isInferenceTransportPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/src/inference/transport/");
+}
+
+fn isLocalStageRunnerPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/inference/pipeline/local_stage_runner.zig");
+}
+
+fn isLocalPipelineRuntimePath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/inference/pipeline/local_pipeline_runtime.zig");
+}
+
 fn isModelsPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/models/");
 }
@@ -46,8 +58,8 @@ fn isResponsesPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/responses/");
 }
 
-fn isResponsesInferenceBridgePath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "core/src/responses/inference_bridge.zig");
+fn isResponsesInferenceBoundaryPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/responses/inference_boundary.zig");
 }
 
 fn isCoreSourceFile(path: []const u8) bool {
@@ -85,6 +97,16 @@ fn importTargetsInference(target: []const u8) bool {
         std.mem.eql(u8, target, "inference_pkg");
 }
 
+fn importTargetsInferencePipeline(target: []const u8) bool {
+    return std.mem.indexOf(u8, target, "pipeline/") != null;
+}
+
+fn isAllowedBackendPipelineImportPath(path: []const u8) bool {
+    if (std.mem.indexOf(u8, path, "/interface/") != null) return true;
+    if (std.mem.endsWith(u8, path, "/stage_capabilities.zig")) return true;
+    return false;
+}
+
 fn importTargetsForbiddenComputeDependency(target: []const u8) bool {
     return std.mem.indexOf(u8, target, "inference/") != null or
         std.mem.indexOf(u8, target, "models/") != null or
@@ -92,7 +114,6 @@ fn importTargetsForbiddenComputeDependency(target: []const u8) bool {
         std.mem.indexOf(u8, target, "protocol/") != null or
         std.mem.indexOf(u8, target, "capi/") != null or
         std.mem.indexOf(u8, target, "bindings/") != null or
-        std.mem.indexOf(u8, target, "bridge") != null or
         std.mem.indexOf(u8, target, "scheduler") != null or
         std.mem.indexOf(u8, target, "runtime_contract") != null or
         std.mem.eql(u8, target, "inference_pkg") or
@@ -102,6 +123,24 @@ fn importTargetsForbiddenComputeDependency(target: []const u8) bool {
 
 fn isComputeRootImport(target: []const u8) bool {
     return std.mem.endsWith(u8, target, "compute/root.zig");
+}
+
+fn isAllowedTransportAuthorityToken(file_path: []const u8, token: []const u8) bool {
+    if (isInferenceTransportPath(file_path)) return true;
+
+    if (isLocalStageRunnerPath(file_path)) {
+        return std.mem.eql(u8, token, "executeLocalStageTransport(") or
+            std.mem.eql(u8, token, "executeLocalStageTransportWithFailureCapture(");
+    }
+
+    if (isLocalPipelineRuntimePath(file_path)) {
+        return std.mem.eql(u8, token, "downloadExternalActivation(") or
+            std.mem.eql(u8, token, "uploadExternalActivation(") or
+            std.mem.eql(u8, token, "uploadExternalActivationSegments(") or
+            std.mem.eql(u8, token, "peerCopyExternalActivation(");
+    }
+
+    return false;
 }
 
 fn isOldTopLevelSimdOrQuantImport(target: []const u8) bool {
@@ -187,10 +226,10 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
             }
         }
 
-        if (isResponsesPath(file_path) and !isResponsesInferenceBridgePath(file_path) and importTargetsInference(target)) {
+        if (isResponsesPath(file_path) and !isResponsesInferenceBoundaryPath(file_path) and importTargetsInference(target)) {
             violations += 1;
             if (emit) {
-                std.debug.print("{s}:{d}: responses must import inference only via responses/inference_bridge.zig: \"{s}\"\n", .{ file_path, line, target });
+                std.debug.print("{s}:{d}: responses must import inference only via responses/inference_boundary.zig: \"{s}\"\n", .{ file_path, line, target });
             }
         }
 
@@ -205,6 +244,34 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
             violations += 1;
             if (emit) {
                 std.debug.print("{s}:{d}: models must not import inference internals: \"{s}\"\n", .{ file_path, line, target });
+            }
+        }
+
+        if (isInferenceBackendPath(file_path) and
+            importTargetsInferencePipeline(target) and
+            !isAllowedBackendPipelineImportPath(file_path))
+        {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}:{d}: concrete backend engines must not import inference/pipeline internals: \"{s}\"\n", .{ file_path, line, target });
+            }
+        }
+    }
+
+    // The responses inference boundary must stay narrow. Re-exporting
+    // inference.root, or reaching through `inference_boundary.root`, gives
+    // responses access to concrete backend internals and defeats the boundary.
+    if (isResponsesPath(file_path)) {
+        const forbidden = [_][]const u8{
+            "pub const root = inference_abi.root",
+            "inference_boundary.root",
+        };
+        for (forbidden) |token| {
+            if (std.mem.indexOf(u8, source, token) != null) {
+                violations += 1;
+                if (emit) {
+                    std.debug.print("{s}: responses inference boundary must stay explicit, forbidden token: \"{s}\"\n", .{ file_path, token });
+                }
             }
         }
     }
@@ -290,6 +357,47 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
         }
     }
 
+    // Backend-to-backend activation movement must remain centralized in
+    // inference/transport. Pipeline may invoke the transport handoff entry
+    // points; backends may expose descriptors but must not call transfer
+    // primitives directly.
+    if (isInferencePath(file_path)) {
+        const movement_tokens = [_][]const u8{
+            "executeLocalStageTransport(",
+            "executeLocalStageTransportWithFailureCapture(",
+            "downloadExternalActivation(",
+            "uploadExternalActivation(",
+            "uploadExternalActivationSegments(",
+            "peerCopyExternalActivation(",
+            "downloadCudaActivation(",
+            "uploadCudaActivation(",
+            "uploadCudaActivationSegments(",
+            "peerCopyCudaActivation(",
+            "peerCopyCudaActivationRuntime(",
+            "copyCudaPeerActivation(",
+            "copyCudaPeerActivationAfterEvent(",
+            "downloadHostSlotActivation(",
+            "uploadHostSlotActivation(",
+            "uploadCpuKvToCudaMirrors(",
+        };
+        for (movement_tokens) |token| {
+            var search_start: usize = 0;
+            while (std.mem.indexOfPos(u8, source, search_start, token)) |offset| {
+                if (!isAllowedTransportAuthorityToken(file_path, token)) {
+                    violations += 1;
+                    if (emit) {
+                        std.debug.print("{s}:{d}: backend transition movement must route through inference/transport authority, forbidden token: \"{s}\"\n", .{
+                            file_path,
+                            lineNumberForOffset(source, offset),
+                            token,
+                        });
+                    }
+                }
+                search_start = offset + token.len;
+            }
+        }
+    }
+
     return violations;
 }
 
@@ -362,7 +470,7 @@ fn isAllowedBackendParityGap(gap: BackendParityGap, name: []const u8) bool {
         "weights.zig",
     };
 
-    // Metal currently owns execution through the runtime graph and MLX bridge,
+    // Metal currently owns execution through the runtime graph and MLX runtime,
     // so these named gaps are classified asymmetries rather than silent drift.
     // New CPU/Metal file drift still fails closed until it is classified here.
     return switch (gap) {
@@ -656,9 +764,9 @@ test "lintSource rejects runtime contract import in compute" {
     try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/cpu/capabilities.zig", src, false));
 }
 
-test "lintSource rejects bridge and scheduler imports in compute" {
+test "lintSource rejects boundary and scheduler imports in compute" {
     const src =
-        \\const bad_bridge = @import("../../responses/inference_bridge.zig");
+        \\const bad_boundary = @import("../../responses/inference_boundary.zig");
         \\const bad_scheduler = @import("../../inference/scheduler/generic.zig");
     ;
     try std.testing.expectEqual(@as(usize, 2), try lintSource(std.testing.allocator, "core/src/compute/cuda/capabilities.zig", src, false));
@@ -719,7 +827,7 @@ test "lintLoggingPolicy rejects direct C stderr logging" {
     ;
     try std.testing.expectEqual(
         @as(usize, 1),
-        lintLoggingPolicy("core/src/inference/backend/metal/mlx_bridge/bad.inc", src, false),
+        lintLoggingPolicy("core/src/inference/backend/metal/mlx_runtime/bad.inc", src, false),
     );
 }
 
@@ -751,7 +859,7 @@ test "lintInferenceProductionLexicon allows test source paths" {
 
 test "lintSource rejects models importing inference internals" {
     const src =
-        \\const bad = @import("../../inference/backend/topology.zig");
+        \\const bad = @import("../../inference/pipeline/local_pipeline_topology.zig");
     ;
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -769,13 +877,33 @@ test "lintSource rejects responses direct inference import" {
     );
 }
 
-test "lintSource allows responses inference bridge import" {
+test "lintSource allows responses inference boundary import" {
     const src =
-        \\const ok = @import("inference_bridge.zig");
+        \\const ok = @import("inference_boundary.zig");
     ;
     try std.testing.expectEqual(
         @as(usize, 0),
         try lintSource(std.testing.allocator, "core/src/responses/local.zig", src, false),
+    );
+}
+
+test "lintSource rejects responses inference root shortcut" {
+    const src =
+        \\const inference = inference_boundary.root;
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/responses/local.zig", src, false),
+    );
+}
+
+test "lintSource rejects responses boundary root export" {
+    const src =
+        \\pub const root = inference_abi.root;
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/responses/inference_boundary.zig", src, false),
     );
 }
 
@@ -870,6 +998,90 @@ test "lintSource rejects transitional compute symbol in inference" {
     try std.testing.expectEqual(
         @as(usize, 1),
         try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/executor/block.zig", src, false),
+    );
+}
+
+test "lintSource rejects concrete backend pipeline import" {
+    const src =
+        \\const pipeline = @import("../../pipeline/root.zig");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cuda/engine.zig", src, false),
+    );
+}
+
+test "lintSource allows backend pipeline imports only at stage boundary surfaces" {
+    const src =
+        \\const pipeline = @import("../../../pipeline/root.zig");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cuda/interface/stage_executor.zig", src, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cuda/stage_capabilities.zig", src, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/root.zig", src, false),
+    );
+}
+
+test "lintSource rejects backend direct transport movement primitive" {
+    const src =
+        \\const transport = @import("../../transport/root.zig");
+        \\pub fn bad() !void {
+        \\    try transport.uploadCudaActivation(null, 0, &.{}, 0);
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cuda/engine.zig", src, false),
+    );
+}
+
+test "lintSource rejects external activation movement outside pipeline handoff adapter" {
+    const src =
+        \\const transport = @import("../../transport/root.zig");
+        \\pub fn bad() !void {
+        \\    try transport.downloadExternalActivation(undefined, &.{}, 0);
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cuda/engine.zig", src, false),
+    );
+}
+
+test "lintSource allows pipeline runtime transport handoff entrypoints" {
+    const src =
+        \\const transport = @import("../transport/root.zig");
+        \\pub fn ok() !void {
+        \\    try transport.downloadExternalActivation(undefined, &.{}, 0);
+        \\    try transport.uploadExternalActivation(undefined, &.{}, 0);
+        \\    try transport.uploadExternalActivationSegments(undefined, &.{}, 0);
+        \\    try transport.peerCopyExternalActivation(undefined, undefined, 0);
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/inference/pipeline/local_pipeline_runtime.zig", src, false),
+    );
+}
+
+test "lintSource allows transport module movement primitives" {
+    const src =
+        \\pub fn ok() !void {
+        \\    try uploadCudaActivation(null, 0, &.{}, 0);
+        \\    try peerCopyCudaActivation(null, null, 0, .source_stream);
+        \\    try uploadCpuKvToCudaMirrors(null, null, 0, 0, 0);
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/inference/transport/cuda_activation.zig", src, false),
     );
 }
 

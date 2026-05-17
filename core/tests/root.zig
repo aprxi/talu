@@ -71,8 +71,8 @@ pub const models_loader = @import("models/loader/root.zig");
 pub const models_config_model_description = @import("models/config/model_description_test.zig");
 pub const models_config_generation = @import("models/config/generation_config_test.zig");
 
-// inference bridge (backend-neutral staged runtime contracts)
-pub const inference_bridge = @import("inference/bridge/root.zig");
+// inference pipeline (backend-neutral staged runtime contracts)
+pub const inference_pipeline = @import("inference/pipeline/root.zig");
 pub const inference_backend_cpu_transport_endpoint = @import("inference/backend/cpu/interface_transport_endpoint_test.zig");
 
 // responses conversation state (conversation / item / reasoning types)

@@ -22,7 +22,6 @@ const trace = @import("xray_pkg").trace;
 const load_transforms = @import("models_pkg").load.transforms;
 const vision_types = @import("../../vision_types.zig");
 const common_mrope = @import("../../vision_mrope.zig");
-const bridge = @import("../../bridge/root.zig");
 const smoke_checks = @import("selftest.zig");
 const attention_policy = @import("attention_policy.zig");
 const attention_mod = @import("attention_path.zig");
@@ -31,7 +30,7 @@ const prefill_mod = @import("prefill.zig");
 const preflight = @import("route_preflight.zig");
 const shared_scheduler = @import("../../scheduler/contracts.zig");
 const progress_mod = @import("progress_pkg");
-const sampling_mod = @import("../../sampling.zig");
+const sampling_mod = @import("../../sampling/root.zig");
 const sampling_policy = sampling_mod.policy;
 const vision_runtime_mod = @import("vision.zig");
 const cpu_kernels = @import("../cpu/kernels/root.zig");
@@ -561,8 +560,6 @@ pub const CudaBackend = struct {
     /// Whether standalone layer-scalar multipliers are applied in CUDA decode paths.
     enable_layer_scalars: bool = false,
 
-    const LocalCudaTransferMode = enum { none, peer_to_peer, host_staged };
-
     const max_state_bindings_per_slot: usize = runtime_contract.max_state_descriptors;
 
     /// Per-slot KV cache, gated delta, and shortconv state buffer pointers.
@@ -634,12 +631,31 @@ pub const CudaBackend = struct {
     pub const InitOptions = struct {
         device_ordinal: usize = 0,
         /// Restricts layer-dependent allocations to [start, end). Multi-stage
-        /// bridge runtimes pass this for CUDA stage executors; single-stage
+        /// pipeline runtimes pass this for CUDA stage executors; single-stage
         /// CUDA leaves it null and owns the full model range.
         layer_range: ?struct { start: usize, end: usize } = null,
+        /// Whether this backend instance owns token embedding input.
+        /// The caller supplies this from the validated stage contract.
+        owns_embedding: bool = true,
+        /// Whether this backend instance owns final normalization/projection.
+        /// The caller supplies this from the validated stage contract.
+        owns_projection: bool = true,
         /// Progress context for "Devices" progress bar.
         progress: progress_mod.Context = progress_mod.Context.NONE,
     };
+
+    pub const StageRuntimeSurface = struct {
+        skip_embedding: bool,
+        skip_projection: bool,
+    };
+
+    /// Translate explicit stage ownership into runtime allocation flags.
+    pub fn computeStageRuntimeSurface(init_options: InitOptions) StageRuntimeSurface {
+        return .{
+            .skip_embedding = !init_options.owns_embedding,
+            .skip_projection = !init_options.owns_projection,
+        };
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -876,6 +892,7 @@ pub const CudaBackend = struct {
         // from the split points so BlockRuntime only allocates the needed layers.
         const total_layers = loaded.blocks.len;
         const layer_range = try computeInitLayerRange(init_options, total_layers, loaded.config);
+        const stage_surface = computeStageRuntimeSurface(init_options);
         backend.stage_layer_start = layer_range.start;
         backend.block_runtime = BlockRuntime.initRange(
             allocator,
@@ -951,8 +968,8 @@ pub const CudaBackend = struct {
             backend.max_batch_size,
             @max(@as(usize, 1), backend.block_runtime.attention_block_count),
             @max(@as(usize, 1), backend.block_runtime.gated_delta_block_count),
-            layer_range.start > 0, // skip_embedding: intermediate stage receives hidden states
-            layer_range.end < total_layers, // skip_projection: intermediate stage doesn't compute logits
+            stage_surface.skip_embedding,
+            stage_surface.skip_projection,
         ) catch |err| {
             log.warn("inference", "CUDA runtime buffer init failed", .{
                 .reason = @errorName(err),
@@ -2434,7 +2451,7 @@ pub const CudaBackend = struct {
             const row_start = std.math.mul(usize, row_index, top_k) catch return error.InvalidArgument;
             const row_end = std.math.add(usize, row_start, top_k) catch return error.InvalidArgument;
             if (row_end > topk_shape.total_candidates) return error.InvalidArgument;
-            candidate_counts_out[row_index] = try bridge.local_stage_runtime.extractTopKFromHostLogitsRow(
+            candidate_counts_out[row_index] = try sampling_policy.extractTopKFromHostLogitsRow(
                 row_logits,
                 top_k,
                 candidate_logits_out[row_start..row_end],
@@ -3055,7 +3072,7 @@ pub const CudaBackend = struct {
             .gate_up_unfused_calls = saturatingAddU64(primary.gate_up_unfused_calls, secondary.gate_up_unfused_calls),
             .attention_fused_heads_f16_kv = saturatingAddU64(primary.attention_fused_heads_f16_kv, secondary.attention_fused_heads_f16_kv),
             .attention_heads_f16_kv = saturatingAddU64(primary.attention_heads_f16_kv, secondary.attention_heads_f16_kv),
-            .attention_heads_lowbit_bridge_f16_kv = saturatingAddU64(primary.attention_heads_lowbit_bridge_f16_kv, secondary.attention_heads_lowbit_bridge_f16_kv),
+            .attention_heads_lowbit_dequant_f16_kv = saturatingAddU64(primary.attention_heads_lowbit_dequant_f16_kv, secondary.attention_heads_lowbit_dequant_f16_kv),
             .attention_fused_heads_i8_kv = saturatingAddU64(primary.attention_fused_heads_i8_kv, secondary.attention_fused_heads_i8_kv),
             .attention_heads_i8_kv = saturatingAddU64(primary.attention_heads_i8_kv, secondary.attention_heads_i8_kv),
             .attention_fused_heads_fp8_kv = saturatingAddU64(primary.attention_fused_heads_fp8_kv, secondary.attention_fused_heads_fp8_kv),
@@ -3063,7 +3080,7 @@ pub const CudaBackend = struct {
             .attention_heads_f32_kv = saturatingAddU64(primary.attention_heads_f32_kv, secondary.attention_heads_f32_kv),
             .attention_fused_heads_f16_kv_ns = saturatingAddU64(primary.attention_fused_heads_f16_kv_ns, secondary.attention_fused_heads_f16_kv_ns),
             .attention_heads_f16_kv_ns = saturatingAddU64(primary.attention_heads_f16_kv_ns, secondary.attention_heads_f16_kv_ns),
-            .attention_heads_lowbit_bridge_f16_kv_ns = saturatingAddU64(primary.attention_heads_lowbit_bridge_f16_kv_ns, secondary.attention_heads_lowbit_bridge_f16_kv_ns),
+            .attention_heads_lowbit_dequant_f16_kv_ns = saturatingAddU64(primary.attention_heads_lowbit_dequant_f16_kv_ns, secondary.attention_heads_lowbit_dequant_f16_kv_ns),
             .attention_fused_heads_i8_kv_ns = saturatingAddU64(primary.attention_fused_heads_i8_kv_ns, secondary.attention_fused_heads_i8_kv_ns),
             .attention_heads_i8_kv_ns = saturatingAddU64(primary.attention_heads_i8_kv_ns, secondary.attention_heads_i8_kv_ns),
             .attention_fused_heads_fp8_kv_ns = saturatingAddU64(primary.attention_fused_heads_fp8_kv_ns, secondary.attention_fused_heads_fp8_kv_ns),
@@ -3140,7 +3157,7 @@ pub const CudaBackend = struct {
         const attn_tensorcore_ns = phase_delta.attentionTensorCoreNsApprox();
         const attn_scalar_ns = phase_delta.attentionScalarNsApprox();
         const attn_custom_f16_ns = phase_delta.attentionCustomF16Ns();
-        const attn_tensorcore_contract = "heads_f16_kv + heads_lowbit_bridge_f16_kv (GEMM f16 routes)";
+        const attn_tensorcore_contract = "heads_f16_kv + heads_lowbit_dequant_f16_kv (GEMM f16 routes)";
         const attn_scalar_contract = "heads/fused i8+fp8 and heads_f32 (non-GEMM buckets)";
         const attn_custom_f16_contract = "fused_heads_f16_kv custom-kernel bucket";
         const ns_to_ms = 1_000_000.0;
@@ -3171,7 +3188,7 @@ pub const CudaBackend = struct {
             .gate_up_unfused = phase_delta.gate_up_unfused_calls,
             .attn_fused_f16 = phase_delta.attention_fused_heads_f16_kv,
             .attn_heads_f16 = phase_delta.attention_heads_f16_kv,
-            .attn_heads_lowbit_bridge_f16 = phase_delta.attention_heads_lowbit_bridge_f16_kv,
+            .attn_heads_lowbit_dequant_f16 = phase_delta.attention_heads_lowbit_dequant_f16_kv,
             .attn_fused_i8 = phase_delta.attention_fused_heads_i8_kv,
             .attn_heads_i8 = phase_delta.attention_heads_i8_kv,
             .attn_fused_fp8 = phase_delta.attention_fused_heads_fp8_kv,
@@ -3181,7 +3198,7 @@ pub const CudaBackend = struct {
             .attn_scalar_ms = @as(f64, @floatFromInt(attn_scalar_ns)) / ns_to_ms,
             .attn_custom_f16_ms = @as(f64, @floatFromInt(attn_custom_f16_ns)) / ns_to_ms,
             .attn_heads_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_f16_kv_ns)) / ns_to_ms,
-            .attn_heads_lowbit_bridge_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_lowbit_bridge_f16_kv_ns)) / ns_to_ms,
+            .attn_heads_lowbit_dequant_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_lowbit_dequant_f16_kv_ns)) / ns_to_ms,
             .attn_fused_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_fused_heads_f16_kv_ns)) / ns_to_ms,
             .attn_heads_i8_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_i8_kv_ns)) / ns_to_ms,
             .attn_fused_i8_ms = @as(f64, @floatFromInt(phase_delta.attention_fused_heads_i8_kv_ns)) / ns_to_ms,
@@ -3210,7 +3227,7 @@ pub const CudaBackend = struct {
             .attention_batched_prefill_calls = phase_delta.attention_batched_prefill_calls,
             .attn_fused_f16 = phase_delta.attention_fused_heads_f16_kv,
             .attn_heads_f16 = phase_delta.attention_heads_f16_kv,
-            .attn_heads_lowbit_bridge_f16 = phase_delta.attention_heads_lowbit_bridge_f16_kv,
+            .attn_heads_lowbit_dequant_f16 = phase_delta.attention_heads_lowbit_dequant_f16_kv,
             .attn_fused_i8 = phase_delta.attention_fused_heads_i8_kv,
             .attn_heads_i8 = phase_delta.attention_heads_i8_kv,
             .attn_fused_fp8 = phase_delta.attention_fused_heads_fp8_kv,
@@ -3220,7 +3237,7 @@ pub const CudaBackend = struct {
             .attn_scalar_ms = @as(f64, @floatFromInt(attn_scalar_ns)) / ns_to_ms,
             .attn_custom_f16_ms = @as(f64, @floatFromInt(attn_custom_f16_ns)) / ns_to_ms,
             .attn_heads_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_f16_kv_ns)) / ns_to_ms,
-            .attn_heads_lowbit_bridge_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_lowbit_bridge_f16_kv_ns)) / ns_to_ms,
+            .attn_heads_lowbit_dequant_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_lowbit_dequant_f16_kv_ns)) / ns_to_ms,
             .attn_fused_f16_ms = @as(f64, @floatFromInt(phase_delta.attention_fused_heads_f16_kv_ns)) / ns_to_ms,
             .attn_heads_i8_ms = @as(f64, @floatFromInt(phase_delta.attention_heads_i8_kv_ns)) / ns_to_ms,
             .attn_fused_i8_ms = @as(f64, @floatFromInt(phase_delta.attention_fused_heads_i8_kv_ns)) / ns_to_ms,

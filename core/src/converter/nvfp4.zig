@@ -1978,7 +1978,7 @@ fn captureActivationCacheBestEffort(
     }
     if (!calibration_capture.isAvailable()) {
         std.debug.print(
-            "NVFP4 convert failed: replay=xray requires xray bridge. Rebuild with -Dxray_bridge=true.\n",
+            "NVFP4 convert failed: replay=xray requires xray pipeline. Rebuild with -Dxray_pipeline=true.\n",
             .{},
         );
         return error.Nvfp4ReplayRequiresActivationCapture;

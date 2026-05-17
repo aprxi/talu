@@ -1,6 +1,6 @@
 //! Model-owned performance hint metadata.
 //!
-//! This module is the bridge between:
+//! This module is the boundary between:
 //! 1. inference-facing `xray` output (`core/src/inference/` call sites / points)
 //! 2. compute-facing CPU benchmark rows (`core/bench/compute/cpu`)
 //!

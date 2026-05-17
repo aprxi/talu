@@ -3,16 +3,16 @@
 //! This module is the inference boundary used by responses/bindings:
 //! - `types` - generation request/result types
 //! - `sampling` - token sampling policies
-//! - `scheduler` - continuous batching runtime
-//! - `backend` - CPU/Metal/CUDA inference backends
+//! - `scheduler` - continuous batching and execution-target selection
+//! - `backend` - concrete CPU/Metal/CUDA inference backends
 
 const std = @import("std");
 
-pub const sampling = @import("sampling.zig");
-pub const scheduler = @import("scheduler.zig");
+pub const sampling = @import("sampling/root.zig");
+pub const scheduler = @import("scheduler/root.zig");
 pub const vision_types = @import("vision_types.zig");
 pub const runtime_contract = @import("runtime_contract_pkg");
-pub const bridge = @import("bridge/root.zig");
+pub const pipeline = @import("pipeline/root.zig");
 pub const transport = @import("transport/root.zig");
 pub const diagnostics = @import("diagnostics/root.zig");
 
@@ -101,11 +101,5 @@ pub const SchedulerSubmitOptions = scheduler.Scheduler.SubmitOptions;
 // Internal API (for core/src/ only)
 // =============================================================================
 
-/// Backend implementations
-pub const backend = struct {
-    pub const cpu = @import("backend/cpu/root.zig");
-    pub const metal = @import("backend/metal/root.zig");
-    pub const cuda = @import("backend/cuda/root.zig");
-    // Re-export inference behavioral type used by dump/xray tooling.
-    pub const FusedCpuBackend = cpu.FusedCpuBackend;
-};
+/// Concrete backend implementations and backend-local types.
+pub const backend = @import("backend/root.zig");

@@ -20,7 +20,7 @@ pub const kernels = @import("contract_kernels.zig");
 pub const interface = @import("interface/root.zig");
 pub const stage_capabilities = @import("stage_capabilities.zig");
 pub const scheduler = @import("scheduler.zig");
-pub const sampling = @import("../../sampling.zig");
+pub const sampling = @import("../../sampling/root.zig");
 
 pub const testing = if (builtin.is_test) struct {
     pub const engine = engine_mod;

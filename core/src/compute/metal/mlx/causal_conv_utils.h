@@ -1,4 +1,4 @@
-// MLX Bridge - shared causal-conv sequence utilities.
+// MLX Runtime - shared causal-conv sequence utilities.
 //
 // This helper keeps dense and fused paths on one vectorized convolution
 // implementation: no token-by-token graph construction in hot paths.

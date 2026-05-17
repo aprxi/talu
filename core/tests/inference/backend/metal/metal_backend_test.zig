@@ -241,7 +241,7 @@ test "metal backend xray record+verify capture path is stable under repeated run
     }
 }
 
-test "metal bridge grouped-affine moe gpu path matches reference implementation" {
+test "metal runtime grouped-affine moe gpu path matches reference implementation" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_grouped_affine_moe_gpu_path();
@@ -251,7 +251,7 @@ test "metal bridge grouped-affine moe gpu path matches reference implementation"
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge nvfp4 moe gather path matches reference implementation" {
+test "metal runtime nvfp4 moe gather path matches reference implementation" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_nvfp4_moe_gather_path();
@@ -261,7 +261,7 @@ test "metal bridge nvfp4 moe gather path matches reference implementation" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge depthwise conv decode step matches conv1d" {
+test "metal runtime depthwise conv decode step matches conv1d" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_depthwise_conv_decode_step();
@@ -271,7 +271,7 @@ test "metal bridge depthwise conv decode step matches conv1d" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge single-query attention matches sdpa" {
+test "metal runtime single-query attention matches sdpa" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_single_query_attention_matches_sdpa();
@@ -281,7 +281,7 @@ test "metal bridge single-query attention matches sdpa" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge kv cache reserve preserves prefix" {
+test "metal runtime kv cache reserve preserves prefix" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_kv_cache_reserve_preserves_prefix();
@@ -291,7 +291,7 @@ test "metal bridge kv cache reserve preserves prefix" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge shared expert gate-up fusion matches split projections" {
+test "metal runtime shared expert gate-up fusion matches split projections" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_shared_expert_gate_up_fusion();
@@ -301,7 +301,7 @@ test "metal bridge shared expert gate-up fusion matches split projections" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge dense mlp gate-up fusion matches split projections" {
+test "metal runtime dense mlp gate-up fusion matches split projections" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_dense_mlp_gate_up_fusion();
@@ -311,7 +311,7 @@ test "metal bridge dense mlp gate-up fusion matches split projections" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge full attention qkv fusion matches split projections" {
+test "metal runtime full attention qkv fusion matches split projections" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_full_attention_qkv_fusion();
@@ -321,7 +321,7 @@ test "metal bridge full attention qkv fusion matches split projections" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge grouped-affine prefill cache helper matches dense prefill and preserves decode qmm path" {
+test "metal runtime grouped-affine prefill cache helper matches dense prefill and preserves decode qmm path" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_grouped_affine_prefill_cache_helper();
@@ -331,7 +331,7 @@ test "metal bridge grouped-affine prefill cache helper matches dense prefill and
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge gated-delta recurrence does not renormalize q and k internally" {
+test "metal runtime gated-delta recurrence does not renormalize q and k internally" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_gated_delta_no_double_qk_norm();
@@ -341,7 +341,7 @@ test "metal bridge gated-delta recurrence does not renormalize q and k internall
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge rmsnorm-gated kernel matches reference path" {
+test "metal runtime rmsnorm-gated kernel matches reference path" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_rmsnorm_gated_kernel_matches_reference();
@@ -351,7 +351,7 @@ test "metal bridge rmsnorm-gated kernel matches reference path" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge chunked prefill tail matches full prompt logits" {
+test "metal runtime chunked prefill tail matches full prompt logits" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_chunked_prefill_tail_matches_full_prompt();
@@ -361,7 +361,7 @@ test "metal bridge chunked prefill tail matches full prompt logits" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge fused linear grouped-affine in-proj reuses captured quantized payload" {
+test "metal runtime fused linear grouped-affine in-proj reuses captured quantized payload" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_linear_attention_fused_quant_inproj_reuse();
@@ -371,7 +371,7 @@ test "metal bridge fused linear grouped-affine in-proj reuses captured quantized
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge nvfp4 fused in-proj row-wise post-scale matches split decode" {
+test "metal runtime nvfp4 fused in-proj row-wise post-scale matches split decode" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_nvfp4_rowwise_post_scale_linear_decode();
@@ -381,7 +381,7 @@ test "metal bridge nvfp4 fused in-proj row-wise post-scale matches split decode"
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge detects nvfp4 scheme in talu_meta json" {
+test "metal runtime detects nvfp4 scheme in talu_meta json" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_talu_meta_nvfp4_detection();
@@ -391,7 +391,7 @@ test "metal bridge detects nvfp4 scheme in talu_meta json" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge enables mmap strict mode for pure nvfp4 checkpoints" {
+test "metal runtime enables mmap strict mode for pure nvfp4 checkpoints" {
     const status = mlx_test_nvfp4_mmap_strict_policy();
     if (status != 1) {
         std.debug.print("mlx nvfp4 mmap strict policy self-test failed: {s}\n", .{std.mem.span(mlx_last_error())});
@@ -399,7 +399,7 @@ test "metal bridge enables mmap strict mode for pure nvfp4 checkpoints" {
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge dense lm_head lhs primary matches explicit transpose matmul" {
+test "metal runtime dense lm_head lhs primary matches explicit transpose matmul" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_dense_lm_head_lhs_primary();
@@ -409,7 +409,7 @@ test "metal bridge dense lm_head lhs primary matches explicit transpose matmul" 
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge grouped-affine embedding lookup dequantizes selected token rows correctly" {
+test "metal runtime grouped-affine embedding lookup dequantizes selected token rows correctly" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_grouped_affine_embedding_lookup_matches_reference();
@@ -419,7 +419,7 @@ test "metal bridge grouped-affine embedding lookup dequantizes selected token ro
     try std.testing.expectEqual(@as(c_int, 1), status);
 }
 
-test "metal bridge top-k candidate extraction supports top_k greater than one" {
+test "metal runtime top-k candidate extraction supports top_k greater than one" {
     if (!canRunMetalRuntime()) return;
 
     const status = mlx_test_topk_candidate_extraction_multi();

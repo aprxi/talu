@@ -14,7 +14,7 @@ const progress_api = @import("progress_pkg");
 
 const ProgressContext = progress_api.Context;
 
-/// Context for byte-level progress callback bridge.
+/// Context for byte-level progress callback pipeline.
 /// Adapts http.ProgressCallback to the unified progress API.
 const ByteProgressContext = struct {
     progress: ProgressContext,
@@ -24,7 +24,7 @@ const ByteProgressContext = struct {
     last_percent: i64,
 };
 
-/// Bridge callback from http.ProgressCallback to unified progress API.
+/// Adapter callback from http.ProgressCallback to unified progress API.
 fn byteProgressCallback(downloaded: u64, total: u64, user_data: ?*anyopaque) void {
     const ctx: *ByteProgressContext = @ptrCast(@alignCast(user_data orelse return));
     // Update the byte progress line (line_id=1)

@@ -1,7 +1,7 @@
 //! Xray-owned staged-frame metadata capture.
 //!
 //! This module stores copied boundary metadata facts only. It has no dependency
-//! on runtime bridge contracts and does not inspect tensor payload bytes.
+//! on runtime pipeline contracts and does not inspect tensor payload bytes.
 
 const std = @import("std");
 

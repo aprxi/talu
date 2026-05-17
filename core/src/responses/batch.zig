@@ -14,37 +14,34 @@
 
 const std = @import("std");
 const local_mod = @import("local.zig");
-const capi_bridge = @import("capi_bridge.zig");
+const capi_boundary = @import("capi_boundary.zig");
 const tool_schema_mod = @import("tool_schema.zig");
 const commit_mod = @import("commit.zig");
 const conversation_mod = @import("conversation/root.zig");
 const protocol = @import("protocol/root.zig");
-const inference_bridge = @import("inference_bridge.zig");
-const inference = inference_bridge.root;
-const inference_types = inference.types;
+const inference_boundary = @import("inference_boundary.zig");
+const inference_types = inference_boundary.types;
 const FinishReason = inference_types.FinishReason;
-const sampler_mod = inference.sampling;
+const sampler_mod = inference_boundary.sampling;
 const validate_mod = @import("validate_pkg");
 const ConstrainedSampler = validate_mod.sampler.ConstrainedSampler;
 const GrammarConfig = validate_mod.sampler.GrammarConfig;
-const gen_config_mod = inference_bridge.generation_config;
+const gen_config_mod = inference_boundary.generation_config;
 const chat_template = @import("../template/chat_template.zig");
-const backend_root = inference_bridge.backend;
-const Backend = backend_root.Backend;
 const log = @import("log_pkg");
 const error_context = @import("error_context_pkg");
 
 const LocalEngine = local_mod.LocalEngine;
-const BackendScheduler = local_mod.BackendScheduler;
+const ExecutionScheduler = local_mod.ExecutionScheduler;
 const SchedulerConfig = local_mod.SchedulerConfig;
 const Chat = conversation_mod.Chat;
 const ItemType = conversation_mod.ItemType;
 const ContentType = conversation_mod.ContentType;
 
 const GenerateOptions = local_mod.GenerateOptions;
-const CGenerateConfig = capi_bridge.CGenerateConfig;
-const CFinishReason = capi_bridge.CFinishReason;
-const CToolCallRef = capi_bridge.CToolCallRef;
+const CGenerateConfig = capi_boundary.CGenerateConfig;
+const CFinishReason = capi_boundary.CFinishReason;
+const CToolCallRef = capi_boundary.CToolCallRef;
 
 const allocator = std.heap.c_allocator;
 
@@ -214,7 +211,7 @@ const RequestState = struct {
 /// Adds per-request state for decoding, reasoning filtering, grammar
 /// constraints, and result assembly. The caller drives the step loop.
 pub const BatchWrapper = struct {
-    scheduler: BackendScheduler,
+    scheduler: ExecutionScheduler,
     engine: *LocalEngine,
     requests: std.AutoHashMap(u64, *RequestState),
     completed_results: std.AutoHashMap(u64, *BatchResult),
@@ -272,7 +269,7 @@ pub const BatchWrapper = struct {
         // Build GenerateOptions from C config. Batch requests outlive this
         // submit call, so any allocated option payloads are transferred into
         // RequestState before the scheduler stores borrowed slices.
-        var built = try capi_bridge.buildOptions(allocator, config, self.engine);
+        var built = try capi_boundary.buildOptions(allocator, config, self.engine);
         defer built.deinit(allocator);
         if (built.options.external_vision_input != null) {
             error_context.setContext("batch generation does not support external vision prefill yet", .{});

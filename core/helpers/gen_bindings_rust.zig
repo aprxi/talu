@@ -483,7 +483,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
     // Check for type aliases (e.g., RemoteModelListResult -> CRemoteModelListResult)
     if (eql(zig_type, "RemoteModelListResult")) return "CRemoteModelListResult";
     if (eql(zig_type, "RemoteModelInfo")) return "CRemoteModelInfo";
-    // Router config is an alias to CGenerateConfig in capi_bridge.zig.
+    // Router config is an alias to CGenerateConfig in capi_boundary.zig.
     if (eql(zig_type, "RouterGenerateConfig")) return "CGenerateConfig";
 
     // Check for double-pointer output param pattern: ?*?*Type or *?*Type

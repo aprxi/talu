@@ -1,45 +1,59 @@
-//! CPU implementation of the backend transport endpoint descriptor interface.
+//! CPU implementation of the backend external activation surface interface.
+//!
+//! These functions expose only CPU-owned activation inputs/outputs. They do not
+//! select routes, inspect adjacent stages, or perform handoff copies.
 
-const bridge = @import("../../../bridge/root.zig");
+const pipeline = @import("../../../pipeline/root.zig");
 
 pub const supports_transport_endpoint_descriptors = true;
 
-pub const HostActivationSlice = struct {
+pub const HostActivationOutput = struct {
     bytes: []const u8,
 };
 
-pub const HostActivationTarget = struct {
+pub const HostActivationInput = struct {
     bytes: []u8,
 };
 
-pub fn deviceLocationHint(_: anytype) !bridge.TensorFramePayloadLocationHint {
+pub fn deviceLocationHint(_: anytype) !pipeline.TensorFramePayloadLocationHint {
     return .{ .cpu = {} };
 }
 
-pub fn hostDecodeActivationSlice(backend: anytype, slot_index: usize, byte_count: usize) !HostActivationSlice {
+pub fn decodeExternalOutput(backend: anytype, slot_index: usize, byte_count: usize) !HostActivationOutput {
     const bytes = backend.slotActivationBytes(slot_index);
     if (byte_count > bytes.len) return error.InvalidArgument;
     return .{ .bytes = bytes[0..byte_count] };
 }
 
-pub fn hostPrefillActivationSlice(backend: anytype, byte_count: usize) !HostActivationSlice {
-    const bytes = backend.localPrefillActivationBytes(byte_count);
+pub fn prefillExternalOutput(backend: anytype, byte_count: usize) !HostActivationOutput {
+    const BackendType = @TypeOf(backend.*);
+    const bytes = if (comptime hasDecl(BackendType, "ensureLocalPrefillActivationBytes"))
+        try backend.ensureLocalPrefillActivationBytes(byte_count)
+    else
+        backend.localPrefillActivationBytes(byte_count);
     if (byte_count > bytes.len) return error.InvalidArgument;
     return .{ .bytes = bytes[0..byte_count] };
 }
 
-pub fn decodeInputBuffer(backend: anytype, slot_index: usize, byte_count: usize) !HostActivationTarget {
-    const target = backend.slotActivationBytesMut(slot_index);
-    if (byte_count > target.len) return error.InvalidArgument;
-    return .{ .bytes = target[0..byte_count] };
+pub fn decodeExternalInput(backend: anytype, slot_index: usize, byte_count: usize) !HostActivationInput {
+    const input = backend.slotActivationBytesMut(slot_index);
+    if (byte_count > input.len) return error.InvalidArgument;
+    return .{ .bytes = input[0..byte_count] };
 }
 
-pub fn prefillInputBuffer(backend: anytype, byte_count: usize) !HostActivationTarget {
-    const target = backend.localPrefillActivationBytesMut(byte_count);
-    if (byte_count > target.len) return error.InvalidArgument;
-    return .{ .bytes = target[0..byte_count] };
+pub fn prefillExternalInput(backend: anytype, byte_count: usize) !HostActivationInput {
+    const input = backend.localPrefillActivationBytesMut(byte_count);
+    if (byte_count > input.len) return error.InvalidArgument;
+    return .{ .bytes = input[0..byte_count] };
 }
 
-pub fn sideInputBuffer(_: anytype, _: usize) !HostActivationTarget {
+pub fn sideExternalInput(_: anytype, _: usize) !HostActivationInput {
     return error.UnsupportedContentType;
+}
+
+fn hasDecl(comptime T: type, comptime name: []const u8) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, name),
+        else => false,
+    };
 }

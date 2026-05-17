@@ -1620,7 +1620,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         cast_f32_to_f16_function,
                         causal_softmax_f32_fn,
                     );
-                    attention_path = .heads_lowbit_bridge_f16_kv;
+                    attention_path = .heads_lowbit_dequant_f16_kv;
                 } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
@@ -1776,7 +1776,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         cast_f32_to_f16_function,
                         causal_softmax_f32_fn,
                     );
-                    attention_path = .heads_lowbit_bridge_f16_kv;
+                    attention_path = .heads_lowbit_dequant_f16_kv;
                 } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
@@ -2599,7 +2599,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         cast_f32_to_f16_function,
                         causal_softmax_f32_fn,
                     );
-                    attention_path = .heads_lowbit_bridge_f16_kv;
+                    attention_path = .heads_lowbit_dequant_f16_kv;
                 } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
@@ -2753,7 +2753,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         cast_f32_to_f16_function,
                         causal_softmax_f32_fn,
                     );
-                    attention_path = .heads_lowbit_bridge_f16_kv;
+                    attention_path = .heads_lowbit_dequant_f16_kv;
                 } else if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,

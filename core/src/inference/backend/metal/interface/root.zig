@@ -1,4 +1,4 @@
-//! Metal backend interface surface used by bridge and transport.
+//! Metal backend interface surface used by pipeline and transport.
 //!
 //! Local stage execution is intentionally fail-closed until the Metal stage
 //! executor implementation lands.

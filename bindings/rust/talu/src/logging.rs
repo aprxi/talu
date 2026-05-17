@@ -55,7 +55,7 @@ pub struct CoreLogRecord {
     pub line: Option<u32>,
 }
 
-/// Callback for core log bridge records.
+/// Callback for core log boundary records.
 pub type CoreLogCallback = fn(&CoreLogRecord);
 
 static CORE_LOG_CALLBACK: OnceLock<RwLock<Option<CoreLogCallback>>> = OnceLock::new();
@@ -192,7 +192,7 @@ pub fn get_log_format() -> LogFormat {
     }
 }
 
-/// Install or clear the core log callback bridge.
+/// Install or clear the core log callback pipeline.
 ///
 /// The callback receives copied (owned) data and may outlive the FFI frame.
 pub fn set_core_log_callback(callback: Option<CoreLogCallback>) {

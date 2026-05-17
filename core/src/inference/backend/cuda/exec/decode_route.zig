@@ -179,7 +179,7 @@ pub fn executeDecodeWithLayerLimit(
         global_rope_theta;
 
     if (use_preloaded_input) {
-        // Stage boundary handoff path: input_dev is already populated by caller.
+        // External activation input was already populated by pipeline/transport.
     } else if (hidden_override) |hidden| {
         if (hidden.len != self.d_model) return error.InvalidArgument;
         @memcpy(self.runtime_buffers.hidden_host, hidden);
@@ -298,8 +298,8 @@ pub fn executeDecodeWithLayerLimit(
     var per_layer_source_embeddings_opt: ?compute.cuda.Buffer = null;
     if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
         if (use_preloaded_input) {
-            // Bridge handoff mode: input_dev starts with prior-stage hidden
-            // states. Per-layer branch features still need source embeddings.
+            // External activation input starts in input_dev. Per-layer branch
+            // features still need source embeddings.
             if (per_layer_branch_feature.hasPerLayerBranchRuntime(self)) {
                 per_layer_source_embeddings_opt = per_layer_branch_feature.capturePerLayerSourceEmbeddingsForLocalStage(self, token) catch |err| blk: {
                     log.warn("inference", "CUDA capturePerLayerSourceEmbeddingsForLocalStage failed", .{
@@ -315,8 +315,8 @@ pub fn executeDecodeWithLayerLimit(
     }
     const gemma_token_id_single = [_]u32{token};
 
-    // Bridge handoff mode: input_dev was populated by transport before this
-    // stage runs. Synchronize compute_stream before reading that input.
+    // input_dev was populated by transport before this stage runs. Synchronize
+    // compute_stream before reading that external input.
     if (use_preloaded_input) {
         if (self.compute_stream) |stream| {
             try self.device.synchronizeStream(stream);
@@ -635,12 +635,12 @@ pub fn executeDecodeWithLayerLimit(
         self.loadKvSlot(slot_index);
 
         if (!compute_logits) {
-            // Stage handoff invariant: when skipping logits, publish the final hidden
-            // row to input_dev so the next stage can consume a deterministic buffer.
+            // External output invariant: when skipping logits, publish the final
+            // hidden row to input_dev so pipeline/transport can expose it.
             if (final_hidden.pointer != self.runtime_buffers.input_dev.pointer) {
                 try self.runtime_buffers.input_dev.copyFrom(&self.device, &final_hidden, row_bytes);
             }
-            // Finalize graph capture for non-logit stage (local CUDA source stage).
+            // Finalize graph capture for non-logit layer-range execution.
             // The copyFrom above uses async DtoD when a stream is set, so it is
             // captured into the graph alongside the layer kernels.
             if (graph_capture_active) {

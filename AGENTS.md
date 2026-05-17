@@ -111,7 +111,7 @@ Build & test entrypoints for canonical commands. Do not guess.
     zig build release -Drelease                # build library + CLI + copy to Python
     zig build test-<module> -Drelease          # run unit tests for a module
     zig build test-integration -Drelease       # run integration tests
-    zig build release -Drelease -Dxray_bridge=true # xray debug
+    zig build release -Drelease -Dxray_pipeline=true # xray debug
 
 
 Per-module test steps (match test scope to your changes):

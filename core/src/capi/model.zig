@@ -1,6 +1,6 @@
 //! C API for model metadata/config retrieval.
 //!
-//! This module is a thin FFI bridge. All retrieval/parsing logic lives in
+//! This module is a thin FFI boundary. All retrieval/parsing logic lives in
 //! `io/model_config.zig`.
 
 const std = @import("std");

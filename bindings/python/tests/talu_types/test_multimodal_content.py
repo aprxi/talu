@@ -111,7 +111,7 @@ class TestInputImage:
             InputImage.from_file(tmp_path / "nonexistent.png")
 
     def test_to_dict(self):
-        """to_dict returns proper format for Zig bridge."""
+        """to_dict returns proper format for Zig pipeline."""
         img = InputImage.from_bytes(b"test", mime_type="image/png", detail="high")
         d = img.to_dict()
 
@@ -179,7 +179,7 @@ class TestInputAudio:
             InputAudio.from_file(tmp_path / "nonexistent.wav")
 
     def test_to_dict(self):
-        """to_dict returns proper format for Zig bridge."""
+        """to_dict returns proper format for Zig pipeline."""
         audio = InputAudio.from_bytes(b"test", mime_type="audio/wav")
         d = audio.to_dict()
 
@@ -239,7 +239,7 @@ class TestInputVideo:
             InputVideo.from_file(tmp_path / "nonexistent.mp4")
 
     def test_to_dict(self):
-        """to_dict returns proper format for Zig bridge."""
+        """to_dict returns proper format for Zig pipeline."""
         video = InputVideo.from_bytes(b"test", mime_type="video/mp4")
         d = video.to_dict()
 

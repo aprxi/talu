@@ -185,7 +185,7 @@ pub fn describe(model_path: &str) -> Result<ModelInfo> {
 
 /// Returns model-owned performance hints as JSON.
 ///
-/// This is the bridge between inference-facing xray points and compute-facing
+/// This is the boundary between inference-facing xray points and compute-facing
 /// benchmark rows. Input may be either an architecture id or a model type.
 pub fn performance_hints_json(name: &str) -> Result<Option<String>> {
     let c_name = CString::new(name)?;

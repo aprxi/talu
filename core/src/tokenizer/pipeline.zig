@@ -17,7 +17,7 @@ pub const tokenizer_apply_normalizer_spec = normalize.tokenizer_apply_normalizer
 
 pub const tokenizer_apply_postprocessor_spec = postprocess.tokenizer_apply_postprocessor_spec;
 
-// C API entrypoints (FFI bridge).
+// C API entrypoints (FFI boundary).
 pub const tokenizer_from_pretrained = c_api.tokenizer_from_pretrained;
 pub const tokenizer_from_json_string = c_api.tokenizer_from_json_string;
 pub const tokenizer_set_error = c_api.tokenizer_set_error;

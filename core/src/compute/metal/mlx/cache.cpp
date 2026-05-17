@@ -1,4 +1,4 @@
-// MLX Bridge - KV Cache Management
+// MLX Runtime - KV Cache Management
 //
 // Implements KV cache for transformer inference, matching Python mlx-lm behavior.
 // Uses pre-allocated buffers with slice_update for efficiency.

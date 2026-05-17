@@ -10,9 +10,9 @@ test "Metal transport endpoint shape is present and fail-closed" {
     var backend = Backend{};
 
     try std.testing.expectError(error.UnsupportedBackend, endpoint.deviceLocationHint(&backend));
-    try std.testing.expectError(error.UnsupportedBackend, endpoint.hostDecodeActivationSlice(&backend, 0, 4));
-    try std.testing.expectError(error.UnsupportedBackend, endpoint.hostPrefillActivationSlice(&backend, 4));
-    try std.testing.expectError(error.UnsupportedBackend, endpoint.decodeInputBuffer(&backend, 0, 4));
-    try std.testing.expectError(error.UnsupportedBackend, endpoint.prefillInputBuffer(&backend, 4));
-    try std.testing.expectError(error.UnsupportedBackend, endpoint.sideInputBuffer(&backend, 4));
+    try std.testing.expectError(error.UnsupportedBackend, endpoint.decodeExternalOutput(&backend, 0, 4));
+    try std.testing.expectError(error.UnsupportedBackend, endpoint.prefillExternalOutput(&backend, 4));
+    try std.testing.expectError(error.UnsupportedBackend, endpoint.decodeExternalInput(&backend, 0, 4));
+    try std.testing.expectError(error.UnsupportedBackend, endpoint.prefillExternalInput(&backend, 4));
+    try std.testing.expectError(error.UnsupportedBackend, endpoint.sideExternalInput(&backend, 4));
 }
